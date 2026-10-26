@@ -21,7 +21,7 @@ Resources::Resources(ExecutionPlan input, DeviceContext& device, ContextCommunic
     : plan(checked(std::move(input))), device_(device),
       context_(device.device(), plan.capacity.device_bytes),
       fixed_(device.device(), plan.fixed_bytes), workspace_(device.device(), plan.workspace.bytes),
-      ingress_(plan.frame.ingress.bytes), sampling_(plan.frame.sampling_ingress.bytes),
+      ingress_(plan.frame.host_ingress.bytes), sampling_(plan.frame.sampling_ingress.bytes),
       egress_(plan.pinned_output_bytes),
       context_counts_(plan.frame.token_counts ? plan.frame.token_counts->region.bytes : 0),
       workspace(workspace_.span().subspan(0, plan.workspace.general_bytes)),
@@ -47,18 +47,19 @@ Resources::Resources(ExecutionPlan input, DeviceContext& device, ContextCommunic
         kda_fold.emplace(*kda_records, states.kda().all_layers_view());
     }
     std::memset(ingress_.data(), 0, ingress_.size());
+    copy_bytes_async(plan.frame.host_ingress.bind(fixed_.span()), ingress_.span(),
+                     device.execution_view());
     if (const auto& m = plan.frame.mtp) {
+        std::vector<std::int64_t> offsets(plan.shape.max_concurrency);
         for (std::size_t slot = 0; slot < m->tail_offsets.size(); ++slot) {
-            const auto offset = m->tail_offsets[slot].region.offset - plan.frame.ingress.offset;
-            auto* values =
-                reinterpret_cast<std::int64_t*>(static_cast<std::byte*>(ingress_.data()) + offset);
-            for (std::uint32_t row = 0; row < plan.shape.max_concurrency; ++row)
-                values[row] = (slot * plan.shape.max_concurrency + row) * m->tail_keys.shape[0] *
-                              m->tail_keys.shape[1] * sizeof(std::uint16_t);
+            for (std::size_t row = 0; row < offsets.size(); ++row)
+                offsets[row] = (slot * plan.shape.max_concurrency + row) * m->tail_keys.shape[0] *
+                               m->tail_keys.shape[1] * sizeof(std::uint16_t);
+            copy_bytes(m->tail_offsets[slot].region.bind(fixed_.span()),
+                       {offsets.data(), offsets.size() * sizeof(offsets.front()), Device::cpu()},
+                       device.execution_view());
         }
     }
-    copy_bytes_async(plan.frame.ingress.bind(fixed_.span()), ingress_.span(),
-                     device.execution_view());
     {
         const auto& r = plan.frame.attention.selection_rows;
         std::vector<std::int32_t> indices(r.shape[0]);
@@ -89,7 +90,6 @@ Resources::Resources(ExecutionPlan input, DeviceContext& device, ContextCommunic
     clear(plan.main.tables.page_offsets, 255);
     if (plan.mtp) clear(plan.mtp->tables.page_offsets, 255);
     if (plan.frame.token_counts) clear(*plan.frame.token_counts, 0);
-    if (plan.frame.mtp && plan.frame.mtp->token_counts) clear(*plan.frame.mtp->token_counts, 0);
     device.synchronize();
 }
 

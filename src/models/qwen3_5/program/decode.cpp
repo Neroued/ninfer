@@ -102,23 +102,24 @@ void RankProgramImpl::begin_draft(ComputeOperation& operation) {
         maximum = std::max(maximum, row.main_frontier);
     }
     if (graphs) {
-        if (backend == SpeculativeBackend::Mtp) prepare_mtp_draft(operation);
         (void)graphs->start(GraphPhase::Draft, operation.batch, maximum, device.execution_view());
     } else if (backend == SpeculativeBackend::Mtp) {
         begin_mtp_draft(operation);
     } else {
         run_dflash_draft(operation.batch, minimum, maximum);
     }
-    Tensor proposals =
-        dense_prefix(backend == SpeculativeBackend::Mtp ? frame.mtp->drafts : frame.dflash->drafts,
-                     {drafts, batch});
-    auto input = frame.input_view(width, batch);
+    Tensor proposals = backend == SpeculativeBackend::Mtp
+                           ? frame.mtp->proposals(batch)
+                           : dense_prefix(frame.dflash->drafts, {drafts, batch});
+    auto input       = frame.decode_view(width, batch);
     ops::prepare_verify_ids(frame.anchors.slice(0, 0, batch), proposals,
                             frame.extents.slice(0, 0, batch), input.ids, device.execution_view());
     const bool constrained = std::any_of(operation.sampling.begin(), operation.sampling.end(),
                                          [](const auto& row) { return row.constrained; });
     if (constrained) {
-        CUDA_CHECK(cudaMemcpyAsync(frame.host_drafts.data, proposals.data, proposals.bytes(),
+        CUDA_CHECK(cudaMemcpyAsync(frame.host_drafts.data, proposals.data,
+                                   backend == SpeculativeBackend::Mtp ? frame.mtp->drafts.bytes()
+                                                                      : proposals.bytes(),
                                    cudaMemcpyDeviceToHost, device.stream()));
         drafts_ready.record(device.stream());
     }
@@ -131,7 +132,7 @@ void RankProgramImpl::begin_target(ComputeOperation& operation) {
                          std::holds_alternative<ScoreWork>(operation.request.work.operation);
     const int batch = forward ? 1 : static_cast<int>(operation.batch);
     const int width = static_cast<int>(operation.width);
-    auto input      = frame.input_view(width, batch);
+    auto input      = forward ? frame.input_view(width, batch) : frame.decode_view(width, batch);
     if (!forward && graphs) {
         const auto phase       = operation.speculative ? GraphPhase::Verify : GraphPhase::Main;
         std::uint32_t frontier = 0;

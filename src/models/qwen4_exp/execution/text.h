@@ -17,6 +17,8 @@ struct TextExecution {
     moe::Schedule* experts = nullptr;
     Tensor qsa_raw_records, qsa_coordinate_records, ple_records;
     ParallelExecution* parallel = nullptr;
+    // A preceding producer may use the same communicator on its own stream.
+    const CudaCompletionEvent* first_collective_ready = nullptr;
 };
 
 // Activations stay live across the Host PLE handoff. All borrowed views follow the Program's

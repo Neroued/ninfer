@@ -159,8 +159,8 @@ void mtp_kv_projection(const Tensor& hidden, const MtpProjectionParameters& para
                        const AttentionConfig& config, Tensor& key, Tensor& value,
                        MemoryArena& workspace, CudaExecutionView execution) {
     if (parameters.rows) {
-        ops::linear_pair(hidden, (*parameters.rows)[1].weight, (*parameters.rows)[3].weight, key,
-                         value, execution);
+        ops::linear_pair(hidden, hidden, (*parameters.rows)[1].weight, (*parameters.rows)[3].weight,
+                         key, value, execution);
         return;
     }
     auto scope   = workspace.scope();

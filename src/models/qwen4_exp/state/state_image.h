@@ -32,6 +32,7 @@ public:
 
     [[nodiscard]] const LinearAttentionStateView& gdn() const { return gdn_; }
 
+    [[nodiscard]] ops::QsaTailStateView main_tail(Tensor offsets) const;
     [[nodiscard]] ops::QsaTailStateView main_tail(std::uint32_t layer, Tensor offsets) const;
     [[nodiscard]] ops::QsaTailStateView mtp_tail(Tensor offsets) const;
     [[nodiscard]] ops::PleConvStateView ple(Tensor offsets) const;

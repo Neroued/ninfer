@@ -29,9 +29,7 @@ struct MtpInputRow {
 
 struct VerifyRound {
     std::uint32_t width = 0;
-    std::vector<std::uint32_t> bases, extents;
-    std::vector<TokenId> inputs;
-    execution::BatchView batch;
+    std::span<const std::uint32_t> extents;
 };
 
 enum class ComputePhase : std::uint8_t {
@@ -120,17 +118,20 @@ public:
     [[nodiscard]] bool advance_layers(std::uint32_t end);
     void request_decision();
     void install_sampling(bool speculative);
-    void upload_main(std::span<const WorkRow>, std::uint32_t tokens);
+    void prepare_main_inputs(std::span<const WorkRow>, std::uint32_t tokens);
     void align_mtp(std::span<const WorkRow>, std::uint32_t tokens, const Tensor& previous,
                    const Tensor& conditioning, std::optional<models::vision::EmbeddingView>);
     void commit_verify(const Commit&);
-    void execute_mtp_commit(std::int32_t batch, bool rebuild_history,
-                            DecodeGraphSection* = nullptr);
+    void execute_mtp_commit(std::int32_t batch, bool rebuild_history, bool count_tokens,
+                            DecodeGraphSection*                 = nullptr,
+                            DecodeGraphSection* captured_counts = nullptr);
     [[nodiscard]] execution::MtpRun draft_run(std::uint32_t step, std::int32_t batch,
                                               std::uint32_t visible);
     void draft_forward(std::uint32_t step, std::int32_t batch, std::uint32_t visible,
                        const DecodeGraphDefinition* = nullptr, DecodeGraphChild* = nullptr);
-    void save_draft(std::uint32_t step, std::int32_t batch);
+    void install_decode(std::int32_t batch);
+    [[nodiscard]] Tensor draft_proposals(std::int32_t batch);
+    [[nodiscard]] Tensor draft_output_ids(std::uint32_t step, std::int32_t batch);
     void sample_forward(std::int32_t batch, bool first_token);
     void accept_forward(std::int32_t batch);
     [[nodiscard]] DistributedVocabulary vocabulary();
@@ -141,7 +142,7 @@ public:
     void copy_verify_inputs(std::int32_t batch, DecodeGraphSection* = nullptr);
     [[nodiscard]] execution::BatchView mtp_inputs(const MtpBatchLayout&, std::span<const WorkRow>,
                                                   std::uint32_t tokens,
-                                                  std::span<const MtpInputRow>);
+                                                  std::span<const MtpInputRow>, bool history);
     [[nodiscard]] ops::QsaTailStateView mtp_working_tail(std::uint32_t slot, std::uint32_t batch);
     [[nodiscard]] Tensor device_tensor(const TensorRegion&);
     [[nodiscard]] Tensor host_tensor(const TensorRegion&);

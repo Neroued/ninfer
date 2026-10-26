@@ -8,7 +8,7 @@
 namespace ninfer::models::glm5next::execution {
 struct AttentionBatchView {
     std::int32_t rows;
-    Tensor ids, positions, valid_columns, source_offsets, destination_offsets;
+    Tensor positions, valid_columns, source_offsets, destination_offsets;
     Tensor table_rows, record_offsets, selection_rows, to_global, from_gather, live_rows;
     std::uint32_t max_visible_tokens;
 };

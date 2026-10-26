@@ -66,46 +66,40 @@ public:
         const auto maximum  = resources_.decoder.text_kv.max_context() - 1;
         const auto frontier = std::min(maximum, std::max(1U, call.profile.min));
         const auto extent   = std::min(frame.spec.draft_window, maximum - frontier);
-        const auto input    = frame.host_input_view(call.width, call.batch);
-        auto* ids           = static_cast<std::int32_t*>(input.ids.data);
+        const auto input    = frame.host_decode_view(call.width, call.batch);
         auto* positions     = static_cast<std::int32_t*>(input.cache_positions.data);
         auto* rope          = static_cast<std::int32_t*>(input.rope_positions.data);
         for (std::uint32_t row = 0; row < call.batch; ++row) {
-            auto& host                              = *frame.host_ingress;
-            host.frontiers[row]                     = frontier;
-            host.backend_frontiers[row]             = frame.spec.backend == SpeculativeBackend::Mtp
-                                                          ? (frontier ? frontier - 1 : 0)
-                                                          : frontier;
-            host.extents[row]                       = extent;
-            host.valid_columns[row]                 = std::min(call.width, extent + 1);
-            host.proposal_valid_columns[row]        = frame.spec.draft_window + 1;
-            host.budgets[row]                       = frame.spec.draft_window + 1;
-            host.main_table_rows[row]               = row;
-            host.backend_table_rows[row]            = row;
-            host.state_source_offsets[row]          = state_offsets_[row];
-            host.state_destination_offsets[row]     = state_offsets_[row];
-            host.residency_slots[row]               = row;
-            frame.host_commit->history_columns[row] = extent;
+            auto& host                               = *frame.host_ingress;
+            host.frontiers[row]                      = frontier;
+            host.sampling_positions[row]             = frontier;
+            host.history_skip[row]                   = 1;
+            frame.host_commit->accepted_columns[row] = extent + 1;
+            host.backend_frontiers[row]              = frame.spec.backend == SpeculativeBackend::Mtp
+                                                           ? (frontier ? frontier - 1 : 0)
+                                                           : frontier;
+            host.extents[row]                        = extent;
+            host.valid_columns[row]                  = std::min(call.width, extent + 1);
+            host.proposal_valid_columns[row]         = frame.spec.draft_window + 1;
+            host.budgets[row]                        = frame.spec.draft_window + 1;
+            host.main_table_rows[row]                = row;
+            host.backend_table_rows[row]             = row;
+            host.state_source_offsets[row]           = state_offsets_[row];
+            host.state_destination_offsets[row]      = state_offsets_[row];
+            host.residency_slots[row]                = row;
             frame.host_commit->state_destination_offsets[row] = state_offsets_[row];
             for (std::uint32_t column = 0; column < call.width; ++column) {
                 const auto index = row * call.width + column;
-                ids[index]       = 0;
                 positions[index] = frontier + std::min(column, extent);
                 for (std::uint32_t axis = 0; axis < 3; ++axis) {
                     rope[axis * call.width * call.batch + index] = positions[index];
                 }
             }
         }
-        const auto destination = frame.input_view(call.width, call.batch);
-        const auto upload      = [&](const Tensor& source, const Tensor& target) {
-            CUDA_CHECK(cudaMemcpyAsync(target.data, source.data, source.bytes(),
-                                            cudaMemcpyHostToDevice, cuda.stream()));
-        };
-        upload(input.ids, destination.ids);
-        upload(input.cache_positions, destination.cache_positions);
-        upload(input.rope_positions, destination.rope_positions);
-        CUDA_CHECK(cudaMemcpyAsync(frame.ingress.data, frame.host_ingress, sizeof(FrameIngress),
-                                   cudaMemcpyHostToDevice, cuda.stream()));
+        if (call.width > 1) {
+            const auto ids = frame.decode_view(call.width, call.batch).ids;
+            CUDA_CHECK(cudaMemsetAsync(ids.data, 0, ids.bytes(), cuda.stream()));
+        }
         CUDA_CHECK(cudaMemcpyAsync(frame.commit.data, frame.host_commit, sizeof(FrameCommit),
                                    cudaMemcpyHostToDevice, cuda.stream()));
         CUDA_CHECK(cudaMemsetAsync(frame.egress.data, 0, frame.egress.bytes, cuda.stream()));
@@ -137,15 +131,14 @@ public:
                     }
                 }
             }
-            upload(frame.host_step_positions, mtp.step_positions);
-            upload(frame.host_step_rope_positions, mtp.step_rope_positions);
-            upload(frame.host_step_valid_columns, mtp.step_valid_columns);
         }
         if (resources_.dflash) {
             auto& state = *resources_.dflash;
             CUDA_CHECK(cudaMemsetAsync(state.pending_features.data, 0,
                                        state.pending_features.bytes(), cuda.stream()));
         }
+        CUDA_CHECK(cudaMemcpyAsync(frame.ingress.data, frame.host_ingress, sizeof(FrameIngress),
+                                   cudaMemcpyHostToDevice, cuda.stream()));
         device_.synchronize();
     }
 
@@ -362,19 +355,21 @@ void Graphs::prepare(Resources& resources, const execution::Parameters& paramete
             prepare_segment(target.accept, GraphPhase::Accept, decision_profiles,
                             spec_.draft_window + 1);
         }
-        if (bodies.mtp_history && spec_.draft_window) {
+        if (bodies.mtp_commit && spec_.draft_window) {
             inputs.prepare(invocation(GraphPhase::Verify, batch, spec_.draft_window + 1,
                                       {0, spec_.capacity - 1, 0}, spec_.capacity));
             auto& frame = resources.frame;
             for (std::uint32_t row = 0; row < batch; ++row)
-                frame.host_commit->history_columns[row] = spec_.draft_window;
+                frame.host_commit->accepted_columns[row] = spec_.draft_window + 1;
             CUDA_CHECK(cudaMemcpyAsync(frame.commit.data, frame.host_commit, sizeof(FrameCommit),
                                        cudaMemcpyHostToDevice, device.stream()));
             resources.work.reset_peak();
-            bodies.mtp_history(batch);
+            bodies.mtp_commit(batch, nullptr, nullptr);
             device.synchronize();
-            auto& history = target.mtp_history;
-            history.definition.capture(device.stream(), [&] { bodies.mtp_history(batch); });
+            auto& history = target.mtp_commit;
+            history.definition.capture(device.stream(), [&] {
+                bodies.mtp_commit(batch, &history.repair, &history.counts);
+            });
             history.executable.instantiate(history.definition);
             history.executable.upload(device.stream());
             workspace_peak_ = std::max(workspace_peak_, resources.work.peak_used());
@@ -428,9 +423,12 @@ bool Graphs::poll() {
     return true;
 }
 
-void Graphs::rebuild_mtp_history(std::uint32_t batch, CudaExecutionView cuda) {
+void Graphs::commit_mtp(std::uint32_t batch, bool repair, bool counts, CudaExecutionView cuda) {
     if (pending_) throw std::logic_error("MTP history cannot precede its completed target");
-    batches_.at(batch - 1).mtp_history.executable.launch(cuda.stream());
+    auto& commit = batches_.at(batch - 1).mtp_commit;
+    commit.repair.set_enabled(commit.executable, repair);
+    commit.counts.set_enabled(commit.executable, counts);
+    commit.executable.launch(cuda.stream());
 }
 
 void Graphs::cancel() {

@@ -144,7 +144,7 @@ void append_context_impl(DraftExecutionView& execution, const Tensor& features,
                     key_raw.view({dimension(config.attention.key_width()), layer_columns});
                 Tensor value_flat =
                     value.view({dimension(config.attention.key_width()), layer_columns});
-                ops::linear_pair(layer_context, weight.context_key.weight,
+                ops::linear_pair(layer_context, layer_context, weight.context_key.weight,
                                  weight.context_value.weight, key_flat, value_flat, execution.cuda);
                 Tensor key = layer_roots.key.view({dimension(config.attention.head_dim),
                                                    dimension(config.attention.num_key_value_heads),

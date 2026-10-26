@@ -143,6 +143,51 @@ inline Range range(const Tensor& tensor, const char* op) {
 
 inline bool overlaps(Range a, Range b) noexcept { return a.begin < b.end && b.begin < a.end; }
 
+inline Range strided_range(const Tensor& value, const char* op) {
+    std::size_t extent = dtype_size(value.dtype);
+    for (int axis = 0; axis < 4; ++axis) {
+        if (value.ne[axis] <= 0 || value.nb[axis] <= 0)
+            throw std::invalid_argument(std::string(op) + ": invalid strided extent");
+        const auto tail = bytes(value.ne[axis] - 1, value.nb[axis], op);
+        if (tail > std::numeric_limits<std::size_t>::max() - extent)
+            throw std::overflow_error(std::string(op) + ": strided range overflows");
+        extent += tail;
+    }
+    return range(value.data, extent, op);
+}
+
+inline void strided_tensor(const Tensor& value, DType dtype,
+                           std::initializer_list<std::int32_t> dimensions, std::size_t alignment,
+                           const char* op, const char* name, Device expected_device) {
+    device(value.device, expected_device, op, name);
+    const auto expected = Tensor::metadata(dtype, dimensions);
+    if (value.dtype != dtype || !aligned(value.data, alignment))
+        throw std::invalid_argument(std::string(op) + ": invalid " + name);
+    std::array<int, 4> axes{};
+    int count       = 0;
+    const auto word = dtype_size(dtype);
+    for (int axis = 0; axis < 4; ++axis) {
+        if (value.ne[axis] != expected.ne[axis] || value.ne[axis] <= 0 || value.nb[axis] <= 0 ||
+            value.nb[axis] % word)
+            throw std::invalid_argument(std::string(op) + ": invalid strides for " + name);
+        if (value.ne[axis] > 1) axes[count++] = axis;
+    }
+    std::sort(axes.begin(), axes.begin() + count,
+              [&](int a, int b) { return value.nb[a] < value.nb[b]; });
+    std::size_t extent = word;
+    for (int i = 0; i < count; ++i) {
+        const int axis    = axes[i];
+        const auto stride = static_cast<std::size_t>(value.nb[axis]);
+        if (stride < extent)
+            throw std::invalid_argument(std::string(op) + ": overlapping elements in " + name);
+        const auto tail = bytes(value.ne[axis] - 1, stride, op);
+        if (tail > std::numeric_limits<std::size_t>::max() - extent)
+            throw std::overflow_error(std::string(op) + ": tensor extent overflows");
+        extent += tail;
+    }
+    (void)range(value.data, extent, op);
+}
+
 inline void disjoint(Range a, Range b, const char* op) {
     if (overlaps(a, b))
         throw std::invalid_argument(std::string(op) + ": operands must not overlap");

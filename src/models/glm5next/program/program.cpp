@@ -19,7 +19,7 @@ RankProgramImpl::RankProgramImpl(const execution::Parameters& p, std::unique_ptr
       drafts_done(d) {
     if (p.profile != resources.plan.profile)
         throw std::invalid_argument("GLM5Next resources have another profile");
-    if (binding.group) parallel.emplace(binding, d);
+    if (binding.group) parallel.emplace(binding);
     if (p.profile->local.size != (parallel ? parallel->size() : 1))
         throw std::invalid_argument("GLM5Next communication differs from weight partition");
     if (shape.gpu_timing) prefill_timer.emplace(d);
@@ -154,11 +154,6 @@ void RankProgramImpl::drain() {
     try {
         resources.synchronize();
     } catch (...) { error = std::current_exception(); }
-    try {
-        if (parallel) parallel->synchronize();
-    } catch (...) {
-        if (!error) error = std::current_exception();
-    }
     compute.reset();
     context.reset();
     events.clear();

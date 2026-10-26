@@ -28,20 +28,14 @@ namespace {
 struct AcceptExpected {
     std::vector<std::int32_t> sampled;
     std::int32_t num_sampled;
-    std::int32_t accepted;
-    std::int32_t length;
-    std::int32_t token;
 };
 
 AcceptExpected accept_state_oracle(const std::vector<std::int32_t>& drafts, std::int32_t accepted,
-                                   std::int32_t terminal_token, std::int32_t initial_length) {
+                                   std::int32_t terminal_token) {
     const int k = static_cast<int>(drafts.size());
     AcceptExpected expected{
         .sampled     = std::vector<std::int32_t>(static_cast<std::size_t>(k + 1), 0),
         .num_sampled = accepted + 1,
-        .accepted    = accepted,
-        .length      = initial_length + accepted + 1,
-        .token       = terminal_token,
     };
     for (int i = 0; i < accepted; ++i) {
         expected.sampled[static_cast<std::size_t>(i)] = drafts[static_cast<std::size_t>(i)];
@@ -66,38 +60,30 @@ int execute_accept_case(const std::string& label, const std::vector<std::int32_t
     const auto config_before = from_device<std::uint8_t>(d_config, sizeof(ops::SamplingConfig));
 
     GuardedDeviceBuffer d_length(sizeof(std::int32_t));
-    GuardedDeviceBuffer d_token(sizeof(std::int32_t));
     GuardedDeviceBuffer d_sampled(static_cast<std::size_t>(k + 1) * sizeof(std::int32_t));
     GuardedDeviceBuffer d_num(sizeof(std::int32_t));
-    GuardedDeviceBuffer d_accepted(sizeof(std::int32_t));
     DeviceBuffer d_extent               = to_device<std::int32_t>({k});
     const std::int32_t d_length_initial = initial_length;
     d_length.copy_from_host(&d_length_initial, sizeof(d_length_initial));
-    const std::int32_t d_token_initial = -1234567;
-    d_token.copy_from_host(&d_token_initial, sizeof(d_token_initial));
     d_sampled.fill(0x9d);
     const std::int32_t d_num_initial = -11;
     d_num.copy_from_host(&d_num_initial, sizeof(d_num_initial));
-    const std::int32_t d_accepted_initial = -13;
-    d_accepted.copy_from_host(&d_accepted_initial, sizeof(d_accepted_initial));
 
     Tensor targets(d_targets.span(), DType::I32, {k + 1});
     Tensor logits(d_logits.span(), DType::BF16, {physical_rows, k + 1});
     Tensor draft_tensor(d_drafts.span(), DType::I32, {k});
     Tensor extent(d_extent.span(), DType::I32, {1});
     Tensor length(d_length.span(), DType::I32, {1});
-    Tensor token(d_token.span(), DType::I32, {1});
     Tensor sampled(d_sampled.span(), DType::I32, {k + 1});
     Tensor num_sampled(d_num.span(), DType::I32, {1});
-    Tensor accepted(d_accepted.span(), DType::I32, {1});
     const std::size_t workspace_bytes =
         ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(token_domain, k, k, 1, 1);
     ninfer::DeviceBuffer workspace_storage(ninfer::test::cuda_environment().context.device(),
                                            std::max<std::size_t>(256, workspace_bytes));
     MemoryArena workspace(workspace_storage.span());
     ops::speculative_accept_greedy_drafts(
-        targets, logits, draft_tensor, extent, length, token, sampled, num_sampled, accepted,
-        token_domain, static_cast<const ops::SamplingConfig*>(d_config.data()), workspace,
+        targets, logits, draft_tensor, extent, length, sampled, num_sampled, token_domain,
+        static_cast<const ops::SamplingConfig*>(d_config.data()), workspace,
         ninfer::test::cuda_environment().default_execution);
     cuda_synchronize();
 
@@ -106,12 +92,8 @@ int execute_accept_case(const std::string& label, const std::vector<std::int32_t
                      from_device<std::int32_t>(d_sampled.data(), k + 1), expected.sampled);
     failures += verify_exact((label + " num sampled").c_str(),
                              from_device<std::int32_t>(d_num.data(), 1), {expected.num_sampled});
-    failures += verify_exact((label + " accepted").c_str(),
-                             from_device<std::int32_t>(d_accepted.data(), 1), {expected.accepted});
-    failures += verify_exact((label + " length").c_str(),
-                             from_device<std::int32_t>(d_length.data(), 1), {expected.length});
-    failures += verify_exact((label + " token").c_str(),
-                             from_device<std::int32_t>(d_token.data(), 1), {expected.token});
+    failures += verify_exact((label + " positions unchanged").c_str(),
+                             from_device<std::int32_t>(d_length.data(), 1), {initial_length});
 
     failures +=
         verify_exact((label + " target tokens unchanged").c_str(),
@@ -125,18 +107,13 @@ int execute_accept_case(const std::string& label, const std::vector<std::int32_t
                              config_before);
 
     auto expected_counts = initial_token_counts;
-    for (int i = 0; i < expected.num_sampled; ++i) {
-        ++expected_counts[static_cast<std::size_t>(expected.sampled[static_cast<std::size_t>(i)])];
-    }
     failures +=
         verify_exact((label + " token counts").c_str(),
                      from_device<std::int32_t>(d_counts, expected_counts.size()), expected_counts);
 
     failures += d_length.verify_guards((label + " length guards").c_str());
-    failures += d_token.verify_guards((label + " token guards").c_str());
     failures += d_sampled.verify_guards((label + " sampled guards").c_str());
     failures += d_num.verify_guards((label + " num guards").c_str());
-    failures += d_accepted.verify_guards((label + " accepted guards").c_str());
     if (workspace.used() != 0 || workspace.peak_used() != workspace_bytes) {
         std::cerr << label << ": workspace query/execution high-water mismatch\n";
         ++failures;
@@ -156,8 +133,8 @@ int greedy_accept_case(int k, int accepted_count, int token_domain = 64) {
             targets[static_cast<std::size_t>(accepted_count)] + 1;
     }
     const std::int32_t initial_length = 200 + k;
-    const auto expected               = accept_state_oracle(
-        drafts, accepted_count, targets[static_cast<std::size_t>(accepted_count)], initial_length);
+    const auto expected               = accept_state_oracle(drafts, accepted_count,
+                                                            targets[static_cast<std::size_t>(accepted_count)]);
     std::vector<std::uint16_t> logits(static_cast<std::size_t>(token_domain) * (k + 1));
     for (std::size_t i = 0; i < logits.size(); ++i) {
         logits[i] = static_cast<std::uint16_t>(0x3f00u + (i % 127u));
@@ -194,7 +171,7 @@ int deterministic_sampling_case() {
     for (std::size_t i = 0; i < logits.size(); ++i) logits_bits[i] = f32_to_bf16(logits[i]);
 
     const std::int32_t initial_length = 4093;
-    const auto expected = accept_state_oracle(drafts, accepted, correction, initial_length);
+    const auto expected               = accept_state_oracle(drafts, accepted, correction);
     std::vector<std::int32_t> token_counts(token_domain, 0);
     token_counts[static_cast<std::size_t>(drafts[0])]  = 3;
     token_counts[static_cast<std::size_t>(drafts[1])]  = 5;
@@ -227,7 +204,7 @@ int grammar_onehot_case(int domain, float temperature) {
     ops::SamplingConfig config;
     config.temperature  = temperature;
     config.mask         = {static_cast<const std::uint32_t*>(device_masks.data()), words};
-    const auto expected = accept_state_oracle(drafts, 2, 51, 73);
+    const auto expected = accept_state_oracle(drafts, 2, 51);
     return execute_accept_case("one-hot grammar mask", targets, logits, domain + 2, drafts, 73,
                                domain, config, std::vector<int>(domain, 0), expected);
 }
@@ -250,7 +227,7 @@ int greedy_penalty_case(int token_domain) {
     config.temperature      = 0.0F;
     config.presence_penalty = 1.0F;
     const std::vector<std::int32_t> counts(static_cast<std::size_t>(token_domain), 0);
-    const auto expected = accept_state_oracle(drafts, 1, 4, 100);
+    const auto expected = accept_state_oracle(drafts, 1, 4);
     return execute_accept_case(
         "speculative greedy penalty token-domain=" + std::to_string(token_domain), raw_targets,
         bits, token_domain, drafts, 100, token_domain, config, counts, expected);
@@ -278,16 +255,16 @@ int batched_sampling_workspace_stride_case() {
 
     DeviceBuffer d_targets = to_device(winners);
     DeviceBuffer d_logits  = to_device(logits);
-    DeviceBuffer d_drafts  = to_device(drafts);
+    std::vector<int> steps(drafts.size());
+    for (int row = 0; row < batch; ++row)
+        for (int col = 0; col < k; ++col) steps[col * batch + row] = drafts[row * k + col];
+    DeviceBuffer d_drafts  = to_device(steps);
     DeviceBuffer d_extents = to_device<std::int32_t>({k, k});
     DeviceBuffer d_lengths = to_device<std::int32_t>({100, 200});
-    DeviceBuffer d_anchors = to_device<std::int32_t>({-1, -1});
     DeviceBuffer d_licensed(ninfer::test::cuda_environment().context.device(),
                             static_cast<std::size_t>(columns) * batch * sizeof(std::int32_t));
     DeviceBuffer d_counts(ninfer::test::cuda_environment().context.device(),
                           static_cast<std::size_t>(batch) * sizeof(std::int32_t));
-    DeviceBuffer d_accepted(ninfer::test::cuda_environment().context.device(),
-                            static_cast<std::size_t>(batch) * sizeof(std::int32_t));
 
     ops::SamplingConfig config{};
     config.temperature = 1.0f;
@@ -297,13 +274,11 @@ int batched_sampling_workspace_stride_case() {
 
     Tensor targets(d_targets.span(), DType::I32, {columns, batch});
     Tensor logits_tensor(d_logits.span(), DType::BF16, {physical_rows, columns, batch});
-    Tensor draft_tensor(d_drafts.span(), DType::I32, {k, batch});
+    auto draft_tensor = Tensor(d_drafts.span(), DType::I32, {batch, k}).permute({1, 0, 2, 3});
     Tensor extents(d_extents.span(), DType::I32, {batch});
     Tensor lengths(d_lengths.span(), DType::I32, {batch});
-    Tensor anchors(d_anchors.span(), DType::I32, {batch});
     Tensor licensed(d_licensed.span(), DType::I32, {columns, batch});
     Tensor counts(d_counts.span(), DType::I32, {batch});
-    Tensor accepted(d_accepted.span(), DType::I32, {batch});
     const std::size_t workspace_bytes =
         ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(token_domain, k, k, batch,
                                                                        batch);
@@ -311,8 +286,8 @@ int batched_sampling_workspace_stride_case() {
                                            workspace_bytes);
     MemoryArena workspace(workspace_storage.span());
     ops::speculative_accept_greedy_drafts(
-        targets, logits_tensor, draft_tensor, extents, lengths, anchors, licensed, counts, accepted,
-        token_domain, static_cast<const ops::SamplingConfig*>(d_configs.data()), workspace,
+        targets, logits_tensor, draft_tensor, extents, lengths, licensed, counts, token_domain,
+        static_cast<const ops::SamplingConfig*>(d_configs.data()), workspace,
         ninfer::test::cuda_environment().default_execution);
     cuda_synchronize();
 
@@ -321,12 +296,8 @@ int batched_sampling_workspace_stride_case() {
                                 {10, 20, 0, 0, 30, 31, 32, 33});
     failures += verify_exact("speculative sampling B=2 counts",
                              from_device<std::int32_t>(d_counts, batch), {2, 4});
-    failures += verify_exact("speculative sampling B=2 accepted",
-                             from_device<std::int32_t>(d_accepted, batch), {1, 3});
     failures += verify_exact("speculative sampling B=2 lengths",
-                             from_device<std::int32_t>(d_lengths, batch), {102, 204});
-    failures += verify_exact("speculative sampling B=2 anchors",
-                             from_device<std::int32_t>(d_anchors, batch), {20, 33});
+                             from_device<std::int32_t>(d_lengths, batch), {100, 200});
     return failures;
 }
 

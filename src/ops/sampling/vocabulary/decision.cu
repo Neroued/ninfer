@@ -63,10 +63,10 @@ __global__ void sample_kernel(const unsigned long long* keys, int cap, int batch
 }
 
 __global__ void accept_kernel(const unsigned long long* keys, int cap, int drafts_count, int batch,
-                              int ranks, const SamplingConfig* configs, const int* drafts,
-                              const int* extents, int* lengths, int* anchors, int* licensed,
-                              int* counts, int* accepted) {
-    const int row = blockIdx.x, extent = extents[row], old_length = lengths[row];
+                              int ranks, const SamplingConfig* configs, TokenRows drafts,
+                              const int* extents, const int* positions, int* licensed,
+                              int* counts) {
+    const int row = blockIdx.x, extent = extents[row], old_length = positions[row];
     const auto cfg = configs[row];
     __shared__ Support s;
     __shared__ int terminal;
@@ -75,7 +75,7 @@ __global__ void accept_kernel(const unsigned long long* keys, int cap, int draft
         if (threadIdx.x == 0) {
             if (!s.size) asm volatile("trap;");
             terminal        = -1;
-            const int draft = col < extent ? drafts[row * drafts_count + col] : -1;
+            const int draft = col < extent ? drafts[row][col] : -1;
             if (!(cfg.temperature > 0)) {
                 if (col == extent || draft != s.ids[0]) terminal = s.ids[0];
             } else if (col < extent) {
@@ -96,9 +96,8 @@ __global__ void accept_kernel(const unsigned long long* keys, int cap, int draft
                                                                 kSamplePurposeSpeculativeBonus, 0));
             }
             if (terminal >= 0)
-                speculative_store_accept_result<false>(
-                    drafts + row * drafts_count, drafts_count, row, col, terminal, lengths, anchors,
-                    licensed + row * (drafts_count + 1), counts, accepted, configs + row);
+                speculative_store_accept_result(drafts[row], drafts_count, row, col, terminal,
+                                                licensed + row * (drafts_count + 1), counts);
         }
         __syncthreads();
         if (terminal >= 0) break;
@@ -119,7 +118,8 @@ void check_outputs(std::initializer_list<Tensor*> outputs,
                    int batch, const char* op) {
     for (auto current = outputs.begin(); current != outputs.end(); ++current) {
         const auto range = operand::range(**current, op);
-        for (const auto* input : inputs) operand::disjoint(range, operand::range(*input, op), op);
+        for (const auto* input : inputs)
+            operand::disjoint(range, operand::strided_range(*input, op), op);
         operand::disjoint(range, operand::range(configs, sizeof(SamplingConfig) * batch, op), op);
         for (auto earlier = outputs.begin(); earlier != current; ++earlier)
             operand::disjoint(range, operand::range(**earlier, op), op);
@@ -145,28 +145,26 @@ void sample_vocabulary_candidates(const Tensor& keys, const SamplingConfig* conf
 
 void accept_vocabulary_candidates(const Tensor& keys, const SamplingConfig* configs,
                                   const Tensor& drafts, const Tensor& current_extents,
-                                  Tensor& round_lengths, Tensor& round_anchors,
-                                  Tensor& licensed_tokens, Tensor& licensed_counts,
-                                  Tensor& accepted_drafts, CudaExecutionView execution) {
+                                  const Tensor& base_positions, Tensor& licensed_tokens,
+                                  Tensor& licensed_counts, CudaExecutionView execution) {
     constexpr const char* op = "accept_vocabulary_candidates";
     check_keys(keys, configs, op, execution.device());
     const int d = keys.ne[1] - 1, batch = keys.ne[2];
     if (d < 1) throw std::invalid_argument("accept_vocabulary_candidates: expected D>=1");
-    operand::tensor(drafts, DType::I32, {d, batch}, 4, op, "drafts", execution.device());
+    operand::strided_tensor(drafts, DType::I32, {d, batch}, 4, op, "drafts", execution.device());
     operand::tensor(current_extents, DType::I32, {batch}, 4, op, "extents", execution.device());
-    for (const auto* tensor : {&round_lengths, &round_anchors, &licensed_counts, &accepted_drafts})
-        operand::tensor(*tensor, DType::I32, {batch}, 4, op, "round output", execution.device());
+    operand::tensor(base_positions, DType::I32, {batch}, 4, op, "base positions",
+                    execution.device());
+    operand::tensor(licensed_counts, DType::I32, {batch}, 4, op, "counts", execution.device());
     operand::tensor(licensed_tokens, DType::I32, {d + 1, batch}, 4, op, "licensed tokens",
                     execution.device());
-    check_outputs(
-        {&round_lengths, &round_anchors, &licensed_tokens, &licensed_counts, &accepted_drafts},
-        {&keys, &drafts, &current_extents}, configs, batch, op);
+    check_outputs({&licensed_tokens, &licensed_counts},
+                  {&keys, &drafts, &current_extents, &base_positions}, configs, batch, op);
     accept_kernel<<<batch, 32, 0, execution.stream()>>>(
         static_cast<const unsigned long long*>(keys.data), keys.ne[0], d, batch, keys.ne[3],
-        configs, static_cast<const int*>(drafts.data),
-        static_cast<const int*>(current_extents.data), static_cast<int*>(round_lengths.data),
-        static_cast<int*>(round_anchors.data), static_cast<int*>(licensed_tokens.data),
-        static_cast<int*>(licensed_counts.data), static_cast<int*>(accepted_drafts.data));
+        configs, token_rows(drafts), static_cast<const int*>(current_extents.data),
+        static_cast<const int*>(base_positions.data), static_cast<int*>(licensed_tokens.data),
+        static_cast<int*>(licensed_counts.data));
     CUDA_CHECK(cudaGetLastError());
 }
 } // namespace ninfer::ops

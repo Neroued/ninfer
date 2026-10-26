@@ -33,6 +33,11 @@ StateLayout plan_state_image(const Config& config, const GdnConfig& gdn) {
 StateViews::StateViews(MemorySpan backing, const StateLayout& layout)
     : layout_(layout), storage_(backing, layout.images), gdn_(storage_, layout.gdn) {}
 
+ops::QsaTailStateView StateViews::main_tail(Tensor offsets) const {
+    return {storage_.field(layout_.main_qsa.raw_keys, offsets),
+            storage_.field(layout_.main_qsa.first_rope, offsets)};
+}
+
 ops::QsaTailStateView StateViews::main_tail(std::uint32_t layer, Tensor offsets) const {
     return {storage_.field(layout_.main_qsa.raw_keys, offsets, layer),
             storage_.field(layout_.main_qsa.first_rope, offsets, layer)};

@@ -30,7 +30,7 @@ RankProgramImpl::RankProgramImpl(const execution::Parameters& p, ExecutionPlan p
       resources(p, std::move(plan), d, observer), ple_inputs(d), ple_ready(d), draft_copied(d),
       draft_output(resources.plan.pinned_draft_bytes), shape(resources.plan.shape),
       prefill_timer(d), gpu_timer(d, shape.gpu_timing), compute_done(d), context_done(d) {
-    if (binding.group) parallel.emplace(binding, d);
+    if (binding.group) parallel.emplace(binding);
     if (parameters.profile->local.size != (parallel ? parallel->size() : 1))
         throw std::logic_error("Qwen4Exp Program communication differs from its weight partition");
     if (resources.ple_prepare) host_ple = std::make_unique<PlePipeline>(resources, d);

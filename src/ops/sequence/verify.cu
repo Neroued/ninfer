@@ -13,21 +13,20 @@ using namespace common;
 
 namespace {
 
-__global__ void prepare_verify_inputs_kernel(const std::int32_t* anchors,
-                                             const std::int32_t* drafts,
-                                             const std::int32_t* base_positions,
-                                             const std::int32_t* current_extents,
-                                             std::int32_t* verify_ids, std::int32_t* positions,
-                                             std::int32_t k) {
+__global__ void prepare_verify_inputs_kernel(
+    const std::int32_t* anchors, const std::int32_t* drafts, const std::int32_t* base_positions,
+    const std::int32_t* current_extents, std::int32_t* verify_ids, std::int32_t* positions,
+    std::int32_t k, std::int64_t draft_column, std::int64_t draft_row) {
     const int row = static_cast<int>(blockIdx.y);
     const int T   = k + 1;
     int extent    = current_extents[row];
     extent        = extent < 0 ? 0 : (extent > k ? k : extent);
     for (int j = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x; j < T;
          j += blockDim.x * gridDim.x) {
-        const int off = row * T + j;
-        verify_ids[off] =
-            j == 0 ? anchors[row] : (j <= extent ? drafts[row * k + j - 1] : anchors[row]);
+        const int off   = row * T + j;
+        verify_ids[off] = j == 0 ? anchors[row]
+                                 : (j <= extent ? drafts[row * draft_row + (j - 1) * draft_column]
+                                                : anchors[row]);
         if (positions != nullptr) {
             positions[off] = base_positions[row] + (j <= extent ? j : extent);
         }
@@ -47,7 +46,8 @@ void prepare_verify_inputs_launch(const Tensor& anchors, const Tensor& drafts,
         static_cast<const std::int32_t*>(drafts.data),
         static_cast<const std::int32_t*>(base_positions.data),
         static_cast<const std::int32_t*>(current_extents.data),
-        static_cast<std::int32_t*>(verify_ids.data), static_cast<std::int32_t*>(positions.data), k);
+        static_cast<std::int32_t*>(verify_ids.data), static_cast<std::int32_t*>(positions.data), k,
+        drafts.nb[0] / 4, drafts.nb[1] / 4);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -63,7 +63,8 @@ void prepare_verify_ids_launch(const Tensor& anchors, const Tensor& drafts,
         static_cast<const std::int32_t*>(anchors.data),
         static_cast<const std::int32_t*>(drafts.data), nullptr,
         static_cast<const std::int32_t*>(current_extents.data),
-        static_cast<std::int32_t*>(verify_ids.data), nullptr, k);
+        static_cast<std::int32_t*>(verify_ids.data), nullptr, k, drafts.nb[0] / 4,
+        drafts.nb[1] / 4);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -79,7 +80,8 @@ void prepare_verify_inputs(const Tensor& anchors, const Tensor& drafts,
     if (k < 1) { throw std::invalid_argument("prepare_verify_inputs: K must be >=1"); }
     if (batch < 1) { throw std::invalid_argument("prepare_verify_inputs: B must be >=1"); }
     common::operand::tensor(anchors, DType::I32, {batch}, 1, op, "anchors", execution.device());
-    common::operand::tensor(drafts, DType::I32, {k, batch}, 1, op, "drafts", execution.device());
+    common::operand::strided_tensor(drafts, DType::I32, {k, batch}, 4, op, "drafts",
+                                    execution.device());
     common::operand::tensor(base_positions, DType::I32, {batch}, 1, op, "base_positions",
                             execution.device());
     common::operand::tensor(current_extents, DType::I32, {batch}, 1, op, "current_extents",
@@ -102,7 +104,8 @@ void prepare_verify_ids(const Tensor& anchors, const Tensor& drafts, const Tenso
         throw std::invalid_argument("prepare_verify_ids: K and B must be positive");
     }
     common::operand::tensor(anchors, DType::I32, {batch}, 1, op, "anchors", execution.device());
-    common::operand::tensor(drafts, DType::I32, {k, batch}, 1, op, "drafts", execution.device());
+    common::operand::strided_tensor(drafts, DType::I32, {k, batch}, 4, op, "drafts",
+                                    execution.device());
     common::operand::tensor(current_extents, DType::I32, {batch}, 1, op, "current_extents",
                             execution.device());
     common::operand::tensor(verify_ids, DType::I32, {k + 1, batch}, 1, op, "verify_ids",

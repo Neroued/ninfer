@@ -44,7 +44,7 @@ struct GraphBodies {
     std::function<void(const GraphInvocation&)> draft;
     std::function<void(const GraphInvocation&)> decision;
     std::function<void(const GraphInvocation&)> readback;
-    std::function<void(std::uint32_t batch)> mtp_history;
+    std::function<void(std::uint32_t, DecodeGraphSection*, DecodeGraphSection*)> mtp_commit;
 };
 
 class Graphs {
@@ -56,7 +56,7 @@ public:
     [[nodiscard]] bool poll();
     void cancel();
     void clear();
-    void rebuild_mtp_history(std::uint32_t batch, CudaExecutionView);
+    void commit_mtp(std::uint32_t batch, bool repair, bool counts, CudaExecutionView);
 
     [[nodiscard]] std::size_t workspace_peak() const noexcept { return workspace_peak_; }
 
@@ -83,12 +83,13 @@ private:
         execution::TextGraph main, verify;
         SegmentFamily draft, sample, accept;
 
-        struct History {
+        struct MtpCommit {
             DecodeGraphDefinition definition;
             DecodeGraphExecutable executable;
+            DecodeGraphSection repair, counts;
         };
 
-        History mtp_history;
+        MtpCommit mtp_commit;
     };
 
     GraphSpec spec_;

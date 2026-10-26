@@ -13,7 +13,7 @@ public:
     void prepare(execution::TextRun&, const execution::Parameters&, moe::Schedule*,
                  std::span<const std::uint32_t> bounds, std::array<ple::DeviceEmbedding, 2>,
                  execution::TextOutputs, Tensor logits, std::int32_t columns, MemoryArena&,
-                 DeviceContext&);
+                 DeviceContext&, const std::function<void()>& install_inputs);
     void select(std::uint32_t visible_tokens);
     void set_head(bool enabled);
     [[nodiscard]] bool resident() const;
@@ -50,10 +50,12 @@ private:
 
     void prepare_resident(execution::TextRun&, const execution::Parameters&,
                           std::array<ple::DeviceEmbedding, 2>, execution::TextOutputs,
-                          Tensor logits, MemoryArena&, CudaExecutionView);
+                          Tensor logits, MemoryArena&, CudaExecutionView,
+                          const std::function<void()>& install_inputs);
     void prepare_offloaded(execution::TextRun&, const execution::Parameters&, moe::Schedule&,
                            std::array<ple::DeviceEmbedding, 2>, execution::TextOutputs,
-                           Tensor logits, std::int32_t columns, MemoryArena&, CudaExecutionView);
+                           Tensor logits, std::int32_t columns, MemoryArena&, CudaExecutionView,
+                           const std::function<void()>& install_inputs);
     void capture_finish(execution::TextRun&, const execution::Parameters&, execution::TextOutputs,
                         Tensor logits, MemoryArena&, CudaExecutionView);
     DecodeGraphSection head_;

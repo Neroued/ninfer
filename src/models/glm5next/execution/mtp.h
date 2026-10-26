@@ -35,6 +35,7 @@ private:
     workspace::AttentionBuffers attention_;
 };
 
+// History consumes owner-local rows and conditioning; it performs no row redistribution.
 void mtp_history(const Parameters&, MtpExecution, const BatchView&, const Tensor& conditioning,
                  CudaExecutionView);
 

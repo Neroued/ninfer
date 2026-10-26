@@ -98,18 +98,7 @@ void mtp_history(const Parameters& p, MtpExecution e, const BatchView& batch,
     auto scope      = e.workspace.scope();
     auto residual   = e.workspace.alloc(DType::BF16, {h, t * rows});
     auto normalized = e.workspace.alloc(DType::BF16, {h, t * rows});
-    auto hidden     = conditioning;
-    if (!batch.sequence_owner && p.profile->local.size > 1) {
-        hidden = e.workspace.alloc(DType::BF16, {h, t, rows});
-        ops::gather_batch_rows(conditioning.view({h, t, batch.rows}), local.to_global, hidden,
-                               cuda);
-        hidden = hidden.view({h, t * rows});
-    }
-    auto local_batch      = batch;
-    local_batch.rows      = rows;
-    local_batch.ids       = local.ids;
-    local_batch.positions = local.positions;
-    prepare_stem(p, local_batch, hidden, residual, normalized, e.workspace, cuda);
+    prepare_stem(p, batch, conditioning, residual, normalized, e.workspace, cuda);
     mla_history(normalized.view({h, t, rows}), p.mtp->attention,
                 {local.positions, local.valid_columns, local.table_rows}, e.before, e.after,
                 e.cache.layer(0), e.workspace, cuda);

@@ -100,6 +100,8 @@ void TextRun::finish_mixer(std::uint32_t i) {
     const auto& config = parameters_.profile->config.text;
     const auto& p      = parameters_.text.layers[i];
     auto& arena        = execution_.workspace;
+    if (i == 0 && execution_.first_collective_ready)
+        execution_.first_collective_ready->wait(cuda_.stream());
     if (execution_.parallel) execution_.parallel->sum(roots_.output, cuda_);
     ops::hc_combine_norm(roots_.residual, roots_.output, roots_.injection, p.moe_hc.norm,
                          config.norm_epsilon, roots_.residual, roots_.normalized, cuda_);

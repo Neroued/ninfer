@@ -10,14 +10,15 @@ void TextGraph::prepare(execution::TextRun& run, const execution::Parameters& pa
                         moe::Schedule* experts, std::span<const std::uint32_t> bounds,
                         std::array<ple::DeviceEmbedding, 2> ple, execution::TextOutputs output,
                         Tensor logits, std::int32_t columns, MemoryArena& workspace,
-                        DeviceContext& device) {
+                        DeviceContext& device, const std::function<void()>& install_inputs) {
     bounds_.assign(bounds.begin(), bounds.end());
     workspace_bytes_.resize(bounds.size());
     const auto cuda = device.execution_view();
     if (experts)
-        prepare_offloaded(run, parameters, *experts, ple, output, logits, columns, workspace, cuda);
+        prepare_offloaded(run, parameters, *experts, ple, output, logits, columns, workspace, cuda,
+                          install_inputs);
     else
-        prepare_resident(run, parameters, ple, output, logits, workspace, cuda);
+        prepare_resident(run, parameters, ple, output, logits, workspace, cuda, install_inputs);
     // Qualify every child/layer update before accepting requests.
     for (const auto bound : bounds_) {
         select(bound);
@@ -35,7 +36,8 @@ void TextGraph::prepare(execution::TextRun& run, const execution::Parameters& pa
 void TextGraph::prepare_resident(execution::TextRun& run, const execution::Parameters& p,
                                  std::array<ple::DeviceEmbedding, 2> inputs,
                                  execution::TextOutputs output, Tensor logits,
-                                 MemoryArena& workspace, CudaExecutionView cuda) {
+                                 MemoryArena& workspace, CudaExecutionView cuda,
+                                 const std::function<void()>& install_inputs) {
     auto& graph = implementation_.emplace<Resident>();
     for (const auto bound : bounds_) {
         run.set_visible_tokens(bound);
@@ -57,6 +59,7 @@ void TextGraph::prepare_resident(execution::TextRun& run, const execution::Param
     }
     run.set_visible_tokens(bounds_.front());
     graph.main.prepare(cuda, [&] {
+        install_inputs();
         run.stem();
         std::size_t mixer = 0;
         for (std::uint32_t i = 0; i < p.text.layers.size(); ++i) {
@@ -80,12 +83,16 @@ void TextGraph::prepare_offloaded(execution::TextRun& run, const execution::Para
                                   std::array<ple::DeviceEmbedding, 2> inputs,
                                   execution::TextOutputs output, Tensor logits,
                                   std::int32_t columns, MemoryArena& workspace,
-                                  CudaExecutionView cuda) {
+                                  CudaExecutionView cuda,
+                                  const std::function<void()>& install_inputs) {
     auto& graph        = implementation_.emplace<Offloaded>();
     graph.ple_layer    = p.profile->config.text.ple.layer;
     graph.block_output = run.block_output();
     workspace.reset_peak();
-    graph.stem.prepare(cuda, [&] { run.stem(); });
+    graph.stem.prepare(cuda, [&] {
+        install_inputs();
+        run.stem();
+    });
     for (std::size_t slot = 0; slot < inputs.size(); ++slot) {
         graph.ple[slot].prepare(cuda, [&] {
             inputs[slot].ready.wait_external(cuda.stream());

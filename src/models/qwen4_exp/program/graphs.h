@@ -15,6 +15,7 @@ public:
     ~GraphInputs();
     void prepare();
     void batch(execution::BatchView, std::uint32_t visible);
+    void stage();
 
 private:
     RankProgramImpl& owner_;
@@ -74,7 +75,7 @@ public:
     explicit MtpCommitGraphs(RankProgramImpl& owner) : owner_(owner) {}
 
     void prepare(GraphInputs&);
-    void replay(std::uint32_t batch, bool rebuild_history);
+    void replay(std::uint32_t batch, bool rebuild_history, bool count_tokens);
 
     [[nodiscard]] std::size_t workspace_peak() const { return workspace_peak_; }
 
@@ -83,7 +84,7 @@ public:
 private:
     struct Batch {
         GraphSegment graph;
-        DecodeGraphSection repair;
+        DecodeGraphSection repair, counts;
         std::size_t workspace_bytes = 0;
     };
 

@@ -88,11 +88,15 @@ public:
     void accept_mtp(std::int32_t rows);
     [[nodiscard]] DistributedVocabulary vocabulary();
     void commit_mtp(const Commit&);
-    void execute_mtp_commit(const execution::BatchView&, bool repair_history,
-                            DecodeGraphSection* = nullptr);
+    void execute_mtp_commit(const execution::BatchView&, bool repair_history, bool count_tokens,
+                            DecodeGraphSection*                 = nullptr,
+                            DecodeGraphSection* captured_counts = nullptr);
     void stage_conditioning(std::int32_t rows);
-    void seed_mtp_tail(const execution::BatchView&, bool canonical_destination);
-    void localize(const execution::BatchView&);
+    void gather_decode_state(const execution::BatchView&);
+    execution::BatchView decode_batch(int tokens, int rows, int local_rows, std::uint32_t visible);
+    void fill_local_metadata(const BatchLayout&, int tokens, int rows);
+    [[nodiscard]] Tensor draft_proposals(int batch);
+    [[nodiscard]] Tensor draft_output_ids(int step, int batch);
     void align_history(const execution::BatchView&, Tensor hidden, std::int32_t width);
     void prepare_history_metadata(std::span<const WorkRow>,
                                   std::span<const std::uint32_t> skip_first = {});
@@ -107,8 +111,8 @@ public:
     void sample(std::int32_t rows, SampleKind);
     void score();
     void result();
-    void upload(std::span<const WorkRow>, const BatchPlan&, std::uint32_t tokens,
-                std::span<const std::uint32_t> valid_columns = {});
+    void prepare_inputs(std::span<const WorkRow>, const BatchPlan&, std::uint32_t tokens,
+                        std::span<const std::uint32_t> valid_columns = {});
     void upload_sampling();
     void control_counts();
     [[nodiscard]] MemorySpan host_region(const LayoutRegion&);

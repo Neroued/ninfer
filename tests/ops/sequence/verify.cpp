@@ -35,12 +35,17 @@ int prepare_verify_case(int k, int batch) {
     }
     DeviceBuffer d_anchors = to_device(anchors);
     DeviceBuffer d_lengths = to_device(lengths);
-    DeviceBuffer d_drafts  = to_device(drafts);
+    auto stored            = drafts;
+    if (batch > 1)
+        for (int row = 0; row < batch; ++row)
+            for (int col = 0; col < k; ++col) stored[col * batch + row] = drafts[row * k + col];
+    DeviceBuffer d_drafts  = to_device(stored);
     DeviceBuffer d_extents = to_device(extents);
     GuardedDeviceBuffer d_full(width * batch * sizeof(std::int32_t));
     GuardedDeviceBuffer d_ids(d_full.bytes()), d_positions(d_full.bytes());
     Tensor a(d_anchors.span(), DType::I32, {batch}), l(d_lengths.span(), DType::I32, {batch});
     Tensor d(d_drafts.span(), DType::I32, {k, batch}), e(d_extents.span(), DType::I32, {batch});
+    if (batch > 1) d = Tensor(d_drafts.span(), DType::I32, {batch, k}).permute({1, 0, 2, 3});
     Tensor full(d_full.span(), DType::I32, {width, batch}),
         ids(d_ids.span(), DType::I32, {width, batch});
     Tensor positions(d_positions.span(), DType::I32, {width, batch});
@@ -90,8 +95,8 @@ int prepare_verify_case(int k, int batch) {
         verify_exact("anchors unchanged", from_device<std::int32_t>(d_anchors, batch), anchors);
     failures +=
         verify_exact("lengths unchanged", from_device<std::int32_t>(d_lengths, batch), lengths);
-    failures += verify_exact("drafts unchanged", from_device<std::int32_t>(d_drafts, drafts.size()),
-                             drafts);
+    failures += verify_exact("drafts unchanged", from_device<std::int32_t>(d_drafts, stored.size()),
+                             stored);
     failures += d_full.verify_guards("verify full ids");
     failures += d_ids.verify_guards("verify ids");
     failures += d_positions.verify_guards("verify positions");

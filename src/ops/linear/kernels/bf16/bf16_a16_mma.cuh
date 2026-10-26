@@ -7,10 +7,10 @@
 
 namespace ninfer::ops::detail {
 template <class Schedule, bool FullTokens, class Output, class Epilogue, int Splits = 1>
-__global__
-__launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_a16_mma_kernel(
-    const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ weight, Output output,
-    Epilogue epilogue, int rows, int input_rows, int token_offset, int count) {
+__device__ __forceinline__ void bf16_a16_mma_body(const __nv_bfloat16* __restrict__ x,
+                                                  const __nv_bfloat16* __restrict__ weight,
+                                                  Output output, Epilogue epilogue, int rows,
+                                                  int input_rows, int token_offset, int count) {
     const int M           = rows;
     const int K           = Schedule::kStaticK ? Schedule::kStaticK : input_rows;
     const int tokens      = token_offset + count;
@@ -121,5 +121,14 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_a16_m
 
     bf16_finish_mma_tile<Schedule, FullTokens>(output, epilogue, shared_raw, accum, m0, n0, M,
                                                tokens, warp, lane);
+}
+
+template <class Schedule, bool FullTokens, class Output, class Epilogue, int Splits = 1>
+__global__
+__launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_a16_mma_kernel(
+    const __nv_bfloat16* x, const __nv_bfloat16* weight, Output output, Epilogue epilogue, int rows,
+    int input_rows, int token_offset, int count) {
+    bf16_a16_mma_body<Schedule, FullTokens, Output, Epilogue, Splits>(
+        x, weight, output, epilogue, rows, input_rows, token_offset, count);
 }
 } // namespace ninfer::ops::detail

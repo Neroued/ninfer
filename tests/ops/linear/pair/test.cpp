@@ -165,13 +165,14 @@ struct OutputRead {
 };
 
 OutputRead read_output(const void* device, std::int32_t t, std::span<const std::int32_t> rows,
-                       std::span<const std::int32_t> columns, std::string_view label) {
-    const std::size_t total_words = checked_elements(kOutputRows, t, "output");
+                       std::span<const std::int32_t> columns, std::string_view label,
+                       int output_rows = kOutputRows) {
+    const std::size_t total_words = checked_elements(output_rows, t, "output");
     std::vector<std::size_t> wanted;
     wanted.reserve(rows.size() * columns.size());
     for (const std::int32_t column : columns) {
         for (const std::int32_t row : rows) {
-            wanted.push_back(static_cast<std::size_t>(column) * kOutputRows + row);
+            wanted.push_back(static_cast<std::size_t>(column) * output_rows + row);
         }
     }
 
@@ -215,7 +216,7 @@ int compare_output(std::string_view label, std::span<const double> actual,
 }
 
 int run_q8_a16_shape(std::string_view label, const ShapeCase& shape,
-                     std::span<const Invocation> calls) {
+                     std::span<const Invocation> calls, bool distinct_inputs = false) {
     int maximum_t = 0;
     for (const auto& call : calls) maximum_t = std::max(maximum_t, call.tokens);
 
@@ -234,6 +235,8 @@ int run_q8_a16_shape(std::string_view label, const ShapeCase& shape,
     const std::vector<std::uint16_t> activation =
         make_activation(shape.k, maximum_t, shape.seed + 2U);
 
+    const auto second_activation  = make_activation(shape.k, maximum_t, shape.seed + 19U);
+    auto second_device_activation = distinct_inputs ? to_device(second_activation) : DeviceBuffer{};
     test::GuardedDeviceBuffer device_activation(activation.size() * sizeof(std::uint16_t));
     device_activation.copy_from_host(activation.data(), device_activation.bytes());
     test::GuardedDeviceBuffer first_device_weight(fixture.first_storage.payload.size());
@@ -286,7 +289,10 @@ int run_q8_a16_shape(std::string_view label, const ShapeCase& shape,
         DecodeGraphDefinition definition;
         DecodeGraphExecutable graph;
         const auto launch = [&] {
-            ops::linear_pair(input, first_weight, second_weight, first, second,
+            const auto second_input =
+                distinct_inputs ? Tensor(second_device_activation.span(), DType::BF16, {shape.k, t})
+                                : input;
+            ops::linear_pair(input, second_input, first_weight, second_weight, first, second,
                              context.execution_view());
         };
         cuda_synchronize();
@@ -326,7 +332,7 @@ int run_q8_a16_shape(std::string_view label, const ShapeCase& shape,
                 represented_input, columns);
             const std::vector<double> second_reference = linear_pair_oracle(
                 second_oracle, shape.k, static_cast<std::int32_t>(oracle_rows.size()),
-                represented_input, columns);
+                distinct_inputs ? second_activation : represented_input, columns);
             failures +=
                 compare_output(case_label + " first", first_actual.selected, first_reference);
             failures +=
@@ -354,6 +360,65 @@ int run_q8_a16_shape(std::string_view label, const ShapeCase& shape,
         failures += verify_preserved(second_device_weight.data(),
                                      std::as_bytes(std::span(fixture.second_storage.payload)),
                                      "linear_pair second weight");
+    }
+    return failures;
+}
+
+int bf16_pair(int n, int t) {
+    constexpr int k = 128;
+    auto& context   = cuda_environment().context;
+    std::array<std::vector<std::uint16_t>, 2> activation, weights;
+    std::array<std::vector<float>, 2> represented_weights;
+    std::array<DeviceBuffer, 2> dx, dw, dy;
+    std::array<Tensor, 2> x, y;
+    std::array<Weight, 2> w;
+    for (int i = 0; i < 2; ++i) {
+        activation[i]  = make_activation(k, t, 719 + i * 97);
+        weights[i]     = make_activation(k, n, 173 + i * 281);
+        dx[i]          = to_device(activation[i]);
+        dw[i]          = to_device(weights[i]);
+        dy[i]          = DeviceBuffer(context.device(), std::size_t(n) * t * 2);
+        x[i]           = Tensor(dx[i].span(), DType::BF16, {k, t});
+        y[i]           = Tensor(dy[i].span(), DType::BF16, {n, t});
+        auto& weight   = w[i];
+        weight.device  = context.device();
+        weight.payload = weight.qdata = dw[i].data();
+        weight.payload_bytes          = dw[i].size();
+        weight.qtype                  = QType::BF16;
+        weight.layout                 = QuantLayout::Contiguous;
+        weight.n = weight.shape[0] = weight.padded_shape[0] = n;
+        weight.k = weight.shape[1] = weight.padded_shape[1] = k;
+        weight.ndim                                         = 2;
+        for (auto bits : weights[i]) represented_weights[i].push_back(bf16_to_f32(bits));
+    }
+    DecodeGraphDefinition definition;
+    definition.capture(context.stream(), [&] {
+        ops::linear_pair(x[0], x[1], w[0], w[1], y[0], y[1], context.execution_view());
+    });
+    DecodeGraphExecutable graph;
+    graph.instantiate(definition);
+    int failures       = 0;
+    const auto columns = sampled_indices(t);
+    for (int phase = 0; phase < 2; ++phase) {
+        if (phase) {
+            for (auto& bits : activation[1]) bits ^= 0x8000;
+            dx[1].copy_from_host(activation[1].data(), dx[1].size());
+        }
+        cuda_synchronize();
+        graph.launch(context.stream());
+        context.synchronize();
+        for (int i = 0; i < 2; ++i) {
+            const auto actual =
+                read_output(dy[i].data(), t, sampled_indices(n), columns, "BF16 pair", n);
+            std::vector<float> selected;
+            for (auto row : sampled_indices(n))
+                selected.insert(selected.end(), represented_weights[i].begin() + row * k,
+                                represented_weights[i].begin() + (row + 1) * k);
+            const auto expected =
+                linear_pair_oracle(selected, k, sampled_indices(n).size(), activation[i], columns);
+            failures += actual.failures +
+                        compare_output("BF16 independent pair", actual.selected, expected);
+        }
     }
     return failures;
 }
@@ -403,6 +468,25 @@ void add_shape(linear_suite::Suite& suite, const ShapeCase& shape) {
 
 int main(int argc, char** argv) {
     linear_suite::Suite suite;
+    for (int n : {4096, 8192})
+        for (int t : {1, 4, 8, 33, 64, 4096})
+            suite.add(linear_suite::make_case("bf16", n, 128, t, ops::LinearPolicy::A16Only,
+                                              linear_suite::Execution::Graph, "independent-inputs"),
+                      [=] { return bf16_pair(n, t); });
+    for (int k : {2048, 5120})
+        suite.add(linear_suite::make_case("q8", 1024, k, 4, ops::LinearPolicy::A16Only,
+                                          linear_suite::Execution::Graph, "independent-inputs"),
+                  [=] {
+                      const ShapeCase shape{.k           = k,
+                                            .seed        = 431U,
+                                            .parents     = k == 2048 ? WeightParents::Shared
+                                                                     : WeightParents::Separate,
+                                            .parent_rows = k == 2048 ? 6144 : 1024,
+                                            .first_row   = k == 2048 ? 4096 : 0,
+                                            .second_row  = k == 2048 ? 5120 : 0};
+                      const std::array calls{Invocation{4, true, "Q8 independent pair"}};
+                      return run_q8_a16_shape("Q8 independent pair", shape, calls, true);
+                  });
     constexpr std::array<std::int32_t, 2> kK5120RouteStarts{86, 961};
     constexpr std::array<std::int32_t, 3> kK5120RouteInteriors{24, 512, 1024};
     add_shape(suite, ShapeCase{.k               = 5120,

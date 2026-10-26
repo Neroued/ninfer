@@ -5,16 +5,17 @@
 #include "ninfer/ops/indexing.h"
 
 #include <algorithm>
-#include <cstring>
 #include <stdexcept>
 
 namespace ninfer::models::qwen3_5::detail {
 namespace {
 
 void bind_row(FrameIngress& input, std::size_t index, const ExecutionRow& row) {
-    input.frontiers[index]         = static_cast<std::int32_t>(row.main_frontier);
-    input.backend_frontiers[index] = static_cast<std::int32_t>(row.backend_frontier);
-    input.main_table_rows[index]   = static_cast<std::int32_t>(row.main_table.index);
+    input.frontiers[index]          = static_cast<std::int32_t>(row.main_frontier);
+    input.sampling_positions[index] = static_cast<std::int32_t>(row.main_frontier);
+    input.history_skip[index]       = row.main_frontier == 0;
+    input.backend_frontiers[index]  = static_cast<std::int32_t>(row.backend_frontier);
+    input.main_table_rows[index]    = static_cast<std::int32_t>(row.main_table.index);
     input.backend_table_rows[index] =
         row.backend_table ? static_cast<std::int32_t>(row.backend_table->index) : 0;
     input.state_source_offsets[index]      = row.state_offsets.source;
@@ -110,6 +111,9 @@ void RankProgramImpl::initialize_forward(ComputeOperation& operation, const Forw
     frame.host_ingress->valid_columns[0] = static_cast<std::int32_t>(operation.width);
     if (work.sample != SamplePurpose::None)
         frame.host_ingress->sampling[0] = sampling_config(row, work.sampling[index], index);
+    frame.host_ingress->sampling_positions[0] += operation.width;
+    for (int axis = 0; axis < 3; ++axis)
+        frame.host_ingress->previous_rope[axis] = row.tail_rope_position[axis];
     upload_ingress();
     operation.input_embeddings.reset();
     if (!operation.width) return;
@@ -187,17 +191,14 @@ void RankProgramImpl::initialize_decode(ComputeOperation& operation, const Decod
     }
     operation.speculative = operation.drafts != 0;
     operation.width       = operation.speculative ? draft_window + 1 : 1;
-    if (!graphs || resources.dflash) upload_ingress();
-    auto host =
-        frame.host_input_view(static_cast<int>(operation.width), static_cast<int>(operation.batch));
-    auto* ids          = static_cast<TokenId*>(host.ids.data);
-    auto* positions    = static_cast<std::int32_t*>(host.cache_positions.data);
-    auto* rope         = static_cast<std::int32_t*>(host.rope_positions.data);
-    const auto columns = operation.width * operation.batch;
+    auto host             = frame.host_decode_view(static_cast<int>(operation.width),
+                                                   static_cast<int>(operation.batch));
+    auto* positions       = static_cast<std::int32_t*>(host.cache_positions.data);
+    auto* rope            = static_cast<std::int32_t*>(host.rope_positions.data);
+    const auto columns    = operation.width * operation.batch;
     for (std::size_t row = 0; row < work.rows.size(); ++row) {
         for (std::uint32_t column = 0; column < operation.width; ++column) {
             const auto offset = row * operation.width + column;
-            ids[offset]       = work.rows[row].anchor;
             positions[offset] = static_cast<int>(work.rows[row].binding.main_frontier +
                                                  std::min(column, work.rows[row].draft_extent));
             for (int axis = 0; axis < 3; ++axis)
@@ -205,7 +206,14 @@ void RankProgramImpl::initialize_decode(ComputeOperation& operation, const Decod
                     positions[offset] + work.rows[row].binding.rope_delta;
         }
     }
-    if (!graphs) upload_input(operation.width, operation.batch);
+    for (std::size_t row = 0; row < work.rows.size(); ++row) {
+        frame.host_ingress->history_skip[row] = operation.speculative ? 1 : 0;
+        for (int axis = 0; axis < 3; ++axis)
+            frame.host_ingress->previous_rope[axis * operation.batch + row] =
+                work.rows[row].binding.tail_rope_position[axis];
+    }
+    if (operation.speculative && backend == SpeculativeBackend::Mtp) prepare_mtp_draft(operation);
+    if (!graphs || resources.dflash) upload_ingress();
 }
 
 void RankProgramImpl::initialize_score(ComputeOperation& operation, const ScoreWork& work) {

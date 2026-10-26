@@ -22,7 +22,8 @@ execution::TextRun DeviceGraphs::main_run(std::uint32_t batch, bool verify, std:
                                        r.tensor(io.main_qsa.keys),
                                        r.tensor(io.main_qsa.coordinates),
                                        r.tensor(io.ple_records),
-                                       p.parallel ? &*p.parallel : nullptr};
+                                       p.parallel ? &*p.parallel : nullptr,
+                                       p.parallel ? &p.ple_ready : nullptr};
     execution::StateUpdate update = execution::StepUpdate{};
     if (verify) update.emplace<execution::VerifyRecords>(*r.gdn_records);
     return execution::TextRun(p.parameters, execution, r.main_batch(tokens, batch, visible), update,
@@ -37,18 +38,18 @@ void DeviceGraphs::body(Batch& profiles, Round* round, std::uint32_t batch, bool
     const auto depth = verify ? p.shape.draft_tokens : 0;
     const int b = batch, t = verify ? p.shape.draft_tokens + 1 : 1;
     const auto visible = round ? bounds_.front() : bounds_.back();
+    p.install_decode(batch);
     if (depth) {
         for (std::uint32_t step = 0; step < depth; ++step) {
             DecodeGraphChild child;
             p.draft_forward(step, batch, visible, round ? &profiles.drafts[step].front() : nullptr,
                             round ? &child : nullptr);
             if (round) round->draft.push_back(child);
-            p.save_draft(step, batch);
         }
         const auto& mtp = *io.mtp;
-        auto anchors    = r.tensor(mtp.anchors).slice(0, 0, batch);
+        auto anchors    = r.tensor(io.anchors).slice(0, 0, batch);
         auto extents    = r.tensor(mtp.extents).slice(0, 0, batch);
-        auto drafts     = r.packed(mtp.drafts, {t - 1, b});
+        auto drafts     = p.draft_proposals(b);
         auto ids        = r.main_batch(t, b, visible).ids;
         ops::prepare_verify_ids(anchors, drafts, extents, ids, p.cuda);
         p.copy_verify_inputs(batch, round ? &round->readback : nullptr);
@@ -139,7 +140,7 @@ void DeviceGraphs::prepare(GraphInputs& inputs) {
             if (verify) {
                 write(r.tensor(io.mtp->extents).slice(0, 0, b),
                       std::min(drafts, p.shape.max_context - 1));
-                write(r.tensor(io.mtp->anchors).slice(0, 0, b),
+                write(r.tensor(io.anchors).slice(0, 0, b),
                       p.parameters.profile->config.text.ple.eos);
             }
             const auto decision = [&] {
@@ -149,6 +150,7 @@ void DeviceGraphs::prepare(GraphInputs& inputs) {
                     p.sample_forward(b, false);
                 p.copy_sample_result(b, verify);
             };
+            inputs.stage();
             body(batch, nullptr, b, verify);
             decision();
             p.device.synchronize();

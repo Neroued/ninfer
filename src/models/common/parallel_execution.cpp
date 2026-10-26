@@ -3,18 +3,8 @@
 
 namespace ninfer::models {
 
-ParallelExecution::ParallelExecution(ParallelBinding binding, const DeviceContext& device)
-    : binding_(binding), stream_(device), cuda_(device.execution_view(stream_.stream())),
-      input_(device), output_(device) {
+ParallelExecution::ParallelExecution(ParallelBinding binding) : binding_(binding) {
     if (!binding.group) throw std::invalid_argument("parallel execution has no group");
-}
-
-bool ParallelExecution::output_owner() const {
-#if NINFER_ENABLE_DISTRIBUTED
-    return binding_.group->rank() == binding_.output_rank;
-#else
-    return true;
-#endif
 }
 
 std::uint32_t ParallelExecution::size() const {
@@ -30,12 +20,8 @@ void ParallelExecution::enqueue(distributed::Collective operation, distributed::
                                 std::size_t count, std::uint32_t owner,
                                 CudaExecutionView execution) {
 #if NINFER_ENABLE_DISTRIBUTED
-    input_.record(execution.stream());
-    input_.wait(cuda_.stream());
     binding_.group->enqueue(operation, source.data, destination.data, count, type, reduction, owner,
-                            cuda_);
-    output_.record(cuda_.stream());
-    output_.wait(execution.stream());
+                            execution);
 #else
     throw std::logic_error("distributed execution was not built");
 #endif
@@ -73,11 +59,7 @@ void ParallelExecution::broadcast(Tensor& value, std::uint32_t owner, CudaExecut
 void ParallelExecution::exchange(std::span<const distributed::PeerTransfer> transfers,
                                  CudaExecutionView execution) {
 #if NINFER_ENABLE_DISTRIBUTED
-    input_.record(execution.stream());
-    input_.wait(cuda_.stream());
-    binding_.group->exchange(transfers, cuda_);
-    output_.record(cuda_.stream());
-    output_.wait(execution.stream());
+    binding_.group->exchange(transfers, execution);
 #else
     throw std::logic_error("distributed execution was not built");
 #endif
@@ -96,7 +78,5 @@ void ParallelExecution::replayed(const CommunicationWork& work) const {
     binding_.group->replayed(work);
 #endif
 }
-
-void ParallelExecution::synchronize() const { CUDA_CHECK(cudaStreamSynchronize(cuda_.stream())); }
 
 } // namespace ninfer::models

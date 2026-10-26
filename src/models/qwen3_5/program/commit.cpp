@@ -1,5 +1,6 @@
 #include "models/qwen3_5/program/internal.h"
 #include "ninfer/ops/sampling.h"
+#include "ninfer/ops/indexing.h"
 
 #include <algorithm>
 #include <array>
@@ -7,10 +8,32 @@
 namespace ninfer::models::qwen3_5::detail {
 
 void RankProgramImpl::launch_commit(ComputeOperation& operation) {
-    auto& frame       = resources.frame;
-    const auto& value = *operation.commit;
-    const bool decode = std::holds_alternative<DecodeWork>(operation.request.work.operation);
-    bool device_work  = false;
+    auto& frame          = resources.frame;
+    const auto& value    = *operation.commit;
+    const bool decode    = std::holds_alternative<DecodeWork>(operation.request.work.operation);
+    const auto* forward  = std::get_if<ForwardWork>(&operation.request.work.operation);
+    const bool generated = decode || (forward && forward->sample != SamplePurpose::None);
+    const bool mtp       = decode && operation.speculative && backend == SpeculativeBackend::Mtp;
+    bool count_tokens    = false;
+    *frame.host_commit   = {};
+    for (std::uint32_t i = 0; generated && i < operation.batch; ++i) {
+        const auto& row     = operation.rows[i];
+        const auto accepted = value.rows[i].discarded ? 0 : value.rows[i].accepted_tokens;
+        frame.host_commit->state_destination_offsets[i] = row.state_offsets.destination;
+        frame.host_commit->last_columns[i]              = static_cast<int>(accepted) - 1;
+        frame.host_commit->accepted_columns[i]          = accepted;
+        frame.host_commit->draft_append_starts[i]       = static_cast<int>(row.main_frontier);
+        frame.host_commit->draft_append_ends[i] =
+            static_cast<int>(row.main_frontier) + (value.rows[i].terminal ? accepted : 0);
+        if (generated && frame.host_ingress->sampling[i].token_counts) {
+            frame.host_commit->count_columns[i] = accepted;
+            count_tokens |= accepted != 0;
+        }
+    }
+    bool device_work = decode || count_tokens;
+    if (device_work)
+        CUDA_CHECK(cudaMemcpyAsync(frame.commit.data, frame.host_commit, sizeof(FrameCommit),
+                                   cudaMemcpyHostToDevice, device.stream()));
     if (decode) {
         const bool mtp_history =
             backend == SpeculativeBackend::Mtp && operation.speculative &&
@@ -21,76 +44,34 @@ void RankProgramImpl::launch_commit(ComputeOperation& operation) {
             std::any_of(value.rows.begin(), value.rows.end(), [](const auto& row) {
                 return row.terminal && !row.discarded && row.accepted_tokens;
             });
-        if (mtp_history || draft_history) {
-            *frame.host_commit = {};
-            for (std::uint32_t i = 0; i < operation.batch; ++i) {
-                const auto& row    = operation.rows[i];
-                const int accepted = static_cast<int>(value.rows[i].accepted_tokens);
-                frame.host_commit->history_columns[i]           = std::max(accepted - 1, 0);
-                frame.host_commit->state_destination_offsets[i] = row.state_offsets.destination;
-                frame.host_commit->draft_append_starts[i] = static_cast<int>(row.main_frontier);
-                frame.host_commit->draft_append_ends[i] =
-                    static_cast<int>(row.main_frontier) +
-                    (value.rows[i].terminal && !value.rows[i].discarded ? accepted : 0);
-            }
-            CUDA_CHECK(cudaMemcpyAsync(frame.commit.data, frame.host_commit, sizeof(FrameCommit),
-                                       cudaMemcpyHostToDevice, device.stream()));
-            device_work = true;
-        }
-        if (operation.speculative) {
-            std::array<ops::GdnReplayFoldRow, kMaximumConcurrency> fold{};
-            for (std::uint32_t i = 0; i < operation.batch; ++i) {
-                const auto& row = operation.rows[i];
-                fold[i]         = {row.state_offsets.source, row.state_offsets.destination,
-                                   static_cast<int>(value.rows[i].accepted_tokens)};
-            }
-            resources.replay_fold->execute(std::span(fold).first(operation.batch),
-                                           device.execution_view());
-            device_work = true;
-            if (mtp_history) {
-                std::uint32_t columns = 0;
-                for (const auto& row : value.rows)
-                    if (!row.discarded && row.accepted_tokens)
-                        columns = std::max(columns, row.accepted_tokens - 1);
-                if (columns) {
-                    if (graphs)
-                        graphs->rebuild_mtp_history(operation.batch, device.execution_view());
-                    else
-                        rebuild_mtp_history(operation.batch);
-                }
-            }
-        }
-        const auto hidden =
-            frame.input_view(static_cast<int>(operation.width), static_cast<int>(operation.batch))
-                .hidden;
-        for (std::uint32_t i = 0; i < operation.batch; ++i) {
-            const auto accepted = value.rows[i].accepted_tokens;
-            if (!accepted) continue;
-            if (backend == SpeculativeBackend::Mtp ||
-                accepted < static_cast<std::uint32_t>(frame.host_egress->counts[i])) {
-                Tensor source = hidden.slice(2, static_cast<int>(i), 1)
-                                    .slice(1, static_cast<int>(accepted - 1), 1);
-                Tensor destination = resources.state_images.continuation_hidden(
-                    operation.rows[i].state_offsets.destination);
-                CUDA_CHECK(cudaMemcpyAsync(destination.data, source.data, destination.bytes(),
-                                           cudaMemcpyDeviceToDevice, device.stream()));
-                device_work = true;
-            }
-            if (backend == SpeculativeBackend::DFlash2 && operation.speculative &&
-                frame.host_ingress->sampling[i].token_counts) {
-                Tensor ids = frame.output_tokens.slice(1, static_cast<int>(i), 1)
-                                 .slice(0, 0, static_cast<int>(accepted))
-                                 .view({static_cast<int>(accepted)});
-                Tensor counts =
-                    resources.token_counts
-                        .slice(1, static_cast<int>(operation.rows[i].member.residency.lane.value),
-                               1)
-                        .view({execution::dimension(parameters.profile->public_tokens)});
-                ops::increment_token_counts(ids, counts, device.execution_view());
-                device_work = true;
-            }
+        if (mtp) {
+            if (graphs)
+                graphs->commit_mtp(operation.batch, mtp_history, count_tokens,
+                                   device.execution_view());
+            else
+                execute_mtp_commit(operation.batch, mtp_history, count_tokens);
+        } else {
+            if (operation.speculative)
+                resources.replay_fold->execute(
+                    frame.state_source_offsets.slice(0, 0, operation.batch),
+                    frame.commit_destination_offsets.slice(0, 0, operation.batch),
+                    frame.accepted_columns.slice(0, 0, operation.batch), device.execution_view());
+            const auto hidden = frame.decode_view(operation.width, operation.batch).hidden;
+            ops::scatter_batch_columns(
+                hidden, frame.last_columns.slice(0, 0, operation.batch),
+                resources.state_images.continuation_hidden(
+                    frame.commit_destination_offsets.slice(0, 0, operation.batch)),
+                device.execution_view());
         }
         if (draft_history) commit_draft_history(operation);
+    }
+    if (count_tokens && !mtp) {
+        const int width = operation.speculative ? static_cast<int>(draft_window + 1) : 1;
+        Tensor tokens({frame.output_tokens.data, frame.output_tokens.bytes(), device.device()},
+                      DType::I32, {width, static_cast<int>(operation.batch)});
+        ops::increment_token_counts_batch(tokens, frame.count_columns.slice(0, 0, operation.batch),
+                                          frame.residency_slots.slice(0, 0, operation.batch),
+                                          resources.token_counts, device.execution_view());
     }
     if (const auto* forward = std::get_if<ForwardWork>(&operation.request.work.operation);
         forward && forward->purpose == ForwardPurpose::Control) {
@@ -125,6 +106,38 @@ void RankProgramImpl::launch_commit(ComputeOperation& operation) {
     gpu_timer.record_retirement();
     compute_retired.record(device.stream());
     operation.stage = ComputeStage::Retiring;
+}
+
+void RankProgramImpl::execute_mtp_commit(std::uint32_t batch, bool repair, bool counts,
+                                         DecodeGraphSection* repair_section,
+                                         DecodeGraphSection* counts_section) {
+    auto& frame     = resources.frame;
+    const auto cuda = device.execution_view();
+    resources.replay_fold->execute(frame.state_source_offsets.slice(0, 0, batch),
+                                   frame.commit_destination_offsets.slice(0, 0, batch),
+                                   frame.accepted_columns.slice(0, 0, batch), cuda);
+    const auto history = [&] { rebuild_mtp_history(batch); };
+    if (repair_section)
+        repair_section->capture(cuda.stream(), history);
+    else if (repair)
+        history();
+    const auto hidden = frame.decode_view(draft_window + 1, batch).hidden;
+    ops::scatter_batch_columns(hidden, frame.last_columns.slice(0, 0, batch),
+                               resources.state_images.continuation_hidden(
+                                   frame.commit_destination_offsets.slice(0, 0, batch)),
+                               cuda);
+    const auto count = [&] {
+        const int width = draft_window + 1;
+        Tensor tokens({frame.output_tokens.data, frame.output_tokens.bytes(), cuda.device()},
+                      DType::I32, {width, static_cast<int>(batch)});
+        ops::increment_token_counts_batch(tokens, frame.count_columns.slice(0, 0, batch),
+                                          frame.residency_slots.slice(0, 0, batch),
+                                          resources.token_counts, cuda);
+    };
+    if (counts_section)
+        counts_section->capture(cuda.stream(), count);
+    else if (counts)
+        count();
 }
 
 void RankProgramImpl::retire_compute() {

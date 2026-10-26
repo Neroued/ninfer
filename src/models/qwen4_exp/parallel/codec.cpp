@@ -34,7 +34,7 @@ runtime::protocol::ControlBudget control_budget(const ModelDefinition& definitio
     const auto commit       = header + 4 + 8 + batch * 51 + commit_actions;
     const auto words    = (std::size_t(definition.resources().text.public_token_count) + 31) / 32;
     const auto decision = header + 12 + batch * (20 + 4 * words * positions);
-    // Generated and verification tokens are bounded by speculative positions. Scoring emits
+    // Generated tokens are bounded by speculative positions. Scoring emits
     // at most one prefill chunk; context observations are coalesced by resource/direction.
     wire::Encoder completion;
     RankExecutionObservation observed;
@@ -42,7 +42,7 @@ runtime::protocol::ControlBudget control_budget(const ModelDefinition& definitio
     runtime::protocol::encode(completion, observed);
     const auto event =
         std::move(completion).take().size() + 96 +
-        std::max<std::size_t>({batch * (64 + 8 * positions), 4ULL * s.prefill_chunk + 64,
+        std::max<std::size_t>({batch * (64 + 4 * positions), 4ULL * s.prefill_chunk + 64,
                                40ULL * 3 * (p.context.pools.size() + 1)});
     wire::Encoder report;
     runtime::protocol::encode(report, rank.observation);

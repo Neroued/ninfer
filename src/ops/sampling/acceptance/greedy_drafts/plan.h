@@ -39,8 +39,7 @@ inline std::size_t capacity(int token_domain, int min_columns, int max_columns) 
 }
 
 void launch(const Tensor& target_tokens, const Tensor& logits, const Tensor& drafts,
-            const Tensor& current_extents, Tensor& lengths, Tensor& anchors,
-            Tensor& licensed_tokens, Tensor& licensed_counts, Tensor& accepted,
-            std::int32_t token_domain, const SamplingConfig* configs, const Plan& plan,
-            MemorySpan workspace, cudaStream_t stream);
+            const Tensor& current_extents, const Tensor& base_positions, Tensor& licensed_tokens,
+            Tensor& licensed_counts, std::int32_t token_domain, const SamplingConfig* configs,
+            const Plan& plan, MemorySpan workspace, cudaStream_t stream);
 } // namespace ninfer::ops::greedy_drafts_detail

@@ -17,7 +17,7 @@ Tensor RankProgramImpl::packed_tensor(const TensorRegion& r,
 
 Tensor RankProgramImpl::host_tensor(const TensorRegion& region) {
     auto r = region;
-    r.region.offset -= resources.plan.persistent.buffers.batch.ids.region.offset;
+    r.region.offset -= resources.plan.persistent.buffers.host_region.offset;
     return r.bind(resources.ingress());
 }
 
@@ -32,10 +32,11 @@ ops::SamplingConfig sampling_config(const ResolvedSamplingParameters& p) {
             .mask              = {}};
 }
 
-void RankProgramImpl::upload_main(std::span<const WorkRow> rows, std::uint32_t tokens) {
-    auto& frame     = *compute;
-    const auto& io  = resources.plan.persistent.buffers.batch;
-    const auto host = [&](const TensorRegion& r) {
+void RankProgramImpl::prepare_main_inputs(std::span<const WorkRow> rows, std::uint32_t tokens) {
+    auto& frame         = *compute;
+    const auto& buffers = resources.plan.persistent.buffers;
+    const auto& io      = frame.sequence ? buffers.batch : buffers.decode;
+    const auto host     = [&](const TensorRegion& r) {
         return static_cast<std::int32_t*>(host_tensor(r).data);
     };
     const auto offsets = [&](const TensorRegion& r) {
@@ -50,18 +51,22 @@ void RankProgramImpl::upload_main(std::span<const WorkRow> rows, std::uint32_t t
         offsets(io.source_offsets)[b] = row.states.at(parameters.profile->local.rank).source;
         offsets(io.destination_offsets)[b] =
             row.states.at(parameters.profile->local.rank).destination;
-        host(io.main_tables)[b]         = row.main_table.index;
-        host(io.base_positions)[b]      = row.main_frontier;
-        host(io.record_offsets)[b]      = 0;
-        host(io.accepted_columns)[b]    = frame.verify ? valid - 1 : valid;
+        host(io.main_tables)[b]        = row.main_table.index;
+        host(io.base_positions)[b]     = row.main_frontier;
+        host(io.record_offsets)[b]     = 0;
+        host(io.sampling_positions)[b] = row.sampling_position;
+        if (!frame.sequence) host(buffers.anchors)[b] = row.ids.front();
+        if (buffers.mtp && frame.verify) {
+            host(buffers.mtp->extents)[b]    = frame.verify->extents[b];
+            host(buffers.mtp->skip_first)[b] = 1;
+        }
         host(io.raw_tail)[2 * b]        = row.ple_raw_tail[0];
         host(io.raw_tail)[2 * b + 1]    = row.ple_raw_tail[1];
         offsets(io.raw_tail_offsets)[b] = b * 2 * sizeof(TokenId);
-        host(io.row_indices)[b]         = b;
         host(io.count_slots)[b]         = row.member.residency.lane.value;
         for (std::uint32_t j = 0; j < tokens; ++j) {
-            const auto offset            = std::min<std::size_t>(j, valid - 1);
-            host(io.ids)[j + tokens * b] = row.ids[std::min<std::size_t>(j, row.ids.size() - 1)];
+            const auto offset = std::min<std::size_t>(j, valid - 1);
+            if (frame.sequence) host(io.ids)[j + tokens * b] = row.ids[j];
             host(io.positions)[j + tokens * b] = row.main_frontier + offset;
             for (int axis = 0; axis < 3; ++axis)
                 host(io.rope_positions)[j + tokens * (axis + 3 * b)] =
@@ -76,12 +81,30 @@ void RankProgramImpl::upload_main(std::span<const WorkRow> rows, std::uint32_t t
         copy_bytes_async({device_tensor(r).data, bytes, cuda.device()},
                          {host(r), bytes, Device::cpu(), true}, cuda);
     };
-    upload(io.ids, tokens * batch * sizeof(TokenId));
-    upload(io.positions, tokens * batch * sizeof(std::int32_t));
-    upload(io.rope_positions, tokens * batch * 3 * sizeof(std::int32_t));
-    upload(io.valid_columns, io.count_slots.region.offset + io.count_slots.region.bytes -
-                                 io.valid_columns.region.offset);
-    frame.batch = resources.main_batch(tokens, batch, frame.visible);
+    if (frame.sequence) {
+        upload(io.ids, tokens * batch * sizeof(TokenId));
+        upload(io.positions, tokens * batch * sizeof(std::int32_t));
+        upload(io.rope_positions, tokens * batch * 3 * sizeof(std::int32_t));
+        upload(io.valid_columns, io.sampling_positions.region.offset +
+                                     io.sampling_positions.region.bytes -
+                                     io.valid_columns.region.offset);
+    }
+    if (buffers.sampling) {
+        auto* configs = static_cast<ops::SamplingConfig*>(host_tensor(*buffers.sampling).data);
+        for (std::size_t b = 0; b < batch; ++b) {
+            configs[b] = sampling_config(rows[b].sampling);
+            if (configs[b].presence_penalty || configs[b].frequency_penalty)
+                configs[b].token_counts =
+                    static_cast<const int*>(device_tensor(*buffers.token_counts)
+                                                .slice(1, rows[b].member.residency.lane.value, 1)
+                                                .data);
+            if (rows[b].constrained)
+                configs[b].mask = {static_cast<const std::uint32_t*>(
+                                       device_tensor(*buffers.grammar_masks).slice(2, b, 1).data),
+                                   static_cast<int>((parameters.profile->public_tokens + 31) / 32)};
+        }
+    }
+    frame.batch = resources.main_batch(tokens, batch, frame.visible, frame.sequence);
 }
 
 void RankProgramImpl::prepare_forward() {
@@ -112,7 +135,8 @@ void RankProgramImpl::prepare_forward() {
         f.ple = host_ple->try_require(f.request.ticket, f.tokens, {inputs.data(), f.rows.size()});
         if (!f.ple) return;
     }
-    upload_main(f.rows, f.tokens);
+    prepare_main_inputs(f.rows, f.tokens);
+    if (!f.sequence && !device_graphs && !graphs) install_decode(f.rows.size());
     if (!host_ple && (!device_graphs || f.sequence)) prepare_device_ple(f.batch);
     prepare_main();
     request_decision();
@@ -134,14 +158,11 @@ void RankProgramImpl::prepare_main() {
         if (parameters.mtp) {
             const auto channels = dimension(parameters.profile->config.text.residual_width());
             auto base           = packed_tensor(layout.mtp->base_conditioning, {channels, batch});
-            for (int b = 0; b < batch; ++b) {
-                auto old = resources.states->conditioning(
-                    f.rows[b].states.at(parameters.profile->local.rank).source);
-                auto saved = base.slice(1, b, 1);
-                copy_bytes_async({saved.data, saved.bytes(), cuda.device()},
-                                 {old.data, old.bytes(), cuda.device()}, cuda);
-            }
             if (f.sequence) {
+                const auto previous = resources.states->conditioning(
+                    f.rows.front().states.at(parameters.profile->local.rank).source);
+                copy_bytes_async({base.data, base.bytes(), cuda.device()},
+                                 {previous.data, previous.bytes(), cuda.device()}, cuda);
                 auto window = device_tensor(*layout.prefill_conditioning);
                 auto first  = window.slice(1, 0, 1);
                 copy_bytes_async({first.data, first.bytes(), cuda.device()},
@@ -178,7 +199,8 @@ void RankProgramImpl::prepare_main() {
                                              device_tensor(layout.main_qsa.keys),
                                              device_tensor(layout.main_qsa.coordinates),
                                              device_tensor(layout.ple_records),
-                                             parallel ? &*parallel : nullptr};
+                                             parallel ? &*parallel : nullptr,
+                                             parallel && !host_ple ? &ple_ready : nullptr};
     execution::StateUpdate update = execution::StepUpdate{};
     if (f.verify)
         update.emplace<execution::VerifyRecords>(*resources.gdn_records);
@@ -310,24 +332,10 @@ void RankProgramImpl::install_sampling(bool speculative) {
     const auto batch    = f.rows.size();
     const auto words    = (parameters.profile->public_tokens + 31) / 32;
     const auto width    = speculative ? f.verify->width : 1;
-    auto* configs       = static_cast<ops::SamplingConfig*>(resources.sampling_ingress().data);
-    auto* masks         = reinterpret_cast<std::uint32_t*>(configs + shape.max_concurrency);
-    auto* positions     = static_cast<std::int32_t*>(resources.compute_aux().data);
+    auto* masks         = static_cast<std::uint32_t*>(resources.sampling_ingress().data);
     f.dead_positions.assign(batch, 0);
     runtime::DecisionConsumed consumed{f.request.ticket, f.decision->stage, {}};
     for (std::size_t b = 0; b < batch; ++b) {
-        configs[b] = sampling_config(f.rows[b].sampling);
-        auto counts =
-            device_tensor(*buffers.token_counts).slice(1, f.rows[b].member.residency.lane.value, 1);
-        if (speculative && !parallel) {
-            if (configs[b].presence_penalty || configs[b].frequency_penalty) {
-                auto provisional = device_tensor(buffers.mtp->token_counts).slice(1, b, 1);
-                copy_bytes_async({provisional.data, provisional.bytes(), cuda.device()},
-                                 {counts.data, counts.bytes(), cuda.device()}, cuda);
-                configs[b].token_counts = static_cast<std::int32_t*>(provisional.data);
-            }
-        } else
-            configs[b].token_counts = static_cast<std::int32_t*>(counts.data);
         if (f.rows[b].constrained) {
             const auto found = std::find_if(f.decision->rows.begin(), f.decision->rows.end(),
                                             [&](const auto& row) { return row.member == b; });
@@ -338,30 +346,38 @@ void RankProgramImpl::install_sampling(bool speculative) {
             auto mask = device_tensor(*buffers.grammar_masks).slice(2, b, 1);
             copy_bytes_async({mask.data, found->words.size() * 4, cuda.device()},
                              {destination, found->words.size() * 4, Device::cpu(), true}, cuda);
-            configs[b].mask     = {static_cast<const std::uint32_t*>(mask.data),
-                                   static_cast<int>(words)};
             f.dead_positions[b] = found->dead_positions;
             consumed.rows.push_back({static_cast<std::uint32_t>(b), found->words.size() * 4});
         }
-        positions[b] = f.rows[b].sampling_position;
-    }
-    if (!speculative && f.first_sample && parallel) {
-        auto target = device_tensor(buffers.batch.accepted_columns).slice(0, 0, batch);
-        auto* host  = static_cast<std::int32_t*>(host_tensor(buffers.batch.accepted_columns).data);
-        std::fill_n(host, batch, 1);
-        copy_bytes_async({target.data, target.bytes(), cuda.device()},
-                         {host, target.bytes(), Device::cpu(), true}, cuda);
     }
     if (!consumed.rows.empty()) events.emplace_back(std::move(consumed));
-    auto target = device_tensor(*buffers.sampling);
-    copy_bytes_async({target.data, batch * sizeof(*configs), cuda.device()},
-                     {configs, batch * sizeof(*configs), Device::cpu(), true}, cuda);
-    {
-        auto target_positions =
-            device_tensor(speculative ? buffers.mtp->frontiers : buffers.batch.sampling_positions)
-                .slice(0, 0, batch);
-        copy_bytes_async({target_positions.data, batch * 4, cuda.device()},
-                         {positions, batch * 4, Device::cpu(), true}, cuda);
+    if (f.sequence || f.first_sample) {
+        auto* configs = static_cast<ops::SamplingConfig*>(host_tensor(*buffers.sampling).data);
+        auto* positions =
+            static_cast<std::int32_t*>(host_tensor(buffers.batch.sampling_positions).data);
+        for (std::size_t b = 0; b < batch; ++b) {
+            configs[b] = sampling_config(f.rows[b].sampling);
+            if (configs[b].presence_penalty || configs[b].frequency_penalty)
+                configs[b].token_counts =
+                    static_cast<const int*>(device_tensor(*buffers.token_counts)
+                                                .slice(1, f.rows[b].member.residency.lane.value, 1)
+                                                .data);
+            if (f.rows[b].constrained)
+                configs[b].mask = {static_cast<const std::uint32_t*>(
+                                       device_tensor(*buffers.grammar_masks).slice(2, b, 1).data),
+                                   static_cast<int>(words)};
+            positions[b] = f.rows[b].sampling_position;
+            static_cast<int*>(host_tensor(buffers.batch.count_slots).data)[b] =
+                f.rows[b].member.residency.lane.value;
+        }
+        const auto upload = [&](const TensorRegion& region, std::size_t bytes) {
+            copy_bytes_async({device_tensor(region).data, bytes, cuda.device()},
+                             {host_tensor(region).data, bytes, Device::cpu(), true}, cuda);
+        };
+        upload(*buffers.sampling, batch * sizeof(*configs));
+        upload(buffers.batch.count_slots, buffers.batch.sampling_positions.region.offset +
+                                              buffers.batch.sampling_positions.region.bytes -
+                                              buffers.batch.count_slots.region.offset);
     }
 }
 
@@ -386,7 +402,7 @@ void RankProgramImpl::prepare_decision() {
             accept_forward(batch);
         const auto begin = buffers.sampled_ids->region.offset;
         const auto bytes =
-            buffers.accepted_drafts->region.offset + buffers.accepted_drafts->region.bytes - begin;
+            buffers.output_counts->region.offset + buffers.output_counts->region.bytes - begin;
         copy_bytes_async(resources.egress().subspan(0, bytes),
                          resources.persistent().subspan(begin, bytes), cuda);
     } else {
@@ -413,7 +429,7 @@ void RankProgramImpl::copy_sample_result(std::int32_t batch, bool verify) {
     const auto& io   = resources.plan.persistent.buffers;
     const auto begin = io.sampled_ids->region.offset;
     const auto bytes =
-        verify ? io.accepted_drafts->region.offset + io.accepted_drafts->region.bytes - begin
+        verify ? io.output_counts->region.offset + io.output_counts->region.bytes - begin
                : std::size_t(batch) * sizeof(TokenId);
     copy_bytes_async(resources.egress().subspan(0, bytes),
                      resources.persistent().subspan(begin, bytes), cuda);

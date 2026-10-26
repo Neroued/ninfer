@@ -13,8 +13,8 @@ struct BatchLayout {
     TensorRegion ids, positions, rope_positions;
     std::optional<TensorRegion> visual_indices;
     TensorRegion valid_columns, source_offsets, destination_offsets, main_tables;
-    TensorRegion base_positions, record_offsets, accepted_columns;
-    TensorRegion raw_tail, raw_tail_offsets, row_indices, count_slots, sampling_positions;
+    TensorRegion base_positions, record_offsets, accepted_columns, count_columns;
+    TensorRegion raw_tail, raw_tail_offsets, count_slots, sampling_positions;
     std::uint32_t max_positions;
 };
 
@@ -29,16 +29,17 @@ struct MtpBatchLayout {
 struct MtpBufferLayout {
     MtpBatchLayout history;
     std::vector<MtpBatchLayout> draft_steps;
-    LayoutRegion ingress;
     TensorRegion base_conditioning, alignment_conditioning, hidden, sample;
-    TensorRegion tail_keys, tail_coordinates, tail_key_offsets, tail_coordinate_offsets,
-        row_indices;
-    TensorRegion drafts, extents, anchors, frontiers, target_tokens, token_counts;
-    TensorRegion last_columns, active_columns;
+    TensorRegion tail_keys, tail_coordinates, tail_key_offsets, tail_coordinate_offsets;
+    TensorRegion drafts, extents, verify_ids, target_tokens;
+    TensorRegion last_columns, active_columns, skip_first;
 };
 
 struct BufferLayout {
-    BatchLayout batch;
+    BatchLayout batch, decode;
+    TensorRegion anchors;
+    LayoutRegion ingress, commit_ingress, host_region;
+    TensorRegion commit_destination_offsets;
     TensorRegion prefill_sample;
     std::optional<TensorRegion> prefill_conditioning;
     TensorRegion pending_sample;
@@ -50,7 +51,7 @@ struct BufferLayout {
     std::optional<TensorRegion> logits;
     std::optional<TensorRegion> ple_embedding, vocabulary_local, vocabulary_gathered;
     std::optional<TensorRegion> proposal_sampling, proposal_columns;
-    std::optional<TensorRegion> sampled_ids, output_counts, accepted_drafts;
+    std::optional<TensorRegion> sampled_ids, output_counts;
     std::optional<TensorRegion> token_counts, sampling, grammar_masks;
 };
 

@@ -51,6 +51,7 @@ public:
         return field(index).tensor(byte_offset(record));
     }
 
+    // Copies finish before returning, including when the consumer uses a nonblocking stream.
     void upload() const { copy(true); }
 
     void copy_back() const { copy(false); }
@@ -117,6 +118,7 @@ private:
                                       cudaMemcpyDefault));
             }
         }
+        CUDA_CHECK(cudaStreamSynchronize(nullptr));
     }
 
     std::vector<Tensor> dense_;

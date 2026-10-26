@@ -4,6 +4,7 @@
 #include "core/record_view.h"
 #include "core/tensor.h"
 #include <cstdint>
+#include <span>
 
 namespace ninfer::ops {
 
@@ -81,6 +82,35 @@ void gather(const ConstStateFieldView& source, const Tensor& active, Tensor& out
 // workspace, and consumes current Device selectors under Graph replay.
 void scatter_batch_columns(const Tensor& source, const Tensor& columns,
                            const StateFieldView& destination, CudaExecutionView execution);
+
+struct StateGather {
+    ConstStateFieldView source;
+    Tensor active;
+    Tensor output;
+};
+
+struct StateColumnScatter {
+    Tensor source, columns;
+    StateFieldView destination;
+};
+
+// Apply independent field assignments in one submission. Each of up to eight entries has its
+// own D>0, B=1..8 and BF16/I32 dtype. State fields are single-layer dense [D], selected by
+// contiguous Device I64 [B] byte offsets. Dense operands have contiguous features and explicit
+// non-overlapping, naturally aligned outer strides. Entries may use different backing arenas.
+//
+// Gather: output[:,b] = source.record[b].field when active[b]>0, otherwise represented zero.
+// Output is [D,B], active is contiguous I32 [B]; inactive rows read neither offsets nor fields.
+// Scatter: destination.record[b].field = source[:,columns[b],b] for columns[b]>=0. Source is
+// [D,T,B], columns is contiguous I32 [B] in {-1} union [0,T); -1 accesses neither source nor
+// offset and preserves destination. Selected destinations are distinct across all entries.
+//
+// Copies bits exactly. Inputs and outputs are disjoint, including across entries; selected
+// State-address alias constraints are caller guarantees. Unselected State storage is preserved.
+// Host descriptors are captured by value and Device selectors are read on replay. No workspace,
+// hidden allocation, descriptor upload or persistent metadata. An empty list performs no work.
+void gather_state_fields(std::span<const StateGather> fields, CudaExecutionView execution);
+void scatter_state_fields(std::span<const StateColumnScatter> fields, CudaExecutionView execution);
 
 /**
  * ids[i] = id_map[ids[i]]. The nonempty I32 ids vector is contiguous and updated in place.

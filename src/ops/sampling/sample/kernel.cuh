@@ -57,7 +57,6 @@ __launch_bounds__(S::kSamplerBlock) __global__
         if (tid == 0) {
             if (cfg.mask.words && !isfinite(red_val[0])) { asm volatile("trap;"); }
             out[row] = red_idx[0];
-            if (cfg.token_counts != nullptr) { atomicAdd(&cfg.token_counts[red_idx[0]], 1); }
         }
         return;
     }
@@ -90,7 +89,6 @@ __launch_bounds__(S::kSamplerBlock) __global__
         }
     }
     out[row] = picked;
-    if (cfg.token_counts != nullptr) { atomicAdd(&cfg.token_counts[picked], 1); }
 }
 
 template <class S, bool WarpTiles = false>
@@ -216,7 +214,6 @@ __launch_bounds__(S::kSamplerGroupBlock) __global__
                 if (cfg.mask.words && !isfinite(score_from_order_key(best))) asm volatile("trap;");
                 const int picked = id_from_order_key(best);
                 out[col]         = picked;
-                if (cfg.token_counts) atomicAdd(&cfg.token_counts[picked], 1);
             }
             return;
         }
@@ -248,7 +245,6 @@ __launch_bounds__(S::kSamplerGroupBlock) __global__
             if (cfg.mask.words && !isfinite(score_from_order_key(best))) { asm volatile("trap;"); }
             const int picked = id_from_order_key(best);
             out[col]         = picked;
-            if (cfg.token_counts != nullptr) { atomicAdd(&cfg.token_counts[picked], 1); }
             workspace.group_done[col] = 0;
         }
         return;
@@ -327,7 +323,6 @@ __launch_bounds__(S::kSamplerGroupBlock) __global__
             }
         }
         out[col] = picked;
-        if (cfg.token_counts != nullptr) { atomicAdd(&cfg.token_counts[picked], 1); }
         workspace.group_done[col] = 0;
     }
 }

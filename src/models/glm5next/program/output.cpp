@@ -46,7 +46,7 @@ void RankProgramImpl::sample(int b, SampleKind kind) {
                     positions, purpose, resources.workspace, cuda);
         return;
     }
-    vocabulary().sample(logits, configs, row(io.rows.accepted_columns, b), positions, purpose, ids);
+    vocabulary().sample(logits, configs, row(io.rows.sampling_columns, b), positions, purpose, ids);
 }
 
 void RankProgramImpl::score() {

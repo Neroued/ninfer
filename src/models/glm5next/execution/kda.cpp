@@ -4,6 +4,7 @@
 #include "ninfer/ops/kda_input_proj.h"
 #include "ninfer/ops/kimi_delta_attention.h"
 #include "ninfer/ops/linear_split.h"
+#include "ninfer/ops/linear_pair.h"
 #include "ninfer/ops/rmsnorm.h"
 
 #include <cmath>
@@ -47,8 +48,8 @@ void kda(const Tensor& input, const ModelProfile& profile, const KdaParameters& 
                                         arena, cuda);
     const std::array controls{b.beta, b.forget_lowrank, b.gate_lowrank};
     ops::linear_split(input, p.control, controls, arena, cuda);
-    ops::linear(b.forget_lowrank, p.forget.weight, b.forget, p.forget.policy, arena, cuda);
-    ops::linear(b.gate_lowrank, p.gate.weight, b.gate, p.gate.policy, arena, cuda);
+    ops::linear_pair(b.forget_lowrank, b.gate_lowrank, p.forget.weight, p.gate.weight, b.forget,
+                     b.gate, cuda);
     auto forget       = b.forget.view({d, heads, t, rows});
     auto beta         = b.beta.view({heads, t, rows});
     auto recurrent    = b.output.view({d, heads, t, rows});

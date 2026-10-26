@@ -28,7 +28,8 @@ namespace ninfer::ops {
  * Masks use position t regardless of whether drafts are present. Only t<n[b] is consumed.
  * Missing candidates, locally empty masks, padding IDs and inactive columns produce zero keys.
  *
- * All Tensors are contiguous and naturally aligned on execution.device(). keys overlaps no
+ * Tensors are contiguous except drafts, which permits positive, naturally aligned,
+ * non-overlapping strides. All belong to execution.device(). keys overlaps no
  * input, config or its referenced storage. Workspace is caller-owned, disjoint from operands,
  * and sized for at least T*B columns. No persistent state is changed. All metadata is read on
  * Device at execution time; descriptors/scalars are capture-time values.
@@ -64,15 +65,15 @@ void sample_vocabulary_candidates(const Tensor& keys, const SamplingConfig* conf
  * are those of speculative_accept_greedy_drafts. Inputs and token counts remain read-only.
  * Each consumed column must have nonempty global support.
  *
- * Writes I32 licensed_tokens [D+1,B] (accepted prefix, correction/bonus, then zeros),
- * licensed_counts [B] and accepted_drafts [B]. Updates provisional round_lengths [B] by
- * accepted+1 and round_anchors [B] to the terminal ID. Outputs are pairwise disjoint and
- * overlap no inputs/configs. No workspace. The caller later commits its chosen prefix.
+ * drafts permits positive, naturally aligned, non-overlapping strides. Base logical positions
+ * are read-only I32 [B], with the same RNG meaning as speculative_accept_greedy_drafts.
+ * Writes I32 licensed_tokens [D+1,B] (accepted prefix, correction/bonus, then zeros) and
+ * licensed_counts [B]. Outputs are disjoint and overlap no inputs/configs. No workspace or
+ * persistent state effects. The caller later commits its chosen prefix and updates counts.
  */
 void accept_vocabulary_candidates(const Tensor& keys, const SamplingConfig* configs,
                                   const Tensor& drafts, const Tensor& current_extents,
-                                  Tensor& round_lengths, Tensor& round_anchors,
-                                  Tensor& licensed_tokens, Tensor& licensed_counts,
-                                  Tensor& accepted_drafts, CudaExecutionView execution);
+                                  const Tensor& base_positions, Tensor& licensed_tokens,
+                                  Tensor& licensed_counts, CudaExecutionView execution);
 
 } // namespace ninfer::ops

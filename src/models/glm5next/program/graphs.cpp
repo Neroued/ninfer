@@ -31,7 +31,7 @@ void Graphs::bind_sites(Round& round, int g, int c, int depth) {
     const int t                   = depth ? p.shape.draft_tokens + 1 : 1;
     execution::StateUpdate update = execution::StepUpdate{};
     if (depth) update.emplace<execution::RecordWindow>(*p.resources.kda_records);
-    auto run = p.text_run(p.batch(io.main, t, g, c, p.shape.max_context), update);
+    auto run = p.text_run(p.decode_batch(t, g, c, p.shape.max_context), update);
     for (std::uint32_t i = 0; i < p.parameters.text.layers.size(); ++i) {
         if (!std::holds_alternative<execution::MlaParameters>(p.parameters.text.layers[i].mixer))
             continue;
@@ -55,7 +55,7 @@ void Graphs::prepare_round(int g, int c, bool verify) {
         site.attention_node = site.attention.append_to(p.cuda.stream());
     };
     const int t     = depth ? p.shape.draft_tokens + 1 : 1;
-    const auto main = p.batch(p.resources.plan.frame.main, t, g, c, p.shape.max_context);
+    const auto main = p.decode_batch(t, g, c, p.shape.max_context);
     const std::vector<std::uint32_t> draft(depth, p.shape.max_context);
     round.graph.prepare(
         p.cuda, [&] { p.execute_round(main, draft, true, true, emit, &round.sections); },
@@ -75,8 +75,8 @@ void Graphs::prepare(GraphInputs& inputs) {
                 if (verify && !p.parameters.mtp) continue;
                 const int depth = verify ? maximum : 0;
                 inputs.set(g, c, depth);
-                const auto main = p.batch(p.resources.plan.frame.main, verify ? maximum + 1 : 1, g,
-                                          c, p.shape.max_context);
+                const auto main =
+                    p.decode_batch(verify ? maximum + 1 : 1, g, c, p.shape.max_context);
                 const std::vector<std::uint32_t> draft(depth, p.shape.max_context);
                 const auto decide = [&] {
                     if (verify)
@@ -94,12 +94,12 @@ void Graphs::prepare(GraphInputs& inputs) {
             }
             if (p.parameters.mtp) {
                 inputs.set(g, c, maximum);
-                const auto main =
-                    p.batch(p.resources.plan.frame.main, maximum + 1, g, c, p.shape.max_context);
+                const auto main = p.decode_batch(maximum + 1, g, c, p.shape.max_context);
                 auto& commit = commits_[{g, c}];
                 p.resources.workspace.reset_peak();
-                commit.graph.prepare(p.cuda,
-                                     [&] { p.execute_mtp_commit(main, true, &commit.repair); });
+                commit.graph.prepare(p.cuda, [&] {
+                    p.execute_mtp_commit(main, true, true, &commit.repair, &commit.counts);
+                });
                 commit.workspace_bytes = p.resources.workspace.peak_used();
                 workspace_peak_        = std::max(workspace_peak_, commit.workspace_bytes);
             }
@@ -159,9 +159,10 @@ void Graphs::decide(int g, bool verify) {
     workspace_peak_ = std::max(workspace_peak_, decision.workspace_bytes);
 }
 
-void Graphs::commit(int g, int c, bool repair) {
+void Graphs::commit(int g, int c, bool repair, bool count_tokens) {
     auto& commit = commits_.at({g, c});
     commit.repair.set_enabled(commit.graph.executable, repair);
+    commit.counts.set_enabled(commit.graph.executable, count_tokens);
     commit.graph.launch(owner_.cuda);
     workspace_peak_ = std::max(workspace_peak_, commit.workspace_bytes);
 }
@@ -182,7 +183,6 @@ void RankProgramImpl::prepare_graphs() {
 
 void RankProgramImpl::release_graphs() {
     device.synchronize();
-    if (parallel) parallel->synchronize();
     graphs.reset();
     graph_inputs.reset();
 }

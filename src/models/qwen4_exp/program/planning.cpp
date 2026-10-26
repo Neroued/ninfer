@@ -107,26 +107,17 @@ ExecutionPlan physical_plan(std::shared_ptr<const execution::ModelProfile> profi
             ? 0
             : context::host_context_capacity(o.context_cache.host_capacity_bytes,
                                              out.persistent.state.images.image_bytes);
-    // Keep all per-call metadata in the pinned ingress as well as input IDs/positions.
-    out.pinned_io_bytes = out.persistent.buffers.batch.count_slots.region.offset +
-                          out.persistent.buffers.batch.count_slots.region.bytes -
-                          out.persistent.buffers.batch.ids.region.offset;
-    if (out.persistent.buffers.mtp)
-        out.pinned_mtp_bytes =
-            out.persistent.buffers.mtp->ingress.bytes +
+    out.pinned_io_bytes = out.persistent.buffers.host_region.bytes;
+    if (out.persistent.buffers.mtp && out.profile->ple_placement == ple::Placement::Disk)
+        out.pinned_ple_handoff_bytes =
             2ULL * o.speculative.draft_tokens * o.max_concurrency * sizeof(TokenId);
     if (out.persistent.buffers.mtp && out.profile->ple_placement == ple::Placement::Device)
         out.pinned_draft_bytes =
             (o.speculative.draft_tokens + 1) * o.max_concurrency * sizeof(TokenId);
     if (out.persistent.buffers.sampled_ids) {
-        out.pinned_sampling_bytes =
-            o.max_concurrency *
-            (sizeof(ops::SamplingConfig) + sizeof(std::int32_t) +
-             (o.speculative.draft_tokens + 1) * ((out.profile->public_tokens + 31) / 32) *
-                 sizeof(std::uint32_t));
-        const auto& buffers = out.persistent.buffers;
-        const auto end =
-            buffers.accepted_drafts ? *buffers.accepted_drafts : *buffers.output_counts;
+        out.pinned_sampling_bytes = out.persistent.buffers.grammar_masks->region.bytes;
+        const auto& buffers       = out.persistent.buffers;
+        const auto end            = *buffers.output_counts;
         out.pinned_output_bytes =
             end.region.offset + end.region.bytes - buffers.sampled_ids->region.offset;
     }
@@ -166,8 +157,8 @@ std::size_t ExecutionPlan::host_reservation_bytes() const {
         moe ? moe->description().bridge_pinned_bytes + moe->description().cpu_workspace_bytes : 0;
     return host_context_bytes + pinned_draft_bytes + ple_prepare_bytes +
            ple_upload.ordinary_host_bytes + ple_upload.pinned_host_bytes + pinned_io_bytes +
-           pinned_output_bytes + pinned_sampling_bytes + pinned_mtp_bytes + pinned_context_bytes() +
-           pinned_aux_bytes() + pinned_context_counts_bytes() + expert +
+           pinned_output_bytes + pinned_sampling_bytes + pinned_ple_handoff_bytes +
+           pinned_context_bytes() + pinned_aux_bytes() + pinned_context_counts_bytes() + expert +
            (workspace.vision ? workspace.vision->encoder.host_staging_bytes : 0);
 }
 

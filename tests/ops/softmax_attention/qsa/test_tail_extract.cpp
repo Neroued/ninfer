@@ -4,6 +4,7 @@
 #include "cuda_fixture.h"
 #include "core/buffer.h"
 #include "core/decode_graph.h"
+#include "core/state_image.h"
 
 #include <limits>
 
@@ -161,6 +162,93 @@ int run(DeviceContext& device, int batch, int layout, Binding binding, int capac
     return failures;
 }
 
+int multilayer(DeviceContext& device) {
+    constexpr int layers = 4, batch = 2, columns = 8;
+    StateImageBuilder builder;
+    const auto raw    = builder.add(DType::BF16, {128, 3}, layers, "keys");
+    const auto rope   = builder.add(DType::I32, {3}, layers, "coordinates");
+    const auto layout = builder.finish();
+    std::vector<std::uint8_t> initial(layout.image_bytes * 4, 0x7b);
+    GuardedDeviceBuffer backing(initial.size());
+    StateImageStorage images(backing.span(), layout);
+    const auto offset = [&](StateField field, int record, int layer) {
+        const auto& f = layout.fields[field.index];
+        return record * layout.image_bytes + f.tensor.region.offset + layer * f.layer_stride;
+    };
+    auto source      = to_device<std::int64_t>({static_cast<std::int64_t>(layout.image_bytes), 0});
+    auto destination = to_device<std::int64_t>({static_cast<std::int64_t>(2 * layout.image_bytes),
+                                                static_cast<std::int64_t>(3 * layout.image_bytes)});
+    Tensor from(source.span(), DType::I64, {batch}), to(destination.span(), DType::I64, {batch});
+    const ops::QsaTailStateView before{images.field(raw, from), images.field(rope, from)},
+        after{images.field(raw, to), images.field(rope, to)};
+    auto base = to_device<int>({6, 7}), valid = to_device<int>({8, 8}),
+         accepted = to_device<int>({0, 4});
+    std::vector<std::uint16_t> keys(layers * batch * columns * 128);
+    std::vector<int> coordinates(layers * batch * columns * 3);
+    for (std::size_t i = 0; i < keys.size(); ++i) keys[i] = static_cast<std::uint16_t>(i * 37);
+    for (std::size_t i = 0; i < coordinates.size(); ++i) coordinates[i] = i * 7 + 123;
+    auto dk = to_device(keys), dr = to_device(coordinates);
+    const ops::QsaRawRecordReadView records{
+        Tensor(dk.span(), DType::BF16, {128, columns, batch, layers}),
+        Tensor(dr.span(), DType::I32, {3, columns, batch, layers}),
+        Tensor(base.span(), DType::I32, {batch}), Tensor(valid.span(), DType::I32, {batch})};
+    Tensor count(accepted.span(), DType::I32, {batch});
+    DecodeGraphDefinition definition;
+    definition.capture(device.stream(), [&] {
+        ops::qsa_tail_extract(before, records, count, after, device.execution_view());
+    });
+    DecodeGraphExecutable graph;
+    graph.instantiate(definition);
+    int failures = 0;
+    for (int phase = 0; phase < 2; ++phase) {
+        const std::array counts{phase ? 5 : 0, phase ? 1 : 4};
+        accepted.copy_from_host(counts.data(), sizeof(counts));
+        for (int b = 0; b < batch; ++b)
+            for (int l = 0; l < layers; ++l) {
+                auto* k = reinterpret_cast<std::uint16_t*>(initial.data() + offset(raw, 1 - b, l));
+                auto* r = reinterpret_cast<int*>(initial.data() + offset(rope, 1 - b, l));
+                for (int j = 0; j < 3; ++j)
+                    for (int d = 0; d < 128; ++d)
+                        k[j * 128 + d] = j < (6 + b) % 4 ? (l * 701 + b * 137 + j * 17 + d) : 0;
+                for (int axis = 0; axis < 3; ++axis) r[axis] = l * 100 + b * 10 + axis;
+            }
+        auto expected = initial;
+        for (int b = 0; b < batch; ++b) {
+            const int start = 6 + b, end = start + counts[b], n = end % 4, first = end - n;
+            for (int l = 0; l < layers; ++l) {
+                auto* dst =
+                    reinterpret_cast<std::uint16_t*>(expected.data() + offset(raw, 2 + b, l));
+                const auto* src =
+                    reinterpret_cast<const std::uint16_t*>(initial.data() + offset(raw, 1 - b, l));
+                for (int j = 0; j < 3; ++j)
+                    for (int d = 0; d < 128; ++d)
+                        dst[j * 128 + d] =
+                            j >= n ? 0
+                            : first + j < start
+                                ? src[j * 128 + d]
+                                : keys[((l * batch + b) * columns + first + j - start) * 128 + d];
+                auto* dst_rope = reinterpret_cast<int*>(expected.data() + offset(rope, 2 + b, l));
+                const auto* src_rope =
+                    reinterpret_cast<const int*>(initial.data() + offset(rope, 1 - b, l));
+                for (int axis = 0; axis < 3; ++axis)
+                    dst_rope[axis] =
+                        n == 0 ? 0
+                        : first < start
+                            ? src_rope[axis]
+                            : coordinates[((l * batch + b) * columns + first - start) * 3 + axis];
+            }
+        }
+        backing.copy_from_host(initial.data(), initial.size());
+        cuda_synchronize();
+        graph.launch(device.stream());
+        device.synchronize();
+        failures +=
+            verify_exact("layered QSA tail",
+                         from_device<std::uint8_t>(backing.data(), expected.size()), expected);
+    }
+    return failures + backing.verify_guards("layered state");
+}
+
 // Only the actually consumed record columns are initialized. Initcheck therefore catches
 // reads of rejected suffixes, earlier complete blocks, and unused coordinate columns.
 int read_footprint(DeviceContext& device) {
@@ -291,6 +379,7 @@ int validation(DeviceContext& device) {
 
 int main(int argc, char** argv) {
     OpSuite suite;
+    suite.add("qsa_tail/multilayer", [] { return multilayer(cuda_environment().context); });
     suite.add("qsa_tail/contract", [] { return validation(cuda_environment().context); });
     suite.add("qsa_tail/read_footprint", [] { return read_footprint(cuda_environment().context); });
     const auto add = [&](int b, int layout, Binding binding, int capacity, bool exhaustive = true) {

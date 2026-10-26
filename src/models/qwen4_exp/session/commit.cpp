@@ -215,12 +215,12 @@ CommitResult Session::commit(PendingBatch&& batch,
             s.identity.digests.prepare_generated(count, s.continuation.metadata.rope_delta,
                                                  decision.prefix_execution_split_after);
             if (tx.kind == detail::ComputeTransaction::Kind::Mtp) {
-                const auto& inputs = tx.result->rows[b].input_tokens;
-                if (inputs.size() < count)
-                    throw std::logic_error("MTP result omitted its adopted input prefix");
-                completed[b] =
-                    p.prepare_commit(s, tx.rows[b], std::span<const TokenId>(inputs).first(count),
-                                     false, *tx.completion);
+                // Accepted drafts are the licensed output prefix before the correction/bonus.
+                // Main consumed the previous anchor followed by exactly those draft tokens.
+                std::vector<TokenId> inputs(count);
+                inputs[0] = tx.rows[b].ids.front();
+                std::copy_n(tx.result->rows[b].tokens.begin(), count - 1, inputs.begin() + 1);
+                completed[b] = p.prepare_commit(s, tx.rows[b], inputs, false, *tx.completion);
             } else {
                 completed[b] =
                     p.prepare_commit(s, tx.rows[b], tx.rows[b].ids, false, *tx.completion);

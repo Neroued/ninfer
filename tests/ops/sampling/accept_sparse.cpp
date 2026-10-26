@@ -222,9 +222,7 @@ struct SparseAcceptSuite {
     struct SparseExpected {
         std::vector<std::int32_t> licensed_tokens;
         std::vector<std::int32_t> licensed_counts;
-        std::vector<std::int32_t> accepted;
         std::vector<std::int32_t> lengths;
-        std::vector<std::int32_t> anchors;
     };
 
     SparseExpected sparse_accept_oracle(const std::vector<std::uint16_t>& logits,
@@ -238,9 +236,7 @@ struct SparseAcceptSuite {
         SparseExpected expected{
             .licensed_tokens = std::vector<std::int32_t>(kSparseColumns * kSparseBatch, 0),
             .licensed_counts = std::vector<std::int32_t>(kSparseBatch),
-            .accepted        = std::vector<std::int32_t>(kSparseBatch),
             .lengths         = initial_lengths,
-            .anchors         = std::vector<std::int32_t>(kSparseBatch),
         };
         for (int row = 0; row < kSparseBatch; ++row) {
             const int extent = std::clamp(extents[static_cast<std::size_t>(row)], 0, kSparseDrafts);
@@ -296,9 +292,6 @@ struct SparseAcceptSuite {
             }
             expected.licensed_tokens[row_base + accepted_count]     = terminal_token;
             expected.licensed_counts[static_cast<std::size_t>(row)] = accepted_count + 1;
-            expected.accepted[static_cast<std::size_t>(row)]        = accepted_count;
-            expected.lengths[static_cast<std::size_t>(row)] += accepted_count + 1;
-            expected.anchors[static_cast<std::size_t>(row)] = terminal_token;
         }
         return expected;
     }
@@ -308,7 +301,6 @@ struct SparseAcceptSuite {
         const std::vector<std::uint16_t>& logits, const std::vector<std::int32_t>& drafts,
         const std::vector<std::int32_t>& candidate_ids, const std::vector<float>& proposal_q,
         const std::vector<std::int32_t>& extents, const std::vector<std::int32_t>& initial_lengths,
-        const std::vector<std::int32_t>& initial_anchors,
         const std::vector<ops::SamplingConfig>& host_configs,
         const std::vector<std::int32_t>& token_counts,
         ops::SpeculativeAcceptExecutionEnvelope envelope) {
@@ -341,17 +333,12 @@ struct SparseAcceptSuite {
         DeviceBuffer d_configs = to_device(device_configs);
 
         GuardedDeviceBuffer d_lengths(kSparseBatch * sizeof(std::int32_t));
-        GuardedDeviceBuffer d_anchors(kSparseBatch * sizeof(std::int32_t));
         GuardedDeviceBuffer d_licensed(kSparseColumns * kSparseBatch * sizeof(std::int32_t));
         GuardedDeviceBuffer d_licensed_counts(kSparseBatch * sizeof(std::int32_t));
-        GuardedDeviceBuffer d_accepted(kSparseBatch * sizeof(std::int32_t));
         d_lengths.copy_from_host(initial_lengths.data(),
                                  initial_lengths.size() * sizeof(initial_lengths[0]));
-        d_anchors.copy_from_host(initial_anchors.data(),
-                                 initial_anchors.size() * sizeof(initial_anchors[0]));
         d_licensed.fill(0xcd);
         d_licensed_counts.fill(0xef);
-        d_accepted.fill(0xab);
 
         Tensor target_tensor(d_target_tokens.span(), DType::I32, {kSparseColumns, kSparseBatch});
         Tensor logits_tensor(d_logits.span(), DType::BF16,
@@ -363,10 +350,8 @@ struct SparseAcceptSuite {
                         {kSparseCandidates, kSparseDrafts, kSparseBatch});
         Tensor extent_tensor(d_extents.span(), DType::I32, {kSparseBatch});
         Tensor lengths_tensor(d_lengths.span(), DType::I32, {kSparseBatch});
-        Tensor anchors_tensor(d_anchors.span(), DType::I32, {kSparseBatch});
         Tensor licensed_tensor(d_licensed.span(), DType::I32, {kSparseColumns, kSparseBatch});
         Tensor licensed_counts_tensor(d_licensed_counts.span(), DType::I32, {kSparseBatch});
-        Tensor accepted_tensor(d_accepted.span(), DType::I32, {kSparseBatch});
         const std::size_t workspace_bytes =
             ops::speculative_accept_sparse_drafts_workspace_capacity_bytes(
                 kSparseTokenDomain, envelope, kSparseDrafts, kSparseDrafts, kSparseBatch,
@@ -376,10 +361,9 @@ struct SparseAcceptSuite {
         const auto launch = [&](CudaExecutionView cuda) {
             ops::speculative_accept_sparse_drafts(
                 target_tensor, logits_tensor, drafts_tensor, candidate_tensor, q_tensor,
-                extent_tensor, lengths_tensor, anchors_tensor, licensed_tensor,
-                licensed_counts_tensor, accepted_tensor, kSparseTokenDomain,
-                static_cast<const ops::SamplingConfig*>(d_configs.data()), envelope, workspace,
-                cuda);
+                extent_tensor, lengths_tensor, licensed_tensor, licensed_counts_tensor,
+                kSparseTokenDomain, static_cast<const ops::SamplingConfig*>(d_configs.data()),
+                envelope, workspace, cuda);
         };
         launch(ninfer::test::cuda_environment().default_execution);
         cuda_synchronize();
@@ -393,15 +377,9 @@ struct SparseAcceptSuite {
                 verify_exact((label + phase + " licensed counts").c_str(),
                              from_device<std::int32_t>(d_licensed_counts.data(), kSparseBatch),
                              wanted.licensed_counts);
-            checks += verify_exact((label + phase + " accepted drafts").c_str(),
-                                   from_device<std::int32_t>(d_accepted.data(), kSparseBatch),
-                                   wanted.accepted);
-            checks += verify_exact((label + phase + " provisional lengths").c_str(),
+            checks += verify_exact((label + phase + " positions unchanged").c_str(),
                                    from_device<std::int32_t>(d_lengths.data(), kSparseBatch),
                                    wanted.lengths);
-            checks += verify_exact((label + phase + " provisional anchors").c_str(),
-                                   from_device<std::int32_t>(d_anchors.data(), kSparseBatch),
-                                   wanted.anchors);
             return checks;
         };
         int failures = check_result(expected, " eager");
@@ -462,8 +440,6 @@ struct SparseAcceptSuite {
                     const auto& current_q      = change_inputs ? replay_q : proposal_q;
                     d_lengths.copy_from_host(next_lengths.data(),
                                              next_lengths.size() * sizeof(next_lengths[0]));
-                    d_anchors.copy_from_host(initial_anchors.data(),
-                                             initial_anchors.size() * sizeof(initial_anchors[0]));
                     d_extents.copy_from_host(next_extents.data(),
                                              next_extents.size() * sizeof(int));
                     cuda_synchronize();
@@ -512,10 +488,8 @@ struct SparseAcceptSuite {
                                  from_device<std::int32_t>(d_token_counts, token_counts.size()),
                                  token_counts);
         failures += d_lengths.verify_guards((label + " lengths guards").c_str());
-        failures += d_anchors.verify_guards((label + " anchors guards").c_str());
         failures += d_licensed.verify_guards((label + " licensed guards").c_str());
         failures += d_licensed_counts.verify_guards((label + " licensed-count guards").c_str());
-        failures += d_accepted.verify_guards((label + " accepted guards").c_str());
         return failures;
     }
 
@@ -526,7 +500,7 @@ struct SparseAcceptSuite {
                                               kSparseColumns * kSparseBatch,
                                           f32_to_bf16(-20.0f));
         std::vector<int> ids(kSparseCandidates * kSparseDrafts * kSparseBatch),
-            extents(kSparseBatch), lengths(kSparseBatch), anchors(kSparseBatch, -1);
+            extents(kSparseBatch), lengths(kSparseBatch);
         std::vector<float> q(ids.size(), 0.0f);
         std::vector<ops::SamplingConfig> configs(kSparseBatch);
         std::vector<int> history(kSparseTokenDomain * kSparseBatch, 3);
@@ -563,7 +537,7 @@ struct SparseAcceptSuite {
         return execute_sparse_accept_case("sparse greedy K=" + std::to_string(kSparseDrafts) +
                                               " B=" + std::to_string(kSparseBatch),
                                           targets, logits, drafts, ids, q, extents, lengths,
-                                          anchors, configs, history, {!general});
+                                          configs, history, {!general});
     }
 
     int generated_general_case() {
@@ -573,7 +547,7 @@ struct SparseAcceptSuite {
                                               kSparseColumns * kSparseBatch,
                                           f32_to_bf16(-20.0f));
         std::vector<int> ids(kSparseCandidates * kSparseDrafts * kSparseBatch),
-            extents(kSparseBatch), lengths(kSparseBatch), anchors(kSparseBatch, -1);
+            extents(kSparseBatch), lengths(kSparseBatch);
         std::vector<float> q(ids.size(), 0.0f);
         std::vector<ops::SamplingConfig> configs(kSparseBatch);
         std::vector<int> history(kSparseTokenDomain * kSparseBatch, 0);
@@ -629,15 +603,14 @@ struct SparseAcceptSuite {
         return execute_sparse_accept_case("sparse general K=" + std::to_string(kSparseDrafts) +
                                               " B=" + std::to_string(kSparseBatch),
                                           targets, logits, drafts, ids, q, extents, lengths,
-                                          anchors, configs, history, {false});
+                                          configs, history, {false});
     }
 
     int grammar_mask_case() {
         std::vector<int> targets(kSparseColumns * kSparseBatch, 42),
             drafts(kSparseDrafts * kSparseBatch),
             ids(kSparseCandidates * kSparseDrafts * kSparseBatch),
-            extents(kSparseBatch, kSparseDrafts), lengths(kSparseBatch, 70),
-            anchors(kSparseBatch, 0);
+            extents(kSparseBatch, kSparseDrafts), lengths(kSparseBatch, 70);
         std::vector<std::uint16_t> logits(static_cast<std::size_t>(kSparsePhysicalRows) *
                                               kSparseColumns * kSparseBatch,
                                           f32_to_bf16(12.0f));
@@ -667,7 +640,7 @@ struct SparseAcceptSuite {
         }
         // p(a)=p(b)=.5, q(a)=q(x)=.5: a accepts, invalid x corrects to b with probability 1.
         return execute_sparse_accept_case("sparse grammar mask", targets, logits, drafts, ids, q,
-                                          extents, lengths, anchors, configs, history, {false});
+                                          extents, lengths, configs, history, {false});
     }
 
     int repeated_history_case(bool stochastic) {
@@ -677,8 +650,7 @@ struct SparseAcceptSuite {
                                               kSparseColumns * kSparseBatch,
                                           f32_to_bf16(-20.0f));
         std::vector<int> ids(kSparseCandidates * kSparseDrafts * kSparseBatch),
-            extents(kSparseBatch, kSparseDrafts), lengths(kSparseBatch, 7000),
-            anchors(kSparseBatch, -1);
+            extents(kSparseBatch, kSparseDrafts), lengths(kSparseBatch, 7000);
         std::vector<float> q(ids.size(), 0.0f);
         std::vector<ops::SamplingConfig> configs(kSparseBatch);
         std::vector<int> history(kSparseTokenDomain * kSparseBatch, 0);
@@ -702,7 +674,7 @@ struct SparseAcceptSuite {
         return execute_sparse_accept_case(
             "sparse repeated-history K=" + std::to_string(kSparseDrafts) +
                 (stochastic ? " stochastic" : " greedy"),
-            targets, logits, drafts, ids, q, extents, lengths, anchors, configs, history, {false});
+            targets, logits, drafts, ids, q, extents, lengths, configs, history, {false});
     }
 
     int sparse_general_mixed_case() {
@@ -716,7 +688,6 @@ struct SparseAcceptSuite {
         std::vector<std::int32_t> extents{2, 1, 1, kSparseDrafts, 0, 3, 2, 4};
         for (auto& extent : extents) extent = std::min(extent, kSparseDrafts);
         std::vector<std::int32_t> lengths(kSparseBatch);
-        std::vector<std::int32_t> anchors(kSparseBatch, -1);
         std::vector<ops::SamplingConfig> configs(kSparseBatch);
         std::vector<std::int32_t> token_counts(
             static_cast<std::size_t>(kSparseTokenDomain) * kSparseBatch, 0);
@@ -801,7 +772,7 @@ struct SparseAcceptSuite {
 
         return execute_sparse_accept_case(
             "sparse speculative general mixed B=8", targets, logits, drafts, candidate_ids,
-            proposal_q, extents, lengths, anchors, configs, token_counts,
+            proposal_q, extents, lengths, configs, token_counts,
             ops::SpeculativeAcceptExecutionEnvelope{.all_rows_greedy_without_penalties = false});
     }
 };

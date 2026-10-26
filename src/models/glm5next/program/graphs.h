@@ -22,7 +22,7 @@ public:
     void replay(const execution::BatchView&, std::span<const std::uint32_t> draft_bounds, bool head,
                 bool read_drafts);
     void decide(int rows, bool verify);
-    void commit(int rows, int attention_rows, bool repair);
+    void commit(int rows, int attention_rows, bool repair, bool count_tokens);
 
     [[nodiscard]] std::size_t workspace_peak() const { return workspace_peak_; }
 
@@ -51,7 +51,7 @@ private:
 
     struct CommitGraph {
         GraphSegment graph;
-        DecodeGraphSection repair;
+        DecodeGraphSection repair, counts;
         std::size_t workspace_bytes = 0;
     };
 

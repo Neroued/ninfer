@@ -301,7 +301,6 @@ void encode_result(Encoder& out, const Result& result) {
                     out.u32(r.drafts);
                     out.u32(r.accepted_drafts);
                     integers(out, r.tokens);
-                    integers(out, r.input_tokens);
                     out.u32(r.dead_positions);
                 }
 
@@ -338,13 +337,12 @@ Result decode_result(Decoder& in) {
     switch (in.u8()) {
     case 1: {
         ComputeResult v;
-        v.rows.resize(in.count(4 * 4 + 2 * 8));
+        v.rows.resize(in.count(4 * 4 + 8));
         for (auto& r : v.rows) {
             r.processed       = in.u32();
             r.drafts          = in.u32();
             r.accepted_drafts = in.u32();
             r.tokens          = integers<TokenId>(in);
-            r.input_tokens    = integers<TokenId>(in);
             r.dead_positions  = in.u32();
         }
 

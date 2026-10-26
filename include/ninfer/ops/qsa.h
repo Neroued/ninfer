@@ -336,8 +336,10 @@ void qsa_prepare_kv(const QsaKvProjectionView& projected, const QsaKvPreparePara
  * that block's first token coordinates, or three I32 zeros when F0%4==0.
  *
  * Logical shapes / supported domain:
- * View rules above apply. B is in [1,8]; R is positive. Each state's two
- * fields agree on B, and both record planes agree on R/B.
+ * B is in [1,8]; R and L are positive. Each state's two fields agree on B/L.
+ * Record raw keys are BF16 [128,R,B,L], coordinates I32 [3,R,B,L], with contiguous features
+ * and explicit disjoint outer strides. Each layer independently applies the equations above;
+ * base_positions, valid_columns and accepted_columns are shared across layers.
  * accepted_columns is contiguous Device I32 [B]. Each row has 0<=a<=u<=R, F0>=0, and F0+u
  * representable as nonnegative I32. The caller supplies the input-prefix length, not an emitted
  * token count, and ensures that before corresponds to F0. Source/destination record offsets are

@@ -410,7 +410,7 @@ public:
         auto& frame          = native.resources.frame;
         const int width      = operation.width;
         const int hidden     = frame.spec.hidden;
-        const auto main      = frame.input_view(width, kBatch);
+        const auto main      = frame.decode_view(width, kBatch);
         const auto target    = read<std::uint16_t>(main.hidden);
         const auto ids       = read<std::int32_t>(main.ids);
         const auto positions = read<std::int32_t>(main.cache_positions);
@@ -446,6 +446,7 @@ public:
             for (std::uint32_t lane = 0; lane < kBatch; ++lane) {
                 expected.counts.push_back(static_cast<int>(accepted[lane] - 1));
                 for (int i = 0; i < expected.width; ++i) {
+                    if (i >= expected.counts[lane]) continue;
                     const auto dst = lane * expected.width + i, src = lane * width + i;
                     std::copy_n(target.data() + std::size_t(src) * hidden, hidden,
                                 expected.conditioning.data() + std::size_t(dst) * hidden);
@@ -460,16 +461,13 @@ public:
                 operation.commit = q35::Commit{};
                 for (std::uint32_t lane = 0; lane < kBatch; ++lane) {
                     operation.commit->rows.push_back({accepted[lane], true, false});
-                    frame.host_commit->history_columns[lane] = expected.counts[lane];
+                    frame.host_commit->accepted_columns[lane] = accepted[lane];
                 }
-                CUDA_CHECK(cudaMemcpyAsync(frame.history_columns.data,
-                                           frame.host_commit->history_columns.data(),
+                CUDA_CHECK(cudaMemcpyAsync(frame.accepted_columns.data,
+                                           frame.host_commit->accepted_columns.data(),
                                            kBatch * sizeof(std::int32_t), cudaMemcpyHostToDevice,
                                            native_.device().stream()));
-                if (native.graphs)
-                    native.graphs->rebuild_mtp_history(kBatch, native_.device().execution_view());
-                else
-                    native.rebuild_mtp_history(kBatch);
+                native.rebuild_mtp_history(kBatch);
                 native_.device().synchronize();
                 oracle_.compare_inputs(expected);
             }

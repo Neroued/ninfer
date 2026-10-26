@@ -31,14 +31,14 @@ struct SamplingMask {
 // Device-resident sampling parameters and operands. token_counts is an optional device I32
 // [token_domain] committed generated-token occurrence-count array used by both penalties.
 struct SamplingConfig {
-    float temperature          = 0.0f; // <= 0 => greedy argmax over allowed tokens
-    std::int32_t top_k         = 20;   // runtime contract is [1,20]; Op defensively caps otherwise
-    float top_p                = 1.0f; // >= 1 => disabled
-    float min_p                = 0.0f; // <= 0 => disabled
-    float presence_penalty     = 0.0f;
-    float frequency_penalty    = 0.0f;
-    unsigned long long seed    = 0;
-    std::int32_t* token_counts = nullptr; // device [token_domain] i32, or null
+    float temperature       = 0.0f; // <= 0 => greedy argmax over allowed tokens
+    std::int32_t top_k      = 20;   // runtime contract is [1,20]; Op defensively caps otherwise
+    float top_p             = 1.0f; // >= 1 => disabled
+    float min_p             = 0.0f; // <= 0 => disabled
+    float presence_penalty  = 0.0f;
+    float frequency_penalty = 0.0f;
+    unsigned long long seed = 0;
+    const std::int32_t* token_counts = nullptr; // device [token_domain] i32, or null
     SamplingMask mask;
 };
 
@@ -78,11 +78,10 @@ struct SamplingConfig {
  *
  * Row b uses counter-based RNG key
  * (configs[b].seed,logical_positions[b],purpose), without mutable RNG state or dependence on the
- * compact row index. In every mode the selected token atomically increments
- * configs[b].token_counts when it is non-null. Non-null token-count arrays belonging to distinct
- * active requests must not alias. `out` must not overlap logits, configs, logical_positions, or any
- * token-count array. The Op writes all of out, uses caller-owned transient storage reported by
- * sampling_workspace_capacity_bytes(), and has no other persistent-state side effect.
+ * compact row index. Counts, masks and all inputs remain read-only. `out` must not overlap
+ * logits, configs, logical_positions or any token-count array. The Op writes all of out, uses
+ * caller-owned transient storage reported by sampling_workspace_capacity_bytes(), and has no
+ * persistent-state side effect. The caller commits its final output with the count-update Op.
  */
 void sample(const Tensor& logits, Tensor& out, std::int32_t token_domain,
             const SamplingConfig* configs, const Tensor& logical_positions, std::int32_t purpose,

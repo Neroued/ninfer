@@ -119,7 +119,7 @@ public:
     void run_dflash_draft(std::uint32_t batch, std::uint32_t minimum, std::uint32_t maximum);
     void project_decode(std::uint32_t batch, std::uint32_t width);
     void decide_decode(std::uint32_t batch, std::uint32_t width);
-    void readback_decode();
+    void readback_decode(std::uint32_t batch, bool speculative);
     void initialize_graphs();
     void release_graphs();
     void append_draft_history(ComputeOperation&);
@@ -127,6 +127,9 @@ public:
     void commit_draft_history(ComputeOperation&);
     void align_mtp_history(ComputeOperation&);
     void rebuild_mtp_history(std::uint32_t batch);
+    void execute_mtp_commit(std::uint32_t batch, bool repair, bool counts,
+                            DecodeGraphSection* repair_section = nullptr,
+                            DecodeGraphSection* counts_section = nullptr);
     void request_decision(ComputeOperation&);
     void launch_decision(ComputeOperation&);
     void launch_commit(ComputeOperation&);

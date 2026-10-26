@@ -6,36 +6,37 @@
 
 namespace ninfer::ops {
 
-struct CausalPairOutputs {
-    Tensor hidden, ids, positions, lengths, last_columns, active_columns;
+struct CausalPairInputs {
+    Tensor hidden, previous_hidden;
+    Tensor ids, positions;
+    Tensor rope, previous_rope;
+    Tensor prefix, skip_first;
+    Tensor rows;
 };
 
-// Pair each adopted token with its preceding hidden state. For n=max(prefix[b]-skip[b],0),
-// j<n and i=j+skip[b]: out.hidden[:,j,b]=(i ? hidden[:,i-1,b] : previous[:,b]),
-// out.ids[j,b]=ids[i,b], out.positions[j,b]=positions[i,b]-1. Remaining physical columns are
-// zero. Also writes lengths=n, last_columns=prefix-1, active_columns=(prefix>0 ? 0 : -1).
-// BF16 hidden[D,W,B], previous[D,B], output hidden[D,P,B] are contiguous and 16-byte aligned;
-// D is divisible by eight. All metadata are contiguous I32: ids/positions[W,B], prefix/skip[B],
-// output ids/positions[P,B], other outputs[B]. W,P>=1, B=1..8. Caller supplies 0<=prefix<=W,
-// skip in {0,1}, n<=P, and positive live input positions. Invalid tails and unused previous
-// hidden are not read. Outputs are disjoint from each other and all inputs. Copies represented
-// values exactly, without workspace or persistent effects; Device controls are read on replay.
-void prepare_causal_pairs(const Tensor& hidden, const Tensor& previous, const Tensor& ids,
-                          const Tensor& positions, const Tensor& prefix, const Tensor& skip,
-                          const CausalPairOutputs& out, CudaExecutionView execution);
+struct CausalPairOutputs {
+    Tensor hidden, ids, positions, lengths;
+    Tensor rope;
+};
 
-// Shift an adopted prefix to pair its next token with the preceding position. For A=prefix[b],
-// 0<=A<=W, n=max(A-1,0), shifted_ids[j,b]=ids[j+1,b], shifted_positions[j,b]=positions[j,b]
-// and shifted_rope[j,axis,b]=rope[j,axis,b] for j<n. Remaining output columns copy input column
-// zero. Writes lengths[b]=n, last_columns[b]=A-1, active_columns[b]=(A>0 ? 0 : -1). Input
-// IDs/positions are contiguous I32 [W,B], RoPE [W,3,B], prefix [B]; outputs have width W-1, with
-// contiguous I32 [B] metadata. W>=2, B=1..8. Outputs are mutually disjoint and disjoint from
-// inputs. Copies integers exactly, has no persistent effect or workspace, and reads live device
-// metadata during Graph replay.
-void prepare_shifted_prefix(const Tensor& ids, const Tensor& positions, const Tensor& rope,
-                            const Tensor& prefix, Tensor& shifted_ids, Tensor& shifted_positions,
-                            Tensor& shifted_rope, Tensor& lengths, Tensor& last_columns,
-                            Tensor& active_columns, CudaExecutionView execution);
+// Pair adopted tokens with their preceding hidden/coordinates, selecting input row b=rows[r]
+// for output row r; absent rows means identity and C=B. For n=max(prefix[b]-skip_first[b],0),
+// j<n, i=j+skip_first[b]: output hidden[:,j,r] is hidden[:,i-1,b] if i>0, previous_hidden[:,b]
+// otherwise; IDs are ids[i,b], positions are positions[i,b]-1, and optional coordinates are
+// rope[i-1,:,b] if i>0, previous_rope[:,b] otherwise. Writes lengths[r]=n. rows[r]=-1 writes an
+// all-zero row without reading input metadata; physical tails j>=n are zero and read no inputs.
+//
+// BF16 hidden[D,W,B], previous_hidden[D,B], output hidden[D,P,C] have contiguous features;
+// bases and outer strides are 16-byte aligned, D>0 is divisible by eight. I32 IDs/positions are
+// [W,B] in, [P,C] out. Optional I32 rope [W,A,B], previous_rope [A,B], output rope [P,A,C]
+// either all exist, A=1 or 3, or are all absent. These tensors have positive, element-aligned,
+// non-overlapping strides. prefix/skip_first[B], optional rows[C], output lengths[C] are
+// contiguous I32. W,P>=1, B,C=1..8. Caller supplies rows in {-1} union [0,B), 0<=prefix<=W,
+// skip_first in {0,1}, n<=P, and positive consumed positions. Read-only inputs may alias;
+// output ranges are mutually disjoint and disjoint from all inputs. Copies bits exactly,
+// including coordinates. No workspace or persistent effects; Device controls are read on replay.
+void prepare_causal_pairs(const CausalPairInputs& input, const CausalPairOutputs& output,
+                          CudaExecutionView execution);
 
 /**
  *   For row b and 0<=j<=K:
@@ -44,7 +45,8 @@ void prepare_shifted_prefix(const Tensor& ids, const Tensor& positions, const Te
  *                       anchors[b]                        otherwise;
  *     positions[j,b]  = base_positions[b] + min(j,Pcur[b]).
  *
- *   All tensors are contiguous I32. anchors/base_positions/current_extents are [B], drafts is
+ *   All tensors are I32, contiguous except drafts, which permits positive, naturally aligned,
+ *   non-overlapping strides. anchors/base_positions/current_extents are [B], drafts is
  *   [K,B] with K>=1 and B>=1, and verify_ids/positions are [K+1,B]. Each current extent is in
  *   [0,K]. Inputs and outputs do not overlap.
  *

@@ -32,7 +32,7 @@ struct ExecutionPlan {
     std::size_t host_context_bytes    = 0;
     std::size_t pinned_io_bytes       = 0;
     std::size_t pinned_sampling_bytes = 0;
-    std::size_t pinned_mtp_bytes      = 0;
+    std::size_t pinned_ple_handoff_bytes = 0;
     std::size_t pinned_draft_bytes    = 0;
     runtime::ContextCapacityResolution capacity;
     std::uint32_t checkpoint_interval = 8192;

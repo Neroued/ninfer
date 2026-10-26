@@ -73,7 +73,7 @@ context::ContextDirectorySpec schema(const ExecutionPlan& p, std::size_t capacit
 
 std::size_t ExecutionPlan::pinned_bytes() const {
     return (workspace.vision ? workspace.vision->encoder.host_staging_bytes : 0) +
-           frame.ingress.bytes + frame.sampling_ingress.bytes + pinned_output_bytes +
+           frame.host_ingress.bytes + frame.sampling_ingress.bytes + pinned_output_bytes +
            2 * mapping_elements * sizeof(std::int64_t) +
            (frame.token_counts ? frame.token_counts->region.bytes : 0);
 }

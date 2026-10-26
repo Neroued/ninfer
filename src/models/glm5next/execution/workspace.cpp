@@ -1,4 +1,5 @@
 #include "models/glm5next/execution/workspace.h"
+#include "ninfer/ops/linear_pair.h"
 
 #include "models/glm5next/state/context.h"
 #include "models/glm5next/vision/execution.h"
@@ -101,8 +102,8 @@ std::size_t body(const ModelProfile& p, const ExecutionShape& s, int first, int 
                                      k->qkv, batch, first, last));
             scratch(a, ops::linear_split_workspace_capacity_bytes({k->control, {}}, k->control_rows,
                                                                   minimum, columns));
-            scratch(a, linear(k->forget, minimum, columns));
-            scratch(a, linear(k->gate, minimum, columns));
+            scratch(
+                a, ops::linear_pair_workspace_capacity_bytes(k->forget, k->gate, minimum, columns));
             if (prefill)
                 scratch(a, ops::kimi_delta_attention_workspace_capacity_bytes(
                                dimension(p.local.kda_heads.size), dimension(p.local.kda_heads.size),

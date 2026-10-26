@@ -14,17 +14,12 @@ void RankProgramImpl::initialize_graphs() {
     graphs.emplace(GraphSpec{capacity, max_concurrency, draft_window, backend});
     GraphBodies bodies;
     bodies.prologue = [this](const GraphInvocation& call) {
-        if (call.phase == GraphPhase::Verify) {
-            upload_positions(call.width, call.batch);
-        } else {
-            if (!resources.dflash) upload_ingress();
-            upload_input(call.width, call.batch);
-        }
+        if (call.phase != GraphPhase::Verify && !resources.dflash) upload_ingress();
     };
     bodies.text = [this](const GraphInvocation& call) {
         auto& frame      = resources.frame;
         const auto batch = static_cast<int>(call.batch), width = static_cast<int>(call.width);
-        auto input = frame.input_view(width, batch);
+        auto input = frame.decode_view(width, batch);
         execution::TextInputs inputs{input.ids,
                                      input.cache_positions,
                                      input.rope_positions,
@@ -64,8 +59,13 @@ void RankProgramImpl::initialize_graphs() {
         decide_decode(call.batch, call.width);
     };
     if (backend == SpeculativeBackend::Mtp)
-        bodies.mtp_history = [this](std::uint32_t batch) { rebuild_mtp_history(batch); };
-    bodies.readback = [this](const GraphInvocation&) { readback_decode(); };
+        bodies.mtp_commit = [this](std::uint32_t batch, DecodeGraphSection* repair,
+                                   DecodeGraphSection* counts) {
+            execute_mtp_commit(batch, true, true, repair, counts);
+        };
+    bodies.readback = [this](const GraphInvocation& call) {
+        readback_decode(call.batch, call.width > 1);
+    };
     graphs->prepare(resources, parameters, device, bodies);
     device.synchronize();
     graph_memory = GraphMemorySummary{.preparation_increment_bytes = device_memory_growth(

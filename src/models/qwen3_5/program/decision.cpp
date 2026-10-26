@@ -2,7 +2,6 @@
 #include "models/qwen3_5/execution/linear.h"
 #include "ninfer/ops/argmax.h"
 #include "ninfer/ops/indexing.h"
-#include "ninfer/ops/scalar.h"
 #include "ninfer/ops/speculative_accept.h"
 
 #include <algorithm>
@@ -38,7 +37,11 @@ void RankProgramImpl::request_decision(ComputeOperation& operation) {
         member.member = row;
         if (operation.speculative) {
             const auto count = resources.frame.host_ingress->extents[row];
-            member.drafts.assign(drafts + row * draft_window, drafts + row * draft_window + count);
+            for (int step = 0; step < count; ++step)
+                member.drafts.push_back(
+                    drafts[backend == SpeculativeBackend::Mtp
+                               ? step * resources.frame.spec.batch_capacity + row
+                               : row * draft_window + step]);
         }
         request.rows.push_back(std::move(member));
     }
@@ -68,16 +71,14 @@ void RankProgramImpl::decide_decode(std::uint32_t batch_value, std::uint32_t wid
     const int rows       = frame.spec.output_rows;
     const int vocabulary = execution::dimension(parameters.profile->public_tokens);
     if (width > 1) {
-        Tensor logits = prefix(frame.logits, {rows, width, batch});
-        Tensor argmax = prefix(frame.target_argmax, {width, batch});
-        auto drafts =
-            prefix(backend == SpeculativeBackend::Mtp ? frame.mtp->drafts : frame.dflash->drafts,
-                   {static_cast<int>(draft_window), batch});
+        Tensor logits    = prefix(frame.logits, {rows, width, batch});
+        Tensor argmax    = prefix(frame.target_argmax, {width, batch});
+        auto drafts      = backend == SpeculativeBackend::Mtp
+                               ? frame.mtp->proposals(batch)
+                               : prefix(frame.dflash->drafts, {static_cast<int>(draft_window), batch});
         Tensor counts    = frame.output_counts.slice(0, 0, batch);
-        Tensor accepted  = frame.accepted_drafts.slice(0, 0, batch);
         Tensor tokens    = prefix(frame.output_tokens, {width, batch});
-        Tensor frontiers = frame.frontiers.slice(0, 0, batch);
-        Tensor anchors   = frame.anchors.slice(0, 0, batch);
+        Tensor frontiers = frame.sampling_positions.slice(0, 0, batch);
         if (backend == SpeculativeBackend::DFlash2) {
             auto& draft = *frame.dflash;
             ops::speculative_accept_sparse_drafts(
@@ -86,46 +87,27 @@ void RankProgramImpl::decide_decode(std::uint32_t batch_value, std::uint32_t wid
                        {draft.candidate_ids.ne[0], static_cast<int>(draft_window), batch}),
                 prefix(draft.proposal_q,
                        {draft.proposal_q.ne[0], static_cast<int>(draft_window), batch}),
-                frame.extents.slice(0, 0, batch), frontiers, anchors, tokens, counts, accepted,
-                vocabulary, frame.sampling, {false}, resources.work, device.execution_view());
+                frame.extents.slice(0, 0, batch), frontiers, tokens, counts, vocabulary,
+                frame.sampling, {false}, resources.work, device.execution_view());
         } else {
             ops::speculative_accept_greedy_drafts(
-                argmax, logits, drafts, frame.extents.slice(0, 0, batch), frontiers, anchors,
-                tokens, counts, accepted, vocabulary, frame.sampling, resources.work,
-                device.execution_view());
+                argmax, logits, drafts, frame.extents.slice(0, 0, batch), frontiers, tokens, counts,
+                vocabulary, frame.sampling, resources.work, device.execution_view());
         }
     } else {
         Tensor logits = prefix(frame.logits, {rows, batch});
         Tensor tokens = prefix(frame.output_tokens, {batch});
-        ops::sample(logits, tokens, vocabulary, frame.sampling, frame.frontiers.slice(0, 0, batch),
-                    ops::kSamplePurposeDecode, resources.work, device.execution_view());
-        for (int row = 0; row < batch; ++row) {
-            auto count = frame.output_counts.slice(0, row, 1);
-            ops::set_i32_scalar(count, 1, device.execution_view());
-        }
-        CUDA_CHECK(cudaMemsetAsync(frame.accepted_drafts.data, 0, batch * sizeof(std::int32_t),
-                                   device.stream()));
-    }
-    // MTP history still consumes the previous tail before commit publishes its replacement.
-    if (backend != SpeculativeBackend::Mtp) {
-        auto scope        = resources.work.scope();
-        const auto hidden = frame.input_view(width, batch).hidden;
-        auto selected     = hidden.view({frame.spec.hidden, width * batch});
-        if (width > 1) {
-            selected = resources.work.alloc(DType::BF16, {frame.spec.hidden, batch});
-            ops::gather_bf16_batch_columns(hidden, frame.accepted_drafts.slice(0, 0, batch),
-                                           selected, device.execution_view());
-        }
-        ops::scatter(selected,
-                     resources.state_images.continuation_hidden(
-                         frame.state_destination_offsets.slice(0, 0, batch)),
-                     device.execution_view());
+        ops::sample(logits, tokens, vocabulary, frame.sampling,
+                    frame.sampling_positions.slice(0, 0, batch), ops::kSamplePurposeDecode,
+                    resources.work, device.execution_view());
     }
 }
 
-void RankProgramImpl::readback_decode() {
-    CUDA_CHECK(cudaMemcpyAsync(resources.frame.host_egress, resources.frame.egress.data,
-                               sizeof(FrameEgress), cudaMemcpyDeviceToHost, device.stream()));
+void RankProgramImpl::readback_decode(std::uint32_t batch, bool speculative) {
+    const auto bytes = speculative ? offsetof(FrameEgress, counts) + batch * sizeof(std::int32_t)
+                                   : batch * sizeof(TokenId);
+    CUDA_CHECK(cudaMemcpyAsync(resources.frame.host_egress, resources.frame.egress.data, bytes,
+                               cudaMemcpyDeviceToHost, device.stream()));
 }
 
 void RankProgramImpl::launch_decision(ComputeOperation& operation) {
@@ -158,7 +140,7 @@ void RankProgramImpl::launch_decision(ComputeOperation& operation) {
                                 device.execution_view());
         } else {
             decide_decode(operation.batch, operation.width);
-            readback_decode();
+            readback_decode(operation.batch, operation.speculative);
         }
         gpu_timer.record_result();
         result_ready.record(device.stream());
@@ -180,10 +162,6 @@ void RankProgramImpl::launch_decision(ComputeOperation& operation) {
                 hidden = resources.state_images
                              .continuation_hidden(operation.rows[0].state_offsets.source)
                              .view({frame.spec.hidden, 1});
-            auto position = frame.frontiers.slice(0, 0, 1);
-            ops::set_i32_scalar(position,
-                                static_cast<int>(operation.rows[0].main_frontier + operation.width),
-                                device.execution_view());
             purpose = forward->sample == SamplePurpose::FirstToken ? ops::kSamplePurposePrefill
                                                                    : ops::kSamplePurposeDecode;
         } else {
@@ -193,17 +171,11 @@ void RankProgramImpl::launch_decision(ComputeOperation& operation) {
         execution::project(hidden, parameters.text.output_head, logits, resources.work,
                            device.execution_view());
         Tensor tokens = prefix(frame.output_tokens, {batch});
-        ops::sample(logits, tokens, vocabulary, frame.sampling, frame.frontiers.slice(0, 0, batch),
-                    purpose, resources.work, device.execution_view());
-        for (int row = 0; row < batch; ++row) frame.host_egress->counts[row] = 1;
-        CUDA_CHECK(cudaMemcpyAsync(frame.output_counts.data, frame.host_egress->counts.data(),
-                                   batch * sizeof(std::int32_t), cudaMemcpyHostToDevice,
-                                   device.stream()));
-        CUDA_CHECK(cudaMemsetAsync(frame.accepted_drafts.data, 0, batch * sizeof(std::int32_t),
-                                   device.stream()));
+        ops::sample(logits, tokens, vocabulary, frame.sampling,
+                    frame.sampling_positions.slice(0, 0, batch), purpose, resources.work,
+                    device.execution_view());
     }
-    CUDA_CHECK(cudaMemcpyAsync(frame.host_egress, frame.egress.data, sizeof(FrameEgress),
-                               cudaMemcpyDeviceToHost, device.stream()));
+    readback_decode(operation.batch, false);
     gpu_timer.record_result();
     result_ready.record(device.stream());
     operation.stage = ComputeStage::Readback;
@@ -216,19 +188,19 @@ void RankProgramImpl::publish_result(ComputeOperation& operation) {
     const bool generated = std::holds_alternative<DecodeWork>(operation.request.work.operation) ||
                            (forward && forward->sample != SamplePurpose::None);
     if (generated) {
-        const auto& output = *resources.frame.host_egress;
+        auto& output = *resources.frame.host_egress;
         GeneratedResult value;
         value.row_stride = operation.speculative ? draft_window + 1 : 1;
         value.tokens.assign(output.tokens.begin(),
                             output.tokens.begin() + value.row_stride * operation.batch);
         for (std::uint32_t row = 0; row < operation.batch; ++row) {
-            const auto count  = output.counts[row];
-            const auto extent = resources.frame.host_ingress->extents[row];
+            const auto count   = operation.speculative ? output.counts[row] : 1;
+            output.counts[row] = count;
+            const auto extent  = resources.frame.host_ingress->extents[row];
             if (count < 1 || count > extent + 1)
                 throw std::runtime_error("Qwen3.5 sampling returned an invalid prefix length");
             value.counts.push_back(static_cast<std::uint32_t>(count));
-            value.accepted_drafts.push_back(
-                static_cast<std::uint32_t>(output.accepted_drafts[row]));
+            value.accepted_drafts.push_back(static_cast<std::uint32_t>(count - 1));
             value.draft_extents.push_back(static_cast<std::uint32_t>(extent));
             value.dead_positions.push_back(operation.dead_positions[row]);
             for (int column = 0; column < count; ++column) {

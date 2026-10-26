@@ -117,7 +117,7 @@ struct Fixture {
     const Options& options;
     int t, k;
     DeviceBuffer logits, configs, counts, masks, valid, drafts, keys, work, positions, output;
-    DeviceBuffer extents, lengths, anchors, licensed, licensed_counts, accepted;
+    DeviceBuffer extents, lengths, licensed, licensed_counts;
     Tensor input, key_view, valid_view, draft_view;
     MemoryArena workspace;
     std::size_t logical_bytes;
@@ -141,8 +141,7 @@ struct Fixture {
           output(make_buffer(o.batch * 4)),
           extents(measurement::make_i32(std::vector<int>(o.batch, t - 1))),
           lengths(measurement::make_i32(std::vector<int>(o.batch, 1024))),
-          anchors(make_buffer(o.batch * 4)), licensed(make_buffer(t * o.batch * 4)),
-          licensed_counts(make_buffer(o.batch * 4)), accepted(make_buffer(o.batch * 4)),
+          licensed(make_buffer(t * o.batch * 4)), licensed_counts(make_buffer(o.batch * 4)),
           input(logits.span(), DType::BF16, {o.rows, t, o.batch}),
           key_view(keys.span(), DType::I64, {k, t, o.batch, o.ranks}),
           valid_view(valid.span(), DType::I32, {o.batch}), workspace(work.span()) {
@@ -184,12 +183,10 @@ struct Fixture {
         if (o.penalties) logical_bytes += std::size_t(live) * o.batch * 4 + drafts.size();
         if (o.mask) logical_bytes += std::size_t((live + 31) / 32) * t * o.batch * 4;
         if (o.op != "candidates")
-            logical_bytes =
-                keys.size() + configs.size() +
-                (o.op == "sample"
-                     ? positions.size() + output.size()
-                     : drafts.size() + extents.size() + 2 * lengths.size() + anchors.size() +
-                           licensed.size() + licensed_counts.size() + accepted.size());
+            logical_bytes = keys.size() + configs.size() +
+                            (o.op == "sample" ? positions.size() + output.size()
+                                              : drafts.size() + extents.size() + lengths.size() +
+                                                    licensed.size() + licensed_counts.size());
     }
 
     void extract(int rank, CudaExecutionView cuda) {
@@ -212,10 +209,9 @@ struct Fixture {
                                               cuda);
         } else {
             Tensor e(extents.span(), DType::I32, {b}), l(lengths.span(), DType::I32, {b}),
-                a(anchors.span(), DType::I32, {b}), tokens(licensed.span(), DType::I32, {t, b}),
-                n(licensed_counts.span(), DType::I32, {b}), ac(accepted.span(), DType::I32, {b});
-            ops::accept_vocabulary_candidates(key_view, cfg, draft_view, e, l, a, tokens, n, ac,
-                                              cuda);
+                tokens(licensed.span(), DType::I32, {t, b}),
+                n(licensed_counts.span(), DType::I32, {b});
+            ops::accept_vocabulary_candidates(key_view, cfg, draft_view, e, l, tokens, n, cuda);
         }
     }
 

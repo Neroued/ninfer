@@ -93,29 +93,33 @@ void GraphInputs::set(int g, int c, int depth) {
     const auto i64 = [&](const TensorRegion& region) {
         return static_cast<std::int64_t*>(p.host(region).data);
     };
-    const auto batch = [&](const BatchLayout& b, int t, int start, int valid) {
+    const auto batch = [&](const BatchLayout& b, int t, int start, int valid, bool ids = true) {
         for (int j = 0; j < g; ++j) {
             for (int k = 0; k < t; ++k) {
-                i32(b.ids)[j * t + k]       = 0;
+                if (ids) i32(b.ids)[j * t + k] = 0;
                 i32(b.positions)[j * t + k] = start + std::min(k, std::max(0, valid - 1));
             }
             i32(b.valid_columns)[j] = valid;
         }
     };
-    batch(io.main, width, base, extent + 1);
+    batch(io.decode, width, base, extent + 1, false);
+    for (int j = 0; j < g; ++j) i32(io.rows.anchors)[j] = 0;
     for (int j = 0; j < g; ++j) {
         i64(io.rows.source_offsets)[j]      = states_[j];
         i64(io.rows.destination_offsets)[j] = states_[j];
         i32(io.rows.base_positions)[j]      = base;
         i32(io.rows.accepted_columns)[j]    = 1;
+        i32(io.rows.count_columns)[j]       = 0;
         i32(io.rows.count_slots)[j]         = j;
         i32(io.rows.sampling_positions)[j]  = base;
+        i32(io.rows.sampling_columns)[j]    = 1;
     }
     for (int j = 0; j < c; ++j) {
         const bool live               = j < counts[rank];
         const int row                 = begins[rank] + j;
         i32(a.to_global)[j]           = live ? row : -1;
         i32(a.live_rows)[j]           = live;
+        i32(a.live_columns)[j]        = live ? 0 : -1;
         i64(a.source_offsets)[j]      = live ? states_[row] : -1;
         i64(a.destination_offsets)[j] = live ? states_[row] : -1;
         i32(a.main_tables)[j]         = live ? row : -1;
@@ -129,26 +133,22 @@ void GraphInputs::set(int g, int c, int depth) {
         for (int j = 0; j < counts[rank]; ++j) i32(a.from_gather)[begins[rank] + j] = rank * c + j;
     if (io.mtp) {
         const auto& m = *io.mtp;
-        batch(m.history, width, std::max(base - 1, 0), 1);
         for (int s = 0; s < depth; ++s)
-            batch(m.draft_steps[s], 1, std::max(base - 1, 0) + std::min(s, extent), s < extent);
+            batch(m.draft_steps[s], 1, std::max(base - 1, 0) + std::min(s, extent), s < extent,
+                  false);
         for (int j = 0; j < g; ++j) {
-            i32(m.extents)[j]    = extent;
-            i32(m.anchors)[j]    = 0;
-            i32(m.skip_first)[j] = depth ? extent != 0 : base == 0;
+            i32(m.extents)[j]      = extent;
+            i32(m.skip_first)[j]   = depth ? extent != 0 : base == 0;
+            i32(m.last_columns)[j] = 0;
         }
     }
+    p.fill_local_metadata(io.decode, width, c);
+    if (io.mtp)
+        for (int step = 0; step < depth; ++step)
+            p.fill_local_metadata(io.mtp->draft_steps[step], 1, c);
+    auto* configs = static_cast<ops::SamplingConfig*>(p.host(*io.sampling).data);
+    for (int j = 0; j < g; ++j) configs[j] = {.temperature = 0, .top_k = 1, .top_p = 1};
     p.upload_region(io.ingress, io.ingress.bytes);
-    std::vector<ops::SamplingConfig> configs(g);
-    for (int j = 0; j < g; ++j)
-        configs[j] = {.temperature  = 0,
-                      .top_k        = 1,
-                      .top_p        = 1,
-                      .token_counts = static_cast<int*>(
-                          r.tensor(!p.parallel && depth ? *io.mtp->token_counts : *io.token_counts)
-                              .slice(1, j, 1)
-                              .data)};
-    copy_bytes(io.sampling->region.bind(r.fixed()).subspan(0, configs.size() * sizeof(configs[0])),
-               {configs.data(), configs.size() * sizeof(configs[0]), Device::cpu()}, p.cuda);
+    p.upload_region(io.commit_ingress, io.commit_ingress.bytes);
 }
 } // namespace ninfer::models::glm5next::detail

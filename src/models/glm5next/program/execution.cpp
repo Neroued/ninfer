@@ -17,12 +17,11 @@ void RankProgramImpl::execute_round(const execution::BatchView& main,
     const int g = main.rows, c = main.attention.rows, h = parameters.profile->config.text.hidden;
     const bool verify = !draft_bounds.empty();
     auto hidden       = resources.packed(io.pending_hidden, {h, main.tokens, g});
-    if (parameters.mtp) stage_conditioning(g);
+    upload_region(io.ingress, io.ingress.bytes);
+    if (parameters.mtp) gather_decode_state(main);
     if (verify) {
         const auto& m = *io.mtp;
-        auto drafts   = resources.packed(m.drafts, {dimension(shape.draft_tokens), g});
-        CUDA_CHECK(cudaMemsetAsync(drafts.data, 0, drafts.bytes(), cuda.stream()));
-        seed_mtp_tail(main, false);
+        auto drafts   = draft_proposals(g);
         {
             nvtx::ScopedRange range(nvtx::Name::DecodeMtpDraft, nvtx::Category::Mtp);
             for (std::uint32_t step = 0; step < draft_bounds.size(); ++step)
@@ -30,8 +29,7 @@ void RankProgramImpl::execute_round(const execution::BatchView& main,
                               submit);
         }
         const auto readback = [&] {
-            copy_bytes_async(output(m.drafts).subspan(0, drafts.bytes()),
-                             {drafts.data, drafts.bytes(), cuda.device()}, cuda);
+            copy_bytes_async(output(m.drafts), m.drafts.region.bind(resources.fixed()), cuda);
         };
         if (sections) {
             sections->drafts.capture(cuda.stream(), readback);
@@ -40,9 +38,8 @@ void RankProgramImpl::execute_round(const execution::BatchView& main,
             readback();
             drafts_done.record(cuda.stream());
         }
-        auto ids = main.ids, positions = main.positions;
-        ops::prepare_verify_inputs(row(m.anchors, g), drafts, row(io.rows.base_positions, g),
-                                   row(m.extents, g), ids, positions, cuda);
+        auto ids = main.ids;
+        ops::prepare_verify_ids(row(io.rows.anchors, g), drafts, row(m.extents, g), ids, cuda);
         {
             nvtx::ScopedRange range(nvtx::Name::DecodeMtpTarget, nvtx::Category::Mtp);
             main_forward(main, execution::RecordWindow{*resources.kda_records}, hidden, {}, submit);
@@ -90,7 +87,7 @@ void RankProgramImpl::forward() {
     } else
         f.physical = work.batch;
     f.tokens = rows.front().ids.size();
-    upload(rows, f.physical, std::max(1U, f.tokens));
+    prepare_inputs(rows, f.physical, std::max(1U, f.tokens));
     if (parameters.mtp && f.tokens) { prepare_history_metadata(rows); }
     const auto& io = resources.plan.frame;
     const int h = dimension(parameters.profile->config.text.hidden), b = rows.size();
@@ -116,6 +113,7 @@ void RankProgramImpl::forward() {
         }
         return;
     }
+    if (!f.sequence) upload_region(io.ingress, io.ingress.bytes);
     if (parameters.mtp && f.tokens) stage_conditioning(rows.size());
     if (!f.tokens) {
         const auto offset = rows[0].states.at(parameters.profile->local.rank).source;
@@ -176,7 +174,6 @@ void RankProgramImpl::main_forward(const execution::BatchView& call, execution::
                                    Tensor hidden,
                                    std::optional<models::vision::EmbeddingView> visual,
                                    const execution::MlaSubmit& submit) {
-    localize(call);
     auto run = text_run(call, update);
     run.stem(std::move(visual));
     for (std::uint32_t i = 0; i < parameters.text.layers.size(); ++i) {
@@ -284,17 +281,14 @@ void RankProgramImpl::result() {
         const auto& io     = resources.plan.frame;
         const auto* ids    = static_cast<const TokenId*>(output(*io.sampled_ids).data);
         const auto* counts = static_cast<const std::int32_t*>(output(*io.output_counts).data);
-        const auto* accepted =
-            static_cast<const std::int32_t*>(output(io.mtp->accepted_drafts).data);
         for (std::size_t b = 0; b < f.physical.members.size(); ++b) {
             const auto logical = f.physical.members[b];
-            if (counts[b] < 1 || std::uint32_t(counts[b]) > mtp->draft_extents[logical] + 1 ||
-                accepted[b] != counts[b] - 1)
+            if (counts[b] < 1 || std::uint32_t(counts[b]) > mtp->draft_extents[logical] + 1)
                 throw std::logic_error("GLM5Next acceptance returned an invalid prefix");
             auto& r           = f.result.rows[logical];
             r.processed       = mtp->draft_extents[logical] + 1;
             r.drafts          = mtp->draft_extents[logical];
-            r.accepted_drafts = accepted[b];
+            r.accepted_drafts = counts[b] - 1;
             r.tokens.assign(ids + b * (shape.draft_tokens + 1),
                             ids + b * (shape.draft_tokens + 1) + counts[b]);
         }

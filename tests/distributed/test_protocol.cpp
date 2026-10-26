@@ -283,7 +283,7 @@ void native_work() {
     contract.validate(work, request, masks);
     masks.rows[0].words.pop_back();
     rejects([&] { contract.validate(work, request, masks); });
-    q::ComputeResult result{{{1, 3, 1, {5, 6}, {23, 5}, 0}}};
+    q::ComputeResult result{{{1, 3, 1, {5, 6}, 0}}};
     q::Commit commit{
         {{original.member, {{0, {2048, 6144}}, {1, {8192, 24576}}}, 2, false, false, false}}, {}};
     contract.validate(work, q::Result{result}, commit);
@@ -317,7 +317,7 @@ void native_work() {
     wire::Decoder result_input(result_bytes);
     const auto received_result = std::get<q::ComputeResult>(q::decode_result(result_input));
     require(received_result.rows[0].tokens == result.rows[0].tokens &&
-                received_result.rows[0].input_tokens == result.rows[0].input_tokens,
+                received_result.rows[0].accepted_drafts == result.rows[0].accepted_drafts,
             "result changed in transit");
 }
 

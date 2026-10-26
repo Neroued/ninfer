@@ -7,7 +7,7 @@
 namespace ninfer::models::glm5next {
 
 struct AttentionLayout {
-    TensorRegion ids, positions, valid_columns, table_rows;
+    TensorRegion positions, valid_columns, table_rows;
 };
 
 struct BatchLayout {
@@ -17,13 +17,15 @@ struct BatchLayout {
 };
 
 struct RowLayout {
-    TensorRegion source_offsets, destination_offsets, base_positions, accepted_columns;
-    TensorRegion count_slots, sampling_positions;
+    TensorRegion source_offsets, destination_offsets, base_positions, accepted_columns,
+        count_columns;
+    TensorRegion anchors, count_slots, sampling_positions, sampling_columns;
     LayoutRegion ingress;
 };
 
 struct AttentionFrameLayout {
-    TensorRegion to_global, from_gather, live_rows, source_offsets, destination_offsets;
+    TensorRegion to_global, from_gather, live_rows, live_columns, source_offsets,
+        destination_offsets;
     TensorRegion main_tables, mtp_tables, base_positions, record_offsets;
     TensorRegion accepted_columns, active_columns;
     TensorRegion selection_rows;
@@ -33,21 +35,20 @@ struct AttentionFrameLayout {
 struct MtpFrameLayout {
     BatchLayout history;
     std::vector<BatchLayout> draft_steps;
-    TensorRegion conditioning, previous_hidden, recursive_hidden, drafts, extents, anchors;
-    TensorRegion round_frontiers;
+    TensorRegion conditioning, previous_hidden, recursive_hidden, drafts, extents, verify_ids;
     TensorRegion proposal_sampling, proposal_columns;
-    std::optional<TensorRegion> target_tokens, token_counts;
-    TensorRegion skip_first, last_columns, active_columns, accepted_drafts;
+    std::optional<TensorRegion> target_tokens;
+    TensorRegion skip_first, last_columns;
     ops::KpoolBlockSelectionLayout selection;
     TensorRegion tail_keys, tail_gates;
     std::array<TensorRegion, 3> tail_offsets;
 };
 
 struct FrameLayout {
-    BatchLayout main;
+    BatchLayout main, decode;
     RowLayout rows;
     AttentionFrameLayout attention;
-    LayoutRegion ingress, sampling_ingress, egress, result_egress;
+    LayoutRegion ingress, commit_ingress, host_ingress, sampling_ingress, egress, result_egress;
     TensorRegion prefill_hidden, pending_hidden;
     std::optional<KdaReplayRecordLayout> kda_records;
     ops::KpoolRawRecordLayout main_records;

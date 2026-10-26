@@ -314,14 +314,12 @@ std::size_t decision_bytes(const Options& o, int columns, const std::vector<std:
         if (o.mask) bytes += std::size_t(used) * ((kTokenDomain + 31) / 32) * 4;
         if (acceptance) {
             // Full valid prefix: drafts, extent/length input, and all output slots.
-            bytes += std::size_t(used - 1 + columns + 6) * 4;
+            bytes += std::size_t(used - 1 + columns + 3) * 4;
             if (!stochastic && !penalties && !o.mask) bytes += std::size_t(used) * 4;
             if (o.dflash2 && stochastic) bytes += std::size_t(used - 1) * kDFlash2Candidates * 8;
         } else {
             bytes += 8; // Logical position and selected token.
         }
-        if (!o.dflash2 && o.counts_active && (stochastic || o.mixed))
-            bytes += std::size_t(used) * (penalties ? 4 : 8);
     }
     return bytes;
 }
@@ -334,7 +332,6 @@ void run_sample(DeviceBuffer& logits, const Options& o, DecisionBenchmark& bench
         make_batch_configs(counts, batch, o.mode, o.counts_active, o.top_k, o.mixed, masks, 1);
     auto out       = make_zeros(std::size_t(batch) * 4);
     auto positions = make_i32(std::vector<std::int32_t>(batch, 4096));
-    SavedBuffer initial_counts(counts);
     Tensor tl(logits.span(), DType::BF16, {kPhysicalRows, batch}),
         to(out.span(), DType::I32, {batch}), tp(positions.span(), DType::I32, {batch});
     const auto bytes = ops::sampling_workspace_capacity_bytes(kTokenDomain, batch, batch);
@@ -354,7 +351,7 @@ void run_sample(DeviceBuffer& logits, const Options& o, DecisionBenchmark& bench
                         ops::kSamplePurposeDecode, workspace, cuda);
             row.workspace_peak = workspace.peak_used();
         },
-        [&](CudaExecutionView cuda) { initial_counts.restore(cuda); });
+        [](CudaExecutionView) {});
 }
 
 void run_mtp(DeviceBuffer& logits, const Options& o, DecisionBenchmark& benchmark) {
@@ -372,17 +369,13 @@ void run_mtp(DeviceBuffer& logits, const Options& o, DecisionBenchmark& benchmar
         }
     const auto active = extents(o, columns);
     auto dt = make_i32(targets), dd = make_i32(drafts), de = make_i32(active);
-    auto lengths  = make_i32(std::vector<std::int32_t>(batch, 4096)),
-         anchors  = make_i32(std::vector<std::int32_t>(batch, 17));
-    auto licensed = make_zeros(std::size_t(columns) * batch * 4), num = make_zeros(batch * 4),
-         accepted = make_zeros(batch * 4);
-    SavedBuffer initial_counts(counts), initial_lengths(lengths), initial_anchors(anchors);
+    auto lengths  = make_i32(std::vector<std::int32_t>(batch, 4096));
+    auto licensed = make_zeros(std::size_t(columns) * batch * 4), num = make_zeros(batch * 4);
     Tensor tt(dt.span(), DType::I32, {columns, batch}),
         tl(logits.span(), DType::BF16, {kPhysicalRows, columns, batch}),
         td(dd.span(), DType::I32, {k, batch}), te(de.span(), DType::I32, {batch}),
-        tlen(lengths.span(), DType::I32, {batch}), ta(anchors.span(), DType::I32, {batch}),
-        tout(licensed.span(), DType::I32, {columns, batch}), tn(num.span(), DType::I32, {batch}),
-        tac(accepted.span(), DType::I32, {batch});
+        tlen(lengths.span(), DType::I32, {batch}),
+        tout(licensed.span(), DType::I32, {columns, batch}), tn(num.span(), DType::I32, {batch});
     const auto bytes = ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(
         kTokenDomain, k, k, batch, batch);
     DeviceBuffer backing(device_context().device(), bytes);
@@ -399,15 +392,11 @@ void run_mtp(DeviceBuffer& logits, const Options& o, DecisionBenchmark& benchmar
         row, o, decision_bytes(o, columns, active, true),
         [&](CudaExecutionView cuda) {
             ops::speculative_accept_greedy_drafts(
-                tt, tl, td, te, tlen, ta, tout, tn, tac, kTokenDomain,
+                tt, tl, td, te, tlen, tout, tn, kTokenDomain,
                 static_cast<const ops::SamplingConfig*>(configs.data()), workspace, cuda);
             row.workspace_peak = workspace.peak_used();
         },
-        [&](CudaExecutionView cuda) {
-            initial_counts.restore(cuda);
-            initial_lengths.restore(cuda);
-            initial_anchors.restore(cuda);
-        });
+        [](CudaExecutionView) {});
 }
 
 void run_dflash2(DeviceBuffer& logits, const Options& options, DecisionBenchmark& benchmark) {
@@ -464,13 +453,10 @@ void run_dflash2(DeviceBuffer& logits, const Options& options, DecisionBenchmark
     DeviceBuffer extents = make_i32(active);
     DeviceBuffer lengths =
         make_i32(std::vector<std::int32_t>(static_cast<std::size_t>(batch), 4096));
-    DeviceBuffer anchors = make_i32(std::vector<std::int32_t>(static_cast<std::size_t>(batch), -1));
     DeviceBuffer licensed(ninfer::bench::device_context().device(),
                           static_cast<std::size_t>(kDFlash2Columns) * batch * sizeof(std::int32_t));
     DeviceBuffer licensed_counts(ninfer::bench::device_context().device(),
                                  static_cast<std::size_t>(batch) * sizeof(std::int32_t));
-    DeviceBuffer accepted(ninfer::bench::device_context().device(),
-                          static_cast<std::size_t>(batch) * sizeof(std::int32_t));
 
     Tensor ttargets(targets.span(), DType::I32, {kDFlash2Columns, batch});
     Tensor tlogits(logits.span(), DType::BF16, {kPhysicalRows, kDFlash2Columns, batch});
@@ -479,10 +465,8 @@ void run_dflash2(DeviceBuffer& logits, const Options& options, DecisionBenchmark
     Tensor tq(proposal_q.span(), DType::FP32, {kDFlash2Candidates, kDFlash2Drafts, batch});
     Tensor textents(extents.span(), DType::I32, {batch});
     Tensor tlengths(lengths.span(), DType::I32, {batch});
-    Tensor tanchors(anchors.span(), DType::I32, {batch});
     Tensor tlicensed(licensed.span(), DType::I32, {kDFlash2Columns, batch});
     Tensor tlicensed_counts(licensed_counts.span(), DType::I32, {batch});
-    Tensor taccepted(accepted.span(), DType::I32, {batch});
     const ops::SpeculativeAcceptExecutionEnvelope envelope{
         .all_rows_greedy_without_penalties =
             mode == Mode::Greedy && !options.force_general && !options.mixed && !options.mask,
@@ -495,12 +479,11 @@ void run_dflash2(DeviceBuffer& logits, const Options& options, DecisionBenchmark
     MemoryArena workspace(workspace_storage.span());
     const auto* config_ptr = static_cast<const ops::SamplingConfig*>(configs.data());
     const auto launch      = [&](CudaExecutionView cuda) {
-        ops::speculative_accept_sparse_drafts(
-            ttargets, tlogits, tdrafts, tcandidates, tq, textents, tlengths, tanchors, tlicensed,
-            tlicensed_counts, taccepted, kTokenDomain, config_ptr, envelope, workspace, cuda);
+        ops::speculative_accept_sparse_drafts(ttargets, tlogits, tdrafts, tcandidates, tq, textents,
+                                                   tlengths, tlicensed, tlicensed_counts, kTokenDomain,
+                                                   config_ptr, envelope, workspace, cuda);
     };
 
-    SavedBuffer initial_lengths(lengths), initial_anchors(anchors);
     measurement::Row row{.op              = "accept-sparse-drafts",
                          .format          = "bf16",
                          .valid           = list_counts(active),
@@ -515,11 +498,7 @@ void run_dflash2(DeviceBuffer& logits, const Options& options, DecisionBenchmark
             launch(cuda);
             row.workspace_peak = workspace.peak_used();
         },
-        [&](CudaExecutionView cuda) {
-            initial_lengths.restore(cuda);
-            initial_anchors.restore(cuda);
-        },
-        envelope.all_rows_greedy_without_penalties);
+        [](CudaExecutionView) {}, envelope.all_rows_greedy_without_penalties);
 }
 
 } // namespace

@@ -63,12 +63,6 @@ void RankProgramImpl::advance_compute() {
             const auto embedding = host_ple->try_consume(*f.ple);
             if (!embedding) return;
             request_decision();
-            if (f.verify) {
-                for (std::size_t b = 0; b < f.rows.size(); ++b) {
-                    const auto input = host_ple->input(*f.ple, b);
-                    std::copy(input.begin(), input.end(), f.verify->inputs.begin() + b * f.tokens);
-                }
-            }
             if (f.graph) {
                 std::optional<nvtx::ScopedRange> range;
                 if (f.verify) range.emplace(nvtx::Name::DecodeMtpTarget, nvtx::Category::Mtp);
@@ -173,38 +167,24 @@ void RankProgramImpl::finish_result() {
     const auto* ids     = static_cast<const TokenId*>(resources.egress().data);
     const auto* forward = std::get_if<ForwardWork>(&f.request.work.operation);
     const bool sampled  = f.verify || (forward && forward->sample != SampleKind::None);
-    if (f.verify && !host_ple) {
-        const auto* input = static_cast<const TokenId*>(draft_output.data());
-        std::copy_n(input, f.verify->inputs.size(), f.verify->inputs.begin());
-    }
     const std::int32_t* counts   = nullptr;
-    const std::int32_t* accepted = nullptr;
     if (f.verify) {
         counts = reinterpret_cast<const std::int32_t*>(
             resources.egress()
                 .subspan(buffers.output_counts->region.offset - buffers.sampled_ids->region.offset)
-                .data);
-        accepted = reinterpret_cast<const std::int32_t*>(
-            resources.egress()
-                .subspan(buffers.accepted_drafts->region.offset -
-                         buffers.sampled_ids->region.offset)
                 .data);
     }
     for (std::size_t b = 0; b < f.rows.size(); ++b) {
         auto& row     = result.rows[b];
         row.processed = f.verify ? 0 : f.rows[b].ids.size();
         row.drafts    = f.verify ? f.verify->extents[b] : 0;
-        if (f.verify)
-            row.input_tokens.assign(f.verify->inputs.begin() + b * f.verify->width,
-                                    f.verify->inputs.begin() + b * f.verify->width + row.drafts +
-                                        1);
         if (sampled) {
             const auto count = counts ? counts[b] : 1;
             if (count < 1 || static_cast<std::uint32_t>(count) > row.drafts + 1)
                 throw std::logic_error("Qwen4Exp generated prefix exceeds its licensed extent");
             const auto stride = f.verify ? f.verify->width : 1;
             row.tokens.assign(ids + stride * b, ids + stride * b + count);
-            row.accepted_drafts = accepted ? accepted[b] : 0;
+            row.accepted_drafts = count - 1;
             row.dead_positions  = f.dead_positions[b];
         }
         if (auto ns = collect_vision_timing(binding(f.rows[b].member.residency)))
@@ -228,18 +208,28 @@ void RankProgramImpl::commit(runtime::ExecutionTicket ticket, runtime::CommandSe
     gpu_timer.resolve();
     if (f.verify)
         commit_verify(commit);
-    else if (parallel && !std::holds_alternative<ScoreWork>(f.request.work.operation)) {
-        const auto& io   = resources.plan.persistent.buffers;
-        const auto& work = std::get<ForwardWork>(f.request.work.operation);
-        if (work.sample != SampleKind::None)
-            for (std::size_t b = 0; b < commit.rows.size(); ++b) {
-                if (!commit.rows[b].accepted) continue;
-                auto id = packed_tensor(*io.sampled_ids, {static_cast<int>(commit.rows.size())})
-                              .slice(0, b, 1);
-                auto counts = device_tensor(*io.token_counts)
-                                  .slice(1, commit.rows[b].member.residency.lane.value, 1);
-                ops::increment_token_counts(id, counts, cuda);
-            }
+    else if (const auto* work = std::get_if<ForwardWork>(&f.request.work.operation);
+             work && work->sample != SampleKind::None) {
+        const auto& io  = resources.plan.persistent.buffers;
+        const int batch = commit.rows.size();
+        auto* lengths   = static_cast<std::int32_t*>(host_tensor(io.batch.count_columns).data);
+        bool any        = false;
+        for (int b = 0; b < batch; ++b) {
+            const auto& sampling = f.rows[b].sampling;
+            lengths[b]           = sampling.presence_penalty || sampling.frequency_penalty
+                                       ? commit.rows[b].accepted
+                                       : 0;
+            any |= lengths[b] != 0;
+        }
+        if (any) {
+            auto columns = device_tensor(io.batch.count_columns).slice(0, 0, batch);
+            copy_bytes_async({columns.data, columns.bytes(), cuda.device()},
+                             {lengths, columns.bytes(), Device::cpu(), true}, cuda);
+            auto counts = device_tensor(*io.token_counts);
+            ops::increment_token_counts_batch(
+                packed_tensor(*io.sampled_ids, {1, batch}), columns,
+                device_tensor(io.batch.count_slots).slice(0, 0, batch), counts, cuda);
+        }
     }
     for (const auto& row : commit.rows)
         f.release_vision |= row.cancelled || row.failed || row.terminal;
@@ -329,7 +319,6 @@ void RankProgramImpl::drain() {
     if (resources.experts) attempt([&] { resources.experts->cancel(); });
     if (host_ple) attempt([&] { host_ple->drain(); });
     attempt([&] { resources.synchronize(); });
-    if (parallel) attempt([&] { parallel->synchronize(); });
     compute.reset();
     context.reset();
     events.clear();

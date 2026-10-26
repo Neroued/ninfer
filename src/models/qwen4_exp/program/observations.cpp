@@ -31,7 +31,7 @@ RankMemoryUsage RankProgramImpl::observe_resources() const {
     a.context_device_bytes     = plan.capacity.device_bytes;
     a.workspace_device_bytes   = plan.workspace.bytes;
     a.io_pinned_bytes = plan.pinned_draft_bytes + plan.pinned_io_bytes + plan.pinned_output_bytes +
-                        plan.pinned_sampling_bytes + plan.pinned_mtp_bytes +
+                        plan.pinned_sampling_bytes + plan.pinned_ple_handoff_bytes +
                         plan.pinned_context_bytes() + plan.pinned_aux_bytes() +
                         plan.pinned_context_counts_bytes();
     a.host_context_bytes = plan.host_context_bytes;

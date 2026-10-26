@@ -17,22 +17,16 @@ void DistributedVocabulary::sample(const Tensor& logits, const ops::SamplingConf
                                    const Tensor& valid, const Tensor& positions, int purpose,
                                    Tensor& ids) const {
     const auto combined = collect(logits, configs, valid, {});
-    if (peer.output_owner())
-        ops::sample_vocabulary_candidates(combined, configs, positions, purpose, ids, cuda);
-    peer.broadcast(ids, cuda);
+    ops::sample_vocabulary_candidates(combined, configs, positions, purpose, ids, cuda);
 }
 
 void DistributedVocabulary::accept(const Tensor& logits, const ops::SamplingConfig* configs,
                                    const Tensor& valid, const Tensor& drafts, const Tensor& extents,
-                                   Tensor& frontiers, Tensor& anchors, Tensor& licensed,
-                                   Tensor& counts, Tensor& accepted) const {
+                                   const Tensor& positions, Tensor& licensed,
+                                   Tensor& counts) const {
     const auto combined = collect(logits, configs, valid, drafts);
-    if (peer.output_owner())
-        ops::accept_vocabulary_candidates(combined, configs, drafts, extents, frontiers, anchors,
-                                          licensed, counts, accepted, cuda);
-    peer.broadcast(licensed, cuda);
-    peer.broadcast(counts, cuda);
-    peer.broadcast(accepted, cuda);
+    ops::accept_vocabulary_candidates(combined, configs, drafts, extents, positions, licensed,
+                                      counts, cuda);
 }
 
 } // namespace ninfer::models

@@ -372,8 +372,7 @@ int greedy_contract() {
                      greedy_oracle(logits, physical_rows, token_domain, batch, config, counts));
     for (std::size_t row = 0; row < result.counts.size(); ++row) {
         std::vector<int> expected_counts = counts;
-        ++expected_counts[static_cast<std::size_t>(result.tokens[row])];
-        failures += verify_exact("sample greedy increments selected token", result.counts[row],
+        failures += verify_exact("sample greedy preserves token counts", result.counts[row],
                                  expected_counts);
     }
     return failures;
@@ -410,11 +409,10 @@ int deterministic_stochastic_contract() {
                                                  ops::kSamplePurposeDecode, &test_case.counts);
 
         std::vector<int> expected_counts = test_case.counts;
-        ++expected_counts[static_cast<std::size_t>(oracle.tokens.front())];
         failures += result.integrity_failures;
         failures += verify_exact(test_case.label, result.tokens, {oracle.tokens.front()});
-        failures += verify_exact("sample increments only selected token", result.counts.front(),
-                                 expected_counts);
+        failures +=
+            verify_exact("sample preserves token counts", result.counts.front(), expected_counts);
     }
     return failures;
 }
@@ -458,10 +456,6 @@ int heterogeneous_batch_contract() {
     int failures = result.integrity_failures;
     failures += verify_exact("sample heterogeneous batch tokens", result.tokens, {5, 11, 17, 19});
     std::vector<std::vector<int>> expected = counts;
-    for (int row = 0; row < batch; ++row) {
-        ++expected[static_cast<std::size_t>(row)]
-                  [static_cast<std::size_t>(result.tokens[static_cast<std::size_t>(row)])];
-    }
     for (int row = 0; row < batch; ++row) {
         failures += verify_exact("sample heterogeneous batch isolated token counts",
                                  result.counts[static_cast<std::size_t>(row)],

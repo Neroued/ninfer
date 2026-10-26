@@ -18,24 +18,88 @@ BufferLayout plan_buffers(LayoutBuilder& b, const Config& c, const EngineOptions
                             const char* label) { return b.add_tensor(dtype, shape, 256, label); };
     const auto rows      = [&] { return tensor(DType::I32, {batch}, "batch metadata"); };
     BufferLayout out;
-    out.batch.ids            = tensor(DType::I32, {positions}, "input IDs");
-    out.batch.positions      = tensor(DType::I32, {positions}, "input ordinals");
-    out.batch.rope_positions = tensor(DType::I32, {positions, 3}, "input RoPE coordinates");
-    if (c.vision)
-        out.batch.visual_indices = tensor(DType::I32, {positions}, "visual embedding indices");
+    out.anchors                   = rows();
+    const auto decode_positions   = tensor(DType::I32, {width * batch}, "decode ordinals");
+    const auto decode_rope        = tensor(DType::I32, {width * batch, 3}, "decode coordinates");
     out.batch.valid_columns       = rows();
     out.batch.source_offsets      = tensor(DType::I64, {batch}, "source State offsets");
     out.batch.destination_offsets = tensor(DType::I64, {batch}, "destination State offsets");
     out.batch.main_tables         = rows();
     out.batch.base_positions      = rows();
     out.batch.record_offsets      = rows();
-    out.batch.accepted_columns    = rows();
     out.batch.raw_tail            = tensor(DType::I32, {2, batch}, "PLE input token tail");
     out.batch.raw_tail_offsets    = tensor(DType::I64, {batch}, "PLE token-tail offsets");
-    out.batch.row_indices         = rows();
     out.batch.count_slots         = rows();
     out.batch.sampling_positions  = rows();
     out.batch.max_positions       = positions;
+    const bool scoring            = o.purpose == EnginePurpose::CausalScoring;
+    if (!scoring)
+        out.sampling =
+            tensor(DType::I32, {static_cast<int>(sizeof(ops::SamplingConfig) / 4), batch},
+                   "sampling config");
+    const auto metadata = [&](std::int32_t n, TensorRegion ids, bool visual) {
+        MtpBatchLayout out;
+        out.ids                 = ids;
+        out.positions           = tensor(DType::I32, {n}, "MTP positions");
+        out.rope_positions      = tensor(DType::I32, {n, 3}, "MTP RoPE");
+        out.valid_columns       = rows();
+        out.source_offsets      = tensor(DType::I64, {batch}, "source State offsets");
+        out.destination_offsets = tensor(DType::I64, {batch}, "destination State offsets");
+        out.table_rows          = rows();
+        out.base_positions      = rows();
+        out.record_offsets      = rows();
+        const auto begin = ids.region.bytes ? ids.region.offset : out.positions.region.offset;
+        out.ingress      = {
+            begin, out.record_offsets.region.offset + out.record_offsets.region.bytes - begin, 256};
+        if (visual) out.visual_indices = tensor(DType::I32, {n}, "MTP visual indices");
+        return out;
+    };
+    TensorRegion last_ingress = out.sampling ? *out.sampling : out.batch.sampling_positions;
+    if (c.mtp) {
+        auto& mtp      = out.mtp.emplace();
+        mtp.extents    = rows();
+        mtp.skip_first = rows();
+        for (int step = 0; step < width - 1; ++step)
+            mtp.draft_steps.push_back(metadata(batch, {}, false));
+        last_ingress = mtp.draft_steps.back().record_offsets;
+    }
+    out.ingress = {
+        out.anchors.region.offset,
+        last_ingress.region.offset + last_ingress.region.bytes - out.anchors.region.offset, 256};
+    out.commit_destination_offsets = tensor(DType::I64, {batch}, "committed State offsets");
+    out.batch.accepted_columns     = rows();
+    out.batch.count_columns        = rows();
+    TensorRegion last_commit       = out.batch.count_columns;
+    if (out.mtp) {
+        out.mtp->last_columns   = rows();
+        out.mtp->active_columns = rows();
+        last_commit             = out.mtp->active_columns;
+    }
+    out.commit_ingress        = {out.commit_destination_offsets.region.offset,
+                                 last_commit.region.offset + last_commit.region.bytes -
+                                     out.commit_destination_offsets.region.offset,
+                                 256};
+    out.decode                = out.batch;
+    out.decode.ids            = out.anchors;
+    out.decode.positions      = decode_positions;
+    out.decode.rope_positions = decode_rope;
+    out.decode.max_positions  = width * batch;
+    out.batch.ids             = tensor(DType::I32, {positions}, "sequence IDs");
+    out.batch.positions       = tensor(DType::I32, {positions}, "sequence ordinals");
+    out.batch.rope_positions  = tensor(DType::I32, {positions, 3}, "sequence coordinates");
+    if (c.vision)
+        out.batch.visual_indices = tensor(DType::I32, {positions}, "visual embedding indices");
+    TensorRegion last_host =
+        out.batch.visual_indices ? *out.batch.visual_indices : out.batch.rope_positions;
+    if (out.mtp) {
+        out.mtp->history = metadata(positions, tensor(DType::I32, {positions}, "MTP history IDs"),
+                                    c.vision.has_value());
+        last_host        = out.mtp->history.visual_indices ? *out.mtp->history.visual_indices
+                                                           : out.mtp->history.record_offsets;
+    }
+    out.host_region = {out.ingress.offset,
+                       last_host.region.offset + last_host.region.bytes - out.ingress.offset, 256};
+    if (out.mtp) out.mtp->verify_ids = tensor(DType::I32, {width * batch}, "verify IDs");
     out.prefill_sample =
         tensor(DType::BF16, {hidden, static_cast<std::int32_t>(chunk)}, "prefill sample");
     out.pending_sample = tensor(DType::BF16, {hidden, width, batch}, "pending sample");
@@ -58,29 +122,7 @@ BufferLayout plan_buffers(LayoutBuilder& b, const Config& c, const EngineOptions
             b, {static_cast<std::int32_t>(c.text.gdn_layers), batch, width,
                 dimension(gdn.conv_channels()), dimension(gdn.key_heads),
                 dimension(gdn.value_heads), dimension(gdn.key_dim), dimension(gdn.value_dim)});
-        auto& mtp           = out.mtp.emplace();
-        const auto metadata = [&](std::int32_t n, bool visual) {
-            MtpBatchLayout out;
-            out.ids                 = tensor(DType::I32, {n}, "MTP IDs");
-            out.positions           = tensor(DType::I32, {n}, "MTP positions");
-            out.rope_positions      = tensor(DType::I32, {n, 3}, "MTP RoPE");
-            out.valid_columns       = rows();
-            out.source_offsets      = tensor(DType::I64, {batch}, "source State offsets");
-            out.destination_offsets = tensor(DType::I64, {batch}, "destination State offsets");
-            out.table_rows          = rows();
-            out.base_positions      = rows();
-            out.record_offsets      = rows();
-            const auto begin        = out.ids.region.offset;
-            const auto& last        = out.record_offsets.region;
-            out.ingress             = {begin, last.offset + last.bytes - begin, 256};
-            if (visual) out.visual_indices = tensor(DType::I32, {n}, "MTP visual indices");
-            return out;
-        };
-        mtp.history = metadata(positions, c.vision.has_value());
-        for (int step = 0; step < width; ++step) mtp.draft_steps.push_back(metadata(batch, false));
-        const auto begin      = mtp.history.ingress.offset;
-        const auto& last      = mtp.draft_steps.back().ingress;
-        mtp.ingress           = {begin, last.offset + last.bytes - begin, 256};
+        auto& mtp             = *out.mtp;
         mtp.base_conditioning = tensor(DType::BF16, {channels, batch}, "MTP bridge conditioning");
         mtp.alignment_conditioning =
             tensor(DType::BF16, {channels, width, batch}, "MTP accepted conditioning");
@@ -92,16 +134,17 @@ BufferLayout plan_buffers(LayoutBuilder& b, const Config& c, const EngineOptions
         mtp.tail_coordinates = tensor(DType::I32, {3, batch, 3}, "MTP working tail coordinates");
         mtp.tail_key_offsets = tensor(DType::I64, {batch}, "MTP tail key offsets");
         mtp.tail_coordinate_offsets = tensor(DType::I64, {batch}, "MTP tail coordinate offsets");
-        mtp.row_indices             = tensor(DType::I32, {batch}, "MTP compact rows");
-        mtp.drafts                  = tensor(DType::I32, {width - 1, batch}, "MTP proposals");
-        mtp.extents                 = rows();
-        mtp.anchors                 = rows();
-        mtp.frontiers               = rows();
-        mtp.last_columns            = rows();
-        mtp.active_columns          = rows();
-        mtp.target_tokens           = tensor(DType::I32, {width, batch}, "MTP target argmax");
-        mtp.token_counts = tensor(DType::I32, {static_cast<std::int32_t>(public_tokens), batch},
-                                  "MTP provisional token counts");
+        mtp.drafts                  = tensor(DType::I32, {batch, width - 1}, "MTP proposals");
+        // Draft inputs borrow the anchor or the preceding contiguous proposal column.
+        for (int step = 0; step < width - 1; ++step) {
+            auto& ids = mtp.draft_steps[step].ids;
+            ids       = step == 0 ? out.anchors : mtp.drafts;
+            if (step) ids.region.offset += (step - 1) * batch * sizeof(TokenId);
+            ids.shape            = {batch, 1, 1, 1};
+            ids.region.bytes     = batch * sizeof(TokenId);
+            ids.region.alignment = alignof(TokenId);
+        }
+        mtp.target_tokens = tensor(DType::I32, {width, batch}, "MTP target argmax");
     }
     if (device_ple)
         out.ple_embedding = tensor(DType::BF16, {dimension(c.text.ple.embedding), positions},
@@ -117,19 +160,14 @@ BufferLayout plan_buffers(LayoutBuilder& b, const Config& c, const EngineOptions
                    "draft greedy config");
         out.proposal_columns = rows();
     }
-    const bool scoring = o.purpose == EnginePurpose::CausalScoring;
     if (!scoring) {
         out.logits =
             tensor(DType::BF16, {static_cast<std::int32_t>(local_vocabulary), width * batch},
                    "head logits");
         out.sampled_ids   = tensor(DType::I32, {width, batch}, "generated IDs");
         out.output_counts = rows();
-        if (c.mtp) out.accepted_drafts = rows();
         out.token_counts =
             tensor(DType::I32, {static_cast<std::int32_t>(public_tokens), batch}, "token counts");
-        out.sampling =
-            tensor(DType::I32, {static_cast<std::int32_t>(sizeof(ops::SamplingConfig) / 4), batch},
-                   "sampling config");
         out.grammar_masks =
             tensor(DType::I32, {static_cast<std::int32_t>((public_tokens + 31) / 32), width, batch},
                    "grammar masks");

@@ -263,7 +263,7 @@ int acceptance(bool stochastic, int d = 5) {
     constexpr int batch = 8, ranks = 2;
     const int cap = stochastic ? 20 : 1;
     std::vector<std::uint64_t> keys(cap * (d + 1) * batch * ranks);
-    std::vector<int> drafts(d * batch), extents(batch), lengths(batch, 30), anchors(batch),
+    std::vector<int> drafts(d * batch), extents(batch), lengths(batch, 30),
         expected((d + 1) * batch), accepted(batch), licensed(batch);
     std::vector<ops::SamplingConfig> configs(batch);
     for (int b = 0; b < batch; ++b) {
@@ -279,34 +279,32 @@ int acceptance(bool stochastic, int d = 5) {
         }
         for (int col = 0; col < accepted[b]; ++col) expected[b * (d + 1) + col] = 100 + col;
         expected[b * (d + 1) + accepted[b]] = 200 + accepted[b];
-        anchors[b]                          = 200 + accepted[b];
-        lengths[b] += licensed[b];
     }
-    auto dk = to_device(keys), dd = to_device(drafts), de = to_device(extents),
-         dc = to_device(configs);
-    auto dl = to_device(std::vector<int>(batch, 30)), da = to_device(std::vector<int>(batch, -1)),
+    std::vector<int> step_major(drafts.size());
+    for (int row = 0; row < batch; ++row)
+        for (int col = 0; col < d; ++col) step_major[col * batch + row] = drafts[row * d + col];
+    auto dk = to_device(keys), dd = to_device(step_major), de = to_device(extents),
+         dc  = to_device(configs);
+    auto dl  = to_device(std::vector<int>(batch, 30)),
          doo = to_device(std::vector<int>((d + 1) * batch, -1)),
-         dn = to_device(std::vector<int>(batch, -1)), dac = to_device(std::vector<int>(batch, -1));
+         dn  = to_device(std::vector<int>(batch, -1));
     Tensor kt(dk.span(), DType::I64, {cap, d + 1, batch, ranks}),
-        dt(dd.span(), DType::I32, {d, batch}), et(de.span(), DType::I32, {batch}),
-        lt(dl.span(), DType::I32, {batch}), at(da.span(), DType::I32, {batch}),
-        ot(doo.span(), DType::I32, {d + 1, batch}), nt(dn.span(), DType::I32, {batch}),
-        act(dac.span(), DType::I32, {batch});
+        dt(Tensor(dd.span(), DType::I32, {batch, d}).permute({1, 0, 2, 3})),
+        et(de.span(), DType::I32, {batch}), lt(dl.span(), DType::I32, {batch}),
+        ot(doo.span(), DType::I32, {d + 1, batch}), nt(dn.span(), DType::I32, {batch});
     auto& device = cuda_environment().context;
     ops::accept_vocabulary_candidates(kt, static_cast<const ops::SamplingConfig*>(dc.data()), dt,
-                                      et, lt, at, ot, nt, act, device.execution_view());
+                                      et, lt, ot, nt, device.execution_view());
     device.synchronize();
     int alias_failure = 1;
     try {
         ops::accept_vocabulary_candidates(kt, static_cast<const ops::SamplingConfig*>(dc.data()),
-                                          dt, et, lt, lt, ot, nt, act, device.execution_view());
+                                          dt, et, lt, ot, lt, device.execution_view());
         device.synchronize();
     } catch (const std::invalid_argument&) { alias_failure = 0; }
     return alias_failure +
            verify_exact("licensed", from_device<int>(doo.data(), expected.size()), expected) +
            verify_exact("lengths", from_device<int>(dl.data(), batch), lengths) +
-           verify_exact("anchors", from_device<int>(da.data(), batch), anchors) +
-           verify_exact("accepted", from_device<int>(dac.data(), batch), accepted) +
            verify_exact("counts", from_device<int>(dn.data(), batch), licensed);
 }
 
@@ -365,18 +363,18 @@ int acceptance_probability() {
     }
     auto dk = to_device(keys), dc = to_device(configs);
     auto dd = to_device(std::vector<int>(batch, 11)), de = to_device(std::vector<int>(batch, 1));
-    auto dl = to_device(std::vector<int>(batch, 0)), da = to_device(std::vector<int>(batch, 0));
+    auto dl   = to_device(std::vector<int>(batch, 0));
     auto dout = to_device(std::vector<int>(batch * 2, 0));
-    auto dn = to_device(std::vector<int>(batch, 0)), dac = to_device(std::vector<int>(batch, 0));
+    auto dn   = to_device(std::vector<int>(batch, 0));
     Tensor kt(dk.span(), DType::I64, {20, 2, batch, 2}), dt(dd.span(), DType::I32, {1, batch});
     Tensor et(de.span(), DType::I32, {batch}), lt(dl.span(), DType::I32, {batch});
-    Tensor at(da.span(), DType::I32, {batch}), ot(dout.span(), DType::I32, {2, batch});
-    Tensor nt(dn.span(), DType::I32, {batch}), act(dac.span(), DType::I32, {batch});
+    Tensor ot(dout.span(), DType::I32, {2, batch});
+    Tensor nt(dn.span(), DType::I32, {batch});
     auto& device = cuda_environment().context;
     DecodeGraphDefinition definition;
     definition.capture(device.stream(), [&] {
         ops::accept_vocabulary_candidates(kt, static_cast<const ops::SamplingConfig*>(dc.data()),
-                                          dt, et, lt, at, ot, nt, act, device.execution_view());
+                                          dt, et, lt, ot, nt, device.execution_view());
     });
     DecodeGraphExecutable graph;
     graph.instantiate(definition);
@@ -388,11 +386,11 @@ int acceptance_probability() {
         graph.launch(device.stream());
         device.synchronize();
         const auto result = from_device<int>(dout.data(), batch * 2);
-        const auto counts = from_device<int>(dac.data(), batch);
+        const auto counts = from_device<int>(dn.data(), batch);
         for (int b = 0; b < batch; ++b) {
-            accepted += counts[b];
-            errors += counts[b] ? result[b * 2] != 11 || result[b * 2 + 1] != 33
-                                : result[b * 2] != 22 || result[b * 2 + 1] != 0;
+            accepted += counts[b] - 1;
+            errors += counts[b] == 2 ? result[b * 2] != 11 || result[b * 2 + 1] != 33
+                                     : result[b * 2] != 22 || result[b * 2 + 1] != 0;
         }
     }
     errors += std::abs(double(accepted) / (512 * batch) - .25) > .035;

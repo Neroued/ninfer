@@ -3,6 +3,8 @@
 #include "core/transfer.h"
 #include "ninfer/ops/sampling.h"
 
+#include <cstring>
+
 namespace ninfer::models::qwen4_exp {
 namespace {
 ExecutionPlan checked_plan(const execution::Parameters& p, ExecutionPlan plan) {
@@ -20,7 +22,7 @@ Resources::Resources(const execution::Parameters& p, ExecutionPlan input, Device
       persistent_(device.device(), plan.persistent.bytes),
       workspace_(device.device(), plan.workspace.bytes), ingress_(plan.pinned_io_bytes),
       egress_(plan.pinned_output_bytes), sampling_(plan.pinned_sampling_bytes),
-      mtp_ingress_(plan.pinned_mtp_bytes), compute_aux_(plan.pinned_aux_bytes()),
+      ple_handoff_(plan.pinned_ple_handoff_bytes), compute_aux_(plan.pinned_aux_bytes()),
       context_counts_(plan.pinned_context_counts_bytes()), ple_stream_(device),
       ple_transfer_(device.execution_view(ple_stream_.stream())),
       workspace(workspace_.span().subspan(0, plan.workspace.general_bytes)) {
@@ -32,8 +34,11 @@ Resources::Resources(const execution::Parameters& p, ExecutionPlan input, Device
     }
     if (plan.workspace.vision) vision.emplace(device, *plan.workspace.vision);
     const auto backing = persistent_.span();
-    states             = std::make_unique<StateViews>(context_.span(), plan.persistent.state);
-    main               = std::make_unique<QsaCache>(context_.span(), backing, plan.persistent.main);
+    std::memset(ingress_.data(), 0, ingress_.size());
+    copy_bytes_async(plan.persistent.buffers.host_region.bind(backing), ingress_.span(),
+                     device.execution_view());
+    states = std::make_unique<StateViews>(context_.span(), plan.persistent.state);
+    main   = std::make_unique<QsaCache>(context_.span(), backing, plan.persistent.main);
     if (plan.persistent.mtp)
         mtp = std::make_unique<QsaCache>(context_.span(), backing, *plan.persistent.mtp);
     std::vector<context::ContextTableStorage> pools;
@@ -66,12 +71,6 @@ Resources::Resources(const execution::Parameters& p, ExecutionPlan input, Device
             throw std::logic_error("PLE allocated capacity differs from the execution plan");
     }
     if (plan.persistent.buffers.mtp) {
-        const auto& region = plan.persistent.buffers.mtp->row_indices;
-        auto* rows         = static_cast<std::int32_t*>(mtp_ingress_.data());
-        for (std::uint32_t i = 0; i < plan.shape.max_concurrency; ++i) rows[i] = i;
-        copy_bytes_async(region.region.bind(backing),
-                         mtp_ingress_.span().subspan(0, region.region.bytes),
-                         device.execution_view());
         const auto& tail = *plan.persistent.buffers.mtp;
         const auto& qsa  = plan.profile->config.text.qsa;
         std::vector<std::int64_t> offsets(plan.shape.max_concurrency);
@@ -156,12 +155,12 @@ Tensor Resources::packed(const TensorRegion& region, std::initializer_list<std::
 namespace {
 template <class Layout>
 execution::BatchView bind_batch(Resources& resources, const Layout& layout,
-                                const TensorRegion& tables, std::int32_t tokens, std::int32_t batch,
-                                std::uint32_t visible) {
+                                const TensorRegion& tables, const TensorRegion& ids,
+                                std::int32_t tokens, std::int32_t batch, std::uint32_t visible) {
     const auto row = [&](const TensorRegion& r) { return resources.tensor(r).slice(0, 0, batch); };
     return {tokens,
             batch,
-            resources.packed(layout.ids, {tokens, batch}),
+            resources.packed(ids, {tokens, batch}),
             resources.packed(layout.positions, {tokens, batch}),
             resources.packed(layout.rope_positions, {tokens, 3, batch}),
             row(layout.valid_columns),
@@ -175,14 +174,16 @@ execution::BatchView bind_batch(Resources& resources, const Layout& layout,
 } // namespace
 
 execution::BatchView Resources::main_batch(std::int32_t tokens, std::int32_t batch,
-                                           std::uint32_t visible) {
-    const auto& layout = plan.persistent.buffers.batch;
-    return bind_batch(*this, layout, layout.main_tables, tokens, batch, visible);
+                                           std::uint32_t visible, bool sequence) {
+    const auto& layout = sequence ? plan.persistent.buffers.batch : plan.persistent.buffers.decode;
+    const auto& ids =
+        !sequence && tokens > 1 ? plan.persistent.buffers.mtp->verify_ids : layout.ids;
+    return bind_batch(*this, layout, layout.main_tables, ids, tokens, batch, visible);
 }
 
 execution::BatchView Resources::mtp_batch(const MtpBatchLayout& layout, std::int32_t tokens,
                                           std::int32_t batch, std::uint32_t visible) {
-    return bind_batch(*this, layout, layout.table_rows, tokens, batch, visible);
+    return bind_batch(*this, layout, layout.table_rows, layout.ids, tokens, batch, visible);
 }
 
 ops::QsaTailStateView Resources::mtp_working_tail(std::uint32_t slot, std::int32_t batch) {

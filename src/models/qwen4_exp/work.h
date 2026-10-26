@@ -98,7 +98,6 @@ struct RowResult {
     std::uint32_t drafts          = 0;
     std::uint32_t accepted_drafts = 0;
     std::vector<TokenId> tokens;
-    std::vector<TokenId> input_tokens;
     std::uint32_t dead_positions = 0;
 };
 

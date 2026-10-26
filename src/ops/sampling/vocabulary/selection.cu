@@ -33,7 +33,7 @@ Plan plan(int rows, std::int64_t columns, int cap) {
             cap == 20 && partials > 25 ? bytes(div_up(partials, 25)) : 0};
 }
 
-__device__ float adjusted(float raw, int id, const SamplingConfig& cfg, const int* drafts,
+__device__ float adjusted(float raw, int id, const SamplingConfig& cfg, TokenRow drafts,
                           int column) {
     // Mask positions are independent of the optional penalty overlay.
     if (cfg.mask.words &&
@@ -46,17 +46,17 @@ __device__ float adjusted(float raw, int id, const SamplingConfig& cfg, const in
 
 template <bool Greedy>
 __global__ void partial_kernel(const __nv_bfloat16* logits, int rows, int begin, int domain,
-                               const SamplingConfig* configs, const int* valid, const int* drafts,
+                               const SamplingConfig* configs, const int* valid, TokenRows drafts,
                                int tokens, std::int64_t column_offset, unsigned long long* output,
                                int partials) {
     const int column         = blockIdx.y;
     const auto global_column = column_offset + column;
     const int b = global_column / tokens, t = global_column % tokens;
-    const int start     = blockIdx.x * (Greedy ? kGreedyTile : 512);
-    const bool active   = t < valid[b];
-    const auto cfg      = configs[b];
-    const auto* overlay = drafts ? drafts + std::int64_t(b) * (tokens - 1) : nullptr;
-    const auto base     = global_column * rows;
+    const int start    = blockIdx.x * (Greedy ? kGreedyTile : 512);
+    const bool active  = t < valid[b];
+    const auto cfg     = configs[b];
+    const auto overlay = drafts[b];
+    const auto base    = global_column * rows;
     if constexpr (Greedy) {
         unsigned long long key = 0;
         for (int offset = threadIdx.x; offset < min(kGreedyTile, rows - start);
@@ -180,14 +180,14 @@ void vocabulary_candidates(const Tensor& logits, int token_begin, int token_doma
                     execution.device());
     if (drafts.data) {
         if (tokens < 2) throw std::invalid_argument("vocabulary_candidates: drafts require T>=2");
-        operand::tensor(drafts, DType::I32, {tokens - 1, batch}, 4, kOp, "drafts",
-                        execution.device());
+        operand::strided_tensor(drafts, DType::I32, {tokens - 1, batch}, 4, kOp, "drafts",
+                                execution.device());
     }
     if (!configs || !operand::aligned(configs, alignof(SamplingConfig)))
         throw std::invalid_argument("vocabulary_candidates: invalid configs");
     const auto destination = operand::range(keys, kOp);
     for (const auto* input : {&logits, &valid_columns, &drafts})
-        if (input->data) operand::disjoint(destination, operand::range(*input, kOp), kOp);
+        if (input->data) operand::disjoint(destination, operand::strided_range(*input, kOp), kOp);
     const auto config_range = operand::range(configs, sizeof(SamplingConfig) * batch, kOp);
     operand::disjoint(destination, config_range, kOp);
     operand::device(workspace.device(), execution.device(), kOp, "workspace");
@@ -200,7 +200,7 @@ void vocabulary_candidates(const Tensor& logits, int token_begin, int token_doma
         operand::disjoint(range, destination, kOp);
         operand::disjoint(range, config_range, kOp);
         for (const auto* input : {&logits, &valid_columns, &drafts})
-            if (input->data) operand::disjoint(range, operand::range(*input, kOp), kOp);
+            if (input->data) operand::disjoint(range, operand::strided_range(*input, kOp), kOp);
         first  = static_cast<unsigned long long*>(scratch.data);
         second = reinterpret_cast<unsigned long long*>(static_cast<char*>(scratch.data) +
                                                        selected.first_bytes);
@@ -213,16 +213,16 @@ void vocabulary_candidates(const Tensor& logits, int token_begin, int token_doma
         if (cap == 1) {
             partial_kernel<true><<<grid, 128, 0, execution.stream()>>>(
                 static_cast<const __nv_bfloat16*>(logits.data), rows, token_begin, token_domain,
-                configs, static_cast<const int*>(valid_columns.data),
-                static_cast<const int*>(drafts.data), tokens, offset, partial, selected.partials);
+                configs, static_cast<const int*>(valid_columns.data), token_rows(drafts), tokens,
+                offset, partial, selected.partials);
             if (selected.partials > 1)
                 merge_greedy<<<width, 128, 0, execution.stream()>>>(partial, result,
                                                                     selected.partials);
         } else {
             partial_kernel<false><<<grid, Schedule::kSamplerBlock, 0, execution.stream()>>>(
                 static_cast<const __nv_bfloat16*>(logits.data), rows, token_begin, token_domain,
-                configs, static_cast<const int*>(valid_columns.data),
-                static_cast<const int*>(drafts.data), tokens, offset, partial, selected.partials);
+                configs, static_cast<const int*>(valid_columns.data), token_rows(drafts), tokens,
+                offset, partial, selected.partials);
             auto* next = second;
             for (int lists = selected.partials; lists > 1;) {
                 const int groups  = div_up(lists, 25);

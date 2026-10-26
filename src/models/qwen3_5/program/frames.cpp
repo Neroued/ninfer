@@ -91,21 +91,16 @@ FrameLayout plan_frames(LayoutBuilder& builder, const FrameSpec& spec) {
         mtp.ar_hidden =
             add(builder, DType::BF16, {spec.hidden, batch}, "MTP autoregressive hidden");
         mtp.next_hidden = add(builder, DType::BF16, {spec.hidden, batch}, "MTP next hidden");
-        mtp.drafts      = add(builder, DType::I32, {drafts, batch}, "MTP current drafts");
+        mtp.drafts      = add(builder, DType::I32, {batch, drafts}, "MTP current drafts");
         mtp.proposal_logits =
             add(builder, DType::BF16, {spec.output_rows, batch}, "MTP proposal logits");
         mtp.history_conditioning =
             add(builder, DType::BF16, {spec.hidden, inputs}, "MTP history conditioning");
         mtp.history_ids       = add(builder, DType::I32, {inputs}, "MTP history ids");
         mtp.history_positions = add(builder, DType::I32, {inputs}, "MTP history positions");
+        mtp.history_columns   = add(builder, DType::I32, {batch}, "MTP history lengths");
         mtp.history_rope_positions =
             add(builder, DType::I32, {inputs, 3}, "MTP history rope positions");
-        mtp.step_ids       = add(builder, DType::I32, {batch, drafts}, "MTP step ids");
-        mtp.step_positions = add(builder, DType::I32, {batch, drafts}, "MTP step positions");
-        mtp.step_rope_positions =
-            add(builder, DType::I32, {3 * batch, drafts}, "MTP step rope positions");
-        mtp.step_valid_columns =
-            add(builder, DType::I32, {batch, drafts}, "MTP step valid columns");
     }
     if (is_masked_draft_backend(spec.backend)) {
         auto& draft        = out.dflash.emplace();
@@ -144,14 +139,6 @@ FrameLayout plan_frames(LayoutBuilder& builder, const FrameSpec& spec) {
     if (spec.draft_window) {
         out.host.drafts = add(host, DType::I32, {width - 1, batch}, "Host draft handoff");
     }
-    if (out.mtp) {
-        out.host.step_positions =
-            add(host, DType::I32, {batch, width - 1}, "Host MTP step positions");
-        out.host.step_rope_positions =
-            add(host, DType::I32, {3 * batch, width - 1}, "Host MTP step rope positions");
-        out.host.step_valid_columns =
-            add(host, DType::I32, {batch, width - 1}, "Host MTP step valid columns");
-    }
     if (spec.causal_scoring) {
         out.host.score_logprobs =
             add(host, DType::FP32, {kScoreTile}, "Host score log probabilities");
@@ -168,18 +155,19 @@ MtpFrame::MtpFrame(MemorySpan backing, const MtpFrameLayout& layout)
       history_ids(layout.history_ids.bind(backing)),
       history_positions(layout.history_positions.bind(backing)),
       history_rope_positions(layout.history_rope_positions.bind(backing)),
-      step_ids(layout.step_ids.bind(backing)), step_positions(layout.step_positions.bind(backing)),
-      step_rope_positions(layout.step_rope_positions.bind(backing)),
-      step_valid_columns(layout.step_valid_columns.bind(backing)) {}
+      history_columns(layout.history_columns.bind(backing)) {}
+
+Tensor MtpFrame::proposals(std::int32_t batch) const {
+    return drafts.slice(0, 0, batch).permute({1, 0, 2, 3});
+}
 
 MtpStepView MtpFrame::step_view(std::int32_t step, std::int32_t batch) const {
-    if (step < 0 || step >= step_ids.ne[1] || batch <= 0 || batch > step_ids.ne[0]) {
+    if (step < 0 || step >= drafts.ne[1] || batch <= 0 || batch > drafts.ne[0])
         throw std::invalid_argument("MTP step exceeds its frame capacity");
-    }
     const auto view = [&](const Tensor& value) {
         return value.slice(1, step, 1).slice(0, 0, batch).view({batch});
     };
-    return {.ids       = view(step_ids),
+    return {.ids       = view(drafts),
             .positions = view(step_positions),
             .rope_positions =
                 step_rope_positions.slice(1, step, 1).slice(0, 0, 3 * batch).view({batch, 3}),
@@ -209,6 +197,14 @@ ExecutionFrame::ExecutionFrame(MemorySpan backing, const FrameLayout& layout)
     const auto in    = [&](std::size_t offset) {
         return Tensor(ingress.subspan(offset), DType::I32, {batch});
     };
+    sampling_positions = in(offsetof(FrameIngress, sampling_positions));
+    history_skip       = in(offsetof(FrameIngress, history_skip));
+    previous_rope =
+        Tensor(ingress.subspan(offsetof(FrameIngress, previous_rope)), DType::I32, {batch, 3});
+    decode_positions =
+        Tensor(ingress.subspan(offsetof(FrameIngress, decode_positions)), DType::I32, {16 * batch});
+    decode_rope =
+        Tensor(ingress.subspan(offsetof(FrameIngress, decode_rope)), DType::I32, {16 * batch, 3});
     anchors                = in(offsetof(FrameIngress, anchors));
     frontiers              = in(offsetof(FrameIngress, frontiers));
     backend_frontiers      = in(offsetof(FrameIngress, backend_frontiers));
@@ -231,14 +227,14 @@ ExecutionFrame::ExecutionFrame(MemorySpan backing, const FrameLayout& layout)
     };
     commit_destination_offsets = Tensor(
         commit.subspan(offsetof(FrameCommit, state_destination_offsets)), DType::I64, {batch});
-    history_columns     = committed(offsetof(FrameCommit, history_columns));
+    last_columns        = committed(offsetof(FrameCommit, last_columns));
+    accepted_columns    = committed(offsetof(FrameCommit, accepted_columns));
+    count_columns       = committed(offsetof(FrameCommit, count_columns));
     draft_append_starts = committed(offsetof(FrameCommit, draft_append_starts));
     draft_append_ends   = committed(offsetof(FrameCommit, draft_append_ends));
     output_tokens =
         Tensor(egress.subspan(offsetof(FrameEgress, tokens)), DType::I32, {width, batch});
     output_counts = Tensor(egress.subspan(offsetof(FrameEgress, counts)), DType::I32, {batch});
-    accepted_drafts =
-        Tensor(egress.subspan(offsetof(FrameEgress, accepted_drafts)), DType::I32, {batch});
     if (layout.logits) logits = layout.logits->bind(backing);
     if (layout.input_embeddings) input_embeddings = layout.input_embeddings->bind(backing);
     if (layout.visual_indices) visual_indices = layout.visual_indices->bind(backing);
@@ -263,12 +259,18 @@ ExecutionFrame::ExecutionFrame(MemorySpan backing, const FrameLayout& layout)
     if (layout.host.control_tokens) host_control_tokens = layout.host.control_tokens->bind(host);
     if (layout.host.masks) host_masks = layout.host.masks->bind(host);
     if (layout.host.drafts) host_drafts = layout.host.drafts->bind(host);
-    if (layout.host.step_positions) host_step_positions = layout.host.step_positions->bind(host);
-    if (layout.host.step_rope_positions) {
-        host_step_rope_positions = layout.host.step_rope_positions->bind(host);
-    }
-    if (layout.host.step_valid_columns) {
-        host_step_valid_columns = layout.host.step_valid_columns->bind(host);
+    if (mtp) {
+        const auto bind_steps = [&](MemorySpan span, std::size_t offset, int axes) {
+            return Tensor(span.subspan(offset), DType::I32,
+                          {axes * batch, static_cast<int>(spec.draft_window)});
+        };
+        mtp->step_positions      = bind_steps(ingress, offsetof(FrameIngress, step_positions), 1);
+        mtp->step_rope_positions = bind_steps(ingress, offsetof(FrameIngress, step_rope), 3);
+        mtp->step_valid_columns  = bind_steps(ingress, offsetof(FrameIngress, step_valid), 1);
+        const auto staging       = layout.host.ingress.bind(host);
+        host_step_positions      = bind_steps(staging, offsetof(FrameIngress, step_positions), 1);
+        host_step_rope_positions = bind_steps(staging, offsetof(FrameIngress, step_rope), 3);
+        host_step_valid_columns  = bind_steps(staging, offsetof(FrameIngress, step_valid), 1);
     }
     if (layout.host.score_logprobs) host_score_logprobs = layout.host.score_logprobs->bind(host);
 }
@@ -286,6 +288,26 @@ FrameInputView ExecutionFrame::input_view(std::int32_t width, std::int32_t batch
             .cache_positions = prefix(cache_positions, {width, batch}),
             .rope_positions  = prefix(rope_positions, {width * batch, 3}),
             .hidden          = prefix(hidden, {spec.hidden, width, batch})};
+}
+
+FrameInputView ExecutionFrame::decode_view(std::int32_t width, std::int32_t batch) const {
+    validate_input_shape(width, batch);
+    if (width > 16) throw std::invalid_argument("Qwen3.5 decode exceeds its token capacity");
+    return {prefix(width == 1 ? anchors : input_ids, {width, batch}),
+            prefix(decode_positions, {width, batch}), prefix(decode_rope, {width * batch, 3}),
+            prefix(hidden, {spec.hidden, width, batch})};
+}
+
+FrameInputView ExecutionFrame::host_decode_view(std::int32_t width, std::int32_t batch) const {
+    validate_input_shape(width, batch);
+    if (width > 16) throw std::invalid_argument("Qwen3.5 decode exceeds its token capacity");
+    const auto view = [&](auto& storage, std::initializer_list<std::int32_t> shape) {
+        return Tensor({storage.data(), sizeof(storage), Device::cpu(), true}, DType::I32, shape);
+    };
+    return {width == 1 ? view(host_ingress->anchors, {1, batch}) : Tensor{},
+            view(host_ingress->decode_positions, {width, batch}),
+            view(host_ingress->decode_rope, {width * batch, 3}),
+            {}};
 }
 
 FrameInputView ExecutionFrame::host_input_view(std::int32_t width, std::int32_t batch) const {

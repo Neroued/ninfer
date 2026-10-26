@@ -95,12 +95,13 @@ struct ViewValidation {
         }
     }
 
-    void state(const ConstQsaTailStateView& v, int batch) const {
+    void state(const ConstQsaTailStateView& v, int batch, int layers = 1) const {
         common::operand::state_field(v.raw_keys, DType::BF16, {128, 3}, 2, op, "tail raw keys",
                                      device);
         common::operand::state_field(v.first_rope, DType::I32, {3}, 4, op, "tail coordinates",
                                      device);
-        require(v.raw_keys.field.layers == 1 && v.first_rope.field.layers == 1, "state layer");
+        require(v.raw_keys.field.layers == layers && v.first_rope.field.layers == layers,
+                "state layer");
         const auto& raw  = v.raw_keys.records;
         const auto& rope = v.first_rope.records;
         require(raw.byte_offsets.ne[0] == batch && rope.byte_offsets.ne[0] == batch, "state rows");

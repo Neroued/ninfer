@@ -7,6 +7,7 @@ struct Options {
     std::string op = "record", valid = "dense", commits = "dense";
     std::vector<int> tokens{4};
     int heads = 32, qk_heads = 32, batch = 1, layers = 34;
+    bool alias_records = true;
 };
 
 inline Options parse(int argc, char** argv) {
@@ -18,6 +19,7 @@ inline Options parse(int argc, char** argv) {
                          "  --op core|update|record|fold|input-update|input-record|chain\n"
                          "  --tokens T[,T...] --batch B --layers L --qk-heads H --value-heads H\n"
                          "  --valid dense|N[,N...] --commits dense|N[,N...]\n"
+                         "  --kv-records alias|copy (record only; default alias)\n"
                          "core is single sequence; update is T=1; fold measures all layers.\n"
                          "chain measures one input-record, recurrence-record and one-layer fold.\n";
             measurement::help();
@@ -40,7 +42,11 @@ inline Options parse(int argc, char** argv) {
             o.valid = value;
         else if (flag == "--commits")
             o.commits = value;
-        else if (!measurement::parse(o.timing, flag, value))
+        else if (flag == "--kv-records") {
+            if (value != "alias" && value != "copy")
+                throw std::invalid_argument("kv-records: alias|copy");
+            o.alias_records = value == "alias";
+        } else if (!measurement::parse(o.timing, flag, value))
             throw std::invalid_argument("unknown option");
     }
     if (o.op != "core" && o.op != "update" && o.op != "record" && o.op != "fold" &&

@@ -67,9 +67,8 @@ void run(const Options& options) {
         row.tokens           = t;
         row.workspace_bytes  = capacity;
         const auto logits_io = 8ULL * e * t;
-        const auto bytes =
-            control.model_weight_bytes() + e * 4 + 2ULL * h * t + logits_io + 8ULL * k * t;
-        const double flops = 2.0 * h * e * t;
+        const auto bytes     = control.model_weight_bytes() + e * 4 + 2ULL * h * t + 8ULL * k * t;
+        const double flops   = 2.0 * h * e * t;
         for (const auto& execution :
              measurement::selections(options.timing.execution, "graph", "eager"))
             for (const auto& cache :

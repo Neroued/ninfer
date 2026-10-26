@@ -53,13 +53,15 @@ int main(int argc, char** argv) {
         L2FlushBuffer flush(options.flush_bytes);
         measurement::Csv csv(options.csv_out, "latent_storage,end,live_queries,scored_queries,key_"
                                               "payload_bytes,query_payload_bytes,output_bytes,"
-                                              "score_flops,key_payload_GBps,score_TFLOps");
+                                              "score_flops,key_payload_GBps,score_TFLOps,"
+                                              "metadata_bytes");
         for (int T : tokens) {
             if (T > end) throw std::invalid_argument("tokens exceed --end");
             kp::IndexerFixture f(device.execution_view(), T, batch, end, layers, ragged, storage);
             std::uint64_t live = 0, scored = 0, key_bytes = 0, query_bytes = 0,
-                          output_bytes = 8ULL * T * batch;
-            double flops               = 0;
+                          output_bytes   = 8ULL * T * batch;
+            std::uint64_t metadata_bytes = 4ULL * batch;
+            double flops                 = 0;
             for (int b = 0; b < batch; ++b) {
                 int largest = 0;
                 for (int t = 0; t < f.valid.at(b); ++t) {
@@ -72,6 +74,8 @@ int main(int argc, char** argv) {
                     flops += 8192. * count;
                 }
                 key_bytes += 256ULL * largest;
+                metadata_bytes += 4ULL * f.valid.at(b);
+                if (largest) metadata_bytes += 4 + 8ULL * ((largest + 15) / 16);
             }
             query_bytes = scored * (8192 + 128);
             measurement::Row row;
@@ -99,7 +103,8 @@ int main(int argc, char** argv) {
                             std::to_string(scored) + "," + std::to_string(key_bytes) + "," +
                             std::to_string(query_bytes) + "," + std::to_string(output_bytes) + "," +
                             std::to_string(flops) + "," + std::to_string(key_bytes / us / 1000) +
-                            "," + std::to_string(flops / us / 1e6));
+                            "," + std::to_string(flops / us / 1e6) + "," +
+                            std::to_string(metadata_bytes));
                 }
         }
     } catch (const std::exception& e) {

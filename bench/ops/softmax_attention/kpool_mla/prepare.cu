@@ -11,7 +11,7 @@ int main(int argc, char** argv) {
         measurement::Options options;
         std::vector<int> tokens{1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 4096};
         int batch = 1, phase = 0;
-        bool update = false, ragged = false, inplace = false;
+        bool update = false, ragged = false, inplace = false, inactive = false;
         auto projection = kp::Projection::Full;
         for (int i = 1; i < argc; ++i) {
             const std::string flag = argv[i];
@@ -20,7 +20,8 @@ int main(int argc, char** argv) {
                     << "Kpool MLA BF16 complete Prepare entry, fixed "
                        "H4096/Dc512/Di128/Rq1536/Hi32.\n"
                        "  --projection full|query-history|history --form record|update\n"
-                       "  --tokens N,... --batch 1..8 --phase 0..3 --ragged 0|1 --inplace 0|1\n";
+                       "  --tokens N,... --batch 1..8 --phase 0..3 --ragged 0|1 --inplace 0|1\n"
+                       "  --inactive 0|1  zero valid columns in every physical row\n";
                 measurement::help();
                 return 0;
             }
@@ -36,6 +37,8 @@ int main(int argc, char** argv) {
                 ragged = measurement::integer(v, 0, 1);
             else if (flag == "--inplace")
                 inplace = measurement::integer(v, 0, 1);
+            else if (flag == "--inactive")
+                inactive = measurement::integer(v, 0, 1);
             else if (flag == "--form" && (v == "record" || v == "update"))
                 update = v == "update";
             else if (flag == "--projection" &&
@@ -58,6 +61,19 @@ int main(int argc, char** argv) {
         for (int T : tokens) {
             kp::Fixture f(weights, device.execution_view(), T, batch, update, ragged, false,
                           inplace, phase);
+            if (inactive) {
+                for (int b = 0; b < batch; ++b) {
+                    f.valid.at(b)          = 0;
+                    f.selectors.at(b)      = -1;
+                    f.offsets.at(b)        = -1;
+                    f.before_offsets.at(b) = -1;
+                    f.after_offsets.at(b)  = -1;
+                    for (int t = 0; t < T; ++t) f.positions.at(t, b) = -1;
+                }
+                for (auto* v : {&f.valid, &f.selectors, &f.offsets, &f.positions}) v->upload();
+                f.before_offsets.upload();
+                f.after_offsets.upload();
+            }
             const std::size_t M = std::size_t(T) * batch;
             std::size_t live = 0, pools = 0, tail_read = 0, tail_write = 0;
             for (int b = 0; b < batch; ++b) {
@@ -89,7 +105,7 @@ int main(int argc, char** argv) {
             row.tokens          = T;
             row.batch           = batch;
             row.layers          = 11;
-            row.valid           = ragged ? "ragged" : "dense";
+            row.valid           = inactive ? "empty" : ragged ? "ragged" : "dense";
             row.workspace_bytes = f.workspace_bytes;
             for (const auto& execution :
                  measurement::selections(options.execution, "graph", "eager"))

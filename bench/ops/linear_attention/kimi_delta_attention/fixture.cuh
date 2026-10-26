@@ -64,14 +64,41 @@ struct Fixture {
         sources.copy_from_host(so.data(), sources.size());
         destinations = make_buffer(b * sizeof(std::int64_t));
         destinations.copy_from_host(ds.data(), destinations.size());
-        storage = std::make_unique<StateImageStorage>(state.span(), state_layout);
-        states  = std::make_unique<LinearAttentionStateView>(*storage, fields);
+        storage           = std::make_unique<StateImageStorage>(state.span(), state_layout);
+        states            = std::make_unique<LinearAttentionStateView>(*storage, fields);
+        auto recurrent    = make_f32(std::size_t(128) * 128 * h * layers * b, 19, -0.1F, 0.1F);
+        auto conv         = make_bf16(std::size_t(channels) * 3 * layers * b, 23, -0.1F, 0.1F);
+        const auto stream = device_context().execution_view().stream();
+        for (int i = 0; i < b; ++i)
+            for (int l = 0; l < layers; ++l) {
+                const auto r     = states->recurrent_tensor(l, so[i]);
+                const auto c     = states->conv_tensor(l, so[i]);
+                const auto index = std::size_t(i) * layers + l;
+                CUDA_CHECK(cudaMemcpyAsync(
+                    r.data, static_cast<std::byte*>(recurrent.data()) + index * r.bytes(),
+                    r.bytes(), cudaMemcpyDeviceToDevice, stream));
+                CUDA_CHECK(cudaMemcpyAsync(c.data,
+                                           static_cast<std::byte*>(conv.data()) + index * c.bytes(),
+                                           c.bytes(), cudaMemcpyDeviceToDevice, stream));
+            }
         if (o.op == "record" || o.op == "fold" || o.op == "input-record" || o.op == "chain") {
             LayoutBuilder rb;
             auto layout   = plan_kda_replay_records(rb, {layers, b, t, channels, qh, h, 128, 128});
             record_buffer = make_zeros(rb.finish(256));
             records       = KdaReplayRecords(record_buffer.span(), layout);
             fold = std::make_unique<ops::KdaReplayFoldPlan>(records, states->all_layers_view());
+            if (o.op == "fold") {
+                auto conv_records = make_bf16(records.conv.numel(), 29, -0.1F, 0.1F);
+                CUDA_CHECK(cudaMemcpyAsync(records.conv.data, conv_records.data(),
+                                           records.conv.bytes(), cudaMemcpyDeviceToDevice, stream));
+            }
+            if (o.op == "record" && o.alias_records) {
+                auto layer = records.layer(0, b);
+                CUDA_CHECK(cudaMemcpyAsync(layer.key.data, k.data(), k.size(),
+                                           cudaMemcpyDeviceToDevice, stream));
+                CUDA_CHECK(cudaMemcpyAsync(layer.value.data, v.data(), v.size(),
+                                           cudaMemcpyDeviceToDevice, stream));
+            }
         }
         if (o.op == "core")
             capacity = ops::kimi_delta_attention_workspace_capacity_bytes(qh, h, t, t);
@@ -106,15 +133,19 @@ struct Fixture {
         return Tensor(x.span(), DType::BF16, {128, heads, t, b});
     }
 
+    bool aliases_kv_records() const {
+        return o.op == "chain" || (o.op == "record" && o.alias_records);
+    }
+
     void record(int layer, CudaExecutionView cuda) {
-        auto rr = records.layer(layer, b);
-        auto y  = vector(out, h);
+        auto rr          = records.layer(layer, b);
+        auto y           = vector(out, h);
+        const bool alias = aliases_kv_records();
         ops::kimi_delta_attention_replay_record(
-            vector(q, qh), o.op == "chain" ? rr.key : vector(k, qh),
-            o.op == "chain" ? rr.value : vector(v, h), vector(g, h),
-            Tensor(beta.span(), DType::BF16, {h, t, b}), Tensor(a_log.span(), DType::FP32, {h}),
-            Tensor(bias.span(), DType::FP32, {128, h}), -5, 0.08838834764831845F,
-            states->layer_view(layer, st()).recurrent, vt(),
+            vector(q, qh), alias ? rr.key : vector(k, qh), alias ? rr.value : vector(v, h),
+            vector(g, h), Tensor(beta.span(), DType::BF16, {h, t, b}),
+            Tensor(a_log.span(), DType::FP32, {h}), Tensor(bias.span(), DType::FP32, {128, h}), -5,
+            0.08838834764831845F, states->layer_view(layer, st()).recurrent, vt(),
             {rr.key, rr.value, rr.log_decay, rr.beta}, y, cuda);
     }
 

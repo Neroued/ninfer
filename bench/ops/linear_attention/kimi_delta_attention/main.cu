@@ -10,7 +10,7 @@ int main(int argc, char** argv) {
         measurement::hardware();
         auto& device = device_context();
         L2FlushBuffer flush(o.timing.flush_bytes);
-        measurement::Csv csv(o.timing.csv_out, kda::Traffic::columns);
+        measurement::Csv csv(o.timing.csv_out, std::string(kda::Traffic::columns) + ",kv_records");
         for (int t : o.tokens) {
             kda::Fixture f(o, t);
             const auto bytes = kda::traffic(f, o.op);
@@ -41,7 +41,9 @@ int main(int argc, char** argv) {
                                              [](auto cuda) { condition_gpu(cuda, 200); }, flush,
                                              device.execution_view(), o.timing, execution, cache);
                     row.workspace_peak = f.workspace->peak_used();
-                    csv.write(row, r, execution, cache, bytes.csv(r.gpu.median_us));
+                    csv.write(row, r, execution, cache,
+                              bytes.csv(r.gpu.median_us) + "," +
+                                  (o.op == "record" ? (o.alias_records ? "alias" : "copy") : ""));
                 }
         }
     } catch (const std::exception& e) {

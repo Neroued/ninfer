@@ -4,20 +4,23 @@
 #include "ninfer/ops/paired_rmsnorm_concat.h"
 #include "ninfer/ops/residual_add_rmsnorm.h"
 
+#include <optional>
+
 using namespace ninfer;
 using namespace ninfer::bench;
 
 int main(int argc, char** argv) {
     try {
         measurement::Options timing;
-        bool paired = true;
+        bool paired = true, alias = false;
         int d = 4096, calls = 1;
         std::vector<int> columns{1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096};
         for (int i = 1; i < argc; ++i) {
             const std::string_view flag = argv[i];
             if (flag == "--help") {
                 std::cout << "Fused normalization public Op benchmark\n"
-                             "  --op paired|residual --dim D --columns M[,M...] --calls N\n";
+                             "  --op paired|residual --dim D --columns M[,M...] --calls N\n"
+                             "  --alias disjoint|inplace (residual only)\n";
                 measurement::help();
                 return 0;
             }
@@ -28,7 +31,11 @@ int main(int argc, char** argv) {
                 paired = value == "paired";
             } else if (flag == "--dim")
                 d = measurement::integer(value);
-            else if (flag == "--columns")
+            else if (flag == "--alias") {
+                if (value != "disjoint" && value != "inplace")
+                    throw std::invalid_argument("alias: disjoint|inplace");
+                alias = value == "inplace";
+            } else if (flag == "--columns")
                 columns = measurement::integers(value);
             else if (flag == "--calls")
                 calls = measurement::integer(value);
@@ -37,10 +44,12 @@ int main(int argc, char** argv) {
         }
         if (calls > 1 && timing.cache != "warm")
             throw std::invalid_argument("--calls > 1 requires --cache warm");
+        if (alias && (paired || calls != 1))
+            throw std::invalid_argument("inplace requires one residual call");
         measurement::hardware();
         L2FlushBuffer flush(timing.flush_bytes);
         measurement::Csv csv(timing.csv_out,
-                             "semantic_bytes,logical_gb_s,bandwidth_reference_us,calls");
+                             "semantic_bytes,logical_gb_s,bandwidth_reference_us,calls,alias");
         for (int m : columns) {
             const auto count = std::size_t(d) * m;
             auto x = make_bf16(count, 3901, -2.F, 2.F), y = make_bf16(count, 3903, -1.F, 1.F),
@@ -54,7 +63,9 @@ int main(int argc, char** argv) {
                 wx(gx.span(), DType::BF16, {d}), wy(gy.span(), DType::BF16, {d}),
                 mask(enabled.span(), DType::I32, {m}),
                 result(out.span(), DType::BF16, {paired ? 2 * d : d, m}),
-                r(residual.span(), DType::BF16, {d, m});
+                r(alias ? x.span() : residual.span(), DType::BF16, {d, m});
+            std::optional<SavedBuffer> saved;
+            if (alias) saved.emplace(x);
             const auto launch = [&](CudaExecutionView e) {
                 for (int i = 0; i < calls; ++i)
                     if (paired)
@@ -66,8 +77,12 @@ int main(int argc, char** argv) {
                  measurement::selections(timing.execution, "graph", "eager"))
                 for (const auto& cache : measurement::selections(timing.cache, "cold", "warm")) {
                     auto measured = measurement::measure(
-                        launch, [](auto e) { condition_gpu(e, 200); }, flush,
-                        device_context().execution_view(), timing, execution, cache);
+                        launch,
+                        [&](auto e) {
+                            if (saved) saved->restore(e);
+                            condition_gpu(e, 200);
+                        },
+                        flush, device_context().execution_view(), timing, execution, cache);
                     for (auto* time : {&measured.gpu, &measured.host}) {
                         time->median_us /= calls;
                         time->min_us /= calls;
@@ -80,12 +95,12 @@ int main(int argc, char** argv) {
                     row.n            = d;
                     row.tokens       = m;
                     const auto bytes = count * 8 + d * (paired ? 4 : 2) + (paired ? m * 4 : 0);
-                    csv.write(row, measured, execution, cache,
-                              std::to_string(bytes) + "," +
-                                  format_metric(bytes / (measured.gpu.median_us * 1000), 3, "") +
-                                  "," +
-                                  format_metric(bytes / (kRoofline.memory_gbs * 1000), 3, "") +
-                                  "," + std::to_string(calls));
+                    csv.write(
+                        row, measured, execution, cache,
+                        std::to_string(bytes) + "," +
+                            format_metric(bytes / (measured.gpu.median_us * 1000), 3, "") + "," +
+                            format_metric(bytes / (kRoofline.memory_gbs * 1000), 3, "") + "," +
+                            std::to_string(calls) + "," + (alias ? "inplace" : "disjoint"));
                 }
         }
     } catch (const std::exception& e) {

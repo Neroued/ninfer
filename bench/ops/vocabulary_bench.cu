@@ -3,6 +3,7 @@
 #include "common/roofline.h"
 
 #include <numeric>
+#include <optional>
 
 using namespace ninfer;
 using namespace ninfer::bench;
@@ -13,6 +14,7 @@ struct Options {
     std::string op = "candidates";
     std::vector<int> tokens{1};
     int batch = 1, rows = 124160, domain = 248077, ranks = 2, rank = 0;
+    std::optional<int> candidates;
     bool stochastic = false, penalties = false, mask = false, accept_all = false;
 };
 
@@ -24,6 +26,7 @@ Options parse(int argc, char** argv) {
             std::cout << "Vocabulary partition benchmark\n"
                          "  --op candidates|sample|accept|counts --tokens T[,T...] --batch 1..8\n"
                          "  --rows V --domain D --ranks 1..16 --rank R\n"
+                         "  --candidates 1|20 (defaults to the sampling requirement)\n"
                          "  --stochastic --penalties --mask --accept-all\n";
             measurement::help();
             std::exit(0);
@@ -59,12 +62,16 @@ Options parse(int argc, char** argv) {
             o.ranks = measurement::integer(value, 1, 16);
         else if (flag == "--rank")
             o.rank = measurement::integer(value, 0, 15);
+        else if (flag == "--candidates")
+            o.candidates = measurement::integer(value);
         else if (!measurement::parse(o.timing, flag, value))
             throw std::invalid_argument("unknown option");
     }
     if ((o.op != "candidates" && o.op != "sample" && o.op != "accept" && o.op != "counts") ||
-        o.rank >= o.ranks || std::int64_t(o.rows) * o.ranks < o.domain ||
-        (o.accept_all && o.op != "accept") || (o.op == "accept" && o.domain < 24) ||
+        (o.candidates && *o.candidates != 1 && *o.candidates != 20) ||
+        (o.stochastic && o.candidates == 1) || o.rank >= o.ranks ||
+        std::int64_t(o.rows) * o.ranks < o.domain || (o.accept_all && o.op != "accept") ||
+        (o.op == "accept" && o.domain < 24) ||
         (o.op == "counts" && (o.stochastic || o.penalties || o.mask)))
         throw std::invalid_argument("invalid Op or vocabulary partition");
     return o;
@@ -116,7 +123,7 @@ struct Fixture {
     std::size_t logical_bytes;
 
     Fixture(const Options& o, int tokens)
-        : options(o), t(tokens), k(o.stochastic ? 20 : 1),
+        : options(o), t(tokens), k(o.candidates.value_or(o.stochastic ? 20 : 1)),
           logits(make_bf16(std::size_t(o.rows) * t * o.batch, 177, -8, 8)),
           configs(make_buffer(o.batch * sizeof(ops::SamplingConfig))),
           counts(o.penalties

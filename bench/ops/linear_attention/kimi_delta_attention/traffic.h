@@ -70,7 +70,7 @@ inline Traffic traffic(Fixture& f, const std::string& op) {
     } else {
         out.state_read    = state;
         out.state_write   = op == "record" ? 0 : state;
-        const auto copied = f.o.op == "chain" ? 0 : 2ULL * 128 * (f.qh + f.h);
+        const auto copied = f.aliases_kv_records() ? 0 : 2ULL * 128 * (f.qh + f.h);
         out.record_write  = op == "record" ? (copied + 4ULL * 129 * f.h) * n : 0;
         out.read = (4ULL * 128 * f.qh + 4ULL * 128 * f.h + 2ULL * f.h) * n + 4ULL * 129 * f.h +
                    out.state_read;

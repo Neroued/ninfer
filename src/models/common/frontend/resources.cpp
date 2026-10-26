@@ -1,5 +1,6 @@
 #include "models/common/frontend/resources.h"
 #include "artifact/schema.h"
+#include <algorithm>
 #include <limits>
 #include <utility>
 
@@ -38,6 +39,20 @@ void parse_text_resources(TextResources& resources, std::uint32_t embedding_rows
     resources.tokenizer          = std::move(tokenizer);
     resources.public_token_count = static_cast<std::uint32_t>(count);
     resources.stop_token_ids     = std::move(stops);
+}
+
+void prepare_control_tokens(TextResources& resources, std::string_view text,
+                            std::string_view close) {
+    auto tokens = std::make_shared<const std::vector<TokenId>>(resources.tokenizer->encode(text));
+    if (tokens->empty() || resources.tokenizer->decode(*tokens) != text ||
+        resources.tokenizer->decode(*tokens, {.skip_special_tokens = true}).find(close) ==
+            std::string::npos)
+        throw std::invalid_argument("tokenizer cannot present the thinking control suffix");
+    for (auto id : *tokens)
+        if (std::find(resources.stop_token_ids.begin(), resources.stop_token_ids.end(), id) !=
+            resources.stop_token_ids.end())
+            throw std::invalid_argument("thinking control contains a terminal token");
+    resources.control_tokens = std::move(tokens);
 }
 
 } // namespace ninfer::models::frontend

@@ -34,6 +34,15 @@ RankPreparation::RankPreparation(const artifact::Reader& reader, std::span<const
     profile_ =
         execution::describe_model(load_->definition(), load_->weight_data(), load_->rank_plan());
     capacity_plan_ = describe_execution_capacity(profile_, options_, device_);
+    const WorkContract contract{describe_execution_shape(*profile_, options_),
+                                profile_->config.text.vocabulary,
+                                profile_->public_tokens,
+                                bool(profile_->mtp),
+                                bool(profile_->vision),
+                                profile_->control_token_limit};
+    host_reservation_bytes_ +=
+        runtime::protocol::work_payload_memory(contract.payload_capacity(topology.ranks.size()),
+                                               {1, 1}, topology.ranks.size(), control_owner_);
 }
 
 runtime::PreparationMemory RankPreparation::memory() const {

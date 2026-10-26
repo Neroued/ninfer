@@ -81,15 +81,7 @@ ExecutionPlan physical_plan(std::shared_ptr<const execution::ModelProfile> profi
                             DeviceContext& device, const moe::Plan* schedule) {
     ExecutionPlan out;
     out.profile    = std::move(profile);
-    out.shape      = {o.max_context,
-                      o.max_concurrency,
-                      o.prefill_chunk,
-                      o.speculative.draft_tokens,
-                      o.kv_cache,
-                      o.purpose,
-                      o.context_cache.enabled,
-                      o.use_cuda_graph,
-                      o.observability.gpu_timing};
+    out.shape      = describe_execution_shape(*out.profile, o);
     out.persistent = persistent(*out.profile, o);
     out.workspace  = execution::plan_workspace(*out.profile, o, o.prefill_chunk,
                                                device.multiprocessor_count(), schedule);
@@ -126,6 +118,20 @@ ExecutionPlan physical_plan(std::shared_ptr<const execution::ModelProfile> profi
     return out;
 }
 } // namespace
+
+ExecutionShape describe_execution_shape(const execution::ModelProfile& profile,
+                                        const EngineOptions& supplied) {
+    const auto o = options(profile, supplied);
+    return {o.max_context,
+            o.max_concurrency,
+            o.prefill_chunk,
+            o.speculative.draft_tokens,
+            o.kv_cache,
+            o.purpose,
+            o.context_cache.enabled,
+            o.use_cuda_graph,
+            o.observability.gpu_timing};
+}
 
 std::size_t ExecutionPlan::device_bytes() const {
     return capacity.device_bytes + persistent.bytes + workspace.bytes + ple_upload.device_bytes +

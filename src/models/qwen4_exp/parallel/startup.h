@@ -18,7 +18,7 @@ public:
 
     [[nodiscard]] qwen::Frontend frontend(const EngineOptions&) const;
     [[nodiscard]] std::vector<distributed::wire::Bytes> requests(const EngineOptions&) const;
-    void resolve(std::span<const distributed::wire::Bytes>, EngineOptions&);
+    void resolve(std::span<const distributed::wire::Payload>, EngineOptions&);
     [[nodiscard]] PreparedSession session() const;
     [[nodiscard]] Codec codec() const;
     [[nodiscard]] std::vector<RankSnapshot> observations() const;

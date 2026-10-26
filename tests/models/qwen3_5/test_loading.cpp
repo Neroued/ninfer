@@ -146,7 +146,8 @@ struct ModelFixture {
                                      "<think>",        "</think>",      "<|vision_start|>",
                                      "<|vision_end|>", "<|image_pad|>", "<|video_pad|>"};
         for (std::size_t i = 0; i < specials.size(); ++i) {
-            const auto token = added_token(static_cast<int>(256 + i), specials[i]);
+            auto token = added_token(static_cast<int>(256 + i), specials[i]);
+            if (i == 3 || i == 4) token["special"] = false;
             if (i < 8) { added.push_back(token); }
             decoder[std::to_string(256 + i)] = token;
         }

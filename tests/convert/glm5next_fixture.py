@@ -240,6 +240,10 @@ def build_checkpoint(path: Path) -> SafetensorsSource:
             rstrip=False,
         )
     ]
+    tokenizer["added_tokens"].append(
+        dict(id=3, content="</think>", special=False, single_word=False,
+             normalized=False, lstrip=False, rstrip=False)
+    )
     processor = dict(
         do_rescale=True,
         patch_expand_factor=1,

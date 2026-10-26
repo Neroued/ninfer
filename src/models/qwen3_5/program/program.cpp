@@ -120,9 +120,8 @@ void RankProgramImpl::validate_work(const Work& work, runtime::FrameKind kind) c
         throw std::invalid_argument("Qwen3.5 work is reserved in the wrong execution frame");
     }
     (context ? context_actions : compute_actions)->validate(work.context);
-    auto validate_input = [&](const InputWindow& input) {
-        if (input.tokens.size() > prefill_chunk ||
-            input.rope_positions.size() != input.tokens.size() * 3) {
+    auto validate_input = [&](const InputWindow& input, std::uint32_t limit) {
+        if (input.tokens.size() > limit || input.rope_positions.size() != input.tokens.size() * 3) {
             throw std::invalid_argument("Qwen3.5 input window has invalid positions or extent");
         }
         std::uint32_t previous = 0;
@@ -157,11 +156,7 @@ void RankProgramImpl::validate_work(const Work& work, runtime::FrameKind kind) c
                     if (binding.member.residency.lane.value >= max_concurrency ||
                         !binding.member.residency.generation || !binding.member.sequence.generation)
                         throw std::invalid_argument("Qwen3.5 residency installation is invalid");
-                    for (auto id : binding.committed_generated_tokens) {
-                        if (id < 0 ||
-                            static_cast<std::uint32_t>(id) >= parameters.profile->public_tokens)
-                            throw std::invalid_argument("Qwen3.5 restored count token is invalid");
-                    }
+                    binding.counts.validate(parameters.profile->public_tokens, capacity);
                 }
                 for (auto id : op.releases) {
                     if (id.lane.value >= max_concurrency || !residencies[id.lane.value].installed ||
@@ -175,21 +170,24 @@ void RankProgramImpl::validate_work(const Work& work, runtime::FrameKind kind) c
                     (op.sample != SamplePurpose::None && op.sampling.size() != op.rows.size()))
                     throw std::invalid_argument("Qwen3.5 forward inputs do not match membership");
                 if (op.purpose == ForwardPurpose::Control) {
-                    if (op.committed_tokens.size() != op.rows.size())
+                    if (op.control_last_tokens.size() != op.rows.size())
                         throw std::invalid_argument(
                             "Qwen3.5 control tokens do not match membership");
-                    for (const auto& tokens : op.committed_tokens) {
-                        if (tokens.size() > prefill_chunk)
-                            throw std::invalid_argument("Qwen3.5 control exceeds staging capacity");
-                        for (TokenId id : tokens)
-                            if (id < 0 ||
-                                static_cast<std::uint32_t>(id) >= parameters.profile->public_tokens)
-                                throw std::invalid_argument(
-                                    "Qwen3.5 control token is outside its vocabulary");
+                    for (std::size_t i = 0; i < op.rows.size(); ++i) {
+                        const auto n  = op.inputs[i].tokens.size();
+                        const auto id = op.control_last_tokens[i];
+                        if (!n || n > parameters.profile->control_token_limit)
+                            throw std::invalid_argument("Qwen3.5 control exceeds prepared extent");
+                        if (id < 0 || std::uint32_t(id) >= parameters.profile->public_tokens)
+                            throw std::invalid_argument("Qwen3.5 control token exceeds vocabulary");
                     }
+                } else if (!op.control_last_tokens.empty()) {
+                    throw std::invalid_argument("Qwen3.5 control output outside control work");
                 }
                 for (std::size_t i = 0; i < op.rows.size(); ++i) {
-                    validate_input(op.inputs[i]);
+                    validate_input(op.inputs[i], op.purpose == ForwardPurpose::Control
+                                                     ? parameters.profile->control_token_limit
+                                                     : prefill_chunk);
                     if (op.rows[i].main_frontier + op.inputs[i].tokens.size() > capacity ||
                         (op.inputs[i].tokens.empty() && op.sample == SamplePurpose::None &&
                          op.purpose != ForwardPurpose::Replay))
@@ -216,7 +214,7 @@ void RankProgramImpl::validate_work(const Work& work, runtime::FrameKind kind) c
                     throw std::logic_error("normalization requires draft feature state");
             } else if constexpr (std::is_same_v<T, ScoreWork>) {
                 validate_row(op.row);
-                validate_input(op.input);
+                validate_input(op.input, prefill_chunk);
                 if (!resources.frame.spec.causal_scoring || op.input.tokens.empty() ||
                     op.first_column > op.input.tokens.size() ||
                     op.targets.size() > op.input.tokens.size() - op.first_column)

@@ -332,6 +332,8 @@ public:
     context::ContextDirectory directory;
     mutable context::RecoveryIndex<> recovery_index{directory.metadata_budget()};
     Checkpoints checkpoints;
+    context::MetadataAccount count_storage{directory.metadata_budget()};
+    TokenCountBuilder count_builder;
     std::array<std::unique_ptr<Sequence>, kMaximumConcurrency> sequences;
     std::array<std::uint64_t, kMaximumConcurrency> epochs{};
     std::vector<runtime::KvPoolDescriptor> pools;

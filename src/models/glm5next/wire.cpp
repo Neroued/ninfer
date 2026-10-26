@@ -1,6 +1,7 @@
 #include "models/glm5next/wire.h"
 
 #include "models/common/context/wire.h"
+#include "models/common/parallel_wire.h"
 
 #include <stdexcept>
 #include <type_traits>
@@ -95,7 +96,8 @@ void row(Encoder& out, const WorkRow& r) {
     out.u32(r.mtp_frontier);
     out.u32(r.attention_rank);
     integers(out, r.ids);
-    integers(out, r.count_tokens);
+    out.boolean(r.control_last_token.has_value());
+    if (r.control_last_token) out.i32(*r.control_last_token);
     integers(out, r.window_ends);
     sampling(out, r.sampling);
     out.u32(r.sampling_position);
@@ -109,13 +111,13 @@ WorkRow row(Decoder& in) {
         const auto owner = in.u32();
         r.states.emplace(owner, selectors(in));
     }
-    r.main_table        = slot<context::TableRow>(in);
-    r.mtp_table         = slot<context::TableRow>(in);
-    r.main_frontier     = in.u32();
-    r.mtp_frontier      = in.u32();
-    r.attention_rank    = in.u32();
-    r.ids               = integers<TokenId>(in);
-    r.count_tokens      = integers<TokenId>(in);
+    r.main_table     = slot<context::TableRow>(in);
+    r.mtp_table      = slot<context::TableRow>(in);
+    r.main_frontier  = in.u32();
+    r.mtp_frontier   = in.u32();
+    r.attention_rank = in.u32();
+    r.ids            = integers<TokenId>(in);
+    if (in.boolean()) r.control_last_token = in.i32();
     r.window_ends       = integers<std::uint32_t>(in);
     r.sampling          = sampling(in);
     r.sampling_position = in.u32();
@@ -189,7 +191,7 @@ void encode_work(Encoder& out, const Work& work, std::uint32_t rank) {
                 out.u64(v.bindings.size());
                 for (const auto& binding : v.bindings) {
                     member(out, binding.member);
-                    integers(out, binding.generated);
+                    encode_token_counts(out, binding.counts);
                 }
                 out.u64(v.releases.size());
                 for (auto id : v.releases) residency(out, id);
@@ -234,8 +236,8 @@ Work decode_work(Decoder& in, const VisionInputBindings& inputs) {
         ContextWork v;
         v.bindings.resize(in.count(36));
         for (auto& binding : v.bindings) {
-            binding.member    = member(in);
-            binding.generated = integers<TokenId>(in);
+            binding.member = member(in);
+            binding.counts = decode_token_counts(in);
         }
         v.releases.resize(in.count(12));
         for (auto& id : v.releases) id = residency(in);

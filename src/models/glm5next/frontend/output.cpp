@@ -13,15 +13,9 @@ constexpr std::string_view kThinkClose = "</think>";
 OutputResources::OutputResources(const models::frontend::TextResources& resources,
                                  std::size_t cache_bytes)
     : text(resources, cache_bytes) {
-    const auto control =
-        std::make_shared<const std::vector<TokenId>>(text.tokenizer->encode(kThinkClose));
-    if (control->empty() || text.tokenizer->decode(*control) != kThinkClose ||
-        text.tokenizer->decode(*control, {.skip_special_tokens = true}) != kThinkClose)
-        throw std::invalid_argument("GLM tokenizer cannot present the thinking control suffix");
-    for (auto token : *control)
-        if (std::find(text.defaults.token_ids.begin(), text.defaults.token_ids.end(), token) !=
-            text.defaults.token_ids.end())
-            throw std::invalid_argument("GLM thinking control contains a terminal token");
+    const auto& control = resources.control_tokens;
+    if (!control || control->empty())
+        throw std::invalid_argument("thinking control tokens have not been prepared");
     normal = std::make_shared<const models::frontend::ReasoningFormat>(
         std::string(kThinkClose), std::string(kThinkClose), control, false, std::string(kToolOpen));
     constrained = std::make_shared<const models::frontend::ReasoningFormat>(

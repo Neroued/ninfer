@@ -77,6 +77,9 @@ runtime::ContextMetadataPlan session_metadata_plan(const ExecutionPlan& executio
                         context::HistoryDirectory::metadata_bytes(0, 0, pool.page_capacity, ranks);
     if (rank == 0)
         metadata.fixed_bytes +=
+            TokenCountBuilder::capacity_bytes(execution.shape.purpose == EnginePurpose::Generation
+                                                  ? execution.profile->public_tokens
+                                                  : 0) +
             detail::Checkpoints::metadata_bytes(std::size_t(schema.state.logical_capacity)) +
             context::RecoveryIndex<>::metadata_bytes(std::size_t(schema.state.logical_capacity));
     metadata.bytes_per_record.at(geometry.spec_classes[0].index) +=

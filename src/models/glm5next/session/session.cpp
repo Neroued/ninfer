@@ -11,6 +11,11 @@ SessionImpl::SessionImpl(std::shared_ptr<const ModelDefinition> model, SessionPl
       checkpoints(Checkpoints::capacity_for_metadata(directory.metadata_budget().limit()),
                   directory.metadata_budget(), &recovery_index) {
     if (!definition) throw std::invalid_argument("invalid GLM5Next session definition");
+    if (shape.purpose == EnginePurpose::Generation) {
+        count_storage.acquire(
+            TokenCountBuilder::capacity_bytes(definition->resources().text.public_token_count));
+        count_builder.prepare(definition->resources().text.public_token_count);
+    }
     releases.reserve(shape.max_concurrency);
     for (std::uint32_t i = 0; i < plan.states.size(); ++i) placements.push_back({i});
     for (std::uint16_t i = 0; i < pool_count(); ++i)

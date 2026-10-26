@@ -108,15 +108,16 @@ ResourceLayout persistent_layout(const SequencePlanImpl& plan) {
         };
     }
     spec.frame = {
-        .hidden         = dimension(config.hidden_size),
-        .output_rows    = dimension(config.vocab_size),
-        .public_tokens  = dimension(profile.public_tokens),
-        .prefill_chunk  = std::min(plan.prefill_chunk, plan.capacity),
-        .batch_capacity = plan.max_concurrency,
-        .draft_window   = plan.draft_window,
-        .backend        = plan.speculative_backend,
-        .causal_scoring = plan.causal_scoring,
-        .vision         = plan.features.vision,
+        .hidden              = dimension(config.hidden_size),
+        .output_rows         = dimension(config.vocab_size),
+        .public_tokens       = dimension(profile.public_tokens),
+        .prefill_chunk       = std::min(plan.prefill_chunk, plan.capacity),
+        .batch_capacity      = plan.max_concurrency,
+        .draft_window        = plan.draft_window,
+        .backend             = plan.speculative_backend,
+        .causal_scoring      = plan.causal_scoring,
+        .vision              = plan.features.vision,
+        .control_token_limit = profile.control_token_limit,
     };
     spec.context_bytes      = plan.context_bytes;
     spec.host_context_bytes = plan.context_cache.host_capacity_bytes.value_or(0);

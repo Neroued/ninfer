@@ -28,9 +28,9 @@ void enter(dist::ExecutionGroup& group, const GroupPreparation& prepared, std::u
         throw std::runtime_error("preparation control queue is full");
 }
 
-std::vector<wire::Bytes> receive(dist::ExecutionGroup& group, wire::Kind kind,
-                                 std::chrono::milliseconds timeout) {
-    std::vector<wire::Bytes> result(group.topology().ranks.size());
+std::vector<wire::Payload> receive(dist::ExecutionGroup& group, wire::Kind kind,
+                                   std::chrono::milliseconds timeout) {
+    std::vector<wire::Payload> result(group.topology().ranks.size());
     std::vector<bool> received(result.size());
     std::size_t remaining = result.size();
     const auto deadline   = std::chrono::steady_clock::now() + timeout;
@@ -182,7 +182,7 @@ GroupPreparation prepare_execution_group(dist::ExecutionGroup& group,
                     success &= in.boolean();
                     if (description) {
                         const auto layout = in.bytes();
-                        result.layouts.emplace_back(layout.begin(), layout.end());
+                        result.layouts.emplace_back(wire::Bytes(layout.begin(), layout.end()));
                     }
                     in.finish();
                 }

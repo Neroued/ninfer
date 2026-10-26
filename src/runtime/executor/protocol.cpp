@@ -1,4 +1,5 @@
 #include "runtime/executor/protocol.h"
+#include "distributed/transport.h"
 
 #include <algorithm>
 #include <set>
@@ -6,6 +7,91 @@
 
 namespace ninfer::runtime::protocol {
 namespace wire = distributed::wire;
+
+std::size_t work_payload_memory(const WorkPayloadCapacity& p, ExecutionCapacity frames,
+                                std::size_t ranks, bool coordinator) {
+    const auto work =
+        p.compute_work * frames.compute_frames + p.context_work * frames.context_frames;
+    const auto continuation = (p.decision + p.commit) * frames.compute_frames;
+    // Context snapshots own one count vector, independent of the number of recipients.
+    // The model reports native Context storage separately from the encoded payload.
+    const auto worker = 3 * (p.compute_work * frames.compute_frames + continuation) +
+                        (p.context_work + p.rank_context_storage) * frames.context_frames;
+    // Encoder vectors can grow to twice their payload. Compute rows are retained by Session
+    // and Executor; a Context snapshot moves from Session into Executor without a second copy.
+    const auto control = coordinator ? 2 * ranks * (work + continuation) +
+                                           4 * ranks * p.compute_work * frames.compute_frames +
+                                           p.coordinator_context_storage * frames.context_frames +
+                                           2 * ranks * continuation
+                                     : 0;
+    return worker + control;
+}
+
+void validate_control_capacity(const ControlBudget& b, ExecutionCapacity frames,
+                               const distributed::TransportLimits& limits, std::size_t ranks) {
+    if (!ranks) throw std::invalid_argument("control capacity requires a rank");
+    const auto report                                    = measurement_report_capacity(b.report);
+    const std::pair<const char*, std::size_t> messages[] = {{"compute Submit", b.compute_work},
+                                                            {"context Submit", b.context_work},
+                                                            {"Supply", b.decision},
+                                                            {"Commit", b.commit},
+                                                            {"Event", b.event},
+                                                            {"MeasurementComplete", report}};
+    for (auto [name, bytes] : messages)
+        if (!bytes || bytes > limits.message_bytes)
+            throw std::invalid_argument(std::string(name) + " capacity " + std::to_string(bytes) +
+                                        " exceeds transport message limit " +
+                                        std::to_string(limits.message_bytes));
+
+    struct Queue {
+        std::size_t bytes = 0, messages = 0;
+
+        void add(std::size_t payload, std::size_t count) {
+            if (payload > SIZE_MAX - wire::kHeaderBytes ||
+                (count && payload + wire::kHeaderBytes > (SIZE_MAX - bytes) / count) ||
+                count > SIZE_MAX - messages)
+                throw std::overflow_error("control queue capacity overflow");
+            bytes += (payload + wire::kHeaderBytes) * count;
+            messages += count;
+        }
+
+        void check(std::size_t max_bytes, std::size_t max_messages, const char* name) const {
+            if (bytes > max_bytes || messages > max_messages)
+                throw std::invalid_argument(
+                    std::string(name) + " requires " + std::to_string(bytes) + " bytes / " +
+                    std::to_string(messages) + " messages; capacity is " +
+                    std::to_string(max_bytes) + " / " + std::to_string(max_messages));
+        }
+    };
+
+    const std::size_t compute = frames.compute_frames, context = frames.context_frames;
+    Queue submits, commands, responses;
+    submits.add(b.compute_work, ranks * compute);
+    submits.add(b.context_work, ranks * context);
+    submits.check(limits.queued_bytes, limits.queued_messages, "coordinator Submit queue");
+
+    commands.add(b.decision, ranks * compute);
+    commands.add(b.commit, ranks * compute);
+    // Discard, InputRelease and a measurement/shutdown command have bounded scalar envelopes.
+    commands.add(128, ranks * (2 * compute + 1));
+    commands.check(limits.continuation_bytes, limits.continuation_messages,
+                   "coordinator continuation queue");
+
+    responses.add(b.event, 6 * compute + 3 * context);
+    responses.add(16, 8 * compute + 3 * context); // applied/retired progress
+    responses.add(report, 1);
+    responses.add(128, 2); // input readiness and terminal acknowledgement
+    responses.check(limits.continuation_bytes, limits.continuation_messages,
+                    "worker continuation queue");
+    Queue incoming;
+    if (responses.bytes > SIZE_MAX / ranks || responses.messages > SIZE_MAX / ranks)
+        throw std::overflow_error("control receive capacity overflow");
+    incoming.bytes    = responses.bytes * ranks;
+    incoming.messages = responses.messages * ranks;
+    incoming.check(limits.queued_bytes + limits.continuation_bytes + limits.input_bytes,
+                   limits.queued_messages + limits.continuation_messages + limits.input_messages,
+                   "coordinator receive queue");
+}
 
 std::size_t measurement_report_capacity(std::size_t snapshot_bytes) {
     constexpr std::size_t envelope = 16 + kMeasurementErrorBytes;

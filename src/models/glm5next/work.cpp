@@ -1,4 +1,6 @@
 #include "models/glm5next/work.h"
+#include "models/common/context/wire.h"
+#include "runtime/executor/protocol.h"
 
 #include "models/glm5next/state/continuation.h"
 
@@ -72,6 +74,38 @@ ExecutionWork ExecutionTypes::describe_work(const Work& work) {
     return out;
 }
 
+runtime::WorkPayloadCapacity WorkContract::payload_capacity(std::uint32_t rank_count) const {
+    const std::size_t batch = shape.max_concurrency, chunk = shape.prefill_chunk;
+    const auto header       = runtime::protocol::envelope_capacity(rank_count);
+    const std::size_t pools = shape.draft_tokens ? 2 : 1;
+    const auto actions      = [&](std::size_t rows, std::size_t tokens) {
+        return context::write_action_capacity(rows, pools, tokens);
+    };
+    const auto payload = [&](std::size_t rows, std::size_t span, std::size_t token_bytes) {
+        return header + actions(rows, span) + 128 + rows * (192 + 20 * rank_count + token_bytes);
+    };
+    const std::size_t width = shape.draft_tokens + 1;
+    const auto work =
+        shape.purpose == EnginePurpose::CausalScoring
+            ? payload(1, chunk, 8 * chunk)
+            : std::max({payload(1, chunk, 4 * chunk), payload(batch, width, 4),
+                        payload(batch, control_token_limit, 8ULL * control_token_limit)});
+    const auto context = header + context::action_batch_capacity() + 128 +
+                         batch * (88 + TokenCounts::encoded_capacity(public_tokens));
+    const auto decision = header + 12 + batch * (20 + 4 * width * ((public_tokens + 31ULL) / 32));
+    const auto commit   = header + 64 + batch * (64 + 20 * rank_count) + actions(batch, width);
+    const auto context_rows =
+        sizeof(Work) + sizeof(ContextWork) +
+        batch * (sizeof(ResidencyBinding) + sizeof(runtime::ResidencyId) + 4ULL * public_tokens);
+    const auto actions_storage = context::action_batch_storage_capacity() + 128;
+    return {work,
+            context,
+            decision,
+            commit,
+            context_rows + actions_storage,
+            context_rows + rank_count * actions_storage};
+}
+
 void WorkContract::validate(const Work& work, runtime::FrameKind kind) const {
     if (const auto* c = std::get_if<ContextWork>(&work.operation)) {
         require(kind == runtime::FrameKind::Context &&
@@ -88,20 +122,25 @@ void WorkContract::validate(const Work& work, runtime::FrameKind kind) const {
             member(b.member, shape.max_concurrency);
             require(!bound[b.member.residency.lane.value], "duplicate residency binding");
             bound[b.member.residency.lane.value] = true;
-            require(b.generated.size() <= shape.max_context, "generated history exceeds context");
-            tokens(b.generated, public_tokens);
+            b.counts.validate(public_tokens, shape.max_context);
+            require(shape.purpose == EnginePurpose::Generation || b.counts.empty(),
+                    "scoring residency has generation counts");
         }
         require(work.batch.members.empty() && work.batch.owners.empty(),
                 "context has compute rows");
         return;
     }
-    const auto rows = work_rows(work);
+    const auto* forward = std::get_if<ForwardWork>(&work.operation);
+    const bool control  = forward && forward->kind == ForwardKind::Control;
+    const auto rows     = work_rows(work);
     require(kind == runtime::FrameKind::Compute && !rows.empty() &&
                 rows.size() <= shape.max_concurrency,
             "compute frame extent");
     require(work.batch == plan_batch(rows, ranks), "physical row plan differs from membership");
     for (std::size_t i = 0; i < rows.size(); ++i) {
         const auto& r = rows[i];
+        require(r.control_last_token.has_value() == control && (control || r.window_ends.empty()),
+                "control fields outside control work");
         member(r.member, shape.max_concurrency);
         require(r.states.size() == ranks && r.main_table.valid() && r.main_table.pool_id == 0,
                 "incomplete context binding");
@@ -116,11 +155,12 @@ void WorkContract::validate(const Work& work, runtime::FrameKind kind) const {
                     "invalid State selector");
         }
         require(r.main_frontier <= shape.max_context &&
-                    r.ids.size() <= shape.max_context - r.main_frontier &&
-                    r.count_tokens.size() <= shape.max_context,
+                    r.ids.size() <= shape.max_context - r.main_frontier,
                 "input exceeds context");
         tokens(r.ids, vocabulary);
-        tokens(r.count_tokens, public_tokens);
+        if (control && !r.ids.empty())
+            tokens(std::span<const TokenId>(r.ids).subspan(1), public_tokens);
+        if (r.control_last_token) tokens({&*r.control_last_token, 1}, public_tokens);
         std::uint32_t previous = 0;
         for (auto end : r.window_ends) {
             require(end > previous && end < r.ids.size(), "invalid window boundary");
@@ -172,7 +212,8 @@ void WorkContract::validate(const Work& work, runtime::FrameKind kind) const {
             require(n == 1 && f->sample == SampleKind::NextToken, "ordinary extent");
             break;
         case ForwardKind::Control:
-            require(n && f->sample == SampleKind::None, "control extent");
+            require(n && n <= control_token_limit && f->sample == SampleKind::None,
+                    "control extent");
             break;
         default:
             require(false, "unknown forward kind");

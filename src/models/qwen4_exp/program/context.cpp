@@ -27,12 +27,11 @@ void RankProgramImpl::advance_context() {
             if (resources.plan.persistent.buffers.token_counts) {
                 auto output = device_tensor(*resources.plan.persistent.buffers.token_counts)
                                   .slice(1, lane, 1);
-                if (input.generated.empty()) {
+                if (input.counts.empty()) {
                     CUDA_CHECK(cudaMemsetAsync(output.data, 0, output.bytes(), transfer.stream()));
                 } else {
                     auto* row = counts + b * vocabulary;
-                    std::fill_n(row, vocabulary, 0);
-                    for (const auto id : input.generated) ++row[id];
+                    input.counts.restore({row, vocabulary});
                     copy_bytes_async({output.data, output.bytes(), transfer.device()},
                                      {row, output.bytes(), Device::cpu(), true}, transfer);
                 }

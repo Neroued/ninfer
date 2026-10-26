@@ -401,6 +401,10 @@ SessionImpl::SessionImpl(std::shared_ptr<const ModelDefinition> definition_in, S
         throw std::invalid_argument("Session preparation is incomplete");
     checkpoints.configure(Checkpoints::capacity_for_metadata(directory.metadata_budget().limit()),
                           directory.metadata_budget(), &recovery_index);
+    if (!causal_scoring) {
+        count_storage.acquire(TokenCountBuilder::capacity_bytes(plan.profile->public_tokens));
+        count_builder.prepare(plan.profile->public_tokens);
+    }
     releases.reserve(max_concurrency);
     for (std::uint32_t i = 0; i < max_concurrency; ++i) sequences[i].lane = i;
 }

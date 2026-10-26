@@ -26,7 +26,7 @@ struct GroupPreparation {
     std::vector<ContextCapacityResolution> capacities;
     std::uint32_t attempt = 0;
     std::vector<RankPreparationReport> reports;
-    std::vector<distributed::wire::Bytes> layouts;
+    std::vector<distributed::wire::Payload> layouts;
 };
 
 enum class PreparationAction : std::uint8_t {
@@ -40,7 +40,7 @@ enum class PreparationAction : std::uint8_t {
 };
 
 struct ControlPreparation {
-    std::function<void(std::span<const distributed::wire::Bytes>)> prepare;
+    std::function<void(std::span<const distributed::wire::Payload>)> prepare;
     std::function<void()> release;
 };
 

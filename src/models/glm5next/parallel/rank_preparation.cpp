@@ -40,6 +40,15 @@ RankPreparation::RankPreparation(const artifact::Reader& reader, std::span<const
                                  distributed::CommunicationContext& communication)
     : RankPreparation(reader, request(payload, identity), device,
                       context_group(topology, communication)) {
+    const WorkContract contract{plan_.shape,
+                                plan_.profile->config.text.vocabulary,
+                                plan_.profile->public_tokens,
+                                plan_.profile->local.size,
+                                0,
+                                plan_.profile->control_token_limit};
+    memory_.host_reservation_bytes +=
+        runtime::protocol::work_payload_memory(contract.payload_capacity(topology.ranks.size()),
+                                               {1, 1}, topology.ranks.size(), control_owner_);
     const auto role = std::find_if(topology.roles.begin(), topology.roles.end(),
                                    [](const auto& r) { return r.role == "tensor"; });
     if (role == topology.roles.end())

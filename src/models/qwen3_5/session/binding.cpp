@@ -289,12 +289,13 @@ BindingReservation SessionImpl::start_binding(const RequestBasePlan& base, runti
         ContextWork work;
         ResidencyBinding binding{{sequences[lane].id, sequences[lane].residency},
                                  base.impl_->sampling};
-        if (resume) {
+        if (resume && (binding.sampling.presence_penalty || binding.sampling.frequency_penalty)) {
             const auto& ledger = resume->impl_->sequence.ledger;
             if (ledger.size() < base.summary().prompt_tokens)
                 throw std::logic_error("sampling restore has no complete generated ledger");
-            binding.committed_generated_tokens.assign(ledger.begin() + base.summary().prompt_tokens,
-                                                      ledger.end());
+            binding.counts = count_builder.build(
+                std::span<const TokenId>(ledger).subspan(base.summary().prompt_tokens),
+                plan.profile->public_tokens);
         }
         work.bindings.push_back(std::move(binding));
         (void)submit_context(*context_operation_, std::move(work));

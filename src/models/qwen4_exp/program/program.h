@@ -24,7 +24,8 @@ public:
     RankProgram(const RankProgram&)            = delete;
     RankProgram& operator=(const RankProgram&) = delete;
 
-    [[nodiscard]] runtime::ExecutionCapacity capacity() const noexcept;
+    [[nodiscard]] static constexpr runtime::ExecutionCapacity capacity() noexcept { return {1, 1}; }
+
     [[nodiscard]] SessionPlan session_plan() const;
     void prepare_execution();
     void release_execution();

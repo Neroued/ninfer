@@ -1,5 +1,7 @@
 #pragma once
 
+#include "models/common/token_input.h"
+
 #include "models/common/context/contract.h"
 #include "models/common/context/directory/state.h"
 #include "models/common/context/directory/history.h"
@@ -56,7 +58,7 @@ struct ForwardWork {
     ForwardPurpose purpose = ForwardPurpose::Prefill;
     std::vector<ExecutionRow> rows;
     std::vector<InputWindow> inputs;
-    std::vector<std::vector<TokenId>> committed_tokens;
+    std::vector<TokenId> control_last_tokens;
     SamplePurpose sample = SamplePurpose::None;
     std::vector<SamplingInput> sampling;
 };
@@ -81,7 +83,7 @@ struct NormalizeWork {
 struct ResidencyBinding {
     runtime::ExecutionMember member;
     ResolvedSamplingParameters sampling;
-    std::vector<TokenId> committed_generated_tokens;
+    TokenCounts counts;
 };
 
 struct ContextWork {

@@ -254,8 +254,8 @@ public:
         }
         work.inputs.push_back(input);
         if (purpose == q35::ForwardPurpose::Control) {
-            work.committed_tokens = {input.tokens};
-            work.sampling         = {{{}, false}};
+            work.control_last_tokens = {input.tokens.back()};
+            work.sampling            = {{{}, false}};
         }
         const auto hidden = native_.rank().resources.frame.spec.hidden;
         std::optional<runtime::ExecutionTicket> ticket;

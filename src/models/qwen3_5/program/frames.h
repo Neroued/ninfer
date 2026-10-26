@@ -12,15 +12,16 @@
 namespace ninfer::models::qwen3_5 {
 
 struct FrameSpec {
-    std::int32_t hidden          = 0;
-    std::int32_t output_rows     = 0;
-    std::int32_t public_tokens   = 0;
-    std::uint32_t prefill_chunk  = 0;
-    std::uint32_t batch_capacity = 1;
-    std::uint32_t draft_window   = 0;
-    SpeculativeBackend backend   = SpeculativeBackend::None;
-    bool causal_scoring          = false;
-    bool vision                  = false;
+    std::int32_t hidden               = 0;
+    std::int32_t output_rows          = 0;
+    std::int32_t public_tokens        = 0;
+    std::uint32_t prefill_chunk       = 0;
+    std::uint32_t batch_capacity      = 1;
+    std::uint32_t draft_window        = 0;
+    SpeculativeBackend backend        = SpeculativeBackend::None;
+    bool causal_scoring               = false;
+    bool vision                       = false;
+    std::uint32_t control_token_limit = 0;
 };
 
 // Arrays are compact-row indexed. Tensor views bind only the current exact-B prefix.
@@ -114,6 +115,7 @@ struct FrameLayout {
     std::optional<TensorRegion> masks;
     std::optional<TensorRegion> score_targets;
     std::optional<TensorRegion> score_logprobs;
+    std::optional<TensorRegion> control_ids;
     std::optional<MtpFrameLayout> mtp;
     std::optional<DFlashFrameLayout> dflash;
     FrameHostLayout host;
@@ -169,6 +171,7 @@ public:
     Tensor host_input_ids, host_cache_positions, host_rope_positions;
     Tensor host_visual_indices;
     Tensor host_control_tokens;
+    Tensor control_ids;
     Tensor host_masks, host_drafts, host_score_logprobs;
     Tensor host_step_positions, host_step_rope_positions, host_step_valid_columns;
     MemorySpan ingress, commit, egress;

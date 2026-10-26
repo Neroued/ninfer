@@ -5,7 +5,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <span>
+#include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace ninfer::distributed::wire {
@@ -42,10 +44,57 @@ enum class Kind : std::uint32_t {
     Event,
 };
 
+// Moving a received payload retains its receive-buffer reservation, including when startup
+// keeps the bytes after consuming the message envelope. Payload size is fixed once published.
+class Payload {
+public:
+    Payload() = default;
+
+    Payload(Bytes bytes, std::shared_ptr<void> reservation = {})
+        : reservation_(std::move(reservation)), bytes_(std::move(bytes)) {}
+
+    Payload(Payload&&) noexcept = default;
+
+    Payload& operator=(Payload&& other) noexcept {
+        Payload replacement(std::move(other));
+        bytes_.swap(replacement.bytes_);
+        reservation_.swap(replacement.reservation_);
+        return *this;
+    }
+
+    Payload(const Payload&)            = delete;
+    Payload& operator=(const Payload&) = delete;
+
+    [[nodiscard]] std::size_t size() const noexcept { return bytes_.size(); }
+
+    [[nodiscard]] bool empty() const noexcept { return bytes_.empty(); }
+
+    [[nodiscard]] auto data() noexcept { return bytes_.data(); }
+
+    [[nodiscard]] auto data() const noexcept { return bytes_.data(); }
+
+    [[nodiscard]] auto begin() noexcept { return bytes_.begin(); }
+
+    [[nodiscard]] auto begin() const noexcept { return bytes_.begin(); }
+
+    [[nodiscard]] auto end() noexcept { return bytes_.end(); }
+
+    [[nodiscard]] auto end() const noexcept { return bytes_.end(); }
+
+    [[nodiscard]] auto& back() const { return bytes_.back(); }
+
+    friend bool operator==(const Payload& a, const Bytes& b) { return a.bytes_ == b; }
+
+    friend bool operator==(const Payload& a, const Payload& b) { return a.bytes_ == b.bytes_; }
+private:
+    std::shared_ptr<void> reservation_;
+    Bytes bytes_;
+};
+
 struct Message {
     Kind kind;
     std::uint64_t epoch = 0;
-    Bytes payload;
+    Payload payload;
 };
 
 class Encoder {

@@ -59,6 +59,7 @@ Frontend make_frontend(const FrontendResources& source,
     if (options.vision_enabled)
         parsed.processor = ninfer::models::qwen::parse_processor_options(
             source.preprocessor_config_json, source.video_preprocessor_config_json);
+    ninfer::models::qwen::prepare_control_tokens(parsed.text);
     return ninfer::models::qwen::make_frontend(
         parsed, options,
         {.thinking     = {.temperature = 1.0F, .top_k = 20, .top_p = 0.95F},

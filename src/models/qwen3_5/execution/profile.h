@@ -87,6 +87,7 @@ struct ModelProfile {
     Config config;
     models::LoadOptions options;
     std::uint32_t public_tokens;
+    std::uint32_t control_token_limit = 0;
     TextProfile text;
     std::optional<MtpProfile> mtp;
     std::optional<qwen::VisionProfile> vision;

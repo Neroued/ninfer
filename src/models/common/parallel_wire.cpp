@@ -17,6 +17,40 @@ artifact::Shape shape(Decoder& in) {
 }
 } // namespace
 
+void encode_token_counts(Encoder& out, const TokenCounts& counts) {
+    const auto& values = counts.storage();
+    out.u8(static_cast<std::uint8_t>(values.index()));
+    if (const auto* sparse = std::get_if<TokenCounts::Sparse>(&values)) {
+        out.u64(sparse->size());
+        for (auto [token, count] : *sparse) {
+            out.i32(token);
+            out.i32(count);
+        }
+    } else if (const auto* dense = std::get_if<TokenCounts::Dense>(&values)) {
+        out.u64(dense->size());
+        for (auto count : *dense) out.i32(count);
+    }
+}
+
+TokenCounts decode_token_counts(Decoder& in) {
+    switch (in.u8()) {
+    case 0:
+        return {};
+    case 1: {
+        TokenCounts::Sparse values(in.count(8));
+        for (auto& value : values) value = {in.i32(), in.i32()};
+        return TokenCounts(std::move(values));
+    }
+    case 2: {
+        TokenCounts::Dense values(in.count(4));
+        for (auto& value : values) value = in.i32();
+        return TokenCounts(std::move(values));
+    }
+    default:
+        throw std::invalid_argument("unknown token counts encoding");
+    }
+}
+
 void encode_assemblies(Encoder& out, std::span<const ParameterAssembly> assemblies) {
     out.u64(assemblies.size());
     for (const auto& a : assemblies) {

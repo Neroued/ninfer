@@ -47,3 +47,7 @@ set_tests_properties(ninfer_context_store_test ninfer_kv_history_test ninfer_kv_
 ninfer_add_test(ninfer_vision_window_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_vision_window.cpp"
   LIBRARIES ninfer_model_control)
+
+ninfer_add_test(ninfer_token_input_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_token_input.cpp"
+  LIBRARIES ninfer_model_control)

@@ -27,13 +27,13 @@ struct ExecutionPlan {
     std::shared_ptr<const moe::Plan> moe;
     ple::disk::PrepareOptions ple;
     ple::UploadMemory ple_upload{};
-    std::size_t pinned_output_bytes   = 0;
-    std::size_t ple_prepare_bytes     = 0;
-    std::size_t host_context_bytes    = 0;
-    std::size_t pinned_io_bytes       = 0;
-    std::size_t pinned_sampling_bytes = 0;
+    std::size_t pinned_output_bytes      = 0;
+    std::size_t ple_prepare_bytes        = 0;
+    std::size_t host_context_bytes       = 0;
+    std::size_t pinned_io_bytes          = 0;
+    std::size_t pinned_sampling_bytes    = 0;
     std::size_t pinned_ple_handoff_bytes = 0;
-    std::size_t pinned_draft_bytes    = 0;
+    std::size_t pinned_draft_bytes       = 0;
     runtime::ContextCapacityResolution capacity;
     std::uint32_t checkpoint_interval = 8192;
     bool graph_probe                  = false;
@@ -53,6 +53,9 @@ struct ExecutionPlan {
 
     [[nodiscard]] std::size_t context_capacity() const { return capacity.device_bytes; }
 };
+
+[[nodiscard]] ExecutionShape describe_execution_shape(const execution::ModelProfile&,
+                                                      const EngineOptions&);
 
 [[nodiscard]] std::shared_ptr<const moe::Plan> describe_moe_plan(const execution::ModelProfile&,
                                                                  const MoeOptions&);

@@ -144,9 +144,18 @@ frontend::ProcessorOptions parse_processor_options(std::string_view image_json,
     return options;
 }
 
+void prepare_control_tokens(models::frontend::TextResources& resources) {
+    models::frontend::prepare_control_tokens(
+        resources,
+        "\n\n Considering the limited time by the user, I have to give the solution based on the "
+        "thinking directly now.\n</think>\n\n",
+        "</think>");
+}
+
 void parse_resources(FrontendResources& resources, std::uint32_t embedding_rows,
                      std::optional<MediaGeometry> vision) {
     models::frontend::parse_text_resources(resources.text, embedding_rows);
+    prepare_control_tokens(resources.text);
     if (vision) {
         for (const auto bytes :
              {resources.preprocessor_config_json, resources.video_preprocessor_config_json}) {

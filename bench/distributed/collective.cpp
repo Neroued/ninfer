@@ -157,7 +157,7 @@ int coordinator(int argc, char** argv) {
         deployment, topology,
         [](auto rank, auto line) { std::cerr << "rank=" << rank << " " << line << '\n'; }, args);
     const auto receive = [&] {
-        std::vector<wire::Bytes> results(size);
+        std::vector<wire::Payload> results(size);
         std::vector<bool> seen(size);
         std::size_t count   = 0;
         const auto deadline = Clock::now() + std::chrono::seconds(90);

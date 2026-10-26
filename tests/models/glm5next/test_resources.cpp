@@ -40,7 +40,7 @@ void synthetic() {
       "model":{"type":"BPE","vocab":{"a":0,"b":1},"merges":[],"ignore_merges":true},
       "added_tokens":[
         {"id":2,"content":"<eos>","special":true,"single_word":false,"normalized":false,"lstrip":false,"rstrip":false},
-        {"id":3,"content":"<think>","special":false,"single_word":false,"normalized":false,"lstrip":false,"rstrip":false}]
+        {"id":3,"content":"</think>","special":false,"single_word":false,"normalized":false,"lstrip":false,"rstrip":false}]
     })json";
     std::string generation      = R"({"eos_token_id":[2],"temperature":1.0,"top_p":0.95})";
     FrontendResources resources{.text = {.tokenizer_json         = tokenizer,

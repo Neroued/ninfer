@@ -1,5 +1,7 @@
 #pragma once
 
+#include "models/common/token_input.h"
+
 #include "models/common/context/contract.h"
 #include "models/common/context/directory/state.h"
 #include "models/common/context/directory/history.h"
@@ -37,7 +39,7 @@ struct WorkRow {
     std::int32_t rope_delta     = 0;
     std::array<TokenId, 2> ple_raw_tail{};
     std::vector<TokenId> ids;
-    std::vector<TokenId> count_tokens;
+    std::optional<TokenId> control_last_token;
     // Required boundaries within ids, measured from this input window's beginning.
     std::vector<std::uint32_t> window_ends;
     // Axis-major [3,T], where T is ids.size().
@@ -74,7 +76,7 @@ struct MtpWork {
 struct ResidencyBinding {
     runtime::ExecutionMember member;
     ResolvedSamplingParameters sampling;
-    std::vector<TokenId> generated;
+    TokenCounts counts;
 };
 
 struct ContextWork {
@@ -143,7 +145,9 @@ struct WorkContract {
     ExecutionShape shape;
     std::uint32_t vocabulary, public_tokens;
     bool mtp, vision;
+    std::uint32_t control_token_limit = 0;
 
+    [[nodiscard]] runtime::WorkPayloadCapacity payload_capacity(std::uint32_t rank_count) const;
     void validate(const Work&, runtime::FrameKind) const;
     void validate(const Work&, const Result&, const Commit&) const;
     void validate_commit(const Work&, std::span<const RowResult>, const Commit&) const;

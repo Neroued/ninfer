@@ -112,18 +112,19 @@ private:
 std::shared_ptr<const ModelProfile> describe_model(const ModelDefinition& definition,
                                                    std::span<const BoundWeight> weights,
                                                    const RankPlan& rank) {
-    auto out           = std::make_shared<ModelProfile>();
-    out->config        = definition.config();
-    out->options       = definition.options();
-    out->local         = {rank.rank,
-                          rank.size,
-                          rank.kda_heads,
-                          rank.vocabulary,
-                          rank.dense_intermediate,
-                          rank.shared_intermediate};
-    out->public_tokens = definition.resources().text.public_token_count;
-    const auto& c      = out->config.text;
-    const auto& w      = definition.weights();
+    auto out                 = std::make_shared<ModelProfile>();
+    out->config              = definition.config();
+    out->options             = definition.options();
+    out->local               = {rank.rank,
+                                rank.size,
+                                rank.kda_heads,
+                                rank.vocabulary,
+                                rank.dense_intermediate,
+                                rank.shared_intermediate};
+    out->public_tokens       = definition.resources().text.public_token_count;
+    out->control_token_limit = definition.resources().text.control_tokens->size();
+    const auto& c            = out->config.text;
+    const auto& w            = definition.weights();
     const Describe d(definition, weights);
     out->text.mhc            = {dimension(c.hidden), dimension(c.mhc.streams)};
     out->text.mhc_parameters = {c.norm_epsilon, c.norm_epsilon,

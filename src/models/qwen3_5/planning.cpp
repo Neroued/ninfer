@@ -126,8 +126,11 @@ SequencePlanner make_sequence_planner(std::shared_ptr<const execution::ModelProf
     auto& metadata               = impl->capacity_plan.metadata;
     const auto checkpoints =
         std::size_t(spec.state.logical_capacity) + 2ULL * options.max_concurrency;
-    metadata.fixed_bytes += detail::Checkpoints::metadata_bytes(checkpoints) +
-                            context::RecoveryIndex<>::metadata_bytes(checkpoints);
+    metadata.fixed_bytes +=
+        TokenCountBuilder::capacity_bytes(
+            impl->minimum->causal_scoring ? 0 : impl->minimum->profile->public_tokens) +
+        detail::Checkpoints::metadata_bytes(checkpoints) +
+        context::RecoveryIndex<>::metadata_bytes(checkpoints);
     const auto geometry    = describe_context_pool(impl->capacity_plan.records);
     const auto state_class = geometry.spec_classes.front().index;
     metadata.bytes_per_record[state_class] +=

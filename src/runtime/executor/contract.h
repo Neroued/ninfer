@@ -2,12 +2,18 @@
 
 #include "runtime/contract/execution.h"
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <variant>
 #include <vector>
 
 namespace ninfer::runtime {
+
+struct WorkPayloadCapacity {
+    std::size_t compute_work, context_work, decision, commit;
+    std::size_t rank_context_storage, coordinator_context_storage;
+};
 
 struct SessionEpoch {
     std::uint64_t value                                         = 0;

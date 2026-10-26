@@ -75,15 +75,15 @@ void RankProgramImpl::launch_commit(ComputeOperation& operation) {
     }
     if (const auto* forward = std::get_if<ForwardWork>(&operation.request.work.operation);
         forward && forward->purpose == ForwardPurpose::Control) {
-        for (std::size_t i = 0; i < forward->committed_tokens.size(); ++i) {
-            const auto& tokens = forward->committed_tokens[i];
-            if (tokens.empty() ||
+        for (std::size_t i = 0; i < forward->control_last_tokens.size(); ++i) {
+            const ControlTokens tokens{forward->inputs[i].tokens, forward->control_last_tokens[i]};
+            if (!tokens.size() ||
                 !residencies[operation.rows[i].member.residency.lane.value].penalties)
                 continue;
             auto host = frame.host_control_tokens.slice(1, static_cast<int>(i), 1)
                             .slice(0, 0, static_cast<int>(tokens.size()));
-            std::copy(tokens.begin(), tokens.end(), static_cast<TokenId*>(host.data));
-            auto ids = frame.input_ids.slice(0, 0, static_cast<int>(tokens.size()));
+            tokens.copy({static_cast<TokenId*>(host.data), tokens.size()});
+            auto ids = frame.control_ids.slice(0, 0, static_cast<int>(tokens.size()));
             CUDA_CHECK(cudaMemcpyAsync(ids.data, host.data, ids.bytes(), cudaMemcpyHostToDevice,
                                        device.stream()));
             auto counts =

@@ -21,7 +21,7 @@ void RankProgramImpl::prepare_control_window() {
     f.control_window = original;
     auto& row        = *f.control_window;
     row.ids.assign(original.ids.begin() + begin, original.ids.begin() + begin + count);
-    row.count_tokens.clear();
+    row.control_last_token.reset();
     row.window_ends.clear();
     row.main_frontier += begin;
     row.mtp_frontier = row.main_frontier ? row.main_frontier - 1 : 0;
@@ -88,10 +88,10 @@ void RankProgramImpl::enqueue_control_counts() {
     std::uint32_t used  = 0;
     while (f.control_row < work.rows.size() && used < capacity) {
         const auto& row = work.rows[f.control_row];
-        const auto n =
-            std::min<std::size_t>(capacity - used, row.count_tokens.size() - f.control_offset);
+        const auto n    = std::min<std::size_t>(capacity - used, row.ids.size() - f.control_offset);
         if (n) {
-            std::copy_n(row.count_tokens.begin() + f.control_offset, n, host + used);
+            ControlTokens{row.ids, *row.control_last_token}.copy({host + used, n},
+                                                                 f.control_offset);
             auto input = device_ids.slice(0, used, n);
             copy_bytes_async({input.data, input.bytes(), cuda.device()},
                              {host + used, input.bytes(), Device::cpu(), true}, cuda);
@@ -101,7 +101,7 @@ void RankProgramImpl::enqueue_control_counts() {
             used += n;
             f.control_offset += n;
         }
-        if (f.control_offset == row.count_tokens.size()) {
+        if (f.control_offset == row.ids.size()) {
             ++f.control_row;
             f.control_offset = 0;
         }

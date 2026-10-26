@@ -31,7 +31,7 @@ ParallelStartup::requests(const EngineOptions& options) const {
     return payloads;
 }
 
-void ParallelStartup::resolve(std::span<const distributed::wire::Bytes> descriptions,
+void ParallelStartup::resolve(std::span<const distributed::wire::Payload> descriptions,
                               EngineOptions& options) {
     ranks_.clear();
     for (const auto& bytes : descriptions) {

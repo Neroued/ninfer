@@ -48,18 +48,18 @@ void RankProgramImpl::commit(runtime::ExecutionTicket ticket, runtime::CommandSe
 }
 
 void RankProgramImpl::commit_mtp(const Commit& commit) {
-    auto& f        = *compute;
-    const auto& io = resources.plan.frame;
-    const int b    = f.batch.rows;
-    auto* values   = static_cast<std::int32_t*>(host(io.rows.accepted_columns).data);
+    auto& f             = *compute;
+    const auto& io      = resources.plan.frame;
+    const int b         = f.batch.rows;
+    auto* values        = static_cast<std::int32_t*>(host(io.rows.accepted_columns).data);
     auto* count_lengths = static_cast<std::int32_t*>(host(io.rows.count_columns).data);
     auto* last          = static_cast<std::int32_t*>(host(io.mtp->last_columns).data);
     bool any = false, repair = false, count_tokens = false;
     const auto& work = std::get<MtpWork>(f.request.work.operation);
     for (int i = 0; i < b; ++i) {
-        const auto logical = f.physical.members[i];
-        const auto n       = commit.rows[logical].accepted;
-        values[i]          = n;
+        const auto logical   = f.physical.members[i];
+        const auto n         = commit.rows[logical].accepted;
+        values[i]            = n;
         const auto& sampling = work.rows[logical].sampling;
         count_lengths[i]     = sampling.presence_penalty || sampling.frequency_penalty ? n : 0;
         count_tokens |= count_lengths[i] != 0;
@@ -158,10 +158,9 @@ void RankProgramImpl::control_counts() {
     std::uint32_t used = 0;
     while (f.control_row < rows.size() && used < cap) {
         const auto& row = rows[f.control_row];
-        const auto n =
-            std::min<std::size_t>(cap - used, row.count_tokens.size() - f.control_offset);
+        const auto n    = std::min<std::size_t>(cap - used, row.ids.size() - f.control_offset);
         if (n) {
-            std::copy_n(row.count_tokens.begin() + f.control_offset, n, ids + used);
+            ControlTokens{row.ids, *row.control_last_token}.copy({ids + used, n}, f.control_offset);
             auto input = resources.tensor(io.main.ids).slice(0, used, n);
             copy_bytes_async({input.data, input.bytes(), cuda.device()},
                              {ids + used, input.bytes(), Device::cpu(), true}, cuda);
@@ -171,7 +170,7 @@ void RankProgramImpl::control_counts() {
             f.control_offset += n;
             used += n;
         }
-        if (f.control_offset == row.count_tokens.size()) {
+        if (f.control_offset == row.ids.size()) {
             ++f.control_row;
             f.control_offset = 0;
         }

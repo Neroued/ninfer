@@ -78,7 +78,7 @@ void SessionImpl::finish_result(ComputeResult result) {
         const auto& row = tx.result->rows[b];
         commit.rows.push_back({member(s), tx.rows[b].states, row.processed});
         if (tx.kind == Kind::Control) {
-            const auto count = tx.rows[b].count_tokens.size();
+            const auto count = tx.rows[b].ids.size();
             s.identity.tokens.reserve(s.identity.tokens.size() + count);
             s.identity.positions.prepare_generated(count, s.continuation.metadata.rope_delta,
                                                    tx.splits[b]);
@@ -122,7 +122,17 @@ void SessionImpl::finish_result(ComputeResult result) {
         if (tx.kind == Kind::Prefill)
             s.capture_pending =
                 s.capture && s.captures[s.next_capture].frontier == completed[b].main_frontier;
-        if (tx.kind == Kind::Control) append_identity(s, tx.rows[b].count_tokens, tx.splits[b]);
+        if (tx.kind == Kind::Control) {
+            const auto& row   = tx.rows[b];
+            const auto prefix = std::span<const TokenId>(row.ids).subspan(1);
+            append_identity(s, prefix,
+                            tx.splits[b] && *tx.splits[b] <= prefix.size() ? tx.splits[b]
+                                                                           : std::nullopt);
+            const auto split = tx.splits[b] && *tx.splits[b] == row.ids.size()
+                                   ? std::optional<std::uint32_t>{1}
+                                   : std::nullopt;
+            append_identity(s, {&*row.control_last_token, 1}, split);
+        }
         if (tx.kind == Kind::Replay && s.continuation.metadata.main_frontier == s.replay_target)
             s.phase = s.resume_phase;
     }

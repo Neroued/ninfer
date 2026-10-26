@@ -10,6 +10,7 @@ namespace ninfer::models::glm5next {
 
 void parse_resources(FrontendResources& resources, std::uint32_t embedding_rows) {
     models::frontend::parse_text_resources(resources.text, embedding_rows);
+    models::frontend::prepare_control_tokens(resources.text, "</think>", "</think>");
     const auto generation =
         artifact::parse_json(resources.text.generation_config_json, "generation_config.json");
     SamplingPreset sampling;

@@ -1,6 +1,7 @@
 #include "models/qwen4_exp/wire.h"
 
 #include "models/common/context/wire.h"
+#include "models/common/parallel_wire.h"
 
 #include <stdexcept>
 #include <type_traits>
@@ -92,7 +93,8 @@ void row(Encoder& out, const WorkRow& r, std::uint32_t rank) {
     out.i32(r.rope_delta);
     for (auto value : r.ple_raw_tail) out.i32(value);
     integers(out, r.ids);
-    integers(out, r.count_tokens);
+    out.boolean(r.control_last_token.has_value());
+    if (r.control_last_token) out.i32(*r.control_last_token);
     integers(out, r.window_ends);
     integers(out, r.rope_positions);
     for (auto value : r.previous_rope) out.i32(value);
@@ -111,8 +113,8 @@ WorkRow row(Decoder& in, std::uint32_t rank) {
     r.mtp_frontier  = in.u32();
     r.rope_delta    = in.i32();
     for (auto& value : r.ple_raw_tail) value = in.i32();
-    r.ids            = integers<TokenId>(in);
-    r.count_tokens   = integers<TokenId>(in);
+    r.ids = integers<TokenId>(in);
+    if (in.boolean()) r.control_last_token = in.i32();
     r.window_ends    = integers<std::uint32_t>(in);
     r.rope_positions = integers<std::int32_t>(in);
     for (auto& value : r.previous_rope) value = in.i32();
@@ -191,7 +193,7 @@ void encode_work(Encoder& out, const Work& work, const VisionInputBindings& inpu
                 for (const auto& binding : v.bindings) {
                     member(out, binding.member);
                     sampling(out, binding.sampling);
-                    integers(out, binding.generated);
+                    encode_token_counts(out, binding.counts);
                 }
                 out.u64(v.releases.size());
                 for (auto id : v.releases) residency(out, id);
@@ -236,9 +238,9 @@ Work decode_work(Decoder& in, const VisionInputBindings& inputs) {
         ContextWork v;
         v.bindings.resize(in.count(68));
         for (auto& binding : v.bindings) {
-            binding.member    = member(in);
-            binding.sampling  = sampling(in);
-            binding.generated = integers<TokenId>(in);
+            binding.member   = member(in);
+            binding.sampling = sampling(in);
+            binding.counts   = decode_token_counts(in);
         }
         v.releases.resize(in.count(12));
         for (auto& id : v.releases) id = residency(in);

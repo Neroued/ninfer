@@ -130,7 +130,9 @@ FrameLayout plan_frames(LayoutBuilder& builder, const FrameSpec& spec) {
         out.host.visual_indices = add(host, DType::I32, {chunk}, "Host visual indices");
     }
     if (!spec.causal_scoring) {
-        out.host.control_tokens = add(host, DType::I32, {chunk, batch}, "Host control tokens");
+        const auto control      = dimension(std::max(spec.control_token_limit, 1U));
+        out.host.control_tokens = add(host, DType::I32, {control, batch}, "Host control tokens");
+        out.control_ids         = add(builder, DType::I32, {control}, "control token counts input");
     }
     if (out.masks) {
         out.host.masks =
@@ -257,6 +259,7 @@ ExecutionFrame::ExecutionFrame(MemorySpan backing, const FrameLayout& layout)
     host_rope_positions  = layout.host.rope_positions.bind(host);
     if (layout.host.visual_indices) host_visual_indices = layout.host.visual_indices->bind(host);
     if (layout.host.control_tokens) host_control_tokens = layout.host.control_tokens->bind(host);
+    if (layout.control_ids) control_ids = layout.control_ids->bind(backing);
     if (layout.host.masks) host_masks = layout.host.masks->bind(host);
     if (layout.host.drafts) host_drafts = layout.host.drafts->bind(host);
     if (mtp) {

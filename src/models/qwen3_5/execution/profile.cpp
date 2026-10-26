@@ -114,10 +114,11 @@ private:
 };
 
 std::shared_ptr<const ModelProfile> describe_model_impl(const ModelDefinition& plan) {
-    auto out           = std::make_shared<ModelProfile>();
-    out->config        = plan.config();
-    out->options       = plan.options();
-    out->public_tokens = plan.resources().text.public_token_count;
+    auto out                 = std::make_shared<ModelProfile>();
+    out->config              = plan.config();
+    out->options             = plan.options();
+    out->public_tokens       = plan.resources().text.public_token_count;
+    out->control_token_limit = plan.resources().text.control_tokens->size();
     const Describe describe(plan);
     const auto& w         = plan.weights();
     out->text.output_head = describe.linear(w.text.output_head_use);

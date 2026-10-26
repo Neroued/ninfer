@@ -58,8 +58,12 @@ ResidentBinding& RankProgramImpl::binding(runtime::ResidencyId residency) {
 }
 
 void RankProgramImpl::validate_work(const Work& work, runtime::FrameKind kind) const {
-    WorkContract{shape, parameters.profile->config.text.vocabulary,
-                 parameters.profile->public_tokens, bool(parameters.mtp), bool(parameters.vision)}
+    WorkContract{shape,
+                 parameters.profile->config.text.vocabulary,
+                 parameters.profile->public_tokens,
+                 bool(parameters.mtp),
+                 bool(parameters.vision),
+                 parameters.profile->control_token_limit}
         .validate(work, kind);
     const auto check_resident = [&](const runtime::ExecutionMember& member) {
         const auto& resident = bindings[member.residency.lane.value];
@@ -131,8 +135,12 @@ void RankProgramImpl::prepare_commit(runtime::ExecutionTicket ticket, const Comm
         compute->phase != ComputePhase::PendingCommit)
         throw std::logic_error("Qwen4Exp commit does not match the pending execution");
     const auto& frame = *compute;
-    WorkContract{shape, parameters.profile->config.text.vocabulary,
-                 parameters.profile->public_tokens, bool(parameters.mtp), bool(parameters.vision)}
+    WorkContract{shape,
+                 parameters.profile->config.text.vocabulary,
+                 parameters.profile->public_tokens,
+                 bool(parameters.mtp),
+                 bool(parameters.vision),
+                 parameters.profile->control_token_limit}
         .validate_commit(frame.request.work, frame.result.rows, commit);
     for (const auto& row : commit.rows)
         check_selectors(row.states.at(parameters.profile->local.rank), resources.states->storage());
@@ -163,8 +171,6 @@ void RankProgram::prepare_execution() {
 void RankProgram::release_execution() { impl_->release_graphs(); }
 
 RankProgram::~RankProgram() = default;
-
-runtime::ExecutionCapacity RankProgram::capacity() const noexcept { return {1, 1}; }
 
 SessionPlan RankProgram::session_plan() const {
     auto plan = plan_session(impl_->resources.plan);

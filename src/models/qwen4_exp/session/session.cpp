@@ -10,6 +10,11 @@ SessionImpl::SessionImpl(std::shared_ptr<const ModelDefinition> model, SessionPl
       checkpoints(Checkpoints::capacity_for_metadata(directory.metadata_budget().limit()),
                   directory.metadata_budget(), &recovery_index) {
     if (!definition) throw std::invalid_argument("invalid Qwen4Exp session definition");
+    if (shape.purpose == EnginePurpose::Generation) {
+        count_storage.acquire(
+            TokenCountBuilder::capacity_bytes(definition->resources().text.public_token_count));
+        count_builder.prepare(definition->resources().text.public_token_count);
+    }
     releases.reserve(shape.max_concurrency);
     for (std::uint16_t i = 0; i < pool_count(); ++i)
         pools.push_back({{i}, i == 0 ? "main" : "mtp"});
@@ -232,6 +237,12 @@ WorkRow SessionImpl::work_row(const Sequence& s, std::uint32_t tokens) const {
         for (std::uint32_t j = 0; j < tokens; ++j)
             row.rope_positions[axis * tokens + j] = position(start + j, axis);
     }
+    bool linear = true;
+    for (std::uint32_t axis = 0; axis < 3; ++axis)
+        for (std::uint32_t j = 0; j < tokens; ++j)
+            linear &= row.rope_positions[axis * tokens + j] ==
+                      static_cast<std::int32_t>(start + j) + m.rope_delta;
+    if (linear) row.rope_positions.clear();
     return row;
 }
 

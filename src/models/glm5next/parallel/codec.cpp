@@ -9,27 +9,19 @@ ExecutionCodec::ExecutionCodec(const ModelDefinition& definition,
                                const RankResourceDescription& rank,
                                const distributed::ExecutionTopology& topology)
     : rank_(rank.rank), ranks_(topology.ranks.size()),
-      contract_{rank.shape, definition.config().text.vocabulary,
-                definition.resources().text.public_token_count, ranks_, rank.vision_max_features} {
+      contract_{rank.shape,
+                definition.config().text.vocabulary,
+                definition.resources().text.public_token_count,
+                ranks_,
+                rank.vision_max_features,
+                static_cast<std::uint32_t>(definition.resources().text.control_tokens->size())} {
     scope_.result_owner = topology.output_rank;
     for (const auto& r : topology.ranks) scope_.owners.push_back(r.rank);
     scope_.validate(topology);
-    const std::size_t batch = rank.shape.max_concurrency, context = rank.shape.max_context;
+    const std::size_t batch = rank.shape.max_concurrency;
     const auto ranks = topology.ranks.size(), pools = rank.context.pools.size();
-    wire::Encoder envelope;
-    runtime::protocol::encode(envelope, runtime::protocol::Envelope{{}, {}, 0, scope_});
-    const auto header  = std::move(envelope).take().size();
-    const auto pages   = batch * pools * ((context + 63) / 64);
-    const auto actions = 8 + 54 * (pages + batch) + 21 * batch * pools;
-    const auto context_actions =
-        8 + 46 * context::kContextActionBatchOperations + 8 * context::kContextActionBatchOffsets;
-    const auto work         = header + actions + 128 + batch * (192 + 20 * ranks + 12 * context);
-    const auto context_work = header + context_actions + 128 + batch * (88 + 4 * context);
-    const auto width        = std::size_t(rank.shape.draft_tokens) + 1;
-    const auto decision =
-        header + 12 + batch * (20 + 4 * width * ((contract_.public_tokens + 31) / 32));
-    const auto commit = header + 64 + batch * (64 + 20 * ranks) + 8 +
-                        54 * (2 * batch * pools + batch) + 21 * batch * pools;
+    const auto payloads = contract_.payload_capacity(ranks);
+    const auto width    = std::size_t(rank.shape.draft_tokens) + 1;
     wire::Encoder observed;
     RankExecutionObservation sample;
     sample.gpu = {0, 0, 0, 0};
@@ -47,7 +39,12 @@ ExecutionCodec::ExecutionCodec(const ModelDefinition& definition,
                 {group.id, static_cast<std::uint32_t>(group.members.size())});
     wire::Encoder report;
     runtime::protocol::encode(report, snapshot);
-    budget_ = {work, context_work, decision, commit, event, std::move(report).take().size()};
+    budget_ = {payloads.compute_work,
+               payloads.context_work,
+               payloads.decision,
+               payloads.commit,
+               event,
+               std::move(report).take().size()};
 }
 
 void ExecutionCodec::validate_work(const Work& w, runtime::FrameKind f) const {

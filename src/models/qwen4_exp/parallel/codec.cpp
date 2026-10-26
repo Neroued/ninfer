@@ -9,31 +9,18 @@ namespace wire = distributed::wire;
 runtime::protocol::ControlBudget control_budget(const ModelDefinition& definition,
                                                 const RankExecutionDescription& rank,
                                                 const runtime::protocol::Scope& scope) {
-    const auto& p           = rank.session;
-    const auto& s           = p.shape;
-    const std::size_t batch = s.max_concurrency, context = s.max_context;
+    const auto& p               = rank.session;
+    const auto& s               = p.shape;
+    const std::size_t batch     = s.max_concurrency;
     const std::size_t positions = s.draft_tokens + 1;
-    wire::Encoder envelope;
-    runtime::protocol::encode(envelope, runtime::protocol::Envelope{{}, {}, 0, scope});
-    const auto header = std::move(envelope).take().size();
-
-    const auto histories     = p.context.pools.size();
-    const auto history_pages = (context + 63) / 64;
-    const auto write_pages   = batch * histories * history_pages;
-    const auto compute_actions =
-        8 + 46 * (write_pages + batch) + 21 * batch * histories + 8 * write_pages;
-    const auto context_actions =
-        8 + 46 * context::kContextActionBatchOperations + 8 * context::kContextActionBatchOffsets;
-    const auto commit_pages = batch * histories * 2;
-    const auto commit_actions =
-        8 + 46 * (commit_pages + batch) + 21 * batch * histories + 8 * commit_pages;
-    // Control inputs may cover the remaining context; native execution chunks them internally.
-    const auto work =
-        header + 4 + compute_actions + 128 + batch * (200 + 24 * context) + 4ULL * s.prefill_chunk;
-    const auto context_work = header + 4 + context_actions + 32 + batch * (88 + 4 * context);
-    const auto commit       = header + 4 + 8 + batch * 51 + commit_actions;
-    const auto words    = (std::size_t(definition.resources().text.public_token_count) + 31) / 32;
-    const auto decision = header + 12 + batch * (20 + 4 * words * positions);
+    const WorkContract contract{
+        s,
+        definition.config().text.vocabulary,
+        definition.resources().text.public_token_count,
+        definition.options().mtp(),
+        definition.options().vision,
+        static_cast<std::uint32_t>(definition.resources().text.control_tokens->size())};
+    const auto payloads = contract.payload_capacity(scope.owners.size());
     // Generated tokens are bounded by speculative positions. Scoring emits
     // at most one prefill chunk; context observations are coalesced by resource/direction.
     wire::Encoder completion;
@@ -46,7 +33,12 @@ runtime::protocol::ControlBudget control_budget(const ModelDefinition& definitio
                                40ULL * 3 * (p.context.pools.size() + 1)});
     wire::Encoder report;
     runtime::protocol::encode(report, rank.observation);
-    return {work, context_work, decision, commit, event, std::move(report).take().size()};
+    return {payloads.compute_work,
+            payloads.context_work,
+            payloads.decision,
+            payloads.commit,
+            event,
+            std::move(report).take().size()};
 }
 
 } // namespace
@@ -102,9 +94,12 @@ GroupExecutionPlan plan_group_execution(const ParallelPlan& parallel,
 ExecutionCodec::ExecutionCodec(const ModelDefinition& definition,
                                const RankExecutionDescription& rank,
                                const distributed::ExecutionTopology& topology)
-    : contract_{rank.session.shape, definition.config().text.vocabulary,
-                definition.resources().text.public_token_count, definition.options().mtp(),
-                definition.options().vision} {
+    : contract_{rank.session.shape,
+                definition.config().text.vocabulary,
+                definition.resources().text.public_token_count,
+                definition.options().mtp(),
+                definition.options().vision,
+                static_cast<std::uint32_t>(definition.resources().text.control_tokens->size())} {
     rank_               = rank.observation.rank;
     ranks_              = topology.ranks.size();
     max_features_       = rank.session.vision_max_features;

@@ -171,7 +171,8 @@ SessionImpl::start_control(std::span<const SequenceHandle> members, std::span<co
                            std::span<const std::optional<std::uint32_t>> splits) {
     if (execution) return {};
     if (members.empty() || members.size() > max_concurrency || !stride ||
-        tokens.size() != members.size() * stride || splits.size() != members.size())
+        stride > plan.profile->control_token_limit || tokens.size() != members.size() * stride ||
+        splits.size() != members.size())
         throw std::invalid_argument("forced control shape is invalid");
     auto reservation = executor().try_reserve(runtime::FrameKind::Compute);
     if (!reservation) return {};
@@ -214,7 +215,7 @@ SessionImpl::start_control(std::span<const SequenceHandle> members, std::span<co
                         static_cast<std::int32_t>(f + j) + state.continuation.metadata.rope_delta;
             forward.rows.push_back(execution_row(state));
             forward.inputs.push_back(std::move(input));
-            forward.committed_tokens.emplace_back(forced.begin(), forced.end());
+            forward.control_last_tokens.push_back(forced.back());
             forward.sampling.push_back({request.sampling_host, false});
         }
         return submit_execution(std::move(pending), std::move(*reservation),

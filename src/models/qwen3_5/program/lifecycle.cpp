@@ -81,14 +81,13 @@ void RankProgramImpl::install_residencies(const ContextWork& work) {
             binding.sampling.presence_penalty != 0.0F || binding.sampling.frequency_penalty != 0.0F;
         if (!resources.token_counts.data || !residency.penalties) continue;
         Tensor destination = resources.token_counts.slice(1, static_cast<int>(lane), 1);
-        if (binding.committed_generated_tokens.empty()) {
+        if (binding.counts.empty()) {
             CUDA_CHECK(cudaMemsetAsync(destination.data, 0, destination.bytes(),
                                        device.transfer_stream()));
             continue;
         }
         auto* row_counts = counts + lane * vocabulary;
-        std::fill_n(row_counts, vocabulary, 0);
-        for (auto token : binding.committed_generated_tokens) ++row_counts[token];
+        binding.counts.restore({row_counts, vocabulary});
         CUDA_CHECK(cudaMemcpyAsync(destination.data, row_counts, vocabulary * sizeof(std::int32_t),
                                    cudaMemcpyHostToDevice, device.transfer_stream()));
     }

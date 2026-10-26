@@ -5,6 +5,7 @@
 #include "models/glm5next/parallel/wire.h"
 #include "runtime/executor/protocol.h"
 #include "runtime/executor/input.h"
+#include "models/common/parallel_wire.h"
 
 #include <sys/socket.h>
 
@@ -150,7 +151,6 @@ q::WorkRow row() {
     r.rope_delta        = -3;
     r.ple_raw_tail      = {13, 17};
     r.ids               = {23};
-    r.count_tokens      = {5, 8};
     r.rope_positions    = {7, 8, 9};
     r.previous_rope     = {6, 7, 8};
     r.sampling          = {0.7F, 7, 0.9F, 0.1F, -0.2F, 0.3F, UINT64_MAX};
@@ -195,8 +195,9 @@ void native_work() {
                 r.ple_raw_tail == original.ple_raw_tail && r.ids == original.ids &&
                 r.rope_delta == -3 && r.rope_positions == original.rope_positions &&
                 r.previous_rope == original.previous_rope &&
-                r.count_tokens == original.count_tokens && r.sampling.temperature == 0.7F &&
-                r.sampling.seed == UINT64_MAX && r.sampling_position == 4 && r.constrained,
+                r.control_last_token == original.control_last_token &&
+                r.sampling.temperature == 0.7F && r.sampling.seed == UINT64_MAX &&
+                r.sampling_position == 4 && r.constrained,
             "native work values changed in transit");
     const auto& actions = decoded.actions.at(0).operations;
     require(actions.size() == 4 &&
@@ -246,7 +247,6 @@ void native_work() {
 
     auto prefill_row           = original;
     prefill_row.ids            = {23, 24};
-    prefill_row.window_ends    = {1};
     prefill_row.rope_positions = {7, 8, 9, 10, 11, 12};
     q::Work forward{{},
                     q::ForwardWork{q::ForwardKind::Prefill,
@@ -261,7 +261,7 @@ void native_work() {
     contract.validate(forward_copy, runtime::FrameKind::Compute);
     const auto& f = std::get<q::ForwardWork>(forward_copy.operation);
     require(f.prefetch->ids == std::vector<TokenId>{31, 32} && f.prefetch->frontier == 23 &&
-                f.rows[0].window_ends == std::vector<std::uint32_t>{1},
+                f.rows[0].window_ends.empty(),
             "prefill window or PLE prefetch changed in transit");
 
     auto scoring_contract          = contract;
@@ -391,6 +391,109 @@ void queues() {
     }
 }
 
+void compact_payloads() {
+    models::TokenCountBuilder builder;
+    for (const std::vector<TokenId> history :
+         {std::vector<TokenId>{}, {2, 2, 2}, {0, 1, 2, 3, 4, 5, 6, 7, 2}}) {
+        auto counts = builder.build(history, 8);
+        wire::Encoder encoded;
+        models::encode_token_counts(encoded, counts);
+        const auto bytes = std::move(encoded).take();
+        require(bytes.size() <= models::TokenCounts::encoded_capacity(8),
+                "count encoding exceeded its vocabulary bound");
+        wire::Decoder in(bytes);
+        auto restored = models::decode_token_counts(in);
+        in.finish();
+        restored.validate(8, history.size());
+        std::vector<std::int32_t> actual(8), expected(8);
+        restored.restore(actual);
+        for (auto token : history) ++expected[token];
+        require(actual == expected, "count snapshot changed across ranks");
+    }
+    q::WorkContract contract{
+        {1048576, 8, 4096, 3, KvCacheStorage::BFloat16, EnginePurpose::Generation},
+        248320,
+        248320,
+        true,
+        true,
+        64};
+    auto control               = row();
+    control.ids                = {23, 5};
+    control.control_last_token = 8;
+    control.rope_positions.clear();
+    control.window_ends = {1};
+    q::Work work{{}, q::ForwardWork{q::ForwardKind::Control, q::SampleKind::None, {control}}};
+    contract.validate(work, runtime::FrameKind::Compute);
+    q::VisionInputBindings bindings;
+    wire::Encoder encoded;
+    q::encode_work(encoded, work, bindings, 0);
+    const auto bytes = std::move(encoded).take();
+    wire::Decoder input(bytes);
+    const auto decoded = q::decode_work(input, bindings);
+    input.finish();
+    contract.validate(decoded, runtime::FrameKind::Compute);
+    const auto& r = q::work_rows(decoded).front();
+    std::array<TokenId, 2> forced{};
+    models::ControlTokens{r.ids, *r.control_last_token}.copy(forced);
+    require(forced == std::array<TokenId, 2>{5, 8} &&
+                r.window_ends == std::vector<std::uint32_t>{1},
+            "Control lost its committed token sequence or execution split");
+    const auto p = contract.payload_capacity(2);
+    runtime::protocol::validate_control_capacity(
+        {p.compute_work, p.context_work, p.decision, p.commit, 4096, 4096}, {1, 1}, {}, 2);
+    contract.vocabulary += 8;
+    auto& control_row  = std::get<q::ForwardWork>(work.operation).rows[0];
+    control_row.ids[1] = contract.public_tokens;
+    rejects([&] { contract.validate(work, runtime::FrameKind::Compute); });
+    control_row.ids[1] = 5;
+    std::get<q::ForwardWork>(work.operation).rows[0].ids.resize(65, 5);
+    rejects([&] { contract.validate(work, runtime::FrameKind::Compute); });
+}
+
+void retained_payload() {
+    wire::Payload retained;
+    {
+        int sockets[2];
+        require(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0, sockets) == 0,
+                "socketpair failed");
+        const dist::TransportLimits limits{64, 84, 1, 0, 0, 0, 0};
+        dist::Transport source(limits), target(limits);
+        source.add(1, dist::Socket(sockets[0]));
+        target.add(0, dist::Socket(sockets[1]));
+        source.start();
+        target.start();
+        const std::array messages{
+            dist::OutgoingMessage{1, std::make_shared<wire::Message>(wire::Message{
+                                         wire::Kind::Submit, 1, wire::Bytes(64, std::byte{42})})}};
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        const auto receive  = [&] {
+            for (;;) {
+                if (auto incoming = target.poll()) return std::move(incoming->message.payload);
+                require(std::chrono::steady_clock::now() < deadline, "retained payload stalled");
+                std::this_thread::yield();
+            }
+        };
+        require(source.try_send(messages), "initial send failed");
+        retained = receive();
+        while (source.sending()) {
+            require(std::chrono::steady_clock::now() < deadline, "send did not drain");
+            std::this_thread::yield();
+        }
+        require(source.try_send(messages), "second send failed");
+        const auto held_until = std::chrono::steady_clock::now() + std::chrono::milliseconds(20);
+        while (std::chrono::steady_clock::now() < held_until) {
+            require(!target.poll(), "poll released credit while the payload was still retained");
+            std::this_thread::yield();
+        }
+        retained = {};
+        retained = receive();
+        source.close();
+        target.close();
+    }
+    require(retained.back() == std::byte{42}, "closing transport invalidated retained bytes");
+    retained = {};
+}
+
 void inputs() {
     int sockets[2];
     require(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0, sockets) == 0,
@@ -410,8 +513,8 @@ void inputs() {
     data.reset();
     require(!owner.expired() && !transfers.ready(keys), "input owner was released before upload");
     transfers.progress(source, 11);
-    const auto control =
-        std::make_shared<wire::Message>(wire::Message{wire::Kind::Commit, 11, {std::byte{23}}});
+    const auto control = std::make_shared<wire::Message>(
+        wire::Message{wire::Kind::Commit, 11, wire::Bytes{std::byte{23}}});
     const dist::OutgoingMessage message{1, control};
     require(source.try_send({&message, 1}, dist::Traffic::Continuation),
             "bulk input consumed continuation capacity");
@@ -466,6 +569,8 @@ int main() {
         native_work();
         context_observations();
         queues();
+        retained_payload();
+        compact_payloads();
         inputs();
         RankSnapshot memory;
         memory.rank                                             = 1;

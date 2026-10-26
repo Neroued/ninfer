@@ -64,6 +64,13 @@ struct ContextActions {
 inline constexpr std::size_t kContextActionBatchOperations = 1024;
 inline constexpr std::size_t kContextActionBatchOffsets    = 4096;
 
+[[nodiscard]] inline std::size_t action_batch_storage_capacity() {
+    const auto ordinary = kContextActionBatchOperations * sizeof(ContextAction) +
+                          kContextActionBatchOffsets * sizeof(std::int64_t);
+    const auto peer = sizeof(ContextAction) + kContextActionBatchOffsets * sizeof(ContextRange);
+    return sizeof(ContextActions) + (ordinary > peer ? ordinary : peer);
+}
+
 struct ContextActionCursor {
     std::size_t operation      = 0;
     std::size_t mapping_offset = 0;

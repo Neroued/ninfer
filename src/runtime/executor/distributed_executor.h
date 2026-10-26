@@ -403,38 +403,9 @@ private:
     }
 
     void validate_control_capacity() const {
-        const auto b       = codec_.control_budget();
-        const auto& limits = group_->transport().limits();
-        const auto report  = protocol::measurement_report_capacity(b.report);
-        for (auto bytes : {b.compute_work, b.context_work, b.decision, b.commit, b.event, report})
-            if (!bytes || bytes > limits.message_bytes)
-                throw std::invalid_argument(
-                    "prepared execution message exceeds transport capacity");
-        const auto capacity       = pool_.capacity();
-        const std::size_t compute = capacity.compute_frames, context = capacity.context_frames;
-        const auto ranks  = group_->topology().ranks.size();
-        const auto framed = [](std::size_t bytes) {
-            if (bytes > SIZE_MAX - distributed::wire::kHeaderBytes)
-                throw std::overflow_error("execution control capacity overflow");
-            return bytes + distributed::wire::kHeaderBytes;
-        };
-        const auto reserve = [](std::size_t& available, std::size_t bytes, std::size_t count) {
-            if (count && bytes > available / count)
-                throw std::invalid_argument("transport cannot reserve execution payloads");
-            available -= bytes * count;
-        };
-        auto normal       = limits.queued_bytes / ranks;
-        auto continuation = limits.continuation_bytes / ranks;
-        reserve(normal, framed(b.compute_work), compute);
-        reserve(normal, framed(b.context_work), context);
-        reserve(continuation, framed(b.decision), compute);
-        reserve(continuation, framed(b.commit), compute);
-        reserve(continuation, framed(b.event), compute * 6 + context * 3);
-        reserve(continuation, framed(report), 1);
-        reserve(continuation, 1024, 1);
-        if (compute + context > limits.queued_messages / ranks ||
-            compute * 8 + context * 3 + 4 > limits.continuation_messages / ranks)
-            throw std::invalid_argument("transport cannot reserve all execution continuations");
+        protocol::validate_control_capacity(codec_.control_budget(), pool_.capacity(),
+                                            group_->transport().limits(),
+                                            group_->topology().ranks.size());
     }
 
     void measurement_boundary(MeasurementCommand command) {
@@ -497,8 +468,10 @@ private:
                     ? budget.work(envelope.ticket.frame.kind)
                     : (kind == distributed::wire::Kind::Supply ? budget.decision : budget.commit);
             if (payload.size() > limit)
-                throw std::invalid_argument(
-                    "execution message exceeds its prepared frame capacity");
+                throw std::logic_error("rank " + std::to_string(rank.rank) + " message " +
+                                       std::to_string(static_cast<unsigned>(kind)) + " encoded " +
+                                       std::to_string(payload.size()) + " bytes; Codec bound is " +
+                                       std::to_string(limit));
             auto message = std::make_shared<distributed::wire::Message>(
                 distributed::wire::Message{kind, epoch().value, std::move(payload)});
             result.push_back({rank.rank, std::move(message)});

@@ -1,4 +1,6 @@
 #include "models/qwen4_exp/work.h"
+#include "models/common/context/wire.h"
+#include "runtime/executor/protocol.h"
 
 #include <algorithm>
 #include <type_traits>
@@ -69,14 +71,48 @@ const context::ContextActions& local_actions(const ContextActions& actions, std:
     return found == actions.end() ? empty : found->second;
 }
 
+runtime::WorkPayloadCapacity WorkContract::payload_capacity(std::uint32_t rank_count) const {
+    const std::size_t batch = shape.max_concurrency, chunk = shape.prefill_chunk;
+    const auto header       = runtime::protocol::envelope_capacity(rank_count);
+    const std::size_t pools = shape.draft_tokens ? 2 : 1;
+    const auto actions      = [&](std::size_t rows, std::size_t tokens) {
+        return context::write_action_capacity(rows, pools, tokens);
+    };
+    const auto payload = [&](std::size_t rows, std::size_t span, std::size_t token_bytes) {
+        return header + actions(rows, span) + 128 + rows * (204 + token_bytes);
+    };
+    const std::size_t width = shape.draft_tokens + 1;
+    const auto work         = std::max({payload(1, chunk, 20 * chunk), payload(batch, width, 16),
+                                        payload(batch, control_token_limit, 8ULL * control_token_limit)});
+    const auto context      = header + context::action_batch_capacity() + 128 +
+                         batch * (88 + TokenCounts::encoded_capacity(public_tokens));
+    const auto decision = header + 12 + batch * (20 + 4 * width * ((public_tokens + 31ULL) / 32));
+    const auto commit   = header + 64 + batch * (64 + 20 * rank_count) + actions(batch, width);
+    const auto context_rows =
+        sizeof(Work) + sizeof(ContextWork) +
+        batch * (sizeof(ResidencyBinding) + sizeof(runtime::ResidencyId) + 4ULL * public_tokens);
+    const auto actions_storage = context::action_batch_storage_capacity() + 128;
+    return {work,
+            context,
+            decision,
+            commit,
+            context_rows + actions_storage,
+            context_rows + rank_count * actions_storage};
+}
+
 void WorkContract::validate(const Work& work, runtime::FrameKind kind) const {
-    const auto rows = work_rows(work);
+    const auto rows     = work_rows(work);
+    const auto* forward = std::get_if<ForwardWork>(&work.operation);
+    const bool control  = forward && forward->kind == ForwardKind::Control;
     if (!std::holds_alternative<ContextWork>(work.operation)) {
         if (kind != runtime::FrameKind::Compute || rows.empty() ||
             rows.size() > shape.max_concurrency)
             throw std::invalid_argument("Qwen4Exp compute shape differs from its reservation");
         for (std::size_t b = 0; b < rows.size(); ++b) {
             const auto& row = rows[b];
+            if (row.control_last_token.has_value() != control ||
+                (!control && !row.window_ends.empty()) || (control && !row.rope_positions.empty()))
+                throw std::invalid_argument("Qwen4Exp control fields outside control work");
             member(row.member, shape.max_concurrency);
             if (row.states.empty() || !row.main_table.valid() || row.main_table.pool_id != 0)
                 throw std::invalid_argument("Qwen4Exp work has invalid context selectors");
@@ -87,7 +123,6 @@ void WorkContract::validate(const Work& work, runtime::FrameKind kind) const {
             } else if (row.mtp_table.valid() || row.mtp_frontier)
                 throw std::invalid_argument("Qwen4Exp work refers to an absent MTP history");
             if (row.main_frontier > shape.max_context ||
-                row.count_tokens.size() > shape.max_context ||
                 row.ids.size() > shape.max_context - row.main_frontier ||
                 (!row.rope_positions.empty() && row.rope_positions.size() != 3 * row.ids.size()))
                 throw std::invalid_argument("Qwen4Exp input window exceeds its shape");
@@ -98,7 +133,9 @@ void WorkContract::validate(const Work& work, runtime::FrameKind kind) const {
                 previous = boundary;
             }
             tokens(row.ids, vocabulary);
-            tokens(row.count_tokens, public_tokens);
+            if (control && !row.ids.empty())
+                tokens(std::span<const TokenId>(row.ids).subspan(1), public_tokens);
+            if (row.control_last_token) tokens({&*row.control_last_token, 1}, public_tokens);
             tokens(row.ple_raw_tail, vocabulary);
             for (auto position : row.rope_positions)
                 if (position < 0) throw std::invalid_argument("negative Qwen4Exp RoPE position");
@@ -156,7 +193,7 @@ void WorkContract::validate(const Work& work, runtime::FrameKind kind) const {
                         throw std::invalid_argument("invalid Qwen4Exp ordinary work");
                     break;
                 case ForwardKind::Control:
-                    if (!count || sampling)
+                    if (!count || count > control_token_limit || sampling)
                         throw std::invalid_argument("invalid Qwen4Exp control work");
                     break;
                 default:
@@ -169,7 +206,9 @@ void WorkContract::validate(const Work& work, runtime::FrameKind kind) const {
                 if (operation.prefetch) {
                     const auto& next = *operation.prefetch;
                     member(next.member, shape.max_concurrency);
-                    if (rows.size() != 1 || !same_member(next.member, rows.front().member) ||
+                    if ((operation.kind != ForwardKind::Prefill &&
+                         operation.kind != ForwardKind::Replay) ||
+                        rows.size() != 1 || !same_member(next.member, rows.front().member) ||
                         next.frontier != rows.front().main_frontier + count || next.ids.empty() ||
                         next.ids.size() > shape.prefill_chunk ||
                         next.frontier > shape.max_context ||
@@ -223,10 +262,9 @@ void WorkContract::validate(const Work& work, runtime::FrameKind kind) const {
                         if (previous.member.sequence == binding.member.sequence)
                             throw std::invalid_argument("duplicate Qwen4Exp sequence binding");
                     }
-                    if (binding.generated.size() > shape.max_context)
-                        throw std::invalid_argument(
-                            "Qwen4Exp generated history exceeds its context");
-                    tokens(binding.generated, public_tokens);
+                    binding.counts.validate(public_tokens, shape.max_context);
+                    if (shape.purpose != EnginePurpose::Generation && !binding.counts.empty())
+                        throw std::invalid_argument("scoring residency has generation counts");
                 }
             }
         },

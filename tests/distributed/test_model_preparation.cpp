@@ -18,9 +18,9 @@ void require(bool value, const char* message) {
     if (!value) throw std::runtime_error(message);
 }
 
-std::vector<wire::Bytes> exchange(distributed::ExecutionGroup& group,
-                                  const rt::GroupPreparation& prepared,
-                                  rt::PreparationAction action, wire::Kind reply) {
+std::vector<wire::Payload> exchange(distributed::ExecutionGroup& group,
+                                    const rt::GroupPreparation& prepared,
+                                    rt::PreparationAction action, wire::Kind reply) {
     std::vector<distributed::OutgoingMessage> messages;
     for (const auto& rank : group.topology().ranks) {
         const auto& capacity = prepared.capacities.at(rank.rank);
@@ -36,7 +36,7 @@ std::vector<wire::Bytes> exchange(distributed::ExecutionGroup& group,
     }
     require(group.transport().try_send(messages, distributed::Traffic::Continuation),
             "preparation queue is full");
-    std::vector<wire::Bytes> responses(messages.size());
+    std::vector<wire::Payload> responses(messages.size());
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::minutes(2);
     for (std::size_t n = 0; n < responses.size();) {
         group.check_processes();
@@ -79,7 +79,7 @@ void rebuild(distributed::ExecutionGroup& group, rt::GroupPreparation& prepared)
         require(in.u64() == group.topology().plan && in.u32() == prepared.attempt && in.boolean(),
                 "Program rebuild did not fit");
         const auto layout = in.bytes();
-        prepared.layouts.emplace_back(layout.begin(), layout.end());
+        prepared.layouts.emplace_back(wire::Bytes(layout.begin(), layout.end()));
         in.finish();
     }
 }
@@ -133,7 +133,8 @@ void contexts(Executor& executor, const q4::SessionPlan& plan) {
         std::vector<ctx::RecordLease> retained;
         const rt::ExecutionMember member{{generation, 1}, {{0}, generation}};
         q4::ContextWork binding;
-        binding.bindings.push_back({member, {}, {1, 2, 1}});
+        binding.bindings.push_back(
+            {member, {}, models::TokenCounts(models::TokenCounts::Sparse{{1, 2}, {2, 1}})});
         q4::Work work{{}, std::move(binding)};
         std::uint32_t expected_images = 0, expected_pages = 0;
         for (std::size_t i = 0; i < layouts.size(); ++i) {

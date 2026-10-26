@@ -423,6 +423,8 @@ public:
     std::uint64_t next_sequence = 1;
     mutable context::RecoveryIndex<> recovery_index{directory.metadata_budget()};
     Checkpoints checkpoints;
+    context::MetadataAccount count_storage{directory.metadata_budget()};
+    TokenCountBuilder count_builder;
     std::unique_ptr<PendingContext> context_operation_;
     std::optional<ContextAssessment> pending_maintenance_;
     std::optional<SequenceHandle> normalizing_pause_;

@@ -57,6 +57,8 @@ struct MediaGeometry {
 frontend::ProcessorOptions parse_processor_options(std::string_view image_json,
                                                    std::string_view video_json);
 
+void prepare_control_tokens(models::frontend::TextResources&);
+
 void parse_resources(FrontendResources& resources, std::uint32_t embedding_rows,
                      std::optional<MediaGeometry> vision);
 

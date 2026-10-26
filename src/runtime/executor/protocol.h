@@ -5,6 +5,10 @@
 
 #include <string_view>
 
+namespace ninfer::distributed {
+struct TransportLimits;
+}
+
 namespace ninfer::runtime::protocol {
 void encode(distributed::wire::Encoder&, const RankMemoryBudget&);
 [[nodiscard]] RankMemoryBudget memory_budget(distributed::wire::Decoder&);
@@ -27,6 +31,16 @@ struct ControlBudget {
         return kind == FrameKind::Compute ? compute_work : context_work;
     }
 };
+
+[[nodiscard]] constexpr std::size_t envelope_capacity(std::size_t owners) {
+    return 57 + 4 * owners;
+}
+
+[[nodiscard]] std::size_t work_payload_memory(const WorkPayloadCapacity&, ExecutionCapacity,
+                                              std::size_t ranks, bool coordinator);
+
+void validate_control_capacity(const ControlBudget&, ExecutionCapacity,
+                               const distributed::TransportLimits&, std::size_t ranks);
 
 struct Scope {
     std::vector<distributed::RankId> owners;

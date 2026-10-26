@@ -148,6 +148,7 @@ Session::start_control(std::span<const SequenceHandle> members, std::span<const 
     auto& p = *impl_;
     if (p.compute) return {};
     if (members.empty() || members.size() > p.shape.max_concurrency || !stride ||
+        stride > p.definition->resources().text.control_tokens->size() ||
         tokens.size() != members.size() * stride || splits.size() != members.size())
         throw std::logic_error("invalid forced control window");
     for (std::size_t b = 0; b < members.size(); ++b) {
@@ -172,9 +173,10 @@ Session::start_control(std::span<const SequenceHandle> members, std::span<const 
         for (std::size_t b = 0; b < members.size(); ++b) {
             auto& s = p.sequence(members[b]);
             p.prepare_write(s, s.continuation.metadata.main_frontier + stride, tx.context);
-            auto row = p.work_row(s, 1);
-            row.count_tokens.assign(tokens.begin() + b * stride, tokens.begin() + (b + 1) * stride);
-            row.ids.insert(row.ids.end(), row.count_tokens.begin(), row.count_tokens.end() - 1);
+            auto row               = p.work_row(s, 1);
+            const auto forced      = tokens.subspan(b * stride, stride);
+            row.control_last_token = forced.back();
+            row.ids.insert(row.ids.end(), forced.begin(), forced.end() - 1);
             for (const auto frontier : s.identity.execution_frontiers)
                 if (frontier > row.main_frontier && frontier < row.main_frontier + stride)
                     row.window_ends.push_back(frontier - row.main_frontier);

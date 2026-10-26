@@ -310,7 +310,11 @@ ResidencyBinding SessionImpl::context_binding(BindOperation& operation) {
 
     const auto generated = std::span<const TokenId>(sequence.identity.tokens)
                                .subspan(sequence.request->summary.prompt_tokens);
-    ResidencyBinding result{member(sequence), {generated.begin(), generated.end()}};
+    ResidencyBinding result{member(sequence), {}};
+    const auto& sampling = sequence.request->sampling;
+    if (sampling.presence_penalty || sampling.frequency_penalty)
+        result.counts =
+            count_builder.build(generated, definition->resources().text.public_token_count);
     operation.binding = std::move(binding);
     return result;
 }

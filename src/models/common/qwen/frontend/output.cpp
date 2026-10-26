@@ -8,28 +8,16 @@
 namespace ninfer::models::qwen::frontend {
 namespace {
 constexpr std::string_view kThinkClose = "</think>";
-constexpr std::string_view kThinkingControl =
-    "\n\n Considering the limited time by the user, I have to give the solution based on the "
-    "thinking directly now.\n</think>\n\n";
-static_assert(kThinkingControl.ends_with(kCanonicalReasoningCloseSerialization));
+
 
 } // namespace
 
 OutputResources::OutputResources(const models::frontend::TextResources& resources,
                                  std::size_t cache_bytes)
     : text(resources, cache_bytes) {
-    auto control =
-        std::make_shared<const std::vector<TokenId>>(text.tokenizer->encode(kThinkingControl));
-    if (control->empty() || text.tokenizer->decode(*control) != kThinkingControl ||
-        text.tokenizer->decode(*control, {.skip_special_tokens = true}).find(kThinkClose) ==
-            std::string::npos)
-        throw std::invalid_argument(
-            "Qwen tokenizer cannot present the canonical thinking control suffix");
-    for (auto token : *control)
-        if (std::find(text.defaults.token_ids.begin(), text.defaults.token_ids.end(), token) !=
-            text.defaults.token_ids.end())
-            throw std::invalid_argument(
-                "canonical thinking control suffix contains a default terminal token");
+    const auto& control = resources.control_tokens;
+    if (!control || control->empty())
+        throw std::invalid_argument("thinking control tokens have not been prepared");
     normal = std::make_shared<const models::frontend::ReasoningFormat>(
         std::string(kThinkClose), std::string(kCanonicalReasoningCloseSerialization), control,
         true);

@@ -160,7 +160,9 @@ runtime::ContextCapacityPlan describe_execution_capacity(const ExecutionPlan& p)
     // The selected TP plan has equal KDA shards. Describe whole logical objects for metadata
     // costs, while charging allocator metadata to each rank and fixed control storage once.
     auto description = schema(p, 0, true);
-    out.metadata     = session_metadata_plan(description, geometry, rank);
+    out.metadata     = session_metadata_plan(
+        description, geometry, rank,
+        p.shape.purpose == EnginePurpose::Generation ? p.profile->public_tokens : 0);
     return out;
 }
 

@@ -212,6 +212,39 @@ wire::Message receive_message(const Socket& socket, Deadline deadline, std::size
     return result;
 }
 
+namespace {
+struct ReceiveCredits {
+    Socket wake{::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC)};
+    std::atomic<std::size_t> bytes{0}, count{0};
+
+    ReceiveCredits() {
+        if (wake.fd() < 0) socket_error("eventfd");
+    }
+
+    void notify() noexcept {
+        std::uint64_t one = 1;
+        while (::write(wake.fd(), &one, sizeof(one)) < 0 && errno == EINTR) {}
+    }
+};
+
+struct ReceiveReservation {
+    std::shared_ptr<ReceiveCredits> owner;
+    std::size_t bytes;
+
+    ReceiveReservation(std::shared_ptr<ReceiveCredits> owner, std::size_t bytes)
+        : owner(std::move(owner)), bytes(bytes) {
+        this->owner->bytes.fetch_add(bytes, std::memory_order_relaxed);
+        this->owner->count.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    ~ReceiveReservation() {
+        owner->bytes.fetch_sub(bytes, std::memory_order_relaxed);
+        owner->count.fetch_sub(1, std::memory_order_relaxed);
+        owner->notify();
+    }
+};
+} // namespace
+
 struct Transport::Impl {
     struct Write {
         std::shared_ptr<const wire::Message> message;
@@ -235,19 +268,14 @@ struct Transport::Impl {
         Write write;
     };
 
-    explicit Impl(TransportLimits limits)
-        : limits(limits), wake(::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC)) {
-        if (wake.fd() < 0) socket_error("eventfd");
+    explicit Impl(TransportLimits limits) : limits(limits) {
         if (!limits.message_bytes || !limits.queued_bytes || !limits.queued_messages)
             throw std::invalid_argument("empty transport capacity");
     }
 
     ~Impl() { stop(); }
 
-    void notify() noexcept {
-        std::uint64_t one = 1;
-        while (::write(wake.fd(), &one, sizeof(one)) < 0 && errno == EINTR) {}
-    }
+    void notify() noexcept { receive->notify(); }
 
     void stop() noexcept {
         {
@@ -257,7 +285,16 @@ struct Transport::Impl {
         notify();
         cpu_detail::join_workers(threads);
         threads.clear();
-        for (auto& peer : peers) peer.socket.close();
+        std::lock_guard lock(mutex);
+        for (auto& peer : peers) {
+            peer.socket.close();
+            peer.writes.clear();
+            peer.reading.reset();
+        }
+        pending.clear();
+        incoming.clear();
+        queued_bytes = queued_count = continuation_bytes = continuation_count = 0;
+        input_bytes = input_count = 0;
     }
 
     void complete(const Write& write) {
@@ -306,21 +343,28 @@ struct Transport::Impl {
             if (!peer.reading && peer.position == peer.header.size()) {
                 const auto h = wire::decode_header(peer.header);
                 if (h.bytes > limits.message_bytes)
-                    throw std::runtime_error("incoming control message exceeds its capacity");
+                    throw std::runtime_error("rank " + std::to_string(peer.rank) + " message " +
+                                             std::to_string(static_cast<unsigned>(h.kind)) +
+                                             " has " + std::to_string(h.bytes) +
+                                             " bytes; transport limit is " +
+                                             std::to_string(limits.message_bytes));
                 {
                     std::lock_guard lock(mutex);
-                    if (incoming_count >= limits.queued_messages + limits.continuation_messages +
-                                              limits.input_messages ||
+                    if (receive->count.load(std::memory_order_relaxed) >=
+                            limits.queued_messages + limits.continuation_messages +
+                                limits.input_messages ||
                         h.bytes > limits.queued_bytes + limits.continuation_bytes +
-                                      limits.input_bytes - incoming_bytes) {
+                                      limits.input_bytes -
+                                      receive->bytes.load(std::memory_order_relaxed)) {
                         peer.blocked = true;
                         return;
                     }
-                    incoming_bytes += h.bytes;
-                    ++incoming_count;
                 }
+                auto reservation = std::make_shared<ReceiveReservation>(receive, h.bytes);
                 peer.reading.emplace(
-                    wire::Message{h.kind, h.epoch, wire::Bytes(static_cast<std::size_t>(h.bytes))});
+                    wire::Message{h.kind, h.epoch,
+                                  wire::Payload(wire::Bytes(static_cast<std::size_t>(h.bytes)),
+                                                std::move(reservation))});
                 peer.position = 0;
             }
             if (peer.reading && peer.position == peer.reading->payload.size()) {
@@ -374,7 +418,7 @@ struct Transport::Impl {
                     }
                     pending.clear();
                 }
-                pollers[0] = {wake.fd(), POLLIN, 0};
+                pollers[0] = {receive->wake.fd(), POLLIN, 0};
                 for (std::size_t i = 0; i < peers.size(); ++i) {
                     read_peer(peers[i]);
                     pollers[i + 1] = {peers[i].socket.fd(),
@@ -389,7 +433,8 @@ struct Transport::Impl {
                 }
                 if (pollers[0].revents) {
                     std::uint64_t count;
-                    while (::read(wake.fd(), &count, sizeof(count)) < 0 && errno == EINTR) {}
+                    while (::read(receive->wake.fd(), &count, sizeof(count)) < 0 &&
+                           errno == EINTR) {}
                 }
                 for (std::size_t i = 0; i < peers.size(); ++i) {
                     const auto events = pollers[i + 1].revents;
@@ -413,7 +458,7 @@ struct Transport::Impl {
 
     TransportLimits limits;
     std::shared_ptr<std::atomic<bool>> failure_signal = std::make_shared<std::atomic<bool>>(false);
-    Socket wake;
+    std::shared_ptr<ReceiveCredits> receive           = std::make_shared<ReceiveCredits>();
     std::vector<Peer> peers;
     std::vector<std::thread> threads;
     mutable std::mutex mutex;
@@ -421,7 +466,6 @@ struct Transport::Impl {
     std::deque<IncomingMessage> incoming;
     std::size_t queued_bytes = 0, queued_count = 0, continuation_bytes = 0, continuation_count = 0;
     std::size_t input_bytes = 0, input_count = 0;
-    std::size_t incoming_bytes = 0, incoming_count = 0;
     bool started = false, closed = false;
     std::string error;
 };
@@ -452,8 +496,13 @@ bool Transport::try_send(std::span<const OutgoingMessage> messages, Traffic traf
         throw std::runtime_error(p.error.empty() ? "control transport is closed" : p.error);
     std::size_t bytes = 0;
     for (const auto& item : messages) {
-        if (!item.message || item.message->payload.size() > p.limits.message_bytes)
-            throw std::invalid_argument("outgoing control message exceeds its capacity");
+        if (!item.message) throw std::invalid_argument("outgoing control message is empty");
+        if (item.message->payload.size() > p.limits.message_bytes)
+            throw std::invalid_argument("rank " + std::to_string(item.peer) + " message " +
+                                        std::to_string(static_cast<unsigned>(item.message->kind)) +
+                                        " has " + std::to_string(item.message->payload.size()) +
+                                        " bytes; transport limit is " +
+                                        std::to_string(p.limits.message_bytes));
         if (std::none_of(p.peers.begin(), p.peers.end(),
                          [&](const auto& peer) { return peer.rank == item.peer; }))
             throw std::invalid_argument("unknown control peer");
@@ -495,9 +544,6 @@ std::optional<IncomingMessage> Transport::poll() {
     if (p.incoming.empty()) return {};
     auto out = std::move(p.incoming.front());
     p.incoming.pop_front();
-    p.incoming_bytes -= out.message.payload.size();
-    --p.incoming_count;
-    p.notify();
     return out;
 }
 

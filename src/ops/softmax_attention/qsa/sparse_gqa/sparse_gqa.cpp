@@ -1,4 +1,5 @@
 #include "ninfer/ops/qsa.h"
+#include "ops/softmax_attention/qsa/geometry.h"
 #include "ops/softmax_attention/qsa/sparse_gqa/plan.h"
 #include "ops/softmax_attention/qsa/validation.h"
 
@@ -8,7 +9,8 @@ constexpr detail::qsa::ViewValidation v{"qsa_sparse_gqa"};
 
 void profile(KvCacheStorage storage, int query_heads, int kv_heads, int lo, int hi, int batch,
              QsaSparseGqaExecutionEnvelope envelope, std::int32_t multiprocessor_count) {
-    v.require((query_heads == 24 && kv_heads == 2) || (query_heads == 12 && kv_heads == 1),
+    v.require(query_heads == detail::qsa::registered_query_heads(kv_heads, storage) &&
+                  query_heads > 0,
               "query/KV heads");
     v.require(envelope.max_visible_tokens <= 262144, "visible-token capacity");
     v.require(storage == KvCacheStorage::BFloat16 || storage == KvCacheStorage::Fp8E4M3Row256 ||

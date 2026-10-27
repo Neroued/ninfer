@@ -20,9 +20,10 @@ __device__ __forceinline__ void sparse_gqa_mma(SparseGqaKernelArguments<KvHeads>
     const auto work = a.work(q);
     if (work.size == 0) {
         if (a.numerator == nullptr)
-            for (int i = tid; i < 12 * 128; i += Warps * 32)
+            for (int i = tid; i < a.ratio * 128; i += Warps * 32)
                 *reinterpret_cast<unsigned*>(
-                    a.out + (q * a.query_heads + head * 12 + i / 128) * 256 + (i % 128) * 2) = 0;
+                    a.out + (q * a.query_heads + head * a.ratio + i / 128) * 256 + (i % 128) * 2) =
+                    0;
         return;
     }
     if (split >= work.splits) return;
@@ -175,8 +176,8 @@ __device__ __forceinline__ void sparse_gqa_mma(SparseGqaKernelArguments<KvHeads>
 #pragma unroll
     for (int j = 0; j < 2; ++j) {
         const int h = gid + j * 8;
-        if (h >= 12) continue;
-        const auto row    = a.partial_row(q, split, head * 12 + h);
+        if (h >= a.ratio) continue;
+        const auto row    = a.partial_row(q, split, head * a.ratio + h);
         const bool direct = a.numerator == nullptr;
         const float inv   = direct ? __frcp_rn(sum[j]) : 1.0f;
 #pragma unroll
@@ -187,7 +188,7 @@ __device__ __forceinline__ void sparse_gqa_mma(SparseGqaKernelArguments<KvHeads>
                     *reinterpret_cast<float2*>(s.partial + h * 256 + d) =
                         make_float2(acc[n][2 * j] * inv, acc[n][2 * j + 1] * inv);
                 else
-                    sparse_gqa_store(a, q, head * 12 + h, d, acc[n][2 * j] * inv,
+                    sparse_gqa_store(a, q, head * a.ratio + h, d, acc[n][2 * j] * inv,
                                      acc[n][2 * j + 1] * inv);
             } else
                 *reinterpret_cast<float2*>(a.numerator + row * 256 + d) =

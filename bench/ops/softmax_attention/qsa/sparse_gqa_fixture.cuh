@@ -40,7 +40,10 @@ __global__ void copy_sparse_plane(const std::uint8_t* src, std::size_t src_recor
     for (std::size_t i = blockIdx.x * blockDim.x + threadIdx.x; i < bytes;
          i += std::size_t(gridDim.x) * blockDim.x) {
         const auto row         = i / row_bytes;
-        const auto encoded_row = heads == 1 ? row / 128 * 128 + row % 2 * 64 + row / 2 % 64 : row;
+        const auto token       = row / (64 * heads) * 64 + row % 64;
+        const auto head        = row / 64 % heads;
+        const auto flat        = token * heads + head;
+        const auto encoded_row = flat / 128 * 128 + flat % 2 * 64 + flat / 2 % 64;
         dst[row / (64 * heads) * dst_record_stride + row % (64 * heads) * row_bytes +
             i % row_bytes]     = src[encoded_row / 128 * src_record_stride +
                                  encoded_row % 128 * row_bytes + i % row_bytes];
@@ -123,10 +126,10 @@ struct SparseGqaFixture {
             initialize_sparse_source<<<1024, 256, 0, execution.stream()>>>(
                 static_cast<__nv_bfloat16*>(raw_value.data()), raw_value.size() / 2, true,
                 o.kv_heads);
-            std::vector<int> coordinates(rows);
+            const int encoded_tokens = rows * o.kv_heads / 2;
+            std::vector<int> coordinates(encoded_tokens);
             std::iota(coordinates.begin(), coordinates.end(), 0);
             auto source_positions    = measurement::make_i32(coordinates);
-            const int encoded_tokens = rows * o.kv_heads / 2;
             const int encoded_pages  = (encoded_tokens + 63) / 64;
             auto encoded_geometry    = geometry;
             for (auto& plane : encoded_geometry.planes) plane.head_extent = 2;

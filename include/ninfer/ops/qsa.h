@@ -176,7 +176,7 @@ struct QsaSparseGqaExecutionEnvelope {
  * Math / indexing:
  * For each live (t,b), p=positions[t,b], C=floor((p+1)/4), c=block_counts[t,b].
  * J is the union of {4*g,4*g+1,4*g+2,4*g+3} for the first c block_ids and [4*C,p+1).
- * For head h, kvh=floor(h/12), score[j]=dot(query[:,h,t,b],K[:,j,kvh])/16:
+ * For head h, kvh=floor(h/(Hq/Hkv)), score[j]=dot(query[:,h,t,b],K[:,j,kvh])/16:
  *   attention[d,h] = sum_{j in J} softmax(score)[j] * V[d,j,kvh];
  *   out[d,h,t,b] = BF16(attention[d,h] * sigmoid(FP32(output_gate[d,h,t,b]))).
  * There is no attention-output BF16 rounding before the gate. Indexer scores do not enter
@@ -187,20 +187,21 @@ struct QsaSparseGqaExecutionEnvelope {
  *
  * Domain / numeric:
  * T>0, B=1..8. Query, gate and out are contiguous, 16-byte-aligned BF16 [256,Hq,T,B], (Hq,Hkv) in
- * {(24,2),(12,1)}. Cache supports BFloat16 (BF16 K / FP16 V), Fp8E4M3Row256, Int8Group64,
- * Nvfp4Group16 and Fp8KeyNvfp4Value. Data/scale planes follow paged_kv_storage_layout(storage,256),
- * with dense, naturally aligned [leading_extent,64,Hkv] geometry per 64-token record. Q and softmax
- * probabilities are not quantized to low-bit operands. The A16 numerical policy applies to the
- * complete attention and gate; intermediate arithmetic remains private. Decoded KV tiles stay on
- * chip; there is no expanded global cache. Tables contain contiguous I64 arena-relative record
- * offsets. Positions are contiguous I32 [T,B]; valid_columns/table_rows are contiguous Device I32
- * [B]. Each row has 0<=n<=T, with consecutive nonnegative live positions satisfying
- * p+1<=envelope.max_visible_tokens<=262144, covered by its table. Selection is contiguous I32
- * [512,T,B] and [T,B]; each live c lies in [0,min(512,C)], with distinct ids in [0,C). Id order is
- * unspecified; the set need not be an Indexer's actual TopK. Device metadata and readable selected
- * pages are caller guarantees. Live mathematical operands/results are finite. Cache storage
- * quantization and the A16 computation have separate rounding boundaries; decoded KV, transformed Q
- * and probabilities are internal operands rather than additional public tensors.
+ * {(24,2),(12,1)}, plus (24,4) on RTX 5090 with Fp8E4M3Row256. Cache supports BFloat16 (BF16 K /
+ * FP16 V), Fp8E4M3Row256, Int8Group64, Nvfp4Group16 and Fp8KeyNvfp4Value. Data/scale planes follow
+ * paged_kv_storage_layout(storage,256), with dense, naturally aligned [leading_extent,64,Hkv]
+ * geometry per 64-token record. Q and softmax probabilities are not quantized to low-bit operands.
+ * The A16 numerical policy applies to the complete attention and gate; intermediate arithmetic
+ * remains private. Decoded KV tiles stay on chip; there is no expanded global cache. Tables contain
+ * contiguous I64 arena-relative record offsets. Positions are contiguous I32 [T,B];
+ * valid_columns/table_rows are contiguous Device I32 [B]. Each row has 0<=n<=T, with consecutive
+ * nonnegative live positions satisfying p+1<=envelope.max_visible_tokens<=262144, covered by its
+ * table. Selection is contiguous I32 [512,T,B] and [T,B]; each live c lies in [0,min(512,C)], with
+ * distinct ids in [0,C). Id order is unspecified; the set need not be an Indexer's actual TopK.
+ * Device metadata and readable selected pages are caller guarantees. Live mathematical
+ * operands/results are finite. Cache storage quantization and the A16 computation have separate
+ * rounding boundaries; decoded KV, transformed Q and probabilities are internal operands rather
+ * than additional public tensors.
  *
  * Effects / execution:
  * All inputs and cache are preserved. There is no append, persistent state or publication.

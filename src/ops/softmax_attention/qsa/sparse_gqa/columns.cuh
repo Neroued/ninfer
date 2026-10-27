@@ -24,9 +24,10 @@ __launch_bounds__(Parts * 32) __global__
     const auto work = a.work(q);
     if (work.size == 0) {
         if (a.numerator == nullptr)
-            for (int i = tid; i < 12 * 128; i += Parts * 32)
+            for (int i = tid; i < a.ratio * 128; i += Parts * 32)
                 *reinterpret_cast<unsigned*>(
-                    a.out + (q * a.query_heads + head * 12 + i / 128) * 256 + (i % 128) * 2) = 0;
+                    a.out + (q * a.query_heads + head * a.ratio + i / 128) * 256 + (i % 128) * 2) =
+                    0;
         return;
     }
     if (split >= work.splits) return;
@@ -131,8 +132,8 @@ __launch_bounds__(Parts * 32) __global__
 #pragma unroll
     for (int j = 0; j < 2; ++j) {
         const int h = gid + j * 8;
-        if (h >= 12) continue;
-        const auto row    = a.partial_row(q, split, head * 12 + h);
+        if (h >= a.ratio) continue;
+        const auto row    = a.partial_row(q, split, head * a.ratio + h);
         const bool direct = a.numerator == nullptr;
         const float inv   = direct ? __frcp_rn(state[j].sum) : 1.0f;
 #pragma unroll
@@ -143,7 +144,7 @@ __launch_bounds__(Parts * 32) __global__
                 if constexpr (kSparseRotatedValue<Storage>)
                     *reinterpret_cast<float2*>(s.partial + h * 256 + d) = make_float2(x, y);
                 else
-                    sparse_gqa_store(a, q, head * 12 + h, d, x, y);
+                    sparse_gqa_store(a, q, head * a.ratio + h, d, x, y);
             } else
                 *reinterpret_cast<float2*>(a.numerator + row * 256 + d) = make_float2(x, y);
         }

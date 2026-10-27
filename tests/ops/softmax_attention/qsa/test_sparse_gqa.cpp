@@ -74,8 +74,8 @@ int verify(Fixture& f, const std::string& label, bool preserved = true) {
 int run(DeviceContext& device, int t, int b, int history, bool padded = false, int cap = 512,
         float magnitude = 1, bool graph = false, KvCacheStorage storage = KvCacheStorage::BFloat16,
         int live_limit = std::numeric_limits<int>::max(), int query_heads = 24,
-        bool dense_rows = false) {
-    Fixture f(t, b, history, padded, storage, false, query_heads);
+        bool dense_rows = false, int kv_heads = 0) {
+    Fixture f(t, b, history, padded, storage, false, query_heads, kv_heads);
     f.dense_rows     = dense_rows;
     f.live_limit     = live_limit;
     const auto bytes = ops::qsa_sparse_gqa_workspace_capacity_bytes(
@@ -110,8 +110,8 @@ int run(DeviceContext& device, int t, int b, int history, bool padded = false, i
 }
 
 int gate_rounding(DeviceContext& device, KvCacheStorage storage = KvCacheStorage::BFloat16,
-                  int tokens = 1, std::uint32_t bound = 1, int query_heads = 24) {
-    Fixture f(tokens, 1, 1, false, storage, false, query_heads);
+                  int tokens = 1, std::uint32_t bound = 1, int query_heads = 24, int kv_heads = 0) {
+    Fixture f(tokens, 1, 1, false, storage, false, query_heads, kv_heads);
     f.envelope.max_visible_tokens = bound;
     f.reset();
     std::fill(f.ghost.begin(), f.ghost.end(), f32_to_bf16(1.0f));
@@ -161,8 +161,8 @@ int gate_rounding(DeviceContext& device, KvCacheStorage storage = KvCacheStorage
 }
 
 int read_footprint(DeviceContext& device, KvCacheStorage storage, bool padded, int batch = 4,
-                   int query_heads = 24) {
-    Fixture f(3, batch, 2053, padded, storage, false, query_heads);
+                   int query_heads = 24, int kv_heads = 0) {
+    Fixture f(3, batch, 2053, padded, storage, false, query_heads, kv_heads);
     f.reset(0, 1);
     DeviceBuffer q(ninfer::test::cuda_environment().context.device(), f.q.bytes());
     DeviceBuffer gate(ninfer::test::cuda_environment().context.device(), f.gate.bytes());
@@ -245,8 +245,8 @@ int read_footprint(DeviceContext& device, KvCacheStorage storage, bool padded, i
 
 int graph_update(DeviceContext& device, int tokens, int batch,
                  KvCacheStorage storage = KvCacheStorage::BFloat16, bool padded = true,
-                 int query_heads = 24) {
-    Fixture f(tokens, batch, 8192, padded, storage, false, query_heads);
+                 int query_heads = 24, int kv_heads = 0) {
+    Fixture f(tokens, batch, 8192, padded, storage, false, query_heads, kv_heads);
     const auto bytes = ops::qsa_sparse_gqa_workspace_capacity_bytes(
         storage, f.q_heads, f.kv_heads, tokens, tokens, batch, {262144},
         device.execution_view().multiprocessor_count());
@@ -330,9 +330,9 @@ int validation(DeviceContext& device) {
 }
 
 int scale_layout(DeviceContext& device, KvCacheStorage storage, int tokens, int history,
-                 int query_heads = 24) {
+                 int query_heads = 24, int kv_heads = 0) {
     // Scale planes have their own strides/alignment, independently of vector-aligned data.
-    Fixture f(tokens, 1, history, false, storage, true, query_heads);
+    Fixture f(tokens, 1, history, false, storage, true, query_heads, kv_heads);
     f.live_limit = 4;
     f.reset();
     ninfer::DeviceBuffer arena_storage(
@@ -370,16 +370,19 @@ void add_case(OpSuite& suite, int t, int b, int history, bool padded = false, in
               float magnitude = 1, bool graph = false,
               KvCacheStorage storage = KvCacheStorage::BFloat16,
               int live_limit = std::numeric_limits<int>::max(), int query_heads = 24,
-              bool dense_rows = false) {
+              bool dense_rows = false, int kv_heads = 0) {
     const auto format = kv_cache_storage_name(storage);
-    suite.add(std::string(query_heads == 12 ? "sparse_gqa_local/" : "sparse_gqa/") + format + "/t" +
-                  std::to_string(t) + "/b" + std::to_string(b) + "/l" + std::to_string(history) +
-                  "/cap" + std::to_string(cap) + (padded ? "/padded" : "/contiguous") + "/qk" +
-                  std::to_string(magnitude) + "/live" + std::to_string(live_limit) +
-                  (graph ? "/graph" : "/eager") + (dense_rows ? "/dense_rows" : ""),
+    suite.add(std::string(kv_heads == 4       ? "sparse_gqa_h24_4/"
+                          : query_heads == 12 ? "sparse_gqa_local/"
+                                              : "sparse_gqa/") +
+                  format + "/t" + std::to_string(t) + "/b" + std::to_string(b) + "/l" +
+                  std::to_string(history) + "/cap" + std::to_string(cap) +
+                  (padded ? "/padded" : "/contiguous") + "/qk" + std::to_string(magnitude) +
+                  "/live" + std::to_string(live_limit) + (graph ? "/graph" : "/eager") +
+                  (dense_rows ? "/dense_rows" : ""),
               [=] {
                   return run(cuda_environment().context, t, b, history, padded, cap, magnitude,
-                             graph, storage, live_limit, query_heads, dense_rows);
+                             graph, storage, live_limit, query_heads, dense_rows, kv_heads);
               },
               {{"format", format}, {"execution", graph ? "graph" : "eager"}});
 }
@@ -515,6 +518,65 @@ void add_local_cases(OpSuite& suite, KvCacheStorage storage) {
     });
 }
 
+void add_four_head_cases(OpSuite& suite) {
+    constexpr auto storage = KvCacheStorage::Fp8E4M3Row256;
+    const auto add         = [&](int t, int b, int history, bool padded = false, int cap = 512,
+                         float magnitude = 1.F, bool graph = false) {
+        add_case(suite, t, b, history, padded, cap, magnitude, graph, storage,
+                         std::numeric_limits<int>::max(), 24, false, 4);
+    };
+    // Tails, full-select/TopK transition, long sparse history, and independent head mapping.
+    for (int l : {1, 2, 3, 4, 64, 65, 2044, 2048, 2051, 2052, 262144}) add(1, 1, l);
+    for (int t : {255, 256, 257}) add(t, 1, 2051);
+    add(65, 1, 2051, false, 17, 1.F, true);
+    for (int t : {2, 4}) add(t, 1, 2051);
+    for (int t : {8, 9}) add(t, 1, 8192);
+    for (int t : {63, 64, 65}) add(t, 1, 2048);
+    add(2048, 1, 8192, false, 1);
+    add(33, 8, 1024, false, 512, 1.F, true);
+    add(6, 8, 32771, true, 512, 1.8F, true);
+    add(3, 2, 2052, true, 0, 0.1F, true);
+    const std::string prefix = "sparse_gqa_h24_4/fp8/";
+    const auto special       = [&](std::string id, auto run, const char* execution = "eager") {
+        suite.add(prefix + id, std::move(run), {{"format", "fp8"}, {"execution", execution}});
+    };
+    special("capacity", [=] {
+        const int sms = cuda_environment().context.multiprocessor_count();
+        int failures  = 0;
+        for (int b : {1, 8})
+            for (unsigned bound : {0u, 64u, 2051u, 262144u}) {
+                std::size_t maximum = 0;
+                for (int t = 1; t <= 257; ++t)
+                    maximum = std::max(maximum, ops::qsa_sparse_gqa_workspace_capacity_bytes(
+                                                    storage, 24, 4, t, t, b, {bound}, sms));
+                failures += maximum != ops::qsa_sparse_gqa_workspace_capacity_bytes(
+                                           storage, 24, 4, 1, 257, b, {bound}, sms);
+            }
+        for (auto format : {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64,
+                            KvCacheStorage::Nvfp4Group16, KvCacheStorage::Fp8KeyNvfp4Value})
+            failures += rejects([&] {
+                (void)ops::qsa_sparse_gqa_workspace_capacity_bytes(format, 24, 4, 1, 8, 1, {8192},
+                                                                   sms);
+            });
+        return failures;
+    });
+    special(
+        "metadata_update",
+        [=] {
+            return graph_update(cuda_environment().context, 33, 8, storage, true, 24, 4) +
+                   graph_update(cuda_environment().context, 8, 8, storage, true, 24, 4);
+        },
+        "graph");
+    special("gate_rounding", [=] {
+        return gate_rounding(cuda_environment().context, storage, 1, 1, 24, 4) +
+               gate_rounding(cuda_environment().context, storage, 256, 8192, 24, 4);
+    });
+    special("read_footprint",
+            [=] { return read_footprint(cuda_environment().context, storage, true, 4, 24, 4); });
+    special("scale_layout",
+            [=] { return scale_layout(cuda_environment().context, storage, 256, 65, 24, 4); });
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -525,5 +587,6 @@ int main(int argc, char** argv) {
         add_cases(suite, storage);
         add_local_cases(suite, storage);
     }
+    add_four_head_cases(suite);
     return suite.main(argc, argv);
 }

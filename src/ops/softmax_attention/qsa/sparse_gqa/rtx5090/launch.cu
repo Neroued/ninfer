@@ -2,6 +2,7 @@
 #include "ops/common/host/launch.h"
 #include "ops/softmax_attention/qsa/sparse_gqa/prefill.cuh"
 #include "ops/softmax_attention/qsa/sparse_gqa/simt.cuh"
+#include "ops/softmax_attention/qsa/sparse_gqa/compact.cuh"
 
 namespace ninfer::ops::detail::qsa {
 namespace {
@@ -11,7 +12,29 @@ void launch(const SparseGqaArguments& arguments, SparseGqaPlan plan,
     SparseGqaKernelArguments<KvHeads> a{arguments};
     a.splits             = launch_plan.splits;
     constexpr bool Async = kSparseQuantized<Storage> && VectorCache;
-    if (plan.instance == SparseGqaInstance::FullPrefix) {
+    if constexpr (KvHeads == 4) {
+        const auto compact = [&]<int N, int Warps, SparseGqaLoad Load, bool Prefix>() {
+            constexpr auto kernel = sparse_gqa_compact_kernel<N, Warps, VectorCache, Load, Prefix>;
+            constexpr int bytes =
+                sizeof(SparseGqaStorage<Storage, N, Warps, Load, SparseGqaWarpSplit::Sequence, 8>);
+            const int shared = common::prepare_shared<bytes, kernel, true>();
+            const int groups = Prefix ? (queries + Warps - 1) / Warps : queries;
+            kernel<<<dim3(groups * 4, a.splits), Warps * 32, shared, execution.stream()>>>(a);
+        };
+        if (plan.instance == SparseGqaInstance::FullPrefix) {
+            constexpr auto load = Async ? SparseGqaLoad::Aliased : SparseGqaLoad::Direct;
+            compact.template operator()<64, 4, load, true>();
+        } else if (plan.instance == SparseGqaInstance::Simt) {
+            sparse_gqa_simt_kernel<Storage, 8, VectorCache>
+                <<<dim3(queries * a.query_heads, a.splits), 256, 0, execution.stream()>>>(a);
+        } else if (plan.key_rows == 64) {
+            constexpr auto load = Async ? SparseGqaLoad::Aliased : SparseGqaLoad::Direct;
+            compact.template operator()<64, 4, load, false>();
+        } else {
+            constexpr auto load = Async ? SparseGqaLoad::Aliased : SparseGqaLoad::Direct;
+            compact.template operator()<16, 1, load, false>();
+        }
+    } else if (plan.instance == SparseGqaInstance::FullPrefix) {
         constexpr auto load   = Async ? SparseGqaLoad::InPlace : SparseGqaLoad::Direct;
         constexpr auto kernel =
             sparse_gqa_all_select_kernel<Storage, 64, 4, VectorCache, load, KvHeads>;
@@ -57,7 +80,10 @@ void launch_sparse_gqa_instance(SparseGqaArguments a, KvCacheStorage storage, in
         };
         if (kv_heads == 1)
             geometry.template operator()<1>();
-        else
+        else if (kv_heads == 4) {
+            if constexpr (Storage == KvCacheStorage::Fp8E4M3Row256)
+                geometry.template operator()<4>();
+        } else
             geometry.template operator()<2>();
     };
     switch (storage) {

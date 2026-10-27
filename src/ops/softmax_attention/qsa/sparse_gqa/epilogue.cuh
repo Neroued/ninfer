@@ -38,14 +38,14 @@ __device__ void sparse_gqa_inverse_rows(const SparseGqaKernelArguments<KvHeads>&
                                         std::int64_t first, std::int64_t last, int head,
                                         const float* rows) {
     const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
-    for (int i = warp; i < Queries * 12; i += Warps) {
-        const auto q = first + i / 12;
-        const int h  = i % 12;
+    for (int i = warp; i < Queries * a.ratio; i += Warps) {
+        const auto q = first + i / a.ratio;
+        const int h  = i % a.ratio;
         if (q >= last) continue;
         float values[8];
 #pragma unroll
-        for (int d = 0; d < 8; ++d) values[d] = rows[(i / 12 * 16 + h) * 256 + lane + 32 * d];
-        sparse_gqa_inverse_gate(a, q, head * 12 + h, values);
+        for (int d = 0; d < 8; ++d) values[d] = rows[(i / a.ratio * 16 + h) * 256 + lane + 32 * d];
+        sparse_gqa_inverse_gate(a, q, head * a.ratio + h, values);
     }
 }
 

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "ops/softmax_attention/qsa/geometry.h"
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cstdint>
@@ -8,7 +9,7 @@ namespace ninfer::ops::detail::qsa {
 
 enum class SparseGqaWarpSplit { Sequence, Output };
 
-enum class SparseGqaLoad { Direct, Staged, InPlace };
+enum class SparseGqaLoad { Direct, Staged, InPlace, Aliased };
 
 struct SparseGqaPage {
     const std::uint8_t* data;
@@ -44,7 +45,8 @@ struct SparseGqaArguments {
 // Head geometry stays constant through the contraction and output address calculations.
 template <int KvHeads>
 struct SparseGqaKernelArguments : SparseGqaArguments {
-    static constexpr int kv_heads = KvHeads, query_heads = 12 * KvHeads;
+    static constexpr int kv_heads = KvHeads, query_heads = HeadGeometry<KvHeads>::query_heads,
+                         ratio = HeadGeometry<KvHeads>::ratio;
 
     __device__ static unsigned group_query(unsigned x) { return x / kv_heads; }
 

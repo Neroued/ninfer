@@ -1,5 +1,6 @@
 #include "ops/softmax_attention/qsa/sparse_gqa/plan.h"
 #include "ops/common/host/operands.h"
+#include <limits>
 
 namespace ninfer::ops::detail::qsa {
 int sparse_gqa_direct_queries(int, int) { return 256; }
@@ -8,6 +9,33 @@ SparseGqaPlan select_sparse_gqa_plan(KvCacheStorage, int tokens, int batch, int 
                                      QsaSparseGqaExecutionEnvelope envelope, int sms) {
     const auto queries = std::int64_t(tokens) * batch;
     const auto visible = envelope.max_visible_tokens;
+    if (kv_heads == 4) {
+        const bool partial = queries < sparse_gqa_direct_queries(kv_heads, sms);
+        const bool prefix  = visible <= 2051 && queries >= 2 && (visible > 64 || queries >= 32);
+        if (!prefix && visible <= 64) return {32, 1, SparseGqaInstance::Simt, true};
+        const int rows     = prefix || queries <= 8 ? 64 : 16;
+        const auto groups  = prefix ? (queries + 3) / 4 * 4 : queries * 4;
+        const int resident = rows == 16 ? 7 : 2;
+        const int tiles    = std::max(1, (int(std::min(visible, 2051u)) + rows - 1) / rows);
+        int splits         = 1;
+        if (partial) {
+            // Compare complete waves, including the Q prologue. A fixed CTA target can
+            // spill one partition into another wave and create a latency inversion.
+            std::int64_t best = std::numeric_limits<std::int64_t>::max();
+            for (int candidate = 1; candidate <= std::min(64, tiles); ++candidate) {
+                const int count = std::min(candidate, tiles);
+                const auto waves =
+                    (std::int64_t(groups) * count + resident * sms - 1) / (resident * sms);
+                const auto cost = waves * ((tiles + count - 1) / count + 2);
+                if (cost < best) {
+                    best   = cost;
+                    splits = count;
+                }
+            }
+        }
+        return {rows, splits, prefix ? SparseGqaInstance::FullPrefix : SparseGqaInstance::Mma,
+                partial};
+    }
     if (queries >= sparse_gqa_direct_queries(kv_heads, sms))
         return visible <= 2051 ? SparseGqaPlan{64, 1, SparseGqaInstance::FullPrefix, false}
                                : SparseGqaPlan{32, 1, SparseGqaInstance::Mma, false};
@@ -31,6 +59,12 @@ SparseGqaLaunchPlan select_sparse_gqa_launch(const ConstPagedKVBatchLayerView& c
                t.head_stride_bytes() % 16 == 0 && t.plane.tensor.region.alignment % 16 == 0;
     };
     const bool vector = aligned(cache.k_pages) && aligned(cache.v_pages);
+    if (cache.num_kv_heads == 4) {
+        const auto load = !vector || plan.instance == SparseGqaInstance::Simt
+                              ? SparseGqaLoad::Direct
+                              : SparseGqaLoad::Aliased;
+        return {load, vector, plan.splits};
+    }
     if (cache.storage == KvCacheStorage::BFloat16 || !vector ||
         plan.instance == SparseGqaInstance::Simt)
         return {SparseGqaLoad::Direct, vector, plan.splits};

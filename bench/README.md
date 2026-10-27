@@ -1237,7 +1237,8 @@ Prepare, Indexer and sparse GQA share semantic work/traffic columns. Counts foll
 prefixes; T/B describe physical extents. Indexer reports scoring queries and complete candidate
 blocks, excluding the C<=512 all-select case. QK FLOPs count the four 128-dimensional heads only
 for scored queries. Sparse GQA reports separate useful QK/PV FLOPs over selected blocks plus the
-incomplete tail, with 24 query heads and two KV heads (`value_heads` in the common CSV).
+incomplete tail, with the selected query/KV geometry (`value_heads` in the common CSV). RTX 5090 also admits
+24Q/4KV with `--query-heads 24 --kv-heads 4 --kv-cache fp8`.
 
 `logical_read_bytes` and `logical_write_bytes` count unique boundary payloads by direction,
 including activations, relevant metadata and all required output writes. `kv_read_bytes` is the

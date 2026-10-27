@@ -8,7 +8,7 @@ template <KvCacheStorage Storage, int Warps, bool Vector, int KvHeads>
 __launch_bounds__(Warps * 32) __global__
     void sparse_gqa_simt_kernel(SparseGqaKernelArguments<KvHeads> a) {
     const auto q   = a.begin + a.head_query(blockIdx.x);
-    const int head = a.head_index(blockIdx.x), kvh = head / 12, split = blockIdx.y;
+    const int head = a.head_index(blockIdx.x), kvh = head / a.ratio, split = blockIdx.y;
     const int tid = threadIdx.x, lane = tid & 31, warp = tid / 32;
     const auto work = a.work(q);
     // This route always publishes FP32 partials; merge owns basis inversion and the gate.

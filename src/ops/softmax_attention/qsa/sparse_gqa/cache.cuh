@@ -116,22 +116,22 @@ __device__ __forceinline__ int4 sparse_gqa_expand(const std::uint8_t* data,
 }
 
 // Q is transformed only in registers and the existing shared prologue space. No A8/A4 operand
-// or additional global Q tensor is formed. Row order matches the MMA's padded 16-head tiles.
-template <KvCacheStorage Storage, int Warps, int Queries, int KvHeads>
+// or additional global Q tensor is formed. Padded head rows match the chosen contraction.
+template <KvCacheStorage Storage, int Warps, int Queries, int PaddedHeads = 16, int KvHeads>
 __device__ void sparse_gqa_prepare_query(const SparseGqaKernelArguments<KvHeads>& a,
                                          std::int64_t first, std::int64_t last, int head,
                                          std::uint16_t* target) {
     const int tid = threadIdx.x, lane = tid % 32, warp = tid / 32;
     if constexpr (kSparseQuantized<Storage>) {
-        for (int row = warp; row < Queries * 16; row += Warps) {
-            const int h  = row % 16;
-            const auto q = first + row / 16;
+        for (int row = warp; row < Queries * PaddedHeads; row += Warps) {
+            const int h  = row % PaddedHeads;
+            const auto q = first + row / PaddedHeads;
             float values[8]{};
-            if (q < last && h < 12) {
+            if (q < last && h < a.ratio) {
 #pragma unroll
                 for (int i = 0; i < 8; ++i)
                     values[i] = __bfloat162float(
-                        a.query[(q * a.query_heads + head * 12 + h) * 256 + lane + 32 * i]);
+                        a.query[(q * a.query_heads + head * a.ratio + h) * 256 + lane + 32 * i]);
                 kv::normalized_hadamard_d256_inplace(values, lane);
             }
 #pragma unroll
@@ -140,12 +140,15 @@ __device__ void sparse_gqa_prepare_query(const SparseGqaKernelArguments<KvHeads>
                     __half_as_ushort(__float2half_rn(values[i]));
         }
     } else {
-        for (int i = tid; i < Queries * 16 * 32; i += Warps * 32) {
-            const int row = i / 32, d = i % 32 * 8, h = row % 16;
+        for (int i = tid; i < Queries * PaddedHeads * 32; i += Warps * 32) {
+            const int row = i / 32, d = i % 32 * 8, h = row % PaddedHeads;
             auto* dst = target + row * 256 + common::swizzle_xor_64(row, d);
-            if (first + row / 16 < last && h < 12)
+            if (first + row / PaddedHeads < last && h < a.ratio)
                 common::cp_async<16>(
-                    dst, a.query + ((first + row / 16) * a.query_heads + head * 12 + h) * 256 + d);
+                    dst,
+                    a.query +
+                        ((first + row / PaddedHeads) * a.query_heads + head * a.ratio + h) * 256 +
+                        d);
             else
                 common::store_vec(dst, make_int4(0, 0, 0, 0));
         }

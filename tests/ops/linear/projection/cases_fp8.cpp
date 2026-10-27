@@ -359,5 +359,28 @@ void ninfer::test::linear::add_fp8_cases(Suite& suite) {
               make_fp8_weight,
               {14976, 5120, 865U, Comparison::Sampled, true, tail, ActivationPattern::KTail});
     add_workspace_cases(suite, QType::FP8_E4M3FN_ROW_BF16, 14976, 5120);
+    const std::vector<Invocation> stem_a16{
+        {1, CallForm::A16Convenience}, {2}, {16}, {24}, {32}, {64}, {128}, {2048}};
+    add_shape(suite, QType::FP8_E4M3FN_ROW_BF16, ActivationRecipe::TokenBlocks,
+              make_fp8_weight, {5120, 5120, 875U, Comparison::Sampled, true, stem_a16});
+    const std::vector<Invocation> stem_a8{
+        {16, CallForm::Policy, ops::LinearPolicy::AllowA8},
+        {17, CallForm::Policy, ops::LinearPolicy::AllowA8, true},
+        {32, CallForm::Policy, ops::LinearPolicy::AllowA8},
+        {64, CallForm::Policy, ops::LinearPolicy::AllowA4},
+        {128, CallForm::Policy, ops::LinearPolicy::AllowA8},
+        {129, CallForm::Policy, ops::LinearPolicy::AllowA8, true},
+        {512, CallForm::Policy, ops::LinearPolicy::AllowA8},
+        {513, CallForm::Policy, ops::LinearPolicy::AllowA8, true},
+        {2048, CallForm::Policy, ops::LinearPolicy::AllowA8},
+        {4096, CallForm::Policy, ops::LinearPolicy::AllowA8, true}};
+    add_shape(suite, QType::FP8_E4M3FN_ROW_BF16, ActivationRecipe::Hashed,
+              make_fp8_weight, {5120, 5120, 877U, Comparison::Sampled, true, stem_a8});
+    const std::vector<Invocation> stem_tail{
+        {2052, CallForm::Policy, ops::LinearPolicy::AllowA8, true}};
+    add_shape(suite, QType::FP8_E4M3FN_ROW_BF16, ActivationRecipe::Hashed,
+              make_fp8_weight,
+              {5120, 5120, 879U, Comparison::Sampled, true, stem_tail, ActivationPattern::KTail});
+    add_workspace_cases(suite, QType::FP8_E4M3FN_ROW_BF16, 5120, 5120);
 #endif
 }

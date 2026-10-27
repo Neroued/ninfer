@@ -10,6 +10,7 @@ namespace {
 const std::array kShapes{&kFp8N14336K5120, &kFp8N16384K5120, &kFp8N34816K5120,
 #if NINFER_TARGET_RTX5090
                          &kFp8N14976K5120,
+                         &kFp8N5120K5120,
 #endif
                          &kFp8N5120K6144,  &kFp8N5120K17408, &kFp8N248320K5120};
 

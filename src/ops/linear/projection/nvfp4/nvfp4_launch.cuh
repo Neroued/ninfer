@@ -70,6 +70,19 @@ constexpr Nvfp4A4Route nvfp4_a4_tma_route() {
     return {nvfp4_linear_a4_tma<Geometry, Layout>, Layout};
 }
 
+template <Nvfp4GeometryId Geometry, Nvfp4ScaleLayout Layout>
+void nvfp4_linear_a4_tma_split(const Weight& weight, Tensor& out, Nvfp4A4Workspace scratch,
+                               int tokens, cudaStream_t stream) {
+    launch_nvfp4_a4_tma_linear_split(
+        Geometry, nvfp4_a4_operands(weight, scratch, tokens, Layout), scratch,
+        static_cast<__nv_bfloat16*>(out.data), stream);
+}
+
+template <Nvfp4GeometryId Geometry, Nvfp4ScaleLayout Layout>
+constexpr Nvfp4A4Route nvfp4_a4_tma_split_route() {
+    return {nvfp4_linear_a4_tma_split<Geometry, Layout>, Layout};
+}
+
 template <class Geometry, class Schedule>
 constexpr Nvfp4A4Route nvfp4_a4_mma_route() {
     return {nvfp4_linear_a4_mma<Geometry, Schedule>, Nvfp4ScaleLayout::RowMajor};

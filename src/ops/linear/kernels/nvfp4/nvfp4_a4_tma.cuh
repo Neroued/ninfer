@@ -28,6 +28,28 @@ struct alignas(128) Nvfp4A4TmaDescriptors {
     CUtensorMap b_scales;
 };
 
+template <int Partitions>
+struct alignas(128) Nvfp4A4TmaDescriptorSet {
+    Nvfp4A4TmaDescriptors partitions[Partitions];
+};
+
+__device__ __forceinline__ const Nvfp4A4TmaDescriptors&
+nvfp4_tma_descriptor(const Nvfp4A4TmaDescriptors& descriptor) {
+    return descriptor;
+}
+
+template <int Partitions>
+__device__ __forceinline__ const Nvfp4A4TmaDescriptors&
+nvfp4_tma_descriptor(const Nvfp4A4TmaDescriptorSet<Partitions>& descriptors) {
+    return descriptors.partitions[blockIdx.z];
+}
+
+template <class Schedule>
+inline constexpr int nvfp4_tma_k_partitions = [] {
+    if constexpr (requires { Schedule::kKPartitions; }) return Schedule::kKPartitions;
+    else return 1;
+}();
+
 inline void nvfp4_check_driver(CUresult status, const char* operation) {
     if (status == CUDA_SUCCESS) { return; }
     const char* name = nullptr;
@@ -55,27 +77,42 @@ nvfp4_make_tma_2d(void* address, CUtensorMapDataType data_type, std::uint64_t co
 }
 
 template <class Schedule, class Rows>
-Nvfp4A4TmaDescriptors make_nvfp4_a4_tma_descriptors(const Nvfp4A4Operands& p) {
+Nvfp4A4TmaDescriptors make_nvfp4_a4_tma_descriptors(const Nvfp4A4Operands& p,
+                                                    int k_begin = 0, int k_count = 0) {
+    if (k_count == 0) k_count = p.k;
+    if (k_begin < 0 || k_count <= 0 || k_begin % 256 || k_count % 256 ||
+        k_begin > p.k || k_count > p.k - k_begin)
+        throw std::invalid_argument("NVFP4 TMA K interval requires complete K256 tiles");
+    // K partitions borrow parent rows and scale tiles without repacking them.
+    // Preserve the full parent's strides even when only part of K is read.
     constexpr int tile      = Schedule::kBlockTokens;
     constexpr int code_rows = Rows::kPaired ? Schedule::kBlockRows / 2 : Schedule::kBlockRows;
     Nvfp4A4TmaDescriptors d{};
-    d.a_codes = nvfp4_make_tma_2d(const_cast<std::uint8_t*>(p.x), CU_TENSOR_MAP_DATA_TYPE_UINT8,
-                                  p.k / 2, p.tokens, p.k / 2, 64, tile, CU_TENSOR_MAP_SWIZZLE_64B,
+    d.a_codes = nvfp4_make_tma_2d(const_cast<std::uint8_t*>(p.x) + k_begin / 2,
+                                  CU_TENSOR_MAP_DATA_TYPE_UINT8,
+                                  k_count / 2, p.tokens, p.k / 2, 64, tile, CU_TENSOR_MAP_SWIZZLE_64B,
                                   "encode activation codes TMA");
     d.b_codes =
-        nvfp4_make_tma_2d(const_cast<std::uint8_t*>(p.codes), CU_TENSOR_MAP_DATA_TYPE_UINT8,
-                          p.k / 2, p.rows, p.k / 2, 64, code_rows, CU_TENSOR_MAP_SWIZZLE_64B,
+        nvfp4_make_tma_2d(const_cast<std::uint8_t*>(p.codes) + k_begin / 2,
+                          CU_TENSOR_MAP_DATA_TYPE_UINT8,
+                          k_count / 2, p.rows, p.k / 2, 64, code_rows, CU_TENSOR_MAP_SWIZZLE_64B,
                           "encode weight codes TMA", Schedule::kWeightCodePromotion);
     // The quantizer and descriptor agree on both token and group tile dimensions.
     d.a_scales = nvfp4_make_tma_2d(
-        const_cast<std::uint8_t*>(p.x_scales), CU_TENSOR_MAP_DATA_TYPE_UINT8, tile,
+        const_cast<std::uint8_t*>(p.x_scales) +
+            static_cast<std::size_t>(k_begin / 256) * tile * 16,
+        CU_TENSOR_MAP_DATA_TYPE_UINT8, tile,
         static_cast<std::uint64_t>(nvfp4_a4_padded_tokens(p.tokens, Schedule::kScaleLayout) /
                                    tile) *
-            (p.k / 256) * 16,
+                (p.k / 256) * 16 - (k_begin / 256) * 16,
         tile, tile, 16, CU_TENSOR_MAP_SWIZZLE_NONE, "encode activation scales TMA");
     d.b_scales =
-        nvfp4_make_tma_2d(const_cast<std::uint8_t*>(p.scales), CU_TENSOR_MAP_DATA_TYPE_UINT8, 16,
-                          static_cast<std::uint64_t>(p.rows) * p.k / 256, 16, 16, 64,
+        nvfp4_make_tma_2d(const_cast<std::uint8_t*>(p.scales) +
+                              static_cast<std::size_t>(k_begin / 64) * 512,
+                          CU_TENSOR_MAP_DATA_TYPE_UINT8, 16,
+                          static_cast<std::uint64_t>(p.rows) * p.k / 256 -
+                              static_cast<std::uint64_t>(k_begin / 64) * 32,
+                          16, 16, 64,
                           CU_TENSOR_MAP_SWIZZLE_NONE, "encode weight scales TMA");
     return d;
 }
@@ -127,13 +164,15 @@ __device__ __forceinline__ void nvfp4_tma_raster_blocks(int& block_x, int& block
     block_x = linear / rows;
 }
 
-template <class Schedule, class Epilogue, class OutputPolicy, class Rows>
+template <class Schedule, class Epilogue, class OutputPolicy, class Rows,
+          class Descriptors = Nvfp4A4TmaDescriptors>
 __global__
 __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a4_tma_kernel(
-    const __grid_constant__ Nvfp4A4TmaDescriptors descriptors, float alpha,
+    const __grid_constant__ Descriptors descriptor_set, float alpha,
     const __grid_constant__ Epilogue epilogue, const __grid_constant__ OutputPolicy output,
     int token_count, int output_rows, int input_rows, int token_offset) {
     const int K               = Schedule::kStaticK ? Schedule::kStaticK : input_rows;
+    const auto& descriptors   = nvfp4_tma_descriptor(descriptor_set);
     constexpr int branches    = Rows::kPaired ? 2 : 1;
     constexpr int loaded_rows = Schedule::kBlockRows / branches;
     static_assert(Schedule::kStages >= 2, "the activation-scale buffer needs two slots");
@@ -157,7 +196,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a4_t
     }
     __syncthreads();
 
-    const int kKTiles = K / Schedule::kBlockK;
+    const int kKTiles = K / Schedule::kBlockK / nvfp4_tma_k_partitions<Schedule>;
 
     if (threadIdx.x < Schedule::kProducerThreads) {
         if constexpr (Schedule::kProducerThreads == 128) {
@@ -361,6 +400,8 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a4_t
 template <class Schedule, class Output, class Epilogue, class Rows = Nvfp4IdentityRows>
 void launch_nvfp4_a4_tma_mma(const Nvfp4A4Operands& p, Output output, Epilogue epilogue,
                              cudaStream_t stream, Rows = {}) {
+    static_assert(nvfp4_tma_k_partitions<Schedule> == 1,
+                  "partitioned TMA schedules require the split-K launcher");
     validate_nvfp4_operands<Schedule>(p);
     static_assert(
         Rows::kContiguous ||

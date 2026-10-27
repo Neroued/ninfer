@@ -456,7 +456,7 @@ int verify_workspace_envelopes(QType qtype, std::int32_t n, std::int32_t k) {
     for (auto policy :
          {ops::LinearPolicy::A16Only, ops::LinearPolicy::AllowA8, ops::LinearPolicy::AllowA4}) {
         for (auto [first, last] : {std::pair{1, 4}, std::pair{2, 4}, std::pair{1, 128},
-                                   std::pair{9, 25}, std::pair{24, 129}}) {
+                                   std::pair{9, 25}, std::pair{24, 129}, std::pair{1, 2048}}) {
             const auto capacity =
                 ops::linear_workspace_capacity_bytes(qtype, n, k, policy, first, last);
             for (int t = first; t <= last; ++t) {

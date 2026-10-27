@@ -88,6 +88,11 @@ void launch_nvfp4_a4_quantize(const Tensor& x, const Weight& weight, Nvfp4A4Work
     case Nvfp4Activation17408Geometry::kInputRows:
         launch_quantize_exact<Nvfp4Activation17408Geometry>(x, weight, workspace, layout, stream);
         return;
+#if NINFER_TARGET_RTX5090
+    case Nvfp4Activation14336Geometry::kInputRows:
+        launch_quantize_exact<Nvfp4Activation14336Geometry>(x, weight, workspace, layout, stream);
+        return;
+#endif
     default:
         throw std::invalid_argument("nvfp4 A4 quantize: unsupported K");
     }

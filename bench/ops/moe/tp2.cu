@@ -30,7 +30,7 @@ Options parse(int argc, char** argv) {
         if (flag == "--help") {
             std::cout
                 << "TP2 MoE, all distinct expert payloads and verified router distributions.\n"
-                   "  --profile-id m1|m2 --entry complete|routed|both --rank 0|1\n"
+                   "  --profile-id m1|m2|m3 --entry complete|routed|both --rank 0|1\n"
                    "  --distribution reuse|pool|tail|spread|all\n"
                    "  --tokens T[,T...] --sweep FIRST:LAST[:STEP]\n"
                    "Default extents: every T=1..256, then 512,1024,2048,4096.\n";
@@ -54,7 +54,7 @@ Options parse(int argc, char** argv) {
         else
             throw std::invalid_argument("unknown TP2 benchmark option");
     }
-    if ((o.profile != "m1" && o.profile != "m2") ||
+    if ((o.profile != "m1" && o.profile != "m2" && o.profile != "m3") ||
         (o.entry != "complete" && o.entry != "routed" && o.entry != "both") ||
         (o.distribution != "all" && o.distribution != "reuse" && o.distribution != "pool" &&
          o.distribution != "tail" && o.distribution != "spread"))
@@ -63,18 +63,29 @@ Options parse(int argc, char** argv) {
 }
 
 void run(const Options& o) {
-    const bool fp8 = o.profile == "m2";
-    const tp::Shape shape{4096, 1024, 288,
-                          8,    true, fp8 ? QType::FP8_E4M3FN_BLOCK128X128_BF16 : QType::NVFP4};
+    const bool clamped = o.profile != "m3";
+    const bool fp8     = o.profile == "m2";
+    const tp::Shape shape =
+        clamped ? tp::Shape{4096, 1024, 288,
+                            8,    true, fp8 ? QType::FP8_E4M3FN_BLOCK128X128_BF16 : QType::NVFP4}
+                : tp::Shape{2560, 320, 512, 10, false, QType::NVFP4};
     const auto cuda   = device_context().execution_view();
     const int maximum = *std::max_element(o.tokens.begin(), o.tokens.end());
     tp::Fixture fixture(cuda, shape, o.rank, maximum);
-    const auto profile       = fixture.routed_profile();
-    const auto full_profile  = fixture.sigmoid_profile();
-    const auto weights       = fixture.sigmoid_weights();
-    const auto experts       = fixture.experts();
-    const auto full_capacity = ops::topk_sigmoid_swiglu_moe_workspace_capacity_bytes(
-        full_profile, ops::ExpertSubsetKind::All, 1, maximum);
+    const auto profile           = fixture.routed_profile();
+    const auto full_profile      = clamped ? fixture.sigmoid_profile() : ops::SigmoidMoeProfile{};
+    const auto softmax_profile   = clamped ? ops::MoeProfile{} : fixture.softmax_profile();
+    const auto weights           = clamped ? fixture.sigmoid_weights() : ops::SigmoidMoeWeights{};
+    const auto softmax_weights   = clamped ? ops::MoeWeights{} : fixture.softmax_weights();
+    const auto experts           = fixture.experts();
+    const auto complete_capacity = [&](int first, int last) {
+        return clamped ? ops::topk_sigmoid_swiglu_moe_workspace_capacity_bytes(
+                             full_profile, ops::ExpertSubsetKind::All, first, last)
+                       : ops::topk_softmax_swiglu_moe_workspace_capacity_bytes(
+                             softmax_profile, ops::ExpertSubsetKind::All, ops::MoeEpilogue::Write,
+                             first, last);
+    };
+    const auto full_capacity   = complete_capacity(1, maximum);
     const auto routed_capacity = ops::routed_swiglu_workspace_capacity_bytes(
         profile, ops::ExpertSubsetKind::All, DType::BF16, ops::MoeEpilogue::Write, 1, maximum);
     auto output  = make_buffer(std::size_t(shape.hidden) * maximum * 2);
@@ -115,20 +126,21 @@ void run(const Options& o) {
                 Tensor y(output.span(), DType::BF16, {shape.hidden, tokens});
                 const std::size_t bytes =
                     unique * fixture.encoded_expert_bytes() + 4ULL * shape.hidden * tokens +
-                    (complete
-                         ? fixture.router_bytes() + fixture.shared_bytes() + shape.experts * 4ULL
-                         : 8ULL * shape.top_k * tokens);
+                    (complete ? fixture.router_bytes() + fixture.shared_bytes() +
+                                    (clamped ? shape.experts * 4ULL : 0)
+                              : 8ULL * shape.top_k * tokens);
                 const double router_flops =
-                    complete ? 2.0 * shape.hidden * shape.experts * tokens : 0;
+                    complete ? 2.0 * shape.hidden * (shape.experts + !clamped) * tokens : 0;
                 const double shared_flops =
                     complete ? 6.0 * shape.hidden * shape.intermediate * tokens : 0;
                 const double routed_flops =
                     6.0 * shape.hidden * shape.intermediate * shape.top_k * tokens;
                 const double memory_reference = bytes / (kRoofline.sustained_read_gbs * 1000);
                 const double compute_reference =
-                    tokens <= (fp8 ? 2 : 1)
+                    (tokens <= (clamped ? (fp8 ? 2 : 1) : 3) || (complete && !clamped && tokens < 8))
                         ? std::numeric_limits<double>::quiet_NaN()
-                        : (router_flops + shared_flops * (tokens <= 48 ? 4.0 / 3 : 2)) /
+                        : (router_flops + shared_flops * (clamped ? (tokens <= 48 ? 4.0 / 3 : 2)
+                                                                  : (tokens < 128 ? 4.0 / 3 : 1))) /
                                   (kRoofline.bf16_f32_tflops * 1e6) +
                               routed_flops /
                                   ((fp8 ? kRoofline.fp8_f32_tflops : kRoofline.nvfp4_f32_tflops) *
@@ -139,34 +151,45 @@ void run(const Options& o) {
                 const bool memory_limited =
                     !std::isfinite(compute_reference) || memory_reference >= compute_reference;
                 const auto call = [&](auto execution) {
-                    if (complete)
-                        ops::topk_sigmoid_swiglu_moe(x, full_profile, weights, {}, y, workspace,
-                                                     execution);
-                    else
+                    if (complete) {
+                        if (clamped)
+                            ops::topk_sigmoid_swiglu_moe(x, full_profile, weights, {}, y, workspace,
+                                                         execution);
+                        else
+                            ops::topk_softmax_swiglu_moe(x, softmax_profile, softmax_weights, {},
+                                                         ops::MoeEpilogue::Write, y, workspace,
+                                                         execution);
+                    } else
                         ops::routed_swiglu(x, profile, experts, routes, {}, ops::MoeEpilogue::Write,
                                            y, workspace, execution);
                 };
                 measurement::Row row;
-                row.op     = complete ? "topk_sigmoid_swiglu_moe" : "routed_swiglu";
-                row.format = fp8 ? "fp8" : "nvfp4";
-                row.policy = fp8 ? "a8" : "a4";
-                row.n      = shape.hidden;
-                row.k      = shape.intermediate;
-                row.tokens = tokens;
-                row.workspace_bytes =
-                    complete ? ops::topk_sigmoid_swiglu_moe_workspace_capacity_bytes(
-                                   full_profile, ops::ExpertSubsetKind::All, tokens, tokens)
-                             : ops::routed_swiglu_workspace_capacity_bytes(
-                                   profile, ops::ExpertSubsetKind::All, DType::BF16,
-                                   ops::MoeEpilogue::Write, tokens, tokens);
+                row.op              = complete
+                                          ? (clamped ? "topk_sigmoid_swiglu_moe" : "topk_softmax_swiglu_moe")
+                                          : "routed_swiglu";
+                row.format          = fp8 ? "fp8" : "nvfp4";
+                row.policy          = fp8 ? "a8" : "a4";
+                row.n               = shape.hidden;
+                row.k               = shape.intermediate;
+                row.tokens          = tokens;
+                row.workspace_bytes = complete
+                                          ? complete_capacity(tokens, tokens)
+                                          : ops::routed_swiglu_workspace_capacity_bytes(
+                                                profile, ops::ExpertSubsetKind::All, DType::BF16,
+                                                ops::MoeEpilogue::Write, tokens, tokens);
                 // Quantized input/product publication and reduction scratch are separate
                 // from the unique public operands. This is a minimum, not measured DRAM.
+                const bool direct = tokens <= (clamped ? (fp8 ? 2 : 1) : 3);
+                const auto elements =
+                    std::uint64_t(tokens) * (shape.hidden + shape.intermediate * shape.top_k);
+                const int group        = fp8 ? 128 : 16;
+                const auto scale_words = std::uint64_t(tokens) *
+                                         ((shape.hidden + group - 1) / group +
+                                          shape.top_k * ((shape.intermediate + group - 1) / group));
                 const std::uint64_t staging =
                     (complete ? (16ULL * shape.top_k + 8ULL * shape.hidden) * tokens : 0) +
-                    (tokens <= (fp8 ? 2 : 1)
-                         ? 8ULL * shape.intermediate * shape.top_k * tokens
-                         : 2ULL * (shape.hidden + shape.intermediate * shape.top_k) * tokens *
-                               (fp8 ? 33 : 9) / (fp8 ? 32 : 16));
+                    (direct ? 8ULL * shape.intermediate * shape.top_k * tokens
+                            : 2 * (elements / (fp8 ? 1 : 2) + scale_words * (fp8 ? 4 : 1)));
                 for (const auto& execution :
                      measurement::selections(o.timing.execution, "graph", "eager"))
                     for (const auto& cache :
@@ -184,10 +207,14 @@ void run(const Options& o) {
                               << ',' << shared_flops << ',' << routed_flops << ','
                               << memory_reference << ',' << format_metric(compute_reference, 3, "")
                               << ',' << roofline << ',' << result.gpu.median_us / roofline << ','
-                              << (tokens <= (fp8 ? 2 : 1) ? (complete && tokens > 1 ? "BF16_F32ACC+SIMT_FP32" : "SIMT_FP32")
-                                  : complete              ? (fp8 ? "BF16_F32ACC+FP8_F32ACC"
-                                                                 : "BF16_F32ACC+NVFP4_F32ACC")
-                                                          : (fp8 ? "FP8_F32ACC" : "NVFP4_F32ACC"))
+                              << (direct
+                                      ? (complete && clamped && tokens > 1 ? "BF16_F32ACC+SIMT_FP32"
+                                                                           : "SIMT_FP32")
+                                  : complete && !clamped && tokens < 8
+                                      ? (fp8 ? "SIMT_FP32+FP8_F32ACC" : "SIMT_FP32+NVFP4_F32ACC")
+                                  : complete ? (fp8 ? "BF16_F32ACC+FP8_F32ACC"
+                                                    : "BF16_F32ACC+NVFP4_F32ACC")
+                                             : (fp8 ? "FP8_F32ACC" : "NVFP4_F32ACC"))
                               << ',' << (complete ? full_capacity : routed_capacity) << ','
                               << staging << ',' << memory_limited << ','
                               << (cache == "cold" && memory_limited ? bandwidth >= 235 : 0);

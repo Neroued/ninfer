@@ -9,7 +9,7 @@ Storage allocate(Arena& arena, const Plan& plan, int tokens, bool routed, int sh
     Storage out;
     if (routed && plan.vector) {
         out.vector_activation =
-            static_cast<float*>(arena.alloc(DType::FP32, {kIntermediate, kTopK * tokens}).data);
+            static_cast<float*>(arena.alloc(DType::FP32, {plan.intermediate, kTopK * tokens}).data);
         if (shared_intermediate) {
             out.routed_sum = static_cast<float*>(arena.alloc(DType::FP32, {kHidden, tokens}).data);
         }
@@ -26,9 +26,10 @@ Storage allocate(Arena& arena, const Plan& plan, int tokens, bool routed, int sh
         const auto scale_bytes = fp8 ? sizeof(float) : sizeof(std::uint8_t);
         out.input_codes        = bytes(std::size_t(tokens) * kHidden / packing);
         out.input_scales       = bytes(std::size_t(tokens) * (kHidden / scale_group) * scale_bytes);
-        out.product_codes      = bytes(std::size_t(assignments) * kIntermediate / packing);
+        out.product_codes      = bytes(std::size_t(assignments) * plan.intermediate / packing);
         out.product_scales =
-            bytes(std::size_t(assignments) * (kIntermediate / scale_group) * scale_bytes);
+            bytes(std::size_t(assignments) * ((plan.intermediate + scale_group - 1) / scale_group) *
+                  scale_bytes);
         if (plan.atomic_output) {
             out.routed_sum = static_cast<float*>(arena.alloc(DType::FP32, {kHidden, tokens}).data);
         } else {

@@ -29,6 +29,7 @@ public:
     void input(int tokens, std::string_view distribution, int phase = 0, bool stress = false);
     Tensor x(int tokens) const;
     ops::ExpertRoutes routes(int tokens) const;
+    Tensor shared_coefficients(int tokens) const;
     ops::RoutedSwiGLUProfile routed_profile() const;
     ops::SigmoidMoeProfile sigmoid_profile() const;
     ops::MoeProfile softmax_profile() const;
@@ -74,6 +75,7 @@ public:
     ~Oracle();
     std::pair<std::vector<int>, std::vector<double>> routing(int token);
     double output(int row, int token, bool complete, bool signed_coefficients = false);
+    double shared_coefficient(int token);
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

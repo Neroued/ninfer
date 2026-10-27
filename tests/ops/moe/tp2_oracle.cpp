@@ -146,6 +146,11 @@ std::pair<std::vector<int>, std::vector<double>> Oracle::routing(int token) {
     return impl_->routing(token);
 }
 
+double Oracle::shared_coefficient(int token) {
+    (void)impl_->routing(token);
+    return impl_->shared_coefficient.at(token);
+}
+
 double Oracle::output(int row, int token, bool complete, bool signed_coefficients) {
     auto& f       = *impl_;
     const auto s  = f.fixture.shape;

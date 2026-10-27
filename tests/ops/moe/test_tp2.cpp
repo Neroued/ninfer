@@ -10,8 +10,10 @@ namespace ninfer::test::moe_tp2 {
 namespace {
 constexpr Shape kM1{4096, 1024, 288, 8, true, QType::NVFP4};
 constexpr Shape kM2{4096, 1024, 288, 8, true, QType::FP8_E4M3FN_BLOCK128X128_BF16};
+constexpr Shape kM3{2560, 320, 512, 10, false, QType::NVFP4};
 constexpr ReductionCriterion kA4{.25, 1e-6, .35, 1e-6};
 constexpr ReductionCriterion kA8{.08, 1e-7, .12, 1e-7};
+constexpr ReductionCriterion kA16{1.0 / 256, 1.0 / 256, 2.0 / 256};
 constexpr ReductionCriterion kRouting{3e-5, 5e-6, 0};
 
 struct Case {
@@ -20,13 +22,19 @@ struct Case {
     std::string distribution;
     bool transition   = false;
     DType output_type = DType::BF16;
+    bool shared_only  = false;
 };
 
 std::size_t capacity(const Fixture& fixture, bool complete, int first, int last,
                      DType output_type = DType::BF16) {
-    if (complete)
-        return ops::topk_sigmoid_swiglu_moe_workspace_capacity_bytes(
-            fixture.sigmoid_profile(), ops::ExpertSubsetKind::All, first, last);
+    if (complete) {
+        if (fixture.shape.clamped)
+            return ops::topk_sigmoid_swiglu_moe_workspace_capacity_bytes(
+                fixture.sigmoid_profile(), ops::ExpertSubsetKind::All, first, last);
+        return ops::topk_softmax_swiglu_moe_workspace_capacity_bytes(
+            fixture.softmax_profile(), ops::ExpertSubsetKind::All, ops::MoeEpilogue::Write, first,
+            last);
+    }
     return ops::routed_swiglu_workspace_capacity_bytes(fixture.routed_profile(),
                                                        ops::ExpertSubsetKind::All, output_type,
                                                        ops::MoeEpilogue::Write, first, last);
@@ -43,18 +51,28 @@ int run_case(Fixture& fixture, Case c, CudaExecutionView cuda) {
     Tensor y(destination.span(), c.output_type, {fixture.shape.hidden, c.tokens});
     fixture.input(c.tokens, c.distribution, 0, c.stress);
     fixture.publish_routes(c.tokens, true);
-    const auto profile      = fixture.routed_profile();
-    const auto full_profile = fixture.sigmoid_profile();
-    const auto experts      = fixture.experts();
-    const auto weights      = fixture.sigmoid_weights();
-    const auto x            = fixture.x(c.tokens);
-    const auto routes       = fixture.routes(c.tokens);
-    const auto launch       = [&] {
-        if (c.complete)
-            ops::topk_sigmoid_swiglu_moe(x, full_profile, weights, {}, y, workspace, cuda);
-        else
+    const auto profile = fixture.routed_profile();
+    const auto full_profile =
+        fixture.shape.clamped ? fixture.sigmoid_profile() : ops::SigmoidMoeProfile{};
+    const auto softmax_profile =
+        fixture.shape.clamped ? ops::MoeProfile{} : fixture.softmax_profile();
+    const auto experts = fixture.experts();
+    const auto weights =
+        fixture.shape.clamped ? fixture.sigmoid_weights() : ops::SigmoidMoeWeights{};
+    const auto softmax_weights =
+        fixture.shape.clamped ? ops::MoeWeights{} : fixture.softmax_weights();
+    const auto x      = fixture.x(c.tokens);
+    const auto routes = fixture.routes(c.tokens);
+    const auto launch = [&] {
+        if (c.complete) {
+            if (fixture.shape.clamped)
+                ops::topk_sigmoid_swiglu_moe(x, full_profile, weights, {}, y, workspace, cuda);
+            else
+                ops::topk_softmax_swiglu_moe(x, softmax_profile, softmax_weights, {},
+                                             ops::MoeEpilogue::Write, y, workspace, cuda);
+        } else
             ops::routed_swiglu(x, profile, experts, routes, {}, ops::MoeEpilogue::Write, y,
-                                     workspace, cuda);
+                               workspace, cuda);
     };
     launch();
     CUDA_CHECK(cudaStreamSynchronize(cuda.stream()));
@@ -142,6 +160,17 @@ int run_case(Fixture& fixture, Case c, CudaExecutionView cuda) {
                     std::vector<double>(actual_coefficients.begin(), actual_coefficients.end()),
                     coefficients, kRouting);
             }
+            if (c.complete && !fixture.shape.clamped) {
+                float gate;
+                CUDA_CHECK(cudaMemcpy(
+                    &gate,
+                    static_cast<const float*>(fixture.shared_coefficients(c.tokens).data) + token,
+                    sizeof(float), cudaMemcpyDeviceToHost));
+                const std::array actual_gate{double(gate)};
+                const std::array expected_gate{oracle.shared_coefficient(token)};
+                failures += verify_reduction(label + "/shared gate", actual_gate, expected_gate,
+                                             kRouting);
+            }
             for (int row : rows) {
                 const auto index = std::size_t(token) * fixture.shape.hidden + row;
                 got.push_back(c.output_type == DType::BF16 ? bf16_to_f32(words[index])
@@ -150,7 +179,9 @@ int run_case(Fixture& fixture, Case c, CudaExecutionView cuda) {
             }
         }
         failures += verify_reduction(label, got, reference,
-                                     fixture.shape.format == QType::NVFP4 ? kA4 : kA8);
+                                     c.shared_only                          ? kA16
+                                     : fixture.shape.format == QType::NVFP4 ? kA4
+                                                                            : kA8);
         failures += destination.verify_guards(label) + scratch.verify_guards(label);
         if (workspace.used() != 0) throw std::runtime_error("TP2 workspace cursor was retained");
     }
@@ -181,8 +212,13 @@ int test_composition(Shape shape) {
             output(cuda.device(), shape.hidden * tokens * 2);
         MemoryArena workspace(scratch.span());
         Tensor y(output.span(), DType::BF16, {shape.hidden, tokens});
-        ops::topk_sigmoid_swiglu_moe(fixture.x(tokens), fixture.sigmoid_profile(),
-                                     fixture.sigmoid_weights(), {}, y, workspace, cuda);
+        if (shape.clamped)
+            ops::topk_sigmoid_swiglu_moe(fixture.x(tokens), fixture.sigmoid_profile(),
+                                         fixture.sigmoid_weights(), {}, y, workspace, cuda);
+        else
+            ops::topk_softmax_swiglu_moe(fixture.x(tokens), fixture.softmax_profile(),
+                                         fixture.softmax_weights(), {}, ops::MoeEpilogue::Write, y,
+                                         workspace, cuda);
         CUDA_CHECK(cudaStreamSynchronize(cuda.stream()));
         std::vector<std::uint16_t> words(std::size_t(shape.hidden) * tokens);
         output.copy_to_host(words.data(), words.size() * 2);
@@ -205,28 +241,38 @@ int test_composition(Shape shape) {
 }
 
 void add_profile(OpSuite& suite, Shape shape, const std::string& name) {
-    suite.add("tp2/" + name + "/shared-once",
-              [=] {
-                  const auto cuda = cuda_environment().context.execution_view();
-                  Fixture fixture(cuda, shape, 0, 3);
-                  fixture.zero_routed();
-                  fixture.preserve_weights();
-                  return run_case(fixture, {3, 0, true, true, true, "reuse"}, cuda) +
-                         fixture.verify_preserved();
-              },
-              {{"format", shape.format == QType::NVFP4 ? "nvfp4" : "fp8"},
-               {"policy", shape.format == QType::NVFP4 ? "a4" : "a8"},
-               {"execution", "graph"}});
+    for (int tokens : {3, 129})
+        suite.add("tp2/" + name + "/shared-once/T" + std::to_string(tokens),
+                  [=] {
+                      const auto cuda = cuda_environment().context.execution_view();
+                      Fixture fixture(cuda, shape, 0, tokens);
+                      fixture.zero_routed();
+                      fixture.preserve_weights();
+                      return run_case(
+                                 fixture,
+                                 {tokens, 0, true, true, true, "reuse", false, DType::BF16, true},
+                                 cuda) +
+                             fixture.verify_preserved();
+                  },
+                  {{"format", shape.format == QType::NVFP4 ? "nvfp4" : "fp8"},
+                   {"policy", shape.format == QType::NVFP4 ? "a4" : "a8"},
+                   {"execution", "graph"}});
     suite.add("tp2/" + name + "/composition", [=] { return test_composition(shape); },
               {{"format", shape.format == QType::NVFP4 ? "nvfp4" : "fp8"},
                {"policy", shape.format == QType::NVFP4 ? "a4" : "a8"},
                {"execution", "eager"}});
-    const std::vector<int> extents =
+    std::vector<int> extents =
         shape.format == QType::NVFP4
             ? std::vector<int>{1,   2,   8,   9,    16,   17,   64,   65,   127,  128,  129,
                                256, 512, 513, 1023, 1024, 1025, 2048, 2049, 2050, 4096, 4097}
             : std::vector<int>{1,   2,   3,   4,   8,   9,   16,   17,   32,   33,   64,  65,
                                256, 257, 258, 272, 273, 274, 1023, 1024, 1025, 4096, 4097};
+    if (!shape.clamped && shape.format == QType::NVFP4) {
+        extents.push_back(3);
+        extents.push_back(4);
+        extents.push_back(5);
+        std::sort(extents.begin(), extents.end());
+    }
     for (int rank : {0, 1}) {
         std::vector<Case> cases;
         std::vector<OpCase> catalogue;
@@ -294,5 +340,6 @@ int main(int argc, char** argv) {
     ninfer::test::OpSuite suite;
     ninfer::test::moe_tp2::add_profile(suite, ninfer::test::moe_tp2::kM1, "m1");
     ninfer::test::moe_tp2::add_profile(suite, ninfer::test::moe_tp2::kM2, "m2");
+    ninfer::test::moe_tp2::add_profile(suite, ninfer::test::moe_tp2::kM3, "m3");
     return suite.main(argc, argv);
 }

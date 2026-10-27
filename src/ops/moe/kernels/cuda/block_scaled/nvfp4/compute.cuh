@@ -27,7 +27,8 @@ using common::nvfp4_activation_scale;
 using common::quantize_nvfp4_activation_pair;
 using common::nvfp4_dequant_f16x16;
 
-template <int Columns, bool Gate, int Stages = 2, int KStep = 128, int Eviction = 0>
+template <int Columns, bool Gate, int Stages = 2, int KStep = 128, int Eviction = 0,
+          int Intermediate = kIntermediate>
 struct Schedule {
     static constexpr int columns      = Columns;
     static constexpr int stages       = Stages;
@@ -37,7 +38,8 @@ struct Schedule {
     static constexpr int warp_columns = Columns >= 64 ? Columns / 2 : Columns;
     static constexpr int mma_columns  = warp_columns / 8;
     static constexpr int rows         = Gate ? 64 : 128;
-    static constexpr int k            = Gate ? kHidden : kIntermediate;
+    static constexpr int k            = Gate ? kHidden : Intermediate;
+    static constexpr int intermediate = Intermediate;
     static constexpr int min_blocks   = Columns == 128 ? 2 : Columns == 64 ? 3 : 1;
 };
 
@@ -74,7 +76,7 @@ __device__ __forceinline__ void stage_inputs(TileStorage<S>& tile, int stage, in
                                              std::uint64_t stream, std::uint64_t retained) {
     for (int task = threadIdx.x; task < 128 * (S::k_step / 32); task += S::threads) {
         const int row = task / (S::k_step / 32), segment = task % (S::k_step / 32);
-        const int wr     = row0 + (Gate ? (row < 64 ? row : row - 64 + kIntermediate) : row);
+        const int wr     = row0 + (Gate ? (row < 64 ? row : row - 64 + S::intermediate) : row);
         const bool valid = S::k % S::k_step == 0 || kt * S::k_step + segment * 32 < S::k;
         if constexpr (S::eviction & 4) {
             if (cache_policy & 1)
@@ -106,7 +108,7 @@ __device__ __forceinline__ void stage_inputs(TileStorage<S>& tile, int stage, in
     constexpr int bytes = Gate ? 8 : 16;
     for (int task = threadIdx.x; task < (S::k_step / 64) * parts * 32; task += S::threads) {
         const int row = task % 32, part = (task / 32) % parts, k64 = task / (32 * parts);
-        const int wr      = row0 + row + (Gate ? part * kIntermediate : 0);
+        const int wr      = row0 + row + (Gate ? part * S::intermediate : 0);
         auto* destination = reinterpret_cast<std::uint8_t*>(tile.weight_scales[stage]) + k64 * 512 +
                             row * 16 + part * bytes;
         const bool valid = S::k % S::k_step == 0 || kt * S::k_step + k64 * 64 < S::k;
@@ -147,19 +149,34 @@ __device__ __forceinline__ void stage_inputs(TileStorage<S>& tile, int stage, in
                                    (valid ? kt * (S::k_step / 2) + segment * 16 : 0),
                                valid ? 16 : 0);
     }
-    for (int task = threadIdx.x; task < S::columns * (S::k_step / 128); task += S::threads) {
-        const int row = task / (S::k_step / 128), part = task % (S::k_step / 128);
-        const int source = tile.sources[row];
-        const bool valid =
-            source >= 0 && (S::k % S::k_step == 0 || kt * S::k_step + part * 128 < S::k);
-        cp_async_zfill<8>(&tile.input_scales[stage][row * (S::k_step / 64) + part * 2],
-                          scales + std::int64_t(source >= 0 ? source : 0) * (S::k / 16) +
-                              (valid ? kt * (S::k_step / 16) + part * 8 : 0),
-                          valid ? 8 : 0);
+    if constexpr (S::k % 128 == 0) {
+        for (int task = threadIdx.x; task < S::columns * (S::k_step / 128); task += S::threads) {
+            const int row = task / (S::k_step / 128), part = task % (S::k_step / 128);
+            const int source = tile.sources[row];
+            const bool valid =
+                source >= 0 && (S::k % S::k_step == 0 || kt * S::k_step + part * 128 < S::k);
+            cp_async_zfill<8>(&tile.input_scales[stage][row * (S::k_step / 64) + part * 2],
+                              scales + std::int64_t(source >= 0 ? source : 0) * (S::k / 16) +
+                                  (valid ? kt * (S::k_step / 16) + part * 8 : 0),
+                              valid ? 8 : 0);
+        }
+    } else {
+        // A K320 product has 20 G16 scale bytes per assignment. Copy aligned
+        // K64 words individually; an 8-byte copy would misalign every odd row.
+        for (int task = threadIdx.x; task < S::columns * (S::k_step / 64); task += S::threads) {
+            const int row = task / (S::k_step / 64), part = task % (S::k_step / 64);
+            const int source = tile.sources[row];
+            const bool valid = source >= 0 && kt * S::k_step + part * 64 < S::k;
+            cp_async_zfill<4>(&tile.input_scales[stage][row * (S::k_step / 64) + part],
+                              scales + std::int64_t(source >= 0 ? source : 0) * (S::k / 16) +
+                                  (valid ? kt * (S::k_step / 16) + part * 4 : 0),
+                              valid ? 4 : 0);
+        }
     }
     cp_commit();
 }
 
+template <int Intermediate>
 __device__ __forceinline__ void store_product(float lo, float hi, float divisor,
                                               std::uint8_t* codes, std::uint8_t* scales,
                                               int assignment, int feature) {
@@ -178,31 +195,31 @@ __device__ __forceinline__ void store_product(float lo, float hi, float divisor,
         high |= __shfl_xor_sync(0xffffffff, high, delta);
     }
     if (!r && assignment >= 0) {
-        *reinterpret_cast<uint2*>(codes + std::int64_t(assignment) * (kIntermediate / 2) +
+        *reinterpret_cast<uint2*>(codes + std::int64_t(assignment) * (Intermediate / 2) +
                                   feature / 2) = make_uint2(low, high);
-        scales[std::int64_t(assignment) * (kIntermediate / 16) + feature / 16] = scale;
+        scales[std::int64_t(assignment) * (Intermediate / 16) + feature / 16] = scale;
     }
 }
 
 template <int Columns, bool Gate, bool Atomic = false, int Stages = 2, int KStep = 128,
-          int Eviction = 0, bool CachedExpertMajor = true>
-__global__ __launch_bounds__(
-    Schedule<Columns, Gate, Stages, KStep, Eviction>::threads,
-    Schedule<Columns, Gate, Stages, KStep,
-             Eviction>::min_blocks) void grouped_mma(const std::uint8_t* input,
-                                                     const std::uint8_t* input_scales,
-                                                     ExpertMatrixDeviceView bank,
-                                                     float activation_divisor,
-                                                     float product_divisor, Groups groups,
-                                                     std::uint8_t* product,
-                                                     std::uint8_t* product_scales,
-                                                     float* contributions,
-                                                     const float* coefficients, float* routed_sum,
-                                                     int subtiles, int feature_rows = 0,
-                                                     int cache_policy         = 0,
-                                                     int minimum_expert_count = 0,
-                                                     int maximum_expert_count = 0x7fffffff) {
-    using S = Schedule<Columns, Gate, Stages, KStep, Eviction>;
+          int Eviction = 0, bool CachedExpertMajor = true, int Intermediate = kIntermediate>
+__global__
+__launch_bounds__(Schedule<Columns, Gate, Stages, KStep, Eviction, Intermediate>::threads,
+                  Schedule<Columns, Gate, Stages, KStep, Eviction, Intermediate>::
+                      min_blocks) void grouped_mma(const std::uint8_t* __restrict__ input,
+                                                   const std::uint8_t* __restrict__ input_scales,
+                                                   ExpertMatrixDeviceView bank,
+                                                   float activation_divisor, float product_divisor,
+                                                   Groups groups,
+                                                   std::uint8_t* __restrict__ product,
+                                                   std::uint8_t* __restrict__ product_scales,
+                                                   float* __restrict__ contributions,
+                                                   const float* __restrict__ coefficients,
+                                                   float* __restrict__ routed_sum, int subtiles,
+                                                   int feature_rows = 0, int cache_policy = 0,
+                                                   int minimum_expert_count = 0,
+                                                   int maximum_expert_count = 0x7fffffff) {
+    using S = Schedule<Columns, Gate, Stages, KStep, Eviction, Intermediate>;
     static_assert(!CachedExpertMajor || (Stages == 2 && KStep == 128 && Eviction == 0));
     static_assert(S::stages <= (S::k + S::k_step - 1) / S::k_step);
     if (groups.load_range && (groups.load_range[1] <= minimum_expert_count ||
@@ -213,9 +230,10 @@ __global__ __launch_bounds__(
     const auto retained = (S::eviction & 8) ? common::l2_retained_policy() : 0;
     auto& tile =
         *reinterpret_cast<TileStorage<S>*>(common::shared_storage<sizeof(TileStorage<S>)>());
-    constexpr int row_tiles = (Gate ? kIntermediate : kHidden) / S::rows;
+    constexpr int row_tiles = (Gate ? Intermediate : kHidden) / S::rows;
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     const int warp_m = warp % 4, warp_n = warp / 4;
+    const int subtile_bits = 31 - __clz(unsigned(subtiles));
     const int window =
         Gate || CachedExpertMajor || feature_rows == 0 ? row_tiles : min(feature_rows, row_tiles);
     const int rounded_rows = (row_tiles + window - 1) / window * window;
@@ -223,9 +241,9 @@ __global__ __launch_bounds__(
     for (int task = blockIdx.x; task < count; task += gridDim.x) {
         int job, row0, subtile;
         if constexpr (Gate || CachedExpertMajor) {
-            job     = task / (row_tiles * subtiles);
+            job     = (task / row_tiles) >> subtile_bits;
             row0    = (task % row_tiles) * S::rows;
-            subtile = (task / row_tiles) % subtiles;
+            subtile = (task / row_tiles) & (subtiles - 1);
         } else {
             const int jobs = *groups.jobs;
             job            = (task / (window * subtiles)) % jobs;
@@ -315,26 +333,37 @@ __global__ __launch_bounds__(
                     const float g0 = acc[0][n][t] * factor, g1 = acc[0][n][t + 2] * factor;
                     const float h0 = silu(g0) * (acc[1][n][t] * factor);
                     const float h1 = silu(g1) * (acc[1][n][t + 2] * factor);
-                    store_product(h0, h1, product_divisor, product, product_scales,
-                                  column + t < end ? column + t : -1, row0 + warp_m * 16);
+                    store_product<Intermediate>(h0, h1, product_divisor, product, product_scales,
+                                                column + t < end ? column + t : -1,
+                                                row0 + warp_m * 16);
                 }
             } else {
 #pragma unroll
-                for (int m = 0; m < 2; ++m) {
+                for (int t = 0; t < 2; ++t) {
+                    const int c = column + t;
+                    if (c >= end) continue;
+                    // Every row for one column consumes the same immutable route.
+                    // Resolve it before atomic writes; otherwise conservative aliasing
+                    // reloads the assignment/coefficient after each output element.
+                    float* target;
+                    float coefficient = 1;
+                    if constexpr (Atomic) {
+                        const int assignment = groups.assignments[c];
+                        target      = routed_sum + std::int64_t(assignment / kTopK) * kHidden;
+                        coefficient = coefficients[assignment];
+                    } else {
+                        target = contributions + std::int64_t(c) * kHidden;
+                    }
 #pragma unroll
-                    for (int v = 0; v < 4; ++v) {
-                        const int c = column + (v & 1);
-                        if (c < end) {
-                            const int row = row0 + warp_m * 32 + m * 16 + (lane >> 2) + (v / 2) * 8;
-                            if constexpr (Atomic) {
-                                const int assignment = groups.assignments[c];
-                                atomicAdd(routed_sum + std::int64_t(assignment / kTopK) * kHidden +
-                                              row,
-                                          acc[m][n][v] * factor * coefficients[assignment]);
-                            } else {
-                                contributions[std::int64_t(c) * kHidden + row] =
-                                    acc[m][n][v] * factor;
-                            }
+                    for (int m = 0; m < 2; ++m) {
+#pragma unroll
+                        for (int half = 0; half < 2; ++half) {
+                            const int v   = t + 2 * half;
+                            const int row = row0 + warp_m * 32 + m * 16 + (lane >> 2) + half * 8;
+                            if constexpr (Atomic)
+                                atomicAdd(target + row, acc[m][n][v] * factor * coefficient);
+                            else
+                                target[row] = acc[m][n][v] * factor;
                         }
                     }
                 }
@@ -363,6 +392,7 @@ __device__ __forceinline__ void expand_group(Matrix weight, int row, int group, 
     }
 }
 
+template <int Intermediate = kIntermediate>
 __global__ void vector_gate(const __nv_bfloat16* x, ExpertMatrixDeviceView bank, const int* ids,
                             ExpertSubsetKind kind, const int* mask, float* activation) {
     const int assignment = blockIdx.y, expert = ids[assignment];
@@ -375,7 +405,7 @@ __global__ void vector_gate(const __nv_bfloat16* x, ExpertMatrixDeviceView bank,
     for (int group = lane; group < kHidden / 16; group += 32) {
         float g[16], u[16];
         expand_group(weight, row, group, kHidden, g);
-        expand_group(weight, row + kIntermediate, group, kHidden, u);
+        expand_group(weight, row + Intermediate, group, kHidden, u);
         const auto x0           = load_vec<uint4>(input + group * 16);
         const auto x1           = load_vec<uint4>(input + group * 16 + 8);
         const unsigned words[8] = {x0.x, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w};
@@ -390,10 +420,10 @@ __global__ void vector_gate(const __nv_bfloat16* x, ExpertMatrixDeviceView bank,
     }
     gate = warp_reduce_sum(gate) / weight.divisor;
     up   = warp_reduce_sum(up) / weight.divisor;
-    if (!lane) { activation[std::int64_t(assignment) * kIntermediate + row] = silu(gate) * up; }
+    if (!lane) { activation[std::int64_t(assignment) * Intermediate + row] = silu(gate) * up; }
 }
 
-template <int Rows, int Warps = kTopK, class Output>
+template <int Intermediate, int Rows, int Warps = kTopK, class Output>
 __global__ void vector_down(const float* activation, ExpertMatrixDeviceView bank, const int* ids,
                             const float* coefficients, ExpertSubsetKind kind, const int* mask,
                             Output output) {
@@ -406,15 +436,15 @@ __global__ void vector_down(const float* activation, ExpertMatrixDeviceView bank
         float sum[Rows] = {};
         if (includes(kind, mask, expert)) {
             const auto weight = resolve(bank, expert);
-            for (int group = lane; group < kIntermediate / 16; group += 32) {
+            for (int group = lane; group < Intermediate / 16; group += 32) {
                 float x[16];
 #pragma unroll
                 for (int i = 0; i < 16; ++i)
-                    x[i] = activation[std::int64_t(assignment) * kIntermediate + group * 16 + i];
+                    x[i] = activation[std::int64_t(assignment) * Intermediate + group * 16 + i];
 #pragma unroll
                 for (int r = 0; r < Rows; ++r) {
                     float w[16];
-                    expand_group(weight, blockIdx.x * Rows + r, group, kIntermediate, w);
+                    expand_group(weight, blockIdx.x * Rows + r, group, Intermediate, w);
 #pragma unroll
                     for (int i = 0; i < 16; ++i) sum[r] = fmaf(x[i], w[i], sum[r]);
                 }

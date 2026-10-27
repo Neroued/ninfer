@@ -280,6 +280,10 @@ ops::ExpertRoutes Fixture::routes(int tokens) const {
             Tensor(impl_->coefficients.span(), DType::FP32, {shape.top_k, tokens})};
 }
 
+Tensor Fixture::shared_coefficients(int tokens) const {
+    return Tensor(impl_->shared_coefficients.span(), DType::FP32, {tokens});
+}
+
 ops::RoutedSwiGLUProfile Fixture::routed_profile() const {
     const bool fp8 = shape.format != QType::NVFP4;
     auto p =
@@ -386,20 +390,48 @@ std::vector<int> Fixture::check_routes(int tokens, MemoryArena& workspace, CudaE
 }
 
 int Fixture::verify_source_coordinates() const {
+    const auto source_row = [&](bool gate, int row) {
+        return gate ? (row / shape.intermediate) * (2 * shape.intermediate) +
+                          rank * shape.intermediate + row % shape.intermediate
+                    : row;
+    };
+    if (shape.format != QType::NVFP4) {
+        // Check every BF16 scale word against its original 128x128 source block.
+        // This also covers the rank-dependent block phase after the K64 refine.
+        for (bool gate : {false, true}) {
+            const auto& matrix = gate ? impl_->gate_up : impl_->down;
+            std::vector<std::uint16_t> words(matrix.geometry.scale_bytes / 2);
+            matrix.storage.copy_to_host(words.data(), words.size() * 2,
+                                        matrix.geometry.scale_offset);
+            for (int e = 0; e < shape.experts; ++e)
+                for (int row = 0; row < matrix.n; row += matrix.block)
+                    for (int col = 0; col < matrix.k; col += matrix.block) {
+                        const auto index =
+                            (std::size_t(e) * (matrix.n / matrix.block) + row / matrix.block) *
+                                (matrix.k / matrix.block) +
+                            col / matrix.block;
+                        const auto original_col = col + (gate ? 0 : rank * shape.intermediate);
+                        if (words[index] != source_scale(e, source_row(gate, row), original_col,
+                                                         gate ? 101 : 211, true))
+                            return 1;
+                    }
+        }
+    }
+
     for (const auto gate : {false, true})
         for (const auto e : {0, shape.experts / 2, shape.experts - 1}) {
             const auto m = snapshot(gate, e);
             for (const int r : {0, 63, 127, m.n / 2 - 1, m.n / 2, m.n - 1})
-                for (const int c : {0, 63, 127, m.k - 65, m.k - 1}) {
+                for (const int c : {0, 63, 64, 127, 128, 191, 192, 255, 256, m.k - 65, m.k - 1}) {
                     const bool fp8   = m.format != QType::NVFP4;
                     const auto index = std::size_t(r) * m.k + c;
                     const auto code =
                         fp8 ? m.codes[index] : (m.codes[index / 2] >> (4 * (c & 1))) & 15;
-                    if (code != source_code(e, original_row(r, shape.intermediate, rank, gate),
+                    if (code != source_code(e, source_row(gate, r),
                                             c + (gate ? 0 : rank * shape.intermediate),
                                             gate ? 101 : 211, fp8))
                         return 1;
-                    const auto sr             = original_row(r, shape.intermediate, rank, gate);
+                    const auto sr             = source_row(gate, r);
                     const auto sc             = c + (gate ? 0 : rank * shape.intermediate);
                     const auto expected_scale = source_scale(e, sr, sc, gate ? 101 : 211, fp8);
                     if (fp8) {

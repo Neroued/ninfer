@@ -61,7 +61,12 @@ void validate_expert_profile(const RoutedSwiGLUProfile& p) {
         const bool fp8 = f.gate_up_type == QType::FP8_E4M3FN_BLOCK128X128_BF16 &&
                          f.gate_up_layout == QuantLayout::BlockScaleM128K128 &&
                          f.gate_up_policy == LinearPolicy::AllowA8;
-        require(f.intermediate == 640 && (nvfp4 || fp8) && f.down_type == f.gate_up_type &&
+        require((f.intermediate == 640
+#if NINFER_TARGET_SPARK
+                 || (nvfp4 && f.intermediate == 320)
+#endif
+                     ) &&
+                    (nvfp4 || fp8) && f.down_type == f.gate_up_type &&
                     f.down_layout == f.gate_up_layout && f.down_policy == f.gate_up_policy,
                 "routed SwiGLU: unsupported block-scaled profile");
         return;

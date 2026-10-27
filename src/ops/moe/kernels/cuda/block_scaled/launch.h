@@ -14,6 +14,7 @@ struct Plan {
     // Policies select these widths from slice M, but each tile covers assignments
     // belonging to one expert. The entry policy owns the maximum slice size.
     QType format     = QType::NVFP4;
+    int intermediate = kIntermediate;
     int gate_columns = 0, down_columns = 0;
     bool vector                = false;
     bool atomic_output         = false;

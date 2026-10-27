@@ -560,12 +560,15 @@ Input/output residual and normalized tensors are BF16 `[H,4,M]`,
 embedding/block tensors are BF16 `[H,M]`, and activated injection is FP32 `[4,M]`.
 `add-norm` selects the unit-weight overload without an injection operand.
 
-`block-mix` and `final-mix` measure the complete public `hc_mix` overloads, including both BF16
-projections, nonlinearities, four-stream mean and Block injection. They consume normalized BF16
-`[2560,4,M]`, native compact BF16 Down/Up parents and caller-owned workspace. The fixture seeds
-nonuniform inputs/weights, allocates only the selected form’s operands, and queries/allocates scratch
-before timing. No norm or residual combine is included; internal routes remain production-owned.
-These are new capabilities without a preexisting production Mix baseline.
+`block-mix` and `final-mix` measure the complete public `hc_mix` overloads, including
+projections, exact nonlinearities, four-stream mean and Block injection. `--mix-format bf16`
+(the default) uses normalized BF16 `[2560,4,M]` and compact BF16 Down/Up parents.
+`--mix-format fp8 --policy a8` uses `[5120,4,M]`, row-scaled E4M3 Down/Up, and an independent
+BF16/A16 injection matrix. `--policy a16` forces A16 activations for the FP8 projections;
+otherwise production selects activation precision independently for Down and Up.
+The fixture seeds nonuniform inputs/weights, allocates only the selected form's operands, and
+queries caller-owned scratch before timing. No norm or residual combine is included;
+internal routes remain production-owned. `--width` applies to norm/combine fixtures only.
 
 `combine-then-norm` times public `hc_combine` followed by `hc_grouped_rmsnorm` as one interval.
 `add-then-norm` uses the same composition with an all-one FP32 injection prepared before timing.
@@ -592,7 +595,9 @@ The logical count includes each public input read and output write, with shared 
 once per call; the named two-Op compositions include the intermediate residual reread.
 The reference uses the target's nominal memory bandwidth. Private repeated loads and internal
 staging are excluded, and cache retention/writeback can make the logical rate exceed DRAM bandwidth.
-Mix leaves these fields empty because its contractions require separate work accounting.
+Mix counts the native weight bytes and public input/output tensors once. Its contractions,
+activation encoding, repeated reads and nonlinearities require separate stage analysis; the logical
+rate does not establish physical DRAM utilization.
 
 ```bash
 cmake --build build/rtx5090-dev -j --target ninfer_gated_residual_bench
@@ -609,7 +614,7 @@ cmake --build build/rtx5090-dev -j --target ninfer_gated_residual_bench
 ./build/rtx5090-dev/bench/ninfer_gated_residual_bench \
   --op combine-norm --tokens 1,128 --execution eager --cache warm --condition-us 0
 ./build/rtx5090-dev/bench/ninfer_gated_residual_bench \
-  --op block-mix --sweep 1:128 --execution graph --cache both \
+  --op block-mix --mix-format fp8 --policy a8 --sweep 1:128 --execution graph --cache both \
   --warmup 10 --repeat 61 --csv-out /tmp/hc-block-mix.csv
 ./build/rtx5090-dev/bench/ninfer_gated_residual_bench \
   --op final-mix --tokens 1,4,8,64,128,512,1024 --execution both --cache both

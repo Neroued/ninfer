@@ -76,21 +76,37 @@ void hc_combine_norm(const Tensor& residual, const Tensor& block_output,
                      const Tensor& next_norm_weight, float epsilon, Tensor& updated_residual,
                      Tensor& normalized, CudaExecutionView execution);
 
-struct HcMixWeights {
+struct HcBf16MixWeights {
     Weight down_injection; // BF16 Contiguous [324,10240], rows [320,324) are injection.
     Weight up;             // BF16 Contiguous [10240,320], row=s*2560+d.
 };
 
-struct HcFinalMixWeights {
+struct HcBf16FinalMixWeights {
     Weight down; // BF16 Contiguous [320,10240].
     Weight up;   // BF16 Contiguous [10240,320], row=s*2560+d.
 };
 
-struct HcMixProfile {
+struct HcBf16MixProfile {
     LinearProfile down_injection, up;
 };
 
-struct HcFinalMixProfile {
+struct HcBf16FinalMixProfile {
+    LinearProfile down, up;
+};
+
+// Mixed representation: the injection matrix always consumes the original BF16
+// normalized input, independently of the down/up activation policies.
+struct HcFp8MixWeights {
+    SingleProjectionWeight down, up; // [rank,4H], [4H,rank], row-scaled E4M3/BF16.
+    Weight injection;               // BF16 Contiguous [4,4H].
+};
+struct HcFp8FinalMixWeights {
+    SingleProjectionWeight down, up;
+};
+struct HcFp8MixProfile {
+    LinearProfile down, up, injection;
+};
+struct HcFp8FinalMixProfile {
     LinearProfile down, up;
 };
 
@@ -112,7 +128,7 @@ struct HcFinalMixProfile {
  * matching capacity query.
  * This Op performs no normalization or residual combination.
  */
-void hc_mix(const Tensor& normalized, const HcMixWeights& weights, MemoryArena& workspace,
+void hc_mix(const Tensor& normalized, const HcBf16MixWeights& weights, MemoryArena& workspace,
             Tensor& block_input, Tensor& injection, CudaExecutionView execution);
 
 /**
@@ -120,7 +136,23 @@ void hc_mix(const Tensor& normalized, const HcMixWeights& weights, MemoryArena& 
  * follow the ordinary form; sample_hidden is BF16 [H,M]. Adds no normalization or
  * residual combination.
  */
-void hc_mix(const Tensor& normalized, const HcFinalMixWeights& weights, MemoryArena& workspace,
+void hc_mix(const Tensor& normalized, const HcBf16FinalMixWeights& weights, MemoryArena& workspace,
+            Tensor& sample_hidden, CudaExecutionView execution);
+
+/**
+ * The same four-stream mixing formula with separate down and injection matrices:
+ *   a=down*flatten(normalized), b=injection*flatten(normalized), u=SiLU(a/4).
+ * The implementation catalog owns supported H/rank geometries.
+ * Down/up use row-scaled FP8 with A16Only or AllowA8 independently. Injection is
+ * BF16/A16Only and its output remains FP32. All other layouts, aliases, effects,
+ * stream/capture and caller-owned workspace rules follow the BF16 form.
+ * SiLU and sigmoid use expf and FP32 division, without approximate intrinsics.
+ * Private low-rank staging is allowed; no BF16 gate-logit boundary is introduced.
+ */
+void hc_mix(const Tensor& normalized, const HcFp8MixWeights& weights, MemoryArena& workspace,
+            Tensor& block_input, Tensor& injection, CudaExecutionView execution);
+// Final form omits injection and adds no normalization.
+void hc_mix(const Tensor& normalized, const HcFp8FinalMixWeights& weights, MemoryArena& workspace,
             Tensor& sample_hidden, CudaExecutionView execution);
 
 /**
@@ -130,18 +162,31 @@ void hc_mix(const Tensor& normalized, const HcFinalMixWeights& weights, MemoryAr
  * padding and public tensors. Inspects host metadata only; device backing is not required.
  * Invalid profiles or intervals throw.
  */
-[[nodiscard]] std::size_t hc_mix_workspace_capacity_bytes(const HcMixWeights& weights,
+[[nodiscard]] std::size_t hc_mix_workspace_capacity_bytes(const HcFp8MixWeights& weights,
                                                           std::int32_t min_tokens,
                                                           std::int32_t max_tokens);
-[[nodiscard]] std::size_t hc_mix_workspace_capacity_bytes(const HcFinalMixWeights& weights,
+[[nodiscard]] std::size_t hc_mix_workspace_capacity_bytes(const HcFp8FinalMixWeights& weights,
+                                                          std::int32_t min_tokens,
+                                                          std::int32_t max_tokens);
+[[nodiscard]] std::size_t hc_mix_workspace_capacity_bytes(const HcFp8MixProfile& profile,
+                                                          std::int32_t min_tokens,
+                                                          std::int32_t max_tokens);
+[[nodiscard]] std::size_t hc_mix_workspace_capacity_bytes(const HcFp8FinalMixProfile& profile,
+                                                          std::int32_t min_tokens,
+                                                          std::int32_t max_tokens);
+
+[[nodiscard]] std::size_t hc_mix_workspace_capacity_bytes(const HcBf16MixWeights& weights,
+                                                          std::int32_t min_tokens,
+                                                          std::int32_t max_tokens);
+[[nodiscard]] std::size_t hc_mix_workspace_capacity_bytes(const HcBf16FinalMixWeights& weights,
                                                           std::int32_t min_tokens,
                                                           std::int32_t max_tokens);
 
 // Address-free forms use the same admission and capacity rules as bound weights.
-[[nodiscard]] std::size_t hc_mix_workspace_capacity_bytes(const HcMixProfile& profile,
+[[nodiscard]] std::size_t hc_mix_workspace_capacity_bytes(const HcBf16MixProfile& profile,
                                                           std::int32_t min_tokens,
                                                           std::int32_t max_tokens);
-[[nodiscard]] std::size_t hc_mix_workspace_capacity_bytes(const HcFinalMixProfile& profile,
+[[nodiscard]] std::size_t hc_mix_workspace_capacity_bytes(const HcBf16FinalMixProfile& profile,
                                                           std::int32_t min_tokens,
                                                           std::int32_t max_tokens);
 

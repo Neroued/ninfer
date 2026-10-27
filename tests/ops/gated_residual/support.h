@@ -54,6 +54,7 @@ std::vector<double> grouped_norm(std::span<const double> input, std::span<const 
                                  int columns, float epsilon, int width = kWidth);
 int verify(const Fixture& fixture, const std::string& label, bool exact_residual);
 void add_norm_cases(OpSuite& suite);
-void add_mix_cases(OpSuite& suite);
+void add_bf16_mix_cases(OpSuite& suite);
+void add_fp8_mix_cases(OpSuite& suite);
 int validate(Form form, CudaExecutionView execution, int width = kWidth);
 } // namespace ninfer::test::hc

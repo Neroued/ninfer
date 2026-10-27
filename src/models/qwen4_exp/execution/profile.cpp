@@ -21,11 +21,11 @@ public:
         return ops::describe_linear_weight(inputs);
     }
 
-    ops::HcMixProfile hc(const HcWeights& w) const {
+    ops::HcBf16MixProfile hc(const HcWeights& w) const {
         return {linear({w.down, w.injection.value()}), linear({w.up})};
     }
 
-    ops::HcFinalMixProfile final_hc(const HcWeights& w) const {
+    ops::HcBf16FinalMixProfile final_hc(const HcWeights& w) const {
         return {linear({w.down}), linear({w.up})};
     }
 

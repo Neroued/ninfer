@@ -26,6 +26,7 @@ using Fp8N248320K5120            = Fp8Geometry<248320, 5120>;
 using Fp8N5120K6144              = Fp8Geometry<5120, 6144>;
 using Fp8N5120K17408             = Fp8Geometry<5120, 17408>;
 using Fp8Activation5120Geometry  = Fp8ActivationGeometry<5120>;
+using Fp8Activation20480Geometry = Fp8ActivationGeometry<20480>;
 using Fp8Activation6144Geometry  = Fp8ActivationGeometry<6144>;
 using Fp8Activation17408Geometry = Fp8ActivationGeometry<17408>;
 

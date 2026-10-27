@@ -12,12 +12,12 @@ using LinearParameters = ops::SingleProjectionWeight;
 
 struct HcParameters {
     Tensor norm;
-    ops::HcMixWeights mix;
+    ops::HcBf16MixWeights mix;
 };
 
 struct FinalHcParameters {
     Tensor norm;
-    ops::HcFinalMixWeights mix;
+    ops::HcBf16FinalMixWeights mix;
 };
 
 struct GdnParameters {
@@ -42,7 +42,7 @@ struct QsaHistoryParameters {
 };
 
 struct MtpHistoryParameters {
-    ops::HcFinalMixWeights mix;
+    ops::HcBf16FinalMixWeights mix;
     QsaHistoryParameters attention;
 };
 

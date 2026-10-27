@@ -1,5 +1,6 @@
 #pragma once
 #include "op_measurement.cuh"
+#include "ninfer/ops/linear.h"
 #include <limits>
 
 namespace ninfer::bench::hc {
@@ -54,10 +55,12 @@ struct Options {
     measurement::Options timing;
     Op op = Op::CombineNorm;
     std::vector<int> tokens{1};
-    int batch        = 1;
-    int width        = kWidth;
-    bool in_place    = false;
-    int condition_us = 200;
+    int batch                = 1;
+    int width                = kWidth;
+    bool fp8_mix             = false;
+    ops::LinearPolicy policy = ops::LinearPolicy::AllowA8;
+    bool in_place            = false;
+    int condition_us         = 200;
 };
 
 inline int columns(int tokens, int batch) {
@@ -70,6 +73,7 @@ inline int columns(int tokens, int batch) {
 inline Options parse(int argc, char** argv) {
     Options o;
     bool have_tokens = false, have_sweep = false, have_width = false;
+    bool have_mix_format = false, have_policy = false;
     for (int i = 1; i < argc; ++i) {
         const std::string_view flag = argv[i];
         if (flag == "--help" || flag == "-h") {
@@ -78,6 +82,7 @@ inline Options parse(int argc, char** argv) {
                    "  --op expand-norm|grouped-rmsnorm|combine|combine-norm|add-norm\n"
                    "       |combine-then-norm|add-then-norm|block-mix|final-mix\n"
                    "  --alias disjoint|inplace --batch B --width H --condition-us N\n"
+                   "  --mix-format bf16|fp8 --policy a16|a8 (mix only)\n"
                    "  --tokens T[,T...] or --sweep START:END[:STEP]\n"
                    "Norm/combine width defaults to 2560; streams=4, M=tokens*batch.\n"
                    "Mix uses its native fixed fixture; --width applies to norm/combine only.\n"
@@ -105,6 +110,15 @@ inline Options parse(int argc, char** argv) {
         } else if (flag == "--width") {
             o.width    = measurement::integer(value);
             have_width = true;
+        } else if (flag == "--mix-format") {
+            if (value != "bf16" && value != "fp8")
+                throw std::invalid_argument("mix-format: bf16|fp8");
+            o.fp8_mix       = value == "fp8";
+            have_mix_format = true;
+        } else if (flag == "--policy") {
+            if (value != "a16" && value != "a8") throw std::invalid_argument("policy: a16|a8");
+            o.policy    = value == "a8" ? ops::LinearPolicy::AllowA8 : ops::LinearPolicy::A16Only;
+            have_policy = true;
         } else if (flag == "--batch")
             o.batch = measurement::integer(value);
         else if (flag == "--condition-us")
@@ -122,6 +136,10 @@ inline Options parse(int argc, char** argv) {
         throw std::invalid_argument("tokens and sweep are mutually exclusive");
     if (have_width && mixes(o.op))
         throw std::invalid_argument("--width applies to the norm/combine benchmark fixture");
+    if (have_mix_format && !mixes(o.op))
+        throw std::invalid_argument("mix-format applies to mixer fixtures");
+    if (have_policy && (!mixes(o.op) || !o.fp8_mix))
+        throw std::invalid_argument("--policy applies to FP8 mixer activations");
     if (o.in_place && !combines(o.op))
         throw std::invalid_argument("this Op has no in-place residual form");
     for (int t : o.tokens) (void)columns(t, o.batch);

@@ -40,19 +40,19 @@ struct MoeProfile {
 };
 
 struct BlockProfile {
-    ops::HcMixProfile attention_hc, moe_hc;
+    ops::HcBf16MixProfile attention_hc, moe_hc;
     std::variant<GdnProfile, QsaProfile> mixer;
     MoeProfile moe;
 };
 
 struct TextProfile {
     std::vector<BlockProfile> layers;
-    ops::HcFinalMixProfile final_hc;
+    ops::HcBf16FinalMixProfile final_hc;
     ops::LinearProfile ple, head;
 };
 
 struct MtpHistoryProfile {
-    ops::HcFinalMixProfile mix;
+    ops::HcBf16FinalMixProfile mix;
     ops::LinearProfile input;
     std::array<std::int32_t, 3> output_rows;
 };
@@ -60,7 +60,7 @@ struct MtpHistoryProfile {
 struct MtpProfile {
     ops::LinearProfile fc_embedding, fc_hidden, head;
     BlockProfile layer;
-    ops::HcFinalMixProfile final_hc;
+    ops::HcBf16FinalMixProfile final_hc;
     MtpHistoryProfile history;
 };
 

@@ -6,21 +6,21 @@ namespace ninfer::ops::detail::moe_cuda::block_scaled::clamped::fp8 {
 
 // A CTA owns each output tile across all eight experts, eliminating inter-expert
 // atomic updates. G128 weight/input scales and route coefficients stay in FP32.
-template <int Columns>
+template <int Columns, int Intermediate = kIntermediate>
 struct DenseDownStorage {
-    TileStorage<Schedule<Columns, false>> tile;
+    TileStorage<Schedule<Columns, false, Intermediate>> tile;
     float coefficients[Columns];
 };
 
-template <int Columns>
+template <int Columns, int Intermediate = kIntermediate>
 __global__ void dense_eight_down(const std::uint8_t* input, const float* input_scales,
                                  ExpertMatrixDeviceView bank, Groups groups, const int* ids,
                                  const float* coefficients, float* output, int tokens,
                                  int row_window) {
     if (!dense_eight(groups, tokens)) return;
-    using S = Schedule<Columns, false>;
+    using S = Schedule<Columns, false, Intermediate>;
     extern __shared__ __align__(16) unsigned char bytes[];
-    auto& storage  = *reinterpret_cast<DenseDownStorage<Columns>*>(bytes);
+    auto& storage  = *reinterpret_cast<DenseDownStorage<Columns, Intermediate>*>(bytes);
     auto& tile     = storage.tile;
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     const int wm = warp % S::warp_rows, wn = warp / S::warp_rows;
@@ -47,12 +47,12 @@ __global__ void dense_eight_down(const std::uint8_t* input, const float* input_s
             __syncthreads();
             stage_inputs<S, false>(tile, 0, 0, row0, weight, input, active_columns);
             stage_inputs<S, false>(tile, 1, 1, row0, weight, input, active_columns);
-            for (int kt = 0; kt < kIntermediate / 128; ++kt) {
+            for (int kt = 0; kt < Intermediate / 128; ++kt) {
                 const int stage = kt % 2;
                 cp_wait<1>();
                 __syncthreads();
                 const float sw =
-                    __bfloat162float(weight.scales[(row0 / 128) * (kIntermediate / 128) + kt]);
+                    __bfloat162float(weight.scales[(row0 / 128) * (Intermediate / 128) + kt]);
 #pragma unroll
                 for (int n0 = 0; n0 < S::mma_columns; n0 += 2) {
                     const int first = wn * S::warp_columns + n0 * 8;
@@ -97,7 +97,7 @@ __global__ void dense_eight_down(const std::uint8_t* input, const float* input_s
                                               source = tile.sources[column];
                                     const float scale =
                                         source >= 0 ? input_scales[std::int64_t(source) *
-                                                                       (kIntermediate / 128) +
+                                                                       (Intermediate / 128) +
                                                                    kt] *
                                                           sw * storage.coefficients[column]
                                                     : 0;
@@ -108,7 +108,7 @@ __global__ void dense_eight_down(const std::uint8_t* input, const float* input_s
                     }
                 }
                 __syncthreads();
-                if (kt + 2 < kIntermediate / 128)
+                if (kt + 2 < Intermediate / 128)
                     stage_inputs<S, false>(tile, stage, kt + 2, row0, weight, input,
                                            active_columns);
                 else

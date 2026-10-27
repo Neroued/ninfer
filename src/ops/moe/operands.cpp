@@ -40,7 +40,7 @@ void validate_expert_profile(const RoutedSwiGLUProfile& p) {
         const bool fp8 = f.gate_up_type == QType::FP8_E4M3FN_BLOCK128X128_BF16 &&
                          f.gate_up_layout == QuantLayout::BlockScaleM128K128 &&
                          f.gate_up_policy == LinearPolicy::AllowA8;
-        require((f.intermediate == 2048 || (nvfp4 && f.intermediate == 1024)) && p.experts == 288 &&
+        require((f.intermediate == 2048 || f.intermediate == 1024) && p.experts == 288 &&
                     p.top_k == 8 && f.clamp_limit && std::isfinite(*f.clamp_limit) &&
                     *f.clamp_limit > 0 && (nvfp4 || fp8) && f.down_type == f.gate_up_type &&
                     f.down_layout == f.gate_up_layout && f.down_policy == f.gate_up_policy,

@@ -30,7 +30,7 @@ Options parse(int argc, char** argv) {
         if (flag == "--help") {
             std::cout
                 << "TP2 MoE, all distinct expert payloads and verified router distributions.\n"
-                   "  --profile-id m1 --entry complete|routed|both --rank 0|1\n"
+                   "  --profile-id m1|m2 --entry complete|routed|both --rank 0|1\n"
                    "  --distribution reuse|pool|tail|spread|all\n"
                    "  --tokens T[,T...] --sweep FIRST:LAST[:STEP]\n"
                    "Default extents: every T=1..256, then 512,1024,2048,4096.\n";
@@ -54,7 +54,8 @@ Options parse(int argc, char** argv) {
         else
             throw std::invalid_argument("unknown TP2 benchmark option");
     }
-    if (o.profile != "m1" || (o.entry != "complete" && o.entry != "routed" && o.entry != "both") ||
+    if ((o.profile != "m1" && o.profile != "m2") ||
+        (o.entry != "complete" && o.entry != "routed" && o.entry != "both") ||
         (o.distribution != "all" && o.distribution != "reuse" && o.distribution != "pool" &&
          o.distribution != "tail" && o.distribution != "spread"))
         throw std::invalid_argument("invalid TP2 benchmark workload");
@@ -62,7 +63,9 @@ Options parse(int argc, char** argv) {
 }
 
 void run(const Options& o) {
-    const tp::Shape shape{4096, 1024, 288, 8, true, QType::NVFP4};
+    const bool fp8 = o.profile == "m2";
+    const tp::Shape shape{4096, 1024, 288,
+                          8,    true, fp8 ? QType::FP8_E4M3FN_BLOCK128X128_BF16 : QType::NVFP4};
     const auto cuda   = device_context().execution_view();
     const int maximum = *std::max_element(o.tokens.begin(), o.tokens.end());
     tp::Fixture fixture(cuda, shape, o.rank, maximum);
@@ -123,10 +126,13 @@ void run(const Options& o) {
                     6.0 * shape.hidden * shape.intermediate * shape.top_k * tokens;
                 const double memory_reference = bytes / (kRoofline.sustained_read_gbs * 1000);
                 const double compute_reference =
-                    tokens == 1 ? std::numeric_limits<double>::quiet_NaN()
-                                : (router_flops + shared_flops * (tokens <= 48 ? 4.0 / 3 : 2)) /
-                                          (kRoofline.bf16_f32_tflops * 1e6) +
-                                      routed_flops / (kRoofline.nvfp4_f32_tflops * 1e6);
+                    tokens <= (fp8 ? 2 : 1)
+                        ? std::numeric_limits<double>::quiet_NaN()
+                        : (router_flops + shared_flops * (tokens <= 48 ? 4.0 / 3 : 2)) /
+                                  (kRoofline.bf16_f32_tflops * 1e6) +
+                              routed_flops /
+                                  ((fp8 ? kRoofline.fp8_f32_tflops : kRoofline.nvfp4_f32_tflops) *
+                                   1e6);
                 const double roofline = std::isfinite(compute_reference)
                                             ? std::max(memory_reference, compute_reference)
                                             : memory_reference;
@@ -142,8 +148,8 @@ void run(const Options& o) {
                 };
                 measurement::Row row;
                 row.op     = complete ? "topk_sigmoid_swiglu_moe" : "routed_swiglu";
-                row.format = "nvfp4";
-                row.policy = "a4";
+                row.format = fp8 ? "fp8" : "nvfp4";
+                row.policy = fp8 ? "a8" : "a4";
                 row.n      = shape.hidden;
                 row.k      = shape.intermediate;
                 row.tokens = tokens;
@@ -157,9 +163,10 @@ void run(const Options& o) {
                 // from the unique public operands. This is a minimum, not measured DRAM.
                 const std::uint64_t staging =
                     (complete ? (16ULL * shape.top_k + 8ULL * shape.hidden) * tokens : 0) +
-                    (tokens == 1 ? 8ULL * shape.intermediate * shape.top_k * tokens
-                                 : 2ULL * (shape.hidden + shape.intermediate * shape.top_k) *
-                                       tokens * 9 / 16);
+                    (tokens <= (fp8 ? 2 : 1)
+                         ? 8ULL * shape.intermediate * shape.top_k * tokens
+                         : 2ULL * (shape.hidden + shape.intermediate * shape.top_k) * tokens *
+                               (fp8 ? 33 : 9) / (fp8 ? 32 : 16));
                 for (const auto& execution :
                      measurement::selections(o.timing.execution, "graph", "eager"))
                     for (const auto& cache :
@@ -177,9 +184,10 @@ void run(const Options& o) {
                               << ',' << shared_flops << ',' << routed_flops << ','
                               << memory_reference << ',' << format_metric(compute_reference, 3, "")
                               << ',' << roofline << ',' << result.gpu.median_us / roofline << ','
-                              << (tokens == 1 ? "SIMT_FP32"
-                                  : complete  ? "BF16_F32ACC+NVFP4_F32ACC"
-                                              : "NVFP4_F32ACC")
+                              << (tokens <= (fp8 ? 2 : 1) ? (complete && tokens > 1 ? "BF16_F32ACC+SIMT_FP32" : "SIMT_FP32")
+                                  : complete              ? (fp8 ? "BF16_F32ACC+FP8_F32ACC"
+                                                                 : "BF16_F32ACC+NVFP4_F32ACC")
+                                                          : (fp8 ? "FP8_F32ACC" : "NVFP4_F32ACC"))
                               << ',' << (complete ? full_capacity : routed_capacity) << ','
                               << staging << ',' << memory_limited << ','
                               << (cache == "cold" && memory_limited ? bandwidth >= 235 : 0);

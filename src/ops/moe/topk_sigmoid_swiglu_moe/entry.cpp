@@ -34,7 +34,9 @@ std::size_t routed_capacity(const RoutedSwiGLUProfile& p, ExpertSubsetKind subse
         detail::validate_expert_profile(p);
         detail::validate_interval(first, last);
         if (subset == ExpertSubsetKind::None) return 0;
-        const auto& shape = detail::moe_sigmoid::nvfp4_h4096_i1024_e288_k8();
+        const auto& shape = p.ffn.gate_up_type == QType::NVFP4
+                                ? detail::moe_sigmoid::nvfp4_h4096_i1024_e288_k8()
+                                : detail::moe_sigmoid::fp8_h4096_i1024_e288_k8();
         return detail::interval_capacity(
             first, last, shape.allocation_boundaries, shape.slice_tokens, [&](int tokens) {
                 WorkspaceLayoutBuilder layout;
@@ -56,7 +58,9 @@ routed_contribution(const Tensor& x, const RoutedSwiGLUProfile& p, const CudaSwi
     if (p.ffn.intermediate != 1024)
         return detail::moe_routed::execute_contribution(
             x, p, experts, routes, subset, storage.routed, validity, scratch, execution);
-    const auto& shape = detail::moe_sigmoid::nvfp4_h4096_i1024_e288_k8();
+    const auto& shape = p.ffn.gate_up_type == QType::NVFP4
+                            ? detail::moe_sigmoid::nvfp4_h4096_i1024_e288_k8()
+                            : detail::moe_sigmoid::fp8_h4096_i1024_e288_k8();
     for (int start = 0; start < x.ne[1];) {
         const int tokens = std::min(x.ne[1] - start, shape.slice_tokens);
         const auto input = x.slice(1, start, tokens);

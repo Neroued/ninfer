@@ -16,6 +16,11 @@ struct Fp8PopulationTuning {
     int wide_min_average                  = 0;
     bool wide_down                        = false;
     bool dense_down                       = false;
+    // Zero partitions expert loads at k256_max_load: K256 for short groups,
+    // K128 with the large column tiles for long groups.
+    int k_step                            = 128;
+    int k256_max_load                     = 0;
+    int large_gate_columns = 0, large_down_columns = 0;
 };
 
 struct Plan {
@@ -47,6 +52,10 @@ struct Plan {
 
     int job_columns() const {
         int columns = gate_columns > down_columns ? gate_columns : down_columns;
+        if (fp8.k_step == 0) {
+            if (fp8.large_gate_columns > columns) columns = fp8.large_gate_columns;
+            if (fp8.large_down_columns > columns) columns = fp8.large_down_columns;
+        }
         if (fp8.wide_down && Fp8PopulationTuning::kWideDownColumns > columns)
             columns = Fp8PopulationTuning::kWideDownColumns;
         return columns > group_columns ? columns : group_columns;

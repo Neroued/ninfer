@@ -12,4 +12,5 @@ struct ShapePolicy {
 };
 
 const ShapePolicy& nvfp4_h4096_i1024_e288_k8();
+const ShapePolicy& fp8_h4096_i1024_e288_k8();
 } // namespace ninfer::ops::detail::moe_sigmoid

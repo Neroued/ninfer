@@ -8,6 +8,7 @@ inline constexpr int kPairGateRowsPerCta = 4, kPairDownRowsPerWarp = 4;
 
 // Match logical experts on Device; keep each token's original route rank and
 // unquantized FP32 activation. Only the first token owns a shared expert.
+template <int Intermediate>
 __device__ __forceinline__ void pair_gate_dot(const __nv_bfloat16* x, ExpertMatrixDeviceView bank,
                                               float* activation, float limit, int assignment,
                                               int expert, int mate, int row_tile) {
@@ -21,10 +22,10 @@ __device__ __forceinline__ void pair_gate_dot(const __nv_bfloat16* x, ExpertMatr
         const float4 input = make_float4(a.x, a.y, b.x, b.y);
         const unsigned g   = load_vec<unsigned>(weight.codes + std::int64_t(row) * kHidden + k);
         const unsigned u =
-            load_vec<unsigned>(weight.codes + std::int64_t(row + kIntermediate) * kHidden + k);
+            load_vec<unsigned>(weight.codes + std::int64_t(row + Intermediate) * kHidden + k);
         const float sg = __bfloat162float(weight.scales[(row / 128) * (kHidden / 128) + block]);
-        const float su = __bfloat162float(
-            weight.scales[((row + kIntermediate) / 128) * (kHidden / 128) + block]);
+        const float su =
+            __bfloat162float(weight.scales[((row + Intermediate) / 128) * (kHidden / 128) + block]);
         gate = fmaf(dot_four(g, input), sg, gate);
         up   = fmaf(dot_four(u, input), su, up);
         if (mate >= 0) {
@@ -38,20 +39,20 @@ __device__ __forceinline__ void pair_gate_dot(const __nv_bfloat16* x, ExpertMatr
     gate = warp_reduce_sum(gate);
     up   = warp_reduce_sum(up);
     if (!lane) {
-        activation[std::int64_t(assignment) * kIntermediate + row] =
+        activation[std::int64_t(assignment) * Intermediate + row] =
             silu(fminf(gate, limit)) * fmaxf(-limit, fminf(up, limit));
     }
     if (mate >= 0) {
         mate_gate = warp_reduce_sum(mate_gate);
         mate_up   = warp_reduce_sum(mate_up);
         if (!lane) {
-            activation[std::int64_t(mate) * kIntermediate + row] =
+            activation[std::int64_t(mate) * Intermediate + row] =
                 silu(fminf(mate_gate, limit)) * fmaxf(-limit, fminf(mate_up, limit));
         }
     }
 }
 
-template <int Rows>
+template <int Intermediate, int Rows>
 __device__ __forceinline__ void
 pair_down_dot(const float* activation, ExpertMatrixDeviceView bank, const float* coefficients,
               ExpertSubsetKind kind, const int* mask, const int* experts, const int* mates,
@@ -62,22 +63,22 @@ pair_down_dot(const float* activation, ExpertMatrixDeviceView bank, const float*
     if (includes(kind, mask, expert)) {
         const auto weight = resolve(bank, expert);
         float sum[Rows] = {}, other[Rows] = {};
-        for (int block = 0; block < kIntermediate / 128; ++block) {
+        for (int block = 0; block < Intermediate / 128; ++block) {
             const int k = block * 128 + lane * 4;
             const float4 input =
-                load_vec<float4>(activation + std::int64_t(route) * kIntermediate + k);
+                load_vec<float4>(activation + std::int64_t(route) * Intermediate + k);
             float4 paired{};
             if (mate >= 0) {
                 paired =
-                    load_vec<float4>(activation + std::int64_t(kTopK + mate) * kIntermediate + k);
+                    load_vec<float4>(activation + std::int64_t(kTopK + mate) * Intermediate + k);
             }
 #pragma unroll
             for (int r = 0; r < Rows; ++r) {
                 const int row = row0 + r;
                 const unsigned w =
-                    load_vec<unsigned>(weight.codes + std::int64_t(row) * kIntermediate + k);
+                    load_vec<unsigned>(weight.codes + std::int64_t(row) * Intermediate + k);
                 const float scale =
-                    __bfloat162float(weight.scales[(row / 128) * (kIntermediate / 128) + block]);
+                    __bfloat162float(weight.scales[(row / 128) * (Intermediate / 128) + block]);
                 sum[r] = fmaf(dot_four(w, input), scale, sum[r]);
                 if (mate >= 0) { other[r] = fmaf(dot_four(w, paired), scale, other[r]); }
             }
@@ -98,18 +99,18 @@ pair_down_dot(const float* activation, ExpertMatrixDeviceView bank, const float*
     if (!matched && includes(kind, mask, second)) {
         const auto weight = resolve(bank, second);
         float sum[Rows]   = {};
-        for (int block = 0; block < kIntermediate / 128; ++block) {
+        for (int block = 0; block < Intermediate / 128; ++block) {
             const int k = block * 128 + lane * 4;
             const float4 input =
-                load_vec<float4>(activation + std::int64_t(kTopK + route) * kIntermediate + k);
+                load_vec<float4>(activation + std::int64_t(kTopK + route) * Intermediate + k);
 #pragma unroll
             for (int r = 0; r < Rows; ++r) {
                 const int row = row0 + r;
                 const unsigned w =
-                    load_vec<unsigned>(weight.codes + std::int64_t(row) * kIntermediate + k);
+                    load_vec<unsigned>(weight.codes + std::int64_t(row) * Intermediate + k);
                 sum[r] = fmaf(
                     dot_four(w, input),
-                    __bfloat162float(weight.scales[(row / 128) * (kIntermediate / 128) + block]),
+                    __bfloat162float(weight.scales[(row / 128) * (Intermediate / 128) + block]),
                     sum[r]);
             }
         }
@@ -122,6 +123,7 @@ pair_down_dot(const float* activation, ExpertMatrixDeviceView bank, const float*
 }
 
 // Compact the live assignments once per CTA, then visit each expert's rows in order.
+template <int Intermediate>
 __global__ void pair_gate(const __nv_bfloat16* x, ExpertMatrixDeviceView bank, const int* ids,
                           ExpertSubsetKind kind, const int* mask, float* activation, float limit) {
     __shared__ int experts[2 * kTopK], assignments[2 * kTopK], mates[2 * kTopK], active_count;
@@ -144,15 +146,16 @@ __global__ void pair_gate(const __nv_bfloat16* x, ExpertMatrixDeviceView bank, c
     const int count = active_count;
     if (!count) return;
 
-    constexpr int row_tiles = kIntermediate / kPairGateRowsPerCta;
+    constexpr int row_tiles = Intermediate / kPairGateRowsPerCta;
     for (int task = blockIdx.x; task < row_tiles * count; task += gridDim.x) {
         const int ordinal = task / row_tiles, a = assignments[ordinal];
-        pair_gate_dot(x, bank, activation, limit, a, experts[a], mates[ordinal], task % row_tiles);
+        pair_gate_dot<Intermediate>(x, bank, activation, limit, a, experts[a], mates[ordinal],
+                                    task % row_tiles);
     }
 }
 
 // Compact route pairs into warps; spare warps compute disjoint output rows.
-template <class Output>
+template <int Intermediate, class Output>
 __global__ void pair_down(const float* activation, ExpertMatrixDeviceView bank, const int* ids,
                           const float* coefficients, ExpertSubsetKind kind, const int* mask,
                           Output output) {
@@ -194,9 +197,9 @@ __global__ void pair_down(const float* activation, ExpertMatrixDeviceView bank, 
             reinterpret_cast<float*>(values)[i] = 0;
         __syncthreads();
         if (ordinal < count)
-            pair_down_dot<Rows>(activation, bank, coefficients, kind, mask, experts, mates,
-                                unmatched, slots[ordinal], tile * tile_rows + group * Rows,
-                                values[group]);
+            pair_down_dot<Intermediate, Rows>(activation, bank, coefficients, kind, mask, experts,
+                                              mates, unmatched, slots[ordinal],
+                                              tile * tile_rows + group * Rows, values[group]);
         __syncthreads();
         if (threadIdx.x < tile_rows) {
             const int g = threadIdx.x / Rows, r = threadIdx.x % Rows,

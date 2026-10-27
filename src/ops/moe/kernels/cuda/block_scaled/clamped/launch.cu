@@ -100,8 +100,10 @@ __device__ bool fully_covered_groups(Groups g, int assignments, bool density, bo
         const int tokens = assignments / kTopK;
         return g.load_range && g.load_range[0] == tokens && g.load_range[1] == tokens;
     }
-    // Distinct IDs give at most one hit per token for one selected expert.
-    return g.jobs[2] == 1 && g.offsets[kExperts] == assignments / kTopK;
+    // Distinct IDs bound every expert's count by T. Reaching active*T means
+    // every active expert covers every token, independent of route-slot order.
+    const int active = g.jobs[2];
+    return active > 0 && g.offsets[kExperts] == active * (assignments / kTopK);
 }
 
 __global__ void index_assignments(const int* ids, ExpertSubsetKind kind, const int* mask, Groups g,

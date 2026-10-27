@@ -25,6 +25,13 @@ void validate_policy(LinearPolicy policy) {
     throw std::invalid_argument("linear_swiglu: invalid compute policy");
 }
 
+void validate_output_aliases(const Tensor& x, const Weight& weight, const Tensor& out) {
+    using namespace common::operand;
+    constexpr auto op = "linear_swiglu";
+    disjoint(range(x, op), range(out, op), op);
+    disjoint(range(weight.payload, weight.payload_bytes, op), range(out, op), op);
+}
+
 } // namespace
 
 std::size_t linear_swiglu_workspace_capacity_bytes(QType qtype, std::int32_t gate_up_rows,
@@ -43,6 +50,10 @@ std::size_t linear_swiglu_workspace_capacity_bytes(QType qtype, std::int32_t gat
                                                                  min_tokens, max_tokens);
     }
     if (qtype == QType::NVFP4) {
+#if NINFER_TARGET_RTX5090
+        if (gate_up_rows == 28672 && input_rows == 5120)
+            return detail::nvfp4_swiglu_n28672_k5120_capacity(policy, min_tokens, max_tokens);
+#endif
 #if NINFER_TARGET_SPARK
         if (gate_up_rows == 12288 && input_rows == 4096)
             return detail::nvfp4_swiglu_n12288_k4096_capacity(policy, min_tokens, max_tokens);
@@ -108,12 +119,20 @@ static void execute_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor
 
     if (fp8_weight) {
         (void)common::validate_fp8_weight(gate_up_weight, "fp8 linear_swiglu");
+        validate_output_aliases(x, gate_up_weight, out);
         detail::fp8_linear_swiglu_dispatch(x, gate_up_weight, out, policy, ws, execution.stream());
         return;
     }
 
     if (nvfp4_weight) {
         (void)common::validate_nvfp4_weight(gate_up_weight, "nvfp4 linear_swiglu");
+        validate_output_aliases(x, gate_up_weight, out);
+#if NINFER_TARGET_RTX5090
+        if (w.n == 28672 && w.k == 5120) {
+            detail::launch_nvfp4_swiglu_n28672_k5120(x, w, out, policy, ws, execution.stream());
+            return;
+        }
+#endif
 #if NINFER_TARGET_SPARK
         if (w.n == 12288 && w.k == 4096) {
             detail::launch_nvfp4_swiglu_n12288_k4096(x, w, out, limit, clamped, policy, ws,

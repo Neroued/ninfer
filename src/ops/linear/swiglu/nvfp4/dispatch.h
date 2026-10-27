@@ -15,6 +15,13 @@
 namespace ninfer::ops::detail {
 struct Nvfp4A4Operands;
 
+#if NINFER_TARGET_RTX5090
+std::size_t nvfp4_swiglu_n28672_k5120_capacity(LinearPolicy policy, int min_tokens, int max_tokens);
+void launch_nvfp4_swiglu_n28672_k5120(const Tensor& x, const Weight& w, Tensor& y,
+                                       LinearPolicy policy, MemoryArena& workspace,
+                                       cudaStream_t stream);
+#endif
+
 [[nodiscard]] std::size_t nvfp4_linear_swiglu_workspace_capacity_bytes(LinearPolicy policy,
                                                                        std::int32_t min_tokens,
                                                                        std::int32_t max_tokens);

@@ -20,6 +20,13 @@ target_sources(ninfer_ops_non_rdc PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/nvfp4/shapes/n34816_k5120/a4_tma.cu"
 )
 
+if(NINFER_TARGET STREQUAL "rtx5090")
+  target_sources(ninfer_ops PRIVATE
+    "${CMAKE_CURRENT_LIST_DIR}/nvfp4/shapes/n28672_k5120/dispatch.cu")
+  target_sources(ninfer_ops_non_rdc PRIVATE
+    "${CMAKE_CURRENT_LIST_DIR}/nvfp4/shapes/n28672_k5120/tma.cu")
+endif()
+
 if(NINFER_TARGET STREQUAL "dgx_spark")
   target_sources(ninfer_ops_non_rdc PRIVATE
     "${CMAKE_CURRENT_LIST_DIR}/bf16/dgx_spark/shapes/n8192_k1024_bias.cu"

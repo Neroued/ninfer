@@ -1,5 +1,6 @@
 #include "common/roofline.h"
 #include "core/weight.h"
+#include "core/platform.h"
 #include "core/buffer.h"
 #include "ninfer/ops/linear_swiglu.h"
 
@@ -26,12 +27,11 @@ using namespace ninfer;
 
 namespace {
 
-constexpr std::int32_t kGateUpRows = 34816;
-constexpr std::int32_t kOutputRows = 17408;
-constexpr std::int32_t kHidden     = 5120;
-constexpr std::size_t kFlushBytes  = 256ULL << 20;
+constexpr std::int32_t kHidden    = 5120;
+constexpr std::size_t kFlushBytes = 256ULL << 20;
 
 struct Options {
+    int gate_up_rows         = 34816;
     ops::LinearPolicy policy = ops::LinearPolicy::A16Only;
     std::vector<std::int32_t> t_sweep{1, 4, 8, 16};
     int warmup   = 5;
@@ -56,7 +56,9 @@ Options parse_options(int argc, char** argv) {
             if (++index >= argc) { throw std::invalid_argument(std::string("missing ") + label); }
             return argv[index];
         };
-        if (argument == "--policy") {
+        if (argument == "--rows") {
+            options.gate_up_rows = bench::measurement::integer(next("--rows"));
+        } else if (argument == "--policy") {
             const std::string_view value = next("--policy");
             if (value == "a16") {
                 options.policy  = ops::LinearPolicy::A16Only;
@@ -78,7 +80,8 @@ Options parse_options(int argc, char** argv) {
         } else if (argument == "--csv-out") {
             options.csv_out = next("--csv-out");
         } else if (argument == "--help" || argument == "-h") {
-            std::printf("Usage: %s --policy a16|a4 [--t-sweep 1,4,...] [--warmup N] [--repeat N] "
+            std::printf("Usage: %s --policy a16|a4 [--rows N] [--t-sweep 1,4,...] [--warmup N] "
+                        "[--repeat N] "
                         "[--profile] [--csv-out PATH]\n",
                         argv[0]);
             std::exit(0);
@@ -89,6 +92,12 @@ Options parse_options(int argc, char** argv) {
     if (options.warmup < 0 || options.repeat <= 0) {
         throw std::invalid_argument("--warmup must be nonnegative and --repeat positive");
     }
+    if (options.gate_up_rows != 34816
+#if NINFER_TARGET_RTX5090
+        && options.gate_up_rows != 28672
+#endif
+    )
+        throw std::invalid_argument("unsupported gate/up rows");
     if (options.profile && options.t_sweep.size() != 1) {
         throw std::invalid_argument("--profile requires exactly one T");
     }
@@ -113,8 +122,8 @@ void write_csv(const Options& options, const std::vector<Result>& results,
     out << "op,weight_type,policy,N,K,T,weight_bytes,median_us,min_us,p95_us,effective_gbs,"
            "useful_tflops,nvfp4_peak_percent,warmup,repeat,flush_bytes\n";
     for (const Result& result : results) {
-        out << "linear_swiglu,NVFP4," << policy_name(options.policy) << ',' << kGateUpRows << ','
-            << kHidden << ',' << result.tokens << ',' << weight_bytes << ','
+        out << "linear_swiglu,NVFP4," << policy_name(options.policy) << ',' << options.gate_up_rows
+            << ',' << kHidden << ',' << result.tokens << ',' << weight_bytes << ','
             << result.timing.median_us << ',' << result.timing.min_us << ',' << result.timing.p95_us
             << ',' << result.effective_gbs << ',' << result.useful_tflops << ','
             << bench::format_metric(result.nvfp4_percent, 6, "") << ',' << options.warmup << ','
@@ -127,6 +136,7 @@ void write_csv(const Options& options, const std::vector<Result>& results,
 int main(int argc, char** argv) {
     try {
         const Options options = parse_options(argc, argv);
+        const int kGateUpRows = options.gate_up_rows, kOutputRows = kGateUpRows / 2;
         const std::int32_t max_t =
             *std::max_element(options.t_sweep.begin(), options.t_sweep.end());
         const std::int32_t min_t =
@@ -191,7 +201,8 @@ int main(int argc, char** argv) {
                                        2.0 * static_cast<double>(kHidden + kOutputRows) * tokens;
             const double useful_tflops = useful_flops / seconds / 1.0e12;
             const double effective_gbs = model_bytes / seconds / 1.0e9;
-            const bool a4 = options.policy == ops::LinearPolicy::AllowA4 && tokens >= 5;
+            const bool a4              = options.policy == ops::LinearPolicy::AllowA4 &&
+                            tokens >= (options.gate_up_rows == 28672 ? 8 : 5);
             const double nvfp4_percent =
                 a4 ? 100.0 * useful_tflops / bench::kRoofline.nvfp4_f32_tflops
                    : std::numeric_limits<double>::quiet_NaN();

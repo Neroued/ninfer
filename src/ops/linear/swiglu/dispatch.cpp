@@ -13,6 +13,9 @@ void validate_swiglu_geometry(QType type, int rows, int k, bool clamped) {
 #endif
         throw std::invalid_argument("linear_swiglu: unsupported clamped geometry");
     }
+#if NINFER_TARGET_RTX5090
+    if (type == QType::NVFP4 && rows == 28672 && k == 5120) return;
+#endif
 #if NINFER_TARGET_SPARK
     if (type == QType::BF16 && rows == 20480 && k == 4096) return;
     if (type == QType::NVFP4 && rows == 12288 && k == 4096) return;

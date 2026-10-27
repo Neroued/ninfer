@@ -14,6 +14,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -299,6 +300,19 @@ static int run_profile(std::string_view label, const Profile& profile,
             throw std::runtime_error("SwiGLU interval capacity is insufficient");
         GuardedDeviceBuffer scratch(capacity);
         MemoryArena workspace(scratch.span());
+        if (tokens == 1 && !replay &&
+            (profile.qtype == QType::NVFP4 || profile.qtype == QType::FP8_E4M3FN_ROW_BF16)) {
+            for (const void* alias : std::array<const void*, 3>{x.data, weight.qdata, weight.scales}) {
+                auto invalid = destination;
+                invalid.data = const_cast<void*>(alias);
+                try {
+                    ops::linear_swiglu(x, weight, invalid, policy, workspace,
+                                       cuda_environment().default_execution);
+                    std::cerr << call.id << ": accepted aliased output\n";
+                    ++failures;
+                } catch (const std::invalid_argument&) {}
+            }
+        }
         if (call.form == CallForm::RejectA16Extent) {
             for (bool convenience : {false, true}) {
                 try {

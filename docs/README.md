@@ -29,6 +29,10 @@ Published artifact downloads are listed in the [project README](../README.md).
 
 ## Designs
 
+- [Qwen4-27B on RTX 5090](designs/qwen4-27b-rtx5090.md) — architecture dimensions,
+  Main/Vision/MTP quantization, NVFP4 AllowA4 policy, and weight/context budgets.
+- [Qwen4-27B RTX 5090 Op checklist](designs/qwen4-27b-op-checklist.md) — production shapes,
+  HC/QSA contract gaps, MTP projections, existing Vision reuse, and qualification criteria.
 - [Unified Context storage pool](designs/unified-context-pool.md) — shared KV/State capacity,
   startup guarantees, execution reservations, cache reclamation and recovery, Op views, and
   deployment feasibility on RTX 5090 and single/dual Spark; selected design pending implementation.

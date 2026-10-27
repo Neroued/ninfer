@@ -1,4 +1,5 @@
 #include "support.h"
+#include "core/platform.h"
 #include "ops/suite.h"
 #include "core/decode_graph.h"
 
@@ -19,16 +20,16 @@ int verify(const Fixture& f, const std::string& label, bool exact_residual) {
         failed += verify_exact((label + " midpoint residual").c_str(), residual_words,
                                ref.residual_words);
     if (f.form != Form::Combine) {
-        const auto actual         = from_device_bf16(f.tz.data, f.h.size());
-        const bool combined       = f.form == Form::CombineNorm || f.form == Form::AddNorm;
-        const auto seam_reference = combined
-                                        ? grouped_norm(residual, f.weight, f.columns, f.epsilon)
-                                        : std::vector<double>{};
+        const auto actual   = from_device_bf16(f.tz.data, f.h.size());
+        const bool combined = f.form == Form::CombineNorm || f.form == Form::AddNorm;
+        const auto seam_reference =
+            combined ? grouped_norm(residual, f.weight, f.columns, f.epsilon, f.width)
+                     : std::vector<double>{};
         for (int m = 0; m < f.columns; ++m)
             for (int s = 0; s < kStreams; ++s) {
-                const auto base = (std::size_t(m) * kStreams + s) * kWidth;
+                const auto base = (std::size_t(m) * kStreams + s) * f.width;
                 const auto part = [&](const std::vector<double>& values) {
-                    return std::span<const double>(values.data() + base, kWidth);
+                    return std::span<const double>(values.data() + base, f.width);
                 };
                 const auto tag =
                     label + " column=" + std::to_string(m) + " stream=" + std::to_string(s);
@@ -42,8 +43,9 @@ int verify(const Fixture& f, const std::string& label, bool exact_residual) {
 }
 
 namespace {
-int run(Form form, int m, Pattern pattern, bool alias, bool captured, CudaExecutionView e) {
-    Fixture f(form, m, alias);
+int run(Form form, int m, Pattern pattern, bool alias, bool captured, CudaExecutionView e,
+        int width = kWidth) {
+    Fixture f(form, m, alias, width);
     f.set(pattern);
     f.upload(e.stream());
     DecodeGraphDefinition definition;
@@ -68,7 +70,8 @@ int run(Form form, int m, Pattern pattern, bool alias, bool captured, CudaExecut
                            " alias=" + std::to_string(alias) +
                            " graph=" + std::to_string(captured) + " phase=" + std::to_string(phase);
         const bool exact_residual =
-            pattern == Pattern::Midpoint && (form == Form::Combine || form == Form::CombineNorm);
+            pattern == Pattern::Midpoint &&
+            (form == Form::Combine || form == Form::CombineNorm || form == Form::AddNorm);
         failed += verify(f, label, exact_residual) + f.check(label);
     }
     return failed;
@@ -76,10 +79,58 @@ int run(Form form, int m, Pattern pattern, bool alias, bool captured, CudaExecut
 } // namespace
 
 void add_norm_cases(OpSuite& suite) {
+#if NINFER_TARGET_RTX5090
+    for (Form form :
+         {Form::ExpandNorm, Form::GroupedNorm, Form::Combine, Form::CombineNorm, Form::AddNorm}) {
+        const auto add = [&](int m, Pattern pattern, bool alias = false, bool graph = false) {
+            const auto id = std::string(name(form)) + "/h5120/m" + std::to_string(m) + "/pattern" +
+                            std::to_string(int(pattern)) + (alias ? "/alias" : "/disjoint") +
+                            (graph ? "/graph" : "/eager");
+            suite.add(
+                id,
+                [=] {
+                    return run(form, m, pattern, alias, graph,
+                               cuda_environment().context.execution_view(), 5120);
+                },
+                {{"execution", graph ? "graph" : "eager"}, {"format", "bf16"}, {"width", "5120"}});
+        };
+        for (int m : {1, 128, 512, 2048}) add(m, Pattern::Random);
+        for (auto pattern : {Pattern::Affine, Pattern::Zero, Pattern::Constant,
+                             Pattern::Cancellation, Pattern::Midpoint, Pattern::Small})
+            add(3, pattern);
+        add(6 * 8, Pattern::Random, false, true);
+        if (form != Form::Combine) add(1, Pattern::Gain);
+        if (form == Form::Combine || form == Form::CombineNorm || form == Form::AddNorm) {
+            add(129, Pattern::Random, true);
+            add(3 * 2, Pattern::Midpoint, true, true);
+        }
+        if (form == Form::CombineNorm || form == Form::AddNorm) {
+            // Each case covers both sides of one dispatch boundary, without
+            // multiplying the numerical-pattern and extent dimensions.
+            for (const auto [boundary, alias] :
+                 {std::pair{256, true}, std::pair{640, false}, std::pair{832, true}}) {
+                suite.add(std::string(name(form)) + "/h5120/boundary" + std::to_string(boundary) +
+                              (alias ? "/alias" : "/disjoint"),
+                          [=] {
+                              int failed = 0;
+                              for (int m : {boundary - 1, boundary, boundary + 1})
+                                  failed += run(form, m, Pattern::Random, alias, false,
+                                                cuda_environment().context.execution_view(), 5120);
+                              return failed;
+                          },
+                          {{"width", "5120"}, {"format", "bf16"}, {"execution", "eager"}});
+            }
+            add(1024, Pattern::Midpoint, true, true);
+        }
+        suite.add(std::string(name(form)) + "/h5120/contract",
+                  [=] { return validate(form, cuda_environment().context.execution_view(), 5120); },
+                  {{"width", "5120"}, {"format", "bf16"}});
+    }
+#endif
     for (Form form :
          {Form::ExpandNorm, Form::GroupedNorm, Form::Combine, Form::CombineNorm, Form::AddNorm}) {
         const auto add = [&](int m, Pattern pattern, bool alias, bool graph) {
-            const auto id = std::string(name(form)) + "/m" + std::to_string(m) + "/pattern" +
+            const auto id = std::string(name(form)) + "/h2560/m" + std::to_string(m) + "/pattern" +
                             std::to_string(int(pattern)) + (alias ? "/alias" : "/disjoint") +
                             (graph ? "/graph" : "/eager");
             suite.add(id,
@@ -87,7 +138,7 @@ void add_norm_cases(OpSuite& suite) {
                           return run(form, m, pattern, alias, graph,
                                      cuda_environment().context.execution_view());
                       },
-                      {{"execution", graph ? "graph" : "eager"}});
+                      {{"execution", graph ? "graph" : "eager"}, {"width", "2560"}});
         };
         for (int m : {1, 3, 8, 16, 31, 32, 33, 127, 128, 129, 512, 2048})
             add(m, Pattern::Random, false, false);
@@ -120,8 +171,9 @@ void add_norm_cases(OpSuite& suite) {
             add(2048, Pattern::Random, false, true);
             add(4096, Pattern::Random, true, false);
         }
-        suite.add(std::string(name(form)) + "/contract",
-                  [=] { return validate(form, cuda_environment().context.execution_view()); });
+        suite.add(std::string(name(form)) + "/h2560/contract",
+                  [=] { return validate(form, cuda_environment().context.execution_view()); },
+                  {{"width", "2560"}});
     }
 }
 } // namespace ninfer::test::hc

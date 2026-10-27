@@ -12,10 +12,10 @@ std::size_t mix_weight_bytes(hc::Op op) {
     return std::size_t(hc::kWidth) * hc::kStreams * (down_rows + hc::kRank) * 2;
 }
 
-std::size_t logical_bytes(hc::Op op, int columns) {
-    const auto block     = std::size_t(hc::kWidth) * columns * 2;
+std::size_t logical_bytes(hc::Op op, int columns, int width) {
+    const auto block     = std::size_t(width) * columns * 2;
     const auto residual  = block * hc::kStreams;
-    const auto weight    = std::size_t(hc::kWidth) * hc::kStreams * 2;
+    const auto weight    = std::size_t(width) * hc::kStreams * 2;
     const auto injection = std::size_t(hc::kStreams) * columns * sizeof(float);
     switch (op) {
     case hc::Op::ExpandNorm:
@@ -66,7 +66,7 @@ int main(int argc, char** argv) {
                     measurement::Row row;
                     row.op              = hc::name(options.op);
                     row.format          = "bf16";
-                    row.n               = hc::kWidth;
+                    row.n               = options.width;
                     row.k               = hc::mixes(options.op) ? hc::kRank : 0;
                     row.value_heads     = hc::kStreams;
                     row.tokens          = tokens;
@@ -76,7 +76,7 @@ int main(int argc, char** argv) {
                     auto extra          = std::string(options.in_place ? "inplace," : "disjoint,") +
                                  std::to_string(options.condition_us);
                     const int m      = hc::columns(tokens, options.batch);
-                    const auto bytes = logical_bytes(options.op, m);
+                    const auto bytes = logical_bytes(options.op, m, options.width);
                     extra += ',' + std::to_string(bytes) + ',' +
                              format_metric(bytes / (result.gpu.median_us * 1000.0), 3, "") + ',' +
                              format_metric(bytes / (kRoofline.memory_gbs * 1000.0), 3, "");

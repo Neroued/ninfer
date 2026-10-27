@@ -9,7 +9,7 @@
 namespace ninfer::ops {
 
 /**
- * Four-stream expansion and offset RMSNorm, with H=2560 and S=4:
+ * Four-stream expansion and offset RMSNorm, with S=4 and a supported residual width H:
  *   residual[d,s,m] = embedding[d,m] (exact BF16 word copy, including signed zero)
  *   normalized[d,s,m] = embedding[d,m] * (1+norm_weight[d,s])
  *                         / sqrt(sum_d embedding[d,m]^2/H + epsilon).
@@ -19,6 +19,7 @@ namespace ninfer::ops {
  * 16-byte aligned. M>0; a [T,B] block flattens as M=T*B, m=t+T*b. Epsilon is positive
  * and finite. Outputs are fully written, mutually disjoint and disjoint from inputs;
  * read-only inputs may share backing and remain unchanged.
+ * Supported widths are owned by the norm/combine implementation catalog.
  *
  * All computation entries submit to execution.stream() with a positive physical SM count and
  * support Graph capture/replay with current contents at bound addresses. Norm/combine

@@ -15,17 +15,17 @@ std::uint16_t rounded_word(double value) {
 } // namespace
 
 std::vector<double> grouped_norm(std::span<const double> input, std::span<const float> weight,
-                                 int columns, float epsilon) {
+                                 int columns, float epsilon, int width) {
     std::vector<double> out(input.size());
-    parallel_rows(columns, std::uint64_t(columns) * kStreams * kWidth, [&](int first, int last) {
+    parallel_rows(columns, std::uint64_t(columns) * kStreams * width, [&](int first, int last) {
         for (int m = first; m < last; ++m)
             for (int s = 0; s < kStreams; ++s) {
-                const auto base = (std::size_t(m) * kStreams + s) * kWidth;
+                const auto base = (std::size_t(m) * kStreams + s) * width;
                 double sum      = 0;
-                for (int d = 0; d < kWidth; ++d) sum += input[base + d] * input[base + d];
-                const double inv = 1.0 / std::sqrt(sum / kWidth + double(epsilon));
-                for (int d = 0; d < kWidth; ++d)
-                    out[base + d] = input[base + d] * inv * (1.0 + double(weight[s * kWidth + d]));
+                for (int d = 0; d < width; ++d) sum += input[base + d] * input[base + d];
+                const double inv = 1.0 / std::sqrt(sum / width + double(epsilon));
+                for (int d = 0; d < width; ++d)
+                    out[base + d] = input[base + d] * inv * (1.0 + double(weight[s * width + d]));
             }
     });
     return out;
@@ -37,12 +37,12 @@ Reference reference(const Fixture& f) {
     result.residual_words.resize(f.h.size());
     std::vector<double> represented(f.h.size());
     parallel_rows(
-        f.columns, std::uint64_t(f.columns) * kStreams * kWidth, [&](int first, int last) {
+        f.columns, std::uint64_t(f.columns) * kStreams * f.width, [&](int first, int last) {
             for (int m = first; m < last; ++m)
                 for (int s = 0; s < kStreams; ++s)
-                    for (int d = 0; d < kWidth; ++d) {
-                        const auto i = (std::size_t(m) * kStreams + s) * kWidth + d;
-                        const auto b = std::size_t(m) * kWidth + d;
+                    for (int d = 0; d < f.width; ++d) {
+                        const auto i = (std::size_t(m) * kStreams + s) * f.width + d;
+                        const auto b = std::size_t(m) * f.width + d;
                         double value = double(f.h[i]);
                         if (f.form == Form::ExpandNorm)
                             value = double(f.block[b]);
@@ -58,7 +58,7 @@ Reference reference(const Fixture& f) {
                     }
         });
     if (f.form != Form::Combine)
-        result.normalized = grouped_norm(represented, f.weight, f.columns, f.epsilon);
+        result.normalized = grouped_norm(represented, f.weight, f.columns, f.epsilon, f.width);
     return result;
 }
 } // namespace ninfer::test::hc

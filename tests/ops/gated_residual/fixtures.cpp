@@ -18,15 +18,15 @@ const char* name(Form form) {
     throw std::logic_error("invalid HC form");
 }
 
-Fixture::Fixture(Form f, int m, bool alias)
-    : form(f), columns(m), in_place(alias), h(std::size_t(kWidth) * kStreams * m),
-      block(std::size_t(kWidth) * m), weight(kWidth * kStreams), injection(kStreams * m),
+Fixture::Fixture(Form f, int m, bool alias, int w)
+    : form(f), columns(m), in_place(alias), width(w), h(std::size_t(width) * kStreams * m),
+      block(std::size_t(width) * m), weight(width * kStreams), injection(kStreams * m),
       dh(h.size() * 2), db(block.size() * 2), dw(weight.size() * 2), dj(injection.size() * 4),
-      dr(h.size() * 2), dz(h.size() * 2), th(dh.span(), DType::BF16, {kWidth, kStreams, m}),
-      tb(db.span(), DType::BF16, {kWidth, m}), tw(dw.span(), DType::BF16, {kWidth, kStreams}),
+      dr(h.size() * 2), dz(h.size() * 2), th(dh.span(), DType::BF16, {width, kStreams, m}),
+      tb(db.span(), DType::BF16, {width, m}), tw(dw.span(), DType::BF16, {width, kStreams}),
       tj(dj.span(), DType::FP32, {kStreams, m}),
-      tr(alias ? dh.span() : dr.span(), DType::BF16, {kWidth, kStreams, m}),
-      tz(dz.span(), DType::BF16, {kWidth, kStreams, m}) {}
+      tr(alias ? dh.span() : dr.span(), DType::BF16, {width, kStreams, m}),
+      tz(dz.span(), DType::BF16, {width, kStreams, m}) {}
 
 void Fixture::set(Pattern pattern, int phase) {
     epsilon = kEpsilon;
@@ -37,13 +37,13 @@ void Fixture::set(Pattern pattern, int phase) {
     for (int m = 0; m < columns; ++m)
         for (int s = 0; s < kStreams; ++s) {
             const float scale = std::ldexp(1.0F, s - 1);
-            const auto base   = (std::size_t(m) * kStreams + s) * kWidth;
-            for (int d = 0; d < kWidth; ++d) h[base + d] *= scale;
+            const auto base   = (std::size_t(m) * kStreams + s) * width;
+            for (int d = 0; d < width; ++d) h[base + d] *= scale;
         }
     if (pattern == Pattern::Affine) {
         for (int s = 0; s < kStreams; ++s)
-            for (int d = 0; d < kWidth; ++d)
-                weight[s * kWidth + d] = d % 3 == 0 ? -1.0F : (d % 3 == 1 ? -1.5F : 0.0F);
+            for (int d = 0; d < width; ++d)
+                weight[s * width + d] = d % 3 == 0 ? -1.0F : (d % 3 == 1 ? -1.5F : 0.0F);
         for (std::size_t i = 0; i < injection.size(); ++i) injection[i] = float((i + phase) % 3);
     } else if (pattern == Pattern::Zero) {
         std::fill(h.begin(), h.end(), 0.0F);
@@ -57,20 +57,27 @@ void Fixture::set(Pattern pattern, int phase) {
     } else if (pattern == Pattern::Cancellation) {
         for (int m = 0; m < columns; ++m)
             for (int s = 0; s < kStreams; ++s)
-                for (int d = 0; d < kWidth; ++d) {
-                    const float value                               = float((d % 17) - 8) / 8.0F;
-                    block[std::size_t(m) * kWidth + d]              = value;
-                    h[(std::size_t(m) * kStreams + s) * kWidth + d] = -value;
+                for (int d = 0; d < width; ++d) {
+                    const float value                              = float((d % 17) - 8) / 8.0F;
+                    block[std::size_t(m) * width + d]              = value;
+                    h[(std::size_t(m) * kStreams + s) * width + d] = -value;
                     injection[m * kStreams + s] = s == 0 ? 1.0F : 1.0F + float(s) / 16.0F;
                 }
     } else if (pattern == Pattern::Midpoint) {
         std::fill(h.begin(), h.end(), 1.0F);
         for (std::size_t i = 0; i < block.size(); ++i)
-            block[i] = i % 4 == 0 ? 1.0F : (i % 4 == 1 ? -1.0F : 0.5F);
+            block[i] = (i % 4 == 0 ? 1.0F : (i % 4 == 1 ? -1.0F : 0.5F)) /
+                       (form == Form::AddNorm ? 256.0F : 1.0F);
         for (std::size_t i = 0; i < injection.size(); ++i)
             injection[i] = (i + phase) % 3 == 2
                                ? 1.0F / 256.0F
                                : std::nextafter(1.0F / 256.0F, (i + phase) % 3 ? 0.0F : 1.0F);
+    } else if (pattern == Pattern::Gain) {
+        std::fill(h.begin(), h.end(), 1.0F);
+        std::fill(block.begin(), block.end(), form == Form::ExpandNorm ? 1.0F : 0.0F);
+        std::fill(weight.begin(), weight.end(), 3.0F / 256.0F);
+        std::fill(injection.begin(), injection.end(), 0.0F);
+        epsilon = 1.0e-3F;
     } else if (pattern == Pattern::Small) {
         for (auto& value : h) value *= 1.0e-4F;
         for (auto& value : block) value *= 1.0e-4F;

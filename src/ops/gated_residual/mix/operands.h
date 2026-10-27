@@ -4,6 +4,8 @@
 #include "ops/gated_residual/operands.h"
 
 namespace ninfer::ops::detail::hc::mix {
+inline constexpr int kWidth = 2560, kRank = 320;
+inline constexpr int kResidualWidth = kWidth * kStreams;
 enum class Kind { Block, Final };
 
 constexpr int down_rows(Kind kind) { return kRank + (kind == Kind::Block ? kStreams : 0); }

@@ -55,6 +55,7 @@ struct Options {
     Op op = Op::CombineNorm;
     std::vector<int> tokens{1};
     int batch        = 1;
+    int width        = kWidth;
     bool in_place    = false;
     int condition_us = 200;
 };
@@ -68,7 +69,7 @@ inline int columns(int tokens, int batch) {
 
 inline Options parse(int argc, char** argv) {
     Options o;
-    bool have_tokens = false, have_sweep = false;
+    bool have_tokens = false, have_sweep = false, have_width = false;
     for (int i = 1; i < argc; ++i) {
         const std::string_view flag = argv[i];
         if (flag == "--help" || flag == "-h") {
@@ -76,9 +77,11 @@ inline Options parse(int argc, char** argv) {
                 << "HC gated residual Op benchmark\n"
                    "  --op expand-norm|grouped-rmsnorm|combine|combine-norm|add-norm\n"
                    "       |combine-then-norm|add-then-norm|block-mix|final-mix\n"
-                   "  --alias disjoint|inplace --batch B --condition-us N\n"
+                   "  --alias disjoint|inplace --batch B --width H --condition-us N\n"
                    "  --tokens T[,T...] or --sweep START:END[:STEP]\n"
-                   "H=2560, streams=4, M=tokens*batch. Staged comparisons time both public Ops.\n"
+                   "Norm/combine width defaults to 2560; streams=4, M=tokens*batch.\n"
+                   "Mix uses its native fixed fixture; --width applies to norm/combine only.\n"
+                   "Staged comparisons time both public Ops.\n"
                    "GPU activity prelude: 200 us by default; 0 disables it. Outside Op timing.\n"
                    "In-place input restoration precedes timing and cold-cache eviction.\n";
             measurement::help();
@@ -99,6 +102,9 @@ inline Options parse(int argc, char** argv) {
             if (value != "disjoint" && value != "inplace")
                 throw std::invalid_argument("alias: disjoint|inplace");
             o.in_place = value == "inplace";
+        } else if (flag == "--width") {
+            o.width    = measurement::integer(value);
+            have_width = true;
         } else if (flag == "--batch")
             o.batch = measurement::integer(value);
         else if (flag == "--condition-us")
@@ -114,6 +120,8 @@ inline Options parse(int argc, char** argv) {
     }
     if (have_tokens && have_sweep)
         throw std::invalid_argument("tokens and sweep are mutually exclusive");
+    if (have_width && mixes(o.op))
+        throw std::invalid_argument("--width applies to the norm/combine benchmark fixture");
     if (o.in_place && !combines(o.op))
         throw std::invalid_argument("this Op has no in-place residual form");
     for (int t : o.tokens) (void)columns(t, o.batch);

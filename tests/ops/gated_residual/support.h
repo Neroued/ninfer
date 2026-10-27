@@ -10,11 +10,11 @@ namespace ninfer::test::hc {
 inline constexpr int kWidth = 2560, kStreams = 4;
 inline constexpr float kEpsilon = 1.0e-6F;
 enum class Form { ExpandNorm, GroupedNorm, Combine, CombineNorm, AddNorm };
-enum class Pattern { Random, Affine, Zero, Constant, Cancellation, Midpoint, Small };
+enum class Pattern { Random, Affine, Zero, Constant, Cancellation, Midpoint, Small, Gain };
 const char* name(Form form);
 
 struct Fixture {
-    Fixture(Form form, int columns, bool in_place);
+    Fixture(Form form, int columns, bool in_place, int width = kWidth);
     void set(Pattern pattern, int phase = 0);
     void upload(cudaStream_t stream);
     void invoke(CudaExecutionView execution);
@@ -23,6 +23,7 @@ struct Fixture {
     Form form;
     int columns;
     bool in_place;
+    int width;
     float epsilon = kEpsilon;
     std::vector<float> h, block, weight, injection;
     GuardedDeviceBuffer dh, db, dw, dj, dr, dz;
@@ -50,9 +51,9 @@ struct Reference {
 
 Reference reference(const Fixture& fixture);
 std::vector<double> grouped_norm(std::span<const double> input, std::span<const float> weight,
-                                 int columns, float epsilon);
+                                 int columns, float epsilon, int width = kWidth);
 int verify(const Fixture& fixture, const std::string& label, bool exact_residual);
 void add_norm_cases(OpSuite& suite);
 void add_mix_cases(OpSuite& suite);
-int validate(Form form, CudaExecutionView execution);
+int validate(Form form, CudaExecutionView execution, int width = kWidth);
 } // namespace ninfer::test::hc

@@ -554,9 +554,10 @@ cmake --build build/rtx5090-dev -j --target ninfer_gdn_control_bench
 ## HC gated residual Op benchmark
 
 `ninfer_gated_residual_bench` measures the five public HC residual forms with
-`--op expand-norm|grouped-rmsnorm|combine|combine-norm|add-norm`. Geometry is fixed at H=2560
-and four streams. Input/output residual and normalized tensors are BF16 `[2560,4,M]`,
-embedding/block tensors are BF16 `[2560,M]`, and activated injection is FP32 `[4,M]`.
+`--op expand-norm|grouped-rmsnorm|combine|combine-norm|add-norm`. `--width H` selects the
+norm/combine width (default 2560); the Op owns supported geometry admission. There are four streams.
+Input/output residual and normalized tensors are BF16 `[H,4,M]`,
+embedding/block tensors are BF16 `[H,M]`, and activated injection is FP32 `[4,M]`.
 `add-norm` selects the unit-weight overload without an injection operand.
 
 `block-mix` and `final-mix` measure the complete public `hc_mix` overloads, including both BF16

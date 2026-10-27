@@ -30,14 +30,16 @@ __launch_bounds__((Queries < 4 ? 4 : Queries) * 32,
     const int per_batch = (a.width + Queries - 1) / Queries;
     const int groups = per_batch * a.batch, group = blockIdx.x % groups;
     const int b = group / per_batch, first = group % per_batch * Queries;
-    const int live_end = min(min(a.width, a.valid[b] - a.begin), first + Queries);
-    const int visible  = live_end > first ? a.end(b * a.width + live_end - 1) / 4 : 0;
-    const int start    = blockIdx.x / groups * Keys;
+    // Bound positions directly by the resolved request and this CTA's query group.
+    const int live_end        = min(min(a.width, a.valid[b] - a.begin), first + Queries);
+    const auto request_column = std::int64_t(b) * a.tokens + a.begin;
+    const int visible = live_end > first ? (a.positions[request_column + live_end - 1] + 1) / 4 : 0;
+    const int start   = blockIdx.x / groups * Keys;
     if (visible <= kIndexSelected || start >= visible) return;
     const int step = gridDim.x / groups * Keys;
-    const int t = first + warp / KeyGroups, slot = b * a.width + t;
-    const int limit   = t < a.width ? a.end(slot) / 4 : 0;
-    const auto column = a.column(slot);
+    const int t = first + (Queries == 1 ? 0 : warp / KeyGroups), slot = b * a.width + t;
+    const auto column = request_column + t;
+    const int limit   = Queries == 1 ? visible : t < live_end ? (a.positions[column] + 1) / 4 : 0;
     // MMA rows are pools and columns are heads. Four adjacent lanes reduce the 32 heads.
     unsigned qf[4][8][2];
     float weight[4][2];
@@ -74,22 +76,30 @@ __launch_bounds__((Queries < 4 ? 4 : Queries) * 32,
                 offsets[p] = 0;
         }
     };
-    const auto stage = [&](int g0, int buffer) {
-        auto* dst = pipe + buffer * Keys * 128;
+    // Each copy covers eight pooled rows at 128 threads. Their XOR row phase repeats,
+    // and enumerating chunks makes the prefetched page index a compile-time constant.
+    constexpr int CopiesPerPage = 256 / Threads;
+    static_assert(Threads % 128 == 0 && 256 % Threads == 0);
+    const int copy_row      = tid / 16;
+    auto* copy_destination  = pipe + copy_row * 128 + ((tid % 16 * 8) ^ ((copy_row & 7) << 3));
+    const auto* copy_source = reinterpret_cast<const char*>(a.keys) + tid * 16;
+    const auto stage        = [&](int g0, int buffer) {
+        auto* dst = copy_destination + buffer * Keys * 128;
 #pragma unroll
-        for (int i = tid; i < Keys * 16; i += Threads) {
-            const int g = i / 16, d = i % 16 * 8;
-            auto* out = dst + g * 128 + (d ^ ((g & 7) << 3));
-            if (g0 + g < visible) {
-                const auto* in = reinterpret_cast<const __nv_bfloat16*>(
-                                     reinterpret_cast<const char*>(a.keys) + offsets[g / 16]) +
-                                 (g % 16) * 128 + d;
-                common::cp_async_cache_hint<Cache::cg>(out, in, 16, policy);
-            } else
-                common::store_vec(out, make_int4(0, 0, 0, 0));
+        for (int chunk = 0; chunk < Keys * 16 / Threads; ++chunk) {
+            const auto* in = copy_source + offsets[chunk / CopiesPerPage] +
+                             (chunk % CopiesPerPage) * Threads * 16;
+            const int row = copy_row + chunk * (Threads / 16);
+            common::cp_async_cache_hint<Cache::cg>(dst + chunk * Threads * 8, in,
+                                                   g0 + row < visible ? 16 : 0, policy);
         }
         common::cp_commit();
     };
+    // Only the buffer and K-step offsets change while retaining these lane fragments.
+    const unsigned key_lane_base =
+        common::smem_addr(pipe) +
+        (warp % KeyGroups * WarpKeys + (lane & 15)) * 128 * sizeof(__nv_bfloat16);
+    const unsigned key_column_xor = ((lane >> 4) ^ (lane & 7)) << 4;
     addresses(start);
     if constexpr (Stages == 2) {
         stage(start, 0);
@@ -103,18 +113,15 @@ __launch_bounds__((Queries < 4 ? 4 : Queries) * 32,
         if constexpr (Stages == 2)
             if (g0 + step < visible) stage(g0 + step, 1 - buffer);
         addresses(g0 + Stages * step);
-        const auto* keys = pipe + buffer * Keys * 128;
         float acc[MT][4][4]{};
 #pragma unroll
         for (int k = 0; k < 8; ++k) {
 #pragma unroll
             for (int m = 0; m < MT; ++m) {
                 unsigned af[4];
-                const int row =
-                    warp % KeyGroups * WarpKeys + m * 16 + (lane & 7) + ((lane >> 3) & 1) * 8;
-                const int d = k * 16 + (lane >> 4) * 8;
                 common::ldmatrix_x4(af[0], af[1], af[2], af[3],
-                                    common::smem_addr(keys + row * 128 + (d ^ ((row & 7) << 3))));
+                                    key_lane_base + (buffer * Keys + m * 16) * 256 +
+                                        ((k * 32) ^ key_column_xor));
 #pragma unroll
                 for (int n = 0; n < 4; ++n)
                     common::mma_bf16(acc[m][n][0], acc[m][n][1], acc[m][n][2], acc[m][n][3], af[0],

@@ -83,6 +83,7 @@ finalize_sequence_plan_impl(std::unique_ptr<qwen3_5::detail::SequencePlannerImpl
 
 [[nodiscard]] std::unique_ptr<SequencePlanImpl>
 make_graph_probe_plan(std::shared_ptr<const execution::ModelProfile>, DeviceContext&,
-                      const EngineOptions&, std::shared_ptr<const moe::Plan>);
+                      const EngineOptions&, std::shared_ptr<const moe::Plan>,
+                      GraphProbeBacking = GraphProbeBacking::Inputs);
 
 } // namespace ninfer::models::qwen3_5::detail

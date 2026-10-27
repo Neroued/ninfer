@@ -2,8 +2,6 @@
 #include "models/qwen4_exp/program/internal.h"
 #include "core/startup.h"
 
-#include <algorithm>
-
 namespace ninfer::models::qwen4_exp {
 
 GraphPreparationPlan describe_graph_preparation(const EngineOptions& options,
@@ -39,17 +37,22 @@ GraphCalibration calibrate_graphs(const execution::Parameters& parameters, Devic
     auto plan = plan_graph_probe(
         parameters.profile,
         std::get<std::shared_ptr<const ple::disk::Table>>(parameters.model.ple_table())->geometry(),
-        options, device, std::move(moe));
-    auto probe = std::make_unique<detail::RankProgramImpl>(parameters, std::move(plan), device);
-    const auto before = device_memory_snapshot(device.device());
-    probe->initialize_graphs();
-    const auto ready = device_memory_snapshot(device.device());
-    probe->release_graphs();
-    const auto released                = device_memory_snapshot(device.device());
-    result.preparation_increment_bytes = device_memory_growth(before, ready);
-    result.retained_increment_bytes    = device_memory_growth(before, released);
-    result.rebuild_bytes =
-        static_cast<std::size_t>(std::max<std::int64_t>(0, device_memory_growth(released, ready)));
+        options, device, moe);
+    auto probe    = std::make_unique<detail::RankProgramImpl>(parameters, std::move(plan), device);
+    result.memory = begin_graph_calibration(
+        device, [&](GraphPreparationMode mode) { return probe->initialize_graphs(mode); },
+        [&] { probe->release_graphs(); });
+    probe.reset();
+    device.synchronize();
+    plan = plan_graph_probe(
+        parameters.profile,
+        std::get<std::shared_ptr<const ple::disk::Table>>(parameters.model.ple_table())->geometry(),
+        options, device, moe, GraphProbeBacking::StartupWorkingSet);
+    probe = std::make_unique<detail::RankProgramImpl>(parameters, std::move(plan), device);
+    complete_graph_calibration(
+        result.memory, device,
+        [&](GraphPreparationMode mode) { return probe->initialize_graphs(mode); },
+        [&] { probe->release_graphs(); });
     probe.reset();
     device.synchronize();
     phase.complete();

@@ -300,6 +300,7 @@ WorkerConnection::WorkerConnection(WorkerBootstrap bootstrap)
             throw std::runtime_error("installed topology changed worker placement");
         bootstrap_.identity = rank;
         device_             = std::make_unique<DeviceContext>(rank.device);
+        memory_origin_      = device_memory_snapshot(device_->device());
         communication_ =
             std::make_unique<CommunicationContext>(*device_, transport_->failure_signal());
         send(wire::Kind::Prepared);

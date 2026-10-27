@@ -33,8 +33,8 @@ std::optional<CalibratedPlan<typename Setup::ExecutionPlan>>
 calibrate_plan(const Setup& setup, RankModelInstance<typename Setup::Types>& instance,
                DeviceContext& device, const EngineOptions& options,
                const StartupMemoryBudget& budget, typename Setup::ExecutionPlan candidate,
-               std::vector<typename Setup::Calibration>& measured, std::size_t minimum_rebuild = 0,
-               std::size_t control_rebuild = 0) {
+               std::vector<typename Setup::Calibration>& measured,
+               std::size_t maximum_runtime = SIZE_MAX) {
     for (;;) {
         auto probe_options          = options;
         probe_options.prefill_chunk = candidate.chunk;
@@ -46,29 +46,23 @@ calibrate_plan(const Setup& setup, RankModelInstance<typename Setup::Types>& ins
                 setup.calibrate(instance.parameters, device, probe_options, candidate.preparation));
             found = std::prev(measured.end());
         }
-        const auto graph_bytes = std::max(found->rebuild_bytes, minimum_rebuild);
-        const GraphMemorySummary graph{
-            .rebuild_estimate_bytes      = graph_bytes,
-            .calibration_increment_bytes = found->preparation_increment_bytes,
-            .calibration_retained_bytes  = found->retained_increment_bytes,
-        };
+        const auto graph          = found->memory;
+        const auto graph_bytes    = graph.rebuild_estimate_bytes;
         const auto snapshot       = device_memory_snapshot(device.device());
         auto available            = budget.available(snapshot);
         const auto available_host = budget.available_host(snapshot);
-        if (control_rebuild > available) return std::nullopt;
-        available -= control_rebuild;
         if (graph_bytes > available) return std::nullopt;
-        auto next = setup.plan(device, options, candidate.placement, available - graph_bytes,
-                               available_host);
+        const auto offered = std::min(available - graph_bytes, maximum_runtime);
+        auto next = setup.plan(device, options, candidate.placement, offered, available_host);
         if (!next) return std::nullopt;
         const auto next_key = setup.graph_plan(probe_options, next->preparation);
         if (next_key == key) return CalibratedPlan{std::move(*next), graph};
         const bool revisited = std::any_of(measured.begin(), measured.end(),
                                            [&](const auto& item) { return item.plan == next_key; });
-        if (revisited && candidate.sequence.device_reservation_bytes() <= available - graph_bytes) {
+        if (revisited && candidate.sequence.device_reservation_bytes() <= offered) {
             // At a variant boundary choose the feasible measured side, then fill that interval.
             auto low  = candidate.sequence.device_reservation_bytes();
-            auto high = available - graph_bytes;
+            auto high = offered;
             while (low < high) {
                 const auto middle = low + (high - low + 1) / 2;
                 auto trial =
@@ -93,6 +87,7 @@ prepare_program(const Setup& setup, RankModelInstance<typename Setup::Types>& in
                 const StartupMemoryBudget& budget,
                 CalibratedPlan<typename Setup::ExecutionPlan> plan,
                 std::vector<typename Setup::Calibration>& measured) {
+    StartupPhaseScope phase(options.startup_observer, StartupPhase::ProgramInitialize);
     for (unsigned attempts = 0; attempts < 2; ++attempts) {
         auto& startup             = plan.startup;
         const auto explicit_bytes = startup.sequence.device_reservation_bytes();
@@ -104,10 +99,10 @@ prepare_program(const Setup& setup, RankModelInstance<typename Setup::Types>& in
             throw std::logic_error("resolved capacity differs from the finalized Program plan");
         std::optional<DeviceMemorySnapshot> ready;
         try {
-            StartupPhaseScope phase(options.startup_observer, StartupPhase::ProgramInitialize);
             auto control_plan = plan_session(startup.sequence);
             instance.program = create_rank_program(instance.parameters, std::move(startup.sequence),
-                                                   device, options.startup_observer);
+                                                   device, options.startup_observer,
+                                                   models::GraphPreparationMode::Capture);
             prepared_session.emplace(prepare_session(setup.definition(), std::move(control_plan)));
             device.synchronize();
             ready = device_memory_snapshot(device.device());
@@ -122,47 +117,43 @@ prepare_program(const Setup& setup, RankModelInstance<typename Setup::Types>& in
                 if (memory.cuda_graph) {
                     plan.graph.preparation_increment_bytes =
                         memory.cuda_graph->preparation_increment_bytes;
-                    memory.cuda_graph = plan.graph;
+                    plan.graph.preparation_peak_bytes = memory.cuda_graph->preparation_peak_bytes;
+                    memory.cuda_graph                 = plan.graph;
                 }
                 phase.complete();
                 return plan;
             }
         } catch (const DeviceAllocationError&) {
-            // A failed preparation invalidates its observation; the next probe measures it again.
-            auto probe_options          = options;
-            probe_options.prefill_chunk = startup.chunk;
-            const auto key              = setup.graph_plan(probe_options, startup.preparation);
-            std::erase_if(measured, [&](const auto& entry) { return entry.plan == key; });
+            prepared_session.reset();
+            instance.program.reset();
+            device.synchronize();
+            throw;
         }
+        auto reserve = plan.graph.rebuild_estimate_bytes;
+        if (const auto graph = instance.program->graph_memory_observation())
+            reserve = std::max(reserve, graph->preparation_peak_bytes);
+        auto probe_options          = options;
+        probe_options.prefill_chunk = startup.chunk;
+        const auto key              = setup.graph_plan(probe_options, startup.preparation);
+        for (auto& measured_plan : measured)
+            if (measured_plan.plan == key) measured_plan.memory.rebuild_estimate_bytes = reserve;
+        const auto explicit_cost =
+            explicit_bytes +
+            (ready->shared_physical_memory ? startup.capacity.control_reservation_bytes : 0);
+        const auto maximum_runtime = budget.corrected_runtime_limit(*ready, explicit_cost);
         prepared_session.reset();
-        const auto after_control_cleanup = device_memory_snapshot(device.device());
         instance.program.reset();
         device.synchronize();
         if (attempts == 1) return std::nullopt;
         const auto after_cleanup = device_memory_snapshot(device.device());
         const auto available     = budget.available(after_cleanup);
-        const auto recovered = ready ? device_memory_growth(after_cleanup, after_control_cleanup) -
-                                           static_cast<std::int64_t>(explicit_bytes)
-                                     : 0;
-        const auto control_rebuild =
-            ready
-                ? static_cast<std::size_t>(std::max<std::int64_t>(
-                      0,
-                      device_memory_growth(after_control_cleanup, *ready) -
-                          static_cast<std::int64_t>(after_cleanup.shared_physical_memory
-                                                        ? startup.capacity.control_reservation_bytes
-                                                        : 0)))
-                : 0;
-        const auto reserve =
-            std::max(plan.graph.rebuild_estimate_bytes,
-                     static_cast<std::size_t>(std::max<std::int64_t>(0, recovered)));
-        if (reserve > available || control_rebuild > available - reserve) return std::nullopt;
-        auto candidate =
-            setup.plan(device, options, startup.placement, available - reserve - control_rebuild,
-                       budget.available_host(after_cleanup));
+        if (reserve > available) return std::nullopt;
+        auto candidate = setup.plan(device, options, startup.placement,
+                                    std::min(available - reserve, maximum_runtime),
+                                    budget.available_host(after_cleanup));
         if (!candidate) return std::nullopt;
         auto corrected = calibrate_plan(setup, instance, device, options, budget,
-                                        std::move(*candidate), measured, reserve, control_rebuild);
+                                        std::move(*candidate), measured, maximum_runtime);
         if (!corrected) return std::nullopt;
         plan = std::move(*corrected);
     }

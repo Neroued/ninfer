@@ -18,7 +18,7 @@ class Graphs {
 public:
     explicit Graphs(RankProgramImpl& owner) : owner_(owner) {}
 
-    void prepare(GraphInputs&);
+    void prepare(GraphInputs&, GraphPreparation&);
     void replay(const execution::BatchView&, std::span<const std::uint32_t> draft_bounds, bool head,
                 bool read_drafts);
     void decide(int rows, bool verify);

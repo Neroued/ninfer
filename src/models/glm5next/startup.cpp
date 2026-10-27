@@ -56,9 +56,18 @@ runtime::RankPreparationReport RankPreparation::report(std::size_t available) co
 
 void RankPreparation::prepare_probe() {
     if (!plan_.use_cuda_graph) return;
+    create_probe(detail::graph_context_bytes(plan_));
+}
+
+void RankPreparation::prepare_rebuild_probe() {
+    if (!plan_.use_cuda_graph) return;
+    create_probe(capacity_.minimum_capacity().device_bytes);
+}
+
+void RankPreparation::create_probe(std::size_t context_bytes) {
     auto plan                               = plan_;
     plan.capacity                           = {};
-    plan.capacity.device_bytes              = detail::graph_context_bytes(plan);
+    plan.capacity.device_bytes              = context_bytes;
     plan.capacity.runtime_reservation_bytes = plan.reservation_bytes();
     auto resources                          = std::make_unique<Resources>(std::move(plan), device_);
     probe_ = std::make_unique<RankProgram>(instance_->parameters, std::move(resources), device_,
@@ -67,20 +76,26 @@ void RankPreparation::prepare_probe() {
 
 void RankPreparation::calibrate() {
     if (!probe_) return;
-    const auto before = device_memory_snapshot(device_.device());
-    probe_->prepare_execution();
-    const auto ready = device_memory_snapshot(device_.device());
-    probe_->release_execution();
-    const auto released                       = device_memory_snapshot(device_.device());
-    graph_memory_.calibration_increment_bytes = device_memory_growth(before, ready);
-    graph_memory_.calibration_retained_bytes  = device_memory_growth(before, released);
-    graph_memory_.rebuild_estimate_bytes =
-        std::max<std::int64_t>(0, device_memory_growth(released, ready));
+    graph_memory_ = begin_graph_calibration(
+        device_, [&](GraphPreparationMode mode) { return probe_->prepare_execution(mode); },
+        [&] { probe_->release_execution(); });
     probe_.reset();
     device_.synchronize();
 }
 
-void RankPreparation::prepare_execution() { instance_->program->prepare_execution(); }
+void RankPreparation::calibrate_rebuild() {
+    if (!probe_) return;
+    complete_graph_calibration(
+        graph_memory_, device_,
+        [&](GraphPreparationMode mode) { return probe_->prepare_execution(mode); },
+        [&] { probe_->release_execution(); });
+    probe_.reset();
+    device_.synchronize();
+}
+
+void RankPreparation::prepare_execution() {
+    instance_->program->prepare_execution(GraphPreparationMode::Capture);
+}
 
 void RankPreparation::prepare(runtime::ContextCapacity capacity, std::size_t available,
                               std::size_t available_host) {
@@ -107,6 +122,9 @@ void RankPreparation::prepare(runtime::ContextCapacity capacity, std::size_t ava
 void RankPreparation::release_resources() {
     if (instance_ && instance_->program) {
         instance_->program->drain();
+        if (const auto graph = instance_->program->resource_budget().graphs)
+            graph_memory_.rebuild_estimate_bytes =
+                std::max(graph_memory_.rebuild_estimate_bytes, graph->preparation_peak_bytes);
         instance_->program.reset();
     }
 }
@@ -135,8 +153,10 @@ RankResourceDescription RankPreparation::describe() const {
     if (plan_.use_cuda_graph) {
         auto observed     = instance_->program->resource_budget().graphs;
         out.budget.graphs = graph_memory_;
-        if (observed)
+        if (observed) {
             out.budget.graphs->preparation_increment_bytes = observed->preparation_increment_bytes;
+            out.budget.graphs->preparation_peak_bytes      = observed->preparation_peak_bytes;
+        }
     }
     out.caches.push_back(p.main.cache.page.geometry);
     if (p.mtp) out.caches.push_back(p.mtp->cache.page.geometry);

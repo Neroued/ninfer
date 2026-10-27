@@ -12,9 +12,12 @@ namespace ninfer::distributed {
 using RankId  = std::uint32_t;
 using GroupId = std::uint32_t;
 
+enum class GroupUsage : std::uint8_t { General, PeerExchange };
+
 struct GroupDescription {
     GroupId id = 0;
     std::vector<RankId> members;
+    GroupUsage usage = GroupUsage::General;
 
     [[nodiscard]] std::uint32_t index(RankId rank) const;
 };

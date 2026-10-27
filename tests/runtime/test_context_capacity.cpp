@@ -133,6 +133,11 @@ int main() {
                       "negative memory growth wrapped to a large unsigned estimate");
     failures += check(budget.fits({2100, 12000}) && !budget.fits({1900, 12000}),
                       "actual startup footprint did not obey the Device budget");
+    failures +=
+        check(budget.shortfall({1900, 12000}) == 100 && budget.shortfall({2100, 12000}) == 0,
+              "startup correction did not measure the forward budget shortfall");
+    failures += check(budget.corrected_runtime_limit({1900, 12000}, 2000) == 1900,
+                      "runtime correction did not reclaim the observed Device deficit");
     const ninfer::runtime::StartupMemoryBudget physical({3000, 12000}, 8000, 500, 0);
     failures += check(physical.available({2000, 12000}) == 1500,
                       "physical availability did not bound the configured budget");
@@ -145,12 +150,24 @@ int main() {
                       "shared Host payload capacity was not reserved");
     failures += check(shared.fits(unified(3000)) && !shared.fits(unified(2999)),
                       "startup consumed the shared Host payload reservation");
+    failures += check(shared.shortfall(unified(2999)) == 1,
+                      "shared Host reservation was counted twice in the shortfall");
+    failures += check(shared.corrected_runtime_limit(unified(2999), 2000) == 1999,
+                      "shared physical shortage cannot reclaim runtime capacity");
     const DeviceMemorySnapshot discrete_start{10000, 12000, 5000, 6000, false};
     const StartupMemoryBudget host_media(discrete_start, 8000, 500, 1000);
     failures += check(host_media.available({7800, 12000, 5000, 6000, false}) == 5300 &&
                           host_media.available_host(discrete_start) == 4000 &&
                           !host_media.fits({7800, 12000, 999, 6000, false}),
                       "discrete Host reservation was charged to VRAM or not protected in RAM");
+    failures += check(host_media.shortfall({7800, 12000, 900, 6000, false}) == 100,
+                      "Host-only shortage was omitted from startup correction");
+    bool host_correction_rejected = false;
+    try {
+        (void)host_media.corrected_runtime_limit({7800, 12000, 900, 6000, false}, 2000);
+    } catch (const std::runtime_error&) { host_correction_rejected = true; }
+    failures += check(host_correction_rejected,
+                      "separate Host shortage was treated as reclaimable Device capacity");
 
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;

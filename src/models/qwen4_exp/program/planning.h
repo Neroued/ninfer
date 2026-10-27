@@ -8,6 +8,7 @@
 #include "models/qwen4_exp/ple/disk/prepare.h"
 #include "models/qwen4_exp/ple/upload.h"
 #include "runtime/engine/context_capacity.h"
+#include "models/common/graph_preparation.h"
 #include "models/common/moe/schedule.h"
 
 namespace ninfer::models::qwen4_exp {
@@ -70,7 +71,8 @@ plan_execution(std::shared_ptr<const execution::ModelProfile>, ple::disk::TableG
 
 [[nodiscard]] ExecutionPlan plan_graph_probe(std::shared_ptr<const execution::ModelProfile>,
                                              ple::disk::TableGeometry, const EngineOptions&,
-                                             DeviceContext&, std::shared_ptr<const moe::Plan>);
+                                             DeviceContext&, std::shared_ptr<const moe::Plan>,
+                                             GraphProbeBacking = GraphProbeBacking::Inputs);
 
 [[nodiscard]] runtime::ContextCapacityPlan
 describe_execution_capacity(std::shared_ptr<const execution::ModelProfile>, const EngineOptions&,

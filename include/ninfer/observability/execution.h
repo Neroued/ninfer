@@ -97,9 +97,16 @@ struct CommunicationWork {
     }
 };
 
+// NCCL's tracked GPU allocations; Host buffers and driver storage are not included.
+struct CommunicationMemory {
+    std::uint64_t tracked_device_bytes = 0, persistent_device_bytes = 0;
+    std::uint64_t suspendable_device_bytes = 0;
+};
+
 struct CommunicationStatistics {
     std::uint32_t group = 0, size = 1;
     CommunicationWork eager, graph;
+    std::optional<CommunicationMemory> startup_memory;
 };
 
 // Fixed-size completion facts. Host counters are cumulative on the rank's execution thread;

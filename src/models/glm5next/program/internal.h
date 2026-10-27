@@ -69,7 +69,7 @@ public:
     void collect_vision_timing();
     void retire_vision(runtime::ResidencyId) noexcept;
     void forward();
-    void prepare_graphs();
+    GraphPreparationSample prepare_graphs(GraphPreparationMode);
     void release_graphs();
     void execute_round(const execution::BatchView&, std::span<const std::uint32_t> draft_bounds,
                        bool head, bool read_drafts, const execution::MlaSubmit& = {},

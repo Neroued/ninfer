@@ -22,6 +22,19 @@ struct PeerTransfer {
     MemorySpan receive;
 };
 
+struct CollectivePreparation {
+    Collective operation;
+    DType dtype;
+    std::size_t count;
+    Reduction reduction = Reduction::Sum;
+    std::uint32_t root  = 0;
+};
+
+struct PeerPreparation {
+    std::uint32_t peer;
+    std::size_t bytes;
+};
+
 class CommunicationContext;
 
 // Borrowed by model execution and Graphs; its context outlives all operations and buffers.
@@ -35,6 +48,10 @@ public:
     [[nodiscard]] std::uint32_t size() const noexcept;
     [[nodiscard]] Device device() const noexcept;
     [[nodiscard]] CommunicationStatistics statistics() const noexcept;
+    // Startup-only preparation. Members provide matching ordered operations; peer exchanges
+    // prepare both directions. Temporary buffers are owned until communication completes.
+    void prepare(std::span<const CollectivePreparation>, std::span<const PeerPreparation>,
+                 CudaExecutionView) const;
     void record_graph(CommunicationWork&, const std::function<void()>&) const;
     void replayed(const CommunicationWork&) const noexcept;
     // All mutually dependent sends/receives are enqueued together, in caller order.
@@ -66,6 +83,7 @@ public:
     void close(std::chrono::steady_clock::time_point deadline);
     [[nodiscard]] int version() const;
     [[nodiscard]] std::vector<CommunicationStatistics> statistics() const;
+    void sample_startup_memory();
     void reset_statistics();
     void observe_totals(CommunicationWork& eager, CommunicationWork& graph) const noexcept;
 private:

@@ -55,29 +55,27 @@ build_prepared_local_model(const artifact::Reader& reader, EngineOptions& option
         StartupPhaseScope phase(options.startup_observer, StartupPhase::CudaGraphCalibration);
         preparation->prepare_probe();
         preparation->calibrate();
+        preparation->prepare_rebuild_probe();
+        preparation->calibrate_rebuild();
         phase.complete();
     }
     std::optional<typename Types::PreparedSession> session;
     ContextCapacityResolution capacity;
-    std::size_t correction = 0;
-    auto description       = [&] {
+    std::size_t maximum_runtime = SIZE_MAX;
+    auto description            = [&] {
+        StartupPhaseScope phase(options.startup_observer, StartupPhase::ProgramInitialize);
         for (unsigned attempt = 0; attempt < 2; ++attempt) {
-            const auto before = device_memory_snapshot(device->device());
-            const auto room   = budget.available(before);
-            if (correction >= room)
-                throw DeviceAllocationError("runtime exceeds local resource budget");
-            const auto report   = preparation->report(room - correction);
-            const auto offered  = std::min(report.capacity.available_bytes, room - correction);
-            const auto withheld = room - correction - offered;
+            const auto before  = device_memory_snapshot(device->device());
+            const auto room    = budget.available(before);
+            const auto report  = preparation->report(room);
+            const auto offered = std::min(report.capacity.available_bytes, maximum_runtime);
             capacity = resolve_context_capacity(options.context_capacity, report.capacity.plan,
-                                                      offered, budget.available_host(before),
-                                                      before.shared_physical_memory);
+                                                           offered, budget.available_host(before),
+                                                           before.shared_physical_memory);
             std::optional<DeviceMemorySnapshot> ready;
             std::exception_ptr allocation_error;
             try {
-                StartupPhaseScope phase(options.startup_observer, StartupPhase::ProgramInitialize);
-                preparation->prepare({capacity.device_bytes}, room - correction,
-                                           budget.available_host(before));
+                preparation->prepare({capacity.device_bytes}, room, budget.available_host(before));
                 preparation->prepare_execution();
                 auto described = preparation->describe();
                 session.emplace(
@@ -100,20 +98,16 @@ build_prepared_local_model(const artifact::Reader& reader, EngineOptions& option
                     return described;
                 }
             } catch (const DeviceAllocationError&) { allocation_error = std::current_exception(); }
+            if (ready) {
+                const auto cost =
+                    capacity.runtime_reservation_bytes +
+                    (before.shared_physical_memory ? capacity.control_reservation_bytes : 0);
+                maximum_runtime = budget.corrected_runtime_limit(*ready, cost);
+            }
             session.reset();
             preparation->release_resources();
             device->synchronize();
-            if (attempt == 1 && allocation_error) std::rethrow_exception(allocation_error);
-            if (ready) {
-                const auto released = device_memory_snapshot(device->device());
-                const auto explicit_bytes =
-                    withheld + capacity.runtime_reservation_bytes +
-                    (before.shared_physical_memory ? capacity.control_reservation_bytes : 0);
-                const auto reclaimed = device_memory_growth(released, *ready);
-                correction           = reclaimed > static_cast<std::int64_t>(explicit_bytes)
-                                                 ? reclaimed - explicit_bytes
-                                                 : 0;
-            }
+            if (allocation_error) std::rethrow_exception(allocation_error);
         }
         throw DeviceAllocationError("prepared runtime exceeds local resource budget");
     }();

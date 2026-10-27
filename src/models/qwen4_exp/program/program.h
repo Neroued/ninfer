@@ -4,6 +4,7 @@
 #include "models/qwen4_exp/session/planning.h"
 #include "models/qwen4_exp/work.h"
 #include "models/common/parallel_execution.h"
+#include "models/common/graph_preparation.h"
 
 namespace ninfer::models::qwen4_exp {
 namespace execution {
@@ -27,7 +28,7 @@ public:
     [[nodiscard]] static constexpr runtime::ExecutionCapacity capacity() noexcept { return {1, 1}; }
 
     [[nodiscard]] SessionPlan session_plan() const;
-    void prepare_execution();
+    GraphPreparationSample prepare_execution(GraphPreparationMode = GraphPreparationMode::Complete);
     void release_execution();
     void validate_work(const Work&, runtime::FrameKind) const;
     void start(runtime::ExecutionRequest<ExecutionTypes>&&);

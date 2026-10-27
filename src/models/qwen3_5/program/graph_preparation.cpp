@@ -5,8 +5,6 @@
 #include "models/qwen3_5/program/planning/startup.h"
 #include "core/startup.h"
 
-#include <algorithm>
-
 namespace ninfer::models::qwen3_5 {
 
 GraphPreparationPlan describe_graph_preparation(const EngineOptions& options,
@@ -33,18 +31,21 @@ GraphCalibration calibrate_graphs(const execution::Parameters& parameters, Devic
     result.plan = describe_graph_preparation(options, moe.get());
     if (!options.use_cuda_graph) return result;
     StartupPhaseScope phase(options.startup_observer, StartupPhase::CudaGraphCalibration);
-    auto plan = detail::make_graph_probe_plan(parameters.profile, device, options, std::move(moe));
+    auto plan = detail::make_graph_probe_plan(parameters.profile, device, options, moe);
     auto probe =
         std::make_unique<detail::RankProgramImpl>(parameters, *plan, device, StartupObserver{});
-    const auto before = device_memory_snapshot(device.device());
-    probe->initialize_graphs();
-    const auto ready = device_memory_snapshot(device.device());
-    probe->release_graphs();
-    const auto released                = device_memory_snapshot(device.device());
-    result.preparation_increment_bytes = device_memory_growth(before, ready);
-    result.retained_increment_bytes    = device_memory_growth(before, released);
-    result.rebuild_bytes =
-        static_cast<std::size_t>(std::max<std::int64_t>(0, device_memory_growth(released, ready)));
+    result.memory = begin_graph_calibration(
+        device, [&](GraphPreparationMode mode) { return probe->initialize_graphs(mode); },
+        [&] { probe->release_graphs(); });
+    probe.reset();
+    device.synchronize();
+    plan  = detail::make_graph_probe_plan(parameters.profile, device, options, moe,
+                                          GraphProbeBacking::StartupWorkingSet);
+    probe = std::make_unique<detail::RankProgramImpl>(parameters, *plan, device, StartupObserver{});
+    complete_graph_calibration(
+        result.memory, device,
+        [&](GraphPreparationMode mode) { return probe->initialize_graphs(mode); },
+        [&] { probe->release_graphs(); });
     probe.reset();
     device.synchronize();
     phase.complete();

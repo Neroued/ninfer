@@ -55,10 +55,13 @@ struct MoeMemorySummary {
 
 struct GraphMemorySummary {
     std::size_t rebuild_estimate_bytes = 0;
-    // Signed free-memory deltas; calibration holds its backing while releasing graphs.
+    // Signed physical-capacity deltas. Rebuild estimates come from an actual second capture.
+    std::int64_t warmup_increment_bytes      = 0;
     std::int64_t preparation_increment_bytes = 0;
+    std::size_t preparation_peak_bytes       = 0;
     std::int64_t calibration_increment_bytes = 0;
-    std::int64_t calibration_retained_bytes  = 0;
+    std::size_t calibration_peak_bytes       = 0;
+    std::int64_t rebuild_increment_bytes     = 0;
 };
 
 // Owned allocations. Registered ranges, tensor views and layout subregions are not allocations.

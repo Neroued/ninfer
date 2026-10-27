@@ -473,10 +473,11 @@ void OperationalLog::engine_capacity(const GenerationService& service) const {
                       product::format_pretty_bytes(budget.runtime_reservation_bytes),
                       product::format_pretty_bytes(budget.available_after_startup_bytes));
         if (budget.graphs)
-            logger_->debug(
-                "rank {} | graph rebuild estimate {} | preparation delta {} B | retained {} B",
-                rank.rank, product::format_pretty_bytes(budget.graphs->rebuild_estimate_bytes),
-                budget.graphs->preparation_increment_bytes, budget.retained_bytes);
+            logger_->debug("rank {} | graph rebuild estimate {} | preparation peak {} | delta {} B",
+                           rank.rank,
+                           product::format_pretty_bytes(budget.graphs->rebuild_estimate_bytes),
+                           product::format_pretty_bytes(budget.graphs->preparation_peak_bytes),
+                           budget.graphs->preparation_increment_bytes);
     }
 
     logger_->info("context | history {} | checkpoint interval {} tokens",

@@ -93,7 +93,7 @@ void DeviceGraphs::body(Batch& profiles, Round* round, std::uint32_t batch, bool
     }
 }
 
-void DeviceGraphs::prepare(GraphInputs& inputs) {
+void DeviceGraphs::prepare(GraphInputs& inputs, GraphPreparation& preparation) {
     auto& p           = owner_;
     auto& r           = p.resources;
     const auto& io    = r.plan.persistent.buffers;
@@ -112,13 +112,18 @@ void DeviceGraphs::prepare(GraphInputs& inputs) {
             inputs.batch(r.main_batch(t, b, bounds_.back()), bounds_.back());
             for (auto visible : bounds_) {
                 auto& profile = batch.main[verify].emplace_back();
-                auto run      = main_run(b, verify, visible);
+                if (!preparation.capturing()) inputs.batch(r.main_batch(t, b, visible), visible);
+                auto run = main_run(b, verify, visible);
+                if (!preparation.capturing()) run.stem();
                 for (std::uint32_t layer = 0; layer < p.parameters.text.layers.size(); ++layer) {
                     if (!std::holds_alternative<execution::QsaParameters>(
                             p.parameters.text.layers[layer].mixer))
                         continue;
-                    profile.emplace_back().capture(p.cuda.stream(),
-                                                   [&] { run.local_mixer(layer); });
+                    if (preparation.capturing())
+                        profile.emplace_back().capture(p.cuda.stream(),
+                                                       [&] { run.local_mixer(layer); });
+                    else
+                        run.local_mixer(layer);
                 }
             }
         }
@@ -126,9 +131,16 @@ void DeviceGraphs::prepare(GraphInputs& inputs) {
             inputs.batch(r.mtp_batch(io.mtp->draft_steps[step], 1, b, bounds_.back()),
                          bounds_.back());
             for (auto visible : bounds_) {
+                if (!preparation.capturing())
+                    inputs.batch(r.mtp_batch(io.mtp->draft_steps[step], 1, b, visible), visible);
                 auto run = p.draft_run(step, b, visible);
-                batch.drafts[step].emplace_back().capture(p.cuda.stream(),
-                                                          [&] { run.local_mixer(); });
+                if (preparation.capturing())
+                    batch.drafts[step].emplace_back().capture(p.cuda.stream(),
+                                                              [&] { run.local_mixer(); });
+                else {
+                    run.stem();
+                    run.local_mixer();
+                }
             }
         }
         for (int verify = 0; verify < (drafts ? 2 : 1); ++verify) {
@@ -151,9 +163,12 @@ void DeviceGraphs::prepare(GraphInputs& inputs) {
                 p.copy_sample_result(b, verify);
             };
             inputs.stage();
-            body(batch, nullptr, b, verify);
-            decision();
-            p.device.synchronize();
+            if (!preparation.capturing()) {
+                body(batch, nullptr, b, verify);
+                decision();
+                preparation.checkpoint();
+                continue;
+            }
             auto& round = batch.rounds[verify];
             round.installed_draft.resize(depth);
             round.graph.prepare(
@@ -163,7 +178,7 @@ void DeviceGraphs::prepare(GraphInputs& inputs) {
             replay(b, std::vector<std::uint32_t>(depth, bounds_.back()), bounds_.back(), true,
                    false);
             decide(b, verify);
-            p.device.synchronize();
+            preparation.checkpoint();
         }
     }
     workspace_peak_ = r.workspace.peak_used();

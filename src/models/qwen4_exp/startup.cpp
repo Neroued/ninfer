@@ -75,9 +75,10 @@ qwen::Frontend create_frontend(const ModelDefinition& definition, const EngineOp
 std::unique_ptr<RankProgram> create_rank_program(const execution::Parameters& p,
                                                  qwen4_exp::ExecutionPlan&& plan,
                                                  DeviceContext& device,
-                                                 const StartupObserver& observer) {
+                                                 const StartupObserver& observer,
+                                                 GraphPreparationMode mode) {
     auto program = std::make_unique<RankProgram>(p, std::move(plan), device, observer);
-    program->prepare_execution();
+    program->prepare_execution(mode);
     return program;
 }
 

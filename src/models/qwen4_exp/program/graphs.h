@@ -28,7 +28,7 @@ private:
 class Graphs {
 public:
     explicit Graphs(RankProgramImpl&);
-    void prepare(GraphInputs&);
+    void prepare(GraphInputs&, GraphPreparation&);
     [[nodiscard]] TextGraph& main(std::uint32_t batch, bool verify, std::uint32_t visible,
                                   bool head);
     void draft(std::uint32_t batch, std::span<const execution::BatchView>, ple::Ticket,
@@ -62,8 +62,8 @@ private:
         std::size_t sample_workspace = 0, accept_workspace = 0;
     };
 
-    void prepare_main(Batch&, std::uint32_t batch, bool verify);
-    void prepare_drafts(Batch&, std::uint32_t batch);
+    void prepare_main(Batch&, std::uint32_t batch, bool verify, GraphPreparation&);
+    void prepare_drafts(Batch&, std::uint32_t batch, GraphInputs&, GraphPreparation&);
     RankProgramImpl& owner_;
     std::vector<std::uint32_t> bounds_;
     std::vector<Batch> batches_;
@@ -74,7 +74,7 @@ class MtpCommitGraphs {
 public:
     explicit MtpCommitGraphs(RankProgramImpl& owner) : owner_(owner) {}
 
-    void prepare(GraphInputs&);
+    void prepare(GraphInputs&, GraphPreparation&);
     void replay(std::uint32_t batch, bool rebuild_history, bool count_tokens);
 
     [[nodiscard]] std::size_t workspace_peak() const { return workspace_peak_; }

@@ -157,6 +157,7 @@ GroupPreparation prepare_execution_group(dist::ExecutionGroup& group,
         if (!group.transport().try_send(requests))
             throw std::runtime_error("rank preparation payloads exceed control capacity");
         GroupPreparation result;
+        std::string allocation_failure;
         for (std::uint32_t attempt = 0; attempt < 2; ++attempt) {
             const auto enter_phase = [&](PreparationAction action) {
                 enter(group, result, attempt, action);
@@ -174,12 +175,18 @@ GroupPreparation prepare_execution_group(dist::ExecutionGroup& group,
             const auto allocated = [&](bool description) {
                 bool success = true;
                 if (description) result.layouts.clear();
-                for (const auto& bytes : receive(group, wire::Kind::Allocated, timeout)) {
+                const auto replies = receive(group, wire::Kind::Allocated, timeout);
+                for (std::size_t rank = 0; rank < replies.size(); ++rank) {
+                    const auto& bytes = replies[rank];
                     wire::Decoder in(bytes);
                     if (in.u64() != group.topology().plan || in.u32() != attempt)
                         throw std::runtime_error(
                             "rank preparation response belongs to another attempt");
-                    success &= in.boolean();
+                    const bool ready = in.boolean();
+                    success &= ready;
+                    const auto failure = in.string();
+                    if (!ready)
+                        allocation_failure = "rank " + std::to_string(rank) + ": " + failure;
                     if (description) {
                         const auto layout = in.bytes();
                         result.layouts.emplace_back(wire::Bytes(layout.begin(), layout.end()));
@@ -189,13 +196,20 @@ GroupPreparation prepare_execution_group(dist::ExecutionGroup& group,
                 return success;
             };
             reports();
+            if (attempt == 0) {
+                enter_phase(PreparationAction::PrepareCommunication);
+                reports();
+            }
             if (attempt == 0 &&
                 std::any_of(result.reports.begin(), result.reports.end(),
                             [](const auto& report) { return report.preparation_required; })) {
                 enter_phase(PreparationAction::PrepareProbe);
-                if (!allocated(false))
-                    throw DeviceAllocationError("rank calibration resources do not fit");
+                if (!allocated(false)) throw DeviceAllocationError(allocation_failure.c_str());
                 enter_phase(PreparationAction::Calibrate);
+                reports();
+                enter_phase(PreparationAction::PrepareRebuildProbe);
+                if (!allocated(false)) throw DeviceAllocationError(allocation_failure.c_str());
+                enter_phase(PreparationAction::CalibrateRebuild);
                 reports();
             }
             std::vector<RankCapacityOffer> offers;
@@ -226,8 +240,7 @@ GroupPreparation prepare_execution_group(dist::ExecutionGroup& group,
                 }
             }
             if (control.release) control.release();
-            if (attempt == 1)
-                throw std::runtime_error("rank resources do not fit their Context capacities");
+            if (attempt == 1) throw std::runtime_error(allocation_failure);
             enter_phase(PreparationAction::Release);
         }
         throw std::logic_error("preparation attempt exhausted");

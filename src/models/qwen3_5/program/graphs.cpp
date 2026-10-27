@@ -279,7 +279,8 @@ void Graphs::SegmentFamily::launch(std::uint32_t frontier, CudaExecutionView cud
 }
 
 void Graphs::prepare(Resources& resources, const execution::Parameters& parameters,
-                     DeviceContext& device, const GraphBodies& bodies) {
+                     DeviceContext& device, const GraphBodies& bodies,
+                     GraphPreparation& observation) {
     if (!batches_.empty()) throw std::logic_error("Qwen3.5 graphs are already prepared");
     if (!bodies.prologue || !bodies.text || !bodies.project || !bodies.decision ||
         !bodies.readback || (spec_.draft_window && !bodies.draft)) {
@@ -310,8 +311,16 @@ void Graphs::prepare(Resources& resources, const execution::Parameters& paramete
                     auto scope = resources.work.scope();
                     bodies.project(call);
                 },
-                resources.work, device);
-            workspace_peak_ = std::max(workspace_peak_, graph.workspace_peak());
+                resources.work, device, observation);
+            if (observation.capturing()) {
+                if (!graph.start(device.execution_view()))
+                    while (!graph.poll()) {
+                        if (resources.moe) resources.moe->synchronize();
+                        device.synchronize();
+                    }
+                observation.checkpoint();
+                workspace_peak_ = std::max(workspace_peak_, graph.workspace_peak());
+            }
         };
         prepare_main(GraphPhase::Main, target.main, 1, ordinary_profiles);
         if (spec_.draft_window) {
@@ -335,15 +344,25 @@ void Graphs::prepare(Resources& resources, const execution::Parameters& paramete
                         bodies.readback(call);
                     }
                 };
-                body();
-                device.synchronize();
+                if (!observation.capturing()) {
+                    body();
+                    observation.checkpoint();
+                    continue;
+                }
                 auto& stored   = family.profiles.emplace_back();
                 stored.profile = profile;
                 stored.definition.capture(device.stream(), body);
                 workspace_peak_ = std::max(workspace_peak_, resources.work.peak_used());
             }
-            family.instantiate(device.execution_view());
-            device.synchronize();
+            if (observation.capturing()) {
+                family.instantiate(device.execution_view());
+                for (const auto& topology : family.topologies) {
+                    const auto profile = family.profiles[topology.installed].profile;
+                    inputs.prepare(invocation(phase, batch, width, profile, spec_.capacity));
+                    family.launch(profile.min, device.execution_view());
+                    observation.checkpoint();
+                }
+            }
         };
         if (spec_.draft_window) {
             prepare_segment(target.draft, GraphPhase::Draft, draft_profiles,
@@ -364,19 +383,24 @@ void Graphs::prepare(Resources& resources, const execution::Parameters& paramete
             CUDA_CHECK(cudaMemcpyAsync(frame.commit.data, frame.host_commit, sizeof(FrameCommit),
                                        cudaMemcpyHostToDevice, device.stream()));
             resources.work.reset_peak();
-            bodies.mtp_commit(batch, nullptr, nullptr);
-            device.synchronize();
+            if (!observation.capturing()) {
+                bodies.mtp_commit(batch, nullptr, nullptr);
+                observation.checkpoint();
+                continue;
+            }
             auto& history = target.mtp_commit;
             history.definition.capture(device.stream(), [&] {
                 bodies.mtp_commit(batch, &history.repair, &history.counts);
             });
             history.executable.instantiate(history.definition);
             history.executable.upload(device.stream());
+            history.executable.launch(device.stream());
             workspace_peak_ = std::max(workspace_peak_, resources.work.peak_used());
-            device.synchronize();
+            observation.checkpoint();
         }
     }
     if (resources.moe) resources.moe->restore_cache_after_preparation();
+    observation.checkpoint();
     inputs.finish();
     resources.work.reset();
 }

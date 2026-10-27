@@ -103,7 +103,7 @@ void TextGraph::prepare(TextRun& run, const Parameters& parameters, moe::Schedul
                         std::span<const GraphProfile> profiles, std::uint32_t width,
                         const std::function<void()>& prologue,
                         const std::function<void()>& epilogue, MemoryArena& workspace,
-                        DeviceContext& device) {
+                        DeviceContext& device, GraphPreparation& preparation) {
     if (impl_) throw std::logic_error("text graph is already prepared");
     if (profiles.empty() || profiles.front().min != 0 || width == 0) {
         throw std::invalid_argument("text graph profiles are invalid");
@@ -113,16 +113,26 @@ void TextGraph::prepare(TextRun& run, const Parameters& parameters, moe::Schedul
     const auto capacity = profiles.back().max + 1;
     const auto cuda     = device.execution_view();
     const auto layers   = parameters.text.layers.size();
-    run.set_attention_envelope(envelope(profiles.front(), width, capacity));
-    prologue();
-    bool ready = run.start();
-    while (!ready) {
-        if (schedule) schedule->synchronize();
-        device.synchronize();
-        ready = run.poll();
+    if (!preparation.capturing()) {
+        run.set_attention_envelope(envelope(profiles.front(), width, capacity));
+        prologue();
+        bool ready = run.start();
+        while (!ready) {
+            if (schedule) schedule->synchronize();
+            device.synchronize();
+            ready = run.poll();
+        }
+        epilogue();
+        for (const auto& profile : profiles) {
+            run.set_attention_envelope(envelope(profile, width, capacity));
+            for (std::uint32_t layer = 0; layer < layers; ++layer)
+                if (std::holds_alternative<AttentionParameters>(
+                        parameters.text.layers[layer].mixer))
+                    run.mixer(layer);
+        }
+        preparation.checkpoint();
+        return;
     }
-    epilogue();
-    device.synchronize();
 
     if (!schedule) {
         auto& graph = result->graph.emplace<Resident>();
@@ -165,7 +175,7 @@ void TextGraph::prepare(TextRun& run, const Parameters& parameters, moe::Schedul
                 graph.main.executable.update_child(graph.mixers[index], definitions[index]);
             }
             graph.main.executable.upload(cuda.stream());
-            device.synchronize();
+            preparation.checkpoint();
         }
         if (graph.profiles.size() > 1) {
             for (std::size_t index = 0; index < graph.mixers.size(); ++index)
@@ -230,7 +240,7 @@ void TextGraph::prepare(TextRun& run, const Parameters& parameters, moe::Schedul
                     executable.resident.upload(cuda.stream());
                 }
             }
-            device.synchronize();
+            preparation.checkpoint();
         }
         for (std::size_t layer = 0; layer < layers; ++layer) {
             auto& executable       = graph.layers[layer];

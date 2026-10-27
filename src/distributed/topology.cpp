@@ -50,6 +50,8 @@ void ExecutionTopology::validate(const DeploymentOptions& deployment) const {
     }
     std::set<GroupId> ids;
     for (const auto& g : groups) {
+        if (g.usage != GroupUsage::General && g.usage != GroupUsage::PeerExchange)
+            throw std::invalid_argument("invalid communication group usage");
         if (g.members.empty() || !ids.insert(g.id).second)
             throw std::invalid_argument("empty or duplicate communication group");
         std::set<RankId> members;

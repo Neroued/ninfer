@@ -143,7 +143,8 @@ void GraphInputs::batch(execution::BatchView call, std::uint32_t visible) {
 Graphs::Graphs(RankProgramImpl& owner)
     : owner_(owner), bounds_(decode_context_bounds(owner.shape.max_context)) {}
 
-void Graphs::prepare_main(Batch& graph, std::uint32_t batch, bool verify) {
+void Graphs::prepare_main(Batch& graph, std::uint32_t batch, bool verify,
+                          GraphPreparation& preparation) {
     auto& p             = owner_;
     auto& r             = p.resources;
     const auto& buffers = r.plan.persistent.buffers;
@@ -172,16 +173,19 @@ void Graphs::prepare_main(Batch& graph, std::uint32_t batch, bool verify) {
                          r.ple_upload->binding(1, tokens, batch)};
     auto& selected = verify ? graph.verify : graph.main;
     {
-        // Warm the actual bodies before capture. No disk request is needed for these bindings.
         execution::TextRun run(p.parameters, execution, call, update, p.cuda);
-        run.stem();
-        for (std::uint32_t layer = 0; layer < c.ple.layer; ++layer)
-            while (!run.advance_layer(layer)) std::this_thread::yield();
-        run.consume_ple(ple[0].values);
-        for (std::uint32_t layer = c.ple.layer; layer < p.parameters.text.layers.size(); ++layer)
-            while (!run.advance_layer(layer)) std::this_thread::yield();
-        run.finish(output, logits);
-        p.device.synchronize();
+        if (!preparation.capturing()) {
+            run.stem();
+            for (std::uint32_t layer = 0; layer < c.ple.layer; ++layer)
+                while (!run.advance_layer(layer)) std::this_thread::yield();
+            run.consume_ple(ple[0].values);
+            for (std::uint32_t layer = c.ple.layer; layer < p.parameters.text.layers.size();
+                 ++layer)
+                while (!run.advance_layer(layer)) std::this_thread::yield();
+            run.finish(output, logits);
+            preparation.checkpoint();
+            return;
+        }
         selected.prepare(run, p.parameters, r.experts.get(), bounds_, ple, output, logits,
                          tokens * batch, r.workspace, p.device, [&] {
                              if (!verify) p.install_decode(batch);
@@ -198,16 +202,26 @@ void Graphs::prepare_main(Batch& graph, std::uint32_t batch, bool verify) {
         selected.consume_ple(0, p.cuda);
         while (!selected.advance_suffix(p.cuda)) std::this_thread::yield();
     }
-    p.device.synchronize();
+    preparation.checkpoint();
 }
 
-void Graphs::prepare_drafts(Batch& graph, std::uint32_t batch) {
+void Graphs::prepare_drafts(Batch& graph, std::uint32_t batch, GraphInputs& inputs,
+                            GraphPreparation& preparation) {
     auto& p = owner_;
     graph.drafts.resize(p.shape.draft_tokens);
     for (std::uint32_t step = 0; step < p.shape.draft_tokens; ++step) {
         auto& call = graph.drafts[step];
-        p.draft_forward(step, batch, bounds_.back());
-        p.device.synchronize();
+        if (!preparation.capturing()) {
+            for (const auto bound : bounds_) {
+                inputs.batch(p.resources.mtp_batch(
+                                 p.resources.plan.persistent.buffers.mtp->draft_steps[step], 1,
+                                 batch, bound),
+                             bound);
+                p.draft_forward(step, batch, bound);
+            }
+            preparation.checkpoint();
+            continue;
+        }
         for (const auto bound : bounds_) {
             p.resources.workspace.reset_peak();
             call.definitions.emplace_back();
@@ -220,6 +234,7 @@ void Graphs::prepare_drafts(Batch& graph, std::uint32_t batch) {
             call.handoffs[slot].capture(
                 p.cuda.stream(), [&] { p.host_ple->capture_append(slot, ids, step, p.cuda); });
     }
+    if (!preparation.capturing()) return;
     CudaCompletionEvent fork(p.device), join(p.device);
     const auto transfer = p.resources.ple_transfer();
     {
@@ -251,12 +266,12 @@ void Graphs::prepare_drafts(Batch& graph, std::uint32_t batch) {
                 chain.graph.executable.update_child(chain.handoffs[step],
                                                     graph.drafts[step].handoffs[slot]);
             chain.graph.executable.launch(p.cuda.stream());
-            p.device.synchronize();
+            preparation.checkpoint();
         }
     }
 }
 
-void Graphs::prepare(GraphInputs& inputs) {
+void Graphs::prepare(GraphInputs& inputs, GraphPreparation& observation) {
     auto& p = owner_;
     auto& r = p.resources;
     std::optional<moe::Schedule::Preparation> preparation;
@@ -266,11 +281,15 @@ void Graphs::prepare(GraphInputs& inputs) {
         auto& graph = batches_[batch - 1];
         inputs.batch(r.main_batch(1, batch, bounds_.back()), bounds_.back());
         inputs.stage();
-        prepare_main(graph, batch, false);
-        p.sample_forward(batch, false);
-        p.device.synchronize();
+        prepare_main(graph, batch, false, observation);
         r.workspace.reset_peak();
-        graph.sample.prepare(p.cuda, [&] { p.sample_forward(batch, false); });
+        if (observation.capturing()) {
+            graph.sample.prepare(p.cuda, [&] { p.sample_forward(batch, false); });
+            graph.sample.launch(p.cuda);
+        } else {
+            p.sample_forward(batch, false);
+        }
+        observation.checkpoint();
         graph.sample_workspace = r.workspace.peak_used();
         if (p.parameters.mtp) {
             const auto& frame = *r.plan.persistent.buffers.mtp;
@@ -278,14 +297,18 @@ void Graphs::prepare(GraphInputs& inputs) {
                 inputs.batch(r.mtp_batch(frame.draft_steps[step], 1, batch, bounds_.back()),
                              bounds_.back());
             inputs.stage();
-            prepare_drafts(graph, batch);
+            prepare_drafts(graph, batch, inputs, observation);
             inputs.batch(r.main_batch(p.shape.draft_tokens + 1, batch, bounds_.back()),
                          bounds_.back());
-            prepare_main(graph, batch, true);
-            p.accept_forward(batch);
-            p.device.synchronize();
+            prepare_main(graph, batch, true, observation);
             r.workspace.reset_peak();
-            graph.accept.prepare(p.cuda, [&] { p.accept_forward(batch); });
+            if (observation.capturing()) {
+                graph.accept.prepare(p.cuda, [&] { p.accept_forward(batch); });
+                graph.accept.launch(p.cuda);
+            } else {
+                p.accept_forward(batch);
+            }
+            observation.checkpoint();
             graph.accept_workspace = r.workspace.peak_used();
         }
     }
@@ -338,7 +361,7 @@ void Graphs::accept(std::uint32_t batch) {
     batches_.at(batch - 1).accept.executable.launch(owner_.cuda.stream());
 }
 
-void MtpCommitGraphs::prepare(GraphInputs& inputs) {
+void MtpCommitGraphs::prepare(GraphInputs& inputs, GraphPreparation& preparation) {
     auto& p          = owner_;
     auto& r          = p.resources;
     const auto& io   = r.plan.persistent.buffers;
@@ -367,11 +390,18 @@ void MtpCommitGraphs::prepare(GraphInputs& inputs) {
         copy_bytes({destination.data, destination.bytes(), p.cuda.device()},
                    {source.data, source.bytes(), p.cuda.device()}, p.cuda);
         r.workspace.reset_peak();
+        if (!preparation.capturing()) {
+            p.execute_mtp_commit(batch, true, true);
+            preparation.checkpoint();
+            continue;
+        }
         auto& target = batches_[batch - 1];
         target.graph.prepare(p.cuda, [&] {
             p.execute_mtp_commit(batch, true, true, &target.repair, &target.counts);
         });
         target.workspace_bytes = r.workspace.peak_used();
+        target.graph.launch(p.cuda);
+        preparation.checkpoint();
     }
     r.workspace.reset_peak();
 }
@@ -384,27 +414,40 @@ void MtpCommitGraphs::replay(std::uint32_t batch, bool rebuild_history, bool cou
     target.graph.launch(owner_.cuda);
 }
 
-void RankProgramImpl::initialize_graphs() {
-    if (!shape.cuda_graph) return;
+GraphPreparationSample RankProgramImpl::initialize_graphs(GraphPreparationMode mode) {
+    if (!shape.cuda_graph) return {};
+    if (graphs || device_graphs) throw std::logic_error("Qwen4Exp Graphs are already prepared");
+    if (mode == GraphPreparationMode::Complete) {
+        initialize_graphs(GraphPreparationMode::Warmup);
+        return initialize_graphs(GraphPreparationMode::Capture);
+    }
     nvtx::ScopedRange range(nvtx::Name::CudaGraphPrepare, nvtx::Category::Graph);
-    const auto before = device_memory_snapshot(cuda.device());
-    GraphInputs inputs(*this);
-    inputs.prepare();
+    GraphPreparation observation(device, mode);
+    graph_inputs = std::make_unique<GraphInputs>(*this);
+    graph_inputs->prepare();
     if (host_ple) {
         graphs = std::make_unique<Graphs>(*this);
-        graphs->prepare(inputs);
+        graphs->prepare(*graph_inputs, observation);
     } else {
         device_graphs = std::make_unique<DeviceGraphs>(*this);
-        device_graphs->prepare(inputs);
+        device_graphs->prepare(*graph_inputs, observation);
     }
     if (parameters.mtp && shape.draft_tokens) {
         commit_graphs = std::make_unique<MtpCommitGraphs>(*this);
-        commit_graphs->prepare(inputs);
+        commit_graphs->prepare(*graph_inputs, observation);
     }
-    graph_memory.emplace();
-    graph_memory->preparation_increment_bytes =
-        device_memory_growth(before, device_memory_snapshot(cuda.device()));
-    device.synchronize();
+    observation.checkpoint();
+    graph_inputs.reset();
+    const auto result = observation.sample();
+    if (!graph_memory) graph_memory.emplace();
+    if (observation.capturing()) {
+        graph_memory->preparation_increment_bytes = result.increment_bytes;
+        graph_memory->preparation_peak_bytes      = result.peak_bytes;
+    } else {
+        release_graphs();
+        graph_memory->warmup_increment_bytes = result.increment_bytes;
+    }
+    return result;
 }
 
 void RankProgramImpl::release_graphs() {
@@ -412,6 +455,7 @@ void RankProgramImpl::release_graphs() {
     graphs.reset();
     device_graphs.reset();
     commit_graphs.reset();
+    graph_inputs.reset();
 }
 
 } // namespace ninfer::models::qwen4_exp::detail

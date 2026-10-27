@@ -1,6 +1,7 @@
 #pragma once
 
 #include "models/common/moe/schedule.h"
+#include "models/common/graph_preparation.h"
 #include "models/qwen4_exp/execution/parameters.h"
 
 namespace ninfer::models::qwen4_exp {
@@ -16,8 +17,7 @@ struct GraphPreparationPlan {
 
 struct GraphCalibration {
     GraphPreparationPlan plan;
-    std::size_t rebuild_bytes                = 0;
-    std::int64_t preparation_increment_bytes = 0, retained_increment_bytes = 0;
+    GraphMemorySummary memory;
 };
 
 [[nodiscard]] GraphPreparationPlan describe_graph_preparation(const EngineOptions&,

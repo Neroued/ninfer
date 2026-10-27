@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/layout.h"
+#include "models/common/graph_preparation.h"
 
 #include "models/common/context/directory.h"
 #include "models/qwen3_5/execution/profile.h"
@@ -103,7 +104,8 @@ private:
     friend SessionPlan plan_session(const SequencePlan&);
     friend std::unique_ptr<RankProgram> create_rank_program(const execution::Parameters&,
                                                             SequencePlan&&, DeviceContext&,
-                                                            const StartupObserver&);
+                                                            const StartupObserver&,
+                                                            GraphPreparationMode);
 };
 
 class SequencePlanner {
@@ -133,8 +135,8 @@ private:
                                                     std::shared_ptr<const moe::Plan> = {});
 [[nodiscard]] SequencePlanner make_sequence_planner(const execution::Parameters&, DeviceContext&,
                                                     const EngineOptions&);
-[[nodiscard]] std::unique_ptr<RankProgram> create_rank_program(const execution::Parameters&,
-                                                               SequencePlan&&, DeviceContext&,
-                                                               const StartupObserver&);
+[[nodiscard]] std::unique_ptr<RankProgram>
+create_rank_program(const execution::Parameters&, SequencePlan&&, DeviceContext&,
+                    const StartupObserver&, GraphPreparationMode = GraphPreparationMode::Complete);
 
 } // namespace ninfer::models::qwen3_5

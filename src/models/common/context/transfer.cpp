@@ -21,6 +21,20 @@ std::size_t mapping_bytes(const ContextStorage& storage, std::size_t requested) 
 }
 } // namespace
 
+void prepare_peer_communication(const distributed::Group& group, std::size_t chunk_bytes,
+                                CudaExecutionView execution) {
+#if NINFER_ENABLE_DISTRIBUTED
+    if (!chunk_bytes)
+        throw std::invalid_argument("Context peer preparation has no transfer window");
+    std::vector<distributed::PeerPreparation> peers;
+    for (std::uint32_t rank = 0; rank < group.size(); ++rank)
+        if (rank != group.rank()) peers.push_back({rank, chunk_bytes});
+    group.prepare({}, peers, execution);
+#else
+    throw std::logic_error("distributed execution was not built");
+#endif
+}
+
 ContextMigration::ContextMigration(DeviceContext& device, ContextStorage& storage,
                                    std::size_t mapping_capacity_elements,
                                    std::size_t copy_segment_capacity)

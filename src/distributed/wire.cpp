@@ -150,6 +150,7 @@ void encode(Encoder& out, const ExecutionTopology& t) {
     out.u64(t.groups.size());
     for (const auto& g : t.groups) {
         out.u32(g.id);
+        out.u8(static_cast<std::uint8_t>(g.usage));
         out.u64(g.members.size());
         for (auto r : g.members) out.u32(r);
     }
@@ -166,9 +167,10 @@ ExecutionTopology decode_topology(Decoder& in) {
     out.output_rank = in.u32();
     out.ranks.resize(in.count(56));
     for (auto& r : out.ranks) r = decode_rank_identity(in);
-    out.groups.resize(in.count(12));
+    out.groups.resize(in.count(13));
     for (auto& g : out.groups) {
-        g.id = in.u32();
+        g.id    = in.u32();
+        g.usage = static_cast<GroupUsage>(in.u8());
         g.members.resize(in.count(4));
         for (auto& r : g.members) r = in.u32();
     }

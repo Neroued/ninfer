@@ -1,4 +1,6 @@
 #include "distributed/communication.h"
+#include "core/buffer.h"
+#include "core/platform.h"
 
 #include <nccl.h>
 
@@ -90,6 +92,75 @@ std::uint32_t Group::size() const noexcept { return impl_->size; }
 Device Group::device() const noexcept { return impl_->device; }
 
 CommunicationStatistics Group::statistics() const noexcept { return impl_->statistics; }
+
+void Group::prepare(std::span<const CollectivePreparation> collectives,
+                    std::span<const PeerPreparation> peers, CudaExecutionView execution) const {
+    if (size() == 1 || (collectives.empty() && peers.empty())) return;
+    std::size_t source_bytes = 0, destination_bytes = 0;
+    for (const auto& op : collectives) {
+        const auto width = dtype_size(op.dtype);
+        if (op.count > SIZE_MAX / width / size())
+            throw std::overflow_error("communication preparation exceeds buffer range");
+        const auto bytes  = op.count * width;
+        source_bytes      = std::max(source_bytes,
+                                     bytes * (op.operation == Collective::ReduceScatter ? size() : 1));
+        destination_bytes = std::max(destination_bytes,
+                                     bytes * (op.operation == Collective::AllGather ? size() : 1));
+    }
+    std::size_t peer_bytes = 0;
+    for (const auto& peer : peers) {
+        if (peer.bytes > SIZE_MAX - peer_bytes)
+            throw std::overflow_error("peer preparation exceeds buffer range");
+        peer_bytes += peer.bytes;
+    }
+    source_bytes      = std::max(source_bytes, peer_bytes);
+    destination_bytes = std::max(destination_bytes, peer_bytes);
+    DeviceBuffer source(device(), source_bytes), destination(device(), destination_bytes);
+    try {
+        CUDA_CHECK(cudaMemsetAsync(source.data(), 0, source.size(), execution.stream()));
+        CUDA_CHECK(cudaMemsetAsync(destination.data(), 0, destination.size(), execution.stream()));
+        for (const auto& op : collectives)
+            enqueue(op.operation, source.data(), destination.data(), op.count, op.dtype,
+                    op.reduction, op.root, execution);
+        std::vector<PeerTransfer> transfers;
+        std::size_t offset = 0;
+        for (const auto& peer : peers) {
+            transfers.push_back({peer.peer, source.span().subspan(offset, peer.bytes),
+                                 destination.span().subspan(offset, peer.bytes)});
+            offset += peer.bytes;
+        }
+        exchange(transfers, execution);
+        CUDA_CHECK(cudaStreamSynchronize(execution.stream()));
+    } catch (...) {
+        impl_->stop->store(true, std::memory_order_release);
+        if (impl_->comm) {
+            ncclCommAbort(impl_->comm);
+            impl_->comm = nullptr;
+        }
+        throw;
+    }
+}
+
+void CommunicationContext::sample_startup_memory() {
+    for (auto& group : groups_) {
+        auto& p = *group->impl_;
+        p.statistics.startup_memory.reset();
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2, 32, 3)
+        if (!p.comm) continue;
+        CommunicationMemory memory;
+        const auto result =
+            ncclCommMemStats(p.comm, ncclStatGpuMemTotal, &memory.tracked_device_bytes);
+        if (result == ncclInvalidUsage) continue;
+        check_nccl(result, "NCCL memory observation");
+        check_nccl(ncclCommMemStats(p.comm, ncclStatGpuMemPersist, &memory.persistent_device_bytes),
+                   "NCCL memory observation");
+        check_nccl(
+            ncclCommMemStats(p.comm, ncclStatGpuMemSuspend, &memory.suspendable_device_bytes),
+            "NCCL memory observation");
+        p.statistics.startup_memory = memory;
+#endif
+    }
+}
 
 void Group::record_graph(CommunicationWork& into, const std::function<void()>& body) const {
     if (impl_->capture)
@@ -246,6 +317,8 @@ void CommunicationContext::connect(const GroupDescription& description, RankId r
         std::memcpy(&id, unique.data(), sizeof(id));
         ncclConfig_t config = NCCL_CONFIG_INITIALIZER;
         config.blocking     = 0;
+        if (NINFER_TARGET_SPARK && description.usage == GroupUsage::PeerExchange && impl->size == 2)
+            config.maxCTAs = 2;
         const auto result =
             ncclCommInitRankConfig(&impl->comm, impl->size, id, impl->rank, &config);
         impl->ready(result, deadline);

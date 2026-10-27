@@ -141,13 +141,19 @@ int main() {
     budget.available_after_weights_bytes       = 1700;
     budget.available_after_startup_bytes       = 180;
     budget.planned_slack_bytes                 = 100;
-    budget.graphs                              = ninfer::GraphMemorySummary{600, -30, 800, 200};
-    budget.retained_bytes                      = 1000;
-    snapshot.runtime.context_pools             = {{.rank           = 0,
-                                                   .domain         = ninfer::ContextMemoryDomain::Host,
-                                                   .capacity_bytes = 64ULL << 20,
-                                                   .live_bytes     = 8ULL << 20,
-                                                   .reserved_bytes = 4ULL << 20}};
+    budget.graphs                  = ninfer::GraphMemorySummary{.rebuild_estimate_bytes      = 600,
+                                                                .warmup_increment_bytes      = 200,
+                                                                .preparation_increment_bytes = -30,
+                                                                .preparation_peak_bytes      = 40,
+                                                                .calibration_increment_bytes = 800,
+                                                                .calibration_peak_bytes      = 900,
+                                                                .rebuild_increment_bytes     = 500};
+    budget.retained_bytes          = 1000;
+    snapshot.runtime.context_pools = {{.rank           = 0,
+                                       .domain         = ninfer::ContextMemoryDomain::Host,
+                                       .capacity_bytes = 64ULL << 20,
+                                       .live_bytes     = 8ULL << 20,
+                                       .reserved_bytes = 4ULL << 20}};
 
     ServerLogEnvironment environment;
     environment.device                    = 0;
@@ -284,7 +290,7 @@ int main() {
                     .at(0)
                     .at("budget")
                     .at("graph_calibration")
-                    .at("calibration_retained_bytes") == 200 &&
+                    .at("warmup_increment_bytes") == 200 &&
             server.at("resources").at("ranks").at(0).at("budget").at("retained_bytes") == 1000,
         "signed Graph and startup deltas missing");
     failures += check(

@@ -6,11 +6,14 @@
 
 namespace ninfer::models::qwen3_5::detail {
 
-void RankProgramImpl::initialize_graphs() {
-    if (!use_cuda_graph || resources.frame.spec.causal_scoring) return;
+GraphPreparationSample RankProgramImpl::initialize_graphs(GraphPreparationMode mode) {
+    if (!use_cuda_graph || resources.frame.spec.causal_scoring) return {};
     if (graphs) throw std::logic_error("Qwen3.5 graphs are already initialized");
-    device.synchronize();
-    const auto before = device_memory_snapshot(device.device());
+    if (mode == GraphPreparationMode::Complete) {
+        initialize_graphs(GraphPreparationMode::Warmup);
+        return initialize_graphs(GraphPreparationMode::Capture);
+    }
+    GraphPreparation observation(device, mode);
     graphs.emplace(GraphSpec{capacity, max_concurrency, draft_window, backend});
     GraphBodies bodies;
     bodies.prologue = [this](const GraphInvocation& call) {
@@ -66,12 +69,20 @@ void RankProgramImpl::initialize_graphs() {
     bodies.readback = [this](const GraphInvocation& call) {
         readback_decode(call.batch, call.width > 1);
     };
-    graphs->prepare(resources, parameters, device, bodies);
-    device.synchronize();
-    graph_memory = GraphMemorySummary{.preparation_increment_bytes = device_memory_growth(
-                                          before, device_memory_snapshot(device.device()))};
+    graphs->prepare(resources, parameters, device, bodies, observation);
+    observation.checkpoint();
+    const auto result = observation.sample();
+    if (!graph_memory) graph_memory.emplace();
+    if (observation.capturing()) {
+        graph_memory->preparation_increment_bytes = result.increment_bytes;
+        graph_memory->preparation_peak_bytes      = result.peak_bytes;
+    } else {
+        graphs.reset();
+        graph_memory->warmup_increment_bytes = result.increment_bytes;
+    }
     resources.work.reset();
     reset_measurement_peaks();
+    return result;
 }
 
 void RankProgramImpl::release_graphs() {

@@ -65,7 +65,7 @@ void Graphs::prepare_round(int g, int c, bool verify) {
     round.workspace_bytes = p.resources.workspace.peak_used();
 }
 
-void Graphs::prepare(GraphInputs& inputs) {
+void Graphs::prepare(GraphInputs& inputs, GraphPreparation& preparation) {
     auto& p           = owner_;
     const int ranks   = p.parameters.profile->local.size;
     const int maximum = p.parameters.mtp ? p.shape.draft_tokens : 0;
@@ -84,17 +84,23 @@ void Graphs::prepare(GraphInputs& inputs) {
                     else
                         p.sample(g, SampleKind::NextToken);
                 };
-                p.execute_round(main, draft, true, false);
+                if (preparation.capturing()) {
+                    prepare_round(g, c, verify);
+                    replay(main, draft, true, false);
+                } else {
+                    p.execute_round(main, draft, true, false);
+                }
                 decide();
-                p.device.synchronize();
-                prepare_round(g, c, verify);
-                replay(main, draft, true, false);
-                decide();
-                p.device.synchronize();
+                preparation.checkpoint();
             }
             if (p.parameters.mtp) {
                 inputs.set(g, c, maximum);
                 const auto main = p.decode_batch(maximum + 1, g, c, p.shape.max_context);
+                if (!preparation.capturing()) {
+                    p.execute_mtp_commit(main, true, true);
+                    preparation.checkpoint();
+                    continue;
+                }
                 auto& commit = commits_[{g, c}];
                 p.resources.workspace.reset_peak();
                 commit.graph.prepare(p.cuda, [&] {
@@ -102,10 +108,13 @@ void Graphs::prepare(GraphInputs& inputs) {
                 });
                 commit.workspace_bytes = p.resources.workspace.peak_used();
                 workspace_peak_        = std::max(workspace_peak_, commit.workspace_bytes);
+                commit.graph.launch(p.cuda);
+                preparation.checkpoint();
             }
         }
         for (bool verify : {false, true}) {
             if (verify && !p.parameters.mtp) continue;
+            if (!preparation.capturing()) continue;
             auto& decision = decisions_[{g, verify}];
             p.resources.workspace.reset_peak();
             decision.graph.prepare(
@@ -120,6 +129,8 @@ void Graphs::prepare(GraphInputs& inputs) {
                 p.parallel ? &*p.parallel : nullptr);
             decision.workspace_bytes = p.resources.workspace.peak_used();
             workspace_peak_          = std::max(workspace_peak_, decision.workspace_bytes);
+            decision.graph.launch(p.cuda, p.parallel ? &*p.parallel : nullptr);
+            preparation.checkpoint();
         }
     }
 }
@@ -167,18 +178,29 @@ void Graphs::commit(int g, int c, bool repair, bool count_tokens) {
     workspace_peak_ = std::max(workspace_peak_, commit.workspace_bytes);
 }
 
-void RankProgramImpl::prepare_graphs() {
-    if (!resources.plan.use_cuda_graph || graphs) return;
+GraphPreparationSample RankProgramImpl::prepare_graphs(GraphPreparationMode mode) {
+    if (!resources.plan.use_cuda_graph || graphs) return {};
+    if (mode == GraphPreparationMode::Complete) {
+        prepare_graphs(GraphPreparationMode::Warmup);
+        return prepare_graphs(GraphPreparationMode::Capture);
+    }
+    GraphPreparation observation(device, mode);
     // Retain inputs on failure until the executor aborts communication and drains the Program.
     graph_inputs = std::make_unique<GraphInputs>(*this);
     graph_inputs->prepare();
-    const auto before = device_memory_snapshot(device.device());
-    graphs            = std::make_unique<Graphs>(*this);
-    graphs->prepare(*graph_inputs);
-    device.synchronize();
-    graph_memory.preparation_increment_bytes =
-        device_memory_growth(before, device_memory_snapshot(device.device()));
+    graphs = std::make_unique<Graphs>(*this);
+    graphs->prepare(*graph_inputs, observation);
+    observation.checkpoint();
     graph_inputs.reset();
+    const auto result = observation.sample();
+    if (observation.capturing()) {
+        graph_memory.preparation_increment_bytes = result.increment_bytes;
+        graph_memory.preparation_peak_bytes      = result.peak_bytes;
+    } else {
+        graphs.reset();
+        graph_memory.warmup_increment_bytes = result.increment_bytes;
+    }
+    return result;
 }
 
 void RankProgramImpl::release_graphs() {

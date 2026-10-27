@@ -164,8 +164,8 @@ RankProgram::RankProgram(const execution::Parameters& parameters, ExecutionPlan 
     : impl_(std::make_unique<detail::RankProgramImpl>(parameters, std::move(plan), device, observer,
                                                       binding)) {}
 
-void RankProgram::prepare_execution() {
-    if (impl_->shape.cuda_graph) { impl_->initialize_graphs(); }
+GraphPreparationSample RankProgram::prepare_execution(GraphPreparationMode mode) {
+    return impl_->initialize_graphs(mode);
 }
 
 void RankProgram::release_execution() { impl_->release_graphs(); }

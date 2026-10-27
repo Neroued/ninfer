@@ -16,6 +16,11 @@ public:
     [[nodiscard]] std::size_t available(DeviceMemorySnapshot current) const;
     [[nodiscard]] std::size_t available_host(DeviceMemorySnapshot current) const noexcept;
     [[nodiscard]] bool fits(DeviceMemorySnapshot current) const noexcept;
+    [[nodiscard]] std::size_t shortfall(DeviceMemorySnapshot current) const noexcept;
+    // Tightens the next explicit runtime offer after a completed over-budget preparation.
+    // Separate Host shortages cannot be recovered by reducing Device backing.
+    [[nodiscard]] std::size_t corrected_runtime_limit(DeviceMemorySnapshot current,
+                                                      std::size_t previous_runtime_bytes) const;
     [[nodiscard]] std::int64_t retained(DeviceMemorySnapshot current,
                                         std::size_t owned_bytes) const;
 

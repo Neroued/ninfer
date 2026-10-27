@@ -312,7 +312,9 @@ RankMemoryUsage RankProgram::observe_resources() const { return impl_->memory();
 
 RankMemoryBudget RankProgram::resource_budget() const { return impl_->budget(); }
 
-void RankProgram::prepare_execution() { impl_->prepare_graphs(); }
+GraphPreparationSample RankProgram::prepare_execution(GraphPreparationMode mode) {
+    return impl_->prepare_graphs(mode);
+}
 
 void RankProgram::release_execution() { impl_->release_graphs(); }
 

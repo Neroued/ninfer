@@ -12,8 +12,10 @@ template <class T>
 auto fields(T& v) {
     using Value = std::remove_cv_t<T>;
     if constexpr (std::is_same_v<Value, GraphMemorySummary>)
-        return std::tie(v.rebuild_estimate_bytes, v.preparation_increment_bytes,
-                        v.calibration_increment_bytes, v.calibration_retained_bytes);
+        return std::tie(v.rebuild_estimate_bytes, v.warmup_increment_bytes,
+                        v.preparation_increment_bytes, v.preparation_peak_bytes,
+                        v.calibration_increment_bytes, v.calibration_peak_bytes,
+                        v.rebuild_increment_bytes);
     else if constexpr (std::is_same_v<Value, VisionMemorySummary>)
         return std::tie(v.budget_bytes, v.max_window_features, v.encoder_workspace_bytes,
                         v.output_capacity_bytes, v.input_staging_bytes, v.output_active_bytes,
@@ -48,7 +50,10 @@ auto fields(T& v) {
     else if constexpr (std::is_same_v<Value, CommunicationWork>)
         return std::tie(v.calls, v.payload_bytes);
     else if constexpr (std::is_same_v<Value, CommunicationStatistics>)
-        return std::tie(v.group, v.size, v.eager, v.graph);
+        return std::tie(v.group, v.size, v.eager, v.graph, v.startup_memory);
+    else if constexpr (std::is_same_v<Value, CommunicationMemory>)
+        return std::tie(v.tracked_device_bytes, v.persistent_device_bytes,
+                        v.suspendable_device_bytes);
     else if constexpr (std::is_same_v<Value, RankHostStatistics>)
         return std::tie(v.submit_ns, v.progress_ns, v.supply_ns, v.commit_ns, v.discard_ns);
     else if constexpr (std::is_same_v<Value, GpuExecutionObservation>)

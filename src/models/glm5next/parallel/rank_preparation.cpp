@@ -2,6 +2,7 @@
 
 #include "models/glm5next/parallel/codec.h"
 #include "models/glm5next/parallel/wire.h"
+#include "models/common/vocabulary.h"
 
 #include <algorithm>
 
@@ -59,6 +60,44 @@ RankPreparation::RankPreparation(const artifact::Reader& reader, std::span<const
 
 ExecutionCodec RankPreparation::codec(const distributed::ExecutionTopology& topology) const {
     return ExecutionCodec(instance_->model->definition(), describe(), topology);
+}
+
+void RankPreparation::prepare_communication() {
+    if (!binding_.group) return;
+    using distributed::Collective;
+    using distributed::Reduction;
+    const auto& shape = plan_.shape;
+    const auto hidden = std::size_t(plan_.profile->config.text.hidden);
+    const auto batch  = std::size_t(shape.max_concurrency);
+    const auto decode = batch * (shape.draft_tokens + 1);
+    std::vector<distributed::CollectivePreparation> work;
+    for (const auto columns : {std::size_t(1), batch, decode, std::size_t(shape.prefill_chunk)})
+        work.push_back({Collective::AllReduce, DType::BF16, hidden * columns});
+    for (std::uint32_t root = 0; root < binding_.group->size(); ++root) {
+        for (const auto columns : {std::size_t(1), std::size_t(shape.prefill_chunk)})
+            work.push_back(
+                {Collective::Broadcast, DType::BF16, hidden * columns, Reduction::Sum, root});
+        if (plan_.workspace.vision)
+            work.push_back({Collective::Broadcast, DType::BF16,
+                            plan_.workspace.vision->output_bytes / dtype_size(DType::BF16),
+                            Reduction::Sum, root});
+    }
+    if (shape.purpose == EnginePurpose::Generation) {
+        for (const auto columns : {std::size_t(1), batch, decode}) {
+            work.push_back({Collective::AllGather, DType::BF16, hidden * columns});
+            work.push_back(
+                {Collective::AllGather, DType::I64, DistributedVocabulary::candidates * columns});
+        }
+        if (plan_.profile->mtp)
+            work.push_back({Collective::AllReduce, DType::U64, batch, Reduction::Max});
+    } else {
+        work.push_back({Collective::AllGather, DType::FP32,
+                        3 * std::size_t(std::min(shape.prefill_chunk, 1024U))});
+    }
+    binding_.group->prepare(work, {}, device_.execution_view());
+    if (peer_.group)
+        context::prepare_peer_communication(*peer_.group, plan_.peer_staging.front().bytes,
+                                            device_.transfer_view());
 }
 
 } // namespace ninfer::models::glm5next

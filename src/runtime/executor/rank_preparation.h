@@ -32,7 +32,7 @@ prepare_rank(distributed::WorkerConnection& connection, std::unique_ptr<artifact
     namespace wire       = distributed::wire;
     auto& device         = connection.device();
     const auto& topology = connection.topology();
-    const auto initial   = device_memory_snapshot(device.device());
+    const auto initial   = connection.memory_origin();
     preparing = std::make_unique<Preparation>(*reader, payload, connection.bootstrap().identity,
                                               device, topology, connection.communication());
     const auto requirement = preparing->memory();
@@ -50,9 +50,9 @@ prepare_rank(distributed::WorkerConnection& connection, std::unique_ptr<artifact
         throw std::invalid_argument("rank immutable Host weights exceed available RAM");
     preparing->materialize();
     reader.reset();
-    const auto after_weights = device_memory_snapshot(device.device());
-    std::uint32_t attempt    = 0;
-    std::size_t correction   = 0;
+    const auto after_weights    = device_memory_snapshot(device.device());
+    std::uint32_t attempt       = 0;
+    std::size_t maximum_runtime = SIZE_MAX;
     ContextCapacityPlan capacity_plan;
     const auto report = [&] {
         const auto snapshot  = device_memory_snapshot(device.device());
@@ -60,7 +60,8 @@ prepare_rank(distributed::WorkerConnection& connection, std::unique_ptr<artifact
         wire::Encoder out;
         out.u64(topology.plan);
         out.u32(attempt);
-        auto value = preparing->report(available > correction ? available - correction : 0);
+        auto value                     = preparing->report(available);
+        value.capacity.available_bytes = std::min(value.capacity.available_bytes, maximum_runtime);
         value.capacity.available_host_bytes   = budget.available_host(snapshot);
         value.capacity.shared_physical_memory = snapshot.shared_physical_memory;
         capacity_plan                         = value.capacity.plan;
@@ -75,10 +76,11 @@ prepare_rank(distributed::WorkerConnection& connection, std::unique_ptr<artifact
     bool entered = false, accepted = false;
     ContextCapacity allocated_capacity;
     DeviceMemorySnapshot allocation_snapshot{};
-    std::size_t opaque_growth             = 0;
     std::size_t control_reservation_bytes = 0;
-    const auto describe                   = [&] {
-        auto result                                 = preparing->describe();
+    std::string failure;
+    const auto describe = [&] {
+        auto result = preparing->describe();
+        connection.communication().sample_startup_memory();
         const auto after                            = device_memory_snapshot(device.device());
         auto& observation                           = result.observation;
         const auto& identity                        = connection.bootstrap().identity;
@@ -101,13 +103,15 @@ prepare_rank(distributed::WorkerConnection& connection, std::unique_ptr<artifact
         result.budget.planned_slack_bytes           = budget.available(after);
         result.budget.retained_bytes =
             budget.retained(allocation_snapshot, requirement.weight_bytes);
-        const auto planned =
-            result.budget.runtime_reservation_bytes +
-            (after.shared_physical_memory ? control_reservation_bytes : 0) +
-            (result.budget.graphs ? result.budget.graphs->rebuild_estimate_bytes : 0);
-        const auto observed = device_memory_growth(allocation_snapshot, after);
-        opaque_growth = observed > static_cast<std::int64_t>(planned) ? observed - planned : 0;
-        accepted      = budget.fits(after);
+        accepted = budget.fits(after);
+        if (!accepted) {
+            const auto cost = result.budget.runtime_reservation_bytes +
+                              (after.shared_physical_memory ? control_reservation_bytes : 0);
+            const auto deficit = budget.shortfall(after);
+            maximum_runtime =
+                std::min(maximum_runtime, budget.corrected_runtime_limit(after, cost));
+            failure = "startup memory budget exceeded by " + std::to_string(deficit) + " bytes";
+        }
         wire::Encoder out;
         if (accepted) encode(out, result);
         return std::move(out).take();
@@ -117,6 +121,7 @@ prepare_rank(distributed::WorkerConnection& connection, std::unique_ptr<artifact
         out.u64(topology.plan);
         out.u32(attempt);
         out.boolean(accepted);
+        out.string(failure);
         out.bytes(description);
         connection.send(wire::Kind::Allocated, std::move(out).take());
     };
@@ -132,25 +137,50 @@ prepare_rank(distributed::WorkerConnection& connection, std::unique_ptr<artifact
         const ContextCapacity capacity{command.u64()};
         const auto planned_control_bytes = command.u64();
         command.finish();
-        if (action == PreparationAction::PrepareProbe) {
+        if (action == PreparationAction::PrepareCommunication) {
+            preparing->prepare_communication();
+            device.synchronize();
+            connection.communication().sample_startup_memory();
+            report();
+            continue;
+        }
+        if (action == PreparationAction::PrepareProbe ||
+            action == PreparationAction::PrepareRebuildProbe) {
             bool success = true;
             try {
-                if constexpr (requires { preparing->prepare_probe(); })
-                    preparing->prepare_probe();
-                else
+                if constexpr (requires {
+                                  preparing->prepare_probe();
+                                  preparing->prepare_rebuild_probe();
+                              }) {
+                    if (action == PreparationAction::PrepareProbe)
+                        preparing->prepare_probe();
+                    else
+                        preparing->prepare_rebuild_probe();
+                } else
                     throw std::logic_error("rank preparation has no calibration probe");
-            } catch (const DeviceAllocationError&) { success = false; }
+            } catch (const DeviceAllocationError& error) {
+                success = false;
+                failure = error.what();
+            }
             wire::Encoder out;
             out.u64(topology.plan);
             out.u32(attempt);
             out.boolean(success);
+            out.string(failure);
             connection.send(wire::Kind::Allocated, std::move(out).take());
             continue;
         }
-        if (action == PreparationAction::Calibrate) {
-            if constexpr (requires { preparing->calibrate(); })
-                preparing->calibrate();
-            else
+        if (action == PreparationAction::Calibrate ||
+            action == PreparationAction::CalibrateRebuild) {
+            if constexpr (requires {
+                              preparing->calibrate();
+                              preparing->calibrate_rebuild();
+                          }) {
+                if (action == PreparationAction::Calibrate)
+                    preparing->calibrate();
+                else
+                    preparing->calibrate_rebuild();
+            } else
                 throw std::logic_error("rank preparation has no calibration phase");
             report();
             continue;
@@ -158,12 +188,8 @@ prepare_rank(distributed::WorkerConnection& connection, std::unique_ptr<artifact
         if (action == PreparationAction::Release) {
             if (!entered) throw std::logic_error("rank has not entered this allocation attempt");
             preparing->release_resources();
-            const auto retained = std::max<std::int64_t>(
-                0,
-                device_memory_growth(allocation_snapshot, device_memory_snapshot(device.device())));
-            correction = std::max(correction, opaque_growth > static_cast<std::uint64_t>(retained)
-                                                  ? opaque_growth - retained
-                                                  : 0);
+            device.synchronize();
+            failure.clear();
             entered = accepted = false;
             ++attempt;
             report();
@@ -192,24 +218,19 @@ prepare_rank(distributed::WorkerConnection& connection, std::unique_ptr<artifact
             throw std::logic_error("rank allocation is already entered");
         const auto before         = device_memory_snapshot(device.device());
         allocation_snapshot       = before;
-        opaque_growth             = 0;
         const auto available      = budget.available(before);
         control_reservation_bytes = planned_control_bytes;
-        wire::Bytes description;
-        try {
-            const auto local_control = capacity_plan.control_bytes(capacity);
-            const auto remote_control =
-                planned_control_bytes > local_control ? planned_control_bytes - local_control : 0;
-            auto remaining      = available > correction ? available - correction : 0;
-            auto host_remaining = budget.available_host(before);
-            if (before.shared_physical_memory)
-                remaining = remaining > remote_control ? remaining - remote_control : 0;
-            else
-                host_remaining =
-                    host_remaining > remote_control ? host_remaining - remote_control : 0;
-            preparing->prepare(capacity, remaining, host_remaining);
-            description = describe();
-        } catch (const DeviceAllocationError&) { accepted = false; }
+        const auto local_control  = capacity_plan.control_bytes(capacity);
+        const auto remote_control =
+            planned_control_bytes > local_control ? planned_control_bytes - local_control : 0;
+        auto remaining      = available;
+        auto host_remaining = budget.available_host(before);
+        if (before.shared_physical_memory)
+            remaining = remaining > remote_control ? remaining - remote_control : 0;
+        else
+            host_remaining = host_remaining > remote_control ? host_remaining - remote_control : 0;
+        preparing->prepare(capacity, remaining, host_remaining);
+        auto description   = describe();
         entered            = true;
         allocated_capacity = capacity;
         allocated(std::move(description));

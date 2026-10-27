@@ -680,7 +680,7 @@ int coordinator(int argc, char** argv) {
         topology.ranks[r.rank] = {r.rank,         r.node,         0,  r.device,
                                   {r.rank, size}, {r.rank, size}, {}, {}};
     topology.groups.push_back({0, {0, 1}});
-    topology.groups.push_back({1, {0, 1}});
+    topology.groups.push_back({1, {0, 1}, dist::GroupUsage::PeerExchange});
     topology.roles = {{"tp", 0}, {"ep", 0}, {"context", 1}};
     const std::array<std::string, 1> arguments{"--worker"};
     const auto prepare = [&] {

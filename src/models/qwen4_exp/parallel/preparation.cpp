@@ -1,4 +1,5 @@
 #include "models/qwen4_exp/parallel/preparation.h"
+#include "models/common/vocabulary.h"
 
 #include <algorithm>
 
@@ -58,6 +59,40 @@ void RankPreparation::materialize() {
     load_.reset();
 }
 
+void RankPreparation::prepare_communication() {
+    using distributed::Collective;
+    using distributed::Reduction;
+    const auto plan   = plan_graph_probe(profile_, {}, options_, device_, {});
+    const auto& shape = plan.shape;
+    const auto hidden = std::size_t(profile_->config.text.hidden);
+    const auto batch  = std::size_t(shape.max_concurrency);
+    const auto decode = batch * (shape.draft_tokens + 1);
+    std::vector<distributed::CollectivePreparation> work;
+    for (const auto columns : {std::size_t(1), batch, decode, std::size_t(shape.prefill_chunk)}) {
+        work.push_back({Collective::AllReduce, DType::BF16, hidden * columns});
+        if (plan.persistent.buffers.ple_embedding)
+            work.push_back({Collective::AllReduce, DType::U32,
+                            profile_->config.text.ple.embedding * columns *
+                                dtype_size(DType::BF16) / dtype_size(DType::U32)});
+    }
+    if (shape.purpose == EnginePurpose::Generation) {
+        for (const auto columns : {std::size_t(1), batch, decode})
+            work.push_back(
+                {Collective::AllGather, DType::I64, DistributedVocabulary::candidates * columns});
+        if (profile_->mtp)
+            work.push_back({Collective::AllReduce, DType::U64, batch, Reduction::Max});
+    } else {
+        work.push_back({Collective::AllGather, DType::FP32,
+                        3 * std::size_t(std::min(shape.prefill_chunk, 1024U))});
+    }
+    if (plan.workspace.vision)
+        for (std::uint32_t root = 0; root < binding_.group->size(); ++root)
+            work.push_back({Collective::Broadcast, DType::BF16,
+                            plan.workspace.vision->output_bytes / dtype_size(DType::BF16),
+                            Reduction::Sum, root});
+    binding_.group->prepare(work, {}, device_.execution_view());
+}
+
 runtime::RankPreparationReport RankPreparation::report(std::size_t available) const {
     const auto& model  = *instance_->model;
     const auto& s      = model.storage_stats();
@@ -77,27 +112,42 @@ runtime::RankPreparationReport RankPreparation::report(std::size_t available) co
 
 void RankPreparation::prepare_probe() {
     if (!options_.use_cuda_graph) return;
-    auto plan = plan_graph_probe(profile_, {}, options_, device_, {});
+    create_probe(GraphProbeBacking::Inputs);
+}
+
+void RankPreparation::prepare_rebuild_probe() {
+    if (!options_.use_cuda_graph) return;
+    create_probe(GraphProbeBacking::StartupWorkingSet);
+}
+
+void RankPreparation::create_probe(GraphProbeBacking backing) {
+    auto plan = plan_graph_probe(profile_, {}, options_, device_, {}, backing);
     probe_    = std::make_unique<RankProgram>(instance_->parameters, std::move(plan), device_,
                                               options_.startup_observer, binding_);
 }
 
 void RankPreparation::calibrate() {
     if (!probe_) return;
-    const auto before = device_memory_snapshot(device_.device());
-    probe_->prepare_execution();
-    const auto ready = device_memory_snapshot(device_.device());
-    probe_->release_execution();
-    const auto released                       = device_memory_snapshot(device_.device());
-    graph_memory_.calibration_increment_bytes = device_memory_growth(before, ready);
-    graph_memory_.calibration_retained_bytes  = device_memory_growth(before, released);
-    graph_memory_.rebuild_estimate_bytes =
-        std::max<std::int64_t>(0, device_memory_growth(released, ready));
+    graph_memory_ = begin_graph_calibration(
+        device_, [&](GraphPreparationMode mode) { return probe_->prepare_execution(mode); },
+        [&] { probe_->release_execution(); });
     probe_.reset();
     device_.synchronize();
 }
 
-void RankPreparation::prepare_execution() { instance_->program->prepare_execution(); }
+void RankPreparation::calibrate_rebuild() {
+    if (!probe_) return;
+    complete_graph_calibration(
+        graph_memory_, device_,
+        [&](GraphPreparationMode mode) { return probe_->prepare_execution(mode); },
+        [&] { probe_->release_execution(); });
+    probe_.reset();
+    device_.synchronize();
+}
+
+void RankPreparation::prepare_execution() {
+    instance_->program->prepare_execution(GraphPreparationMode::Capture);
+}
 
 void RankPreparation::prepare(runtime::ContextCapacity capacity, std::size_t available,
                               std::size_t available_host_bytes) {
@@ -114,6 +164,10 @@ void RankPreparation::prepare(runtime::ContextCapacity capacity, std::size_t ava
 }
 
 void RankPreparation::release_resources() {
+    if (instance_->program)
+        if (const auto graph = instance_->program->graph_memory_observation())
+            graph_memory_.rebuild_estimate_bytes =
+                std::max(graph_memory_.rebuild_estimate_bytes, graph->preparation_peak_bytes);
     instance_->program.reset();
     device_.synchronize();
 }
@@ -128,8 +182,10 @@ RankExecutionDescription RankPreparation::describe() const {
     result.observation.physical_memory.emplace();
     if (result.budget.graphs) {
         const auto increment = result.budget.graphs->preparation_increment_bytes;
+        const auto peak      = result.budget.graphs->preparation_peak_bytes;
         result.budget.graphs = graph_memory_;
         result.budget.graphs->preparation_increment_bytes = increment;
+        result.budget.graphs->preparation_peak_bytes      = peak;
     }
     return result;
 }

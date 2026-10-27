@@ -578,7 +578,13 @@ int main() {
         memory.memory.workspace                                 = {64, 96, 80};
         memory.memory.experts.emplace().fixed_experts_per_layer = {1, 7, 3};
         RankMemoryBudget budget;
-        budget.graphs = GraphMemorySummary{42, -12, 5, -8};
+        budget.graphs = GraphMemorySummary{.rebuild_estimate_bytes      = 42,
+                                           .warmup_increment_bytes      = -8,
+                                           .preparation_increment_bytes = -12,
+                                           .preparation_peak_bytes      = 23,
+                                           .calibration_increment_bytes = 5};
+        memory.communication.push_back(
+            {.group = 1, .size = 2, .startup_memory = CommunicationMemory{100, 20, 80}});
         wire::Encoder out;
         runtime::protocol::encode(out, memory);
         runtime::protocol::encode(out, budget);
@@ -590,6 +596,8 @@ int main() {
         require(report.rank == 1 && report.node == 3 &&
                     report.memory.workspace.required_peak_bytes == 96 &&
                     planning.graphs->preparation_increment_bytes == -12 &&
+                    planning.graphs->preparation_peak_bytes == 23 &&
+                    report.communication.at(0).startup_memory->tracked_device_bytes == 100 &&
                     report.memory.experts->fixed_experts_per_layer ==
                         std::vector<std::uint32_t>{1, 7, 3},
                 "resource observation lost rank identity, values or signed calibration");

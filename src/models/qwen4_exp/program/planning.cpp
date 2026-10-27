@@ -251,7 +251,8 @@ std::optional<ExecutionPlan> plan_execution(std::shared_ptr<const execution::Mod
 
 ExecutionPlan plan_graph_probe(std::shared_ptr<const execution::ModelProfile> profile,
                                ple::disk::TableGeometry table, const EngineOptions& supplied,
-                               DeviceContext& device, std::shared_ptr<const moe::Plan> schedule) {
+                               DeviceContext& device, std::shared_ptr<const moe::Plan> schedule,
+                               GraphProbeBacking backing) {
     auto o                              = options(*profile, supplied);
     o.context_cache.host_capacity_bytes = 0;
     auto plan           = physical_plan(std::move(profile), table, o, device, schedule.get());
@@ -261,7 +262,9 @@ ExecutionPlan plan_graph_probe(std::shared_ptr<const execution::ModelProfile> pr
     const auto geometry = describe_context_pool(budget.records);
     std::vector<RecordRequest> records;
     for (const auto id : geometry.spec_classes) records.push_back({id, o.max_concurrency});
-    plan.capacity.device_bytes              = geometry.required_bytes(records);
+    plan.capacity.device_bytes              = backing == GraphProbeBacking::Inputs
+                                                  ? geometry.required_bytes(records)
+                                                  : budget.minimum_capacity().device_bytes;
     plan.capacity.block_bytes               = geometry.block_bytes;
     plan.capacity.runtime_reservation_bytes = plan.device_reservation_bytes();
     return plan;

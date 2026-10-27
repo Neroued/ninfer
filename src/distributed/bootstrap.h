@@ -39,6 +39,8 @@ public:
 
     [[nodiscard]] CommunicationContext& communication() noexcept { return *communication_; }
 
+    [[nodiscard]] DeviceMemorySnapshot memory_origin() const noexcept { return memory_origin_; }
+
     [[nodiscard]] const WorkerBootstrap& bootstrap() const noexcept { return bootstrap_; }
 
     [[nodiscard]] const ExecutionTopology& topology() const noexcept { return topology_; }
@@ -53,6 +55,7 @@ private:
     ExecutionTopology topology_;
     std::unique_ptr<Transport> transport_;
     std::unique_ptr<DeviceContext> device_;
+    DeviceMemorySnapshot memory_origin_;
     std::unique_ptr<CommunicationContext> communication_;
     bool closed_ = false;
 };

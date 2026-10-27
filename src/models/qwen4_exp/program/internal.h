@@ -88,7 +88,7 @@ public:
                     const StartupObserver& observer = {}, ParallelBinding = {});
     ~RankProgramImpl();
 
-    void initialize_graphs();
+    GraphPreparationSample initialize_graphs(GraphPreparationMode = GraphPreparationMode::Complete);
     void release_graphs();
     void validate_work(const Work&, runtime::FrameKind) const;
     void start(runtime::ExecutionRequest<ExecutionTypes>&&);
@@ -172,6 +172,7 @@ public:
     std::unique_ptr<Graphs> graphs;
     std::unique_ptr<DeviceGraphs> device_graphs;
     std::unique_ptr<MtpCommitGraphs> commit_graphs;
+    std::unique_ptr<GraphInputs> graph_inputs;
     std::optional<GraphMemorySummary> graph_memory;
     std::size_t workspace_lifetime_peak = 0;
     CudaEventTimer prefill_timer;

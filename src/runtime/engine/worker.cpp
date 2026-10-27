@@ -45,32 +45,12 @@ void run_rank(distributed::WorkerConnection& connection, std::unique_ptr<artifac
     }
 }
 
-void warm_communication(distributed::WorkerConnection& connection) {
-    auto& device = connection.device();
-    DeviceBuffer words(device.device(), 4096);
-    try {
-        words.fill();
-        for (const auto& group : connection.topology().groups) {
-            const auto rank = connection.bootstrap().identity.rank;
-            if (std::find(group.members.begin(), group.members.end(), rank) == group.members.end())
-                continue;
-            connection.communication().group(group.id).enqueue(
-                distributed::Collective::AllReduce, words.data(), words.data(), 1024, DType::FP32,
-                distributed::Reduction::Sum, 0, device.execution_view());
-        }
-        device.synchronize();
-    } catch (const std::exception& error) {
-        connection.fail(error.what());
-        throw;
-    }
-}
 } // namespace
 
 void run_worker(distributed::WorkerBootstrap bootstrap) {
     distributed::WorkerConnection connection(std::move(bootstrap));
     try {
         std::cerr << distributed::rank_description(connection.bootstrap().identity) << std::endl;
-        warm_communication(connection);
         auto message = receive_preparation_command(connection);
         if (message.kind == wire::Kind::Shutdown) {
             connection.shutdown();

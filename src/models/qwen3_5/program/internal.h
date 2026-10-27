@@ -120,7 +120,7 @@ public:
     void project_decode(std::uint32_t batch, std::uint32_t width);
     void decide_decode(std::uint32_t batch, std::uint32_t width);
     void readback_decode(std::uint32_t batch, bool speculative);
-    void initialize_graphs();
+    GraphPreparationSample initialize_graphs(GraphPreparationMode = GraphPreparationMode::Complete);
     void release_graphs();
     void append_draft_history(ComputeOperation&);
     void append_draft_history(std::uint32_t batch, ops::KVCacheAppendPrefixExecutionEnvelope);

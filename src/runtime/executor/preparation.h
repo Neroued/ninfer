@@ -34,8 +34,11 @@ enum class PreparationAction : std::uint8_t {
     Release,
     Activate,
     CheckMemory,
+    PrepareCommunication,
     PrepareProbe,
     Calibrate,
+    PrepareRebuildProbe,
+    CalibrateRebuild,
     PrepareExecution
 };
 

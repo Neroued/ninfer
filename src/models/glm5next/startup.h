@@ -31,8 +31,11 @@ public:
     [[nodiscard]] runtime::PreparationMemory memory() const;
     [[nodiscard]] runtime::RankPreparationReport report(std::size_t available_bytes) const;
     void materialize();
+    void prepare_communication();
     void prepare_probe();
     void calibrate();
+    void prepare_rebuild_probe();
+    void calibrate_rebuild();
     void prepare_execution();
     void prepare(runtime::ContextCapacity, std::size_t available_bytes,
                  std::size_t available_host_bytes);
@@ -42,6 +45,7 @@ public:
     [[nodiscard]] std::unique_ptr<Instance> finish() &&;
 
 private:
+    void create_probe(std::size_t context_bytes);
     DeviceContext& device_;
     EngineOptions options_;
     ContextCommunication peer_;

@@ -60,13 +60,14 @@ void RankProgram::reset_measurement_peaks() noexcept { impl_->reset_measurement_
 
 std::unique_ptr<RankProgram> create_rank_program(const execution::Parameters& parameters,
                                                  SequencePlan&& plan, DeviceContext& device,
-                                                 const StartupObserver& observer) {
+                                                 const StartupObserver& observer,
+                                                 GraphPreparationMode mode) {
     if (!plan.impl_) throw std::invalid_argument("Qwen3.5 rank requires a sequence plan");
     auto impl =
         std::make_unique<detail::RankProgramImpl>(parameters, *plan.impl_, device, observer);
     if (plan.impl_->use_cuda_graph) {
         StartupPhaseScope phase(observer, StartupPhase::CudaGraphPrepare);
-        impl->initialize_graphs();
+        impl->initialize_graphs(mode);
         phase.complete();
     }
     plan.impl_.reset();

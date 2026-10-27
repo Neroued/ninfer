@@ -9,7 +9,7 @@ namespace ninfer::models::qwen4_exp::detail {
 class DeviceGraphs {
 public:
     explicit DeviceGraphs(RankProgramImpl&);
-    void prepare(GraphInputs&);
+    void prepare(GraphInputs&, GraphPreparation&);
     void replay(std::uint32_t batch, std::span<const std::uint32_t> draft_visible,
                 std::uint32_t main_visible, bool head, bool read_drafts);
     void decide(std::uint32_t batch, bool verify);

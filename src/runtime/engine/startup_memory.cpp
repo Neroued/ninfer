@@ -4,6 +4,7 @@
 #include <charconv>
 #include <cstdlib>
 #include <limits>
+#include <string>
 #include <string_view>
 #include <stdexcept>
 
@@ -41,16 +42,35 @@ std::size_t StartupMemoryBudget::available(DeviceMemorySnapshot current) const {
 }
 
 bool StartupMemoryBudget::fits(DeviceMemorySnapshot current) const noexcept {
+    return shortfall(current) == 0;
+}
+
+std::size_t StartupMemoryBudget::shortfall(DeviceMemorySnapshot current) const noexcept {
     const auto consumed       = device_memory_growth(initial_, current);
     const auto device_reserve = initial_.shared_physical_memory ? host_reservation_ : 0;
-    return consumed <= static_cast<std::int64_t>(limit_ - device_reserve) &&
-           current.system_available_bytes >= host_reservation_;
+    const auto device_shortfall =
+        std::max<std::int64_t>(0, consumed - static_cast<std::int64_t>(limit_ - device_reserve));
+    const auto host_shortfall = current.system_available_bytes < host_reservation_
+                                    ? host_reservation_ - current.system_available_bytes
+                                    : 0;
+    return std::max(static_cast<std::size_t>(device_shortfall), host_shortfall);
 }
 
 std::size_t StartupMemoryBudget::available_host(DeviceMemorySnapshot current) const noexcept {
     return current.system_available_bytes > host_reservation_
                ? current.system_available_bytes - host_reservation_
                : 0;
+}
+
+std::size_t StartupMemoryBudget::corrected_runtime_limit(DeviceMemorySnapshot current,
+                                                         std::size_t previous_runtime_bytes) const {
+    if (!initial_.shared_physical_memory && current.system_available_bytes < host_reservation_)
+        throw std::runtime_error("runtime preparation leaves " +
+                                 std::to_string(current.system_available_bytes) +
+                                 " bytes of Host RAM, below the reserved " +
+                                 std::to_string(host_reservation_) + " bytes");
+    const auto deficit = shortfall(current);
+    return previous_runtime_bytes > deficit ? previous_runtime_bytes - deficit : 0;
 }
 
 std::int64_t StartupMemoryBudget::retained(DeviceMemorySnapshot current,

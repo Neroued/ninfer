@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/decode_graph.h"
+#include "models/common/graph_preparation.h"
 #include "models/qwen3_5/program/resources.h"
 #include "models/qwen3_5/program/text_graph.h"
 
@@ -50,7 +51,8 @@ struct GraphBodies {
 class Graphs {
 public:
     explicit Graphs(GraphSpec spec);
-    void prepare(Resources&, const execution::Parameters&, DeviceContext&, const GraphBodies&);
+    void prepare(Resources&, const execution::Parameters&, DeviceContext&, const GraphBodies&,
+                 GraphPreparation&);
     [[nodiscard]] bool start(GraphPhase, std::uint32_t batch, std::uint32_t frontier,
                              CudaExecutionView);
     [[nodiscard]] bool poll();

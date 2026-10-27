@@ -693,7 +693,8 @@ make_sequence_planner_impl(std::shared_ptr<const execution::ModelProfile> profil
 
 std::unique_ptr<SequencePlanImpl>
 make_graph_probe_plan(std::shared_ptr<const execution::ModelProfile> profile, DeviceContext& device,
-                      const EngineOptions& options, std::shared_ptr<const moe::Plan> moe) {
+                      const EngineOptions& options, std::shared_ptr<const moe::Plan> moe,
+                      GraphProbeBacking backing) {
     auto planner = make_sequence_planner_impl(std::move(profile), device, options, std::move(moe));
     auto inputs  = std::move(planner->inputs);
     inputs.context_cache.host_capacity_bytes = 0;
@@ -701,7 +702,10 @@ make_graph_probe_plan(std::shared_ptr<const execution::ModelProfile> profile, De
     const auto geometry                      = describe_context_pool(records);
     std::vector<RecordRequest> demand;
     for (const auto id : geometry.spec_classes) demand.push_back({id, inputs.max_concurrency});
-    auto plan         = build_sequence_candidate(inputs, geometry.required_bytes(demand));
+    const auto bytes  = backing == GraphProbeBacking::Inputs
+                            ? geometry.required_bytes(demand)
+                            : planner->capacity_plan.minimum_capacity().device_bytes;
+    auto plan         = build_sequence_candidate(inputs, bytes);
     plan->graph_probe = true;
     return plan;
 }

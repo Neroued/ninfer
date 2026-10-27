@@ -48,7 +48,7 @@ struct PrepareFixture {
     PrepareFixture(const Options& o, int tokens)
         : q(o.op == "prepare-kv"
                 ? DeviceBuffer{}
-                : make_bf16(std::size_t(3072 * o.kv_heads) * tokens * o.batch, 101)),
+                : make_bf16(std::size_t(256 * prepare_query_heads(o.kv_heads)) * tokens * o.batch, 101)),
           k(make_bf16(std::size_t(256 * o.kv_heads) * tokens * o.batch, 103)),
           v(make_bf16(std::size_t(256 * o.kv_heads) * tokens * o.batch, 107)),
           iq(o.op == "prepare-kv" ? DeviceBuffer{}
@@ -135,7 +135,7 @@ struct PrepareFixture {
                       plane(value_scale_plane), 256, o.kv_heads, o.storage},
                      {plane(index_plane)}};
         projected = {kv_only ? Tensor{}
-                             : Tensor(q.span(), DType::BF16, {256, 12 * o.kv_heads, tokens, B}),
+                             : Tensor(q.span(), DType::BF16, {256, prepare_query_heads(o.kv_heads), tokens, B}),
                      Tensor(k.span(), DType::BF16, {256, o.kv_heads, tokens, B}),
                      Tensor(v.span(), DType::BF16, {256, o.kv_heads, tokens, B}),
                      kv_only ? Tensor{} : Tensor(iq.span(), DType::BF16, {128, 4, tokens, B}),
@@ -152,7 +152,7 @@ struct PrepareFixture {
         rho         = Tensor(rope.span(), DType::I32, {tokens, A, B});
         query       = kv_only     ? Tensor{}
                       : o.inplace ? projected.query
-                                  : Tensor(out_q.span(), DType::BF16, {256, 12 * o.kv_heads, tokens, B});
+                                  : Tensor(out_q.span(), DType::BF16, {256, prepare_query_heads(o.kv_heads), tokens, B});
         index_query = kv_only     ? Tensor{}
                       : o.inplace ? projected.index_query
                                   : Tensor(out_iq.span(), DType::BF16, {128, 4, tokens, B});

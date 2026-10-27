@@ -2,6 +2,8 @@
 #include "ops/softmax_attention/qsa/prepare/launch.h"
 #include "ops/softmax_attention/qsa/validation.h"
 
+#include "ops/softmax_attention/qsa/geometry.h"
+
 #include <cmath>
 #include <initializer_list>
 
@@ -21,7 +23,8 @@ void validate_kv(const detail::qsa::ViewValidation& v, const QsaKvProjectionView
                  QsaCacheView cache, QsaRawRecordWriteView records) {
     const int tokens = p.key.ne[2], rows = p.key.ne[3], axes = rope_positions.ne[1];
     const int kv_heads = p.key.ne[1];
-    v.require(kv_heads == 1 || kv_heads == 2, "unsupported head geometry");
+    v.require(detail::qsa::registered_query_heads(kv_heads, cache.main.storage) != 0,
+              "unsupported head geometry");
     v.require(tokens > 0 && rows >= 1 && rows <= 8 && (axes == 1 || axes == 3), "T/B/A");
     v.require(parameters.rms_epsilon > 0 && std::isfinite(parameters.rms_epsilon) &&
                   parameters.rope_theta > 0 && std::isfinite(parameters.rope_theta),
@@ -81,7 +84,8 @@ void qsa_prepare(const QsaProjectionView& p, const QsaPrepareParameters& paramet
     const detail::qsa::ViewValidation v{"qsa_prepare", execution.device()};
     validate_kv(v, {p.key, p.value, p.index_key}, parameters.kv, batch, rope_positions, before,
                 cache, records);
-    const int tokens = p.key.ne[2], rows = p.key.ne[3], query_heads = 12 * p.key.ne[1];
+    const int tokens = p.key.ne[2], rows = p.key.ne[3],
+              query_heads = detail::qsa::registered_query_heads(p.key.ne[1], cache.main.storage);
     v.dense(p.query, DType::BF16, {256, query_heads, tokens, rows}, 16, "query projection");
     v.dense(p.index_query, DType::BF16, {128, 4, tokens, rows}, 16, "index-query projection");
     v.dense(query, DType::BF16, {256, query_heads, tokens, rows}, 16, "query output");

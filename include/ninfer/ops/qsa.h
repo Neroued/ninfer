@@ -255,7 +255,8 @@ void qsa_sparse_gqa(const Tensor& query, const Tensor& output_gate,
  *
  * Logical shapes / supported domain:
  * The current rotary implementation accepts rotary_dim=64, interleaved sections [11,11,10].
- * Hkv=1 or 2, Hq=12*Hkv; index queries always have four heads. Cache and projections agree on
+ * Supported Hq/Hkv and storage combinations belong to the implementation catalog; index queries
+ * always have four heads. Cache and projections agree on
  * Hkv. T>0, B in [1,8], A=1 or 3. Projections and both outputs have the shapes above, are
  * contiguous and 16-byte aligned. Norm weights are contiguous, naturally aligned BF16 vectors.
  * Positions are contiguous I32 [T,B]; rho is contiguous I32 [T,A,B]. Metadata is contiguous Device

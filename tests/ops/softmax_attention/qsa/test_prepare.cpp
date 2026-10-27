@@ -1,3 +1,4 @@
+#include "core/platform.h"
 #include "ops/suite.h"
 #include "kv_cache_storage.h"
 #include "prepare_fixture.h"
@@ -415,12 +416,16 @@ int norm_alignment_and_phase(DeviceContext& device,
     int failures = 0;
     for (int tokens : {129, 321}) {
         Fixture f(tokens, 1, 1, 3, 1, 0, storage, kv_heads);
-        Buffer<std::uint16_t> wq(DType::BF16, {257}), wiq(DType::BF16, {129});
+        Buffer<std::uint16_t> wq(DType::BF16, {257}), wiq(DType::BF16, {129}),
+            wk(DType::BF16, {257});
         std::copy(f.wq.host.begin(), f.wq.host.end(), wq.host.begin() + 1);
         std::copy(f.wiq.host.begin(), f.wiq.host.end(), wiq.host.begin() + 1);
+        std::copy(f.wk.host.begin(), f.wk.host.end(), wk.host.begin() + 1);
+        wk.upload();
         wq.upload();
         wiq.upload();
         for (bool shifted : {true, false}) {
+            f.parameters.kv.key_norm      = shifted ? wk.view.slice(0, 1, 256) : f.wk.view;
             f.parameters.query_norm       = shifted ? wq.view.slice(0, 1, 256) : f.wq.view;
             f.parameters.index_query_norm = shifted ? wiq.view.slice(0, 1, 128) : f.wiq.view;
             for (float theta : {1e7F, 0.5F}) {
@@ -431,7 +436,8 @@ int norm_alignment_and_phase(DeviceContext& device,
                 failures += verify(f, "norm alignment/phase domain");
             }
         }
-        failures += wq.preserved("shifted Q norm") + wiq.preserved("shifted IQ norm");
+        failures += wq.preserved("shifted Q norm") + wiq.preserved("shifted IQ norm") +
+                    wk.preserved("shifted K norm");
     }
     return failures;
 }
@@ -515,8 +521,9 @@ int validation(DeviceContext& device) {
     return failures;
 }
 
-int exact_key_encoding(DeviceContext& device, KvCacheStorage storage, bool kv_only = false) {
-    Fixture f(16, 1, 1, 3, 1, 0, storage);
+int exact_key_encoding(DeviceContext& device, KvCacheStorage storage, bool kv_only = false,
+                       int kv_heads = 2) {
+    Fixture f(16, 1, 1, 3, 1, 0, storage, kv_heads);
     f.kv_only     = kv_only;
     f.base_origin = 64;
     f.reset(0, true);
@@ -559,8 +566,9 @@ int exact_key_encoding(DeviceContext& device, KvCacheStorage storage, bool kv_on
     return failures;
 }
 
-int scale_edges(DeviceContext& device, KvCacheStorage storage, bool kv_only = false) {
-    Fixture f(8, 1, 1, 0, 1, 0, storage);
+int scale_edges(DeviceContext& device, KvCacheStorage storage, bool kv_only = false,
+                int kv_heads = 2) {
+    Fixture f(8, 1, 1, 0, 1, 0, storage, kv_heads);
     f.kv_only = kv_only;
     constexpr float amplitudes[]{0, 0x1p-30F, 0x1p-18F, 0x1p-10F, 1.0625F, 6.375F, 3072, 65536};
     constexpr float values[]{0, 0.25F, 0.75F, 1.25F, 1.75F, 2.5F, 3.5F, 6};
@@ -717,6 +725,110 @@ int main(int argc, char** argv) {
                              KvCacheStorage::BFloat16, 2, true);
               },
               {{"format", "bf16"}, {"suite", "kv"}});
+
+#if NINFER_TARGET_RTX5090
+    // Four-head FP8 cache: independent math and current-metadata replay, without
+    // taking a Cartesian product of existing layout/alias/storage cases.
+    for (bool kv_only : {false, true}) {
+        const std::string prefix =
+            std::string(kv_only ? "qsa_prepare_kv" : "qsa_prepare") + "/fp8/h24_4";
+
+        struct Case {
+            int t, b, axes, alias, layout, capacity;
+        };
+
+        std::vector<Case> cases{{1, 1, 1, 0, 0, 0},
+                                {33, 8, 3, kv_only ? 0 : 3, 2, 5},
+                                {kv_only ? 255 : 65, 1, 3, kv_only ? 0 : 1, 1, 0},
+                                {257, 1, 3, 0, 0, 0},
+                                {2048, 1, 1, 0, 0, 0}};
+        if (kv_only) cases.push_back({256, 1, 3, 0, 0, 0});
+        if (!kv_only) {
+            cases.push_back({255, 1, 3, 2, 0, 0});
+            cases.push_back({256, 1, 3, 3, 0, 0});
+        }
+        for (auto c : cases)
+            suite.add(prefix + "/t" + std::to_string(c.t) + "/b" + std::to_string(c.b),
+                      [=] {
+                          return run(cuda_environment().context, c.t, c.b, c.axes, c.alias,
+                                     c.layout, c.capacity, KvCacheStorage::Fp8E4M3Row256, 4,
+                                     kv_only);
+                      },
+                      {{"format", "fp8"}, {"execution", "graph"}});
+        suite.add(prefix + "/continuation",
+                  [=] {
+                      return continuation(cuda_environment().context, KvCacheStorage::Fp8E4M3Row256,
+                                          4, kv_only);
+                  },
+                  {{"format", "fp8"}});
+        suite.add(prefix + "/chunking",
+                  [=] {
+                      return chunking(cuda_environment().context, KvCacheStorage::Fp8E4M3Row256, 4,
+                                      kv_only);
+                  },
+                  {{"format", "fp8"}});
+    }
+    suite.add("qsa_prepare/fp8/h24_4/norm_alignment",
+              [] {
+                  return norm_alignment_and_phase(cuda_environment().context,
+                                                  KvCacheStorage::Fp8E4M3Row256, 4);
+              },
+              {{"format", "fp8"}});
+    suite.add("qsa_prepare/fp8/h24_4/encoding_boundaries",
+              [] {
+                  auto& device = cuda_environment().context;
+                  int failed   = 0;
+                  for (bool kv_only : {false, true}) {
+                      failed +=
+                          exact_key_encoding(device, KvCacheStorage::Fp8E4M3Row256, kv_only, 4);
+                      failed += scale_edges(device, KvCacheStorage::Fp8E4M3Row256, kv_only, 4);
+                      Fixture f(8, 1, 3, 0, 1, 0, KvCacheStorage::Fp8E4M3Row256, 4);
+                      f.kv_only = kv_only;
+                      for (float epsilon : {1e-6F, std::numeric_limits<float>::max()}) {
+                          f.reset(2, true);
+                          f.parameters.kv.rms_epsilon = epsilon;
+                          const float amplitudes[]{0, 1e20F, 1e-30F, 1e18F,
+                                                   6, 256,   1e30F,  bf16_to_f32(0x7f7f)};
+                          for (int t = 0; t < 8; ++t)
+                              for (int h = 0; h < 4; ++h)
+                                  for (int c = 0; c < 256; ++c)
+                                      f.k.at(c, h, t, 0) =
+                                          f32_to_bf16((c % 3 - 1) * amplitudes[(t + h) % 8]);
+                          f.k.upload();
+                          f.launch(device.execution_view());
+                          device.synchronize();
+                          failed += verify(f, "four-head K normalization range");
+                      }
+                  }
+                  return failed;
+              },
+              {{"format", "fp8"}});
+    suite.add("qsa_prepare/fp8/h24_4/contract",
+              [] {
+                  Fixture f(1, 1, 1, 0, 0, 0, KvCacheStorage::Fp8E4M3Row256, 4);
+                  auto e             = cuda_environment().context.execution_view();
+                  int failed         = 0;
+                  const auto rejects = [&](auto invoke) {
+                      try {
+                          invoke();
+                          ++failed;
+                      } catch (const std::invalid_argument&) {}
+                  };
+                  const auto storage   = f.cache.main.storage;
+                  f.cache.main.storage = KvCacheStorage::BFloat16;
+                  rejects([&] { f.launch(e); });
+                  f.kv_only = true;
+                  rejects([&] { f.launch(e); });
+                  f.kv_only               = false;
+                  f.cache.main.storage    = storage;
+                  const auto q            = f.projected.query;
+                  f.projected.query.ne[1] = 48;
+                  rejects([&] { f.launch(e); });
+                  f.projected.query = q;
+                  return failed;
+              },
+              {{"format", "fp8"}});
+#endif
 
     return suite.main(argc, argv);
 }

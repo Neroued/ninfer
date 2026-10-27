@@ -81,59 +81,69 @@ __device__ __forceinline__ void prepare_head(const __nv_bfloat16* input,
 }
 
 template <int D, bool VectorWeights>
+__device__ __forceinline__ void
+vector_norm_rotate(const __nv_bfloat16* input, const __nv_bfloat16* weight, float epsilon,
+                   const float2* coefficients, int lane, float (&x)[D / 32]) {
+    static_assert(D == 128 || D == 256);
+    constexpr int N = D / 32;
+    unsigned words[N / 2];
+    if constexpr (N == 8) {
+        const uint4 a = reinterpret_cast<const uint4*>(input)[lane];
+        words[0]      = a.x;
+        words[1]      = a.y;
+        words[2]      = a.z;
+        words[3]      = a.w;
+    } else {
+        const uint2 a = reinterpret_cast<const uint2*>(input)[lane];
+        words[0]      = a.x;
+        words[1]      = a.y;
+    }
+    unsigned weight_words[N / 2];
+    if constexpr (VectorWeights) {
+        if constexpr (N == 8) {
+            const uint4 w   = reinterpret_cast<const uint4*>(weight)[lane];
+            weight_words[0] = w.x;
+            weight_words[1] = w.y;
+            weight_words[2] = w.z;
+            weight_words[3] = w.w;
+        } else {
+            const uint2 w   = reinterpret_cast<const uint2*>(weight)[lane];
+            weight_words[0] = w.x;
+            weight_words[1] = w.y;
+        }
+    }
+#pragma unroll
+    for (int j = 0; j < N; ++j)
+        x[j] = __uint_as_float(((words[j / 2] >> (16 * (j % 2))) & 0xffff) << 16);
+    const float inverse = rms_inverse<D>(x, epsilon);
+#pragma unroll
+    for (int j = 0; j < N; ++j) {
+        float w;
+        if constexpr (VectorWeights)
+            w = __uint_as_float(((weight_words[j / 2] >> (16 * (j % 2))) & 0xffff) << 16);
+        else
+            w = __bfloat162float(weight[lane * N + j]);
+        x[j] = (x[j] * inverse) * (1 + w);
+    }
+#pragma unroll
+    for (int j = 0; j < N; ++j) {
+        const float mate = __shfl_xor_sync(0xffffffff, x[j], 32 / N);
+        if (lane * N < 64) {
+            const auto sc = coefficients[(lane * N + j) % 32];
+            x[j]          = x[j] * sc.y + (lane * N < 32 ? -mate * sc.x : mate * sc.x);
+        }
+    }
+}
+
+template <int D, bool VectorWeights>
 __device__ __forceinline__ void vector_head(const __nv_bfloat16* input, const __nv_bfloat16* weight,
                                             __nv_bfloat16* output, float epsilon,
                                             const float2* coefficients, int lane, bool live) {
     constexpr int N = D / 32;
     unsigned words[N / 2]{};
     if (live) {
-        if constexpr (N == 8) {
-            const uint4 a = reinterpret_cast<const uint4*>(input)[lane];
-            words[0]      = a.x;
-            words[1]      = a.y;
-            words[2]      = a.z;
-            words[3]      = a.w;
-        } else {
-            const uint2 a = reinterpret_cast<const uint2*>(input)[lane];
-            words[0]      = a.x;
-            words[1]      = a.y;
-        }
-        unsigned weight_words[N / 2];
-        if constexpr (VectorWeights) {
-            if constexpr (N == 8) {
-                const uint4 w   = reinterpret_cast<const uint4*>(weight)[lane];
-                weight_words[0] = w.x;
-                weight_words[1] = w.y;
-                weight_words[2] = w.z;
-                weight_words[3] = w.w;
-            } else {
-                const uint2 w   = reinterpret_cast<const uint2*>(weight)[lane];
-                weight_words[0] = w.x;
-                weight_words[1] = w.y;
-            }
-        }
         float x[N];
-#pragma unroll
-        for (int j = 0; j < N; ++j)
-            x[j] = __uint_as_float(((words[j / 2] >> (16 * (j % 2))) & 0xffff) << 16);
-        const float inverse = rms_inverse<D>(x, epsilon);
-#pragma unroll
-        for (int j = 0; j < N; ++j) {
-            float w;
-            if constexpr (VectorWeights)
-                w = __uint_as_float(((weight_words[j / 2] >> (16 * (j % 2))) & 0xffff) << 16);
-            else
-                w = __bfloat162float(weight[lane * N + j]);
-            x[j] = (x[j] * inverse) * (1 + w);
-        }
-#pragma unroll
-        for (int j = 0; j < N; ++j) {
-            const float mate = __shfl_xor_sync(0xffffffff, x[j], 32 / N);
-            if (lane * N < 64) {
-                const auto sc = coefficients[(lane * N + j) % 32];
-                x[j]          = x[j] * sc.y + (lane * N < 32 ? -mate * sc.x : mate * sc.x);
-            }
-        }
+        vector_norm_rotate<D, VectorWeights>(input, weight, epsilon, coefficients, lane, x);
 #pragma unroll
         for (int j = 0; j < N / 2; ++j) {
             const __nv_bfloat162_raw raw = __floats2bfloat162_rn(x[2 * j], x[2 * j + 1]);

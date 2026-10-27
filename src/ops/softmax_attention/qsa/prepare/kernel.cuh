@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ops/softmax_attention/qsa/prepare/norm_rope.cuh"
+#include "ops/softmax_attention/qsa/geometry.h"
 #include "ops/softmax_attention/qsa/prepare/arguments.cuh"
 #include "ops/softmax_attention/qsa/prepare/cache.cuh"
 
@@ -46,7 +47,7 @@ __device__ __forceinline__ void prepare_raw(const PrepareArguments& a, int t, in
 template <int KvHeads, bool Queries>
 struct PrepareGeometry {
     static constexpr int warps       = 4;
-    static constexpr int query_heads = Queries ? 12 * KvHeads : 0;
+    static constexpr int query_heads = Queries ? HeadGeometry<KvHeads>::query_heads : 0;
     static constexpr int key_task    = Queries ? query_heads + 4 : 0;
     static constexpr int raw_task    = key_task + KvHeads;
     static constexpr int groups      = (raw_task + 1 + warps - 1) / warps;
@@ -85,8 +86,10 @@ __global__ __launch_bounds__(128) void prepare_kernel(const __grid_constant__ Pr
         }
     }
     if (live && task < Geometry::raw_task) {
-        if constexpr (Storage == KvCacheStorage::Nvfp4Group16 ||
-                      Storage == KvCacheStorage::Fp8KeyNvfp4Value) {
+        if constexpr (Storage == KvCacheStorage::Fp8E4M3Row256 && KvHeads == 4) {
+            prepare_fp8_kv_vector<KvHeads>(a, task - Geometry::key_task, t, b, lane, coefficients);
+        } else if constexpr (Storage == KvCacheStorage::Nvfp4Group16 ||
+                             Storage == KvCacheStorage::Fp8KeyNvfp4Value) {
             __shared__ float scratch[KvHeads][256];
             prepare_kv<Storage, KvHeads>(a, task - Geometry::key_task, t, b, lane,
                                          coefficients[lane], scratch[task - Geometry::key_task]);

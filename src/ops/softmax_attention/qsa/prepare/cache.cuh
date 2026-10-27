@@ -112,4 +112,58 @@ __device__ __forceinline__ void prepare_kv(const PrepareArguments& a, int head, 
     }
 }
 
+__device__ __forceinline__ void store_fp8_contiguous(const float (&values)[8], std::uint8_t* codes,
+                                                     std::uint8_t* scales, int lane) {
+    float maximum = 0;
+#pragma unroll
+    for (float x : values) maximum = fmaxf(maximum, fabsf(x));
+    const auto quant = common::fp8_fp16_scale(common::warp_max(maximum));
+    unsigned words[2]{};
+#pragma unroll
+    for (int pair = 0; pair < 4; ++pair) {
+        const auto bits =
+            quant.inverse_scale > 0
+                ? __nv_cvt_float2_to_fp8x2(make_float2(values[2 * pair] * quant.inverse_scale,
+                                                       values[2 * pair + 1] * quant.inverse_scale),
+                                           __NV_SATFINITE, __NV_E4M3)
+                : 0;
+        words[pair / 2] |= unsigned(bits) << (16 * (pair % 2));
+    }
+    auto* output = codes + 8 * lane;
+    if (reinterpret_cast<std::uintptr_t>(output) % 8 == 0)
+        *reinterpret_cast<uint2*>(output) = make_uint2(words[0], words[1]);
+    else {
+#pragma unroll
+        for (int j = 0; j < 8; ++j) output[j] = std::uint8_t(words[j / 4] >> (8 * (j % 4)));
+    }
+    if (lane == 0) *reinterpret_cast<__half*>(scales) = quant.scale;
+}
+
+// Native FP8 row stores can consume eight adjacent features per lane. This
+// avoids transposing codes through shared memory or adding a represented K cast.
+template <int KvHeads>
+__device__ __forceinline__ void prepare_fp8_kv_vector(const PrepareArguments& a, int head, int t,
+                                                      int b, int lane, const float2* coefficients) {
+    const auto m      = t + std::int64_t(b) * a.tokens;
+    const int p       = a.positions[m];
+    const auto page   = a.tables[p / 64 + std::int64_t(a.table_rows[b]) * a.table_stride];
+    const auto* key   = a.k + (m * KvHeads + head) * 256;
+    const auto* value = a.v + (m * KvHeads + head) * 256;
+    float x[8];
+    if (reinterpret_cast<std::uintptr_t>(a.wk) % 16 == 0)
+        vector_norm_rotate<256, true>(key, a.wk, a.epsilon, coefficients, lane, x);
+    else
+        vector_norm_rotate<256, false>(key, a.wk, a.epsilon, coefficients, lane, x);
+    kv::normalized_hadamard_d256_contiguous_inplace(x, lane);
+    store_fp8_contiguous(x, a.keys.at(p % 64, head, page), a.key_scales.at(p % 64, head, page),
+                         lane);
+    const auto v = reinterpret_cast<const uint4*>(value)[lane];
+    const unsigned words[4]{v.x, v.y, v.z, v.w};
+#pragma unroll
+    for (int j = 0; j < 8; ++j)
+        x[j] = __uint_as_float(((words[j / 2] >> (16 * (j % 2))) & 0xffff) << 16);
+    store_fp8_contiguous(x, a.values.at(p % 64, head, page), a.value_scales.at(p % 64, head, page),
+                         lane);
+}
+
 } // namespace ninfer::ops::detail::qsa

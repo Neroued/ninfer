@@ -51,10 +51,10 @@ void measure_prepare(const qsa::Options& options, DeviceContext& device, L2Flush
         row.tokens         = tokens;
         row.batch          = options.batch;
         row.valid          = qsa::csv_list(fixture.counts);
-        row.qk_heads       = fixture.kv_only ? 0 : 12 * options.kv_heads;
+        row.qk_heads       = fixture.kv_only ? 0 : qsa::prepare_query_heads(options.kv_heads);
         row.value_heads    = options.kv_heads;
         const auto metrics = qsa::prepare_metrics(
-            tokens, options.axes, options.kv_heads, fixture.bases, fixture.counts,
+            tokens, options.axes, qsa::prepare_query_heads(options.kv_heads), options.kv_heads, fixture.bases, fixture.counts,
             options.kv_heads *
                 paged_kv_storage_layout(options.storage, 256).physical_bytes_per_token_head(),
             !fixture.kv_only);

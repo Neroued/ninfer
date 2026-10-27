@@ -21,6 +21,9 @@ inline const char* name(Projection p) {
     throw std::invalid_argument("invalid QSA projection");
 }
 
+// Canonical fixture geometry; Op admission remains in the corresponding entry.
+inline int prepare_query_heads(int kv_heads) { return kv_heads == 1 ? 12 : 24; }
+
 inline std::vector<int> segments(Projection p, int kv_heads) {
     switch (p) {
     case Projection::QueryGate:
@@ -100,7 +103,7 @@ inline Options parse_options(int argc, char** argv) {
                    "  --context-capacity N (default maximum L) --score-pattern random|ties\n"
                    "  --valid dense|N[,N...]\n"
                    "Sparse GQA: --tokens T[,T...] --batch B --contexts L[,L...]\n  "
-                   "--query-heads Hq --kv-heads Hkv (24/2 or 12/1)\n  --prefix-tokens "
+                   "--query-heads Hq --kv-heads Hkv (sparse: 24/2 or 12/1; prepare also accepts FP8 24/4)\n  --prefix-tokens "
                    "P[,P...] (derive each context as prefix + valid length)\n"
                    "  --selection random|shared|contiguous --selected-blocks 0..512\n"
                    "  --context-capacity N (default maximum L)\n"

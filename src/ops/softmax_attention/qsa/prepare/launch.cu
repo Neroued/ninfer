@@ -87,27 +87,34 @@ struct PreparePlan {
     bool token_major, bounded_phase, vector_weights;
 };
 
-PreparePlan select_prepare_plan(const PrepareArguments& args, float theta) {
-    const auto columns     = std::int64_t(args.tokens) * args.batch;
-    const bool token_major = NINFER_TARGET_SPARK
-                                 ? args.kv_heads == 2 || columns < 256 || columns > 1024
-                                 : columns <= 320;
+PreparePlan select_prepare_plan(const PrepareArguments& args, float theta, bool queries) {
+    const auto columns = std::int64_t(args.tokens) * args.batch;
+    bool token_major =
+        !queries || (NINFER_TARGET_SPARK ? args.kv_heads == 2 || columns < 256 || columns > 1024
+                                         : columns <= 320);
+#if NINFER_TARGET_RTX5090
+    if (args.kv_heads == 4) token_major = columns <= 256;
+#endif
     return {token_major, theta >= 1,
-            common::operand::aligned(args.wq, 16) && common::operand::aligned(args.wiq, 8)};
+            queries && common::operand::aligned(args.wq, 16) &&
+                common::operand::aligned(args.wiq, 8)};
 }
 
 template <KvCacheStorage Storage, bool BoundedPhase, bool VectorWeights, int KvHeads, bool Queries>
 void submit(const PrepareArguments& args, PreparePlan plan, cudaStream_t stream) {
     constexpr int groups = PrepareGeometry<KvHeads, Queries>::groups;
-    if constexpr (!Queries) {
-        prepare_kernel<Storage, BoundedPhase, false, true, KvHeads, false>
-            <<<dim3(args.tokens, args.batch), 128, 0, stream>>>(args);
-    } else if (plan.token_major)
-        prepare_kernel<Storage, BoundedPhase, VectorWeights, true, KvHeads, true>
-            <<<dim3(args.tokens * groups, args.batch), 128, 0, stream>>>(args);
+    const auto launch    = [&]<bool TokenMajor>() {
+        const dim3 grid = TokenMajor ? dim3(args.tokens * groups, args.batch)
+                                        : dim3(args.tokens, args.batch, groups);
+        prepare_kernel<Storage, BoundedPhase, VectorWeights, TokenMajor, KvHeads, Queries>
+            <<<grid, 128, 0, stream>>>(args);
+    };
+    if constexpr (!Queries && KvHeads != 4)
+        launch.template operator()<true>();
+    else if (plan.token_major)
+        launch.template operator()<true>();
     else
-        prepare_kernel<Storage, BoundedPhase, VectorWeights, false, KvHeads, true>
-            <<<dim3(args.tokens, args.batch, groups), 128, 0, stream>>>(args);
+        launch.template operator()<false>();
 }
 
 template <KvCacheStorage Storage, int KvHeads, bool Queries>
@@ -133,8 +140,14 @@ void dispatch_geometry(const PrepareArguments& args, PreparePlan plan, cudaStrea
 
 template <KvCacheStorage Storage, bool Queries>
 void dispatch(const PrepareArguments& args, PreparePlan plan, cudaStream_t stream) {
-    if (args.kv_heads == 1)
-        dispatch_geometry<Storage, 1, Queries>(args, plan, stream);
+    if (args.kv_heads == 1) dispatch_geometry<Storage, 1, Queries>(args, plan, stream);
+
+#if NINFER_TARGET_RTX5090
+    else if (args.kv_heads == 4) {
+        if constexpr (Storage == KvCacheStorage::Fp8E4M3Row256)
+            dispatch_geometry<Storage, 4, Queries>(args, plan, stream);
+    }
+#endif
     else
         dispatch_geometry<Storage, 2, Queries>(args, plan, stream);
 }
@@ -179,8 +192,8 @@ void launch_prepare(const QsaProjectionView& projected, const QsaPrepareParamete
     args.wiq    = static_cast<const __nv_bfloat16*>(parameters.index_query_norm.data);
     args.out_q  = static_cast<__nv_bfloat16*>(query.data);
     args.out_iq = static_cast<__nv_bfloat16*>(index_query.data);
-    launch<true>(args, select_prepare_plan(args, parameters.kv.rope_theta), cache.main.storage,
-                 execution);
+    launch<true>(args, select_prepare_plan(args, parameters.kv.rope_theta, true),
+                 cache.main.storage, execution);
 }
 
 void launch_prepare_kv(const QsaKvProjectionView& projected,
@@ -190,7 +203,8 @@ void launch_prepare_kv(const QsaKvProjectionView& projected,
                        CudaExecutionView execution) {
     const auto args =
         prepare_arguments(projected, parameters, batch, rope_positions, before, cache, records);
-    launch<false>(args, {true, parameters.rope_theta >= 1, false}, cache.main.storage, execution);
+    launch<false>(args, select_prepare_plan(args, parameters.rope_theta, false), cache.main.storage,
+                  execution);
 }
 
 } // namespace ninfer::ops::detail::qsa

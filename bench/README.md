@@ -1189,6 +1189,11 @@ and `--axes 1|3` selects current RoPE coordinates. `--base-positions` and
 tail/record views. `--inplace` aliases both Q/IQ outputs and restores their original projection
 words outside every timed call. CSV rows include positions, axes, alias mode, layout and round.
 
+The RTX 5090 FP8 row256 fixture also supports `--kv-heads 4`, with 24 query heads.
+`prepare-kv` uses the same four-head cache geometry and produces KV, index cache and raw
+records without allocating query projections or outputs. Other head/storage admission belongs
+to the public Op. Metrics use the fixture's actual query and KV extents.
+
 ```bash
 ./build/rtx5090-dev/bench/ninfer_qsa_bench --op prepare --sweep 1:16 --batch 8 --axes 3 \
   --base-positions 63 --inplace --rounds 3 --cache both \

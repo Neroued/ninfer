@@ -24,6 +24,9 @@ constexpr std::array kShapes{
     ShapeEntry{131072, 5120, select_q4_n131072_k5120},
     ShapeEntry{131072, 2048, select_q4_n131072_k2048},
     ShapeEntry{248320, 2560, select_q4_n248320_k2560},
+#if NINFER_TARGET_RTX5090
+    ShapeEntry{248320, 5120, select_q4_n248320_k5120},
+#endif
     ShapeEntry{124160, 2560, select_q4_n124160_k2560},
     ShapeEntry{3456, 1152, select_q4_n3456_k1152},
     ShapeEntry{4304, 1152, select_q4_n4304_k1152},

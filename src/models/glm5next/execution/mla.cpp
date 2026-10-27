@@ -17,8 +17,8 @@ ops::KpoolSparseMlaProfile attention_geometry(const MlaReadout& r) {
 } // namespace
 
 ops::KpoolGraphProfile MlaReadout::index_profile(std::uint32_t bound, int sms) const {
-    return ops::kpool_indexer_graph_profile(index_geometry(*this), {bound}, query.ne[3],
-                                            query.ne[2], sms);
+    return ops::kpool_indexer_graph_profile(index_geometry(*this), cache.index.format, {bound},
+                                            query.ne[3], query.ne[2], sms);
 }
 
 ops::KpoolGraphProfile MlaReadout::attention_profile(std::uint32_t bound, int sms) const {
@@ -30,8 +30,9 @@ std::size_t MlaReadout::scratch_bytes(int sms) const {
     const int t = query.ne[2], b = query.ne[3];
     const auto attention = ops::kpool_sparse_mla_workspace_capacity_bytes(
         attention_geometry(*this), cache.latent.storage, {visible}, b, t, t, sms);
-    return index ? std::max(attention, ops::kpool_indexer_workspace_capacity_bytes(
-                                           index_geometry(*this), {visible}, b, t, t, sms))
+    return index ? std::max(attention,
+                            ops::kpool_indexer_workspace_capacity_bytes(
+                                index_geometry(*this), cache.index.format, {visible}, b, t, t, sms))
                  : attention;
 }
 

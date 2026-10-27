@@ -13,11 +13,13 @@ namespace ninfer::ops {
 // Positive dimensions are required; FP8 latent_dim is a multiple of 128. Execution and its
 // workspace queries separately admit registered contraction geometries.
 struct KpoolMlaCacheSpec {
-    KpoolMlaStorage storage = KpoolMlaStorage::BFloat16;
+    KpoolMlaStorage latent_storage   = KpoolMlaStorage::BFloat16;
+    KvCacheVectorFormat index_format = KvCacheVectorFormat::BFloat16;
     std::int32_t latent_dim = 0, index_dim = 0, layers = 0;
 };
 
-// One page group contains every layer, each in data / optional scales / index order. Plane
+// One page group contains every layer, each in latent data / optional latent scales /
+// index keys / optional index scales order. Plane
 // offsets and total size come from plan_kv_page_layout(), with 64 tokens and 256-byte plane
 // alignment. A group may reside anywhere in the caller's Context backing. Main/MTP or other
 // distinct histories use separate layouts/tables according to their owner's schedule.

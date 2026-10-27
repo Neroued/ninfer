@@ -5,7 +5,8 @@
 namespace ninfer::ops::detail::kpool {
 
 PrepareGeometry prepare_geometry(const KpoolMlaPrepareProfile& p, KpoolMlaStorage storage,
-                                 int batch, int lo, int hi, int sms) {
+                                 KvCacheVectorFormat index_format, int batch, int lo, int hi,
+                                 int sms) {
     int q = 0, heads = 0;
     switch (p.projection) {
     case KpoolMlaPrepareProjection::Full:
@@ -20,10 +21,13 @@ PrepareGeometry prepare_geometry(const KpoolMlaPrepareProfile& p, KpoolMlaStorag
     default:
         throw std::invalid_argument("Kpool Prepare: invalid projection");
     }
-    if (storage != KpoolMlaStorage::BFloat16 || p.hidden != 4096 || p.latent_dim != 512 ||
-        p.index_dim != 128 || p.query_rank != q || p.index_heads != heads || p.pool_size != 4 ||
-        batch < 1 || batch > 8 || lo <= 0 || hi < lo || sms <= 0)
-        throw std::invalid_argument("Kpool Prepare: unsupported BF16 geometry or extent");
+    if (storage != KpoolMlaStorage::BFloat16 ||
+        (index_format != KvCacheVectorFormat::BFloat16 &&
+         index_format != KvCacheVectorFormat::Fp8E4m3fnGroup128Ue8m0) ||
+        p.hidden != 4096 || p.latent_dim != 512 || p.index_dim != 128 || p.query_rank != q ||
+        p.index_heads != heads || p.pool_size != 4 || batch < 1 || batch > 8 || lo <= 0 ||
+        hi < lo || sms <= 0)
+        throw std::invalid_argument("Kpool Prepare: unsupported geometry, format or extent");
     return {768 + q + heads, q, heads};
 }
 

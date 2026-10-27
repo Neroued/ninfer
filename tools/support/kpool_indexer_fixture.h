@@ -6,6 +6,8 @@
 
 #include <memory>
 #include <numeric>
+#include <cmath>
+#include <cuda_fp8.h>
 
 namespace ninfer::tool::kpool {
 
@@ -48,15 +50,17 @@ struct IndexerFixture {
     ops::KpoolBlockSelection selection;
     ops::KpoolExecutionEnvelope envelope;
     std::vector<std::uint16_t> keys;
+    std::vector<std::uint8_t> key_codes, key_scales;
     DeviceBuffer scratch;
     std::unique_ptr<MemoryArena> workspace;
     std::size_t workspace_bytes;
-    int plane_index;
+    int plane_index, scale_plane_index = -1;
 
     IndexerFixture(CudaExecutionView cuda, int tokens, int batch, int end, int layer_count = 11,
                    bool ragged                  = false,
                    ops::KpoolMlaStorage storage = ops::KpoolMlaStorage::BFloat16,
-                   const IndexerCase& shape = {}, bool initialize_history = true)
+                   const IndexerCase& shape = {}, bool initialize_history = true,
+                   KvCacheVectorFormat index_format = KvCacheVectorFormat::BFloat16)
         : T(tokens), B(batch), E(end), P(std::max(1, (shape.table_end(end) + 63) / 64)),
           layers(layer_count), layer(layers / 2), physical_pages(shape.pages(batch, end)),
           query(cuda.device(), DType::BF16, {128, 32, T, B}),
@@ -65,17 +69,19 @@ struct IndexerFixture {
           selectors(cuda.device(), DType::I32, {B}), ids(cuda.device(), DType::I32, {512, T * B}),
           counts(cuda.device(), DType::I32, {T * B}), ends(cuda.device(), DType::I32, {T * B}),
           tables(cuda.device(), DType::I64, {P, B}, true),
-          layout(ops::plan_kpool_mla_cache_layout({storage, 512, 128, layers})),
+          layout(ops::plan_kpool_mla_cache_layout({storage, index_format, 512, 128, layers})),
           packed(cuda.device(), layout.page.geometry, physical_pages),
           cache(layout.layer(PagedRecordView{packed.storage(), tables.view, 64}, layer).index),
           selection{ids.view, counts.view, ends.view},
           envelope{std::uint32_t(shape.envelope ? shape.envelope : end)},
           keys(initialize_history ? std::size_t(physical_pages) * 16 * 128 : 0),
           workspace_bytes(ops::kpool_indexer_workspace_capacity_bytes(
-              {32, 128}, envelope, B, 1, T, cuda.multiprocessor_count())) {
+              {32, 128}, index_format, envelope, B, 1, T, cuda.multiprocessor_count())) {
         if (T <= 0 || B < 1 || B > 8 || E < 0 || E > 1048576 || (E && E < T))
             throw std::invalid_argument("Indexer fixture T/B/end");
-        plane_index    = (storage == ops::KpoolMlaStorage::BFloat16 ? 2 : 3) * (layer + 1) - 1;
+        plane_index = packed.plane_index(cache.keys.plane);
+        if (index_format == KvCacheVectorFormat::Fp8E4m3fnGroup128Ue8m0)
+            scale_plane_index = packed.plane_index(cache.scales.plane);
         int multiplier = 17;
         while (std::gcd(multiplier, physical_pages) != 1) multiplier += 2;
         int next_page = shape.shared_prefix / 64;
@@ -134,9 +140,46 @@ struct IndexerFixture {
     }
 
     void upload_keys() {
-        Tensor dense({keys.data(), keys.size() * 2, Device::cpu()}, DType::BF16,
+        if (cache.format == KvCacheVectorFormat::BFloat16) {
+            Tensor dense({keys.data(), keys.size() * 2, Device::cpu()}, DType::BF16,
+                         {128, 16, 1, physical_pages});
+            packed.upload_plane(plane_index, dense);
+            return;
+        }
+        key_codes.resize(keys.size());
+        key_scales.resize(keys.size() / 128);
+        for (std::size_t row = 0; row < key_scales.size(); ++row) {
+            float values[128];
+            for (int d = 0; d < 128; ++d) values[d] = decode(keys[row * 128 + d]);
+            for (int stride = 1; stride < 128; stride *= 2)
+                for (int start = 0; start < 128; start += 2 * stride)
+                    for (int j = 0; j < stride; ++j) {
+                        const float x = values[start + j], y = values[start + j + stride];
+                        values[start + j]          = x + y;
+                        values[start + j + stride] = x - y;
+                    }
+            float maximum = 0;
+            for (auto& value : values) {
+                value *= 0.08838834764831845F;
+                maximum = std::max(maximum, std::abs(value));
+            }
+            int exponent = 0;
+            if (maximum) {
+                int e;
+                const double fraction = std::frexp(double(maximum) / 448.0, &e);
+                exponent              = std::max(-127, e - (fraction == .5));
+            }
+            key_scales[row] = exponent + 127;
+            for (int d = 0; d < 128; ++d)
+                key_codes[row * 128 + d] = __nv_cvt_float_to_fp8(std::ldexp(values[d], -exponent),
+                                                                 __NV_SATFINITE, __NV_E4M3);
+        }
+        Tensor codes({key_codes.data(), key_codes.size(), Device::cpu()}, DType::FP8_E4M3FN,
                      {128, 16, 1, physical_pages});
-        packed.upload_plane(plane_index, dense);
+        Tensor scales({key_scales.data(), key_scales.size(), Device::cpu()}, DType::U8,
+                      {1, 16, 1, physical_pages});
+        packed.upload_plane(plane_index, codes);
+        packed.upload_plane(scale_plane_index, scales);
     }
 
     const std::uint16_t* key(int b, int pool) const {

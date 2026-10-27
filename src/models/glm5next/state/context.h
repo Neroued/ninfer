@@ -40,7 +40,7 @@ struct CacheLayout {
 
 [[nodiscard]] CacheLayout plan_cache(LayoutBuilder&, const MlaConfig&, std::uint32_t layers,
                                      std::uint32_t max_context, std::uint32_t rows,
-                                     ops::KpoolMlaStorage);
+                                     ops::KpoolMlaStorage, KvCacheVectorFormat index_format);
 
 class StateViews {
 public:

@@ -33,8 +33,8 @@ void execute(const Tensor& x, const KpoolMlaPrepareParameters& p, const KpoolMla
                                          p.query_norm.data ? p.query_norm.ne[0] : 0,
                                          out.head_coeff.data ? out.head_coeff.ne[0] : 0,
                                          4};
-    const auto geometry =
-        prepare_geometry(profile, cache.latent.storage, B, T, T, execution.multiprocessor_count());
+    const auto geometry = prepare_geometry(profile, cache.latent.storage, cache.index.format, B, T,
+                                           T, execution.multiprocessor_count());
     require(p.rms_epsilon > 0 && std::isfinite(p.rms_epsilon) && p.index_epsilon > 0 &&
                 std::isfinite(p.index_epsilon),
             "norm epsilons");
@@ -61,15 +61,18 @@ void execute(const Tensor& x, const KpoolMlaPrepareParameters& p, const KpoolMla
         tail_field(*f, 128, B, 1, device);
         inputs[input_count++] = operand::range(f->records.byte_offsets, kOperation);
     }
-    plane(cache.latent.data, 512, 1, device);
-    plane(cache.index.keys, 128, 4, device);
+    plane(cache.latent.data, DType::BF16, 512, 1, device);
+    index_cache(cache.index, 128, device);
     operand::same_paged_records(cache.latent.data, cache.index.keys, kOperation, "cache planes");
     const auto table_blocks = operand::blocks(cache.latent.data.records.page_offsets, kOperation);
     require(!cache.latent.scales.records.storage.data, "BF16 cache has no scales");
     const auto& cr = cache.latent.data.plane.tensor.region;
-    const auto& ir = cache.index.keys.plane.tensor.region;
-    require(cr.offset + cr.bytes <= ir.offset || ir.offset + ir.bytes <= cr.offset,
-            "cache planes overlap");
+    for (const auto* plane : {&cache.index.keys, &cache.index.scales}) {
+        if (!plane->records.storage.data) continue;
+        const auto& ir = plane->plane.tensor.region;
+        require(cr.offset + cr.bytes <= ir.offset || ir.offset + ir.bytes <= cr.offset,
+                "cache planes overlap");
+    }
     const auto& w = p.a_projection;
     operand::device(w.device, device, kOperation, "projection weight");
     const auto weight_bytes = std::size_t(geometry.rows) * 4096 * 2;
@@ -138,7 +141,9 @@ void execute(const Tensor& x, const KpoolMlaPrepareParameters& p, const KpoolMla
     a.page_offsets = static_cast<const std::int64_t*>(cache.latent.data.records.page_offsets.data);
     a.table_stride = cache.latent.data.records.page_offsets.nb[1] / 8;
     a.latent       = static_cast<__nv_bfloat16*>(cache.latent.data.data());
-    a.index        = static_cast<__nv_bfloat16*>(cache.index.keys.data());
+    a.index          = cache.index.keys.data();
+    a.fp8_index      = cache.index.format == KvCacheVectorFormat::Fp8E4m3fnGroup128Ue8m0;
+    a.index_scales = a.fp8_index ? static_cast<std::uint8_t*>(cache.index.scales.data()) : nullptr;
     a.query        = static_cast<__nv_bfloat16*>(out.q_r.data);
     a.coefficients = static_cast<float*>(out.head_coeff.data);
     a.before[0]    = bind_field(before.raw_keys);
@@ -185,16 +190,18 @@ void kpool_mla_prepare_update(const Tensor& x, const KpoolMlaPrepareParameters& 
 }
 
 std::size_t kpool_mla_prepare_record_workspace_capacity_bytes(const KpoolMlaPrepareProfile& p,
-                                                              KpoolMlaStorage storage, int batch,
-                                                              int lo, int hi, int sms) {
-    const auto g = detail::kpool::prepare_geometry(p, storage, batch, lo, hi, sms);
+                                                              KpoolMlaStorage storage,
+                                                              KvCacheVectorFormat index_format,
+                                                              int batch, int lo, int hi, int sms) {
+    const auto g = detail::kpool::prepare_geometry(p, storage, index_format, batch, lo, hi, sms);
     return detail::kpool::prepare_capacity(g, false, lo, hi, batch);
 }
 
 std::size_t kpool_mla_prepare_update_workspace_capacity_bytes(const KpoolMlaPrepareProfile& p,
-                                                              KpoolMlaStorage storage, int batch,
-                                                              int lo, int hi, int sms) {
-    const auto g = detail::kpool::prepare_geometry(p, storage, batch, lo, hi, sms);
+                                                              KpoolMlaStorage storage,
+                                                              KvCacheVectorFormat index_format,
+                                                              int batch, int lo, int hi, int sms) {
+    const auto g = detail::kpool::prepare_geometry(p, storage, index_format, batch, lo, hi, sms);
     return detail::kpool::prepare_capacity(g, true, lo, hi, batch);
 }
 } // namespace ninfer::ops

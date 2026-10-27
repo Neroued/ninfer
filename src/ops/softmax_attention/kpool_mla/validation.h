@@ -1,5 +1,6 @@
 #pragma once
 
+#include "ninfer/ops/kpool_mla.h"
 #include "ops/common/host/operands.h"
 
 #include <array>
@@ -62,14 +63,14 @@ inline void tail_field(const Field& f, int dim, int batch, int layers, Device de
                     device);
 }
 
-inline void plane(const ConstPagedPlaneView& p, int dim, int span, Device device) {
+inline void plane(const ConstPagedPlaneView& p, DType dtype, int dim, int span, Device device) {
     operand::device(p.records.storage.device, device, kOperation, "cache backing");
     const auto& region  = p.plane.tensor.region;
-    const auto expected = Tensor::metadata(DType::BF16, {dim, 64 / span, 1});
-    require(p.records.page_tokens == 64 && p.plane.geometry.dtype == DType::BF16 &&
+    const auto expected = Tensor::metadata(dtype, {dim, 64 / span, 1});
+    require(p.records.page_tokens == 64 && p.plane.geometry.dtype == dtype &&
                 p.plane.geometry.leading_extent == dim && p.plane.geometry.head_extent == 1 &&
                 p.plane.geometry.tokens_per_row == std::uint32_t(span) &&
-                p.plane.tensor.dtype == DType::BF16 &&
+                p.plane.tensor.dtype == dtype &&
                 std::equal(p.plane.tensor.shape.begin(), p.plane.tensor.shape.end(), expected.ne) &&
                 region.bytes == expected.bytes() && region.offset % 256 == 0 &&
                 p.plane.head_stride_bytes == expected.bytes() && p.records.storage.data &&
@@ -79,5 +80,23 @@ inline void plane(const ConstPagedPlaneView& p, int dim, int span, Device device
             "cache plane geometry/alignment");
     const auto& table = p.records.page_offsets;
     strided(table, DType::I64, {table.ne[0], table.ne[1], 1, 1}, device, "page offsets");
+}
+
+inline void index_cache(const ConstKpoolIndexCacheView& cache, int dim, Device device) {
+    require(cache.format == KvCacheVectorFormat::BFloat16 ||
+                cache.format == KvCacheVectorFormat::Fp8E4m3fnGroup128Ue8m0,
+            "unsupported index cache format");
+    const auto format = paged_kv_vector_layout(cache.format, dim);
+    plane(cache.keys, format.data_dtype, format.data_leading_extent, 4, device);
+    if (!format.has_scale()) {
+        require(!cache.scales.records.storage.data, "BF16 index cache has no scales");
+        return;
+    }
+    plane(cache.scales, format.scale_dtype, format.scale_leading_extent, 4, device);
+    operand::same_paged_records(cache.keys, cache.scales, kOperation, "index codes/scales");
+    const auto& k = cache.keys.plane.tensor.region;
+    const auto& s = cache.scales.plane.tensor.region;
+    require(k.offset + k.bytes <= s.offset || s.offset + s.bytes <= k.offset,
+            "index codes/scales overlap");
 }
 } // namespace ninfer::ops::detail::kpool

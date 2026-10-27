@@ -104,12 +104,31 @@ int run(bool alias, int D) {
 }
 
 int layout_contract() {
-    const auto bf =
-        ops::plan_kpool_mla_cache_layout({ops::KpoolMlaStorage::BFloat16, 512, 128, 11});
-    const auto fp = ops::plan_kpool_mla_cache_layout(
-        {ops::KpoolMlaStorage::Fp8E4m3fnGroup128Ue8m0, 512, 128, 11});
+    const auto bf = ops::plan_kpool_mla_cache_layout(
+        {ops::KpoolMlaStorage::BFloat16, KvCacheVectorFormat::BFloat16, 512, 128, 11});
+    const auto fp = ops::plan_kpool_mla_cache_layout({ops::KpoolMlaStorage::Fp8E4m3fnGroup128Ue8m0,
+                                                      KvCacheVectorFormat::BFloat16, 512, 128, 11});
     if (bf.page.page_bytes != 11 * 68 * 1024 || fp.page.page_bytes != 11 * (516 * 64 + 4096))
         return 1;
+    for (auto latent :
+         {ops::KpoolMlaStorage::BFloat16, ops::KpoolMlaStorage::Fp8E4m3fnGroup128Ue8m0}) {
+        const auto layout = ops::plan_kpool_mla_cache_layout(
+            {latent, KvCacheVectorFormat::Fp8E4m3fnGroup128Ue8m0, 512, 128, 11});
+        const std::size_t latent_bytes =
+            latent == ops::KpoolMlaStorage::BFloat16 ? 512 * 64 * 2 : 516 * 64;
+        if (layout.page.page_bytes != 11 * (latent_bytes + 2304)) return 1;
+        HostBuffer backing(layout.page.page_bytes + 256);
+        const auto layer   = layout.layer(PagedRecordView{backing.span(), {}, 64}, 5);
+        const auto& keys   = layer.index.keys.plane;
+        const auto& scales = layer.index.scales.plane;
+        if (layer.index.format != KvCacheVectorFormat::Fp8E4m3fnGroup128Ue8m0 ||
+            keys.tensor.dtype != DType::FP8_E4M3FN || keys.tensor.region.bytes != 2048 ||
+            scales.tensor.dtype != DType::U8 || scales.tensor.region.bytes != 16 ||
+            keys.geometry.tokens_per_row != 4 || scales.geometry.tokens_per_row != 4 ||
+            keys.tensor.region.offset % 256 || scales.tensor.region.offset % 256 ||
+            layer.index.keys.records.storage.data != layer.index.scales.records.storage.data)
+            return 1;
+    }
     LayoutBuilder builder;
     const auto raw       = ops::plan_kpool_raw_records(builder, 128, 17, 8, 11);
     const auto selection = ops::plan_kpool_block_selection(builder, 7);

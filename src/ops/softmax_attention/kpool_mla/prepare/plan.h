@@ -29,7 +29,8 @@ struct PrepareGeometry {
 };
 
 PrepareGeometry prepare_geometry(const KpoolMlaPrepareProfile& profile, KpoolMlaStorage storage,
-                                 int batch, int min_tokens, int max_tokens, int sm_count);
+                                 KvCacheVectorFormat index_format, int batch, int min_tokens,
+                                 int max_tokens, int sm_count);
 ProjectionRoute select_projection(int columns, int rows);
 int prepare_window_columns();
 

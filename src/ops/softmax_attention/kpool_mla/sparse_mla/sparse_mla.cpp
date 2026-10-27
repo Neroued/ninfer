@@ -67,7 +67,7 @@ void kpool_sparse_mla(const Tensor& query, const KpoolMlaFactors& factors,
     input(selected.pool_ids, DType::I32, {512, selected_rows}, 4, "pool IDs");
     input(selected.pool_counts, DType::I32, {selected_rows}, 4, "pool counts");
     input(selected.selection_end, DType::I32, {selected_rows}, 4, "selection end");
-    plane(cache.data, 512, 1, device);
+    plane(cache.data, DType::BF16, 512, 1, device);
     require(!cache.scales.records.storage.data, "BF16 latent has no scale plane");
     const auto& table = cache.data.records.page_offsets;
     require(std::uint64_t(table.ne[0]) * 64 >= envelope.max_visible_tokens, "page table capacity");

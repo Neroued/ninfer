@@ -74,7 +74,8 @@ struct Fixture {
     std::size_t workspace_bytes;
 
     Fixture(Weights& weights, CudaExecutionView cuda, int tokens, int batch, bool upd,
-            bool ragged = false, bool strided = false, bool alias = false, int phase = 0)
+            bool ragged = false, bool strided = false, bool alias = false, int phase = 0,
+            KvCacheVectorFormat index_format = KvCacheVectorFormat::BFloat16)
         : w(weights), T(tokens), B(batch), W(T + 8), P((T + 128 + 63) / 64), update(upd),
           inplace(alias), x(cuda.device(), DType::BF16, {4096, T, B}),
           q(cuda.device(), DType::BF16, {1536, T, B}),
@@ -86,8 +87,8 @@ struct Fixture {
           tables(cuda.device(), DType::I64, {P, B}, strided),
           before_offsets(cuda.device(), DType::I64, {B}),
           after_offsets(cuda.device(), DType::I64, {B}), bases(B),
-          cache_layout(
-              ops::plan_kpool_mla_cache_layout({ops::KpoolMlaStorage::BFloat16, 512, 128, L})),
+          cache_layout(ops::plan_kpool_mla_cache_layout(
+              {ops::KpoolMlaStorage::BFloat16, index_format, 512, 128, L})),
           packed(cuda.device(), cache_layout.page.geometry, P * B) {
         StateImageBuilder sb;
         (void)sb.add(DType::I32, {64}, 1, "guard");
@@ -131,8 +132,8 @@ struct Fixture {
         state.copy_from_host(state_host.data(), state_host.size() * 2);
         auto capacity    = update ? ops::kpool_mla_prepare_update_workspace_capacity_bytes
                                   : ops::kpool_mla_prepare_record_workspace_capacity_bytes;
-        workspace_bytes  = capacity(w.profile(), ops::KpoolMlaStorage::BFloat16, B, 1, T,
-                                    cuda.multiprocessor_count());
+        workspace_bytes  = capacity(w.profile(), ops::KpoolMlaStorage::BFloat16, index_format, B, 1,
+                                    T, cuda.multiprocessor_count());
         workspace_buffer = DeviceBuffer(cuda.device(), workspace_bytes);
         workspace        = std::make_unique<MemoryArena>(workspace_buffer.span());
     }

@@ -12,7 +12,8 @@ std::uint32_t count(std::uint64_t value) {
     return static_cast<std::uint32_t>(value);
 }
 
-ExecutionShape shape(const execution::ModelProfile& p, const EngineOptions& o) {
+ExecutionShape shape(const execution::ModelProfile& p, const EngineOptions& o,
+                     KvCacheVectorFormat index_format) {
     if (load_options(o) != p.options)
         throw std::invalid_argument("GLM5Next execution components differ from selected weights");
     if (!o.max_context || o.max_context > p.config.text.max_context || !o.max_concurrency ||
@@ -31,6 +32,7 @@ ExecutionShape shape(const execution::ModelProfile& p, const EngineOptions& o) {
             std::min(o.prefill_chunk ? o.prefill_chunk : 4096U, o.max_context),
             o.speculative.draft_tokens,
             o.kv_cache,
+            index_format,
             o.purpose,
             o.context_cache.enabled,
             o.observability.gpu_timing};
@@ -88,12 +90,13 @@ std::size_t ExecutionPlan::reservation_bytes() const {
 }
 
 ExecutionPlan plan_execution(std::shared_ptr<const execution::ModelProfile> profile,
-                             const EngineOptions& o, int sm_count) {
+                             const EngineOptions& o, KvCacheVectorFormat index_format,
+                             int sm_count) {
     if (!profile)
         throw std::invalid_argument("GLM5Next execution planning requires its weight profile");
     ExecutionPlan out;
     out.profile        = std::move(profile);
-    out.shape          = shape(*out.profile, o);
+    out.shape          = shape(*out.profile, o, index_format);
     out.use_cuda_graph = o.use_cuda_graph && o.purpose == EnginePurpose::Generation;
     out.state          = plan_state(*out.profile);
     out.workspace =
@@ -102,10 +105,10 @@ ExecutionPlan plan_execution(std::shared_ptr<const execution::ModelProfile> prof
     LayoutBuilder b;
     const auto storage = latent_storage(o.kv_cache);
     out.main = plan_cache(b, c.mla, c.mla_layers, out.shape.max_context, out.shape.max_concurrency,
-                          storage);
+                          storage, index_format);
     if (out.profile->mtp)
-        out.mtp =
-            plan_cache(b, c.mla, 1, out.shape.max_context, out.shape.max_concurrency, storage);
+        out.mtp = plan_cache(b, c.mla, 1, out.shape.max_context, out.shape.max_concurrency, storage,
+                             index_format);
     out.frame = plan_frame(b, *out.profile, out.shape);
     if (out.profile->local.size > 1)
         for (auto& region : out.peer_staging)

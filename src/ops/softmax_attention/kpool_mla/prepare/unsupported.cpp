@@ -9,8 +9,8 @@ namespace {
 }
 } // namespace
 
-PrepareGeometry prepare_geometry(const KpoolMlaPrepareProfile&, KpoolMlaStorage, int, int, int,
-                                 int) {
+PrepareGeometry prepare_geometry(const KpoolMlaPrepareProfile&, KpoolMlaStorage,
+                                 KvCacheVectorFormat, int, int, int, int) {
     unsupported();
 }
 

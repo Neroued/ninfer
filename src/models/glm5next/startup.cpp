@@ -4,8 +4,18 @@
 #include "models/glm5next/program/graph_inputs.h"
 
 #include <algorithm>
+#include <cstdlib>
+#include <string_view>
 
 namespace ninfer::models::glm5next {
+
+KvCacheVectorFormat index_format_from_environment() {
+    const auto* value = std::getenv("NINFER_KPOOL_INDEXER_BF16");
+    if (!value || std::string_view(value) == "0")
+        return KvCacheVectorFormat::Fp8E4m3fnGroup128Ue8m0;
+    if (std::string_view(value) == "1") return KvCacheVectorFormat::BFloat16;
+    throw std::invalid_argument("NINFER_KPOOL_INDEXER_BF16 must be 0 or 1");
+}
 
 RankPreparation::RankPreparation(const artifact::Reader& reader, RankLoadRequest request,
                                  DeviceContext& device, ContextCommunication peer)
@@ -21,7 +31,8 @@ RankPreparation::RankPreparation(const artifact::Reader& reader, RankLoadRequest
                options_.context_capacity.automatic_headroom_bytes, request.host_reservation_bytes};
     auto profile =
         execution::describe_model(load_->definition(), load_->weight_data(), load_->rank_plan());
-    plan_     = plan_execution(std::move(profile), options_, device.multiprocessor_count());
+    plan_     = plan_execution(std::move(profile), options_, request.index_format,
+                               device.multiprocessor_count());
     capacity_ = describe_execution_capacity(plan_);
 }
 
@@ -179,7 +190,8 @@ Frontend create_frontend(const ModelDefinition& definition, const EngineOptions&
 
 Startup::Startup(const artifact::Reader& reader, const artifact::Reader& rank,
                  const EngineOptions& options, Device)
-    : definition_(read_definition(reader, load_options(options))) {
+    : definition_(read_definition(reader, load_options(options))),
+      index_format_(index_format_from_environment()) {
     if (reader.artifact_id() != rank.artifact_id())
         throw artifact::ArtifactError("GLM5Next local artifact differs from coordinator");
     rank_ = options.deployment ? plan_parallel(*definition_, *options.deployment).ranks.at(0)
@@ -196,8 +208,13 @@ std::unique_ptr<RankPreparation> Startup::preparation(const artifact::Reader& re
                                                       DeviceContext& device) const {
     return std::make_unique<RankPreparation>(
         reader,
-        RankLoadRequest{definition_->artifact_id(), rank_, options,
-                        options.enable_vision ? options.media_live_bytes : 0, true},
+        RankLoadRequest{.artifact     = definition_->artifact_id(),
+                        .rank         = rank_,
+                        .options      = options,
+                        .index_format = index_format_,
+                        .host_reservation_bytes =
+                            options.enable_vision ? options.media_live_bytes : 0,
+                        .control_owner = true},
         device);
 }
 

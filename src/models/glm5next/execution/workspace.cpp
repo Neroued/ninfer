@@ -40,17 +40,19 @@ void mla(WorkspaceLayoutBuilder& a, const ModelProfile& p, const MlaProfile& m,
             const auto& profile = m.prepare.at(
                 static_cast<std::size_t>(reuse ? ops::KpoolMlaPrepareProjection::QueryAndHistory
                                                : ops::KpoolMlaPrepareProjection::Full));
-            scratch(a, record ? ops::kpool_mla_prepare_record_workspace_capacity_bytes(
-                                    profile, storage, local, first, last, sm_count)
-                              : ops::kpool_mla_prepare_update_workspace_capacity_bytes(
-                                    profile, storage, local, first, last, sm_count));
+            scratch(a, record
+                           ? ops::kpool_mla_prepare_record_workspace_capacity_bytes(
+                                 profile, storage, s.index_format, local, first, last, sm_count)
+                           : ops::kpool_mla_prepare_update_workspace_capacity_bytes(
+                                 profile, storage, s.index_format, local, first, last, sm_count));
             if (reuse)
                 scratch(a, linear(m.query, minimum, columns));
             else {
                 scratch(a, ops::linear_split_workspace_capacity_bytes(
                                {m.query_index, {}}, m.query_rows, minimum, columns));
-                scratch(a, ops::kpool_indexer_workspace_capacity_bytes(
-                               m.indexer, {s.max_context}, local, first, last, sm_count));
+                scratch(a, ops::kpool_indexer_workspace_capacity_bytes(m.indexer, s.index_format,
+                                                                       {s.max_context}, local,
+                                                                       first, last, sm_count));
             }
             scratch(a, ops::kpool_sparse_mla_workspace_capacity_bytes(
                            m.attention, storage, {s.max_context}, local, first, last, sm_count));
@@ -142,7 +144,8 @@ std::size_t history(const ModelProfile& p, const ExecutionShape& s, int first, i
         const auto& profile = p.mtp->attention.prepare.at(
             static_cast<std::size_t>(ops::KpoolMlaPrepareProjection::History));
         scratch(a, ops::kpool_mla_prepare_update_workspace_capacity_bytes(
-                       profile, latent_storage(s.kv_storage), local, first, last, sm_count));
+                       profile, latent_storage(s.kv_storage), s.index_format, local, first, last,
+                       sm_count));
     }
     return a.peak_bytes();
 }

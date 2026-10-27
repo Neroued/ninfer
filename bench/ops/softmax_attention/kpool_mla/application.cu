@@ -52,22 +52,23 @@ static kp::IndexerCase shape_of(const Json& c) {
 static Json admission(CudaExecutionView cuda, const Json& c) {
     const auto shape = shape_of(c);
     const int T = c.at("T"), B = c.at("B"), L = c.value("layers", 11);
-    const auto layout =
-        ops::plan_kpool_mla_cache_layout({ops::KpoolMlaStorage::BFloat16, 512, 128, L});
+    const auto layout = ops::plan_kpool_mla_cache_layout(
+        {ops::KpoolMlaStorage::BFloat16, KvCacheVectorFormat::BFloat16, 512, 128, L});
     const auto page     = plan_kv_page_layout(layout.page.geometry);
     const auto bytes    = page.alignment + shape.pages(B, 0) * (page.page_bytes + page.alignment);
     const auto envelope = ops::KpoolExecutionEnvelope{std::uint32_t(shape.envelope)};
-    const auto scratch =
-        std::max({ops::kpool_indexer_workspace_capacity_bytes({32, 128}, envelope, B, 1, T,
-                                                              cuda.multiprocessor_count()),
-                  ops::kpool_sparse_mla_workspace_capacity_bytes(
-                      {64, 256, 256, 512}, ops::KpoolMlaStorage::BFloat16, envelope, B, 1, T,
-                      cuda.multiprocessor_count()),
-                  ops::kpool_mla_prepare_record_workspace_capacity_bytes(
-                      {kp::Projection::Full, 4096, 512, 128, 1536, 32, 4},
-                      ops::KpoolMlaStorage::BFloat16, B, 1, T, cuda.multiprocessor_count()),
-                  ops::linear_workspace_capacity_bytes(QType::Q8_G32_FP16, 4096, 16384,
-                                                       ops::LinearPolicy::A16Only, B, T * B)});
+    const auto scratch  = std::max(
+        {ops::kpool_indexer_workspace_capacity_bytes({32, 128}, KvCacheVectorFormat::BFloat16,
+                                                      envelope, B, 1, T,
+                                                      cuda.multiprocessor_count()),
+          ops::kpool_sparse_mla_workspace_capacity_bytes({64, 256, 256, 512},
+                                                         ops::KpoolMlaStorage::BFloat16, envelope, B,
+                                                         1, T, cuda.multiprocessor_count()),
+          ops::kpool_mla_prepare_record_workspace_capacity_bytes(
+             {kp::Projection::Full, 4096, 512, 128, 1536, 32, 4}, ops::KpoolMlaStorage::BFloat16,
+             KvCacheVectorFormat::BFloat16, B, 1, T, cuda.multiprocessor_count()),
+          ops::linear_workspace_capacity_bytes(QType::Q8_G32_FP16, 4096, 16384,
+                                               ops::LinearPolicy::A16Only, B, T * B)});
     std::size_t free = 0, total = 0;
     CUDA_CHECK(cudaMemGetInfo(&free, &total));
     // Conservative fixture budget: device + Host mirrors of frame/weights, flush and

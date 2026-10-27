@@ -27,10 +27,11 @@ struct ChainFixture {
 
     ChainFixture(CudaExecutionView cuda, int T, int B, int E, int layers = 11, bool ragged = false,
                  const IndexerCase& shape = {}, bool repeated_inputs = true,
-                 bool initialize_history = true)
+                 bool initialize_history          = true,
+                 KvCacheVectorFormat index_format = KvCacheVectorFormat::BFloat16)
         : weights(cuda.device(), Projection::Full),
           index(cuda, T, B, E, layers, ragged, ops::KpoolMlaStorage::BFloat16, shape,
-                initialize_history),
+                initialize_history, index_format),
           x(cuda.device(), DType::BF16, {4096, T, B}),
           rank(cuda.device(), DType::BF16, {1536, T, B}),
           query(cuda.device(), DType::BF16, {256, 64, T, B}),
@@ -100,11 +101,11 @@ struct ChainFixture {
         if (initialize_history) {
             Tensor dense({latent.data(), latent.size() * 2, Device::cpu()}, DType::BF16,
                          {512, 64, 1, index.physical_pages});
-            index.packed.upload_plane(2 * index.layer, dense);
+            index.packed.upload_plane(index.packed.plane_index(cache.latent.data.plane), dense);
         }
         const std::array<std::int32_t, 2> split_rows{16384, 4096};
         capacities = {ops::kpool_mla_prepare_update_workspace_capacity_bytes(
-                          weights.profile(), ops::KpoolMlaStorage::BFloat16, B, 1, T,
+                          weights.profile(), ops::KpoolMlaStorage::BFloat16, index_format, B, 1, T,
                           cuda.multiprocessor_count()),
                       ops::linear_split_workspace_capacity_bytes(
                           ops::ProjectionWeights{ops::SingleProjectionWeight{query_weight}},

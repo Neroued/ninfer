@@ -343,7 +343,8 @@ StartupConfigurationView view(const LaunchOptions& launch, EntryPoint entry, con
             append(key + "device", static_cast<std::uint64_t>(rank.device));
         }
     }
-    for (const char* name : {"NINFER_VRAM_BUDGET_MIB", "NINFER_CUDA_SYNC"}) {
+    for (const char* name :
+         {"NINFER_VRAM_BUDGET_MIB", "NINFER_CUDA_SYNC", "NINFER_KPOOL_INDEXER_BF16"}) {
         if (const char* value = std::getenv(name)) out.environment.emplace(name, value);
     }
     return out;

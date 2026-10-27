@@ -82,7 +82,10 @@ void launch_prepare(const PrepareArguments& inputs, int window_columns, cudaStre
             const int end   = b == a.last_row ? a.last_stop : a.tokens;
             jobs += (end - start + 6) / 4;
         }
-        prepare_post_kernel<<<jobs, 128, 0, stream>>>(a, begin, columns);
+        if (a.fp8_index)
+            prepare_post_kernel<true><<<jobs, 128, 0, stream>>>(a, begin, columns);
+        else
+            prepare_post_kernel<false><<<jobs, 128, 0, stream>>>(a, begin, columns);
         CUDA_CHECK(cudaGetLastError());
     }
 }

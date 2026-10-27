@@ -30,4 +30,12 @@ struct IndexerArguments {
         return t < valid[b] ? positions[t + std::int64_t(b) * tokens] + 1 : 0;
     }
 };
+
+struct Fp8IndexerArguments {
+    IndexerArguments index;
+    const std::uint8_t *keys, *scales;
+    std::uint8_t* query;
+    float* coefficients;
+    int query_begin, query_width;
+};
 } // namespace ninfer::ops::detail::kpool

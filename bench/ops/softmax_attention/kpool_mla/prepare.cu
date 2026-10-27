@@ -13,6 +13,7 @@ int main(int argc, char** argv) {
         int batch = 1, phase = 0;
         bool update = false, ragged = false, inplace = false, inactive = false;
         auto projection = kp::Projection::Full;
+        auto index_format = KvCacheVectorFormat::BFloat16;
         for (int i = 1; i < argc; ++i) {
             const std::string flag = argv[i];
             if (flag == "--help") {
@@ -21,7 +22,8 @@ int main(int argc, char** argv) {
                        "H4096/Dc512/Di128/Rq1536/Hi32.\n"
                        "  --projection full|query-history|history --form record|update\n"
                        "  --tokens N,... --batch 1..8 --phase 0..3 --ragged 0|1 --inplace 0|1\n"
-                       "  --inactive 0|1  zero valid columns in every physical row\n";
+                       "  --inactive 0|1  zero valid columns in every physical row\n"
+                       "  --index-cache bf16|fp8\n";
                 measurement::help();
                 return 0;
             }
@@ -39,6 +41,9 @@ int main(int argc, char** argv) {
                 inplace = measurement::integer(v, 0, 1);
             else if (flag == "--inactive")
                 inactive = measurement::integer(v, 0, 1);
+            else if (flag == "--index-cache" && (v == "bf16" || v == "fp8"))
+                index_format = v == "fp8" ? KvCacheVectorFormat::Fp8E4m3fnGroup128Ue8m0
+                                          : KvCacheVectorFormat::BFloat16;
             else if (flag == "--form" && (v == "record" || v == "update"))
                 update = v == "update";
             else if (flag == "--projection" &&
@@ -53,14 +58,15 @@ int main(int argc, char** argv) {
         auto& device = device_context();
         kp::Weights weights(device.device(), projection);
         L2FlushBuffer flush(options.flush_bytes);
-        measurement::Csv csv(options.csv_out,
-                             "projection,form,phase,live_columns,weight_bytes,read_payload_bytes,"
-                             "write_payload_bytes,payload_bytes,projection_flops,"
-                             "physical_projection_flops,payload_GBps,"
-                             "projection_TFLOps");
+        measurement::Csv csv(
+            options.csv_out,
+            "index_storage,projection,form,phase,live_columns,weight_bytes,read_payload_bytes,"
+            "write_payload_bytes,payload_bytes,projection_flops,"
+            "physical_projection_flops,payload_GBps,"
+            "projection_TFLOps");
         for (int T : tokens) {
             kp::Fixture f(weights, device.execution_view(), T, batch, update, ragged, false,
-                          inplace, phase);
+                          inplace, phase, index_format);
             if (inactive) {
                 for (int b = 0; b < batch; ++b) {
                     f.valid.at(b)          = 0;
@@ -91,9 +97,9 @@ int main(int argc, char** argv) {
             const std::size_t reads = live ? weights.weight.view.bytes() + live * 8192 + tail_read +
                                                  (512 + weights.q + 256 + 512) * 2
                                            : 0;
-            const std::size_t writes = live * (1024 + (update ? 0 : 512)) +
-                                       M * (weights.q * 2 + weights.heads * 4) + pools * 256 +
-                                       tail_write;
+            const std::size_t writes =
+                live * (1024 + (update ? 0 : 512)) + M * (weights.q * 2 + weights.heads * 4) +
+                pools * (index_format == KvCacheVectorFormat::BFloat16 ? 256 : 129) + tail_write;
             const std::size_t payload   = reads + writes;
             const double flops          = 2. * weights.rows * 4096 * live;
             const double physical_flops = 2. * weights.rows * 4096 * M;
@@ -120,9 +126,10 @@ int main(int argc, char** argv) {
                     row.workspace_peak = f.workspace->peak_used();
                     const double us    = result.gpu.median_us;
                     csv.write(row, result, execution, cache,
-                              std::string(kp::name(projection)) + "," +
-                                  (update ? "update" : "record") + "," + std::to_string(phase) +
-                                  "," + std::to_string(live) + "," +
+                              std::string(index_format == KvCacheVectorFormat::BFloat16 ? "bf16,"
+                                                                                        : "fp8,") +
+                                  kp::name(projection) + "," + (update ? "update" : "record") +
+                                  "," + std::to_string(phase) + "," + std::to_string(live) + "," +
                                   std::to_string(weights.weight.view.bytes()) + "," +
                                   std::to_string(reads) + "," + std::to_string(writes) + "," +
                                   std::to_string(payload) + "," + std::to_string(flops) + "," +

@@ -13,6 +13,8 @@
 namespace ninfer::models::glm5next {
 class ExecutionCodec;
 
+[[nodiscard]] KvCacheVectorFormat index_format_from_environment();
+
 // Owns the same rank instance from weight materialization through execution activation.
 // Reader is borrowed until materialize(); DeviceContext and communicators outlive the instance.
 class RankPreparation {
@@ -80,6 +82,7 @@ public:
 private:
     std::shared_ptr<const ModelDefinition> definition_;
     RankPlan rank_;
+    KvCacheVectorFormat index_format_;
 };
 
 [[nodiscard]] std::string prefill_signature(const ModelDefinition&, std::uint32_t chunk,

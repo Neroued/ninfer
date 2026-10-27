@@ -19,6 +19,7 @@ constexpr ReductionCriterion kQueryCriterion{1. / 256, 1. / 256, 2. / 256};
 // assuming that numerically close FP32 scores have identical Top512 boundaries.
 int verify_prepare(kp::ChainFixture& f) {
     auto& i            = f.index;
+    const bool fp8     = i.cache.format == KvCacheVectorFormat::Fp8E4m3fnGroup128Ue8m0;
     const auto& w      = f.weights;
     const int patterns = std::min(i.T, 7), F = i.E - i.T;
     std::vector<double> projected(std::size_t(patterns) * i.B * w.rows);
@@ -32,14 +33,23 @@ int verify_prepare(kp::ChainFixture& f) {
                 projected[j] = sum;
             }
         });
-    f.rank.host             = f.rank.download();
-    i.coeff.host            = i.coeff.download();
-    const auto latent_bytes = i.packed.download_plane(2 * i.layer);
-    const auto key_bytes    = i.packed.download_plane(2 * i.layer + 1);
-    std::vector<std::uint16_t> latent(f.latent.size()), keys(i.keys.size()),
+    f.rank.host  = f.rank.download();
+    i.coeff.host = i.coeff.download();
+    const auto latent_bytes =
+        i.packed.download_plane(i.packed.plane_index(f.cache.latent.data.plane));
+    const auto key_bytes = i.packed.download_plane(i.plane_index);
+    std::vector<std::uint16_t> latent(f.latent.size()), keys(fp8 ? 0 : i.keys.size()),
         state(f.initial_state.size());
     std::memcpy(latent.data(), latent_bytes.data(), latent_bytes.size());
-    std::memcpy(keys.data(), key_bytes.data(), key_bytes.size());
+    if (!fp8) std::memcpy(keys.data(), key_bytes.data(), key_bytes.size());
+    std::vector<std::uint8_t> codes, scales;
+    if (fp8) {
+        codes.resize(key_bytes.size());
+        std::memcpy(codes.data(), key_bytes.data(), key_bytes.size());
+        const auto scale_bytes = i.packed.download_plane(i.scale_plane_index);
+        scales.resize(scale_bytes.size());
+        std::memcpy(scales.data(), scale_bytes.data(), scale_bytes.size());
+    }
     f.state.copy_to_host(state.data(), state.size() * 2);
     auto expected_state = f.initial_state;
     KpoolError c_error, q_error, coeff_error, pool_error, tail_error;
@@ -91,6 +101,7 @@ int verify_prepare(kp::ChainFixture& f) {
         if (!n) continue;
         for (int g = 0; g < int(raw_k.size()) / 4; ++g) {
             const auto base = f.physical_token(b, (F / 4 + g) * 4) / 4 * 128;
+            std::array<double, 128> pooled;
             for (int d = 0; d < 128; ++d) {
                 double logits[4], maximum = -INFINITY, sum = 0, value = 0;
                 for (int r = 0; r < 4; ++r) {
@@ -102,8 +113,23 @@ int verify_prepare(kp::ChainFixture& f) {
                     sum += weight;
                     value += weight * raw_k[g * 4 + r][d];
                 }
-                pool_error.add(kp::decode(keys[base + d]), value / sum);
-                i.keys[base + d] = keys[base + d];
+                pooled[d] = value / sum;
+            }
+            if (fp8) {
+                const auto rotated = index_hadamard_reference(pooled);
+                const double scale = fp8_cache_multiplier(scales[base / 128]);
+                failures += scales[base / 128] == 255;
+                i.key_scales[base / 128] = scales[base / 128];
+                for (int d = 0; d < 128; ++d) {
+                    failures += (codes[base + d] & 127) == 127;
+                    pool_error.add(float_codec::decode_e4m3fn(codes[base + d]) * scale, rotated[d]);
+                    i.key_codes[base + d] = codes[base + d];
+                }
+            } else {
+                for (int d = 0; d < 128; ++d) {
+                    pool_error.add(kp::decode(keys[base + d]), pooled[d]);
+                    i.keys[base + d] = keys[base + d];
+                }
             }
         }
         const int remainder = (F + n) % 4, start = int(raw_k.size()) - remainder;
@@ -120,10 +146,11 @@ int verify_prepare(kp::ChainFixture& f) {
     failures += c_error.check("chain latent", kPreparedBf16Criterion) +
                 q_error.check("chain rank", kPreparedBf16Criterion) +
                 coeff_error.check("chain coefficient", kCoefficientCriterion) +
-                pool_error.check("chain pool", kPooledBf16Criterion) +
+                pool_error.check("chain pool", fp8 ? kPooledFp8Criterion : kPooledBf16Criterion) +
                 tail_error.check("chain tail", kPreparedBf16Criterion);
     // Updated expected buffers retain every untouched word, including future tokens.
-    failures += latent != f.latent || keys != i.keys || state != expected_state;
+    failures += latent != f.latent || state != expected_state;
+    failures += fp8 ? (codes != i.key_codes || scales != i.key_scales) : keys != i.keys;
     return failures;
 }
 
@@ -190,9 +217,11 @@ int verify(kp::ChainFixture& f) {
     return failures;
 }
 
-int run(int T, int B, int E, int layers, bool graph) {
+int run(int T, int B, int E, int layers, bool graph, bool fp8 = false) {
     auto& d = cuda_environment().context;
-    kp::ChainFixture f(d.execution_view(), T, B, E, layers, B > 1);
+    kp::ChainFixture f(d.execution_view(), T, B, E, layers, B > 1, {}, true, true,
+                       fp8 ? KvCacheVectorFormat::Fp8E4m3fnGroup128Ue8m0
+                           : KvCacheVectorFormat::BFloat16);
     if (graph) {
         DecodeGraphDefinition definition;
         definition.capture(d.stream(), [&] { f.launch(d.execution_view()); });
@@ -229,5 +258,15 @@ int main(int argc, char** argv) {
                       std::to_string(E),
                   [=] { return run(T, B, E, layers, graph); },
                   {{"format", "bf16"}, {"execution", graph ? "graph" : "eager"}});
+    for (auto [T, B, E, layers, graph] : {std::tuple{1, 1, 2052, 11, true},
+                                          {5, 3, 2054, 11, true},
+                                          {17, 1, 8193, 1, false},
+                                          {129, 1, 8193, 11, false},
+                                          {1, 1, 65536, 11, false},
+                                          {65, 3, 262147, 11, true}})
+        suite.add("kpool_chain/fp8/" + std::to_string(T) + "x" + std::to_string(B) + "/" +
+                      std::to_string(E),
+                  [=] { return run(T, B, E, layers, graph, true); },
+                  {{"format", "fp8"}, {"execution", graph ? "graph" : "eager"}});
     return suite.main(argc, argv);
 }

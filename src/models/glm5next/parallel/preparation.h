@@ -23,6 +23,7 @@ struct RankLoadRequest {
     artifact::ArtifactId artifact;
     RankPlan rank;
     EngineOptions options;
+    KvCacheVectorFormat index_format   = KvCacheVectorFormat::Fp8E4m3fnGroup128Ue8m0;
     std::size_t host_reservation_bytes = 0;
     bool control_owner                 = false;
 };

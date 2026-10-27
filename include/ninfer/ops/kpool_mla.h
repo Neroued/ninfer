@@ -100,20 +100,29 @@ struct ConstKpoolMlaLatentCacheView {
         : data(view.data), scales(view.scales), storage(view.storage) {}
 };
 
-// One BF16 [Di,16,1] plane, tokens_per_row=4, aligned and addressed as above. Logical pool g
-// uses page g/16 and row g%16. Latent tokens of that pool occupy rows 4*(g%16)+{0,1,2,3}.
+// Keys are BF16 or E4M3FN [Di,16,1], tokens_per_row=4, addressed as above. FP8 keys use
+// the normalized H128 basis and have a dense UE8M0 U8 [Di/128,16,1] scale plane with the
+// same records and tokens_per_row=4. BF16 keys stay in the original basis and have no scales.
+// Logical pool g uses page g/16 and row g%16; its latent rows are 4*(g%16)+{0,1,2,3}.
 struct KpoolIndexCacheView {
     PagedPlaneView keys;
+    PagedPlaneView scales;
+    KvCacheVectorFormat format = KvCacheVectorFormat::BFloat16;
 };
 
 struct ConstKpoolIndexCacheView {
     ConstPagedPlaneView keys;
+    ConstPagedPlaneView scales;
+    KvCacheVectorFormat format = KvCacheVectorFormat::BFloat16;
 
     ConstKpoolIndexCacheView() = default;
 
-    explicit ConstKpoolIndexCacheView(ConstPagedPlaneView keys) : keys(keys) {}
+    ConstKpoolIndexCacheView(ConstPagedPlaneView keys, ConstPagedPlaneView scales,
+                             KvCacheVectorFormat format)
+        : keys(keys), scales(scales), format(format) {}
 
-    ConstKpoolIndexCacheView(const KpoolIndexCacheView& view) : keys(view.keys) {}
+    ConstKpoolIndexCacheView(const KpoolIndexCacheView& view)
+        : keys(view.keys), scales(view.scales), format(view.format) {}
 };
 
 // All present planes use the same backing, page-offset table and 64-token page span. Plane
@@ -258,7 +267,10 @@ struct KpoolSparseMlaProfile {
  * For a live row, F=positions[0,b], n=valid_columns[b]. Write latent [F,F+n) and each completed
  * pooled key g in [floor(F/4),floor((F+n)/4)):
  *   logits[r,d] = FP32(g_raw[4*g+r,d]) + FP32(APE[d,r]);
- *   index.K[d,g] = BF16(sum_r softmax_over_r(logits[:,d])[r] * FP32(k_raw[4*g+r,d])).
+ *   pooled[d,g] = sum_r softmax_over_r(logits[:,d])[r] * FP32(k_raw[4*g+r,d]);
+ *   index.K = BF16(pooled), or G128/UE8M0 encoding of R*pooled for the FP8 index format.
+ * R=H128/sqrt(128), H128[i,j]=(-1)^popcount(i&j). The FP8 branch uses FP32 pooling and
+ * butterfly arithmetic directly through encoding, without an intermediate BF16 cast.
  * Pool softmax/sums use FP32 and actual BF16 raw words, including wholly new pools. Raw words
  * preceding F come from before's canonical tail; no incomplete pool is published. New cache
  * writes may precede attention over this window; query metadata still determines visibility.
@@ -292,7 +304,10 @@ void kpool_mla_prepare_update(const Tensor& x, const KpoolMlaPrepareParameters& 
  * For each live query p, E=p+1, C=floor(E/4), compute over g in [0,C):
  *   dot[h,g] = sum_d index_query[d,h,t,b] * index.K[d,g];
  *   score[g] = sum_h head_coeff[h,t,b] * max(0,dot[h,g]).
- * index_query is BF16 [Di,Hi,T,B]; head_coeff is FP32 [Hi,T,B]. Dot products accumulate in
+ * index_query is BF16 [Di,Hi,T,B]; head_coeff is FP32 [Hi,T,B]. BF16 cache uses the original
+ * query and BF16 dot products. FP8 cache represents rotated keys: the mathematical query is
+ * R*index_query, with R defined above. This profile uses FP8 Q/K dots, with per-head G128
+ * power-of-two query quantization as internal approximation. Both profiles accumulate in
  * FP32; ReLU, signed weighting and head reduction are FP32. Select the exact min(512,C)
  * highest computed scores, ties preferring smaller logical g. The set is unordered and
  * distinct; no forced latest pool, no zero-filled invisible candidate. The common positive
@@ -306,8 +321,9 @@ void kpool_mla_prepare_update(const Tensor& x, const KpoolMlaPrepareParameters& 
  * Each live E fits both the page table and envelope.max_visible_tokens<=kKpoolMaxVisibleTokens.
  *
  * Mixed per-row lengths/all-select/inert cases are Device decisions. Scratch is reused across
- * bounded query windows. Fixed T/B/profile/device facts keep Graph node count/order compatible
- * across envelope updates; changing a Host variable alone does not update captured nodes.
+ * bounded query windows. Fixed T/B/profile/index format/device facts keep Graph node count/order
+ * compatible across envelope updates; changing a Host variable alone does not update captured
+ * nodes.
  */
 void kpool_indexer(const Tensor& index_query, const Tensor& head_coeff,
                    const ConstKpoolIndexCacheView& cache, const KpoolMlaBatchView& batch,
@@ -390,16 +406,19 @@ void kpool_tail_extract(ConstKpoolTailStateView before, const KpoolRawRecordRead
  * algorithm options. Query and execution share admission, selection and allocation rules.
  */
 [[nodiscard]] std::size_t kpool_mla_prepare_record_workspace_capacity_bytes(
-    const KpoolMlaPrepareProfile& profile, KpoolMlaStorage storage, std::int32_t batch_size,
-    std::int32_t min_tokens, std::int32_t max_tokens, std::int32_t sm_count);
+    const KpoolMlaPrepareProfile& profile, KpoolMlaStorage latent_storage,
+    KvCacheVectorFormat index_format, std::int32_t batch_size, std::int32_t min_tokens,
+    std::int32_t max_tokens, std::int32_t sm_count);
 
 [[nodiscard]] std::size_t kpool_mla_prepare_update_workspace_capacity_bytes(
-    const KpoolMlaPrepareProfile& profile, KpoolMlaStorage storage, std::int32_t batch_size,
-    std::int32_t min_tokens, std::int32_t max_tokens, std::int32_t sm_count);
+    const KpoolMlaPrepareProfile& profile, KpoolMlaStorage latent_storage,
+    KvCacheVectorFormat index_format, std::int32_t batch_size, std::int32_t min_tokens,
+    std::int32_t max_tokens, std::int32_t sm_count);
 
 [[nodiscard]] std::size_t kpool_indexer_workspace_capacity_bytes(
-    const KpoolIndexerProfile& profile, KpoolExecutionEnvelope envelope, std::int32_t batch_size,
-    std::int32_t min_tokens, std::int32_t max_tokens, std::int32_t sm_count);
+    const KpoolIndexerProfile& profile, KvCacheVectorFormat index_format,
+    KpoolExecutionEnvelope envelope, std::int32_t batch_size, std::int32_t min_tokens,
+    std::int32_t max_tokens, std::int32_t sm_count);
 
 [[nodiscard]] std::size_t
 kpool_sparse_mla_workspace_capacity_bytes(const KpoolSparseMlaProfile& profile,
@@ -416,6 +435,7 @@ public:
 private:
     std::array<std::uint64_t, 24> words_{};
     friend KpoolGraphProfile kpool_indexer_graph_profile(const KpoolIndexerProfile&,
+                                                         KvCacheVectorFormat,
                                                          KpoolExecutionEnvelope, std::int32_t,
                                                          std::int32_t, std::int32_t);
     friend KpoolGraphProfile kpool_sparse_mla_graph_profile(const KpoolSparseMlaProfile&,
@@ -425,7 +445,7 @@ private:
 };
 
 [[nodiscard]] KpoolGraphProfile
-kpool_indexer_graph_profile(const KpoolIndexerProfile&, KpoolExecutionEnvelope,
+kpool_indexer_graph_profile(const KpoolIndexerProfile&, KvCacheVectorFormat, KpoolExecutionEnvelope,
                             std::int32_t batch_size, std::int32_t tokens, std::int32_t sm_count);
 [[nodiscard]] KpoolGraphProfile
 kpool_sparse_mla_graph_profile(const KpoolSparseMlaProfile&, KpoolMlaStorage,

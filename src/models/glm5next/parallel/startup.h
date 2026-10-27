@@ -35,6 +35,7 @@ public:
 private:
     std::shared_ptr<const ModelDefinition> definition_;
     ParallelPlan parallel_;
+    KvCacheVectorFormat index_format_;
     std::vector<RankResourceDescription> ranks_;
     std::uint32_t checkpoint_interval_ = 0;
 };

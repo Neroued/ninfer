@@ -30,7 +30,8 @@ struct ExecutionPlan {
 
 // Plans eager execution resources. The Program's graph preparation accounts its own storage.
 [[nodiscard]] ExecutionPlan plan_execution(std::shared_ptr<const execution::ModelProfile>,
-                                           const EngineOptions&, std::int32_t sm_count);
+                                           const EngineOptions&, KvCacheVectorFormat index_format,
+                                           std::int32_t sm_count);
 [[nodiscard]] runtime::ContextCapacityPlan describe_execution_capacity(const ExecutionPlan&);
 // Local parts only; the group preparation assembles the complete directory before construction.
 [[nodiscard]] context::ContextDirectorySpec describe_context(const ExecutionPlan&);

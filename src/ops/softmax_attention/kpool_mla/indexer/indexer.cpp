@@ -5,27 +5,30 @@ namespace ninfer::ops {
 using namespace detail::kpool;
 
 KpoolGraphProfile kpool_indexer_graph_profile(const KpoolIndexerProfile& profile,
+                                              KvCacheVectorFormat index_format,
                                               KpoolExecutionEnvelope envelope, int batch,
                                               int tokens, int sms) {
-    indexer_geometry(profile, envelope, batch, tokens, tokens, sms);
-    const auto p = indexer_plan(tokens, tokens, batch, envelope);
+    indexer_geometry(profile, index_format, envelope, batch, tokens, tokens, sms);
+    const auto p = index_format == KvCacheVectorFormat::Fp8E4m3fnGroup128Ue8m0
+                       ? fp8_indexer_plan(tokens, batch, envelope)
+                       : indexer_plan(tokens, tokens, batch, envelope);
     KpoolGraphProfile key;
-    key.words_ = {std::uint64_t(tokens),
-                  std::uint64_t(batch),
-                  std::uint64_t(sms),
-                  std::uint64_t(p.windows),
-                  std::uint64_t(p.columns),
-                  std::uint64_t(p.partitions),
-                  std::uint64_t(p.merge_groups),
-                  p.bytes};
+    key.words_ = {
+        std::uint64_t(tokens),       std::uint64_t(batch),          std::uint64_t(sms),
+        std::uint64_t(index_format), std::uint64_t(p.windows),      std::uint64_t(p.columns),
+        std::uint64_t(p.partitions), std::uint64_t(p.merge_groups), p.bytes,
+        std::uint64_t(p.query_width)};
     return key;
 }
 
 std::size_t kpool_indexer_workspace_capacity_bytes(const KpoolIndexerProfile& profile,
+                                                   KvCacheVectorFormat index_format,
                                                    KpoolExecutionEnvelope envelope,
                                                    std::int32_t batch, std::int32_t lo,
                                                    std::int32_t hi, std::int32_t sms) {
-    indexer_geometry(profile, envelope, batch, lo, hi, sms);
+    indexer_geometry(profile, index_format, envelope, batch, lo, hi, sms);
+    if (index_format == KvCacheVectorFormat::Fp8E4m3fnGroup128Ue8m0)
+        return fp8_indexer_capacity(lo, hi, batch, envelope);
     return indexer_plan(lo, hi, batch, envelope).bytes;
 }
 
@@ -35,7 +38,7 @@ void kpool_indexer(const Tensor& query, const Tensor& coefficients,
                    KpoolBlockSelection& out, CudaExecutionView execution) {
     const int T = query.ne[2], B = query.ne[3];
     const auto device = execution.device();
-    indexer_geometry({query.ne[1], query.ne[0]}, envelope, B, T, T,
+    indexer_geometry({query.ne[1], query.ne[0]}, cache.format, envelope, B, T, T,
                      execution.multiprocessor_count());
     require(std::int64_t(T) * B <= std::numeric_limits<int>::max(), "selection row extent");
     const int rows = T * B;
@@ -51,7 +54,7 @@ void kpool_indexer(const Tensor& query, const Tensor& coefficients,
     input(batch.positions, DType::I32, {T, B}, 4, "positions");
     input(batch.valid_columns, DType::I32, {B}, 4, "valid columns");
     input(batch.table_rows, DType::I32, {B}, 4, "table rows");
-    plane(cache.keys, 128, 4, device);
+    index_cache(cache, 128, device);
     const auto& table = cache.keys.records.page_offsets;
     require(std::uint64_t(table.ne[0]) * 64 >= envelope.max_visible_tokens, "page table capacity");
     const auto table_blocks = operand::blocks(table, kOperation);
@@ -67,7 +70,8 @@ void kpool_indexer(const Tensor& query, const Tensor& coefficients,
         require(!operand::overlaps(table_blocks, outputs[i]), "output overlaps page table");
     }
     operand::device(workspace.device(), device, kOperation, "workspace");
-    const auto plan = indexer_plan(T, T, B, envelope);
+    const bool fp8  = cache.format == KvCacheVectorFormat::Fp8E4m3fnGroup128Ue8m0;
+    const auto plan = fp8 ? fp8_indexer_plan(T, B, envelope) : indexer_plan(T, T, B, envelope);
     auto scope      = workspace.scope();
     MemorySpan scratch{};
     if (plan.bytes) {
@@ -79,7 +83,7 @@ void kpool_indexer(const Tensor& query, const Tensor& coefficients,
     }
     IndexerArguments a{};
     a.query        = static_cast<const __nv_bfloat16*>(query.data);
-    a.keys         = static_cast<const __nv_bfloat16*>(cache.keys.data());
+    a.keys         = fp8 ? nullptr : static_cast<const __nv_bfloat16*>(cache.keys.data());
     a.coefficients = static_cast<const float*>(coefficients.data);
     a.positions    = static_cast<const int*>(batch.positions.data);
     a.valid        = static_cast<const int*>(batch.valid_columns.data);
@@ -99,6 +103,18 @@ void kpool_indexer(const Tensor& query, const Tensor& coefficients,
     a.columns      = plan.columns;
     a.partitions   = plan.partitions;
     a.merge_groups = plan.merge_groups;
-    launch_indexer(a, plan.windows, execution.multiprocessor_count(), execution.stream());
+    if (fp8) {
+        Fp8IndexerArguments f{};
+        f.index  = a;
+        f.keys   = static_cast<const std::uint8_t*>(cache.keys.data());
+        f.scales = static_cast<const std::uint8_t*>(cache.scales.data());
+        if (plan.bytes) {
+            f.query        = static_cast<std::uint8_t*>(plan.query_fp8.bind(scratch).data);
+            f.coefficients = static_cast<float*>(plan.weighted_coefficients.bind(scratch).data);
+        }
+        launch_fp8_indexer(f, execution.multiprocessor_count(), execution.stream());
+    } else {
+        launch_indexer(a, plan.windows, execution.multiprocessor_count(), execution.stream());
+    }
 }
 } // namespace ninfer::ops

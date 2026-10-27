@@ -145,6 +145,7 @@ glm::SessionPlan plan(const glm::ModelDefinition& definition) {
                                 64,
                definition.options().mtp() ? 3U : 0U,
                                 KvCacheStorage::BFloat16,
+                                KvCacheVectorFormat::BFloat16,
                                 EnginePurpose::Generation,
                                 true,
                                 false};
@@ -156,10 +157,11 @@ glm::SessionPlan plan(const glm::ModelDefinition& definition) {
     if (definition.options().mtp()) profile->mtp.emplace();
     const auto state = glm::describe_state(glm::plan_state(*profile));
     p.states         = {state, state};
-    p.caches.push_back(ops::plan_kpool_mla_cache_layout(
-                           {ops::KpoolMlaStorage::BFloat16, glm::dimension(c.mla.latent_dim),
-                            glm::dimension(c.mla.index_dim), glm::dimension(c.mla_layers)})
-                           .page);
+    p.caches.push_back(
+        ops::plan_kpool_mla_cache_layout(
+            {ops::KpoolMlaStorage::BFloat16, p.shape.index_format, glm::dimension(c.mla.latent_dim),
+             glm::dimension(c.mla.index_dim), glm::dimension(c.mla_layers)})
+            .page);
     p.context.ranks                  = {{0, 8ULL << 20, 0}, {1, 8ULL << 20, 0}};
     p.context.state.logical_capacity = 64;
     for (unsigned owner = 0; owner < 2; ++owner) {
@@ -179,10 +181,11 @@ glm::SessionPlan plan(const glm::ModelDefinition& definition) {
                                .parts         = {{0, {page.page_bytes, page.alignment}},
                                                  {1, {page.page_bytes, page.alignment}}}});
     if (definition.options().mtp()) {
-        p.caches.push_back(ops::plan_kpool_mla_cache_layout({ops::KpoolMlaStorage::BFloat16,
-                                                             glm::dimension(c.mla.latent_dim),
-                                                             glm::dimension(c.mla.index_dim), 1})
-                               .page);
+        p.caches.push_back(
+            ops::plan_kpool_mla_cache_layout({ops::KpoolMlaStorage::BFloat16, p.shape.index_format,
+                                              glm::dimension(c.mla.latent_dim),
+                                              glm::dimension(c.mla.index_dim), 1})
+                .page);
         auto pool    = p.context.pools[0];
         pool.pool_id = 1;
         for (auto& part : pool.parts) part.record = {p.caches[1].page_bytes, p.caches[1].alignment};

@@ -24,6 +24,7 @@ void encode_rank_load(Encoder& out, const RankLoadRequest& request) {
         for (auto expert : bank) out.u32(expert);
     }
     encode_rank_options(out, request.options);
+    out.u8(static_cast<std::uint8_t>(request.index_format));
     out.u64(request.host_reservation_bytes);
     out.boolean(request.control_owner);
 }
@@ -44,6 +45,7 @@ RankLoadRequest decode_rank_load(Decoder& in) {
         for (auto& expert : bank) expert = in.u32();
     }
     request.options                = decode_rank_options(in);
+    request.index_format           = static_cast<KvCacheVectorFormat>(in.u8());
     request.host_reservation_bytes = in.u64();
     request.control_owner          = in.boolean();
     return request;
@@ -54,6 +56,7 @@ void encode(Encoder& out, const RankResourceDescription& r) {
     const auto& s = r.shape;
     for (auto n : {s.max_context, s.max_concurrency, s.prefill_chunk, s.draft_tokens}) out.u32(n);
     out.u8(static_cast<std::uint8_t>(s.kv_storage));
+    out.u8(static_cast<std::uint8_t>(s.index_format));
     out.u8(static_cast<std::uint8_t>(s.purpose));
     out.boolean(s.context_cache);
     out.boolean(s.gpu_timing);
@@ -90,6 +93,7 @@ RankResourceDescription decode_rank_resources(Decoder& in) {
                              in.u32(),
                              in.u32(),
                              static_cast<KvCacheStorage>(in.u8()),
+                             static_cast<KvCacheVectorFormat>(in.u8()),
                              static_cast<EnginePurpose>(in.u8()),
                              in.boolean(),
                              in.boolean()};

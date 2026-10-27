@@ -31,8 +31,7 @@ struct SparseMlaFixture {
                      int layer_count = 11, bool ragged = false, bool frozen = false,
                      float magnitude = 1, int selection_span = 1)
         : T(tokens), B(batch), E(end), P(std::max(1, (end + 63) / 64)), layers(layer_count),
-          layer(layers / 2), plane_index(2 * layer),
-          query(cuda.device(), DType::BF16, {256, 64, T, B}),
+          layer(layers / 2), query(cuda.device(), DType::BF16, {256, 64, T, B}),
           key_up(cuda.device(), DType::BF16, {512, 256, 64}),
           value_up(cuda.device(), DType::BF16, {512, 256, 64}),
           output(cuda.device(), DType::BF16, {256, 64, T, B}),
@@ -41,8 +40,8 @@ struct SparseMlaFixture {
           selection_rows(cuda.device(), DType::I32, {T, B}),
           ids(cuda.device(), DType::I32, {512, T * B}), counts(cuda.device(), DType::I32, {T * B}),
           ends(cuda.device(), DType::I32, {T * B}), tables(cuda.device(), DType::I64, {P, B}, true),
-          layout(
-              ops::plan_kpool_mla_cache_layout({ops::KpoolMlaStorage::BFloat16, 512, 128, layers})),
+          layout(ops::plan_kpool_mla_cache_layout(
+              {ops::KpoolMlaStorage::BFloat16, KvCacheVectorFormat::BFloat16, 512, 128, layers})),
           envelope{std::uint32_t(end)},
           workspace_bytes(ops::kpool_sparse_mla_workspace_capacity_bytes(
               {64, 256, 256, 512}, ops::KpoolMlaStorage::BFloat16, envelope, B, 1, T,
@@ -89,6 +88,7 @@ struct SparseMlaFixture {
             tables.at(p, B - 1 - b) = packed->physical_offset(page);
         }
         cache = layout.layer(PagedRecordView{packed->storage(), tables.view, 64}, layer).latent;
+        plane_index = packed->plane_index(cache.data.plane);
         latent.resize(std::size_t(physical_pages) * 64 * 512);
         for (std::size_t i = 0; i < latent.size(); ++i) latent[i] = sample(i + 3351, 1.F / 512);
         for (std::size_t i = 0; i < query.host.size(); ++i)

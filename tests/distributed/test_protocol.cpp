@@ -114,6 +114,7 @@ void model_preparation() {
     o.context_cache.host_capacity_bytes = 0;
     request.host_reservation_bytes      = 2ULL << 30;
     request.control_owner               = false;
+    request.index_format                = KvCacheVectorFormat::BFloat16;
     wire::Encoder out;
     glm::encode_rank_load(out, request);
     const auto bytes = std::move(out).take();
@@ -124,6 +125,7 @@ void model_preparation() {
     glm::encode_rank_load(roundtrip, decoded);
     require(std::move(roundtrip).take() == bytes && decoded.rank.kda_heads.begin == 32 &&
                 decoded.options.speculative.proposal_head == ProposalHead::Optimized &&
+                decoded.index_format == request.index_format &&
                 decoded.host_reservation_bytes == request.host_reservation_bytes,
             "GLM preparation lost partition, assembly, execution policy or Host reservation");
 
@@ -141,17 +143,24 @@ void model_preparation() {
     require(std::move(qr).take() == qb, "shared rank serialization changed Qwen preparation");
 
     glm::RankResourceDescription r{};
-    r.rank          = 1;
-    r.shape         = {1048576, 8,    4096, 3, KvCacheStorage::BFloat16, EnginePurpose::Generation,
-                       true,    false};
-    r.state         = {{1024, 256}, {1536, 256}, {1024, 512, 256}};
-    r.context.ranks = {{1, 2ULL << 30, 0}};
-    r.context.state = {100, {{0, {{1, 1024, 256}}}, {1, {{1, 1536, 256}}}}};
-    r.context.pools = {{0, 4096, 100, 16384, 8, {{1, {8192, 256}}}},
-                       {1, 4096, 100, 16384, 16, {{1, {1024, 256}}}}};
-    r.context.metadata_budget_bytes                       = 1ULL << 20;
-    r.budget.context_capacity_bytes                       = 2ULL << 30;
-    r.observation.rank                                    = 1;
+    r.rank                          = 1;
+    r.shape                         = {1048576,
+                                       8,
+                                       4096,
+                                       3,
+                                       KvCacheStorage::BFloat16,
+                                       KvCacheVectorFormat::Fp8E4m3fnGroup128Ue8m0,
+                                       EnginePurpose::Generation,
+                                       true,
+                                       false};
+    r.state                         = {{1024, 256}, {1536, 256}, {1024, 512, 256}};
+    r.context.ranks                 = {{1, 2ULL << 30, 0}};
+    r.context.state                 = {100, {{0, {{1, 1024, 256}}}, {1, {{1, 1536, 256}}}}};
+    r.context.pools                 = {{0, 4096, 100, 16384, 8, {{1, {8192, 256}}}},
+                                       {1, 4096, 100, 16384, 16, {{1, {1024, 256}}}}};
+    r.context.metadata_budget_bytes = 1ULL << 20;
+    r.budget.context_capacity_bytes = 2ULL << 30;
+    r.observation.rank              = 1;
     r.observation.memory.allocations.device_weights_bytes = 91ULL << 30;
     r.vision_max_features                                 = 4096;
     wire::Encoder resources;

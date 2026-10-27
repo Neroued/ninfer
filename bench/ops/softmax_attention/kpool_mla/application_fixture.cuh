@@ -45,7 +45,7 @@ struct Fixture : kp::ChainFixture {
         auto& i        = index;
         int multiplier = 17;
         while (std::gcd(multiplier, i.physical_pages) != 1) multiplier += 2;
-        for (int plane : {2 * i.layer, 2 * i.layer + 1}) {
+        for (int plane : {int(i.packed.plane_index(cache.latent.data.plane)), i.plane_index}) {
             const auto& p = i.packed.layout().planes[plane];
             history_words<<<4096, 256, 0, cuda.stream()>>>(
                 static_cast<std::byte*>(i.packed.storage().data), i.packed.record_stride(),
@@ -90,19 +90,20 @@ struct Fixture : kp::ChainFixture {
                                        : ops::kpool_mla_prepare_update_workspace_capacity_bytes;
         for (auto phase : {Phase::Full, Phase::Reuse, Phase::History}) {
             const auto p = params(phase);
-            cap          = std::max(cap, prepare_capacity({p.projection, 4096, 512, 128,
-                                                  phase == Phase::History ? 0 : 1536,
-                                                  phase == Phase::Full ? 32 : 0, 4},
-                                                          ops::KpoolMlaStorage::BFloat16, index.B, 1,
-                                                          index.T, cuda.multiprocessor_count()));
+            cap          = std::max(
+                cap,
+                prepare_capacity({p.projection, 4096, 512, 128, phase == Phase::History ? 0 : 1536,
+                                  phase == Phase::Full ? 32 : 0, 4},
+                                          ops::KpoolMlaStorage::BFloat16, KvCacheVectorFormat::BFloat16,
+                                          index.B, 1, index.T, cuda.multiprocessor_count()));
         }
         cap = std::max(cap, ops::linear_workspace_capacity_bytes(QType::BF16, 16384, 1536,
                                                                  ops::LinearPolicy::A16Only,
                                                                  index.B, index.T * index.B));
         for (int u : bounds) {
             cap = std::max(cap, ops::kpool_indexer_workspace_capacity_bytes(
-                                    {32, 128}, {std::uint32_t(u)}, index.B, 1, index.T,
-                                    cuda.multiprocessor_count()));
+                                    {32, 128}, KvCacheVectorFormat::BFloat16, {std::uint32_t(u)},
+                                    index.B, 1, index.T, cuda.multiprocessor_count()));
             cap = std::max(cap, ops::kpool_sparse_mla_workspace_capacity_bytes(
                                     {64, 256, 256, 512}, ops::KpoolMlaStorage::BFloat16,
                                     {std::uint32_t(u)}, index.B, 1, index.T,

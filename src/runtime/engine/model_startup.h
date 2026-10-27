@@ -27,6 +27,9 @@ calibrate_plan(const Setup& setup, ModelInstance<typename Setup::Types>& instanc
                const StartupMemoryBudget& budget, typename Setup::ExecutionPlan candidate,
                std::vector<typename Setup::Calibration>& measured,
                std::size_t minimum_rebuild = 0) {
+    // Explicit template arguments: MSVC fails to deduce aggregate CTAD here
+    // (CalibratedPlan{plan, graph}) inside this member-template context.
+    using ExecutionPlan = typename Setup::ExecutionPlan;
     for (;;) {
         auto probe_options          = options;
         probe_options.prefill_chunk = candidate.chunk;
@@ -49,7 +52,7 @@ calibrate_plan(const Setup& setup, ModelInstance<typename Setup::Types>& instanc
         auto next = setup.plan(device, options, candidate.host_experts, available - graph_bytes);
         if (!next) return std::nullopt;
         const auto next_key = setup.graph_plan(probe_options, next->moe.get());
-        if (next_key == key) return CalibratedPlan{std::move(*next), graph};
+        if (next_key == key) return CalibratedPlan<ExecutionPlan>{std::move(*next), graph};
         const bool revisited = std::any_of(measured.begin(), measured.end(),
                                            [&](const auto& item) { return item.plan == next_key; });
         if (revisited && candidate.sequence.device_reservation_bytes() <= available - graph_bytes) {
@@ -65,7 +68,7 @@ calibrate_plan(const Setup& setup, ModelInstance<typename Setup::Types>& instanc
                 } else
                     high = middle - 1;
             }
-            return CalibratedPlan{std::move(candidate), graph};
+            return CalibratedPlan<ExecutionPlan>{std::move(candidate), graph};
         }
         candidate = std::move(*next);
     }

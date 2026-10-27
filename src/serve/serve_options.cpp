@@ -75,6 +75,26 @@ std::size_t parse_host_context_mib(const char* text) {
     if (fraction.size() > 20) {
         throw std::invalid_argument("--host-context-mib must resolve to a whole number of bytes");
     }
+#if defined(_MSC_VER)
+    // MSVC has no __int128. With k = len(fraction), the value is
+    // fraction * 2^20 / 10^k = (fraction / 5^k) * 2^(20-k), and 5^k divides
+    // fraction * 2^(20-k) exactly when it divides fraction, so 64-bit long
+    // division by 5^k (5^20 < 2^57) decides both divisibility and the quotient.
+    std::uint64_t divisor = 1;
+    for (std::size_t index = 0; index < fraction.size(); ++index) { divisor *= 5; }
+    std::uint64_t quotient  = 0;
+    std::uint64_t remainder = 0;
+    for (const char character : fraction) {
+        const std::uint64_t current = remainder * 10 + static_cast<std::uint64_t>(character - '0');
+        quotient                    = quotient * 10 + current / divisor;
+        remainder                   = current % divisor;
+    }
+    if (remainder != 0) {
+        throw std::invalid_argument("--host-context-mib must resolve to a whole number of bytes");
+    }
+    const std::size_t fractional_bytes =
+        static_cast<std::size_t>(quotient << (20 - fraction.size()));
+#else
     unsigned __int128 numerator = 0;
     unsigned __int128 divisor   = 1;
     for (const char character : fraction) {
@@ -86,6 +106,7 @@ std::size_t parse_host_context_mib(const char* text) {
         throw std::invalid_argument("--host-context-mib must resolve to a whole number of bytes");
     }
     const std::size_t fractional_bytes = static_cast<std::size_t>(numerator / divisor);
+#endif
     const std::size_t whole_bytes      = whole_mib * bytes_per_mib;
     if (fractional_bytes > maximum - whole_bytes) {
         throw std::invalid_argument("--host-context-mib is out of range");

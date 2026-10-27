@@ -39,7 +39,11 @@ inline void with_columns(int columns, Function&& function) noexcept {
         if constexpr (MaxColumns >= 8) { return function.template operator()<8>(); }
         break;
     }
+#if defined(_MSC_VER)
+    __assume(0);
+#else
     __builtin_unreachable();
+#endif
 }
 
 template <class Simd, int K, int Rows, int Columns, class Input>

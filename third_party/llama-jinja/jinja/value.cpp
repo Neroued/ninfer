@@ -8,6 +8,18 @@
 #include <vector>
 #include <optional>
 #include <algorithm>
+#include <time.h>
+
+#if defined(_WIN32)
+// MSVC names the thread-safe localtime localtime_s, with swapped arguments.
+static bool jinja_localtime_r(const std::time_t* time, std::tm* out) {
+    return ::localtime_s(out, time) == 0;
+}
+#else
+static bool jinja_localtime_r(const std::time_t* time, std::tm* out) {
+    return ::localtime_r(time, out) != nullptr;
+}
+#endif
 
 namespace jinja {
 
@@ -281,7 +293,7 @@ const func_builtins& global_builtins() {
              args.ensure_vals<value_string>();
              std::string format = args.get_pos(0)->as_string().str();
              std::tm local{};
-             if (!localtime_r(&args.ctx.current_time, &local)) {
+             if (!jinja_localtime_r(&args.ctx.current_time, &local)) {
                  throw raised_exception("strftime_now: invalid time");
              }
              if (format.empty()) return mk_val<value_string>("");

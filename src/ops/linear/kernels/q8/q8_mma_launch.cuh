@@ -30,8 +30,16 @@ void launch_q8_a16_mma(const Q8LinearOperands& operands, Output output, Epilogue
                     q8_a16_mma_kernel<Schedule, Full, FullK, Output, Epilogue, RowPolicy>;
                 const int shared =
                     common::prepare_shared<linear_mma_shared_bytes<Schedule, Epilogue>, kernel>();
+#if defined(_MSC_VER)
+                // MSVC's cudafe cannot launch through the constexpr function-pointer variable
+                // captured by this lambda (C2326), so reference the kernel template directly.
+                q8_a16_mma_kernel<Schedule, Full, FullK, Output, Epilogue, RowPolicy>
+                    <<<grid, Schedule::kThreads, shared, stream>>>(operands, output, epilogue,
+                                                                  row_policy, offset, count);
+#else
                 kernel<<<grid, Schedule::kThreads, shared, stream>>>(operands, output, epilogue,
                                                                      row_policy, offset, count);
+#endif
                 CUDA_CHECK(cudaGetLastError());
             };
             if (!Schedule::kPredicated && operands.rows % Schedule::kBlockRows == 0 &&

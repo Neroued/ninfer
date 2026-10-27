@@ -40,6 +40,11 @@ public:
 private:
     std::filesystem::path path_;
     FileView view_;
+#ifdef _WIN32
+    // Windows HANDLE. The Linux build stores its descriptor in view_.descriptor instead;
+    // handles are pointer-sized and cannot travel through that int field.
+    void* handle_ = nullptr;
+#endif
 };
 
 struct DirectReadWindow {

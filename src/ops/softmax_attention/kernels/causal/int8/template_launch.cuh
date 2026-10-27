@@ -49,9 +49,18 @@ void launch_int8_kv_tiled_mma(const CausalAttentionOperands& p, Int8KvReadView c
         constexpr auto kernel = int8_kv_tiled_mma_kernel<G, S, Metadata>;
         const int shared      = common::prepare_shared<S::kSharedBytes, kernel, true>();
         const dim3 grid(common::div_up(p.width, S::kQueryRows), G::QHeads);
+#if defined(_MSC_VER)
+        // MSVC's cudafe cannot launch through the constexpr function-pointer variable
+        // captured by this lambda (C2326), so reference the kernel template directly.
+        int8_kv_tiled_mma_kernel<G, S, Metadata>
+            <<<grid, S::kThreads, shared, stream>>>(
+                p.q, cache.keys, cache.values, cache.key_scales, cache.value_scales, metadata,
+                p.positions, p.scale, p.out, p.width);
+#else
         kernel<<<grid, S::kThreads, shared, stream>>>(
             p.q, cache.keys, cache.values, cache.key_scales, cache.value_scales, metadata,
             p.positions, p.scale, p.out, p.width);
+#endif
         CUDA_CHECK(cudaGetLastError());
     };
     if (!cache.table_rows)

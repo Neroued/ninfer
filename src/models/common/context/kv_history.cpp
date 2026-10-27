@@ -760,7 +760,9 @@ LogicalKVPageHandle& KVHistoryStore::directory_slot(Directory& root, std::uint32
     for (;;) {
         if (!*node)
             *node = std::make_shared<DirectoryNode>();
-        else if (!node->unique())
+        // shared_ptr::unique() was removed in C++20 (MSVC rejects it); use_count() == 1
+        // is the same advisory last-owner check.
+        else if (node->use_count() != 1)
             *node = std::make_shared<DirectoryNode>(**node);
         if (width == kChunkPages) return (*node)->pages[index];
         width /= 2;

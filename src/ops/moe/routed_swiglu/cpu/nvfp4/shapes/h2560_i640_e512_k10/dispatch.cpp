@@ -15,7 +15,11 @@ kernel::Plan select_plan(CpuFeatures features) {
     case Isa::Avx2:
         return {.run = kernel::run_avx2, .token_block = token_block, .max_columns = 2};
     }
+#if defined(_MSC_VER)
+    __assume(0);
+#else
     __builtin_unreachable();
+#endif
 }
 
 std::size_t capacity(int tokens) { return kernel::capacity(tokens, token_block); }

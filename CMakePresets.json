@@ -22,11 +22,25 @@
         "BUILD_TESTING": "ON",
         "NINFER_BUILD_BENCHMARKS": "ON"
       }
+    },
+    {
+      "name": "windows-vcpkg",
+      "displayName": "Windows (MSVC, vcpkg-managed dependencies)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build-win",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "NINFER_BUILD_APPS": "ON",
+        "BUILD_TESTING": "OFF",
+        "NINFER_BUILD_BENCHMARKS": "OFF",
+        "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake"
+      }
     }
   ],
   "buildPresets": [
     { "name": "release", "configurePreset": "release" },
-    { "name": "dev", "configurePreset": "dev" }
+    { "name": "dev", "configurePreset": "dev" },
+    { "name": "windows-vcpkg", "configurePreset": "windows-vcpkg" }
   ],
   "testPresets": [
     {

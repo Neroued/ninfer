@@ -130,9 +130,22 @@ __device__ __forceinline__ void nvfp4_tma_raster_blocks(int& block_x, int& block
 template <class Schedule, class Epilogue, class OutputPolicy, class Rows>
 __global__
 __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a4_tma_kernel(
-    const __grid_constant__ Nvfp4A4TmaDescriptors descriptors, float alpha,
-    const __grid_constant__ Epilogue epilogue, const __grid_constant__ OutputPolicy output,
-    int token_count, int output_rows, int input_rows, int token_offset) {
+#if defined(_MSC_VER)
+    // MSVC rejects the over-aligned (alignas(128)) descriptors as a by-value kernel parameter
+    // (C2719), so they travel as a device pointer on Windows; other compilers keep the
+    // __grid_constant__ by-value parameter. The body dereferences them identically.
+    const Nvfp4A4TmaDescriptors* descriptors,
+#else
+    const __grid_constant__ Nvfp4A4TmaDescriptors descriptors,
+#endif
+    float alpha, const __grid_constant__ Epilogue epilogue,
+    const __grid_constant__ OutputPolicy output, int token_count, int output_rows, int input_rows,
+    int token_offset) {
+#if defined(_MSC_VER)
+    const Nvfp4A4TmaDescriptors& tma = *descriptors;
+#else
+    const Nvfp4A4TmaDescriptors& tma = descriptors;
+#endif
     const int K               = Schedule::kStaticK ? Schedule::kStaticK : input_rows;
     constexpr int branches    = Rows::kPaired ? 2 : 1;
     constexpr int loaded_rows = Schedule::kBlockRows / branches;
@@ -184,14 +197,14 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a4_t
                     load_scales ? kTransactionBytes : kTransactionBytes - kScaleBytes);
 
                 auto& tensors = shared.scratch.tensors;
-                common::tma_load_2d(tensors.a_codes[stage], &descriptors.a_codes,
+                common::tma_load_2d(tensors.a_codes[stage], &tma.a_codes,
                                     k_tile * Schedule::kCodeRowBytes, token_begin,
                                     &shared.full[stage]);
 #pragma unroll
                 for (int branch = 0; branch < branches; ++branch)
                     common::tma_load_2d(
                         tensors.b_codes[stage] + branch * loaded_rows * Schedule::kCodeRowBytes,
-                        &descriptors.b_codes, k_tile * Schedule::kCodeRowBytes,
+                        &tma.b_codes, k_tile * Schedule::kCodeRowBytes,
                         row_begin + branch * (output_rows / 2), &shared.full[stage]);
                 if (load_scales) {
                     // The box is tile-contiguous, so its address is a tile index rather than a
@@ -200,7 +213,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a4_t
                     const int scale_tile =
                         (token_begin / Schedule::kBlockTokens) * kScaleTilesPerPlane + k_tile / 2;
                     common::tma_load_2d(tensors.a_scale4[(k_tile / 2) % Schedule::kScaleSlots],
-                                        &descriptors.a_scales, 0, scale_tile * 16,
+                                        &tma.a_scales, 0, scale_tile * 16,
                                         &shared.full[stage]);
                 }
 #pragma unroll
@@ -209,7 +222,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a4_t
                         (((row_begin + branch * (output_rows / 2)) / 128) * (K / 64) +
                          k_tile * Schedule::kK64PerStage) *
                         32;
-                    common::tma_load_2d(tensors.b_scales[stage][branch], &descriptors.b_scales, 0,
+                    common::tma_load_2d(tensors.b_scales[stage][branch], &tma.b_scales, 0,
                                         scale_row, &shared.full[stage]);
                 }
             }
@@ -384,12 +397,30 @@ void launch_nvfp4_a4_tma_mma(const Nvfp4A4Operands& p, Output output, Epilogue e
     constexpr int bytes    = sizeof(Nvfp4A4TmaSharedStorage<Schedule, Rows, Epilogue>);
     constexpr auto kernel  = nvfp4_a4_tma_kernel<Schedule, Epilogue, Output, Rows>;
     (void)common::prepare_shared<bytes, kernel, true>();
+#if defined(_MSC_VER)
+    Nvfp4A4TmaDescriptors* device_descriptors = nullptr;
+    CUDA_CHECK(cudaMallocAsync(&device_descriptors, sizeof(Nvfp4A4TmaDescriptors), stream));
+    CUDA_CHECK(cudaMemcpyAsync(device_descriptors, &descriptors, sizeof(Nvfp4A4TmaDescriptors),
+                               cudaMemcpyHostToDevice, stream));
+#endif
     common::for_each_token_slice(p.tokens, Schedule::kBlockTokens, [&](int offset, int count) {
         const dim3 grid(p.rows / Schedule::kBlockRows,
                         common::div_up(count, Schedule::kBlockTokens));
+#if defined(_MSC_VER)
+        // MSVC's cudafe cannot launch through the constexpr function-pointer variable
+        // captured by this lambda (C2326), so reference the kernel template directly.
+        nvfp4_a4_tma_kernel<Schedule, Epilogue, Output, Rows>
+            <<<grid, Schedule::kThreads, bytes, stream>>>(device_descriptors, p.alpha, epilogue,
+                                                          output, offset + count, p.rows, p.k,
+                                                          offset);
+#else
         kernel<<<grid, Schedule::kThreads, bytes, stream>>>(descriptors, p.alpha, epilogue, output,
                                                             offset + count, p.rows, p.k, offset);
+#endif
         CUDA_CHECK(cudaGetLastError());
     });
+#if defined(_MSC_VER)
+    CUDA_CHECK(cudaFreeAsync(device_descriptors, stream));
+#endif
 }
 } // namespace ninfer::ops::detail

@@ -9,7 +9,9 @@ struct Avx512 : common::cpu::avx512::F32 {
     static constexpr bool bf16_gate   = false;
     static constexpr auto first_chunk = FirstChunkPreparation::Caller;
 
-    static Float scale(std::uint16_t bits) noexcept { return _mm512_set1_ps(_cvtsh_ss(bits)); }
+    static Float scale(std::uint16_t bits) noexcept {
+        return _mm512_set1_ps(common::cpu::avx2::half_to_float(bits));
+    }
 
     template <int Bits>
     static Float decode(const std::uint8_t* code, const std::uint8_t* high) noexcept {

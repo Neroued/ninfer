@@ -15,6 +15,16 @@ inline __m256 load_bf16(const std::uint16_t* source) noexcept {
     return _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(words), 16));
 }
 
+// Half-precision bits to scalar float. MSVC's STL has no scalar _cvtsh_ss, so F16C
+// conversion goes through the vector intrinsic there.
+inline float half_to_float(std::uint16_t bits) noexcept {
+#if defined(_MSC_VER)
+    return _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(bits)));
+#else
+    return _cvtsh_ss(bits);
+#endif
+}
+
 // 16 packed bytes -> 32 unsigned bytes, low nibble then high nibble for each byte.
 inline __m256i unpack_u4(const std::uint8_t* source) noexcept {
     const auto words =

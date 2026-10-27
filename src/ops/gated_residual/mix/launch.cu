@@ -88,8 +88,16 @@ void folded_up(Operands o, Scratch scratch, cudaStream_t stream) {
     const int bytes       = common::prepare_shared<S::kSharedBytes, kernel, true>();
     common::for_each_token_slice(o.columns, Tokens, [&](int offset, int count) {
         const unsigned blocks = (kWidth / Features) * common::div_up(count, Tokens);
+#if defined(_MSC_VER)
+        // MSVC's cudafe cannot launch through the constexpr function-pointer variable
+        // captured by this lambda (C2326), so reference the kernel template directly.
+        up_mma_mix_kernel<Features, Tokens>
+            <<<blocks, S::kThreads, bytes, stream>>>(
+                o, static_cast<const __nv_bfloat16*>(scratch.activation), offset);
+#else
         kernel<<<blocks, S::kThreads, bytes, stream>>>(
             o, static_cast<const __nv_bfloat16*>(scratch.activation), offset);
+#endif
         CUDA_CHECK(cudaGetLastError());
     });
 }

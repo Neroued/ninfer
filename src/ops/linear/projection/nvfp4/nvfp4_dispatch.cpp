@@ -12,6 +12,9 @@ const std::array kShapes{
     &kNvfp4N12288K4096, &kNvfp4N4096K6144,
 #endif
     &kNvfp4N14336K5120, &kNvfp4N16384K5120, &kNvfp4N34816K5120,
+#if NINFER_TARGET_RTX5090
+    &kNvfp4N28672K5120,
+#endif
     &kNvfp4N5120K6144,  &kNvfp4N5120K17408,
 };
 

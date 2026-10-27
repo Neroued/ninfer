@@ -26,6 +26,12 @@ void launch_nvfp4_a4_tma_linear(Nvfp4GeometryId problem, const Nvfp4A4Operands& 
     case Nvfp4GeometryId::N16384K5120:
         launch<5120>(p, output, stream);
         return;
+    case Nvfp4GeometryId::N28672K5120:
+        if (p.scale_layout == Nvfp4ScaleLayout::Tiled128)
+            launch<5120>(p, output, stream);
+        else
+            launch<5120, CU_TENSOR_MAP_L2_PROMOTION_L2_128B>(p, output, stream);
+        return;
     case Nvfp4GeometryId::N34816K5120:
         launch<5120, CU_TENSOR_MAP_L2_PROMOTION_L2_128B>(p, output, stream);
         return;

@@ -135,9 +135,42 @@ void run_nvfp4_spark_shape(Suite& suite, int n, int k, std::uint32_t seed) {
 } // namespace
 #endif
 
+#if NINFER_TARGET_RTX5090
+namespace {
+void run_nvfp4_n28672_k5120(Suite& suite) {
+    const std::vector<Invocation> a16{
+        {1, CallForm::A16Convenience}, {2}, {8}, {32}, {128}, {2048},
+        {33, CallForm::Policy, ops::LinearPolicy::AllowA8}};
+    add_shape(suite, QType::NVFP4, ActivationRecipe::TokenBlocks, make_nvfp4_weight,
+              {28672, 5120, 733U, Comparison::Sampled, true, a16});
+    const std::vector<Invocation> a4{
+        {1, CallForm::Policy, ops::LinearPolicy::AllowA4},
+        {4, CallForm::Policy, ops::LinearPolicy::AllowA4},
+        {8, CallForm::Policy, ops::LinearPolicy::AllowA4, true},
+        {32, CallForm::Policy, ops::LinearPolicy::AllowA4},
+        {128, CallForm::Policy, ops::LinearPolicy::AllowA4},
+        {129, CallForm::Policy, ops::LinearPolicy::AllowA4},
+        {512, CallForm::Policy, ops::LinearPolicy::AllowA4},
+        {513, CallForm::Policy, ops::LinearPolicy::AllowA4, true},
+        {1024, CallForm::Policy, ops::LinearPolicy::AllowA4},
+        {2048, CallForm::Policy, ops::LinearPolicy::AllowA4},
+        {2049, CallForm::Policy, ops::LinearPolicy::AllowA4}};
+    add_shape(suite, QType::NVFP4, ActivationRecipe::Hashed, make_nvfp4_weight,
+              {28672, 5120, 737U, Comparison::Sampled, true, a4});
+    const std::vector<Invocation> tail{{128, CallForm::Policy, ops::LinearPolicy::AllowA4}};
+    add_shape(suite, QType::NVFP4, ActivationRecipe::Hashed, make_nvfp4_weight,
+              {28672, 5120, 743U, Comparison::Sampled, true, tail, ActivationPattern::KTail});
+    add_workspace_cases(suite, QType::NVFP4, 28672, 5120);
+}
+} // namespace
+#endif
+
 void ninfer::test::linear::add_nvfp4_cases(Suite& suite) {
     run_nvfp4_a16(suite);
     run_nvfp4_a4(suite);
+#if NINFER_TARGET_RTX5090
+    run_nvfp4_n28672_k5120(suite);
+#endif
 #if NINFER_TARGET_SPARK
     run_nvfp4_spark_shape(suite, 12288, 4096, 1200U);
     run_nvfp4_spark_shape(suite, 4096, 6144, 1300U);

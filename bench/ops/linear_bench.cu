@@ -587,20 +587,22 @@ double registered_tensor_peak_tflops(const BenchPoint& point, const char*& profi
     }
     const bool nvfp4_problem =
         (point.n == 12288 && point.k == 4096) || (point.n == 4096 && point.k == 6144) ||
-        (point.k == 5120 && (point.n == 14336 || point.n == 16384 || point.n == 34816)) ||
+        (point.k == 5120 &&
+         (point.n == 14336 || point.n == 16384 || point.n == 28672 || point.n == 34816)) ||
         (point.n == 5120 && (point.k == 6144 || point.k == 17408));
     if (point.qtype == QType::NVFP4 && nvfp4_problem) {
         const bool a4 =
             point.policy == LinearPolicy::AllowA4 &&
             ((point.n == 12288 && point.k == 4096 && point.t >= 17) ||
              (point.n == 4096 && point.k == 6144 && point.t >= 9) ||
-             (point.n == 14336 && point.t >= 4) || point.n == 16384 || point.n == 34816 ||
+             (point.n == 14336 && point.t >= 4) || (point.n == 28672 && point.t >= 8) ||
+             point.n == 16384 || point.n == 34816 ||
              (point.k == 6144 && point.t >= 17) || (point.k == 17408 && point.t >= 8));
         if (a4) {
             profile = "NVFP4_F32ACC";
             return bench::kRoofline.nvfp4_f32_tflops;
         }
-        if (point.t >= (point.k == 17408 ? 6 : 3)) {
+        if (point.t >= (point.n == 28672 ? 2 : point.k == 17408 ? 6 : 3)) {
             profile = "BF16_F32ACC";
             return bench::kRoofline.bf16_f32_tflops;
         }

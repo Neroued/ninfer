@@ -14,3 +14,9 @@ target_sources(ninfer_ops_non_rdc PRIVATE
 if(NINFER_TARGET STREQUAL "dgx_spark")
   include("${CMAKE_CURRENT_LIST_DIR}/dgx_spark/sources.cmake")
 endif()
+
+if(NINFER_TARGET STREQUAL "rtx5090")
+  target_sources(ninfer_ops PRIVATE
+    "${CMAKE_CURRENT_LIST_DIR}/shapes/n28672_k5120.cu"
+  )
+endif()

@@ -93,7 +93,8 @@ WeightGeometry weight_geometry(QType format, QuantLayout layout,
         return out;
     }
     const bool nvfp4_bank = layout == QuantLayout::BatchedBlockScaleK16M128x4;
-    const bool fp8_block  = layout == QuantLayout::BlockScaleM128K128;
+    const bool fp8_block  = layout == QuantLayout::BlockScaleM128K128 ||
+                           layout == QuantLayout::BlockScaleM64K64;
     if ((nvfp4_bank && shape.size() != 3) ||
         (fp8_block && shape.size() != 2 && shape.size() != 3) ||
         (!nvfp4_bank && !fp8_block && shape.size() != 2)) {
@@ -160,14 +161,17 @@ WeightGeometry weight_geometry(QType format, QuantLayout layout,
         out.scale_row_bytes    = 2;
         out.code_bytes         = out.elements;
         out.scale_offset       = aligned(out.code_bytes, 256);
-    } else if (layout == QuantLayout::BlockScaleM128K128) {
-        if (format != QType::FP8_E4M3FN_BLOCK128X128_BF16 || n % 128 || k % 128) {
-            throw std::invalid_argument("block-scaled FP8 requires N%128=0 and K%128=0");
+    } else if (fp8_block) {
+        const auto block = layout == QuantLayout::BlockScaleM64K64 ? 64U : 128U;
+        const auto expected = block == 64 ? QType::FP8_E4M3FN_BLOCK64X64_BF16
+                                          : QType::FP8_E4M3FN_BLOCK128X128_BF16;
+        if (format != expected || n % block || k % block) {
+            throw std::invalid_argument("block-scaled FP8 format or matrix block alignment differs");
         }
-        out.group_size         = 128;
-        out.scale_block_rows   = 128;
+        out.group_size         = block;
+        out.scale_block_rows   = block;
         out.code_bytes_per_row = k;
-        out.scale_row_bytes    = mul(k / 128, 2);
+        out.scale_row_bytes    = mul(k / block, 2);
         out.code_bytes         = out.elements;
         out.scale_offset       = aligned(out.code_bytes, 256);
     } else if (layout == QuantLayout::BlockScaleK16M128x4 || nvfp4_bank) {
@@ -363,10 +367,11 @@ Weight native_weight(const WeightView& view, float input_divisor) {
         out.scale_ne[0] = out.n;
         out.scale_nb[0] = 2;
         out.scale_nb[1] = out.scale_nb[2] = out.scale_nb[3] = static_cast<std::int64_t>(out.n) * 2;
-    } else if (g.layout == QuantLayout::BlockScaleM128K128) {
+    } else if (g.layout == QuantLayout::BlockScaleM128K128 ||
+               g.layout == QuantLayout::BlockScaleM64K64) {
         out.scale_dtype = DType::BF16;
         out.scale_ne[0] = dimension(g.padded_columns / g.group_size);
-        out.scale_ne[1] = out.n / 128;
+        out.scale_ne[1] = out.n / dimension(g.scale_block_rows);
         out.scale_nb[0] = 2;
         out.scale_nb[1] = static_cast<std::int64_t>(g.scale_row_bytes);
         out.scale_nb[2] = out.scale_nb[3] = out.scale_nb[1] * out.scale_ne[1];

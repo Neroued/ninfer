@@ -1,6 +1,7 @@
 #include "ops/moe/operands.h"
 #include "core/platform.h"
 
+#include <array>
 #include <cmath>
 #include <stdexcept>
 
@@ -16,26 +17,10 @@ struct MatrixBytes {
     std::size_t codes, high, scales;
 };
 
-MatrixBytes matrix_bytes(QType type, int rows, int columns) {
-    const auto elements = std::size_t(rows) * columns;
-    switch (type) {
-    case QType::BF16:
-        return {elements * 2, 0, 0};
-    case QType::NVFP4:
-        return {elements / 2, 0, elements / 16};
-    case QType::FP8_E4M3FN_BLOCK128X128_BF16:
-        return {elements, 0, elements / (128 * 128) * 2};
-    case QType::Q4_G64_FP16:
-        return {elements / 2, 0, elements / 32};
-    case QType::Q5_G64_FP16:
-        return {elements / 2, elements / 8, elements / 32};
-    case QType::Q6_G64_FP16:
-        return {elements / 2, elements / 4, elements / 32};
-    case QType::Q8_G32_FP16:
-        return {elements, 0, elements / 16};
-    default:
-        throw std::invalid_argument("MoE matrix format is unsupported");
-    }
+MatrixBytes matrix_bytes(QType type, QuantLayout layout, int rows, int columns) {
+    const auto geometry = weight_geometry(
+        type, layout, std::array<std::uint64_t, 2>{std::uint64_t(rows), std::uint64_t(columns)});
+    return {geometry.code_bytes, geometry.high_bytes, geometry.scale_bytes};
 }
 } // namespace
 
@@ -219,12 +204,14 @@ void MoeOperands::experts(const CudaSwiGLUExperts& w, const RoutedSwiGLUProfile&
     if (p.ffn.gate_up_type == QType::NVFP4) {
         require(w.activation_divisors.gate_up && w.activation_divisors.down,
                 "MoE: NVFP4 A4 requires both activation divisors");
-    } else if (p.ffn.gate_up_type == QType::FP8_E4M3FN_BLOCK128X128_BF16) {
+    } else if (p.ffn.gate_up_type == QType::FP8_E4M3FN_BLOCK128X128_BF16 ||
+               p.ffn.gate_up_type == QType::FP8_E4M3FN_BLOCK64X64_BF16) {
         require(!w.activation_divisors.gate_up && !w.activation_divisors.down,
                 "MoE: block FP8 has no activation divisors");
     }
-    const auto matrix = [&](const ExpertMatrixDeviceView& view, QType type, int n, int k) {
-        const auto bytes = matrix_bytes(type, n, k);
+    const auto matrix = [&](const ExpertMatrixDeviceView& view, QType type, QuantLayout layout,
+                            int n, int k) {
+        const auto bytes = matrix_bytes(type, layout, n, k);
         if (type == QType::NVFP4) {
             require(operand::aligned(view.divisors, alignof(float)) &&
                         view.divisor_stride <= (SIZE_MAX / sizeof(float) - 1) / (p.experts - 1),
@@ -265,10 +252,14 @@ void MoeOperands::experts(const CudaSwiGLUExperts& w, const RoutedSwiGLUProfile&
         plane(view.codes, bytes.codes, view.code_stride);
         plane(view.high, bytes.high, view.high_stride);
         plane(view.scales, bytes.scales, view.scale_stride,
-              type == QType::FP8_E4M3FN_BLOCK128X128_BF16 ? 2 : 16);
+              type == QType::FP8_E4M3FN_BLOCK128X128_BF16 ||
+                      type == QType::FP8_E4M3FN_BLOCK64X64_BF16
+                  ? 2
+                  : 16);
     };
-    matrix(w.bank.gate_up, p.ffn.gate_up_type, 2 * p.ffn.intermediate, p.ffn.hidden);
-    matrix(w.bank.down, p.ffn.down_type, p.ffn.hidden, p.ffn.intermediate);
+    matrix(w.bank.gate_up, p.ffn.gate_up_type, p.ffn.gate_up_layout, 2 * p.ffn.intermediate,
+           p.ffn.hidden);
+    matrix(w.bank.down, p.ffn.down_type, p.ffn.down_layout, p.ffn.hidden, p.ffn.intermediate);
 }
 
 void MoeOperands::matrix(const Weight& w, int rows, int columns, QType type) {
@@ -284,7 +275,7 @@ void MoeOperands::matrix(const Weight& w, int rows, int columns, QType type) {
                 : w.layout == QuantLayout::RowSplit && w.group_size == 32 && w.group == 32 &&
                       w.scale_dtype == DType::FP16 && operand::aligned(w.scales, 16),
             "MoE: invalid shared matrix encoding");
-    const auto bytes = matrix_bytes(type, rows, columns);
+    const auto bytes = matrix_bytes(type, w.layout, rows, columns);
     require(w.payload_bytes >= bytes.codes + bytes.scales, "MoE: truncated shared matrix");
     read(w.qdata, bytes.codes);
     read(w.scales, bytes.scales);

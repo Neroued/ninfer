@@ -2,7 +2,6 @@
 #include "models/common/qwen/frontend/tool_format.h"
 #include "models/common/qwen/frontend/tool_name_constraint.h"
 #include "text/json_schema.h"
-#include "text/unicode.h"
 
 #include "grammar_builder.h"
 #include "grammar_functor.h"
@@ -12,8 +11,6 @@
 
 #include <nlohmann/json.hpp>
 
-#include <algorithm>
-#include <map>
 #include <optional>
 
 namespace ninfer::models::qwen::frontend {
@@ -50,74 +47,16 @@ xgrammar::Grammar strict_arguments(const Contract::Tool& tool) {
     }
 }
 
-// An open name language excluding exactly the declared names. A prefix trie avoids overlapping
-// wildcard branches without enumerating parameter permutations or imposing a name whitelist.
-int32_t other_parameter_name(xgrammar::GrammarBuilder& builder, const Contract::Tool& tool) {
-    using Range = xgrammar::GrammarBuilder::CharacterClassElement;
-
-    struct Node {
-        std::map<int32_t, std::size_t> children;
-        bool declared = false;
-        int32_t rule  = -1;
-    };
-
-    std::vector<Node> nodes(1);
-    for (const auto& parameter : tool.parameters) {
-        if (!valid_parameter_name(parameter.name)) continue;
-        std::size_t node = 0;
-        for (const auto cp : text::unicode_internal::utf8_codepoints(parameter.name, "parameter")) {
-            const auto found = nodes[node].children.find(cp.value);
-            if (found != nodes[node].children.end()) {
-                node = found->second;
-            } else {
-                const auto next = nodes.size();
-                nodes[node].children.emplace(cp.value, next);
-                nodes.emplace_back();
-                node = next;
-            }
-        }
-        nodes[node].declared = true;
-    }
-    const std::vector<Range> forbidden{
-        {'\n', '\n'}, {'\r', '\r'}, {'<', '<'}, {'>', '>'}, {0xd800, 0xdfff}};
-    const auto tail = builder.AddCharacterClassStar(forbidden, true);
-    for (std::size_t i = nodes.size(); i-- > 0;) {
-        auto excluded = forbidden;
-        std::vector<int32_t> alternatives;
-        if (i != 0 && !nodes[i].declared) alternatives.push_back(builder.AddEmptyStr());
-        for (const auto [cp, child] : nodes[i].children) {
-            excluded.push_back({cp, cp});
-            alternatives.push_back(builder.AddSequence(
-                {builder.AddByteString(text::unicode_internal::codepoint_to_utf8(cp)),
-                 builder.AddRuleRef(nodes[child].rule)}));
-        }
-        std::sort(excluded.begin(), excluded.end(),
-                  [](const auto& a, const auto& b) { return a.lower < b.lower; });
-        alternatives.push_back(
-            builder.AddSequence({builder.AddCharacterClass(excluded, true), tail}));
-        nodes[i].rule = builder.AddRuleWithHint("open_parameter", builder.AddChoices(alternatives));
-    }
-    return builder.AddRuleRef(nodes.front().rule);
-}
-
-int32_t basic_arguments(xgrammar::GrammarBuilder& builder, const Contract::Tool& tool, int32_t raw,
-                        int32_t json) {
-    const auto parameter = [&](int32_t name, int32_t value) {
-        return builder.AddSequence({builder.AddByteString(std::string(kParamOpen)), name,
-                                    builder.AddByteString(">\n"), builder.AddRuleRef(value),
-                                    builder.AddByteString(std::string(kParameterEnd) + "\n")});
-    };
-    std::vector<int32_t> alternatives;
-    for (const auto& item : tool.parameters) {
-        if (!valid_parameter_name(item.name)) continue;
-        alternatives.push_back(
-            parameter(builder.AddByteString(item.name),
-                      item.encoding == Contract::Encoding::JsonValue ? json : raw));
-    }
-    alternatives.push_back(parameter(other_parameter_name(builder, tool), raw));
-    return builder.AddRuleWithHint(
-        "parameters",
-        builder.AddRepeatFromExpr("parameter", builder.AddChoices(alternatives), 0, -1));
+int32_t basic_arguments(xgrammar::GrammarBuilder& builder, const Contract::Tool& tool,
+                        xgrammar::StringDispatch& names, int32_t json) {
+    std::vector<std::pair<std::string, int32_t>> cases;
+    for (const auto& item : tool.parameters)
+        if (valid_parameter_name(item.name) && item.encoding == Contract::Encoding::JsonValue)
+            cases.emplace_back(item.name, json);
+    const auto parameter = builder.AddSequence(
+        {builder.AddByteString(std::string(kParamOpen)), builder.AddRuleRef(names.Add(cases))});
+    return builder.AddRuleWithHint("parameters",
+                                   builder.AddRepeatFromExpr("parameter", parameter, 0, -1));
 }
 
 xgrammar::Grammar build(const Contract& contract, const std::optional<OutputConstraint>& body) {
@@ -129,19 +68,30 @@ xgrammar::Grammar build(const Contract& contract, const std::optional<OutputCons
         return builder.Get(
             builder.AddRuleWithHint("root", builder.AddTagDispatch({{}, false, {"<tool_call>"}})));
     std::vector<int32_t> choices;
-    std::optional<int32_t> raw_value, json_value;
+    std::optional<xgrammar::StringDispatch> names;
+    int32_t json_value = -1;
     for (const auto& tool : contract.tools) {
-        if (!tool.strict && !raw_value) {
-            raw_value = xgrammar::SubGrammarAdder::Apply(
+        if (!tool.strict && !names) {
+            const auto raw_value = xgrammar::SubGrammarAdder::Apply(
                 &builder,
                 xgrammar::StringConstraints({}, 0, -1, {std::string(kParameterEnd)}, false));
             xgrammar::XMLToolCallingConverter json_codec(std::nullopt, std::nullopt, true,
                                                          std::nullopt);
-            json_value = xgrammar::SubGrammarAdder::Apply(&builder, json_codec.ConvertJSONValue());
+            const auto json =
+                xgrammar::SubGrammarAdder::Apply(&builder, json_codec.ConvertJSONValue());
+            const auto value = [&](int32_t body) {
+                return builder.AddRuleWithHint(
+                    "parameter_value",
+                    builder.AddSequence(
+                        {builder.AddRuleRef(body),
+                         builder.AddByteString(std::string(kParameterEnd) + "\n")}));
+            };
+            json_value = value(json);
+            names.emplace(builder, ">\n", value(raw_value), "<>\r\n", true);
         }
         const auto parameters =
             tool.strict ? xgrammar::SubGrammarAdder::Apply(&builder, strict_arguments(tool))
-                        : basic_arguments(builder, tool, *raw_value, *json_value);
+                        : basic_arguments(builder, tool, *names, json_value);
         choices.push_back(builder.AddSequence(
             {builder.AddByteString("\n<function=" + tool.name + ">\n"),
              builder.AddRuleRef(parameters), builder.AddByteString("</function>\n</tool_call>")}));

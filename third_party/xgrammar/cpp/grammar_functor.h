@@ -157,6 +157,8 @@ class GrammarFunctor {
         return VisitRegex(grammar_expr);
       case GrammarExprType::kSubstring:
         return VisitSubstring(grammar_expr);
+      case GrammarExprType::kByteFSM:
+        return VisitByteFSM(grammar_expr);
       default:
         XGRAMMAR_LOG(FATAL) << "Unexpected sequence type: " << static_cast<int>(grammar_expr.type);
         XGRAMMAR_UNREACHABLE();
@@ -253,6 +255,7 @@ class GrammarFunctor {
 
   /*! \brief Visit a regex GrammarExpr. It is a leaf: the pattern string is carried as-is. */
   virtual T VisitRegex(const GrammarExpr& grammar_expr) { return VisitElement(grammar_expr); }
+  virtual T VisitByteFSM(const GrammarExpr& grammar_expr) { return VisitElement(grammar_expr); }
 
   /*! \brief Visit a substring GrammarExpr. It is a leaf: the chunk list is carried as-is. */
   virtual T VisitSubstring(const GrammarExpr& grammar_expr) { return VisitElement(grammar_expr); }

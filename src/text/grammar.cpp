@@ -3,8 +3,10 @@
 #include "text/unicode.h"
 
 #include <xgrammar/xgrammar.h>
+#include "fsm_builder.h"
 #include "grammar_functor.h"
 #include "grammar_impl.h"
+#include "json_string_grammar.h"
 #include "regex_converter.h"
 
 #include <algorithm>
@@ -95,40 +97,23 @@ xgrammar::Grammar choice_grammar(const std::vector<std::string>& choices) {
         builder.Get(builder.AddRuleWithHint("root", builder.AddChoices(alternatives))));
 }
 
-std::string quoted(unsigned char c) {
-    constexpr char hex[] = "0123456789abcdef";
-    std::string result   = "\"\\x00\"";
-    result[3]            = hex[c >> 4];
-    result[4]            = hex[c & 15];
-    return result;
-}
-
-// A small DFA consumes through the first complete delimiter, including delimiters split across
-// tokens. Concatenation keeps the user's rule names in their own namespace.
+// Consume through the first complete delimiter, including tokens that cross it.
 xgrammar::Grammar reasoning_prefix(std::string_view delimiter) {
-    std::string alphabet(delimiter);
-    std::sort(alphabet.begin(), alphabet.end());
-    alphabet.erase(std::unique(alphabet.begin(), alphabet.end()), alphabet.end());
-    std::string source = "root ::= s0\n";
-    for (std::size_t state = 0; state < delimiter.size(); ++state) {
-        source += "s" + std::to_string(state) + " ::= ";
-        for (unsigned char c : alphabet) {
-            std::string next(delimiter.substr(0, state));
-            next += static_cast<char>(c);
-            std::size_t matched = std::min(next.size(), delimiter.size());
-            while (matched && !next.ends_with(delimiter.substr(0, matched))) { --matched; }
-            source += quoted(c);
-            if (matched != delimiter.size()) { source += " s" + std::to_string(matched); }
-            source += " | ";
-        }
-        source += "[^";
-        for (unsigned char c : alphabet) {
-            const auto escaped = quoted(c);
-            source += escaped.substr(1, escaped.size() - 2);
-        }
-        source += "] s0\n";
+    auto body = xgrammar::GrammarFSMBuilder::TagDispatch({{}, false, {std::string(delimiter)}});
+    if (!body) throw std::logic_error("invalid reasoning delimiter");
+    const auto ends = body->GetEnds();
+    int tail        = body->AddState();
+    for (int end : ends) body->GetFsm().AddEpsilonEdge(end, tail);
+    for (unsigned char byte : delimiter) {
+        const int next = body->AddState();
+        body->GetFsm().AddEdge(tail, next, byte, byte);
+        tail = next;
     }
-    return xgrammar::Grammar::FromEBNF(source);
+    xgrammar::GrammarBuilder builder;
+    const auto value = xgrammar::AddScalarStringFSM(
+        builder, xgrammar::FSMWithStartEnd(body->GetFsm(), body->GetStart(), {tail}), "reasoning",
+        false);
+    return xgrammar::GrammarNormalizer::Apply(builder.Get(builder.AddRuleWithHint("root", value)));
 }
 
 void validate(const xgrammar::Grammar& grammar, const std::vector<std::string>& vocab,
@@ -145,7 +130,8 @@ void validate(const xgrammar::Grammar& grammar, const std::vector<std::string>& 
     for (int i = 0; i < grammar->NumGrammarExprs(); ++i) {
         const auto expression = grammar->GetGrammarExpr(i);
         if (expression.type == Type::kTagDispatch || expression.type == Type::kTokenTagDispatch ||
-            expression.type == Type::kRegex || expression.type == Type::kSubstring) {
+            expression.type == Type::kRegex || expression.type == Type::kByteFSM ||
+            expression.type == Type::kSubstring) {
             throw std::invalid_argument("grammar uses an extension outside the GBNF contract");
         }
         if (expression.type == Type::kToken || expression.type == Type::kExcludeToken) {

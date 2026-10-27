@@ -179,6 +179,14 @@ bool HasProductiveRoot(const Grammar& grammar) {
       const auto expr = grammar->GetGrammarExpr(i);
       bool productive = true;
       switch (expr.type) {
+        case Type::kByteFSM: {
+          const auto fsm = grammar->GetByteFSM(expr);
+          std::unordered_set<int> reachable;
+          fsm.GetReachableStates(&reachable);
+          productive = std::any_of(fsm.GetEnds().begin(), fsm.GetEnds().end(),
+                                   [&](int end) { return reachable.count(end) != 0; });
+          break;
+        }
         case Type::kRuleRef:
           productive = rules[expr[0]];
           break;
@@ -2310,7 +2318,7 @@ int32_t JSONSchemaConverter::ExcludingString(
     XGRAMMAR_CHECK(filtered.IsOk());
     fsm = std::move(filtered).Unwrap();
   }
-  return AddScalarStringFSM(builder_, fsm, rule_name, close_json_string, !excluded_keys.empty());
+  return AddScalarStringFSM(builder_, fsm, rule_name, close_json_string);
 }
 
 int32_t JSONSchemaConverter::GenerateInteger(

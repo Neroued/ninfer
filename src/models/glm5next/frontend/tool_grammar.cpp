@@ -6,10 +6,8 @@
 #include "json_schema_converter_ext.h"
 #include "json_string_grammar.h"
 #include "text/json_schema.h"
-#include "text/unicode.h"
 
 #include <algorithm>
-#include <map>
 #include <nlohmann/json.hpp>
 #include <unordered_map>
 #include <unordered_set>
@@ -43,75 +41,16 @@ xgrammar::Grammar strict_arguments(const Contract::Tool& tool) {
     }
 }
 
-// A trie excludes exactly the declared names. StringConstraints also excludes the closing tag,
-// including occurrences straddling a trie edge and the unrestricted suffix.
-xgrammar::Grammar open_names(const Contract::Tool& tool) {
-    struct Node {
-        std::map<std::int32_t, std::size_t> children;
-        bool declared = false;
-    };
-
-    std::vector<Node> nodes(1);
-    for (const auto& parameter : tool.parameters) {
-        if (!valid_parameter_name(parameter.name)) continue;
-        std::size_t node = 0;
-        for (const auto cp : text::unicode_internal::utf8_codepoints(parameter.name, "parameter")) {
-            const auto found = nodes[node].children.find(cp.value);
-            if (found != nodes[node].children.end())
-                node = found->second;
-            else {
-                const auto next = nodes.size();
-                nodes[node].children.emplace(cp.value, next);
-                nodes.emplace_back();
-                node = next;
-            }
-        }
-        nodes[node].declared = true;
-    }
-    const auto escape = [](std::int32_t cp) {
-        auto value = text::unicode_internal::codepoint_to_utf8(cp);
-        if (cp < 128 && std::string_view("\\.^$|?*+()[]{}-").find(static_cast<char>(cp)) !=
-                            std::string_view::npos)
-            value.insert(0, "\\");
-        return value;
-    };
-    std::vector<std::string> rules(nodes.size());
-    for (std::size_t i = nodes.size(); i-- > 0;) {
-        std::string choices, excluded;
-        for (const auto& [cp, child] : nodes[i].children) {
-            if (!choices.empty()) choices += '|';
-            choices += escape(cp) + rules[child];
-            excluded += escape(cp);
-        }
-        if (!choices.empty()) choices += '|';
-        choices +=
-            (excluded.empty() ? "[\\s\\S]" : "[^" + excluded + "]") + std::string("[\\s\\S]*");
-        if (!nodes[i].declared) choices += '|';
-        rules[i] = "(?:" + choices + ")";
-    }
-    return xgrammar::StringConstraints({"^" + rules.front() + "$"}, 0, -1, {std::string(kKeyClose)},
-                                       false);
-}
-
-int32_t basic_arguments(xgrammar::GrammarBuilder& builder, const Contract::Tool& tool, int32_t raw,
-                        int32_t json) {
-    const auto parameter = [&](int32_t name, int32_t value) {
-        return builder.AddSequence(
-            {builder.AddByteString(std::string(kKeyOpen)), name,
-             builder.AddByteString(std::string(kKeyClose) + std::string(kValueOpen)),
-             builder.AddRuleRef(value), builder.AddByteString(std::string(kValueClose))});
-    };
-    std::vector<int32_t> alternatives;
+int32_t basic_arguments(xgrammar::GrammarBuilder& builder, const Contract::Tool& tool,
+                        xgrammar::StringDispatch& names, int32_t json) {
+    std::vector<std::pair<std::string, int32_t>> cases;
     for (const auto& item : tool.parameters)
-        if (valid_parameter_name(item.name))
-            alternatives.push_back(
-                parameter(builder.AddByteString(item.name),
-                          item.encoding == Contract::Encoding::JsonValue ? json : raw));
-    const auto other = xgrammar::SubGrammarAdder::Apply(&builder, open_names(tool));
-    alternatives.push_back(parameter(builder.AddRuleRef(other), raw));
-    return builder.AddRuleWithHint(
-        "parameters",
-        builder.AddRepeatFromExpr("parameter", builder.AddChoices(alternatives), 0, -1));
+        if (valid_parameter_name(item.name) && item.encoding == Contract::Encoding::JsonValue)
+            cases.emplace_back(item.name, json);
+    const auto parameter = builder.AddSequence(
+        {builder.AddByteString(std::string(kKeyOpen)), builder.AddRuleRef(names.Add(cases))});
+    return builder.AddRuleWithHint("parameters",
+                                   builder.AddRepeatFromExpr("parameter", parameter, 0, -1));
 }
 
 xgrammar::Grammar build(const Contract& contract, const std::optional<OutputConstraint>& body) {
@@ -122,20 +61,30 @@ xgrammar::Grammar build(const Contract& contract, const std::optional<OutputCons
     if (contract.tools.empty())
         return builder.Get(builder.AddRuleWithHint(
             "root", builder.AddTagDispatch({{}, false, {std::string(kToolOpen)}})));
-    std::optional<int32_t> raw_value, json_value;
+    std::optional<xgrammar::StringDispatch> names;
+    int32_t json_value = -1;
     std::vector<int32_t> choices;
     for (const auto& tool : contract.tools) {
-        if (!tool.strict && !raw_value) {
-            raw_value = xgrammar::SubGrammarAdder::Apply(
+        if (!tool.strict && !names) {
+            const auto raw_value = xgrammar::SubGrammarAdder::Apply(
                 &builder,
                 xgrammar::StringConstraints({}, 0, -1, {std::string(kValueClose)}, false));
             xgrammar::XMLToolCallingConverter codec(std::nullopt, std::nullopt, true, std::nullopt,
                                                     {}, xgrammar::JSONFormat::kGlmXML);
-            json_value = xgrammar::SubGrammarAdder::Apply(&builder, codec.ConvertJSONValue());
+            const auto json  = xgrammar::SubGrammarAdder::Apply(&builder, codec.ConvertJSONValue());
+            const auto value = [&](int32_t body) {
+                return builder.AddRuleWithHint(
+                    "parameter_value",
+                    builder.AddSequence({builder.AddByteString(std::string(kValueOpen)),
+                                         builder.AddRuleRef(body),
+                                         builder.AddByteString(std::string(kValueClose))}));
+            };
+            json_value = value(json);
+            names.emplace(builder, std::string(kKeyClose), value(raw_value));
         }
         const auto parameters =
             tool.strict ? xgrammar::SubGrammarAdder::Apply(&builder, strict_arguments(tool))
-                        : basic_arguments(builder, tool, *raw_value, *json_value);
+                        : basic_arguments(builder, tool, *names, json_value);
         choices.push_back(
             builder.AddSequence({builder.AddByteString(tool.name), builder.AddRuleRef(parameters),
                                  builder.AddByteString(std::string(kToolClose))}));

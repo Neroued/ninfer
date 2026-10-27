@@ -203,6 +203,9 @@ class Grammar::Impl {
     // and is carried through the grammar passes as-is; when GrammarFSMBuilder runs, it is
     // compiled into an automaton via a chunk-level suffix automaton (see SuffixAutomata).
     kSubstring,
+    // A self-contained terminal byte automaton: [states, start, end_count, ends...,
+    // (source, target, lower_byte, upper_byte)...]. No rule references or epsilon edges.
+    kByteFSM,
   };
 
   /*! \brief The object representing a grammar expr. */
@@ -307,6 +310,9 @@ class Grammar::Impl {
   std::vector<std::string> GetSubstringChunks(int32_t grammar_expr_id) const {
     return GetSubstringChunks(GetGrammarExpr(grammar_expr_id));
   }
+
+  static bool ValidByteFSM(const GrammarExpr& expression);
+  FSMWithStartEnd GetByteFSM(const GrammarExpr& expression) const;
 
   /*! \brief The object representing a tag dispatch. */
   struct TagDispatch {

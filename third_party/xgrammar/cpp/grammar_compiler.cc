@@ -6,6 +6,7 @@
 #include <xgrammar/compiler.h>
 
 #include <algorithm>
+#include <array>
 #include <bitset>
 #include <cctype>
 #include <cstddef>
@@ -36,6 +37,8 @@
 
 namespace xgrammar {
 
+class ByteDFACompiler;
+
 /************** AdaptiveTokenMaskCache Generator **************/
 
 /*! \brief The concrete implementation of GrammarMatcherNode. */
@@ -61,7 +64,8 @@ class GrammarMatcherForTokenMaskCache : public EarleyParser {
    * \param is_root_rule Whether to consider the parent rule. If false, there will be
    * no uncertain tokens. Useful for the root rule.
    */
-  AdaptiveTokenMask GetAdaptiveTokenMask(bool is_root_rule);
+  AdaptiveTokenMask GetAdaptiveTokenMask(bool is_root_rule,
+                                         const ByteDFACompiler* byte_dfa = nullptr);
 
   /*!
    * \brief Get the token mask for the given ParserState.
@@ -794,7 +798,133 @@ const std::vector<int32_t>& GrammarMatcherForTokenMaskCache::GetTokenEdgeAccepte
   return tmp_token_edge_accepted_;
 }
 
-AdaptiveTokenMask GrammarMatcherForTokenMaskCache::GetAdaptiveTokenMask(bool is_root_rule) {
+// Terminal DFAs need byte transitions, not recursive parser simulation. Their residual
+// languages can be shared even when the surrounding tools and lookaheads differ.
+class ByteDFACompiler {
+ public:
+  static std::shared_ptr<ByteDFACompiler> Create(const CompactFSMWithStartEnd& fsm) {
+    auto result = std::make_shared<ByteDFACompiler>();
+    std::unordered_set<int> reachable;
+    fsm.GetReachableStates(&reachable);
+    for (int state : reachable) result->ids_.emplace(state, result->ids_.size());
+    result->states_.resize(reachable.size());
+    for (const auto& [global, local] : result->ids_) {
+      auto& state = result->states_[local];
+      state.next.fill(-1);
+      state.end = fsm.IsEndState(global);
+      for (const auto& edge : fsm.GetFsm().GetEdges(global)) {
+        if (!edge.IsCharRange()) return nullptr;
+        const int target = result->ids_.at(edge.target);
+        for (int byte = edge.min; byte <= edge.max; ++byte) {
+          if (state.next[byte] >= 0 && state.next[byte] != target) return nullptr;
+          state.next[byte] = target;
+        }
+      }
+      for (int byte = 0; byte < 256;) {
+        const int first = byte, target = state.next[byte];
+        while (++byte < 256 && state.next[byte] == target) {
+        }
+        if (target >= 0) state.edges.push_back({first, byte - 1, target});
+      }
+    }
+    for (int i = 0; i < static_cast<int>(result->states_.size()); ++i)
+      result->keys_.push_back(result->ResidualKey(i));
+    return result;
+  }
+
+  AdaptiveTokenMask Compile(int global, const TokenizerInfo& tokenizer,
+                            std::optional<RuleLevelCache>& cache) const {
+    const int start = ids_.at(global);
+    const auto& key = keys_[start];
+    // Negative state IDs distinguish terminal language caches from whole-grammar FSM keys.
+    if (cache) {
+      auto found = cache->GetCache(key.hash, -1, key.states, key.edges);
+      if (found) return std::move(*found);
+    }
+    const auto& vocab = tokenizer.GetSortedDecodedVocab();
+    std::vector<int32_t> accepted, uncertain;
+    for (int byte = 0; byte < 256; ++byte) {
+      const int next = states_[start].next[byte];
+      if (next < 0) continue;
+      const auto& suffix = keys_[next];
+      const int bucket_id = -2 - byte;
+      auto bucket = cache ? cache->GetCache(suffix.hash, bucket_id, suffix.states, suffix.edges)
+                          : std::nullopt;
+      if (!bucket) {
+        // After the first byte, all prefixes entering the same residual language share this work.
+        AdaptiveTokenMask value;
+        value.store_type = AdaptiveTokenMask::StoreType::kAccepted;
+        const auto begin = std::lower_bound(
+            vocab.begin(), vocab.end(), std::make_pair(0, std::string(1, static_cast<char>(byte))),
+            IntStringPairComparator());
+        for (auto it = begin;
+             it != vocab.end() && static_cast<unsigned char>(it->second.front()) == byte; ++it) {
+          int state = next;
+          bool reached_end = states_[state].end;
+          for (size_t j = 1; j < it->second.size(); ++j) {
+            state = states_[state].next[static_cast<unsigned char>(it->second[j])];
+            if (state < 0) break;
+            reached_end |= states_[state].end;
+          }
+          if (state >= 0)
+            value.accepted_indices.push_back(it - vocab.begin());
+          else if (reached_end)
+            value.uncertain_indices.push_back(it - vocab.begin());
+        }
+        if (cache) cache->AddCache(suffix.hash, bucket_id, suffix.states, suffix.edges, value);
+        bucket = std::move(value);
+      }
+      accepted.insert(accepted.end(), bucket->accepted_indices.begin(),
+                      bucket->accepted_indices.end());
+      uncertain.insert(uncertain.end(), bucket->uncertain_indices.begin(),
+                       bucket->uncertain_indices.end());
+    }
+    AdaptiveTokenMask result(tokenizer.GetVocabSize(), vocab, accepted, uncertain);
+    if (cache) cache->AddCache(key.hash, -1, key.states, key.edges, result);
+    return result;
+  }
+
+ private:
+  struct Edge {
+    int min, max, target;
+  };
+  struct State {
+    std::array<int, 256> next;
+    std::vector<Edge> edges;
+    bool end;
+  };
+  struct Key {
+    uint64_t hash;
+    int states, edges;
+  };
+
+  Key ResidualKey(int start) const {
+    std::vector<int> ids(states_.size(), -1), queue{start};
+    ids[start] = 0;
+    uint64_t hash = 0;
+    int edge_count = 0;
+    for (size_t i = 0; i < queue.size(); ++i) {
+      const auto& state = states_[queue[i]];
+      hash = HashCombine(hash, i, state.end, state.edges.size());
+      for (const auto& edge : state.edges) {
+        if (ids[edge.target] < 0) {
+          ids[edge.target] = queue.size();
+          queue.push_back(edge.target);
+        }
+        hash = HashCombine(hash, edge.min, edge.max, ids[edge.target]);
+        ++edge_count;
+      }
+    }
+    return {hash, static_cast<int>(queue.size()), edge_count};
+  }
+
+  std::unordered_map<int, int> ids_;
+  std::vector<State> states_;
+  std::vector<Key> keys_;
+};
+
+AdaptiveTokenMask GrammarMatcherForTokenMaskCache::GetAdaptiveTokenMask(
+    bool is_root_rule, const ByteDFACompiler* byte_dfa) {
   tmp_accepted_indices_.clear();
   tmp_rejected_indices_.clear();
   tmp_uncertain_indices_.clear();
@@ -806,6 +936,12 @@ AdaptiveTokenMask GrammarMatcherForTokenMaskCache::GetAdaptiveTokenMask(bool is_
   // the rule when matching until this character. Store it in a stack for later rollback.
   tmp_can_reach_end_stack_.push_back(false);
   tmp_can_reach_end_prefix_or_stack_.push_back(false);
+
+  if (byte_dfa) {
+    auto mask = byte_dfa->Compile(initial_state_.element_id, tokenizer_info_, rule_level_cache_);
+    AdaptCacheWithLookahead(&mask, is_root_rule);
+    return mask;
+  }
 
   // Try to get the crossing cache. A partial hash leaves out the rule referenced at the start
   // state, whose tokens the mask of the start state includes.
@@ -1148,7 +1284,8 @@ CompiledGrammar GrammarCompilerSub::CompileImpl(Grammar grammar_unoptimized) {
     adaptive_token_mask_cache_mutex.emplace();
   }
 
-  auto add_adaptive_token_mask = [&](const ParserState& state, bool is_root_rule) {
+  auto add_adaptive_token_mask = [&](const ParserState& state, bool is_root_rule,
+                                     const std::shared_ptr<ByteDFACompiler>& byte_dfa) {
     auto grammar_matcher = GrammarMatcherForTokenMaskCache(
         compiled_grammar_impl->grammar,
         state,
@@ -1156,7 +1293,8 @@ CompiledGrammar GrammarCompilerSub::CompileImpl(Grammar grammar_unoptimized) {
         tokenizer_info_,
         rule_level_cache_
     );
-    auto cur_adaptive_token_mask_cache = grammar_matcher.GetAdaptiveTokenMask(is_root_rule);
+    auto cur_adaptive_token_mask_cache =
+        grammar_matcher.GetAdaptiveTokenMask(is_root_rule, byte_dfa.get());
     if (max_threads_ > 1) {
       std::lock_guard<std::mutex> lock(adaptive_token_mask_cache_mutex.value());
       compiled_grammar_impl->adaptive_token_mask_cache[state] = cur_adaptive_token_mask_cache;
@@ -1165,16 +1303,21 @@ CompiledGrammar GrammarCompilerSub::CompileImpl(Grammar grammar_unoptimized) {
     }
   };
 
-  auto add_task_adaptive_token_mask = [&](const ParserState& state, bool is_root_rule) {
+  auto add_task_adaptive_token_mask = [&](const ParserState& state, bool is_root_rule,
+                                          const std::shared_ptr<ByteDFACompiler>& byte_dfa) {
     // Execute depending on whether we use thread_pool
     if (max_threads_ > 1) {
-      thread_pool->Execute([add_adaptive_token_mask, state, is_root_rule]() {
-        add_adaptive_token_mask(state, is_root_rule);
+      thread_pool->Execute([add_adaptive_token_mask, state, is_root_rule, byte_dfa]() {
+        add_adaptive_token_mask(state, is_root_rule, byte_dfa);
       });
     } else {
-      add_adaptive_token_mask(state, is_root_rule);
+      add_adaptive_token_mask(state, is_root_rule, byte_dfa);
     }
   };
+
+  bool has_char_budget = false;
+  for (int i = 0; i < compiled_grammar_impl->grammar->NumRules(); ++i)
+    has_char_budget |= compiled_grammar_impl->grammar->GetRule(i).max_chars >= 0;
 
   auto root_rule_id = compiled_grammar_impl->grammar->GetRootRuleId();
 
@@ -1187,12 +1330,14 @@ CompiledGrammar GrammarCompilerSub::CompileImpl(Grammar grammar_unoptimized) {
         ParserState(rule_id, rule.body_expr_id, 0, ParserState::kNoPrevInputPos, 0);
     std::unordered_set<int> reachable_states;
     rule_fsm->GetFsm().GetReachableStates(&reachable_states);
+    auto byte_dfa =
+        !has_char_budget && !rule.is_lazy ? ByteDFACompiler::Create(rule_fsm->GetFsm()) : nullptr;
     for (int i : reachable_states) {
       cur_stack_element.element_id = i;
       if (!rule_fsm->GetFsm().IsScanableState(i)) {
         continue;
       }
-      add_task_adaptive_token_mask(cur_stack_element, rule_id == root_rule_id);
+      add_task_adaptive_token_mask(cur_stack_element, rule_id == root_rule_id, byte_dfa);
     }
   }
 

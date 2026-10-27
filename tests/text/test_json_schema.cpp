@@ -188,6 +188,16 @@ void whitespace_token_masks() {
 }
 
 void contracts(ninfer::text::GrammarCompiler& compiler) {
+    for (const auto* source : {R"({"type":"string","allOf":[{"pattern":"^a$"},{"pattern":"^b$"}]})",
+                               R"({"type":"string","pattern":"^a$","maxLength":0})"}) {
+        bool rejected = false;
+        try {
+            (void)compiler.compile(Constraint::json_schema(source), {}, {});
+        } catch (const ninfer::RequestError& error) {
+            rejected = error.kind() == ninfer::RequestErrorKind::UnsatisfiableJsonSchema;
+        }
+        check(rejected, "empty string intersection was not rejected as unsatisfiable");
+    }
     auto object = Constraint::json_object();
     for (const std::string text : {"{}", R"({"x":[1,true,null,{"y":"你好"}]})"})
         check(accepts(compiler, object, text), "JSON object rejected valid content");

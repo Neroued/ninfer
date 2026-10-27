@@ -115,6 +115,41 @@ void basic(text::GrammarCompiler& compiler) {
     }
 }
 
+void parameter_names(text::GrammarCompiler& compiler) {
+    const auto bound = contract(tool_schema({{"", {{"type", "integer"}}},
+                                             {"n", {{"type", "integer"}}},
+                                             {"name", {{"type", "integer"}}},
+                                             {"names", {{"type", "string"}}},
+                                             {"键", {{"type", "integer"}}}}),
+                                false);
+    for (const auto* name : {"", "n", "name", "键"}) {
+        require(accepts(compiler, *bound, call("1", name)), "known JSON name rejected");
+        require(!accepts(compiler, *bound, call("raw", name)), "known name bypassed JSON encoding");
+    }
+    for (const auto* name : {"na", "names", "named", "键名", "a</arg_", "</arg_kex>", "\n\""})
+        require(accepts(compiler, *bound, call("raw", name)), "open name prefix rejected");
+
+    const std::vector<std::string> pieces{"name</arg_key><arg_value>raw",
+                                          "names</arg_key><arg_value>raw",
+                                          "键</arg_key><arg_value>{",
+                                          "键名</arg_key><arg_value>raw",
+                                          "</arg_key><arg_value>raw",
+                                          "n</arg_key><arg_value>1",
+                                          ""};
+    text::GrammarCompiler tokens(pieces, {6}, 1 << 20);
+    auto session = glm::compile_tool_grammar(tokens, bound, {}, "<tool_call>call<arg_key>");
+    std::vector<std::uint32_t> masks(session->mask_words() * 2);
+    const TokenId proposed = 2;
+    session->masks(std::span(&proposed, 1), masks);
+    require(masks[0] == ((1u << 1) | (1u << 2) | (1u << 3) | (1u << 5)),
+            "name/value boundary token mask differs from encoding contract");
+    session->accept(1);
+    session->discard();
+    session->masks({}, std::span(masks).first(session->mask_words()));
+    require(masks[0] == ((1u << 1) | (1u << 2) | (1u << 3) | (1u << 5)),
+            "name dispatch rollback changed token masks");
+}
+
 void strict(text::GrammarCompiler& compiler) {
     const auto string = contract(tool_schema(
         {{"x", {{"type", "string"}, {"pattern", "a"}, {"minLength", 2}, {"maxLength", 3}}}},
@@ -272,6 +307,7 @@ int main(int argc, char** argv) {
             return 0;
         }
         basic(compiler);
+        parameter_names(compiler);
         strict(compiler);
         transactions(compiler);
         std::shared_ptr<const text::Tokenizer> tokenizer;

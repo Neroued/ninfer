@@ -112,6 +112,25 @@ int32_t GrammarBuilder::AddSubstring(const std::vector<std::string>& chunks) {
   );
 }
 
+int32_t GrammarBuilder::AddByteFSM(const FSMWithStartEnd& fsm) {
+  std::vector<int32_t> data{fsm.NumStates(), fsm.GetStart(),
+                            static_cast<int32_t>(fsm.GetEnds().size())};
+  data.insert(data.end(), fsm.GetEnds().begin(), fsm.GetEnds().end());
+  for (int state = 0; state < fsm.NumStates(); ++state) {
+    for (const auto& edge : fsm.GetFsm().GetEdges(state)) {
+      XGRAMMAR_CHECK(edge.IsCharRange()) << "ByteFSM requires terminal byte transitions";
+      data.insert(data.end(), {state, edge.target, edge.min, edge.max});
+    }
+  }
+  return AddByteFSM(data);
+}
+
+int32_t GrammarBuilder::AddByteFSM(const std::vector<int32_t>& data) {
+  GrammarExpr expression{GrammarExprType::kByteFSM, data.data(), static_cast<int32_t>(data.size())};
+  XGRAMMAR_CHECK(Grammar::Impl::ValidByteFSM(expression)) << "Invalid ByteFSM";
+  return AddGrammarExpr(expression);
+}
+
 int32_t GrammarBuilder::AddCharacterClass(
     const std::vector<CharacterClassElement>& elements, bool is_negative
 ) {

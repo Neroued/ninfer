@@ -110,6 +110,14 @@ std::string GrammarPrinter::PrintGrammarExpr(const GrammarExpr& grammar_expr) {
       return PrintRegex(grammar_expr);
     case GrammarExprType::kSubstring:
       return PrintSubstring(grammar_expr);
+    case GrammarExprType::kByteFSM: {
+      std::string result = "ByteFSM(";
+      for (int i = 0; i < grammar_expr.size(); ++i) {
+        if (i) result += ", ";
+        result += std::to_string(grammar_expr[i]);
+      }
+      return result + ")";
+    }
     default:
       XGRAMMAR_LOG(FATAL) << "Unexpected GrammarExpr type: " << static_cast<int>(grammar_expr.type);
       XGRAMMAR_UNREACHABLE();

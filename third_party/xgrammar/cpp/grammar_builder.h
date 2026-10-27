@@ -101,6 +101,10 @@ class GrammarBuilder {
    */
   int32_t AddSubstring(const std::vector<std::string>& chunks);
 
+  // Keep regular languages in one terminal automaton through grammar composition.
+  int32_t AddByteFSM(const FSMWithStartEnd& fsm);
+  int32_t AddByteFSM(const std::vector<int32_t>& data);
+
   /*!
    * \brief Add a GrammarExpr for a character class.
    * \param elements A vector of CharacterClassElement, each containing a lower and a upper bound.

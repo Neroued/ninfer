@@ -159,6 +159,29 @@ void basic_contracts(ninfer::text::GrammarCompiler& compiled) {
             "auto relaxed strict arguments");
 }
 
+void parameter_names(ninfer::text::GrammarCompiler& compiled) {
+    const auto bound = contract({{"type", "object"},
+                                 {"properties",
+                                  {{"n", {{"type", "integer"}}},
+                                   {"name", {{"type", "integer"}}},
+                                   {"names", {{"type", "string"}}},
+                                   {"键", {{"type", "integer"}}}}}},
+                                false);
+    const auto wire  = [](std::string_view name, std::string_view value) {
+        return "<tool_call>\n<function=call>\n<parameter=" + std::string(name) + ">\n" +
+               std::string(value) + "\n</parameter>\n</function>\n</tool_call>";
+    };
+    for (const auto* name : {"n", "name", "键"}) {
+        require(accepts(compiled, *bound, wire(name, "1")), "known JSON name rejected");
+        require(!accepts(compiled, *bound, wire(name, "raw")), "known name bypassed JSON encoding");
+    }
+    for (const auto* name : {"na", "names", "named", "键名"})
+        require(accepts(compiled, *bound, wire(name, "raw")), "open name prefix rejected");
+    for (const auto* name : {"", "<other", "a>b", "a\nb", "a\rb"})
+        require(!accepts(compiled, *bound, wire(name, "raw")),
+                "invalid Qwen parameter name admitted");
+}
+
 void selected_contracts(ninfer::text::GrammarCompiler& compiled) {
     const auto parameters = schema({{"type", "integer"}, {"minimum", 2}, {"maximum", 3}});
     std::vector<std::string> definitions;
@@ -354,6 +377,7 @@ void run() {
     name_transactions();
     auto compiled = compiler();
     basic_contracts(compiled);
+    parameter_names(compiled);
     selected_contracts(compiled);
     json_body_contracts(compiled);
     ninfer::ToolChoice required;

@@ -14,6 +14,7 @@ struct Fp8LoadTuning {
     int maximum_small_load = 0;
     int large_gate_columns = 0, large_down_columns = 0;
     int large_queued_ctas_per_sm = 0;
+    int maximum_large_load = 0, dense_queued_ctas_per_sm = 0;
 };
 
 struct Plan {

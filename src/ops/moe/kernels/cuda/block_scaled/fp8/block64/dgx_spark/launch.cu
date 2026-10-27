@@ -79,7 +79,13 @@ void launch_experts(const Tensor& x, const CudaSwiGLUExperts& experts, const Exp
             large.gate_columns       = plan.fp8.large_gate_columns;
             large.down_columns       = plan.fp8.large_down_columns;
             large.queued_ctas_per_sm = plan.fp8.large_queued_ctas_per_sm;
-            project(large, limit, 0x7fffffff);
+            const int maximum =
+                plan.fp8.maximum_large_load ? plan.fp8.maximum_large_load : 0x7fffffff;
+            project(large, limit, maximum);
+            if (plan.fp8.maximum_large_load) {
+                large.queued_ctas_per_sm = plan.fp8.dense_queued_ctas_per_sm;
+                project(large, maximum, 0x7fffffff);
+            }
         }
     };
     phase.template operator()<true>();

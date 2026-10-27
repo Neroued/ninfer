@@ -23,15 +23,17 @@ Plan select_plan(int t, int shared_intermediate, ExpertSubsetKind) {
                            .queued_ctas_per_sm      = 12};
     if (t >= 17)
         p.fp8 = {.maximum_small_load       = 16,
-                 .large_gate_columns       = t < 128 ? 64 : 128,
+                 .large_gate_columns       = t < 128 || (t > 128 && t <= 256) ? 64 : 128,
                  .large_down_columns       = 64,
-                 .large_queued_ctas_per_sm = 3};
+                 .large_queued_ctas_per_sm = 6,
+                 .maximum_large_load       = t >= 2048 ? 128 : 0,
+                 .dense_queued_ctas_per_sm = 3};
     return plan;
 }
 } // namespace
 
 const ShapePolicy& fp8_h2560_i320_e512_k10() {
-    static constexpr int boundaries[]{3, 8, 17, 65, 128, 512, 1024};
+    static constexpr int boundaries[]{3, 8, 17, 65, 128, 129, 257, 512, 1024};
     static const ShapePolicy policy{.select = select_plan, .allocation_boundaries = boundaries};
     return policy;
 }

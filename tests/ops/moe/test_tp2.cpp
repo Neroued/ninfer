@@ -5,6 +5,7 @@
 
 #include <array>
 #include <set>
+#include <utility>
 
 namespace ninfer::test::moe_tp2 {
 namespace {
@@ -309,6 +310,14 @@ void add_profile(OpSuite& suite, Shape shape, const std::string& name) {
             catalogue.push_back({"tp2/" + name + "/complete/rank0/route-population/T513",
                                  {{"format", "fp8"}, {"policy", "a8"}, {"execution", "graph"}}});
         }
+        if (rank == 0 && !shape.clamped && shape.format != QType::NVFP4)
+            for (bool complete : {false, true}) {
+                cases.push_back({4096, rank, complete, true, false, "reuse", true});
+                catalogue.push_back(
+                    {"tp2/" + name + "/" + (complete ? "complete" : "routed") +
+                         "/rank0/route-population/T4096",
+                     {{"format", "fp8"}, {"policy", "a8"}, {"execution", "graph"}}});
+            }
         if (rank == 0)
             for (bool complete : {false, true}) {
                 cases.push_back({2, rank, complete, true, false, "reuse", true});
@@ -331,6 +340,22 @@ void add_profile(OpSuite& suite, Shape shape, const std::string& name) {
                     if (capacity(fixture, complete, t, t) > interval)
                         throw std::runtime_error(
                             "TP2 interval workspace underestimates an interior extent");
+                for (const auto [first, last] : {std::pair{2, 3},
+                                                 {16, 17},
+                                                 {64, 65},
+                                                 {127, 129},
+                                                 {128, 257},
+                                                 {511, 513},
+                                                 {1023, 1025},
+                                                 {2047, 2049},
+                                                 {4095, 4097}}) {
+                    if (last > maximum) continue;
+                    const auto local = capacity(fixture, complete, first, last);
+                    for (int t = first; t <= last; ++t)
+                        if (capacity(fixture, complete, t, t) > local)
+                            throw std::runtime_error(
+                                "TP2 short interval workspace underestimates an interior extent");
+                }
             }
             for (auto index : selected) failures += run_case(fixture, cases[index], cuda);
             return failures + fixture.verify_preserved();

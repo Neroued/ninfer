@@ -2,7 +2,9 @@
 #include "runtime/engine/model_startup.h"
 #include "models/qwen3_5/startup.h"
 #include "models/qwen3_5/measurement.h"
+#ifdef NINFER_QWEN4_EXP
 #include "models/qwen4_exp/startup.h"
+#endif
 
 #include <charconv>
 #include <cstdlib>
@@ -116,11 +118,13 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device) 
     artifact::Reader reader(options.artifact_path);
     inspect.complete();
     switch (models::resolve_architecture(reader.directory())) {
+#ifdef NINFER_QWEN4_EXP
     case models::Architecture::Qwen4Exp: {
         auto built =
             detail::build_model<models::qwen4_exp::Startup>(reader, options, device, budget, start);
         return {std::move(built.instance), std::move(built.load), std::move(built.context_cost)};
     }
+#endif
     case models::Architecture::Qwen3_5:
     case models::Architecture::Qwen3_5Moe: {
         auto built =

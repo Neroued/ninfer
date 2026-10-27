@@ -151,11 +151,15 @@ public:
     using Qwen35         = runtime::ModelInstance<models::qwen3_5::RuntimeTypes>;
     using GenerationCore = runtime::EngineCore<Qwen35>;
     using ScoringCore    = runtime::CausalScoreCore<Qwen35>;
-    using Qwen4          = runtime::ModelInstance<models::qwen4_exp::RuntimeTypes>;
-    using Core =
-        std::variant<std::monostate, std::unique_ptr<GenerationCore>, std::unique_ptr<ScoringCore>,
-                     std::unique_ptr<runtime::EngineCore<Qwen4>>,
-                     std::unique_ptr<runtime::CausalScoreCore<Qwen4>>>;
+#ifdef NINFER_QWEN4_EXP
+    using Qwen4 = runtime::ModelInstance<models::qwen4_exp::RuntimeTypes>;
+    using Core  = std::variant<std::monostate, std::unique_ptr<GenerationCore>,
+                              std::unique_ptr<ScoringCore>, std::unique_ptr<runtime::EngineCore<Qwen4>>,
+                              std::unique_ptr<runtime::CausalScoreCore<Qwen4>>>;
+#else
+    using Core = std::variant<std::monostate, std::unique_ptr<GenerationCore>,
+                              std::unique_ptr<ScoringCore>>;
+#endif
 
     explicit Impl(EngineOptions engine_options)
         : options(runtime::normalize_engine_options(std::move(engine_options))),

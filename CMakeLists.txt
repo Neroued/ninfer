@@ -39,6 +39,12 @@ if(WIN32)
   add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/utf-8>)
 endif()
 
+# Qwen4-exp execution depends on the Linux CPU facilities (io_uring read queue, expert
+# offload). Windows builds compile without it; the architecture is rejected at dispatch.
+if(NOT WIN32)
+  add_compile_definitions(NINFER_QWEN4_EXP)
+endif()
+
 if(CMAKE_GENERATOR MATCHES "Ninja")
   set_property(GLOBAL PROPERTY JOB_POOLS ninfer_link=1)
   set(CMAKE_JOB_POOL_LINK ninfer_link)

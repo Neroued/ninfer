@@ -126,4 +126,13 @@ __device__ __forceinline__ int4 fp8_dequant_f16x8(const std::uint8_t* codes, std
     return result;
 }
 
+__device__ __forceinline__ unsigned fp8_dequant_bf16x2(std::uint16_t codes, std::uint8_t scale) {
+    const unsigned decoded    = fp8_e4m3x2_to_bf16x2_bits(codes);
+    const unsigned exponent   = scale ? scale << 7 : 0x40u;
+    const unsigned multiplier = exponent | (exponent << 16);
+    const auto value =
+        __hmul2(load_vec<__nv_bfloat162>(&decoded), load_vec<__nv_bfloat162>(&multiplier));
+    return load_vec<unsigned>(&value);
+}
+
 } // namespace ninfer::ops::common

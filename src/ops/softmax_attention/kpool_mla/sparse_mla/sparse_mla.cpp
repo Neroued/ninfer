@@ -17,11 +17,11 @@ KpoolGraphProfile kpool_sparse_mla_graph_profile(const KpoolSparseMlaProfile& pr
     std::size_t at    = 4;
     const auto append = [&](int columns) {
         if (!columns) return;
-        const auto p = sparse_mla_plan(columns, batch, envelope, sms);
+        const auto p = sparse_mla_plan(storage, columns, batch, envelope, sms);
         for (const auto word :
              {std::uint64_t(p.factor), std::uint64_t(p.attention), std::uint64_t(p.splits),
               std::uint64_t(p.tile), std::uint64_t(p.direct), std::uint64_t(p.merge_value),
-              std::uint64_t(p.bytes)})
+              std::uint64_t(p.fp8_query), std::uint64_t(p.bytes)})
             key.words_[at++] = word;
     };
     const auto columns = std::int64_t(tokens) * batch;
@@ -36,7 +36,7 @@ std::size_t kpool_sparse_mla_workspace_capacity_bytes(const KpoolSparseMlaProfil
                                                       std::int32_t batch, std::int32_t lo,
                                                       std::int32_t hi, std::int32_t sms) {
     sparse_mla_geometry(profile, storage, envelope, batch, lo, hi, sms);
-    return sparse_mla_capacity(lo, hi, batch, envelope, sms);
+    return sparse_mla_capacity(storage, lo, hi, batch, envelope, sms);
 }
 
 void kpool_sparse_mla(const Tensor& query, const KpoolMlaFactors& factors,
@@ -67,8 +67,7 @@ void kpool_sparse_mla(const Tensor& query, const KpoolMlaFactors& factors,
     input(selected.pool_ids, DType::I32, {512, selected_rows}, 4, "pool IDs");
     input(selected.pool_counts, DType::I32, {selected_rows}, 4, "pool counts");
     input(selected.selection_end, DType::I32, {selected_rows}, 4, "selection end");
-    plane(cache.data, DType::BF16, 512, 1, device);
-    require(!cache.scales.records.storage.data, "BF16 latent has no scale plane");
+    latent_cache(cache, 512, device);
     const auto& table = cache.data.records.page_offsets;
     require(std::uint64_t(table.ne[0]) * 64 >= envelope.max_visible_tokens, "page table capacity");
     const auto table_blocks = operand::blocks(table, kOperation);
@@ -78,10 +77,15 @@ void kpool_sparse_mla(const Tensor& query, const KpoolMlaFactors& factors,
     require(!operand::overlaps(table_blocks, output), "output overlaps page table");
     operand::device(workspace.device(), device, kOperation, "workspace");
     SparseMlaArguments a{};
-    a.query          = static_cast<const __nv_bfloat16*>(query.data);
-    a.key_up         = static_cast<const __nv_bfloat16*>(factors.key_up.data);
-    a.value_up       = static_cast<const __nv_bfloat16*>(factors.value_up.data);
-    a.latent         = static_cast<const __nv_bfloat16*>(cache.data.data());
+    a.query    = static_cast<const __nv_bfloat16*>(query.data);
+    a.key_up   = static_cast<const __nv_bfloat16*>(factors.key_up.data);
+    a.value_up = static_cast<const __nv_bfloat16*>(factors.value_up.data);
+    if (cache.storage == KpoolMlaStorage::BFloat16)
+        a.latent = static_cast<const __nv_bfloat16*>(cache.data.data());
+    else {
+        a.latent_fp8    = static_cast<const std::uint8_t*>(cache.data.data());
+        a.latent_scales = static_cast<const std::uint8_t*>(cache.scales.data());
+    }
     a.latent_bytes   = cache.data.records.storage.bytes - cache.data.plane.tensor.region.offset;
     a.valid          = static_cast<const int*>(batch.valid_columns.data);
     a.table_rows     = static_cast<const int*>(batch.table_rows.data);
@@ -96,7 +100,7 @@ void kpool_sparse_mla(const Tensor& query, const KpoolMlaFactors& factors,
     a.batch          = B;
     a.scale          = attention_scale;
     auto scope       = workspace.scope();
-    const auto bytes = sparse_mla_capacity(T, T, B, envelope, sms);
+    const auto bytes = sparse_mla_capacity(cache.storage, T, T, B, envelope, sms);
     MemorySpan scratch{};
     if (bytes) {
         scratch          = workspace.alloc_bytes(bytes, 256);
@@ -105,6 +109,6 @@ void kpool_sparse_mla(const Tensor& query, const KpoolMlaFactors& factors,
         operand::disjoint(range, output, kOperation);
         require(!operand::overlaps(table_blocks, range), "workspace overlaps page table");
     }
-    launch_sparse_mla(a, scratch, envelope, sms, execution.stream());
+    launch_sparse_mla(a, scratch, cache.storage, envelope, sms, execution.stream());
 }
 } // namespace ninfer::ops

@@ -13,15 +13,21 @@ int main(int argc, char** argv) {
         measurement::Options options;
         std::vector<int> tokens{1, 2, 4, 8, 16, 32, 64};
         int batch = 1, end = 8192, layers = 11, selected = 512, selection_span = 1;
+        int shared_prefix = 0, envelope = 0;
         bool ragged = false, frozen = false;
+        auto storage      = ops::KpoolMlaStorage::BFloat16;
+        auto index_format = KvCacheVectorFormat::BFloat16;
         for (int i = 1; i < argc; ++i) {
             const std::string flag = argv[i];
             if (flag == "--help") {
                 std::cout
-                    << "Complete BF16 latent Sparse MLA: U_K, attention, U_V.\n"
+                    << "Complete latent Sparse MLA: U_K, attention, U_V.\n"
                        "  --tokens N,... --batch 1..8 --end E --layers 1|11\n"
                        "  --selected 0..512 --ragged 0|1 --frozen 0|1\n"
                        "  --selection-span N  share each selection across N consecutive queries\n"
+                       "  --latent-cache bf16|fp8 --index-cache bf16|fp8\n"
+                       "  --shared-prefix N  share N original tokens, in complete 64-token pages\n"
+                       "  --envelope E       execution bound (default: --end)\n"
                        "E is the final query's exclusive end; T<=E<=1048576.\n";
                 measurement::help();
                 return 0;
@@ -39,6 +45,10 @@ int main(int argc, char** argv) {
                 selected = measurement::integer(value, 0, 512);
             else if (flag == "--selection-span")
                 selection_span = measurement::integer(value);
+            else if (flag == "--shared-prefix")
+                shared_prefix = measurement::integer(value, 0, 1048576);
+            else if (flag == "--envelope")
+                envelope = measurement::integer(value, 1, 1048576);
             else if (flag == "--layers") {
                 layers = measurement::integer(value, 1, 11);
                 if (layers != 1 && layers != 11)
@@ -47,6 +57,12 @@ int main(int argc, char** argv) {
                 ragged = measurement::integer(value, 0, 1);
             else if (flag == "--frozen")
                 frozen = measurement::integer(value, 0, 1);
+            else if (flag == "--latent-cache" && (value == "bf16" || value == "fp8"))
+                storage = value == "fp8" ? ops::KpoolMlaStorage::Fp8E4m3fnGroup128Ue8m0
+                                         : ops::KpoolMlaStorage::BFloat16;
+            else if (flag == "--index-cache" && (value == "bf16" || value == "fp8"))
+                index_format = value == "fp8" ? KvCacheVectorFormat::Fp8E4m3fnGroup128Ue8m0
+                                              : KvCacheVectorFormat::BFloat16;
             else
                 throw std::invalid_argument("unknown flag: " + flag);
         }
@@ -59,11 +75,12 @@ int main(int argc, char** argv) {
             "token_visits,attention_token_visits,unique_"
             "latent_bytes,"
             "factor_bytes,query_bytes,output_bytes,metadata_bytes,factor_flops,attention_flops,"
-            "useful_TFLOps");
+            "useful_TFLOps,qk_flops,pv_flops,index_storage,shared_prefix,envelope");
         for (int T : tokens) {
             if (T > end) throw std::invalid_argument("tokens exceed --end");
             kp::SparseMlaFixture f(device.execution_view(), T, batch, end, selected, layers, ragged,
-                                   frozen, 1, selection_span);
+                                   frozen, 1, selection_span, storage, index_format, shared_prefix,
+                                   envelope);
             std::uint64_t nonempty = 0, nontrivial = 0, visits = 0, attention_visits = 0;
             std::unordered_set<std::size_t> unique;
             std::unordered_set<int> selection, requests;
@@ -96,7 +113,7 @@ int main(int argc, char** argv) {
             const double attention_flops     = attention_visits * (4. * 64 * 512);
             measurement::Row row;
             row.op              = "kpool_sparse_mla";
-            row.format          = "bf16";
+            row.format          = storage == ops::KpoolMlaStorage::BFloat16 ? "bf16" : "fp8";
             row.n               = 256;
             row.k               = 512;
             row.qk_heads        = 64;
@@ -119,13 +136,20 @@ int main(int argc, char** argv) {
                             std::to_string(frozen) + "," + std::to_string(selection_span) + "," +
                             std::to_string(nonempty) + "," + std::to_string(nontrivial) + "," +
                             std::to_string(visits) + "," + std::to_string(attention_visits) + "," +
-                            std::to_string(unique.size() * 1024) + "," +
-                            std::to_string(factor_bytes) + "," + std::to_string(query_bytes) + "," +
-                            std::to_string(output_bytes) + "," + std::to_string(metadata_bytes) +
-                            "," + std::to_string(factor_flops) + "," +
-                            std::to_string(attention_flops) + "," +
+                            std::to_string(
+                                unique.size() *
+                                (storage == ops::KpoolMlaStorage::BFloat16 ? 1024 : 516)) +
+                            "," + std::to_string(factor_bytes) + "," + std::to_string(query_bytes) +
+                            "," + std::to_string(output_bytes) + "," +
+                            std::to_string(metadata_bytes) + "," + std::to_string(factor_flops) +
+                            "," + std::to_string(attention_flops) + "," +
                             std::to_string((factor_flops + attention_flops) / result.gpu.median_us /
-                                           1e6));
+                                           1e6) +
+                            "," + std::to_string(attention_flops / 2) + "," +
+                            std::to_string(attention_flops / 2) + "," +
+                            (index_format == KvCacheVectorFormat::BFloat16 ? "bf16" : "fp8") + "," +
+                            std::to_string(shared_prefix) + "," +
+                            std::to_string(f.envelope.max_visible_tokens));
                 }
         }
     } catch (const std::exception& e) {

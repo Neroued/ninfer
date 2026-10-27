@@ -17,10 +17,11 @@ constexpr ReductionCriterion kQueryCriterion{1. / 256, 1. / 256, 2. / 256};
 // Check every publication against the mathematical Prepare formula, then use its
 // represented outputs as inputs to independent downstream oracles. This avoids
 // assuming that numerically close FP32 scores have identical Top512 boundaries.
-int verify_prepare(kp::ChainFixture& f) {
-    auto& i            = f.index;
-    const bool fp8     = i.cache.format == KvCacheVectorFormat::Fp8E4m3fnGroup128Ue8m0;
-    const auto& w      = f.weights;
+int verify_prepare(kp::ChainFixture& f, const std::vector<int>& accepted = {}) {
+    auto& i               = f.index;
+    const bool fp8        = i.cache.format == KvCacheVectorFormat::Fp8E4m3fnGroup128Ue8m0;
+    const bool fp8_latent = f.cache.latent.storage == ops::KpoolMlaStorage::Fp8E4m3fnGroup128Ue8m0;
+    const auto& w         = f.weights;
     const int patterns = std::min(i.T, 7), F = i.E - i.T;
     std::vector<double> projected(std::size_t(patterns) * i.B * w.rows);
     parallel_rows(
@@ -40,7 +41,16 @@ int verify_prepare(kp::ChainFixture& f) {
     const auto key_bytes = i.packed.download_plane(i.plane_index);
     std::vector<std::uint16_t> latent(f.latent.size()), keys(fp8 ? 0 : i.keys.size()),
         state(f.initial_state.size());
-    std::memcpy(latent.data(), latent_bytes.data(), latent_bytes.size());
+    std::vector<std::uint8_t> latent_codes, latent_scales;
+    if (fp8_latent) {
+        latent_codes.resize(latent_bytes.size());
+        std::memcpy(latent_codes.data(), latent_bytes.data(), latent_bytes.size());
+        const auto scales =
+            i.packed.download_plane(i.packed.plane_index(f.cache.latent.scales.plane));
+        latent_scales.resize(scales.size());
+        std::memcpy(latent_scales.data(), scales.data(), scales.size());
+    } else
+        std::memcpy(latent.data(), latent_bytes.data(), latent_bytes.size());
     if (!fp8) std::memcpy(keys.data(), key_bytes.data(), key_bytes.size());
     std::vector<std::uint8_t> codes, scales;
     if (fp8) {
@@ -79,8 +89,18 @@ int verify_prepare(kp::ChainFixture& f) {
             };
             const auto base = f.physical_token(b, F + t) * 512;
             rms(0, 512, w.cn, [&](int d, double expected) {
-                c_error.add(kp::decode(latent[base + d]), expected);
-                f.latent[base + d] = latent[base + d];
+                if (fp8_latent) {
+                    const auto code  = latent_codes[base + d],
+                               scale = latent_scales[(base + d) / 128];
+                    failures += (code & 127) == 127 || scale == 255;
+                    c_error.add(float_codec::decode_e4m3fn(code) * fp8_cache_multiplier(scale),
+                                expected);
+                    f.latent_codes[base + d]          = code;
+                    f.latent_scales[(base + d) / 128] = scale;
+                } else {
+                    c_error.add(kp::decode(latent[base + d]), expected);
+                    f.latent[base + d] = latent[base + d];
+                }
             });
             rms(768, 1536, w.qn, [&](int d, double expected) {
                 q_error.add(kp::decode(f.rank.at(d, t, b)), expected);
@@ -132,7 +152,9 @@ int verify_prepare(kp::ChainFixture& f) {
                 }
             }
         }
-        const int remainder = (F + n) % 4, start = int(raw_k.size()) - remainder;
+        const int tail_columns = accepted.empty() ? n : accepted.at(b);
+        if (!tail_columns) continue;
+        const int remainder = (F + tail_columns) % 4, start = F % 4 + tail_columns - remainder;
         for (int kind = 0; kind < 2; ++kind)
             for (int r = 0; r < 3; ++r)
                 for (int d = 0; d < 128; ++d) {
@@ -143,20 +165,24 @@ int verify_prepare(kp::ChainFixture& f) {
                     expected_state[offset] = state[offset];
                 }
     }
-    failures += c_error.check("chain latent", kPreparedBf16Criterion) +
+    failures += c_error.check("chain latent",
+                              fp8_latent ? kPreparedFp8LatentCriterion : kPreparedBf16Criterion) +
                 q_error.check("chain rank", kPreparedBf16Criterion) +
                 coeff_error.check("chain coefficient", kCoefficientCriterion) +
                 pool_error.check("chain pool", fp8 ? kPooledFp8Criterion : kPooledBf16Criterion) +
                 tail_error.check("chain tail", kPreparedBf16Criterion);
     // Updated expected buffers retain every untouched word, including future tokens.
-    failures += latent != f.latent || state != expected_state;
+    failures += (fp8_latent ? (latent_codes != f.latent_codes || latent_scales != f.latent_scales)
+                            : latent != f.latent) ||
+                state != expected_state;
     failures += fp8 ? (codes != i.key_codes || scales != i.key_scales) : keys != i.keys;
     return failures;
 }
 
-int verify(kp::ChainFixture& f) {
-    auto& i      = f.index;
-    int failures = verify_prepare(f);
+int verify(kp::ChainFixture& f, const std::vector<int>& accepted = {}) {
+    const bool fp8_latent = f.cache.latent.storage == ops::KpoolMlaStorage::Fp8E4m3fnGroup128Ue8m0;
+    auto& i               = f.index;
+    int failures          = verify_prepare(f, accepted);
     if (failures) return failures;
     f.query.host      = f.query.download();
     i.query.host      = i.query.download();
@@ -192,23 +218,30 @@ int verify(kp::ChainFixture& f) {
                 got_queries.push_back(kp::decode(row < 16384
                                                      ? f.query.host[column * 16384 + row]
                                                      : i.query.host[column * 4096 + row - 16384]));
-            std::vector<const std::uint16_t*> rows;
-            for (int g = 0; g < counts[column]; ++g)
-                for (int r = 0; r < 4; ++r)
-                    rows.push_back(f.latent.data() +
-                                   f.physical_token(b, ids[column * 512 + g] * 4 + r) * 512);
-            for (int token = ends[column] / 4 * 4; token < ends[column]; ++token)
-                rows.push_back(f.latent.data() + f.physical_token(b, token) * 512);
+            std::vector<double> values;
+            const auto append = [&](int token) {
+                const auto base = f.physical_token(b, token) * 512;
+                for (int d = 0; d < 512; ++d)
+                    values.push_back(
+                        fp8_latent ? float_codec::decode_e4m3fn(f.latent_codes[base + d]) *
+                                         fp8_cache_multiplier(f.latent_scales[(base + d) / 128])
+                                   : kp::decode(f.latent[base + d]));
+            };
+            const int selected = f.selection_rows.at(t, b);
+            for (int g = 0; g < counts[selected]; ++g)
+                for (int r = 0; r < 4; ++r) append(ids[selected * 512 + g] * 4 + r);
+            for (int token = ends[selected] / 4 * 4; token < ends[selected]; ++token) append(token);
             const auto result =
-                mla_reference(f.query.host.data() + column * 16384, f.key_up.host.data(),
-                              f.value_up.host.data(), rows, f.scale);
+                mla_reference_values(f.query.host.data() + column * 16384, f.key_up.host.data(),
+                                     f.value_up.host.data(), values, f.scale);
             expected_mla.insert(expected_mla.end(), result.begin(), result.end());
             for (int row = 0; row < 16384; ++row)
                 got_mla.push_back(kp::decode(output[column * 16384 + row]));
         }
     failures += verify_reduction("chain W_B", got_queries, expected_queries, kQueryCriterion);
     failures += verify_selection(i);
-    failures += verify_reduction("chain sparse MLA", got_mla, expected_mla, kMlaCriterion);
+    failures += verify_reduction("chain sparse MLA", got_mla, expected_mla,
+                                 fp8_latent ? kMlaFp8Criterion : kMlaCriterion);
     failures += !i.scratch_guards() || !i.packed.guards_intact() || i.workspace->used() != 0 ||
                 i.workspace->peak_used() > i.workspace_bytes;
     for (auto* v : {&f.x, &f.rank, &f.query, &f.output, &i.query}) failures += !v->guards();
@@ -217,11 +250,12 @@ int verify(kp::ChainFixture& f) {
     return failures;
 }
 
-int run(int T, int B, int E, int layers, bool graph, bool fp8 = false) {
+int run(int T, int B, int E, int layers, bool graph, bool fp8 = false, bool fp8_latent = false) {
     auto& d = cuda_environment().context;
-    kp::ChainFixture f(d.execution_view(), T, B, E, layers, B > 1, {}, true, true,
-                       fp8 ? KvCacheVectorFormat::Fp8E4m3fnGroup128Ue8m0
-                           : KvCacheVectorFormat::BFloat16);
+    kp::ChainFixture f(
+        d.execution_view(), T, B, E, layers, B > 1, {}, true, true,
+        fp8 ? KvCacheVectorFormat::Fp8E4m3fnGroup128Ue8m0 : KvCacheVectorFormat::BFloat16,
+        fp8_latent ? ops::KpoolMlaStorage::Fp8E4m3fnGroup128Ue8m0 : ops::KpoolMlaStorage::BFloat16);
     if (graph) {
         DecodeGraphDefinition definition;
         definition.capture(d.stream(), [&] { f.launch(d.execution_view()); });
@@ -240,10 +274,78 @@ int run(int T, int B, int E, int layers, bool graph, bool fp8 = false) {
     d.synchronize();
     return verify(f);
 }
+
+int record_chain(bool index_fp8) {
+    auto& d         = cuda_environment().context;
+    constexpr int T = 5, B = 3, E = 2056;
+    kp::ChainFixture f(d.execution_view(), T, B, E, 11, false, {}, true, true,
+                       index_fp8 ? KvCacheVectorFormat::Fp8E4m3fnGroup128Ue8m0
+                                 : KvCacheVectorFormat::BFloat16,
+                       ops::KpoolMlaStorage::Fp8E4m3fnGroup128Ue8m0);
+    kp::Buffer<std::uint16_t> keys(d.device(), DType::BF16, {128, T, B}),
+        gates(d.device(), DType::BF16, {128, T, B});
+    kp::Buffer<int> offsets(d.device(), DType::I32, {B}), bases(d.device(), DType::I32, {B}),
+        accepted(d.device(), DType::I32, {B});
+    for (int b = 0; b < B; ++b) {
+        offsets.at(b)  = 0;
+        bases.at(b)    = E - T;
+        accepted.at(b) = T;
+    }
+    offsets.upload();
+    bases.upload();
+    accepted.upload();
+    const auto capacity = ops::kpool_mla_prepare_record_workspace_capacity_bytes(
+        f.weights.profile(), f.cache.latent.storage, f.cache.index.format, B, 1, T,
+        d.execution_view().multiprocessor_count());
+    DeviceBuffer scratch(d.device(), capacity);
+    MemoryArena arena(scratch.span());
+    DecodeGraphDefinition definition;
+    definition.capture(d.stream(), [&] {
+        ops::kpool_mla_prepare_record(
+            f.x.view, f.weights.params,
+            {f.index.positions.view, f.index.valid.view, f.index.selectors.view}, f.before, f.cache,
+            {keys.view, gates.view, offsets.view}, {f.rank.view, f.index.coeff.view}, arena,
+            d.execution_view());
+        f.queries(d.execution_view());
+        f.index.launch(d.execution_view());
+        f.attend(d.execution_view());
+        ops::kpool_tail_extract(f.before,
+                                {keys.view.reshape({128, T, B, 1}),
+                                 gates.view.reshape({128, T, B, 1}), bases.view,
+                                 f.index.valid.view},
+                                accepted.view, f.after, d.execution_view());
+    });
+    DecodeGraphExecutable graph;
+    graph.instantiate(definition);
+    int failures = 0;
+    for (const std::vector<int>& prefix : {std::vector<int>{0, 2, 5}, {1, 3, 4}}) {
+        accepted.host = prefix;
+        accepted.upload();
+        f.state.copy_from_host(f.initial_state.data(), f.state.size());
+        graph.launch(d.stream());
+        d.synchronize();
+        failures += verify(f, prefix);
+    }
+    const auto ids = f.index.ids.download(), counts = f.index.counts.download(),
+               ends = f.index.ends.download();
+    for (int b = 0; b < B; ++b)
+        for (int t = 0; t < T; ++t) f.selection_rows.at(t, b) = b * T;
+    f.selection_rows.upload();
+    f.attend(d.execution_view());
+    d.synchronize();
+    failures += verify(f, accepted.host);
+    failures += ids != f.index.ids.download() || counts != f.index.counts.download() ||
+                ends != f.index.ends.download() || !keys.guards() || !gates.guards() ||
+                arena.used() != 0 || arena.peak_used() > capacity;
+    return failures;
+}
 } // namespace
 
 int main(int argc, char** argv) {
     OpSuite suite;
+    for (bool fp8 : {false, true})
+        suite.add(std::string("kpool_chain/fp8_latent/record_reuse/") + (fp8 ? "fp8" : "bf16"),
+                  [=] { return record_chain(fp8); }, {{"format", "fp8"}, {"execution", "graph"}});
     for (auto [T, B, E, layers, graph] : {std::tuple{1, 1, 1, 1, false},
                                           {1, 1, 3, 11, false},
                                           {1, 1, 2051, 11, false},
@@ -268,5 +370,17 @@ int main(int argc, char** argv) {
                       std::to_string(E),
                   [=] { return run(T, B, E, layers, graph, true); },
                   {{"format", "fp8"}, {"execution", graph ? "graph" : "eager"}});
+    for (bool index_fp8 : {false, true})
+        for (auto [T, B, E, layers, graph] : {std::tuple{1, 1, 1, 1, false},
+                                              {1, 1, 2052, 11, true},
+                                              {5, 3, 2054, 11, true},
+                                              {65, 1, 8195, 11, true},
+                                              {129, 1, 8193, 1, false},
+                                              {1025, 1, 2053, 1, true}})
+            suite.add(std::string("kpool_chain/fp8_latent/") +
+                          (index_fp8 ? "fp8_index/" : "bf16_index/") + std::to_string(T) + "x" +
+                          std::to_string(B) + "/" + std::to_string(E),
+                      [=] { return run(T, B, E, layers, graph, index_fp8, true); },
+                      {{"format", "fp8"}, {"execution", graph ? "graph" : "eager"}});
     return suite.main(argc, argv);
 }

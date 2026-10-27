@@ -74,7 +74,7 @@ head stride，Draft Full 也使用相同记录寻址。
 |---|---:|---:|---:|
 | BF16 | 512 B | 512 B | 1024 B |
 | INT8-G64 | 256 B + 8 B | 256 B + 8 B | 528 B |
-| FP8-E4M3FN-row256 | 256 B + 2 B | 256 B + 2 B | 516 B |
+| FP8-E4M3FN-G128-UE8M0 | 256 B + 2 B | 256 B + 2 B | 516 B |
 | NVFP4-G16 | 128 B + 16 B | 128 B + 16 B | 288 B |
 | K8V4 | 256 B + 2 B | 128 B + 16 B | 402 B |
 
@@ -85,7 +85,8 @@ K 使用 FP8、V 使用 NVFP4，不能按两倍单侧字节数计费。Draft Ful
 
 单 plane payload 为 `sizeof(dtype) * X * H * (P/s)`。记录大小还包含 plane 间与末端 padding，
 容量、迁移和视图使用同一布局生成结果，不另写一套字节公式。
-编码与数值合同见 [KV append](../../include/ninfer/ops/kv_cache_append.h)、
+Cache 编码的共同定义见 [kv_cache_format.h](../../include/ninfer/kv_cache_format.h)；
+各 Op 的基底与计算约定见 [KV append](../../include/ninfer/ops/kv_cache_append.h)、
 [Softmax Attention](../../include/ninfer/ops/softmax_attention.h) 和
 [QSA](../../include/ninfer/ops/qsa.h)。
 

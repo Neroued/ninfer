@@ -350,9 +350,12 @@ struct KpoolMlaFactors {
  * is no RoPE, bias, output gate, sink or forced self token. attention_scale is finite positive,
  * supplied by the caller (1/16 for Dq=256); it is not derived from Dc.
  *
- * The implemented BF16 path uses the actual stored BF16 c_j for both latent K/V roles,
- * including newly written tokens. Factor/QK/weighted contractions follow BF16/F32 computation;
- * softmax statistics, exponentials and split merges are FP32. FP8 execution is not yet supported.
+ * c_j is the value represented by the actual latent cache, including newly written tokens.
+ * BF16 storage uses BF16 QK/PV. FP8 storage uses FP8 QK with per-head G128 power-of-two
+ * query quantization as internal approximation; each Q/K group's scales participate in the
+ * dot product. PV decodes that same stored latent on chip to BF16 and uses BF16 P/V operands.
+ * Both formats accumulate in FP32. Factors remain BF16/F32; softmax statistics, exponentials
+ * and split merges are FP32.
  * q_latent/u are private intermediates, may retain FP32, and impose no additional observable
  * BF16 seam or global materialization. Final O projection is outside this Op. Inputs/results
  * participating in the mathematics are finite; all inputs/cache/selection are preserved.

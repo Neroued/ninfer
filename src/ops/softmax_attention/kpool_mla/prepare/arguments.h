@@ -25,6 +25,7 @@ struct PrepareArguments {
     const std::int64_t* page_offsets;
     std::int64_t table_stride;
     __nv_bfloat16 *latent, *query;
+    std::uint8_t *latent_fp8, *latent_scales;
     void* index;
     std::uint8_t* index_scales;
     float* coefficients;
@@ -37,7 +38,7 @@ struct PrepareArguments {
     int first_row = 0, first_column = 0, first_span = 0, last_row = 0, last_stop = 0;
     std::uint32_t token_multiplier = 0, token_shift = 0;
     float rms_epsilon, key_epsilon;
-    bool update, fp8_index;
+    bool update, fp8_index, fp8_latent;
 };
 
 void launch_prepare(const PrepareArguments& args, int window_columns, cudaStream_t stream);

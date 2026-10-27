@@ -14,16 +14,17 @@ int main(int argc, char** argv) {
         bool update = false, ragged = false, inplace = false, inactive = false;
         auto projection = kp::Projection::Full;
         auto index_format = KvCacheVectorFormat::BFloat16;
+        auto latent_storage = ops::KpoolMlaStorage::BFloat16;
         for (int i = 1; i < argc; ++i) {
             const std::string flag = argv[i];
             if (flag == "--help") {
                 std::cout
-                    << "Kpool MLA BF16 complete Prepare entry, fixed "
+                    << "Kpool MLA complete Prepare entry, fixed "
                        "H4096/Dc512/Di128/Rq1536/Hi32.\n"
                        "  --projection full|query-history|history --form record|update\n"
                        "  --tokens N,... --batch 1..8 --phase 0..3 --ragged 0|1 --inplace 0|1\n"
                        "  --inactive 0|1  zero valid columns in every physical row\n"
-                       "  --index-cache bf16|fp8\n";
+                       "  --index-cache bf16|fp8 --latent-cache bf16|fp8\n";
                 measurement::help();
                 return 0;
             }
@@ -44,6 +45,9 @@ int main(int argc, char** argv) {
             else if (flag == "--index-cache" && (v == "bf16" || v == "fp8"))
                 index_format = v == "fp8" ? KvCacheVectorFormat::Fp8E4m3fnGroup128Ue8m0
                                           : KvCacheVectorFormat::BFloat16;
+            else if (flag == "--latent-cache" && (v == "bf16" || v == "fp8"))
+                latent_storage = v == "fp8" ? ops::KpoolMlaStorage::Fp8E4m3fnGroup128Ue8m0
+                                            : ops::KpoolMlaStorage::BFloat16;
             else if (flag == "--form" && (v == "record" || v == "update"))
                 update = v == "update";
             else if (flag == "--projection" &&
@@ -66,7 +70,7 @@ int main(int argc, char** argv) {
             "projection_TFLOps");
         for (int T : tokens) {
             kp::Fixture f(weights, device.execution_view(), T, batch, update, ragged, false,
-                          inplace, phase, index_format);
+                          inplace, phase, index_format, latent_storage);
             if (inactive) {
                 for (int b = 0; b < batch; ++b) {
                     f.valid.at(b)          = 0;
@@ -98,14 +102,16 @@ int main(int argc, char** argv) {
                                                  (512 + weights.q + 256 + 512) * 2
                                            : 0;
             const std::size_t writes =
-                live * (1024 + (update ? 0 : 512)) + M * (weights.q * 2 + weights.heads * 4) +
+                live * ((latent_storage == ops::KpoolMlaStorage::BFloat16 ? 1024 : 516) +
+                        (update ? 0 : 512)) +
+                M * (weights.q * 2 + weights.heads * 4) +
                 pools * (index_format == KvCacheVectorFormat::BFloat16 ? 256 : 129) + tail_write;
             const std::size_t payload   = reads + writes;
             const double flops          = 2. * weights.rows * 4096 * live;
             const double physical_flops = 2. * weights.rows * 4096 * M;
             measurement::Row row;
             row.op              = "kpool_mla_prepare";
-            row.format          = "bf16";
+            row.format          = latent_storage == ops::KpoolMlaStorage::BFloat16 ? "bf16" : "fp8";
             row.n               = weights.rows;
             row.k               = 4096;
             row.tokens          = T;

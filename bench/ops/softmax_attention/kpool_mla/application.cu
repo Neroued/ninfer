@@ -49,26 +49,39 @@ static kp::IndexerCase shape_of(const Json& c) {
     return s;
 }
 
+static ops::KpoolMlaStorage latent_storage_of(const Json& c) {
+    const auto format = c.value("latent_cache", "bf16");
+    if (format == "bf16") return ops::KpoolMlaStorage::BFloat16;
+    if (format == "fp8") return ops::KpoolMlaStorage::Fp8E4m3fnGroup128Ue8m0;
+    throw std::invalid_argument("latent_cache must be bf16 or fp8");
+}
+
+static KvCacheVectorFormat index_format_of(const Json& c) {
+    const auto format = c.value("index_cache", "bf16");
+    if (format == "bf16") return KvCacheVectorFormat::BFloat16;
+    if (format == "fp8") return KvCacheVectorFormat::Fp8E4m3fnGroup128Ue8m0;
+    throw std::invalid_argument("index_cache must be bf16 or fp8");
+}
+
 static Json admission(CudaExecutionView cuda, const Json& c) {
-    const auto shape = shape_of(c);
+    const auto shape        = shape_of(c);
+    const auto storage      = latent_storage_of(c);
+    const auto index_format = index_format_of(c);
     const int T = c.at("T"), B = c.at("B"), L = c.value("layers", 11);
-    const auto layout = ops::plan_kpool_mla_cache_layout(
-        {ops::KpoolMlaStorage::BFloat16, KvCacheVectorFormat::BFloat16, 512, 128, L});
+    const auto layout   = ops::plan_kpool_mla_cache_layout({storage, index_format, 512, 128, L});
     const auto page     = plan_kv_page_layout(layout.page.geometry);
     const auto bytes    = page.alignment + shape.pages(B, 0) * (page.page_bytes + page.alignment);
     const auto envelope = ops::KpoolExecutionEnvelope{std::uint32_t(shape.envelope)};
-    const auto scratch  = std::max(
-        {ops::kpool_indexer_workspace_capacity_bytes({32, 128}, KvCacheVectorFormat::BFloat16,
-                                                      envelope, B, 1, T,
-                                                      cuda.multiprocessor_count()),
-          ops::kpool_sparse_mla_workspace_capacity_bytes({64, 256, 256, 512},
-                                                         ops::KpoolMlaStorage::BFloat16, envelope, B,
-                                                         1, T, cuda.multiprocessor_count()),
-          ops::kpool_mla_prepare_record_workspace_capacity_bytes(
-             {kp::Projection::Full, 4096, 512, 128, 1536, 32, 4}, ops::KpoolMlaStorage::BFloat16,
-             KvCacheVectorFormat::BFloat16, B, 1, T, cuda.multiprocessor_count()),
-          ops::linear_workspace_capacity_bytes(QType::Q8_G32_FP16, 4096, 16384,
-                                               ops::LinearPolicy::A16Only, B, T * B)});
+    const auto scratch =
+        std::max({ops::kpool_indexer_workspace_capacity_bytes({32, 128}, index_format, envelope, B,
+                                                              1, T, cuda.multiprocessor_count()),
+                  ops::kpool_sparse_mla_workspace_capacity_bytes(
+                      {64, 256, 256, 512}, storage, envelope, B, 1, T, cuda.multiprocessor_count()),
+                  ops::kpool_mla_prepare_record_workspace_capacity_bytes(
+                      {kp::Projection::Full, 4096, 512, 128, 1536, 32, 4}, storage, index_format, B,
+                      1, T, cuda.multiprocessor_count()),
+                  ops::linear_workspace_capacity_bytes(QType::Q8_G32_FP16, 4096, 16384,
+                                                       ops::LinearPolicy::A16Only, B, T * B)});
     std::size_t free = 0, total = 0;
     CUDA_CHECK(cudaMemGetInfo(&free, &total));
     // Conservative fixture budget: device + Host mirrors of frame/weights, flush and
@@ -80,12 +93,15 @@ static Json admission(CudaExecutionView cuda, const Json& c) {
 }
 
 static Json work(app::Fixture& f) {
-    auto& i        = f.index;
+    auto& i               = f.index;
+    const bool fp8_latent = f.cache.latent.storage == ops::KpoolMlaStorage::Fp8E4m3fnGroup128Ue8m0;
+    const bool fp8_index  = f.cache.index.format == KvCacheVectorFormat::Fp8E4m3fnGroup128Ue8m0;
+    const std::uint64_t latent_bytes = fp8_latent ? 516 : 1024, index_bytes = fp8_index ? 129 : 256;
     const auto ids = i.ids.download(), counts = i.counts.download(), ends = i.ends.download();
     std::unordered_set<std::size_t> latent, keys;
     std::uint64_t visits = 0, candidates = 0, active = 0, publications = 0, metadata = i.B * 4;
     bool factor = false;
-    double mla  = 0;
+    double mla = 0, qk = 0;
     for (int b = 0; b < i.B; ++b) {
         int n = i.valid.at(b);
         active += n;
@@ -94,7 +110,7 @@ static Json work(app::Fixture& f) {
         metadata += 20 + std::uint64_t(n) * 8 + ((F + n + 63) / 64) * 8;
         if ((F + n) / 4 > 512)
             for (int g = 0; g < F / 4; ++g) keys.insert(f.physical_token(b, g * 4) / 4);
-        publications += std::uint64_t(n) * 1024 + ((F + n) / 4 - F / 4) * 256;
+        publications += std::uint64_t(n) * latent_bytes + ((F + n) / 4 - F / 4) * index_bytes;
         publications += f.record ? std::uint64_t(n) * 512 + (F % 4) * 512 : (F % 4 + 3) * 512;
         for (int t = 0; t < n; ++t) {
             int row = b * i.T + t, end = ends[row], size = counts[row] * 4 + end % 4;
@@ -102,7 +118,10 @@ static Json work(app::Fixture& f) {
             visits += size;
             factor |= size > 1;
             if (size) mla += 2. * 64 * 512 * 256;
-            if (size > 1) mla += 2. * 64 * 512 * 256 + size * (4. * 64 * 512);
+            if (size > 1) {
+                mla += 2. * 64 * 512 * 256 + size * (4. * 64 * 512);
+                qk += size * (2. * 64 * 512);
+            }
             for (int g = 0; g < counts[row]; ++g)
                 for (int r = 0; r < 4; ++r) {
                     int token = ids[row * 512 + g] * 4 + r;
@@ -117,13 +136,18 @@ static Json work(app::Fixture& f) {
     std::uint64_t weights = f.weights.weight.view.bytes() + f.w_b.view.bytes() +
                             f.value_up.view.bytes() + (factor ? f.key_up.view.bytes() : 0) +
                             f.o_weight.model_weight_bytes() + (512 + 1536 + 128 + 128 + 512) * 2;
-    std::uint64_t bytes = metadata + publications + f.result.view.bytes() + latent.size() * 1024 +
-                          keys.size() * 256 + (active ? weights + active * 4096 * 2 : 0);
+    std::uint64_t bytes = metadata + publications + f.result.view.bytes() +
+                          latent.size() * latent_bytes + keys.size() * index_bytes +
+                          (active ? weights + active * 4096 * 2 : 0);
     double flops            = prepare + wb + idx + mla + o;
     const double memory_us  = bytes / (kRoofline.sustained_read_gbs * 1000.);
-    const double compute_us = flops / (kRoofline.bf16_f32_tflops * 1e6);
+    const double fp8_flops  = (fp8_latent ? qk : 0) + (fp8_index ? idx : 0);
+    const double compute_us = (flops - fp8_flops) / (kRoofline.bf16_f32_tflops * 1e6) +
+                              fp8_flops / (kRoofline.mxfp8_f32_tflops * 1e6);
     return {{"minimum_external_bytes", bytes},
             {"useful_flops", flops},
+            {"bf16_flops", flops - fp8_flops},
+            {"fp8_flops", fp8_flops},
             {"active_columns", active},
             {"selected_visits", visits},
             {"unique_old_latent_tokens", latent.size()},
@@ -133,6 +157,7 @@ static Json work(app::Fixture& f) {
             {"flops_by_stage", {prepare, wb, idx, mla, o}},
             {"memory_reference_gbs", kRoofline.sustained_read_gbs},
             {"bf16_f32_reference_tflops", kRoofline.bf16_f32_tflops},
+            {"fp8_f32_reference_tflops", kRoofline.mxfp8_f32_tflops},
             {"memory_floor_us", memory_us},
             {"compute_floor_us", compute_us},
             {"roofline_us", std::max(memory_us, compute_us)}};
@@ -147,7 +172,8 @@ static Json static_case(CudaExecutionView cuda, const Json& c, int repeats, int 
     }
     const auto begin = Clock::now();
     app::Fixture f(cuda, c.at("T"), c.at("B"), shape_of(c),
-                   c.value("prepare", "update") == "record", c.value("layers", 11));
+                   c.value("prepare", "update") == "record", c.value("layers", 11),
+                   index_format_of(c), latent_storage_of(c));
     CUDA_CHECK(cudaDeviceSynchronize());
     L2FlushBuffer flush(256ULL << 20);
     measurement::BodyTimedGraph graph;
@@ -238,6 +264,7 @@ int main(int argc, char** argv) {
                           << " --case JSON --out JSON [--repeat N --warmup N --stages 0|1]\n"
                           << "       " << argv[0] << " --jobs JSON\n"
                           << "Case modes: static (default), trajectory, mtp.\n"
+                          << "Case storage: latent_cache/index_cache = bf16|fp8 (default bf16).\n"
                           << "Jobs: array of {case, out, repeat, warmup, stages}.\n"
                           << "Defaults: repeat=100, warmup=10, stages=1.\n";
                 return 0;

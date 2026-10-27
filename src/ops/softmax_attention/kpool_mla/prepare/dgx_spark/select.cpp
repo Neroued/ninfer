@@ -21,7 +21,8 @@ PrepareGeometry prepare_geometry(const KpoolMlaPrepareProfile& p, KpoolMlaStorag
     default:
         throw std::invalid_argument("Kpool Prepare: invalid projection");
     }
-    if (storage != KpoolMlaStorage::BFloat16 ||
+    if ((storage != KpoolMlaStorage::BFloat16 &&
+         storage != KpoolMlaStorage::Fp8E4m3fnGroup128Ue8m0) ||
         (index_format != KvCacheVectorFormat::BFloat16 &&
          index_format != KvCacheVectorFormat::Fp8E4m3fnGroup128Ue8m0) ||
         p.hidden != 4096 || p.latent_dim != 512 || p.index_dim != 128 || p.query_rank != q ||

@@ -155,14 +155,51 @@ __device__ __forceinline__ float pooled_feature(const PrepareArguments& a, int d
     return value / sum;
 }
 
-template <bool Fp8Index>
+__device__ __forceinline__ void latent_fp8_job(const PrepareArguments& a, std::int64_t begin,
+                                               int column, float* reduction) {
+    int b, t;
+    coordinate(a, column, b, t);
+    if (t >= a.valid[b]) return;
+    const auto m   = begin + column;
+    const int lane = threadIdx.x % 32, group = threadIdx.x / 32;
+    const int first = group * 128 + lane * 4;
+    float values[4], sum = 0.F;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        values[i] = projection_value(a, column, first + i);
+        sum       = fmaf(values[i], values[i], sum);
+    }
+    sum = common::block_reduce_sum<128>(sum, reduction);
+    if (threadIdx.x == 0) reduction[0] = rsqrtf(sum / 512 + a.rms_epsilon);
+    __syncthreads();
+    float maximum = 0.F;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        values[i] *= reduction[0] * __bfloat162float(a.latent_norm[first + i]);
+        maximum = fmaxf(maximum, fabsf(values[i]));
+    }
+    const auto scale = common::fp8_ue8m0_scale(common::warp_max(maximum));
+    const unsigned codes =
+        common::fp8_quant_code2(values[0], values[1], scale.inverse_scale) |
+        unsigned(common::fp8_quant_code2(values[2], values[3], scale.inverse_scale)) << 16;
+    const int position = a.positions[m];
+    const auto page =
+        a.page_offsets[std::int64_t(a.table_rows[b]) * a.table_stride + position / 64];
+    *reinterpret_cast<unsigned*>(a.latent_fp8 + page + (position % 64) * 512 + first) = codes;
+    if (lane == 0) a.latent_scales[page + (position % 64) * 4 + group] = scale.scale;
+}
+
+template <bool Fp8Index, bool Fp8Latent = false>
 __global__ __launch_bounds__(128) void prepare_post_kernel(PrepareArguments a, std::int64_t begin,
                                                            int columns) {
     __shared__ float reduction[4];
     __shared__ __nv_bfloat16 keys[4][128], gates[4][128];
     int job = blockIdx.x;
     if (job < columns) {
-        rms_job<512, 0, false>(a, begin, job, reduction);
+        if constexpr (Fp8Latent)
+            latent_fp8_job(a, begin, job, reduction);
+        else
+            rms_job<512, 0, false>(a, begin, job, reduction);
         return;
     }
     job -= columns;

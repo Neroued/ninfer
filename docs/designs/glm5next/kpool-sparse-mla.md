@@ -3,8 +3,8 @@
 本文维护 GLM5Next Kpool Sparse MLA 的权重绑定、存储规划、调用链与实现组织。
 公共计算合同在 [kpool_mla.h](../../../include/ninfer/ops/kpool_mla.h)，资源规划合同
 在 [kpool_mla_layout.h](../../../include/ninfer/ops/kpool_mla_layout.h)。语义以头文件
-为准，本文不维护第二份函数声明。DGX Spark 的 BF16 计算链和布局已实现；FP8
-计算与模型集成仍待完成，逐点 roofline 状态见 [MLA 清单](mla-checklist.md)。
+为准，本文不维护第二份函数声明。DGX Spark 支持 BF16/FP8 latent 与 BF16/FP8
+Indexer 的独立组合；逐点 roofline 状态见 [MLA 清单](mla-checklist.md)。
 模型数学以[模型参考](../../maintainer/glm5next-model.md#4-sparse-mla-与-kpool4-indexer)为准，
 表示与精度以[数值约定](../../maintainer/glm5next-quantization.md#3-mlaindexer-cache-与计算政策)为准。
 
@@ -42,10 +42,9 @@ Op 不分配页、不选择请求 owner、不决定接受长度，也不发布�
 | 使用位置 | Main 11 层、MTP 1 层，各层独立历史内容和 selection |
 | 双 Spark 放置 | 一个 DP 副本内 MLA／Indexer 按请求 ADP2，owner 执行完整 heads |
 
-当前为 NoPE，没有 MLA 或 Indexer RoPE。已实现的 Main/MTP 计算使用 BF16 latent；
-Indexer、raw tail、raw records 固定 BF16。E4M3FN-G128-FP32-scale latent 已有布局规划，
-但 Prepare encoder 和 MLA decoder 尚未实现；此 profile 的后续计算仍采用 BF16
-操作数／FP32 累加。布局可表达性不表示执行支持。
+当前为 NoPE，没有 MLA 或 Indexer RoPE。Main/MTP 的 latent 使用现有 KV dtype
+选择；Indexer 默认 FP8，环境变量可选择 BF16。选择范围与数值政策统一见上述数值约定。
+Raw tail 和 raw records 保持原始 BF16 K/gate。
 
 ## 2. 权重、投影与执行链
 
@@ -136,11 +135,12 @@ raw K/gate 属于定长 StateImage。两类状态使用相同原 token frontier�
 |---|---|---:|
 | BF16 latent | BF16 `[512,64,1]` | 1 |
 | 或 FP8 latent codes | E4M3FN `[512,64,1]` | 1 |
-| FP8 latent scales | FP32 `[4,64,1]` | 1 |
-| pooled index keys | BF16 `[128,16,1]` | 4 |
+| FP8 latent scales | U8 UE8M0 `[4,64,1]` | 1 |
+| pooled index keys | BF16 或 E4M3FN `[128,16,1]` | 4 |
+| FP8 index scales | U8 UE8M0 `[1,16,1]` | 4 |
 
-只实例化所选 latent profile。Plane 基址为 256 B 对齐；页内紧密排列，latent row
-stride 为 1024/512 B，scale row 为 16 B，index row 为 256 B。同一逻辑页的全部层
+只实例化所选 latent/index profile。Plane 基址为 256 B 对齐；页内紧密排列，latent row
+stride 为 1024/512 B，latent scale row 为 4 B，index row 为 256/128 B，index scale row 为 1 B。同一逻辑页的全部层
 按 layer 顺序、每层按表中所选 planes 顺序打包成一份 256 B 对齐记录，scales 不插在
 latent rows 之间。
 记录内偏移和总大小统一由 `plan_kv_page_layout()` 产生；记录之间可以离散放置。
@@ -167,21 +167,19 @@ latent rows   = 4*pool_in_page + {0,1,2,3}
 ```
 
 一次页表寻址定位四条连续 latent，不跨页。四 token payload 为 BF16 4096 B，或
-FP8 codes 2048 B＋另一 plane 的 64 B scales。Selection 保留 pool IDs，消费者直接
+FP8 codes 2048 B＋另一 plane 的 16 B scales。Selection 保留 pool IDs，消费者直接
 按组加载，不先展开 token IDs 或构造全局 gather buffer。未完成 tail 按有效数 mask。
 实际地址为 `arena + record_offset + plane_offset + row*row_stride + feature_offset`。
 固定层的跨页地址必须读取映射，不能按单层 payload 或整个 backing 容量外推。
 
-### 3.3 Latent codec 与后续 FP8
+### 3.3 Cache 编码与计算
 
-使用[已定 codec](../../maintainer/glm5next-quantization.md#3-mlaindexer-cache-与计算政策)：
-BF16 每 token 为 1024 B；FP8 每 token 为 512 个 codes＋4 个 FP32 scales，共 528 B。
-FP8 分组沿每 token 连续 128 维，不跨 token 共享 scale，无 Hadamard 或基底旋转。
+存储格式与精度遵循[数值政策](../../maintainer/glm5next-quantization.md#3-mlaindexer-cache-与计算政策)。
+Latent 的 FP8 encoder 直接消费 FP32 RMSNorm 结果；Indexer 的 FP8 encoder 在 FP32
+pooling 后应用归一化 H128。两者共用 G128/UE8M0 codec，但各自持有基底和计算约定。
 
-后续 FP8 encoder 消费 FP32 RMSNorm 结果，前面不插入 BF16 舍入。Consumer 在片上按实际
-code/scale 解码为 BF16 operand，同一 operand 同时服务 QK 和 latent 加权累加。
-当前窗口的新 token 也经过同一编码／解码边界。精确舍入、零和极小值规则只在数值
-文档维护；实现时 Prepare 与 MLA 应使用同一 codec。
+FP8 sparse MLA 在 U_K epilogue 中直接生成私有量化 query，QK 使用 FP8 operands，
+PV 使用片上解码的 BF16 latent。当前窗口新 token 也经过同一 cache 表示边界。
 
 ## 4. 公共 views 与身份
 
@@ -346,8 +344,9 @@ bind 才取得 residency。模型不手算 plane 偏移、不另建一套 byte-s
 
 | 资源 | 容量 |
 |---|---:|
-| 单层一个 64-token cache 页组 | BF16 68 KiB；FP8 37 KiB |
-| Main 11 层一个页组 | BF16 748 KiB；FP8 407 KiB |
+| 单层 64-token 页组，FP8 index | BF16 latent 66.25 KiB；FP8 latent 34.5 KiB |
+| 单层 64-token 页组，BF16 index | BF16 latent 68 KiB；FP8 latent 36.25 KiB |
+| Main 11 层页组，FP8 index | BF16 latent 728.75 KiB；FP8 latent 379.5 KiB |
 | 一行单层 canonical tail | K/gate 各 768 B，共 1536 B |
 | Raw records | `512*W*R*L` B；如 W=4096、R=8、L=11 为 176 MiB |
 | Selection table | `2056*Nselection` B payload，三个 planes 另计对齐间隙 |
@@ -434,11 +433,12 @@ Host 可见的不合法 dtype/shape/device/capacity 由所属入口报告；Devi
 
 ```text
 src/ops/softmax_attention/
-  kernels/topk_512.cuh       # QSA 与 Kpool 共用的精确选择体
+  kernels/topk_512.cuh / topk_512_words.cuh  # 精确选择体
   kpool_mla/
     sources.cmake
     layout.cpp              # Core planner 的无地址组合与借用绑定
     validation.h            # 本 family 的视图检查
+    index_fp8.cuh            # Indexer 的 H128 基底与编码组合
     tail_extract.cu         # 一次调用跨层提取实际 raw words
     prepare/
       prepare.cpp / arguments.h / plan.h
@@ -447,12 +447,12 @@ src/ops/softmax_attention/
       unsupported.cpp
     indexer/
       indexer.cpp / arguments.h / plan.h
-      score.cuh / select.cuh
+      score_bf16.cuh / score_fp8.cuh / query_fp8.cuh / work.cuh / select.cuh
       dgx_spark/select.cpp / launch.cu
       unsupported.cpp
     sparse_mla/
       sparse_mla.cpp / arguments.h / plan.h
-      factor.cuh / attention.cuh
+      factor.cuh / attention.cuh / attention_fp8.cuh
       dgx_spark/select.cpp / launch.cu
       unsupported.cpp
 ```
@@ -472,8 +472,9 @@ Sparse MLA 在有界窗口内完成 U_K、online softmax attention 和 U_V。因
 native latent 维加载，复用多 query 的权重。Attention 每个 pool 解析一次页表，
 通过 TMA 读取四条连续 latent，在 head group 的 QK/PV 间共享。小 T 用 KV split
 补足并行度；两份 partial 的特定工作区间融合 merge 与 U_V。大 T 仍按每条 query
-的真实 selection 读取，不假定相邻集合相同。不分片时 q_latent 在最后读取后原位
-变为 u；分片时 partial 保留到独立 merge 或 value map 的最后读者。
+的真实 selection 读取，不假定相邻集合相同。BF16 不分片时 q_latent 在最后读取后原位
+变为 u；FP8 query 与 BF16 u 使用不同 stride，分别规划。分片时 partial 保留到独立
+merge 或 value map 的最后读者。
 
 每个 selector 决定自己的实例与阈值，launch 文件只绑定具体模板和资源。
 复杂 CUDA 计算体进入 non-RDC archive；C++ 入口与布局归 ninfer_ops，数值精度与

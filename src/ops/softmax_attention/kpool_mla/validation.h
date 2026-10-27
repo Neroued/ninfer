@@ -99,4 +99,20 @@ inline void index_cache(const ConstKpoolIndexCacheView& cache, int dim, Device d
     require(k.offset + k.bytes <= s.offset || s.offset + s.bytes <= k.offset,
             "index codes/scales overlap");
 }
+
+inline void latent_cache(const ConstKpoolMlaLatentCacheView& cache, int dim, Device device) {
+    const auto format = paged_kv_vector_layout(kpool_mla_vector_format(cache.storage), dim);
+    plane(cache.data, format.data_dtype, format.data_leading_extent, 1, device);
+    if (!format.has_scale()) {
+        require(!cache.scales.records.storage.data, "BF16 latent has no scales");
+        return;
+    }
+    plane(cache.scales, format.scale_dtype, format.scale_leading_extent, 1, device);
+    operand::same_paged_records(cache.data, cache.scales, kOperation, "latent codes/scales");
+    const auto& data   = cache.data.plane.tensor.region;
+    const auto& scales = cache.scales.plane.tensor.region;
+    require(data.offset + data.bytes <= scales.offset ||
+                scales.offset + scales.bytes <= data.offset,
+            "latent codes/scales overlap");
+}
 } // namespace ninfer::ops::detail::kpool

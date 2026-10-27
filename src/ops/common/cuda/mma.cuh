@@ -76,7 +76,7 @@ __device__ __forceinline__ void mma_fp8_e4m3(float& c0, float& c1, float& c2, fl
 }
 
 // scale_vec::1X uses the low byte. For B, lane%4==0 supplies column lane/4.
-// A uses lanes 0 and 2 in each quad for rows lane/4 and lane/4+8.
+// A uses lanes 0 and 1 in each quad for rows lane/4 and lane/4+8.
 __device__ __forceinline__ void mma_fp8_e4m3_scaled(float& c0, float& c1, float& c2, float& c3,
                                                     unsigned a0, unsigned a1, unsigned a2,
                                                     unsigned a3, unsigned b0, unsigned b1,

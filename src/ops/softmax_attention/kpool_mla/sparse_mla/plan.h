@@ -18,13 +18,17 @@ struct SparseMlaPlan {
     int splits, tile;
     bool direct;
     bool merge_value = false;
+    MlaFactorSchedule fp8_query;
     TensorRegion mapped, numerator, maximum, denominator;
+    TensorRegion query_fp8, query_scales;
     std::size_t bytes = 0;
 };
 
-SparseMlaPlan sparse_mla_plan(int columns, int batch, KpoolExecutionEnvelope, int sms);
-std::size_t sparse_mla_capacity(int lo, int hi, int batch, KpoolExecutionEnvelope, int sms);
-void launch_sparse_mla(SparseMlaArguments, MemorySpan, KpoolExecutionEnvelope, int sms,
-                       cudaStream_t);
+SparseMlaPlan sparse_mla_plan(KpoolMlaStorage, int columns, int batch, KpoolExecutionEnvelope,
+                              int sms);
+std::size_t sparse_mla_capacity(KpoolMlaStorage, int lo, int hi, int batch, KpoolExecutionEnvelope,
+                                int sms);
+void launch_sparse_mla(SparseMlaArguments, MemorySpan, KpoolMlaStorage, KpoolExecutionEnvelope,
+                       int sms, cudaStream_t);
 
 } // namespace ninfer::ops::detail::kpool

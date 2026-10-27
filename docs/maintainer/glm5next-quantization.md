@@ -118,80 +118,44 @@ Main head、embedding 和 proposal head 是独立权重对象；Main/MTP 共享 
 
 ## 3. MLA／Indexer cache 与计算政策
 
+MLA latent 通过现有 `kv_dtype=bf16|fp8` 选择。Indexer 默认使用 FP8；启动协调进程的
+`NINFER_KPOOL_INDEXER_BF16=1` 选择 BF16，未设置或 `0` 使用 FP8。该选择在模型启动时
+解析并随原生准备请求传给所有 ranks，不增加 Engine 配置项。Main/MTP 和所有 ranks
+使用同一对格式，运行中保持不变；latent 与 index 格式可以独立组合。
+
 | 部分 | 持久表示 | 计算 |
 |---|---|---|
-| MLA latent | BF16 或 E4M3FN/G128/FP32 scales；原始基底 | BF16 操作数、FP32 累加；softmax 指数、统计和分块归约 FP32 |
-| Indexer pooled keys | 固定 BF16，无 scale/Hadamard | BF16 Q/K、FP32 累加；head coefficients 和评分归约 FP32 |
-| Indexer raw tail/records | BF16 K/gate，不含 APE | Pooling softmax/weighted sum FP32，pool 出口 BF16 |
+| BF16 latent | 原始基底，BF16 `[512]`，1024 B/token | BF16 QK/PV，FP32 累加 |
+| FP8 latent | 原始基底，E4M3FN `[512]`＋4 个 UE8M0 scales，516 B/token | 私有 Q_latent 动态 G128 量化，FP8 QK；latent 片上解码为 BF16 供 PV 使用 |
+| BF16 pooled index keys | 原始基底，BF16 `[128]`，256 B/pool | BF16 QK，FP32 累加、signed weighting 与 head reduction |
+| FP8 pooled index keys | 归一化 H128 基底，E4M3FN `[128]`＋1 个 UE8M0 scale，129 B/pool | Query 使用相同 H128 和 G128 编码，FP8 QK，评分归约 FP32 |
+| Raw tail/records | 原始 BF16 K/gate，不含 APE | FP32 pooling；随后按选定 index 格式发布 |
 
-Main/MTP 和两 ranks 在启动时使用同一个 MLA storage profile，运行中不切换。
-本 profile 的 16-bit 操作数是 BF16，不引入 FP16、FP8 query 或 FP8 点积分支。
-FP8 只改变 latent 存储；格式选择不授予更低精度计算许可。
+### 3.1 共用编码
 
-Indexer 固定 BF16 cache/计算。只有后续实测成为瓶颈并由用户明确重新决定，才可
-考虑 FP8 cache＋BF16 计算；这一条件也不自动授权 FP8 query 或 FP8 点积。
-执行路线不得按 T/B、显存压力或设备事实修改这些精度政策。
+所有 FP8 cache 使用 E4M3FN、连续 feature G128 分组和 UE8M0 单字节二次幂 multiplier。
+精确编码、零值和极小值规则由 [kv_cache_format.h](../../include/ninfer/kv_cache_format.h)
+唯一维护。MLA latent 不旋转；Indexer 的归一化 Hadamard-128 属于其算法，不能推广到
+其他 cache。四 token pool 是读取／选择单位，latent 的 scales 不跨 token 共享。
 
-### 3.1 两个存储 profile
+Prepare 直接将 FP32 RMSNorm 结果编码为 latent；FP8 路径不增加中间 BF16 舍入。
+Raw K/gate 保留公开 BF16 边界，pooling 消费其实际 words。BF16 pooled key 对加权和
+执行 BF16 舍入；FP8 pooled key 将 FP32 加权和旋转后直接编码。
 
-- `BFloat16`：每 token 保存一个 BF16 `c[512]`，1024 B，无 scale。
-- `Fp8E4m3fnGroup128F32`：512 个 E4M3FN codes、4 个 FP32 scales，528 B/token。
+### 3.2 消费与数值边界
 
-两种 profile 都在原始 latent 基底中，无 Hadamard 或其他旋转。只有一份 latent，
-供 K/V 两个角色共用；不分别存储展开的 K/V。不能套用现有 GQA 的 BF16-K/FP16-V
-解释或 D256 cache codec。
+Sparse MLA 保留 BF16 U_K/U_V。FP8 路径在 U_K 的 FP32 累加结果上按 G128 编码
+Q_latent，FP8 QK 的各组乘积按对应 query/latent scales 还原后以 FP32 归约。
+Softmax、split partial 与合并统计为 FP32；PV 使用片上 BF16 latent。
+U_V 消费 BF16 latent result，公开输出仍为 BF16 heads。不生成全局展开的 BF16 cache。
 
-FP8 按每 token 的连续 128 维分成四组。四 token 是加载单位，不是量化组：不跨
-token 共享 scale，不因新 token 到来重新编码旧 latent。
+Indexer 的公开 query 始终为 BF16，head coefficients 为 FP32。FP8 路径内部旋转和
+编码 query；评分的 ReLU、带符号系数、head reduction 保持 FP32。Top512 对实际计算
+得到的 scores 精确选择；浮点评分差异与集合选择正确性分别验收。
 
-### 3.2 编码
-
-输入为 latent RMSNorm 实际产生的 FP32 x；BF16 profile 直接写 `RN_BF16(x)`。
-FP8 profile 直接编码 FP32 norm 结果，不增加中间 BF16 舍入。
-
-对每个 128 维组：
-
-```text
-a = max_i(abs(x[i]))
-
-if a == 0:
-    scale   = FP32(+0)
-    code[i] = E4M3FN(+0)
-else:
-    scale   = max(RN_FP32(a / 448), 2^-126)
-    inv     = RN_FP32(1 / scale)
-    z[i]    = RN_FP32(x[i] * inv)
-    code[i] = E4M3FN_RNE(clamp(z[i], -448, 448))
-```
-
-所有 RN 为 round-to-nearest、ties-to-even；scale 为实际存储的 FP32 multiplier，
-不取整到二次幂。全零组规范化为正零；非零组中的 signed zero 按上述编码保留。
-按所列 FP32 步骤执行，不能用另一种除法/scale 舍入规则替换而改变 code words；
-也不能通过 flush-to-zero 改变规定的极小值行为。
-
-有效输入、需要的中间值及计算结果必须有限；NaN/Inf 不属于有效计算域，不能靠
-satfinite 掩盖。Device 内容的有效性由调用者保证，不引入 Host readback 扫描。
-
-### 3.3 消费
-
-```text
-decoded[i] = RN_FP32(FP32(E4M3FN(code[i])) * scale[group(i)])
-operand[i] = RN_BF16(decoded[i])
-```
-
-解码在片上完成，QK 与 latent 加权累加使用同一 BF16 operand。没有全局展开的
-BF16 cache。新写入 token 也必须经过所选 profile 的编码/解码边界，不能用未编码
-的当前窗口 latent 绕过 FP8 精度。融合可以消除内存往返，不能消除这个表示边界。
-
-Storage codec 的精确规则不要求完整 projection/norm 的不同合法实现逐位相同；
-codec 精确验收针对给定 FP32 输入，完整 prepare 另按独立数学 oracle 验证。
-
-### 3.4 与上游 Indexer 表示的区别
-
-本地 vLLM 参考路径会对 query 和 pooled key 做归一化 Hadamard-128，再以 E4M3FN
-per-vector 编码，使用取为二次幂的 FP32 scale。NInfer 不采用这套 Indexer 表示。
-Transformers 直接参考路径也没有该 codec；后端中间舍入与 NInfer 的政策分别解释，
-不能把某个后端输出当作独立数学 oracle。此差异独立于 NVIDIA 的静态权重量化。
+当前窗口新 token 与历史 token 使用同一 cache 表示，不通过未编码 latent 绕过表示
+边界。Codec 检查针对给定 FP32 输入；完整 Prepare、Indexer、MLA 和组合链使用独立
+数学参考，不能把私有 query 量化步骤复制进参考来消除误差。
 
 ## 4. 投影、控制量与 latent attention 边界
 
@@ -229,20 +193,15 @@ RMSNorm 为 `x*gamma/sqrt(mean(x*x)+1e-5)`，LayerNorm 为
 准备投影在 norm 前没有额外 BF16 落点。Pooling、tail 和 records 消费同一份实际
 BF16 raw K/gate；即使完整四个 tokens 都在当前调用内，也不绕过这个边界。
 APE 在 pooling 时以 FP32 加入，每个 channel 沿四 token 做 softmax 和 weighted sum，
-pool 出口转 BF16，无额外 norm、旋转或量化。
+pool 出口按第 3 节选定的 index 格式发布，不增加额外 norm。
 
 ### 4.3 Latent 域 attention
 
 本模型保留 BF16 U_K/U_V 因子，不离线与 Q_b/O 合成扩大后的吸收矩阵。
-QK、加权累加和因子投影保持 BF16/F32 计算约束；softmax max、sum、exp 与分块合并
-为 FP32。q_latent/u 是私有中间值，不强制全局物化，也不为复刻拆分调用增加额外
-BF16 落点。允许保留 FP32 中间量以融合计算，不能将矩阵操作数降低到 FP8。
-公共输出是完整 U_V 映射后的 BF16 heads，完整数学见模型第 4.1 节。
-
-cache_operand 按第 3.3 节产生，BF16 存储则直接使用存储值。FP8 的当前 token
-同样经过实际 encoder/decoder，不从未编码的临时 latent 走旁路。Attention scale
-固定为 1/16，不因 512 维 latent 改成 `1/sqrt(512)`。O projection 消费 BF16 heads，
-使用 Q8-G32 权重和 A16 计算；Q_b、U_K/U_V 与 Indexer 的 BF16 政策不变。
+计算精度和私有中间值的表示遵循第 3 节；公共输出是完整 U_V 映射后的 BF16 heads，
+完整数学见模型第 4.1 节。Attention scale 固定为 1/16，不因 512 维 latent 改成
+`1/sqrt(512)`。O projection 消费 BF16 heads，使用 Q8-G32 权重和 A16 计算；
+Q_b、U_K/U_V 与 Indexer 投影权重仍为 BF16。
 空选择集合的写域和精确零规则由消费者接口规定。
 
 ### 4.4 MTP 与 Vision 的融合边界

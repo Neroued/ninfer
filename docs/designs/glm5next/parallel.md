@@ -144,29 +144,21 @@ MTP 的配对、历史补齐与首步采用见 [MTP 设计](mtp.md)。
 令 `L=1048576`、B=1，按已定 [family layout](kpool-sparse-mla.md)计算。
 Main 有 11 层 MLA，每 token、每层保存一个 512 维 latent：
 
-```text
-BF16 latent = layers * L * 1024 B
-FP8 latent  = layers * L * (512 + 4*4) B
-Indexer    = layers * (L/4) * 128 * 2 B
-```
+Latent 原始 payload 为 BF16 的 1024 B/token，或 FP8 的 512 个 codes＋4 个 UE8M0
+scales，即 516 B/token。Indexer 每四 tokens 一个 pooled key，BF16 为 256 B，FP8
+为 129 B；每个 64-token 页组的 FP8 index scale plane 另按 256 B 对齐。
 
-| 范围 | BF16 latent | FP8 codes | FP32 scales | BF16 Indexer |
+下面容量已含完整 planes 的对齐，未计其他资源；列名为 latent/index 格式：
+
+| 范围 | bf16/bf16 | bf16/fp8 | fp8/bf16 | fp8/fp8 |
 |---|---:|---:|---:|---:|
-| Main 11 层 | 11 GiB | 5.5 GiB | 176 MiB | 704 MiB |
-| MTP 额外一层 | 1 GiB | 0.5 GiB | 16 MiB | 64 MiB |
-| Main＋MTP | 12 GiB | 6 GiB | 192 MiB | 768 MiB |
+| Main 11 层 | 11.6875 GiB | 11.38671875 GiB | 6.23046875 GiB | 5.9296875 GiB |
+| MTP 额外一层 | 1.0625 GiB | 1.03515625 GiB | 0.56640625 GiB | 0.5390625 GiB |
+| Main＋MTP | 12.75 GiB | 12.421875 GiB | 6.796875 GiB | 6.46875 GiB |
 
-这是每份完整 latent cache。第 1 节选定 MLA/Indexer 按请求 ADP2，一份请求的完整
-latent 只驻留在其 owner rank；单请求的这份容量不除以二。按 heads 做 MLA TP2 的
-对照方案则会在两台各保存一份完整 512 维 latent。
-
-Growing cache 合计如下，FP8 列已经包含全部 MLA scales；Indexer 均为 BF16：
-
-| 范围 | BF16 MLA＋BF16 Indexer | FP8 MLA＋BF16 Indexer |
-|---|---:|---:|
-| Main 11 层 | 11.6875 GiB | 6.359375 GiB |
-| MTP 额外一层 | 1.0625 GiB | 0.578125 GiB |
-| Main＋MTP | 12.75 GiB | 6.9375 GiB |
+Indexer 默认为 FP8。格式选择见[数值政策](../../maintainer/glm5next-quantization.md#3-mlaindexer-cache-与计算政策)。
+MLA/Indexer 按请求 ADP2，一份请求的完整历史只驻留在其 owner rank，单请求的这份
+容量不除以二。
 
 三列 K/gate BF16 canonical tail 每层 1536 B，Main 为 16.5 KiB、Main＋MTP 为 18 KiB。
 KDA 的完整 34 层 FP32 state 为 136 MiB，三列 BF16 convolution history 为
@@ -176,8 +168,8 @@ KDA 的完整 34 层 FP32 state 为 136 MiB，三列 BF16 convolution history �
 
 | 单请求在指定 rank 的占用 | Main | Main＋原生 MTP |
 |---|---:|---:|
-| Owner：FP8 MLA＋BF16 Indexer＋StateImage | 约 6.43 GiB | 约 7.01 GiB |
-| Owner：BF16 MLA＋BF16 Indexer＋StateImage | 约 11.76 GiB | 约 12.82 GiB |
+| Owner：FP8 MLA＋默认 FP8 Indexer＋StateImage | 约 6.00 GiB | 约 6.54 GiB |
+| Owner：BF16 MLA＋默认 FP8 Indexer＋StateImage | 约 11.46 GiB | 约 12.49 GiB |
 | 非 owner：本地 StateImage | 约 0.069 GiB | 约 0.069 GiB |
 
 表中按各层均满 1M 计费，真实 Main/MTP 各自 frontier 的有效行数按 family 合同计算。
@@ -188,13 +180,12 @@ State 分片，其容量按状态实例数增加，不随 L 增长。恢复来�
 
 ### 3.1 Page、Indexer 与 raw records 的补充计费
 
-每层每原 token 的 growing payload 为 BF16 MLA＋BF16 Indexer 的 1088 B，
-或 FP8 MLA＋BF16 Indexer 的 592 B；对应每个 64-token page 为 68 KiB 或 37 KiB。
+每个完整 64-token 页组记录如下；格式列为 latent/index：
 
-| 完整页组记录 | BF16 latent | FP8 latent |
-|---|---:|---:|
-| Main 11 层 | 748 KiB | 407 KiB |
-| MTP 1 层 | 68 KiB | 37 KiB |
+| 完整页组记录 | bf16/bf16 | bf16/fp8 | fp8/bf16 | fp8/fp8 |
+|---|---:|---:|---:|---:|
+| Main 11 层 | 748 KiB | 728.75 KiB | 398.75 KiB | 379.5 KiB |
+| MTP 1 层 | 68 KiB | 66.25 KiB | 36.25 KiB | 34.5 KiB |
 
 表中已含当前 planes 的 256 B 对齐；精确大小由 `KVPageLayout` 给出。Context 实际
 需求还包含记录类别的装载余量，使用 `describe_context_pool()` 的几何和成组需求
@@ -205,8 +196,9 @@ State 分片，其容量按状态实例数增加，不随 L 增长。恢复来�
 `512*W*L*R` B，不含 slab 对齐。W、L、R 分别是 raw record 窗口容量、层数和行容量，
 布局按 Kpool 设计；update 出口不要求保留整段 raw records。
 
-1M 时单层 Indexer 有 262144 个 BF16 pooled keys，共 64 MiB。MLA 选中 2048 个
-tokens 的 latent payload 为 BF16 2 MiB 或 FP8 1.03125 MiB。这是唯一数据量，
+1M 时单层 Indexer 有 262144 个 pooled keys，BF16 原始 payload 为 64 MiB，FP8 为
+32.25 MiB（包括 scale，不含 plane padding）。MLA 选中 2048 个 tokens 的 latent payload
+为 BF16 2 MiB 或 FP8 1.0078125 MiB。这是唯一数据量，
 不代表实测 HBM 流量或耗时。
 
 ## 4. mHC 执行资源
@@ -277,10 +269,10 @@ recurrent fold；fold 不重跑权重投影或 readout。
 BF16 Q_b 为 48 MiB、BF16 KV_b 因子为 32 MiB、Q8 O 为 68 MiB，每层合计
 148 MiB；TP2 时每 rank 为 74 MiB，Main＋MTP 共增加 **0.8671875 GiB/rank**。
 
-对于单个 1M 请求，Main＋MTP 的一份 growing cache 为 6.9375 GiB（FP8 MLA）或
-12.75 GiB（BF16 MLA），均包含固定的 BF16 Indexer，FP8 列包含全部 FP32 scales。
+对于单个 1M 请求，Main＋MTP 的一份 growing cache 为 6.46875 GiB（FP8 MLA）或
+12.421875 GiB（BF16 MLA），均包含默认 FP8 Indexer、UE8M0 scales 和 plane 对齐。
 去掉副本并扣除两台合计 1.734375 GiB 新增权重后，双机 payload 分别净减少
-5.203125 / 11.015625 GiB。Owner 仍需
+4.734375 / 10.6875 GiB。Owner 仍需
 保存完整历史，ADP 不把单请求在 owner 上的 cache 减半；最终启动占用还取决于各 rank
 统一 Context 容量、临时数据与通信资源。
 

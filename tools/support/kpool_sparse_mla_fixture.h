@@ -1,10 +1,12 @@
 #pragma once
 
 #include "kpool_fixture.h"
+#include "kpool_fp8_fixture.h"
 #include "paged_kv_fixture.h"
 #include "ninfer/ops/kpool_mla_layout.h"
 
 #include <memory>
+#include <map>
 #include <numeric>
 #include <set>
 
@@ -22,6 +24,8 @@ struct SparseMlaFixture {
     ops::ConstKpoolMlaLatentCacheView cache;
     ops::KpoolExecutionEnvelope envelope;
     std::vector<std::uint16_t> latent;
+    std::vector<std::uint8_t> latent_codes, latent_scales;
+    int scale_plane_index = -1;
     DeviceBuffer scratch;
     std::unique_ptr<MemoryArena> workspace;
     std::size_t workspace_bytes;
@@ -29,9 +33,13 @@ struct SparseMlaFixture {
 
     SparseMlaFixture(CudaExecutionView cuda, int tokens, int batch, int end, int cap = 512,
                      int layer_count = 11, bool ragged = false, bool frozen = false,
-                     float magnitude = 1, int selection_span = 1)
-        : T(tokens), B(batch), E(end), P(std::max(1, (end + 63) / 64)), layers(layer_count),
-          layer(layers / 2), query(cuda.device(), DType::BF16, {256, 64, T, B}),
+                     float magnitude = 1, int selection_span = 1,
+                     ops::KpoolMlaStorage storage     = ops::KpoolMlaStorage::BFloat16,
+                     KvCacheVectorFormat index_format = KvCacheVectorFormat::BFloat16,
+                     int shared_prefix = 0, int max_visible = 0)
+        : T(tokens), B(batch), E(end), P(std::max(1, (std::max(end, max_visible) + 63) / 64)),
+          layers(layer_count), layer(layers / 2),
+          query(cuda.device(), DType::BF16, {256, 64, T, B}),
           key_up(cuda.device(), DType::BF16, {512, 256, 64}),
           value_up(cuda.device(), DType::BF16, {512, 256, 64}),
           output(cuda.device(), DType::BF16, {256, 64, T, B}),
@@ -40,13 +48,13 @@ struct SparseMlaFixture {
           selection_rows(cuda.device(), DType::I32, {T, B}),
           ids(cuda.device(), DType::I32, {512, T * B}), counts(cuda.device(), DType::I32, {T * B}),
           ends(cuda.device(), DType::I32, {T * B}), tables(cuda.device(), DType::I64, {P, B}, true),
-          layout(ops::plan_kpool_mla_cache_layout(
-              {ops::KpoolMlaStorage::BFloat16, KvCacheVectorFormat::BFloat16, 512, 128, layers})),
-          envelope{std::uint32_t(end)},
+          layout(ops::plan_kpool_mla_cache_layout({storage, index_format, 512, 128, layers})),
+          envelope{std::uint32_t(max_visible ? max_visible : end)},
           workspace_bytes(ops::kpool_sparse_mla_workspace_capacity_bytes(
-              {64, 256, 256, 512}, ops::KpoolMlaStorage::BFloat16, envelope, B, 1, T,
-              cuda.multiprocessor_count())) {
-        if (E < 0 || E > 1048576 || (E && E < T) || cap < 0 || cap > 512 || selection_span < 1)
+              {64, 256, 256, 512}, storage, envelope, B, 1, T, cuda.multiprocessor_count())) {
+        if (E < 0 || E > 1048576 || (E && E < T) || cap < 0 || cap > 512 || selection_span < 1 ||
+            shared_prefix < 0 || shared_prefix > E || shared_prefix % 64 ||
+            envelope.max_visible_tokens < unsigned(E))
             throw std::invalid_argument("Sparse MLA fixture T/end/cap");
         std::fill(ids.host.begin(), ids.host.end(), -1);
         std::fill(counts.host.begin(), counts.host.end(), -1);
@@ -76,19 +84,24 @@ struct SparseMlaFixture {
                 if (e % 4) pages.emplace(b, e / 64);
             }
         }
-        const int physical_pages = std::max<std::size_t>(1, pages.size());
+        std::map<std::pair<int, int>, int> physical;
+        for (auto [b, p] : pages)
+            physical.emplace(std::pair{p < shared_prefix / 64 ? 0 : b + 1, p}, 0);
+        const int physical_pages = std::max<std::size_t>(1, physical.size());
         packed =
             std::make_unique<PackedKVFixture>(cuda.device(), layout.page.geometry, physical_pages);
         int multiplier = 17;
         while (std::gcd(multiplier, physical_pages) != 1) multiplier += 2;
         int ordinal = 0;
-        for (auto [b, p] : pages) {
-            const int page =
-                (std::int64_t(ordinal++) * multiplier + physical_pages / 2) % physical_pages;
-            tables.at(p, B - 1 - b) = packed->physical_offset(page);
-        }
+        for (auto& [key, page] : physical)
+            page = (std::int64_t(ordinal++) * multiplier + physical_pages / 2) % physical_pages;
+        for (auto [b, p] : pages)
+            tables.at(p, B - 1 - b) =
+                packed->physical_offset(physical.at({p < shared_prefix / 64 ? 0 : b + 1, p}));
         cache = layout.layer(PagedRecordView{packed->storage(), tables.view, 64}, layer).latent;
         plane_index = packed->plane_index(cache.data.plane);
+        if (storage == ops::KpoolMlaStorage::Fp8E4m3fnGroup128Ue8m0)
+            scale_plane_index = packed->plane_index(cache.scales.plane);
         latent.resize(std::size_t(physical_pages) * 64 * 512);
         for (std::size_t i = 0; i < latent.size(); ++i) latent[i] = sample(i + 3351, 1.F / 512);
         for (std::size_t i = 0; i < query.host.size(); ++i)
@@ -119,9 +132,20 @@ struct SparseMlaFixture {
     }
 
     void upload_latent() {
-        Tensor dense({latent.data(), latent.size() * 2, Device::cpu()}, DType::BF16,
-                     {512, 64, 1, int(latent.size() / (512 * 64))});
-        packed->upload_plane(plane_index, dense);
+        const int pages = latent.size() / (512 * 64);
+        if (cache.storage == ops::KpoolMlaStorage::BFloat16) {
+            Tensor dense({latent.data(), latent.size() * 2, Device::cpu()}, DType::BF16,
+                         {512, 64, 1, pages});
+            packed->upload_plane(plane_index, dense);
+        } else {
+            encode_fp8_latent(latent, latent_codes, latent_scales);
+            Tensor codes({latent_codes.data(), latent_codes.size(), Device::cpu()},
+                         DType::FP8_E4M3FN, {512, 64, 1, pages});
+            Tensor scales({latent_scales.data(), latent_scales.size(), Device::cpu()}, DType::U8,
+                          {4, 64, 1, pages});
+            packed->upload_plane(plane_index, codes);
+            packed->upload_plane(scale_plane_index, scales);
+        }
     }
 
     std::vector<int> selected_tokens(int t, int b) const {

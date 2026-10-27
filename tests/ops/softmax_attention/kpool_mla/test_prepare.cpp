@@ -19,8 +19,9 @@ int exact(const std::vector<T>& a, const std::vector<T>& b, const char* label) {
 }
 
 int verify(kp::Fixture& f) {
-    const auto& w      = f.w;
-    const bool fp8     = f.cache.index.format == KvCacheVectorFormat::Fp8E4m3fnGroup128Ue8m0;
+    const auto& w         = f.w;
+    const bool fp8        = f.cache.index.format == KvCacheVectorFormat::Fp8E4m3fnGroup128Ue8m0;
+    const bool fp8_latent = f.cache.latent.storage == ops::KpoolMlaStorage::Fp8E4m3fnGroup128Ue8m0;
     const int patterns = std::min(f.T, 7), count = patterns * f.B;
     std::vector<std::vector<double>> projected(count, std::vector<double>(w.rows));
     parallel_rows(count * w.rows, std::uint64_t(count) * w.rows * 4096, [&](int lo, int hi) {
@@ -69,9 +70,26 @@ int verify(kp::Fixture& f) {
                     accept(d, z[first + d] * inv * kp::decode(gamma.at(d)));
             };
             rms(0, 512, w.cn, [&](int d, double expected) {
-                const auto i = f.cache_index(0, b, F + t, d);
-                latent.add(kp::decode(cache[i]), expected);
-                expected_cache[i] = cache[i];
+                if (fp8_latent) {
+                    const int token = F + t;
+                    const auto page = f.tables.at(token / 64, f.selectors.at(b));
+                    const auto code = page + f.cache.latent.data.plane.tensor.region.offset +
+                                      (token % 64) * 512 + d;
+                    const auto scale = page + f.cache.latent.scales.plane.tensor.region.offset +
+                                       (token % 64) * 4 + d / 128;
+                    const auto* got = reinterpret_cast<const std::uint8_t*>(cache.data());
+                    auto* written   = reinterpret_cast<std::uint8_t*>(expected_cache.data());
+                    failures += got[scale] == 255 || (got[code] & 127) == 127;
+                    latent.add(float_codec::decode_e4m3fn(got[code]) *
+                                   fp8_cache_multiplier(got[scale]),
+                               expected);
+                    written[code]  = got[code];
+                    written[scale] = got[scale];
+                } else {
+                    const auto i = f.cache_index(0, b, F + t, d);
+                    latent.add(kp::decode(cache[i]), expected);
+                    expected_cache[i] = cache[i];
+                }
             });
             if (w.q)
                 rms(768, 1536, w.qn, [&](int d, double expected) {
@@ -164,10 +182,11 @@ int verify(kp::Fixture& f) {
                     }
         }
     }
-    failures += latent.check("latent", kPreparedBf16Criterion) +
-                query.check("query", kPreparedBf16Criterion) +
-                raw_key.check("raw key", kPreparedBf16Criterion) +
-                raw_gate.check("raw gate", kPreparedBf16Criterion);
+    failures +=
+        latent.check("latent", fp8_latent ? kPreparedFp8LatentCriterion : kPreparedBf16Criterion) +
+        query.check("query", kPreparedBf16Criterion) +
+        raw_key.check("raw key", kPreparedBf16Criterion) +
+        raw_gate.check("raw gate", kPreparedBf16Criterion);
     // Record exposes the actual raw operands; update's reference includes their encoding.
     failures += pooled.check("pool", fp8        ? kPooledFp8Criterion
                                      : f.update ? kPooledBf16Criterion
@@ -183,17 +202,19 @@ int verify(kp::Fixture& f) {
     failures +=
         f.workspace->used() != 0 || f.workspace->peak_used() > f.workspace_bytes ||
         f.workspace->peak_used() !=
-            capacity(w.profile(), ops::KpoolMlaStorage::BFloat16, f.cache.index.format, f.B, f.T,
-                     f.T, cuda_environment().context.execution_view().multiprocessor_count());
+            capacity(w.profile(), f.cache.latent.storage, f.cache.index.format, f.B, f.T, f.T,
+                     cuda_environment().context.execution_view().multiprocessor_count());
     return failures;
 }
 
-int run(kp::Projection mode, int T, int B, bool update, bool graph, int phase, bool fp8 = false) {
+int run(kp::Projection mode, int T, int B, bool update, bool graph, int phase, bool fp8 = false,
+        bool fp8_latent = false) {
     auto& device = cuda_environment().context;
     kp::Weights weights(device.device(), mode);
     kp::Fixture f(weights, device.execution_view(), T, B, update, true, true, update, phase,
-                  fp8 ? KvCacheVectorFormat::Fp8E4m3fnGroup128Ue8m0
-                      : KvCacheVectorFormat::BFloat16);
+                  fp8 ? KvCacheVectorFormat::Fp8E4m3fnGroup128Ue8m0 : KvCacheVectorFormat::BFloat16,
+                  fp8_latent ? ops::KpoolMlaStorage::Fp8E4m3fnGroup128Ue8m0
+                             : ops::KpoolMlaStorage::BFloat16);
     // Seven independent activation vectors keep long-window oracle cost bounded. Every output
     // column is still checked, including page placements, padding, and tail/record write sets.
     for (int b = 0; b < B; ++b)
@@ -231,12 +252,13 @@ int run(kp::Projection mode, int T, int B, bool update, bool graph, int phase, b
     return verify(f);
 }
 
-int inert(bool update, bool fp8 = false) {
+int inert(bool update, bool fp8 = false, bool fp8_latent = false) {
     auto& device = cuda_environment().context;
     kp::Weights weights(device.device(), kp::Projection::Full);
     kp::Fixture f(weights, device.execution_view(), 9, 3, update, false, true, update, 0,
-                  fp8 ? KvCacheVectorFormat::Fp8E4m3fnGroup128Ue8m0
-                      : KvCacheVectorFormat::BFloat16);
+                  fp8 ? KvCacheVectorFormat::Fp8E4m3fnGroup128Ue8m0 : KvCacheVectorFormat::BFloat16,
+                  fp8_latent ? ops::KpoolMlaStorage::Fp8E4m3fnGroup128Ue8m0
+                             : ops::KpoolMlaStorage::BFloat16);
     for (int b = 0; b < f.B; ++b) {
         f.valid.at(b)     = 0;
         f.selectors.at(b) = f.offsets.at(b) = -1;
@@ -266,11 +288,15 @@ int admission() {
     weights.params.rms_epsilon = 1e-6F;
     f.x.view.ne[0]             = 4095;
     failures += rejects([&] { f.launch(device.execution_view()); });
-    failures += rejects([&] {
-        (void)ops::kpool_mla_prepare_record_workspace_capacity_bytes(
-            weights.profile(), ops::KpoolMlaStorage::Fp8E4m3fnGroup128Ue8m0,
-            KvCacheVectorFormat::BFloat16, 1, 1, 1, device.execution_view().multiprocessor_count());
-    });
+    kp::Fixture latent(weights, device.execution_view(), 4, 2, false, false, false, false, 0,
+                       KvCacheVectorFormat::BFloat16, ops::KpoolMlaStorage::Fp8E4m3fnGroup128Ue8m0);
+    const auto latent_scales   = latent.cache.latent.scales;
+    latent.cache.latent.scales = {};
+    failures += rejects([&] { latent.launch(device.execution_view()); });
+    latent.cache.latent.scales = latent_scales;
+    latent.cache.latent.scales.plane.tensor.region.offset =
+        latent.cache.index.keys.plane.tensor.region.offset;
+    failures += rejects([&] { latent.launch(device.execution_view()); });
     kp::Fixture fp(weights, device.execution_view(), 4, 2, false, false, false, false, 0,
                    KvCacheVectorFormat::Fp8E4m3fnGroup128Ue8m0);
     const auto scales     = fp.cache.index.scales;
@@ -336,6 +362,22 @@ int main(int argc, char** argv) {
                 suite.add(id, [=] { return run(mode, T, B, update, T == 513, T % 4, true); },
                           {{"format", "fp8"}, {"execution", T == 513 ? "graph" : "eager"}});
             }
+    }
+    for (bool index_fp8 : {false, true}) {
+        const auto prefix =
+            std::string("kpool_prepare/fp8_latent/") + (index_fp8 ? "fp8_index/" : "bf16_index/");
+        for (bool update : {false, true}) {
+            suite.add(prefix + "inert/" + (update ? "update" : "record"),
+                      [=] { return inert(update, index_fp8, true); }, {{"format", "fp8"}});
+            for (auto mode :
+                 {kp::Projection::Full, kp::Projection::QueryAndHistory, kp::Projection::History})
+                for (auto [T, B] : {std::pair{1, 1}, {4, 1}, {17, 3}, {513, 3}})
+                    suite.add(
+                        prefix + kp::name(mode) + (update ? "/update/" : "/record/") +
+                            std::to_string(T) + "x" + std::to_string(B),
+                        [=] { return run(mode, T, B, update, T == 513, T % 4, index_fp8, true); },
+                        {{"format", "fp8"}, {"execution", T == 513 ? "graph" : "eager"}});
+        }
     }
     return suite.main(argc, argv);
 }

@@ -50,7 +50,8 @@ static Json trajectory(CudaExecutionView cuda, const Json& c, int repetitions) {
         return out;
     }
     auto setup = Clock::now();
-    app::Fixture f(cuda, T, B, shape, c.value("prepare", "update") == "record");
+    app::Fixture f(cuda, T, B, shape, c.value("prepare", "update") == "record",
+                   c.value("layers", 11), index_format_of(c), latent_storage_of(c));
     f.after = f.before;
     f.reserve(cuda, {bounds.begin(), bounds.end()});
     // One pinned, immutable upload frame per step. Reuse only after the final event.

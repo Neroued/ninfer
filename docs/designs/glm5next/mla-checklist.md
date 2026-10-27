@@ -1,12 +1,12 @@
 # Kpool Sparse MLA 交付与后续清单
 
-本清单区分 BF16 实现交付、逐点性能验收和模型集成。BF16 Op family 已实现；
-本次整理用于迁入 dev，不代表所有负载已达到 roofline，也不代表 GLM Engine 已接入。
+本清单区分功能交付与后续性能工作。BF16/FP8 Op family 已接入 GLM Engine；
+算子和模型检查通过不表示所有负载已达到 roofline。
 数学与读写合同以 [kpool_mla.h](../../../include/ninfer/ops/kpool_mla.h) 为准，
 布局以 [kpool_mla_layout.h](../../../include/ninfer/ops/kpool_mla_layout.h) 为准。
 权重绑定、模型调用链和资源交接见 [family 设计](kpool-sparse-mla.md)。
 
-## BF16 已交付范围
+## 已交付范围
 
 - [x] 无地址 profile、缓存／tail／records／selection views、布局 planner 和绑定。
   Native 页组包含全部层；同一页表通过不同 planes 供 Prepare、Indexer 和 MLA 使用。
@@ -28,9 +28,9 @@
 - [x] 各 Op 私有 selector、launch bindings 和计算体分开；只共享 Top512 计算体，
   QSA 的评分和调优政策仍归 QSA。临时候选和强制分派入口不进入主线。
 
-实现支持 DGX Spark 上的 BF16 Prepare／Indexer／sparse MLA。FP8 latent 的布局可被
-规划，Indexer 可访问其中的 BF16 index plane；FP8 Prepare 和 sparse MLA 尚未实现，
-容量查询和执行会拒绝，不能因 enum 或 layout 存在推断执行支持。
+实现支持 DGX Spark 上独立选择 BF16/FP8 latent 与 Indexer；Prepare encoder、Indexer、
+Sparse MLA、组合链、MTP history 和 Graph 采用相同格式。选择方式与计算精度见
+[数值政策](../../maintainer/glm5next-quantization.md#3-mlaindexer-cache-与计算政策)。
 
 ## 资格与复现
 
@@ -46,7 +46,7 @@ Indexer 将精确选择与评分舍入误差分开，tail 检查实际 words 的
 
 ## 仍待完成的性能工作
 
-- [ ] 完整 BF16 分支的每个目标点达到对应 roofline。既有应用测量中，长上下文大 T
+- [ ] 完整 BF16/FP8 分支的每个目标点达到对应 roofline。既有应用测量中，长上下文大 T
   和部分 ragged batch 仍有明显差距，不能勾为性能完成。
 - [ ] 长上下文 prefill 的 sparse MLA：改善分散 Kpool4 读取、跨 query 的实际 KV
   复用和因子映射开销。只在 selection 确实共享时复用，不推断相邻 query 的集合相同。
@@ -60,9 +60,9 @@ Indexer 将精确选择与评分舍入误差分开，tail 检查实际 words 的
 | 部分 | Useful FLOPs | 关键必要 payload |
 |---|---:|---|
 | Prepare | `2*4096*R_A*M_live` | W_A 18.25／18／6 MiB，三种投影需求分别计费 |
-| Indexer score | `2*32*128*Σ(C>512 ? C : 0)` | 每个不同历史的 key 并集为 `256*C` B |
+| Indexer score | `2*32*128*Σ(C>512 ? C : 0)` | 每个不同历史的 key 并集为 BF16 `256*C` / FP8 `129*C` B |
 | U_K＋U_V | 通常 `4*64*256*512*M_live` | 两份因子共 32 MiB；空／单 token 集合按有效数学计费 |
-| Latent QK＋PV | `4*64*512*ΣS` | 每 query `1024*S` B，另报不同 query 的真实地址并集 |
+| Latent QK＋PV | `4*64*512*ΣS` | 每 query BF16 `1024*S` / FP8 `516*S` B，另报真实地址并集 |
 
 完整分支的外部流量下界排除可能在片上连续消费的中间结果；各阶段实际 scratch 和
 重复读取另行分析。`max(bytes/BW, FLOPs/compute)` 是全局理想下界，不能解释成已经
@@ -73,23 +73,14 @@ Indexer 将精确选择与评分舍入误差分开，tail 检查实际 words 的
 性能日志或 profiler 产物提交到主线。新性能决策须在最终公共入口、相同负载与测量条件
 下复测，并记录仍无法解释的离散性。
 
-## FP8 latent 后续
+## FP8 与模型接入
 
-- [ ] 实现 G128／FP32-scale encoder，直接消费 FP32 norm；遵守
-  [已定 codec](../../maintainer/glm5next-quantization.md#3-mlaindexer-cache-与计算政策)。
-- [ ] Sparse MLA 片上解码为 BF16 并在 QK/PV 间复用；新 token 经过同一表示边界，
-  不创建全局 BF16 展开缓存。
-- [ ] 独立 codec 向量和完整数学资格检查；重新测量含量化、scale 读取和解码的完整入口。
-  FP8 与 BF16 的调优政策及 roofline 分别维护。
+- [x] 共享 E4M3FN/G128/UE8M0 cache codec；latent 原始基底、Indexer H128 基底分别归所属 Op。
+- [x] FP8 Prepare 直接消费 FP32 norm/pooling 结果；raw tail/records 保持 BF16。
+- [x] FP8 Indexer query 编码、评分和精确 Top512；BF16 Indexer 保留独立分派。
+- [x] FP8 Sparse MLA 融合 U_K→query 编码、FP8 QK、片上 BF16 PV 和完整 U_V。
+- [x] 独立数学参考、实际 codec words、读写范围、Graph 更新与组合链检查。
+- [x] 原生启动传播格式，Main/MTP 资源规划、ADP 历史转换和公共 Engine 执行接入。
 
-## 模型接入后续
-
-- [ ] Converter／binding 物化 W_A 前缀、W_B split、U_K/U_V 和 Q8 O；执行不做 packing。
-- [ ] RankProgram 通过 planner 规划 Main 11 层和 MTP 1 层 history、tail、frame 和
-  workspace；通过所属 Op 查询能力，不复制 kernel 支持条件。
-- [ ] Session／目录接入 COW、page/state leases、接受／拒绝、checkpoint 和覆盖范围。
-- [ ] 模型执行接入 MTP Full 首步、QueryAndHistory selection 复用、History canonical
-  补齐，以及 record → 接受前缀 → tail extraction → 下一轮的完整事务。
-- [ ] 模型 Graph 管理稳定地址、envelope 容量档位、更新和资源退役；跨流依赖由资源所有者建立。
-- [ ] ADP owner、通信、mHC／residual 与公共 Engine 路径完成集成后，单独验收模型数值、
-  生命周期和双 Spark 吞吐；Op benchmark 不替代这些证据。
+FP8/BF16 的性能与 roofline 分别测量。FP8 减少 cache 流量，但小上下文宽 T 可能因
+编码/解码与阶段依赖变慢；不能由存储压缩比推导模型加速比。

@@ -16,6 +16,9 @@ namespace ninfer::test {
 namespace kp = ninfer::tool::kpool;
 
 inline constexpr ReductionCriterion kPreparedBf16Criterion{.0041, 1e-4, .012};
+// E4M3's <=1/16 normal rounding budget plus FP32 projection/norm error.
+// Subnormal rounding is bounded relative to its G128 maximum, not each tiny value.
+inline constexpr ReductionCriterion kPreparedFp8LatentCriterion{.064, 1e-4, .08};
 inline constexpr ReductionCriterion kPooledBf16Criterion{.006, 1e-4, .018};
 inline constexpr ReductionCriterion kCoefficientCriterion{1e-4, 1e-6, 3e-4};
 // E4M3 normal rounding contributes at most 1/16 relative error. The remaining
@@ -48,6 +51,10 @@ struct KpoolError {
 // Full factor/softmax/factor budget, including private A16 operands and final
 // BF16 output. The independent oracle has no private intermediate casts.
 inline constexpr ReductionCriterion kMlaCriterion{8e-3, 1e-4, 1.2e-2};
+// Independent G128 Q8 study before kernel tuning: <=4.5% L2 / 6.0% gross for
+// ordinary/concentrated logits, <=8.3% / 21.3% with 16x sharp queries and unequal
+// Q/K group scales. One policy includes that sensitivity and BF16/F32 arithmetic.
+inline constexpr ReductionCriterion kMlaFp8Criterion{.09, 1e-4, .25};
 
 // Only the selected set is observable. Bound the smallest score correction that
 // makes that set a valid Top512 of the independent mathematical scores. This
@@ -189,15 +196,14 @@ int verify_selection(Fixture& f, bool exact = false) {
 }
 
 // FP64 formula from represented public inputs; no private A16 intermediate seams.
-inline std::vector<double> mla_reference(const std::uint16_t* query, const std::uint16_t* key_up,
-                                         const std::uint16_t* value_up,
-                                         const std::vector<const std::uint16_t*>& rows,
-                                         float scale) {
-    std::vector<double> c(rows.size() * 512), result(64 * 256);
-    if (rows.empty()) return result;
-    for (std::size_t j = 0; j < rows.size(); ++j)
-        for (int d = 0; d < 512; ++d) c[j * 512 + d] = kp::decode(rows[j][d]);
-    parallel_rows(64, std::uint64_t(rows.size()) * 64 * 1024, [&](int lo, int hi) {
+inline std::vector<double> mla_reference_values(const std::uint16_t* query,
+                                                const std::uint16_t* key_up,
+                                                const std::uint16_t* value_up,
+                                                const std::vector<double>& c, float scale) {
+    const auto count = c.size() / 512;
+    std::vector<double> result(64 * 256);
+    if (!count) return result;
+    parallel_rows(64, std::uint64_t(count) * 64 * 1024, [&](int lo, int hi) {
         for (int h = lo; h < hi; ++h) {
             std::array<double, 512> q{}, u{};
             for (int k = 0; k < 256; ++k) {
@@ -205,9 +211,9 @@ inline std::vector<double> mla_reference(const std::uint16_t* query, const std::
                 for (int d = 0; d < 512; ++d)
                     q[d] += x * kp::decode(key_up[(h * 256 + k) * 512 + d]);
             }
-            std::vector<double> logits(rows.size());
+            std::vector<double> logits(count);
             double maximum = -INFINITY;
-            for (std::size_t j = 0; j < rows.size(); ++j) {
+            for (std::size_t j = 0; j < count; ++j) {
                 double dot = 0;
                 for (int d = 0; d < 512; ++d) dot += q[d] * c[j * 512 + d];
                 logits[j] = scale * dot;
@@ -218,7 +224,7 @@ inline std::vector<double> mla_reference(const std::uint16_t* query, const std::
                 x = std::exp(x - maximum);
                 denominator += x;
             }
-            for (std::size_t j = 0; j < rows.size(); ++j)
+            for (std::size_t j = 0; j < count; ++j)
                 for (int d = 0; d < 512; ++d) u[d] += logits[j] / denominator * c[j * 512 + d];
             for (int v = 0; v < 256; ++v)
                 for (int d = 0; d < 512; ++d)
@@ -226,5 +232,15 @@ inline std::vector<double> mla_reference(const std::uint16_t* query, const std::
         }
     });
     return result;
+}
+
+inline std::vector<double> mla_reference(const std::uint16_t* query, const std::uint16_t* key_up,
+                                         const std::uint16_t* value_up,
+                                         const std::vector<const std::uint16_t*>& rows,
+                                         float scale) {
+    std::vector<double> c(rows.size() * 512);
+    for (std::size_t j = 0; j < rows.size(); ++j)
+        for (int d = 0; d < 512; ++d) c[j * 512 + d] = kp::decode(rows[j][d]);
+    return mla_reference_values(query, key_up, value_up, c, scale);
 }
 } // namespace ninfer::test

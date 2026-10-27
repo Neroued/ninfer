@@ -765,7 +765,7 @@ counts, or kernel-name filters in these benchmarks.
 
 `ninfer_causal_softmax_attention_bench` measures the two public causal-cache entries:
 append-and-attend and cached-only. It covers the registered D256 H24/KV4 and H16/KV2 geometries
-with BF16, INT8-G64, FP8-E4M3FN-row256, NVFP4-G16, and K8V4 KV storage. Production dispatch
+with BF16, INT8-G64, FP8-E4M3FN-G128-UE8M0, NVFP4-G16, and K8V4 KV storage. Production dispatch
 receives the caller-visible execution envelope and owns prefill, decode/spec and work-partition
 choices. `all` emits every storage mode as an independent row.
 
@@ -885,7 +885,7 @@ instruction utilization require a profiler capture of the complete public call.
 
 `ninfer_kv_cache_append_bench` unifies the two public append contracts without combining them in
 one timed body. `--mode full` calls full D256 KV publication for KV4/KV2 and BF16, INT8-G64,
-FP8-E4M3FN-row256, NVFP4-G16, or K8V4 caches. Its report keeps key/value vector bytes separate for
+FP8-E4M3FN-G128-UE8M0, NVFP4-G16, or K8V4 caches. Its report keeps key/value vector bytes separate for
 asymmetric storage profiles. `--mode prefix` calls device-count prefix publication for BF16
 D128/KV8 paged caches or cyclic caches with `--cyclic-capacity 2048|4096`. `T` is the physical input
 width and `C` is the actual device commit count. `--max-count N` selects the host envelope upper
@@ -1540,7 +1540,7 @@ are the row profiles the entry admits: `--channels 8192` gives (2048, 2048, 4096
 
 ## Kpool MLA
 
-DGX Spark's BF16 family provides `ninfer_kpool_prepare_bench`, `ninfer_kpool_indexer_bench`,
+DGX Spark's BF16/FP8 family provides `ninfer_kpool_prepare_bench`, `ninfer_kpool_indexer_bench`,
 `ninfer_kpool_sparse_mla_bench`, `ninfer_kpool_chain_bench` and
 `ninfer_kpool_application_bench`. Build them in `build/dgx-spark-dev` or `build/dgx-spark-ops`.
 The [family reference](../docs/designs/glm5next/kpool-sparse-mla.md) explains native cache layout,
@@ -1551,9 +1551,10 @@ The first four executables use the shared measurement options (`--execution`, `-
 `--warmup`, `--repeat`, `--csv-out`). Prepare additionally selects `--projection
 full|query-history|history`, `--form record|update` and pool phase. Indexer and sparse MLA take
 `--end E`, the final physical query's exclusive end, so `T<=E<=1048576`. `--layers 1|11`
-selects MTP or Main page-group geometry; only one layer's Op is timed. The Indexer option
-`--latent-cache fp8` changes page geometry around the BF16 index plane; it does not execute
-FP8 Prepare or FP8 sparse MLA.
+selects MTP or Main page-group geometry; only one layer's Op is timed. `--index-cache bf16|fp8` selects the pooled-key representation in Prepare, Indexer and the
+chain. `--latent-cache bf16|fp8` selects latent encoding in Prepare and execution in sparse
+MLA/the chain; in the standalone Indexer it only changes surrounding page geometry.
+Both formats are also available as `index_cache` and `latent_cache` in application JSON jobs.
 
 ```bash
 ./build/dgx-spark-dev/bench/ninfer_kpool_prepare_bench \

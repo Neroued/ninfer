@@ -11,7 +11,8 @@ static Json mtp_round(CudaExecutionView cuda, const Json& c, int repeats, int wa
     ds.valid.assign(B, 1);
     ds.reserve_ends.assign(B, F + W);
     ds.envelope = U;
-    app::Fixture main(cuda, W, B, ms, true), draft(cuda, 1, B, ds, false, 1);
+    app::Fixture main(cuda, W, B, ms, true, 11, index_format_of(c), latent_storage_of(c)),
+        draft(cuda, 1, B, ds, false, 1, index_format_of(c), latent_storage_of(c));
     main.after           = main.before;
     const auto canonical = draft.before, first = draft.after;
     DeviceBuffer provisional(cuda.device(), draft.state.size());
@@ -56,8 +57,8 @@ static Json mtp_round(CudaExecutionView cuda, const Json& c, int repeats, int wa
     valid.upload();
     main.accepted.upload();
     const auto history_capacity = ops::kpool_mla_prepare_update_workspace_capacity_bytes(
-        {kp::Projection::History, 4096, 512, 128, 0, 0, 4}, ops::KpoolMlaStorage::BFloat16,
-        KvCacheVectorFormat::BFloat16, B, 1, HW, cuda.multiprocessor_count());
+        {kp::Projection::History, 4096, 512, 128, 0, 0, 4}, draft.cache.latent.storage,
+        draft.cache.index.format, B, 1, HW, cuda.multiprocessor_count());
     DeviceBuffer history_scratch(cuda.device(), history_capacity);
     MemoryArena history_arena(history_scratch.span());
     const auto history_params = draft.params(app::Phase::History);

@@ -14,6 +14,8 @@ struct MlaWork {
 
 struct SparseMlaArguments {
     const __nv_bfloat16 *query, *key_up, *value_up, *latent;
+    const std::uint8_t *latent_fp8, *latent_scales;
+    std::uint8_t *query_fp8, *query_scales;
     const std::int32_t *valid, *table_rows, *selection_rows, *ids, *counts, *ends;
     const std::int64_t* tables;
     std::int64_t table_stride, begin;

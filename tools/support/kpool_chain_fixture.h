@@ -2,6 +2,7 @@
 
 #include "kpool_indexer_fixture.h"
 #include "kpool_prepare_fixture.h"
+#include "kpool_fp8_fixture.h"
 #include "ninfer/ops/linear_split.h"
 
 namespace ninfer::tool::kpool {
@@ -20,6 +21,7 @@ struct ChainFixture {
     ops::KpoolTailFields fields;
     DeviceBuffer state;
     std::vector<std::uint16_t> initial_state, latent;
+    std::vector<std::uint8_t> latent_codes, latent_scales;
     ops::KpoolTailStateView before, after;
     ops::KpoolMlaCacheView cache;
     std::array<std::size_t, 4> capacities;
@@ -28,10 +30,10 @@ struct ChainFixture {
     ChainFixture(CudaExecutionView cuda, int T, int B, int E, int layers = 11, bool ragged = false,
                  const IndexerCase& shape = {}, bool repeated_inputs = true,
                  bool initialize_history          = true,
-                 KvCacheVectorFormat index_format = KvCacheVectorFormat::BFloat16)
+                 KvCacheVectorFormat index_format = KvCacheVectorFormat::BFloat16,
+                 ops::KpoolMlaStorage storage     = ops::KpoolMlaStorage::BFloat16)
         : weights(cuda.device(), Projection::Full),
-          index(cuda, T, B, E, layers, ragged, ops::KpoolMlaStorage::BFloat16, shape,
-                initialize_history, index_format),
+          index(cuda, T, B, E, layers, ragged, storage, shape, initialize_history, index_format),
           x(cuda.device(), DType::BF16, {4096, T, B}),
           rank(cuda.device(), DType::BF16, {1536, T, B}),
           query(cuda.device(), DType::BF16, {256, 64, T, B}),
@@ -99,21 +101,32 @@ struct ChainFixture {
         after_offsets.upload();
         state.copy_from_host(initial_state.data(), state.size());
         if (initialize_history) {
-            Tensor dense({latent.data(), latent.size() * 2, Device::cpu()}, DType::BF16,
-                         {512, 64, 1, index.physical_pages});
-            index.packed.upload_plane(index.packed.plane_index(cache.latent.data.plane), dense);
+            if (storage == ops::KpoolMlaStorage::BFloat16) {
+                Tensor dense({latent.data(), latent.size() * 2, Device::cpu()}, DType::BF16,
+                             {512, 64, 1, index.physical_pages});
+                index.packed.upload_plane(index.packed.plane_index(cache.latent.data.plane), dense);
+            } else {
+                encode_fp8_latent(latent, latent_codes, latent_scales);
+                Tensor codes({latent_codes.data(), latent_codes.size(), Device::cpu()},
+                             DType::FP8_E4M3FN, {512, 64, 1, index.physical_pages});
+                Tensor scales({latent_scales.data(), latent_scales.size(), Device::cpu()},
+                              DType::U8, {4, 64, 1, index.physical_pages});
+                index.packed.upload_plane(index.packed.plane_index(cache.latent.data.plane), codes);
+                index.packed.upload_plane(index.packed.plane_index(cache.latent.scales.plane),
+                                          scales);
+            }
         }
         const std::array<std::int32_t, 2> split_rows{16384, 4096};
-        capacities = {ops::kpool_mla_prepare_update_workspace_capacity_bytes(
-                          weights.profile(), ops::KpoolMlaStorage::BFloat16, index_format, B, 1, T,
-                          cuda.multiprocessor_count()),
-                      ops::linear_split_workspace_capacity_bytes(
-                          ops::ProjectionWeights{ops::SingleProjectionWeight{query_weight}},
-                          split_rows, B, T * B),
-                      index.workspace_bytes,
-                      ops::kpool_sparse_mla_workspace_capacity_bytes(
-                          {64, 256, 256, 512}, ops::KpoolMlaStorage::BFloat16, index.envelope, B, 1,
-                          T, cuda.multiprocessor_count())};
+        capacities = {
+            ops::kpool_mla_prepare_update_workspace_capacity_bytes(
+                weights.profile(), storage, index_format, B, 1, T, cuda.multiprocessor_count()),
+            ops::linear_split_workspace_capacity_bytes(
+                ops::ProjectionWeights{ops::SingleProjectionWeight{query_weight}}, split_rows, B,
+                T * B),
+            index.workspace_bytes,
+            ops::kpool_sparse_mla_workspace_capacity_bytes({64, 256, 256, 512}, storage,
+                                                           index.envelope, B, 1, T,
+                                                           cuda.multiprocessor_count())};
         index.workspace.reset();
         index.workspace_bytes = *std::max_element(capacities.begin(), capacities.end());
         index.scratch         = DeviceBuffer(cuda.device(), index.workspace_bytes + 512);

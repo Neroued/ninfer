@@ -1,5 +1,6 @@
 #include "ops/normalization/rmsnorm/dispatch.h"
 #include "ops/normalization/rmsnorm/launch.h"
+#include "core/platform.h"
 
 #include <algorithm>
 #include <limits>
@@ -9,7 +10,14 @@ namespace {
 
 Instance select_instance(Epilogue kind, Operands operands, std::int32_t sms) {
     const auto [d, rows, aligned] = operands;
-    if (!aligned) return Instance::Generic;
+    if (aligned < 4) return Instance::Generic;
+#if NINFER_TARGET_RTX5090
+    if (!gated(kind) && d == 20480 && aligned >= 8) {
+        // One CTA per row: widen each CTA once a row wave covers the device. The small
+        // route uses wider transfers; naturally aligned operands keep their fallback.
+        return rows <= sms && aligned >= 16 ? Instance::D20480Block512 : Instance::D20480Block1024;
+    }
+#endif
     if (kind == Epilogue::Offset && d == 10240) return Instance::D10240;
     if (gated(kind) && d == 128) {
         // Sixteen rows per CTA cover one wave; smaller CTAs overlap the next wave.
@@ -47,7 +55,7 @@ void dispatch(const Tensor& x, const Tensor& weight, const Tensor* gate, float e
             gate_chunk      = *gate;
             gate_chunk.data = static_cast<std::byte*>(gate->data) + offset;
         }
-        const Operands chunk{operands.dimension, count, operands.aligned_pairs};
+        const Operands chunk{operands.dimension, count, operands.alignment_bytes};
         launch(x_chunk, weight, gate ? &gate_chunk : nullptr, eps, kind, out_chunk, chunk,
                select_instance(kind, chunk, execution.multiprocessor_count()), execution.stream());
         first += count;

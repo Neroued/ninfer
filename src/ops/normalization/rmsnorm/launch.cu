@@ -2,8 +2,10 @@
 #include "ops/common/cuda/reduce.cuh"
 #include "ops/normalization/rmsnorm/kernel/warp.cuh"
 #include "ops/normalization/rmsnorm/kernel/cta.cuh"
+#include "ops/normalization/rmsnorm/kernel/vector_cta.cuh"
 #include "ops/normalization/rmsnorm/kernel/generic.cuh"
 #include "core/device.h"
+#include "core/platform.h"
 
 #include <stdexcept>
 
@@ -77,6 +79,30 @@ void launch_instance(const Tensor& x, const Tensor& weight, const Tensor* gate, 
                                                                   eps);
             return;
         }
+        break;
+    case Instance::D20480Block512:
+#if NINFER_TARGET_RTX5090
+        if constexpr (!is_gated<Kind>) {
+            rmsnorm_vector_cta_kernel<Kind, 20480, 512, 4>
+                <<<static_cast<unsigned>(rows), 512, 0, stream>>>(
+                    static_cast<const __nv_bfloat16*>(x.data),
+                    static_cast<const __nv_bfloat16*>(weight.data),
+                    static_cast<__nv_bfloat16*>(out.data), eps);
+            return;
+        }
+#endif
+        break;
+    case Instance::D20480Block1024:
+#if NINFER_TARGET_RTX5090
+        if constexpr (!is_gated<Kind>) {
+            rmsnorm_vector_cta_kernel<Kind, 20480, 1024, 2>
+                <<<static_cast<unsigned>(rows), 1024, 0, stream>>>(
+                    static_cast<const __nv_bfloat16*>(x.data),
+                    static_cast<const __nv_bfloat16*>(weight.data),
+                    static_cast<__nv_bfloat16*>(out.data), eps);
+            return;
+        }
+#endif
         break;
     case Instance::Warp:
         if constexpr (is_gated<Kind>) {

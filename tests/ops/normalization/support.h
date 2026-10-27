@@ -33,8 +33,7 @@ struct DeviceInput {
     std::vector<std::uint16_t> expected;
 };
 
-inline DeviceInput make_input(const std::vector<float>& values, bool bf16x2_unaligned) {
-    const std::size_t leading = bf16x2_unaligned ? 1 : 0;
+inline DeviceInput make_input(const std::vector<float>& values, std::size_t leading) {
     DeviceInput input;
     input.expected.resize(leading + values.size(), 0x5a5aU);
     for (std::size_t index = 0; index < values.size(); ++index) {
@@ -52,12 +51,12 @@ inline int verify_preserved(const std::string& label, const DeviceInput& input) 
 }
 
 inline int verify_output_storage(const std::string& label, const GuardedDeviceBuffer& output,
-                                 bool bf16x2_unaligned) {
+                                 std::size_t leading) {
     int failures = output.verify_guards(label);
-    if (bf16x2_unaligned) {
-        failures +=
-            verify_exact((label + " prefix").c_str(), from_device<std::uint16_t>(output.data(), 1),
-                         std::vector<std::uint16_t>{0xffffU});
+    if (leading) {
+        failures += verify_exact((label + " prefix").c_str(),
+                                 from_device<std::uint16_t>(output.data(), leading),
+                                 std::vector<std::uint16_t>(leading, 0xffffU));
     }
     return failures;
 }

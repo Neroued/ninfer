@@ -47,20 +47,26 @@ std::vector<double> rmsnorm_oracle(const std::vector<float>& input,
 }
 
 int run_case(const char* label, const Shape& shape, bool unit_offset, std::uint32_t seed,
-             float input_scale = 4.0F, bool bf16x2_unaligned = false, bool replay = false,
-             int width = 0) {
+             float input_scale = 4.0F, std::size_t leading_words = 0, bool replay = false,
+             int width = 0, bool heterogeneous_quarters = false) {
     const std::size_t count = shape.elements();
     std::vector<float> input(count), weight(shape.d);
     fill_uniform(input, seed, -input_scale, input_scale);
+    if (heterogeneous_quarters) {
+        // One RMS is taken across the complete residual, whose four streams need not
+        // have the same energy. Independent stream normalization changes this result.
+        for (std::size_t i = 0; i < input.size(); ++i)
+            input[i] *= std::ldexp(1.F, 2 * int((i % shape.d) / (shape.d / 4)) - 3);
+    }
     fill_uniform(weight, seed + 1U, -1.5F, 1.5F);
     round_to_bf16(input);
     round_to_bf16(weight);
     weight[0] =
         unit_offset ? -1.0F : 0.0F; // Exact zero gain, without an intermediate BF16 gain cast.
 
-    DeviceInput device_input  = make_input(input, bf16x2_unaligned);
-    DeviceInput device_weight = make_input(weight, bf16x2_unaligned);
-    const std::size_t leading = bf16x2_unaligned ? sizeof(std::uint16_t) : 0;
+    DeviceInput device_input  = make_input(input, leading_words);
+    DeviceInput device_weight = make_input(weight, leading_words);
+    const std::size_t leading = leading_words * sizeof(std::uint16_t);
     GuardedDeviceBuffer output(leading + count * sizeof(std::uint16_t));
     output.fill(0xff);
     void* output_data = static_cast<std::uint8_t*>(output.data()) + leading;
@@ -86,7 +92,7 @@ int run_case(const char* label, const Shape& shape, bool unit_offset, std::uint3
         if (phase) {
             for (auto& value : input) value = -value;
             for (auto& value : weight) value = -value;
-            const std::size_t offset = bf16x2_unaligned ? 1 : 0;
+            const std::size_t offset = leading_words;
             for (std::size_t i = 0; i < input.size(); ++i)
                 device_input.expected[i + offset] = f32_to_bf16(input[i]);
             for (std::size_t i = 0; i < weight.size(); ++i)
@@ -110,7 +116,7 @@ int run_case(const char* label, const Shape& shape, bool unit_offset, std::uint3
         const auto reference = rmsnorm_oracle(input, weight, shape, unit_offset);
         failures += verify_reduction(label, from_device_bf16(output_data, count), reference,
                                      rmsnorm_bf16_criterion());
-        failures += verify_output_storage(std::string(label) + " output", output, bf16x2_unaligned);
+        failures += verify_output_storage(std::string(label) + " output", output, leading_words);
         failures += verify_preserved(std::string(label) + " preserves input", device_input);
         failures += verify_preserved(std::string(label) + " preserves weight", device_weight);
     }
@@ -155,8 +161,8 @@ int validate_contract() {
 void add_rmsnorm_cases(ninfer::test::OpSuite& suite) {
     suite.add("rmsnorm/contract", validate_contract);
     const auto add = [&](const char* label, const Shape& shape, bool offset, std::uint32_t seed,
-                         float scale = 4.0F, bool unaligned = false, bool graph = false,
-                         int width = 0) {
+                         float scale = 4.0F, std::size_t unaligned = 0, bool graph = false,
+                         int width = 0, bool heterogeneous_quarters = false) {
         const auto id = "rmsnorm/" + std::string(label) + "/seed" + std::to_string(seed) +
                         "/scale" + std::to_string(scale) + (offset ? "/offset" : "/plain") +
                         "/width" + std::to_string(width) + "/" + std::to_string(shape.d) + "x" +
@@ -164,7 +170,7 @@ void add_rmsnorm_cases(ninfer::test::OpSuite& suite) {
         suite.add(id,
                   [=, label = std::string(label)] {
                       return run_case(label.c_str(), shape, offset, seed, scale, unaligned, graph,
-                                      width);
+                                      width, heterogeneous_quarters);
                   },
                   {{"execution", graph ? "graph" : "eager"}});
     };
@@ -232,4 +238,13 @@ void add_rmsnorm_cases(ninfer::test::OpSuite& suite) {
         add("rmsnorm offset10240 scale", {10240, 1, 3}, true, 2201U, scale);
     add("rmsnorm offset10240 unaligned", {10240, 1, 7}, true, 2202U, 4.f, true, true);
     add("rmsnorm plain10240", {10240, 1, 3}, false, 2203U);
+    // Whole-vector MTP residual normalization; both public gain conventions share
+    // the same width. Keep shape/stress coverage compact instead of sweeping T.
+    add("whole20480 offset", {20480, 1, 1}, true, 2401U, 4.F, false, false, 0, true);
+    add("whole20480 offset graph W/B", {20480, 1, 8}, true, 2402U, 4.F, 4, true, 4, true);
+    add("whole20480 offset rows171", {20480, 1, 171}, true, 2403U, 4.F, false, true, 0, true);
+    add("whole20480 plain rows257", {20480, 1, 257}, false, 2404U, 4.F, false, true, 0, true);
+    add("whole20480 unaligned", {20480, 1, 3}, true, 2405U, 4.F, true, true, 0, true);
+    for (float scale : {0.F, 1.e-5F, 4096.F})
+        add("whole20480 scale", {20480, 1, 3}, true, 2406U, scale, false, false, 0, true);
 }

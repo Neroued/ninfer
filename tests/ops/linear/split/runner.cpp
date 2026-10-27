@@ -96,6 +96,31 @@ int verify_output(const Profile& profile, const Invocation& call,
         }
     }
     const auto columns = columns_to_check(call);
+    if (call.token_axis) {
+        const int t = call.token_axis, b = call.t / t;
+        for (std::size_t i = 0; i < profile.regions.size(); ++i) {
+            const auto region = profile.regions[i];
+            if (region.head_dim == 0 || call.t % t)
+                throw std::invalid_argument("invalid T/B fixture");
+            const auto& matrix = outputs.views[i];
+            const bool single  = region.rows == region.head_dim;
+            const auto heads =
+                single ? matrix.view({region.head_dim, t, b})
+                       : matrix.view({region.head_dim, region.rows / region.head_dim, t, b});
+            const int token_axis = single ? 1 : 2, batch_axis = single ? 2 : 3;
+            if (heads.data != matrix.data || !heads.is_contiguous()) ++failures;
+            // Read the actual downstream addresses, including the second batch's first column.
+            for (int batch = 0; batch < b; ++batch)
+                for (int token = 0; token < t; ++token) {
+                    const auto* address = static_cast<const std::byte*>(heads.data) +
+                                          token * heads.nb[token_axis] +
+                                          batch * heads.nb[batch_axis];
+                    const auto expected = static_cast<const std::byte*>(matrix.data) +
+                                          (token + t * batch) * matrix.nb[1];
+                    if (address != expected) ++failures;
+                }
+        }
+    }
     for (const auto region : profile.regions) {
         auto rows = call.full_rows ? linear_common::all_indices(region.rows)
                                    : input_projection::sampled_rows(region.rows, call.sample_rows);
@@ -191,8 +216,18 @@ ops::ProjectionWeights prepare(const Profile& profile, const Invocation& call,
             call.policy)
             throw std::runtime_error("projection inputs lost their permission intersection");
     }
-    if (profile.binding == Binding::LinearInputs) return ops::prepare_linear_weight(inputs);
-    return ops::prepare_projection_weights(inputs);
+    const auto prepared = profile.binding == Binding::LinearInputs
+                              ? ops::ProjectionWeights{ops::prepare_linear_weight(inputs)}
+                              : ops::prepare_projection_weights(inputs);
+    if (weights.size() == 1) {
+        const auto& native = std::get<ops::SingleProjectionWeight>(prepared).weight;
+        const auto source  = weights[0]->view();
+        if (native.payload != source.payload || native.payload_bytes != source.payload_bytes ||
+            native.qdata != source.qdata || native.scales != source.scales ||
+            native.n != std::accumulate(profile.outputs.begin(), profile.outputs.end(), 0))
+            throw std::runtime_error("prepared projection lost shared parent planes");
+    }
+    return prepared;
 }
 
 template <class F>
@@ -253,10 +288,20 @@ int validate(const Profile& profile, const Weight& weight, CudaExecutionView cud
 int run(const Profile& profile, std::span<const Invocation> calls) {
     std::vector<std::unique_ptr<DevicePackedWeight>> weights;
     for (const auto& recipe : profile.weights) {
-        auto packed = recipe.type == QType::BF16
-                          ? linear_weights::make_bf16_weight(recipe.rows, profile.k, recipe.seed)
-                          : quantized_weight::make_patterned_weight(
+        auto packed            = recipe.type == QType::BF16
+                                     ? linear_weights::make_bf16_weight(recipe.rows, profile.k, recipe.seed)
+                                     : quantized_weight::make_patterned_weight(
                                 recipe.type, recipe.rows, profile.k, recipe.seed, recipe.options);
+        const int logical_rows = std::accumulate(profile.outputs.begin(), profile.outputs.end(), 0);
+        if (profile.weights.size() == 1 && recipe.type == QType::FP8_E4M3FN_ROW_BF16 &&
+            logical_rows < recipe.rows) {
+            // Poison the parent's unused query rows/scales. Prefix kernels may only read
+            // K/V/index-K, and may not invent a compact scale plane at logical_rows*K.
+            std::fill(packed.payload.begin() + std::size_t(logical_rows) * profile.k,
+                      packed.payload.begin() + std::size_t(recipe.rows) * profile.k, 0x7f);
+            std::fill(packed.payload.begin() + packed.scale_plane_offset + logical_rows * 2,
+                      packed.payload.end(), 0xff);
+        }
         weights.push_back(std::make_unique<DevicePackedWeight>(std::move(packed)));
     }
     DeviceContext context;
@@ -346,6 +391,8 @@ void add_profile(Suite& suite, const Profile& profile, std::vector<Invocation> c
         recipe += "s" + std::to_string(weight.seed) + "/";
         n += weight.rows;
     }
+    if (profile.weights.size() == 1)
+        n = std::accumulate(profile.outputs.begin(), profile.outputs.end(), 0);
     recipe += "segments";
     for (int rows : profile.outputs) recipe += "-" + std::to_string(rows);
     std::vector<linear_suite::Case> cases;

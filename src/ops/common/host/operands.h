@@ -336,6 +336,7 @@ namespace ninfer::ops::common {
 
 struct Fp8WeightGeometry {
     std::uint64_t code_plane_bytes;
+    // Compact-storage geometry. Borrowed native views carry their actual plane pointers.
     std::uint64_t scale_plane_offset;
     std::uint64_t scale_plane_bytes;
     std::uint64_t required_payload_bytes;

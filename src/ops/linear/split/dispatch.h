@@ -31,6 +31,7 @@ extern const SplitShape kQ8SplitN8192K2560, kQ8SplitN12288K4096;
 extern const SplitShape kQ8SplitN6144K2560;
 extern const SplitShape kQ4Q5SplitN7168N7168K5120, kQ4Q5SplitN4096N12288K5120;
 extern const SplitShape kFp8SplitN14336K5120, kFp8SplitN16384K5120;
+extern const SplitShape kFp8SplitN14976K5120, kFp8SplitN2176K5120;
 extern const SplitShape kNvfp4SplitN14336K5120, kNvfp4SplitN16384K5120;
 
 void launch_bf16_bias_n3072_k1024(const Tensor& x, const Weight& weight, const Tensor& bias,

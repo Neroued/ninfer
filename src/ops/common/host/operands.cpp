@@ -53,8 +53,13 @@ Fp8WeightGeometry validate_fp8_weight(const Weight& weight, const char* operatio
         throw std::invalid_argument(std::string(operation) + ": invalid FP8 weight");
     }
 
-    const auto* payload = static_cast<const std::byte*>(weight.payload);
-    if (weight.qdata != payload || weight.scales != payload + geometry.scale_plane_offset) {
+    // Native row views retain their parent's backing and borrow both planes. Their
+    // scale plane need not immediately follow the logical view's code rows.
+    const auto backing = operand::range(weight.payload, weight.payload_bytes, operation);
+    const auto codes   = operand::range(weight.qdata, geometry.code_plane_bytes, operation);
+    const auto scales  = operand::range(weight.scales, geometry.scale_plane_bytes, operation);
+    if (codes.begin < backing.begin || codes.end > backing.end || scales.begin < backing.begin ||
+        scales.end > backing.end || operand::overlaps(codes, scales)) {
         throw std::invalid_argument(std::string(operation) + ": invalid FP8 plane geometry");
     }
     return geometry;

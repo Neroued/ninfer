@@ -435,7 +435,9 @@ matrix dimensions. Materialization uploads each required parent once and binds n
 native operands. Direct tensors can use a contiguous element range. Grouped integer matrices can
 use consecutive complete rows with unchanged K, using independent code, high-bit and scale pointers.
 
-The native `Weight` bridge requires a complete parent for row-scaled FP8. NVFP4 accepts complete
+The native `Weight` bridge accepts consecutive complete rows with unchanged K for row-scaled FP8.
+Its code and scale pointers address the original parent planes independently; logical N does not
+determine a borrowed view's physical scale-plane offset. NVFP4 accepts complete
 128-row tiles within one matrix divisor domain, including within a bank. Its native code and scale
 pointers are rebased independently; the inner layout remains `BlockScaleK16M128x4`. Block-scaled
 FP8 accepts 128-row-aligned views with unchanged K and preserves the two-dimensional scale grid.

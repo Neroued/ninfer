@@ -47,6 +47,7 @@ struct Invocation {
     bool eager_before_capture  = false;
     bool validate_operands     = false;
     bool workspace_intervals   = false;
+    int token_axis             = 0; // Check zero-copy [D,H,T,B] with this T and B=t/T.
     std::string id;
 };
 

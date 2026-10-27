@@ -1,4 +1,5 @@
 #include "ops/linear/split/runner.h"
+#include "core/platform.h"
 
 namespace ninfer::test::linear_split {
 
@@ -6,6 +7,43 @@ void add_multi_output_cases(Suite& suite) {
     using Policy = ops::LinearPolicy;
     constexpr ReductionCriterion a16{2.9e-3, 4.0e-3, 4.5e-3};
     constexpr ReductionCriterion fp8_a16{1.0 / 256.0, 1.0 / 256.0, 2.0 / 256.0};
+#if NINFER_TARGET_RTX5090
+    for (bool history : {false, true}) {
+        Profile profile{5120,
+                        {{QType::FP8_E4M3FN_ROW_BF16, 14976, 457U}},
+                        history ? std::vector<int>{1024, 1024, 128}
+                                : std::vector<int>{1024, 1024, 128, 6144, 6144, 512},
+                        {{0, 1024, 256}, {1024, 1024, 256}, {2048, 128, 128}},
+                        fp8_a16,
+                        1.0 / 256.0,
+                        Binding::ProjectionInputs};
+        if (!history)
+            profile.regions.insert(profile.regions.end(),
+                                   {{2176, 6144, 256}, {8320, 6144, 256}, {14464, 512, 128}});
+        std::vector<Invocation> calls;
+        // Evaluate the L2 criterion over every column of each output, including
+        // cancellation-heavy inputs that a five-column sample mischaracterizes.
+        for (int t : {1, 4, 16, 17, 32, 33, 47, 48, 119, 128, 129, 257, 512, 1024, 2048})
+            calls.push_back({.t           = t,
+                             .policy      = Policy::AllowA8,
+                             .input_seed  = 461U,
+                             .columns     = Columns::All,
+                             .sample_rows = 15});
+        for (int t : {6, 65, 513})
+            calls.push_back({.t             = t,
+                             .policy        = Policy::AllowA8,
+                             .graph         = true,
+                             .input_seed    = 461U,
+                             .columns       = Columns::All,
+                             .sample_rows   = 15,
+                             .shared_output = true,
+                             .token_axis    = t == 6 ? 3 : t == 65 ? 13 : 0});
+        for (int t : {4, 33, 129})
+            calls.push_back({.t = t, .input_seed = 443U, .columns = Columns::Projection});
+        calls.push_back({.t = 0, .policy = Policy::AllowA8, .workspace_intervals = true});
+        add_profile(suite, profile, std::move(calls));
+    }
+#endif
     const std::vector<int> segments{6144, 1024, 6144, 1024};
     const std::vector<Region> regions{{0, 6144}, {6144, 1024}, {7168, 6144}, {13312, 1024}};
     const std::vector<int> bulk{129, 191, 192, 193, 256, 257, 287,  288,

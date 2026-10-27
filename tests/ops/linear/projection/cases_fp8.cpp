@@ -151,6 +151,12 @@ void run_fp8_a16(Suite& suite) {
                   invalid               = weight;
                   invalid.payload_bytes = invalid.payload_bytes - 1;
                   expect_invalid("payload bound", invalid);
+                  invalid = weight;
+                  invalid.scales = weight.qdata;
+                  expect_invalid("overlapping planes", invalid);
+                  invalid = weight;
+                  invalid.qdata = static_cast<const std::byte*>(weight.qdata) + 256;
+                  expect_invalid("code range overlapping scales", invalid);
                   failures += device_output.verify_guards("FP8 metadata output");
                   failures += test::linear_common::verify_preserved(
                       device_input.data(), std::as_bytes(std::span(input_bits)),

@@ -35,4 +35,10 @@ target_sources(ninfer_ops_non_rdc PRIVATE
 
 include("${CMAKE_CURRENT_LIST_DIR}/bf16/${NINFER_TARGET}/sources.cmake")
 
+if(NINFER_TARGET STREQUAL "rtx5090")
+  target_sources(ninfer_ops PRIVATE
+    "${CMAKE_CURRENT_LIST_DIR}/fp8/shapes/n14976_k5120.cu"
+    "${CMAKE_CURRENT_LIST_DIR}/fp8/shapes/n2176_k5120.cu")
+endif()
+
 include("${CMAKE_CURRENT_LIST_DIR}/q8/${NINFER_TARGET}/sources.cmake")

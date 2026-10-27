@@ -94,8 +94,17 @@ void geometry_and_views() {
     WeightView fp8_rows{{128, 64}, {{&fp8_parent, 0, 128 * 64}}};
     require(weight_row_planes(fp8_rows.parts.front()).scales == fp8.data() + 16384,
             "FP8 view recomputed the parent scale base");
-    rejects<std::invalid_argument>([&] { (void)native_weight(fp8_rows); },
-                                   "complete-parent ABI accepted an FP8 submatrix");
+    const auto prefix = native_weight(fp8_rows);
+    require(prefix.n == 128 && prefix.k == 64 && prefix.qdata == fp8.data() &&
+                prefix.scales == fp8.data() + 16384 && prefix.scale_ne[0] == 128 &&
+                prefix.payload == fp8.data() && prefix.payload_bytes == fp8_parent.geometry.bytes,
+            "native FP8 prefix lost its logical geometry or parent backing");
+    const auto suffix = native_weight(WeightView{{128, 64}, {{&fp8_parent, 128 * 64, 256 * 64}}});
+    require(suffix.qdata == fp8.data() + 8192 && suffix.scales == fp8.data() + 16384 + 256,
+            "native FP8 row view lost parent-relative codes/scales");
+    rejects<std::invalid_argument>(
+        [&] { (void)native_weight(WeightView{{128, 32}, {{&fp8_parent, 0, 128 * 32}}}); },
+        "native FP8 view accepted partial K");
 
     std::vector<std::byte> nvfp4(4612);
     const std::array divisors{2.0F};

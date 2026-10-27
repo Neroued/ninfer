@@ -1,19 +1,19 @@
 #pragma once
 
-#include "ops/softmax_attention/qsa/sparse_gqa/tile.cuh"
+#include "ops/softmax_attention/qsa/sparse_gqa/output_tile.cuh"
 #include "ops/softmax_attention/qsa/sparse_gqa/epilogue.cuh"
 #include "ops/softmax_attention/kernels/softmax.cuh"
 
 namespace ninfer::ops::detail::qsa {
 template <KvCacheStorage Storage, int N, int Parts, bool Vector, SparseGqaLoad Load,
-          int PrefixQueries = 0, int KvHeads>
+          int PrefixQueries = 0, bool SharedScales = false, int KvHeads>
 __launch_bounds__(Parts * 32) __global__
     void sparse_gqa_columns_kernel(const __grid_constant__ SparseGqaKernelArguments<KvHeads> a) {
     static_assert(N >= 16 && N % 16 == 0 && Parts > 0 && 256 % (Parts * 8) == 0);
     extern __shared__ __align__(16) unsigned char shared[];
-    auto& s =
-        *reinterpret_cast<SparseGqaStorage<Storage, N, Parts, Load, SparseGqaWarpSplit::Output>*>(
-            shared);
+    using Tile     = SparseGqaOutputTile<Storage, N, Parts, Vector, Load, SharedScales>;
+    auto& tile     = *reinterpret_cast<Tile*>(shared);
+    auto& s        = static_cast<typename Tile::Base&>(tile);
     const auto q   = a.begin + a.group_query(blockIdx.x);
     const int head = a.group_head(blockIdx.x), split = blockIdx.y;
     const int tid = threadIdx.x, lane = tid % 32, warp = tid / 32;
@@ -51,14 +51,20 @@ __launch_bounds__(Parts * 32) __global__
     OnlineSoftmaxRow state[2];
     constexpr float scale = common::kLog2E / 16.0f;
     const int gid = lane >> 2, lid = lane & 3;
+    const unsigned key_lane = common::smem_addr(ks) + (lane & 7) * 512;
+    const unsigned key_xor  = ((lane & 7) ^ ((lane >> 3) & 1)) * 16;
     sparse_gqa_addresses<Storage>(a, s, work, q, head, start, end);
-    sparse_gqa_stage<Storage, N, Parts, Vector, true>(a, s, start, end);
+    constexpr bool SharedValueScales = Tile::template prepared_scale<false>;
+    unsigned prefetched_value        = 127;
+    if constexpr (SharedValueScales)
+        prefetched_value = tile.template prefetch_scale<false>(a, start, end);
+    unsigned key_scale = tile.template prefetch<true>(a, start, end);
     common::cp_commit();
     for (int k0 = start; k0 < end; k0 += N) {
-        common::cp_wait<0>();
-        __syncthreads();
-        sparse_gqa_expand_stage<Storage, true>(s);
-        sparse_gqa_stage<Storage, N, Parts, Vector, false>(a, s, k0, end);
+        const bool key_half = tile.template wait<true>(key_scale);
+        tile.template expand<true>(key_half, key_scale);
+        unsigned value_scale = tile.template prefetch<false, !SharedValueScales>(a, k0, end);
+        if constexpr (SharedValueScales) value_scale = prefetched_value;
         common::cp_commit();
         float score[N / 8][4]{};
 #pragma unroll
@@ -66,19 +72,27 @@ __launch_bounds__(Parts * 32) __global__
 #pragma unroll
             for (int k = 0; k < 16; ++k) {
                 unsigned bf[2];
-                const int row = n * 8 + (lane & 7), d = k * 16 + ((lane >> 3) & 1) * 8;
-                common::ldmatrix_x2(
-                    bf[0], bf[1],
-                    common::smem_addr(ks + row * 256 + common::swizzle_xor_64(row, d)));
+                if constexpr (SparseGqaCodec<Storage, true>::format ==
+                              KvCacheVectorFormat::Fp8E4m3fnGroup128Ue8m0)
+                    common::ldmatrix_x2(
+                        bf[0], bf[1],
+                        common::swizzle_xor_address(key_lane, k * 32, n * 4096, key_xor));
+                else {
+                    const int row = n * 8 + (lane & 7), d = k * 16 + ((lane >> 3) & 1) * 8;
+                    common::ldmatrix_x2(
+                        bf[0], bf[1],
+                        common::smem_addr(ks + row * 256 + common::swizzle_xor_64(row, d)));
+                }
                 sparse_gqa_qk<Storage>(score[n], qf[k], bf);
             }
         }
-        common::cp_wait<0>();
-        __syncthreads();
-        sparse_gqa_expand_stage<Storage, false>(s);
+        const bool value_half = tile.template wait<false>(value_scale);
+        tile.template expand<false>(value_half, value_scale);
         if (k0 + N < end) {
             sparse_gqa_addresses<Storage>(a, s, work, q, head, k0 + N, end);
-            sparse_gqa_stage<Storage, N, Parts, Vector, true>(a, s, k0 + N, end);
+            if constexpr (SharedValueScales)
+                prefetched_value = tile.template prefetch_scale<false>(a, k0 + N, end);
+            key_scale = tile.template prefetch<true>(a, k0 + N, end);
             common::cp_commit();
         }
         float maximum[2] = {-CUDART_INF_F, -CUDART_INF_F};

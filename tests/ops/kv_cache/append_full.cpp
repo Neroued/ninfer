@@ -2,6 +2,7 @@
 #include "../../../tools/support/paged_kv_fixture.h"
 #include "kv_cache_storage.h"
 #include "ops/float_codec.h"
+#include "ops/fp8_cache_reference.h"
 #include "ninfer/ops/kv_cache_append.h"
 #include "cuda_fixture.h"
 #include "core/buffer.h"
@@ -34,7 +35,7 @@ constexpr int kPage               = 64;
 constexpr int kFullHeadDim        = 256;
 constexpr int kFullGroup          = 64;
 constexpr int kFullGroups         = kFullHeadDim / kFullGroup;
-constexpr int kFullFp8Groups      = 1;
+constexpr int kFullFp8Groups      = 2;
 constexpr int kFullNvfp4Group     = 16;
 constexpr int kFullNvfp4Groups    = kFullHeadDim / kFullNvfp4Group;
 constexpr int kFullNvfp4CodeBytes = kFullHeadDim / 2;
@@ -59,14 +60,14 @@ TestCacheLayout test_cache_layout(KvCacheStorage storage) {
     case KvCacheStorage::Int8Group64:
         return {{DType::I8, kFullHeadDim, DType::FP16, kFullGroups},
                 {DType::I8, kFullHeadDim, DType::FP16, kFullGroups}};
-    case KvCacheStorage::Fp8E4M3Row256:
-        return {{DType::FP8_E4M3FN, kFullHeadDim, DType::FP16, kFullFp8Groups},
-                {DType::FP8_E4M3FN, kFullHeadDim, DType::FP16, kFullFp8Groups}};
+    case KvCacheStorage::Fp8E4m3fnGroup128Ue8m0:
+        return {{DType::FP8_E4M3FN, kFullHeadDim, DType::U8, kFullFp8Groups},
+                {DType::FP8_E4M3FN, kFullHeadDim, DType::U8, kFullFp8Groups}};
     case KvCacheStorage::Nvfp4Group16:
         return {{DType::U8, kFullNvfp4CodeBytes, DType::U8, kFullNvfp4Groups},
                 {DType::U8, kFullNvfp4CodeBytes, DType::U8, kFullNvfp4Groups}};
     case KvCacheStorage::Fp8KeyNvfp4Value:
-        return {{DType::FP8_E4M3FN, kFullHeadDim, DType::FP16, kFullFp8Groups},
+        return {{DType::FP8_E4M3FN, kFullHeadDim, DType::U8, kFullFp8Groups},
                 {DType::U8, kFullNvfp4CodeBytes, DType::U8, kFullNvfp4Groups}};
     }
     throw std::invalid_argument("unsupported test KV storage");
@@ -174,28 +175,19 @@ std::array<float, kFullHeadDim> nvfp4_codec_rotated_vector() {
 
 void encode_full_fp8_row(const std::array<float, kFullHeadDim>& values,
                          std::vector<std::uint8_t>& codes, int head, int position,
-                         int physical_page, int kv_heads, std::vector<std::uint16_t>& scales) {
-    float absmax = 0.0f;
-    for (const float value : values) absmax = std::max(absmax, std::abs(value));
-    std::uint16_t scale_bits = 0;
-    float scale              = 0.0f;
-    if (absmax != 0.0f) {
-        const float raw_scale = absmax / 448.0f;
-        const float bounded   = std::clamp(raw_scale, std::ldexp(1.0f, -24), 65504.0f);
-        scale_bits            = f32_to_f16_bits(bounded);
-        scale                 = f16_bits_to_f32(scale_bits);
+                         int physical_page, int kv_heads, std::vector<std::uint8_t>& scales) {
+    for (int group = 0; group < 2; ++group) {
+        float maximum = 0;
+        for (int d = group * 128; d < (group + 1) * 128; ++d)
+            maximum = std::max(maximum, std::abs(values[d]));
+        const auto scale        = fp8_cache_scale(maximum);
+        const double multiplier = fp8_cache_multiplier(scale);
+        for (int d = group * 128; d < (group + 1) * 128; ++d)
+            codes[full_cache_index(kFullHeadDim, d, head, position, physical_page, kv_heads)] =
+                encode_e4m3fn_rne_satfinite(float(values[d] / multiplier));
+        scales[full_cache_index(kFullFp8Groups, group, head, position, physical_page, kv_heads)] =
+            scale;
     }
-    const float inverse = scale == 0.0f ? 0.0f : 1.0f / scale;
-    for (int d = 0; d < kFullHeadDim; ++d) {
-        const auto target =
-            full_cache_index(kFullHeadDim, d, head, position, physical_page, kv_heads);
-        codes[target] =
-            scale == 0.0f
-                ? 0
-                : encode_e4m3fn_rne_satfinite(values[static_cast<std::size_t>(d)] * inverse);
-    }
-    scales[full_cache_index(kFullFp8Groups, 0, head, position, physical_page, kv_heads)] =
-        scale_bits;
 }
 
 void encode_full_nvfp4_row(const std::array<float, kFullHeadDim>& values,
@@ -359,7 +351,7 @@ int full_append_case(int kv_heads, KvCacheStorage storage, int tokens = 3) {
         host_k[full_input_index(i, 0, 0, kv_heads)]              = 0.0f;
         host_v[full_input_index(kFullGroup + i, 0, 0, kv_heads)] = 0.0f;
     }
-    if (storage == KvCacheStorage::Fp8E4M3Row256) {
+    if (storage == KvCacheStorage::Fp8E4m3fnGroup128Ue8m0) {
         for (int d = 0; d < kFullHeadDim; ++d) {
             host_k[full_input_index(d, 0, 0, kv_heads)] = 0.0f;
             host_v[full_input_index(d, 0, 0, kv_heads)] = 0.0f;
@@ -491,17 +483,17 @@ int full_append_case(int kv_heads, KvCacheStorage storage, int tokens = 3) {
                                  expected_scale_v);
         failures += scale_k.verify_guards((label + " k scale guards").c_str());
         failures += scale_v.verify_guards((label + " v scale guards").c_str());
-    } else if (storage == KvCacheStorage::Fp8E4M3Row256) {
+    } else if (storage == KvCacheStorage::Fp8E4m3fnGroup128Ue8m0) {
         std::vector<std::uint8_t> expected_k(k_code_count, 0x55U);
         std::vector<std::uint8_t> expected_v(v_code_count, 0xaaU);
-        auto expected_scale_k = patterned_bits(k_scale_count, 0x01234567u);
-        auto expected_scale_v = patterned_bits(v_scale_count, 0x89abcdefu);
+        std::vector<std::uint8_t> expected_scale_k(k_scale_count, 0x55);
+        std::vector<std::uint8_t> expected_scale_v(v_scale_count, 0x55);
         cache_k.copy_from_host(expected_k.data(), expected_k.size());
         cache_v.copy_from_host(expected_v.data(), expected_v.size());
         scale_k.copy_from_host(expected_scale_k.data(),
-                               expected_scale_k.size() * sizeof(std::uint16_t));
+                               expected_scale_k.size() * sizeof(std::uint8_t));
         scale_v.copy_from_host(expected_scale_v.data(),
-                               expected_scale_v.size() * sizeof(std::uint16_t));
+                               expected_scale_v.size() * sizeof(std::uint8_t));
         for (int token = 0; token < tokens; ++token) {
             const int position = positions[static_cast<std::size_t>(token)];
             const int page     = mapping[static_cast<std::size_t>(position / kPage)];
@@ -526,7 +518,7 @@ int full_append_case(int kv_heads, KvCacheStorage storage, int tokens = 3) {
         cuda_synchronize();
         fixture.copy_back();
         const std::string label =
-            "kv_cache_append full fp8-row256 Hkv=" + std::to_string(kv_heads) +
+            "kv_cache_append full fp8-g128-ue8m0 Hkv=" + std::to_string(kv_heads) +
             " T=" + std::to_string(tokens) + " P=" + std::to_string(first_position);
         failures +=
             verify_exact((label + " k codes").c_str(),
@@ -535,22 +527,22 @@ int full_append_case(int kv_heads, KvCacheStorage storage, int tokens = 3) {
             verify_exact((label + " v codes").c_str(),
                          from_device<std::uint8_t>(cache_v.data(), v_code_count), expected_v);
         failures += verify_exact((label + " k scales").c_str(),
-                                 from_device<std::uint16_t>(scale_k.data(), k_scale_count),
+                                 from_device<std::uint8_t>(scale_k.data(), k_scale_count),
                                  expected_scale_k);
         failures += verify_exact((label + " v scales").c_str(),
-                                 from_device<std::uint16_t>(scale_v.data(), v_scale_count),
+                                 from_device<std::uint8_t>(scale_v.data(), v_scale_count),
                                  expected_scale_v);
         failures += scale_k.verify_guards((label + " k scale guards").c_str());
         failures += scale_v.verify_guards((label + " v scale guards").c_str());
     } else if (storage == KvCacheStorage::Fp8KeyNvfp4Value) {
         std::vector<std::uint8_t> expected_k(k_code_count, 0x55U);
         std::vector<std::uint8_t> expected_v(v_code_count, 0xaaU);
-        auto expected_scale_k = patterned_bits(k_scale_count, 0x01234567u);
+        std::vector<std::uint8_t> expected_scale_k(k_scale_count, 0x55);
         std::vector<std::uint8_t> expected_scale_v(v_scale_count, 0x42U);
         cache_k.copy_from_host(expected_k.data(), expected_k.size());
         cache_v.copy_from_host(expected_v.data(), expected_v.size());
         scale_k.copy_from_host(expected_scale_k.data(),
-                               expected_scale_k.size() * sizeof(std::uint16_t));
+                               expected_scale_k.size() * sizeof(std::uint8_t));
         scale_v.copy_from_host(expected_scale_v.data(), expected_scale_v.size());
         for (int token = 0; token < tokens; ++token) {
             const int position = positions[static_cast<std::size_t>(token)];
@@ -586,7 +578,7 @@ int full_append_case(int kv_heads, KvCacheStorage storage, int tokens = 3) {
             verify_exact((label + " v codes").c_str(),
                          from_device<std::uint8_t>(cache_v.data(), v_code_count), expected_v);
         failures += verify_exact((label + " k scales").c_str(),
-                                 from_device<std::uint16_t>(scale_k.data(), k_scale_count),
+                                 from_device<std::uint8_t>(scale_k.data(), k_scale_count),
                                  expected_scale_k);
         failures += verify_exact((label + " v scales").c_str(),
                                  from_device<std::uint8_t>(scale_v.data(), v_scale_count),
@@ -697,18 +689,18 @@ EncodedVector encode_prefix_vector(std::span<const std::uint16_t, kFullHeadDim> 
                 encoded.data[component] = static_cast<std::uint8_t>(code);
             }
         }
-    } else if (storage == KvCacheStorage::Fp8E4M3Row256 ||
+    } else if (storage == KvCacheStorage::Fp8E4m3fnGroup128Ue8m0 ||
                (key && storage == KvCacheStorage::Fp8KeyNvfp4Value)) {
-        float maximum = 0;
-        for (const auto value : values) maximum = std::max(maximum, std::abs(value));
-        const auto bits    = maximum == 0
-                                 ? std::uint16_t{0}
-                                 : f32_to_f16_bits(std::clamp(maximum / 448.0f, 0x1p-24f, 65504.0f));
-        const auto scale   = f16_bits_to_f32(bits);
-        const auto inverse = scale == 0 ? 0.0f : 1.0f / scale;
-        store_u16(encoded.scales, 0, bits);
-        for (int d = 0; d < kFullHeadDim; ++d)
-            encoded.data[d] = scale == 0 ? 0 : encode_e4m3fn_rne_satfinite(values[d] * inverse);
+        for (int group = 0; group < 2; ++group) {
+            float maximum = 0;
+            for (int d = group * 128; d < (group + 1) * 128; ++d)
+                maximum = std::max(maximum, std::abs(values[d]));
+            const auto scale        = fp8_cache_scale(maximum);
+            encoded.scales[group]   = scale;
+            const double multiplier = fp8_cache_multiplier(scale);
+            for (int d = group * 128; d < (group + 1) * 128; ++d)
+                encoded.data[d] = encode_e4m3fn_rne_satfinite(float(values[d] / multiplier));
+        }
     } else {
         for (int group = 0; group < kFullNvfp4Groups; ++group) {
             float maximum = 0;
@@ -873,9 +865,9 @@ int full_prefix_case(int kv_heads, KvCacheStorage storage, int width, int batch,
 } // namespace
 
 void add_full_append_cases(ninfer::test::OpSuite& suite) {
-    for (auto storage :
-         {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64, KvCacheStorage::Fp8E4M3Row256,
-          KvCacheStorage::Nvfp4Group16, KvCacheStorage::Fp8KeyNvfp4Value}) {
+    for (auto storage : {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64,
+                         KvCacheStorage::Fp8E4m3fnGroup128Ue8m0, KvCacheStorage::Nvfp4Group16,
+                         KvCacheStorage::Fp8KeyNvfp4Value}) {
         const std::string format = kv_cache_storage_name(storage);
         for (int heads : {4, 2})
             suite.add("append/full/" + format + "/h" + std::to_string(heads) + "/t3",

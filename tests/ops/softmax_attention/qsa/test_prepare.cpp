@@ -619,7 +619,7 @@ int main(int argc, char** argv) {
               [] { return read_footprint(cuda_environment().context); }, {{"format", "bf16"}});
     suite.add("qsa_prepare/bf16/contract", [] { return validation(cuda_environment().context); },
               {{"format", "bf16"}});
-    for (auto storage : {KvCacheStorage::Int8Group64, KvCacheStorage::Fp8E4M3Row256,
+    for (auto storage : {KvCacheStorage::Int8Group64, KvCacheStorage::Fp8E4m3fnGroup128Ue8m0,
                          KvCacheStorage::Nvfp4Group16, KvCacheStorage::Fp8KeyNvfp4Value}) {
         for (int t : {1, 8, 17, 65, 319, 320, 321, 1024, 2048, 4096})
             add(t, 1, t % 3 ? 3 : 1, t % 4, t % 3, 0, storage);
@@ -645,9 +645,9 @@ int main(int argc, char** argv) {
                   {{"format", kv_cache_storage_name(storage)}});
     }
 
-    for (auto storage :
-         {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64, KvCacheStorage::Fp8E4M3Row256,
-          KvCacheStorage::Nvfp4Group16, KvCacheStorage::Fp8KeyNvfp4Value}) {
+    for (auto storage : {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64,
+                         KvCacheStorage::Fp8E4m3fnGroup128Ue8m0, KvCacheStorage::Nvfp4Group16,
+                         KvCacheStorage::Fp8KeyNvfp4Value}) {
         const std::string prefix =
             std::string("qsa_prepare/") + kv_cache_storage_name(storage) + "/h12_1";
         for (auto [t, b] : {std::pair{1, 1},
@@ -684,9 +684,9 @@ int main(int argc, char** argv) {
               },
               {{"format", "bf16"}});
 
-    for (auto storage :
-         {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64, KvCacheStorage::Fp8E4M3Row256,
-          KvCacheStorage::Nvfp4Group16, KvCacheStorage::Fp8KeyNvfp4Value}) {
+    for (auto storage : {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64,
+                         KvCacheStorage::Fp8E4m3fnGroup128Ue8m0, KvCacheStorage::Nvfp4Group16,
+                         KvCacheStorage::Fp8KeyNvfp4Value}) {
         const std::string prefix = std::string("qsa_prepare_kv/") + kv_cache_storage_name(storage);
         for (int heads : {1, 2})
             for (auto [t, b] : {std::pair{1, 1}, {9, 4}, {65, 1}, {257, 1}})

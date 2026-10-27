@@ -46,14 +46,14 @@ __device__ __forceinline__ void sparse_gqa_mma(SparseGqaKernelArguments<KvHeads>
     constexpr float scale = common::kLog2E / 16.0f;
     const int gid = lane >> 2, lid = lane & 3;
     sparse_gqa_addresses<Storage>(a, s, work, q, head, start, end);
-    sparse_gqa_stage<Storage, N, Warps, VectorCache, true>(a, s, start, end);
+    unsigned key_scale = sparse_gqa_stage<Storage, N, Warps, VectorCache, true>(a, s, start, end);
 
     common::cp_commit();
     for (int k0 = start; k0 < end; k0 += N) {
-        common::cp_wait<0>();
-        __syncthreads();
-        sparse_gqa_expand_stage<Storage, true>(s);
-        sparse_gqa_stage<Storage, N, Warps, VectorCache, false>(a, s, k0, end);
+        const bool key_half = sparse_gqa_wait_stage<Storage, true>(s, key_scale);
+        sparse_gqa_expand_stage<Storage, true>(s, key_half, key_scale);
+        unsigned value_scale =
+            sparse_gqa_stage<Storage, N, Warps, VectorCache, false>(a, s, k0, end);
         common::cp_commit();
         float score[QKNt][4] = {};
 #pragma unroll
@@ -69,12 +69,11 @@ __device__ __forceinline__ void sparse_gqa_mma(SparseGqaKernelArguments<KvHeads>
                 sparse_gqa_qk<Storage>(score[n], qf[k], bf);
             }
         }
-        common::cp_wait<0>();
-        __syncthreads();
-        sparse_gqa_expand_stage<Storage, false>(s);
+        const bool value_half = sparse_gqa_wait_stage<Storage, false>(s, value_scale);
+        sparse_gqa_expand_stage<Storage, false>(s, value_half, value_scale);
         if (k0 + N < end) {
             sparse_gqa_addresses<Storage>(a, s, work, q, head, k0 + N, end);
-            sparse_gqa_stage<Storage, N, Warps, VectorCache, true>(a, s, k0 + N, end);
+            key_scale = sparse_gqa_stage<Storage, N, Warps, VectorCache, true>(a, s, k0 + N, end);
             common::cp_commit();
         }
         float maximum[2] = {-CUDART_INF_F, -CUDART_INF_F};

@@ -107,8 +107,9 @@ int layout_contract() {
     const auto bf =
         ops::plan_kpool_mla_cache_layout({ops::KpoolMlaStorage::BFloat16, 512, 128, 11});
     const auto fp = ops::plan_kpool_mla_cache_layout(
-        {ops::KpoolMlaStorage::Fp8E4m3fnGroup128F32, 512, 128, 11});
-    if (bf.page.page_bytes != 11 * 68 * 1024 || fp.page.page_bytes != 11 * 37 * 1024) return 1;
+        {ops::KpoolMlaStorage::Fp8E4m3fnGroup128Ue8m0, 512, 128, 11});
+    if (bf.page.page_bytes != 11 * 68 * 1024 || fp.page.page_bytes != 11 * (516 * 64 + 4096))
+        return 1;
     LayoutBuilder builder;
     const auto raw       = ops::plan_kpool_raw_records(builder, 128, 17, 8, 11);
     const auto selection = ops::plan_kpool_block_selection(builder, 7);

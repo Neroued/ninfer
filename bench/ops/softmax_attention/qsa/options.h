@@ -35,21 +35,7 @@ inline std::vector<int> segments(Projection p, int kv_heads) {
     throw std::invalid_argument("invalid QSA projection");
 }
 
-inline const char* name(KvCacheStorage storage) {
-    switch (storage) {
-    case KvCacheStorage::BFloat16:
-        return "bf16";
-    case KvCacheStorage::Int8Group64:
-        return "int8";
-    case KvCacheStorage::Fp8E4M3Row256:
-        return "fp8";
-    case KvCacheStorage::Nvfp4Group16:
-        return "nvfp4";
-    case KvCacheStorage::Fp8KeyNvfp4Value:
-        return "k8v4";
-    }
-    throw std::invalid_argument("invalid QSA KV storage");
-}
+inline const char* name(KvCacheStorage storage) { return kv_cache_profile_info(storage).name; }
 
 struct Options {
     measurement::Options timing;
@@ -60,6 +46,7 @@ struct Options {
     std::vector<int> tokens{1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096};
     KvCacheStorage storage = KvCacheStorage::BFloat16;
     int rounds             = 1;
+    int graph_calls        = 1;
     int query_heads = 24, kv_heads = 2;
     std::vector<int> capacities{16}, bases{6};
     std::vector<int> contexts{8192}, prefixes;
@@ -106,6 +93,7 @@ inline Options parse_options(int argc, char** argv) {
                    "  --context-capacity N (default maximum L)\n"
                    "  --kv-cache bf16|int8|fp8|nvfp4|k8v4 (default bf16)\n"
                    "  --valid dense|N[,N...]\n"
+                   "  --graph-calls N (prepare/prepare-kv/sparse-gqa, warm Graph only)\n"
                    "Tail extraction:\n"
                    "  --capacity R[,R...] --batch B --base-positions F0[,F0...]\n"
                    "  --valid dense|N[,N...] --accepted dense|mixed|N[,N...]\n"
@@ -156,8 +144,8 @@ inline Options parse_options(int argc, char** argv) {
         } else if (flag == "--kv-cache") {
             bool matched = false;
             for (auto storage : {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64,
-                                 KvCacheStorage::Fp8E4M3Row256, KvCacheStorage::Nvfp4Group16,
-                                 KvCacheStorage::Fp8KeyNvfp4Value})
+                                 KvCacheStorage::Fp8E4m3fnGroup128Ue8m0,
+                                 KvCacheStorage::Nvfp4Group16, KvCacheStorage::Fp8KeyNvfp4Value})
                 if (value == name(storage)) {
                     o.storage = storage;
                     matched   = true;
@@ -200,7 +188,9 @@ inline Options parse_options(int argc, char** argv) {
             token_options = true;
             o.tokens =
                 flag == "--tokens" ? measurement::integers(value) : measurement::sweep(value);
-        } else if (flag == "--rounds")
+        } else if (flag == "--graph-calls")
+            o.graph_calls = measurement::integer(value);
+        else if (flag == "--rounds")
             o.rounds = measurement::integer(value);
         else if (!measurement::parse(o.timing, flag, value))
             throw std::invalid_argument("unknown option: " + std::string(flag));
@@ -237,6 +227,11 @@ inline Options parse_options(int argc, char** argv) {
     if (o.batch > 8 || (o.axes != 1 && o.axes != 3) ||
         (o.layout != "contiguous" && o.layout != "layered" && o.layout != "unaligned"))
         throw std::invalid_argument("invalid QSA batch/axes/layout");
+    if (o.graph_calls > 1 &&
+        (o.timing.execution != "graph" || o.timing.cache != "warm" || o.inplace ||
+         (o.op != "prepare" && o.op != "prepare-kv" && o.op != "sparse-gqa")))
+        throw std::invalid_argument(
+            "graph-calls > 1 requires non-aliasing prepare/prepare-kv/sparse-gqa and warm Graph");
     return o;
 }
 

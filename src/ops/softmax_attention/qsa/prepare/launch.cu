@@ -149,8 +149,8 @@ void launch(const PrepareArguments& args, PreparePlan plan, KvCacheStorage stora
     case KvCacheStorage::Int8Group64:
         dispatch<KvCacheStorage::Int8Group64, Queries>(args, plan, execution.stream());
         break;
-    case KvCacheStorage::Fp8E4M3Row256:
-        dispatch<KvCacheStorage::Fp8E4M3Row256, Queries>(args, plan, execution.stream());
+    case KvCacheStorage::Fp8E4m3fnGroup128Ue8m0:
+        dispatch<KvCacheStorage::Fp8E4m3fnGroup128Ue8m0, Queries>(args, plan, execution.stream());
         break;
     case KvCacheStorage::Nvfp4Group16:
         dispatch<KvCacheStorage::Nvfp4Group16, Queries>(args, plan, execution.stream());

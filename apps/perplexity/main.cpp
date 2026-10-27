@@ -47,7 +47,7 @@ struct Options {
     std::uint32_t context               = 4096;
     std::uint32_t stride                = 2048;
     int device                          = 0;
-    ninfer::KvCacheStorage kv           = ninfer::KvCacheStorage::Fp8E4M3Row256;
+    ninfer::KvCacheStorage kv           = ninfer::KvCacheStorage::Fp8E4m3fnGroup128Ue8m0;
     bool quick                          = false;
     ninfer::product::LogLevel log_level = ninfer::product::LogLevel::Info;
 };
@@ -103,17 +103,9 @@ Options parse_options(int argc, char** argv) {
             out.device = parse_integer<int>(value("--device"), "device");
         } else if (option == "--kv-dtype") {
             const std::string_view dtype = value("--kv-dtype");
-            if (dtype == "bf16") {
-                out.kv = ninfer::KvCacheStorage::BFloat16;
-            } else if (dtype == "int8") {
-                out.kv = ninfer::KvCacheStorage::Int8Group64;
-            } else if (dtype == "fp8") {
-                out.kv = ninfer::KvCacheStorage::Fp8E4M3Row256;
-            } else if (dtype == "nvfp4") {
-                out.kv = ninfer::KvCacheStorage::Nvfp4Group16;
-            } else if (dtype == "k8v4") {
-                out.kv = ninfer::KvCacheStorage::Fp8KeyNvfp4Value;
-            } else {
+            try {
+                out.kv = ninfer::kv_cache_storage_from_option(dtype);
+            } catch (const std::invalid_argument&) {
                 usage_error("--kv-dtype must be bf16, int8, fp8, nvfp4, or k8v4");
             }
         } else if (option == "--output") {
@@ -135,19 +127,7 @@ Options parse_options(int argc, char** argv) {
 }
 
 std::string kv_name(ninfer::KvCacheStorage value) {
-    switch (value) {
-    case ninfer::KvCacheStorage::BFloat16:
-        return "bf16";
-    case ninfer::KvCacheStorage::Int8Group64:
-        return "int8-g64";
-    case ninfer::KvCacheStorage::Fp8E4M3Row256:
-        return "fp8-e4m3-r256";
-    case ninfer::KvCacheStorage::Nvfp4Group16:
-        return "nvfp4";
-    case ninfer::KvCacheStorage::Fp8KeyNvfp4Value:
-        return "k8v4";
-    }
-    throw std::logic_error("unknown KV dtype");
+    return ninfer::kv_cache_profile_info(value).name;
 }
 
 std::string safe_component(std::string_view value) {

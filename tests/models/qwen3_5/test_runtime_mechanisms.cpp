@@ -85,19 +85,20 @@ void test_decoder_layout() {
                int8.mtp_kv->pages.payload_bytes() == 2ULL * (256 + 4 * 2) * 64 * 2,
            "INT8 Text/MTP record payload includes group scales");
 
-    q35::DecoderStateSpec fp8_spec = decoder_spec(ninfer::KvCacheStorage::Fp8E4M3Row256, true);
+    q35::DecoderStateSpec fp8_spec =
+        decoder_spec(ninfer::KvCacheStorage::Fp8E4m3fnGroup128Ue8m0, true);
     ninfer::LayoutBuilder fp8_builder;
     const q35::DecoderStateLayout fp8 = q35::plan_decoder_state(fp8_builder, fp8_spec);
     (void)fp8_builder.finish(256);
     expect(fp8.text_kv.pages.planes.size() == 8 &&
                fp8.text_kv.pages.planes[0].geometry.dtype == ninfer::DType::FP8_E4M3FN &&
-               fp8.text_kv.pages.planes[2].geometry.dtype == ninfer::DType::FP16 &&
-               fp8.text_kv.pages.planes[2].geometry.leading_extent == 1,
-           "FP8 Text KV has row-scaled code and scale planes per layer");
+               fp8.text_kv.pages.planes[2].geometry.dtype == ninfer::DType::U8 &&
+               fp8.text_kv.pages.planes[2].geometry.leading_extent == 2,
+           "FP8 Text KV has G128 code and UE8M0 scale planes per layer");
     expect(fp8.mtp_kv && fp8.mtp_kv->pages.planes.size() == 4 &&
                fp8.mtp_kv->pages.planes[0].geometry.dtype == ninfer::DType::FP8_E4M3FN &&
-               fp8.mtp_kv->pages.planes[2].geometry.leading_extent == 1,
-           "FP8 MTP KV has row-scaled code and scale planes");
+               fp8.mtp_kv->pages.planes[2].geometry.leading_extent == 2,
+           "FP8 MTP KV has G128 code and UE8M0 scale planes");
     expect(fp8.text_kv.pages.payload_bytes() == 2ULL * (256 + 2) * 2 * 64 * 2 &&
                fp8.mtp_kv->pages.payload_bytes() == 2ULL * (256 + 2) * 64 * 2,
            "FP8 Text/MTP record payload includes row scales");
@@ -129,8 +130,8 @@ void test_decoder_layout() {
                k8v4.text_kv.pages.planes[0].geometry.leading_extent == 256 &&
                k8v4.text_kv.pages.planes[1].geometry.dtype == ninfer::DType::U8 &&
                k8v4.text_kv.pages.planes[1].geometry.leading_extent == 128 &&
-               k8v4.text_kv.pages.planes[2].geometry.dtype == ninfer::DType::FP16 &&
-               k8v4.text_kv.pages.planes[2].geometry.leading_extent == 1 &&
+               k8v4.text_kv.pages.planes[2].geometry.dtype == ninfer::DType::U8 &&
+               k8v4.text_kv.pages.planes[2].geometry.leading_extent == 2 &&
                k8v4.text_kv.pages.planes[3].geometry.dtype == ninfer::DType::U8 &&
                k8v4.text_kv.pages.planes[3].geometry.leading_extent == 16,
            "K8V4 Text KV preserves independent key/value code and scale geometry");

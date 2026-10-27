@@ -439,7 +439,7 @@ int main(int argc, char** argv) {
         options.max_context                       = pressure_mode ? 1024 : 1536;
         options.max_concurrency                   = argc > 3 ? std::stoul(argv[3]) : 2;
         options.prefill_chunk                     = 128;
-        options.kv_cache                          = ninfer::KvCacheStorage::Fp8E4M3Row256;
+        options.kv_cache                          = ninfer::KvCacheStorage::Fp8E4m3fnGroup128Ue8m0;
         options.use_cuda_graph                    = mode != "eager";
         options.context_cache.enabled             = !pressure_mode;
         options.context_cache.host_capacity_bytes = mode == "replay" ? 0 : 512ULL << 20;

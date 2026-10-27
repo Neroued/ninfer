@@ -1995,7 +1995,7 @@ int main(int argc, char** argv) {
         options.max_context              = kCapacity;
         options.prefill_chunk            = kChunk;
         options.max_concurrency          = 2;
-        options.kv_cache                 = KvCacheStorage::Fp8E4M3Row256;
+        options.kv_cache                 = KvCacheStorage::Fp8E4m3fnGroup128Ue8m0;
         options.use_cuda_graph           = false;
         options.speculative.backend      = backend;
         options.speculative.draft_tokens = backend == SpeculativeBackend::None ? 0U : 3U;

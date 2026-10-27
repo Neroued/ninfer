@@ -13,20 +13,27 @@
 namespace ninfer::ops::detail {
 
 struct Fp8KvTiledValues {
-    using Scale                      = __half;
+    using Scale                      = std::uint8_t;
+    using SharedScale                = unsigned;
     static constexpr int kCodeBytes  = 256;
-    static constexpr int kScaleItems = 1;
+    static constexpr int kScaleItems = 2;
 
-    __device__ __forceinline__ static int4 expand(const std::uint8_t* codes, Scale scale) {
-        return common::fp8_dequant_f16x8(codes, scale);
+    template <bool SingleFactor>
+    __device__ __forceinline__ static int4 expand(const std::uint8_t* codes, SharedScale scale) {
+        if constexpr (SingleFactor)
+            return common::fp8_dequant_f16x8_scaled(codes, __ushort_as_half(scale));
+        else
+            return common::fp8_dequant_f16x8(codes, scale >> 16);
     }
 };
 
 struct K8V4KvTiledValues {
     using Scale                      = std::uint8_t;
+    using SharedScale                = Scale;
     static constexpr int kCodeBytes  = 128;
     static constexpr int kScaleItems = 16;
 
+    template <bool SingleFactor>
     __device__ __forceinline__ static int4 expand(const std::uint8_t* codes, Scale scale) {
         return common::nvfp4_dequant_f16x8(codes, scale);
     }
@@ -38,7 +45,7 @@ struct K8V4KvTiledValues {
 template <class Geometry, class Schedule, class Values, class Metadata>
 __global__ __maxnreg__(Schedule::kMaxRegisters) void mxfp8_kv_tiled_mma_kernel(
     const __nv_bfloat16* __restrict__ q, const std::uint8_t* __restrict__ cache_k,
-    const std::uint8_t* __restrict__ cache_v, const __half* __restrict__ cache_k_scale,
+    const std::uint8_t* __restrict__ cache_v, const std::uint8_t* __restrict__ cache_k_scale,
     const typename Values::Scale* __restrict__ cache_v_scale, Metadata metadata,
     const std::int32_t* __restrict__ positions, float scale, std::int32_t width,
     CausalKvPartition partition, CausalPartialView partial) {
@@ -60,10 +67,10 @@ __global__ __maxnreg__(Schedule::kMaxRegisters) void mxfp8_kv_tiled_mma_kernel(
     std::uint8_t* k_fp8 = reinterpret_cast<std::uint8_t*>(
         reinterpret_cast<unsigned char*>(q_scale) + Schedule::kQScaleBytes);
     std::uint8_t* v_codes = k_fp8 + Schedule::kKBytes;
-    __half* v_f16         = reinterpret_cast<__half*>(v_codes + Schedule::kVBytes);
-    __half* k_scale_s =
-        reinterpret_cast<__half*>(reinterpret_cast<unsigned char*>(v_f16) + Schedule::kVStageBytes);
-    auto* v_scale_s = reinterpret_cast<typename Values::Scale*>(k_scale_s + Bc);
+    __half* v_f16           = reinterpret_cast<__half*>(v_codes + Schedule::kVBytes);
+    std::uint8_t* k_scale_s = reinterpret_cast<std::uint8_t*>(
+        reinterpret_cast<unsigned char*>(v_f16) + Schedule::kVStageBytes);
+    auto* v_scale_s = reinterpret_cast<typename Values::SharedScale*>(k_scale_s + 2 * Bc);
 
     const int q_block = static_cast<int>(blockIdx.x);
     const int q_head  = static_cast<int>(blockIdx.y);
@@ -133,32 +140,46 @@ __global__ __maxnreg__(Schedule::kMaxRegisters) void mxfp8_kv_tiled_mma_kernel(
     const unsigned v_as        = (lane >> 4) << 4;
     const unsigned v_r         = b_rin << 4;
     auto issue_kv_scales       = [&](int tile_k0, int cooperative_tid, int cooperative_threads) {
+        bool single_factor               = true;
         const std::int64_t record_offset = block_table[tile_k0 >> kv::kPageShift];
         const int page_offset0           = tile_k0 & (kPagedKVPageSize - 1);
         for (int key_l = cooperative_tid; key_l < Bc; key_l += cooperative_threads) {
             const int key = tile_k0 + key_l;
             if (key <= max_query_abs) {
                 const std::int64_t off =
-                    kv::Fp8RowLayout::scale_offset(record_offset, kv_head, page_offset0 + key_l);
-                k_scale_s[key_l] = cache_k_scale[off];
-                if constexpr (Values::kScaleItems == 1) {
-                    v_scale_s[key_l] = cache_v_scale[off];
+                    kv::Fp8G128Layout::scale_offset(record_offset, kv_head, page_offset0 + key_l);
+                *reinterpret_cast<std::uint16_t*>(k_scale_s + 2 * key_l) =
+                    *reinterpret_cast<const std::uint16_t*>(cache_k_scale + off);
+                if constexpr (Values::kScaleItems == 2) {
+                    const unsigned pair =
+                        *reinterpret_cast<const std::uint16_t*>(cache_v_scale + off);
+#pragma unroll
+                    for (int group = 0; group < 2; ++group) {
+                        const unsigned raw = (pair >> (8 * group)) & 255u;
+                        const auto factor  = __float2half_rn(__uint_as_float(raw << 23));
+                        // Retain the exponent for tiles requiring the full-range decoder.
+                        v_scale_s[2 * key_l + group] =
+                            unsigned(__half_as_ushort(factor)) | raw << 16;
+                        single_factor &= raw >= 103 && raw <= 142;
+                    }
                 } else {
                     const auto v_off =
                         kv::record_offset<Values::kScaleItems, sizeof(typename Values::Scale)>(
                             record_offset, kv_head, page_offset0 + key_l, 0);
                     common::cp_async<16>(v_scale_s + key_l * Values::kScaleItems,
-                                               cache_v_scale + v_off);
+                                         cache_v_scale + v_off);
                 }
             } else {
-                k_scale_s[key_l] = __float2half_rn(0.0F);
-                if constexpr (Values::kScaleItems == 1)
-                    v_scale_s[key_l] = __float2half_rn(0.0F);
-                else
+                *reinterpret_cast<std::uint16_t*>(k_scale_s + 2 * key_l) = 0;
+                if constexpr (Values::kScaleItems == 2) {
+                    v_scale_s[2 * key_l]     = 0;
+                    v_scale_s[2 * key_l + 1] = 0;
+                } else
                     common::store_vec(v_scale_s + key_l * Values::kScaleItems,
-                                            make_int4(0, 0, 0, 0));
+                                      make_int4(0, 0, 0, 0));
             }
         }
+        return single_factor;
     };
 
     auto issue_kv_codes = [&](int tile_k0, int cooperative_tid, int cooperative_threads) {
@@ -173,7 +194,7 @@ __global__ __maxnreg__(Schedule::kMaxRegisters) void mxfp8_kv_tiled_mma_kernel(
             std::uint8_t* kd = &k_fp8[(key_l * DB16 + common::swizzle_xor_64(key_l, dc * 8)) * 2];
             if (key <= max_query_abs) {
                 const std::int64_t off =
-                    kv::Fp8RowLayout::code_offset(record_offset, kv_head, d, page_offset0 + key_l);
+                    kv::Fp8G128Layout::code_offset(record_offset, kv_head, d, page_offset0 + key_l);
                 common::cp_async<16, Cache::cg>(kd, &cache_k[off]);
                 if constexpr (Values::kCodeBytes == D)
                     common::cp_async<16, Cache::cg>(&v_codes[key_l * D + d], &cache_v[off]);
@@ -203,13 +224,18 @@ __global__ __maxnreg__(Schedule::kMaxRegisters) void mxfp8_kv_tiled_mma_kernel(
     };
 
     auto issue_kv_tile = [&](int tile_k0, int cooperative_tid, int cooperative_threads) {
-        issue_kv_scales(tile_k0, cooperative_tid, cooperative_threads);
+        const bool single_factor = issue_kv_scales(tile_k0, cooperative_tid, cooperative_threads);
         issue_kv_codes(tile_k0, cooperative_tid, cooperative_threads);
+        return single_factor;
     };
 
-    if (key_blocks > 0) issue_kv_tile(first_owned_tile * Bc, tid, Schedule::kThreads);
+    bool value_half = true;
+    if (key_blocks > 0) value_half = issue_kv_tile(first_owned_tile * Bc, tid, Schedule::kThreads);
     common::cp_wait<0>();
-    __syncthreads();
+    if constexpr (Values::kScaleItems == 2)
+        value_half = __syncthreads_and(value_half);
+    else
+        __syncthreads();
 
     float acc[PVNtPerWarp][4]{};
     float m0 = -CUDART_INF_F, m1 = -CUDART_INF_F;
@@ -223,18 +249,26 @@ __global__ __maxnreg__(Schedule::kMaxRegisters) void mxfp8_kv_tiled_mma_kernel(
                    : causal_exp_scaled(previous, maximum * scale_l2, scale_l2);
     };
     const auto step = [&]<bool FullTile>(int kb) {
-        const int k0 = (first_owned_tile + kb) * Bc;
-        // Conversion runs while all query warps retain their row state in registers.
+        const int k0             = (first_owned_tile + kb) * Bc;
+        const auto expand_values = [&]<bool SingleFactor>() {
 #pragma unroll 1
-        for (int chunk = tid; chunk < Bc * (D / 8); chunk += Schedule::kThreads) {
-            const int row = chunk / (D / 8);
-            const int d   = (chunk % (D / 8)) * 8;
-            common::store_vec(
-                &v_f16[row * D + common::swizzle_xor_64(row, d)],
-                Values::expand(
-                    v_codes + row * Values::kCodeBytes + d * Values::kCodeBytes / D,
-                    v_scale_s[row * Values::kScaleItems + d / (D / Values::kScaleItems)]));
-        }
+            for (int chunk = tid; chunk < Bc * (D / 8); chunk += Schedule::kThreads) {
+                const int row = chunk / (D / 8);
+                const int d   = (chunk % (D / 8)) * 8;
+                common::store_vec(
+                    &v_f16[row * D + common::swizzle_xor_64(row, d)],
+                    Values::template expand<SingleFactor>(
+                        v_codes + row * Values::kCodeBytes + d * Values::kCodeBytes / D,
+                        v_scale_s[row * Values::kScaleItems + d / (D / Values::kScaleItems)]));
+            }
+        };
+        if constexpr (Values::kScaleItems == 2) {
+            if (value_half)
+                expand_values.template operator()<true>();
+            else
+                expand_values.template operator()<false>();
+        } else
+            expand_values.template operator()<false>();
         // S = Q Kᵀ for this warp's 16 rows over all Bc keys, in registers.
         // Software-pipelined like cute's gemm: issue the ldmatrix for contraction
         // step k+1 while the m16n8k32 MMAs for step k run, so the LSU (ldmatrix)
@@ -276,25 +310,24 @@ __global__ __maxnreg__(Schedule::kMaxRegisters) void mxfp8_kv_tiled_mma_kernel(
             }
 #pragma unroll
             for (int nt = 0; nt < QKNt; ++nt) {
-                common::mma_fp8_e4m3(score[nt][0], score[nt][1], score[nt][2], score[nt][3],
-                                     af[cur][0], af[cur][1], af[cur][2], af[cur][3], bf[cur][nt][0],
-                                     bf[cur][nt][1]);
+                common::mma_fp8_e4m3_scaled(score[nt][0], score[nt][1], score[nt][2], score[nt][3],
+                                            af[cur][0], af[cur][1], af[cur][2], af[cur][3],
+                                            bf[cur][nt][0], bf[cur][nt][1], 0x7fu,
+                                            k_scale_s[2 * (nt * 8 + gid) + k / 4]);
             }
         }
 
 #pragma unroll
         for (int nt = 0; nt < QKNt; ++nt) {
-            const int keya  = nt * 8 + 2 * lid;
-            const float ks0 = __half2float(k_scale_s[keya]);
-            const float ks1 = __half2float(k_scale_s[keya + 1]);
-            score[nt][0] *= q_scale_r0 * ks0;
-            score[nt][1] *= q_scale_r0 * ks1;
-            score[nt][2] *= q_scale_r1 * ks0;
-            score[nt][3] *= q_scale_r1 * ks1;
+            score[nt][0] *= q_scale_r0;
+            score[nt][1] *= q_scale_r0;
+            score[nt][2] *= q_scale_r1;
+            score[nt][3] *= q_scale_r1;
         }
         // QK is finished with the codes; V has been decoded into its own arena.
         __syncthreads();
-        if (kb + 1 < key_blocks) issue_kv_tile(k0 + Bc, tid, Schedule::kThreads);
+        bool next_half = true;
+        if (kb + 1 < key_blocks) next_half = issue_kv_tile(k0 + Bc, tid, Schedule::kThreads);
         const int row0  = warp_row0 + gid;
         const int row1  = warp_row0 + gid + 8;
         const int qrow0 = q0 + row0;
@@ -435,7 +468,10 @@ __global__ __maxnreg__(Schedule::kMaxRegisters) void mxfp8_kv_tiled_mma_kernel(
         }
 
         if (kb + 1 < key_blocks) common::cp_wait<0>();
-        __syncthreads();
+        if constexpr (Values::kScaleItems == 2)
+            value_half = __syncthreads_and(next_half);
+        else
+            __syncthreads();
     };
     const int full_blocks =
         q0 + Br <= tokens ? min(key_blocks, max(0, (base_pos + q0 + 1) / Bc - first_owned_tile))

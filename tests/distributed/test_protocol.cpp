@@ -23,6 +23,33 @@ void require(bool value, const char* message) {
     if (!value) throw std::runtime_error(message);
 }
 
+void cache_profiles_roundtrip() {
+    for (auto storage : {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64,
+                         KvCacheStorage::Fp8E4m3fnGroup128Ue8m0, KvCacheStorage::Nvfp4Group16,
+                         KvCacheStorage::Fp8KeyNvfp4Value}) {
+        q::RankLoadRequest request{};
+        request.options.kv_cache = storage;
+        wire::Encoder load_out;
+        q::encode_rank_load(load_out, request);
+        const auto load_bytes = std::move(load_out).take();
+        wire::Decoder load_in(load_bytes);
+        const auto loaded = q::decode_rank_load(load_in);
+        load_in.finish();
+        require(loaded.options.kv_cache == storage, "rank load changed the KV profile");
+
+        q::RankExecutionDescription execution{};
+        execution.session.shape.kv_storage = storage;
+        wire::Encoder execution_out;
+        q::encode(execution_out, execution);
+        const auto execution_bytes = std::move(execution_out).take();
+        wire::Decoder execution_in(execution_bytes);
+        const auto decoded = q::decode_rank_execution(execution_in);
+        execution_in.finish();
+        require(decoded.session.shape.kv_storage == storage,
+                "rank execution changed the KV profile");
+    }
+}
+
 template <class F>
 void rejects(F function) {
     try {
@@ -566,6 +593,7 @@ int main() {
     try {
         topology_identity();
         model_preparation();
+        cache_profiles_roundtrip();
         native_work();
         context_observations();
         queues();

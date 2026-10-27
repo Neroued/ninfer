@@ -75,7 +75,10 @@ struct EncodedVector {
                         values[d]       = source.view.dtype == DType::BF16 ? bf16_to_f32(word)
                                                                            : prepare::fp16_decode(word);
                     }
-                    const auto encoded = prepare::encode_row(values, format);
+                    auto encoded = prepare::encode_row(values, format);
+                    // Exercise independently scaled groups in every reader route.
+                    // The attention oracle consumes these actual stored operands.
+                    if (format.encoding == prepare::Encoding::Fp8) encoded.scales[(r + h) % 2] -= 3;
                     std::copy(encoded.data.begin(), encoded.data.end(),
                               data.host.begin() + data.offset(r, h, p));
                     std::copy(encoded.scales.begin(), encoded.scales.end(),
@@ -92,6 +95,8 @@ struct EncodedVector {
         const auto code = fp4 ? (data.host[db + d / 2] >> (4 * (d % 2))) & 15 : data.host[db + d];
         const double scale =
             fp4 ? prepare::positive_fp8(scales.host[sb + group])
+            : format.encoding == prepare::Encoding::Fp8
+                ? fp8_cache_multiplier(scales.host[sb + group])
                 : prepare::fp16_decode(prepare::read_u16(scales.host, sb + 2 * group));
         return prepare::decode_code(code, format.encoding) * scale;
     }

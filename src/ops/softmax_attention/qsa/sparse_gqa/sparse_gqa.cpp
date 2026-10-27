@@ -11,11 +11,11 @@ void profile(KvCacheStorage storage, int query_heads, int kv_heads, int lo, int 
     v.require((query_heads == 24 && kv_heads == 2) || (query_heads == 12 && kv_heads == 1),
               "query/KV heads");
     v.require(envelope.max_visible_tokens <= 262144, "visible-token capacity");
-    v.require(storage == KvCacheStorage::BFloat16 || storage == KvCacheStorage::Fp8E4M3Row256 ||
-                  storage == KvCacheStorage::Int8Group64 ||
-                  storage == KvCacheStorage::Nvfp4Group16 ||
-                  storage == KvCacheStorage::Fp8KeyNvfp4Value,
-              "cache storage");
+    v.require(
+        storage == KvCacheStorage::BFloat16 || storage == KvCacheStorage::Fp8E4m3fnGroup128Ue8m0 ||
+            storage == KvCacheStorage::Int8Group64 || storage == KvCacheStorage::Nvfp4Group16 ||
+            storage == KvCacheStorage::Fp8KeyNvfp4Value,
+        "cache storage");
     v.require(lo > 0 && hi >= lo && batch >= 1 && batch <= 8, "T/B interval");
     v.require(multiprocessor_count > 0, "SM count");
 }

@@ -209,7 +209,8 @@ ColdTiming measure_launch(Launch&& launch, CudaExecutionView cuda, int warmup, i
     return summarize_timings(std::move(samples));
 }
 
-inline ColdTiming measure_graph(const TimedGraph& graph, CudaExecutionView cuda, int warmup,
+template <class Graph>
+inline ColdTiming measure_graph(const Graph& graph, CudaExecutionView cuda, int warmup,
                                 int repeat) {
     const auto stream = cuda.stream();
     if (warmup < 0 || repeat <= 0) {
@@ -326,7 +327,8 @@ ColdTiming measure_cold_launch(Launch&& launch, L2FlushBuffer& flush, CudaExecut
     return summarize_timings(std::move(samples));
 }
 
-inline ColdTiming measure_cold_graph(const TimedGraph& graph, L2FlushBuffer& flush,
+template <class Graph>
+inline ColdTiming measure_cold_graph(const Graph& graph, L2FlushBuffer& flush,
                                      CudaExecutionView cuda, int warmup, int repeat) {
     const auto stream = cuda.stream();
     if (warmup < 0 || repeat <= 0) {

@@ -40,7 +40,7 @@ int main(int argc, char** argv) {
                 if (value == "bf16")
                     storage = ops::KpoolMlaStorage::BFloat16;
                 else if (value == "fp8")
-                    storage = ops::KpoolMlaStorage::Fp8E4m3fnGroup128F32;
+                    storage = ops::KpoolMlaStorage::Fp8E4m3fnGroup128Ue8m0;
                 else
                     throw std::invalid_argument("latent-cache: bf16|fp8");
             } else if (flag == "--ragged")

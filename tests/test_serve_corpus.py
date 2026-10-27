@@ -278,9 +278,7 @@ def test_arbitrary_artifact_labels_reach_the_requested_backend(tmp_path: Path) -
         (tmp_path / f"{point.key}.json").write_text("{}")
 
 
-@pytest.mark.parametrize(
-    "kv_dtype,cache_name", [("int8", "int8-group64"), ("fp8", "fp8-e4m3-row256")]
-)
+@pytest.mark.parametrize("kv_dtype", ["int8", "fp8"])
 @pytest.mark.parametrize(
     "concurrent,mode,head",
     [
@@ -292,7 +290,7 @@ def test_arbitrary_artifact_labels_reach_the_requested_backend(tmp_path: Path) -
     ],
 )
 def test_selected_kv_reaches_server_and_is_verified(
-    tmp_path, kv_dtype, cache_name, concurrent, mode, head
+    tmp_path, kv_dtype, concurrent, mode, head
 ):
     artifact = tmp_path / "model.ninfer"
     artifact.touch()
@@ -314,7 +312,7 @@ def test_selected_kv_reaches_server_and_is_verified(
         "max_context": 262144,
         "context_capacity_mode": "auto",
         "prefill_chunk": 1024,
-        "kv_cache": cache_name,
+        "kv_cache": kv_dtype,
         "cuda_graph": True,
         "prefix_reuse": False,
         "speculative_backend": backend,

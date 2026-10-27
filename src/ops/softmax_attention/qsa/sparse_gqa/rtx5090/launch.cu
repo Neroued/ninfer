@@ -64,8 +64,8 @@ void launch_sparse_gqa_instance(SparseGqaArguments a, KvCacheStorage storage, in
     case KvCacheStorage::BFloat16:
         dispatch.template operator()<KvCacheStorage::BFloat16>();
         break;
-    case KvCacheStorage::Fp8E4M3Row256:
-        dispatch.template operator()<KvCacheStorage::Fp8E4M3Row256>();
+    case KvCacheStorage::Fp8E4m3fnGroup128Ue8m0:
+        dispatch.template operator()<KvCacheStorage::Fp8E4m3fnGroup128Ue8m0>();
         break;
     case KvCacheStorage::Int8Group64:
         dispatch.template operator()<KvCacheStorage::Int8Group64>();

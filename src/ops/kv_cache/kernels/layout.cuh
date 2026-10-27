@@ -9,9 +9,11 @@ namespace ninfer::ops::detail::kv {
 inline constexpr int kPageShift   = 6;
 inline constexpr int kPageMask    = kPagedKVPageSize - 1;
 inline constexpr int kHeadDim     = 256;
-inline constexpr int kInt8Group   = 64;
+inline constexpr int kInt8Group =
+    kv_cache_format_info(KvCacheVectorFormat::Int8Group64F16).group_size;
 inline constexpr int kInt8Groups  = kHeadDim / kInt8Group;
-inline constexpr int kNvfp4Group  = 16;
+inline constexpr int kNvfp4Group =
+    kv_cache_format_info(KvCacheVectorFormat::Nvfp4Group16Ue4m3).group_size;
 inline constexpr int kNvfp4Groups = kHeadDim / kNvfp4Group;
 
 static_assert(kPagedKVPageSize == (1 << kPageShift));
@@ -100,13 +102,12 @@ struct QuantizedRowLayout {
 
     __device__ static __forceinline__ std::int64_t scale_offset(std::int64_t record, int head,
                                                                 int offset) {
-        static_assert(ScaleExtent == 1);
         return scale_offset(record, head, 0, offset);
     }
 };
 
 using Int8G64Layout  = QuantizedRowLayout<256, 4>;
-using Fp8RowLayout   = QuantizedRowLayout<256, 1>;
+using Fp8G128Layout  = QuantizedRowLayout<256, 2, 1, 1>;
 using Nvfp4G16Layout = QuantizedRowLayout<128, 16, 2, 1>;
 
 } // namespace ninfer::ops::detail::kv

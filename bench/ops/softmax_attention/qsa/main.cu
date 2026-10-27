@@ -41,7 +41,7 @@ void measure_tail(const qsa::Options& options, DeviceContext& device, L2FlushBuf
 
 void measure_prepare(const qsa::Options& options, DeviceContext& device, L2FlushBuffer& flush) {
     measurement::Csv csv(options.timing.csv_out,
-                         std::string("base_positions,axes,inplace,layout,round,") +
+                         std::string("base_positions,axes,inplace,layout,round,graph_calls,") +
                              qsa::Metrics::columns);
     for (int tokens : options.tokens) {
         qsa::PrepareFixture fixture(options, tokens);
@@ -63,14 +63,20 @@ void measure_prepare(const qsa::Options& options, DeviceContext& device, L2Flush
                  measurement::selections(options.timing.execution, "graph", "eager"))
                 for (const auto& cache :
                      measurement::selections(options.timing.cache, "cold", "warm")) {
-                    const auto result = measurement::measure(
-                        [&](CudaExecutionView cuda) { fixture.launch(cuda); },
+                    auto result = measurement::measure(
+                        [&](CudaExecutionView cuda) {
+                            for (int i = 0; i < options.graph_calls; ++i) fixture.launch(cuda);
+                        },
                         [&](CudaExecutionView cuda) { fixture.restore(cuda); }, flush,
                         device.execution_view(), options.timing, execution, cache);
+                    result.gpu.median_us /= options.graph_calls;
+                    result.gpu.min_us /= options.graph_calls;
+                    result.gpu.p95_us /= options.graph_calls;
                     csv.write(row, result, execution, cache,
                               qsa::csv_list(fixture.bases) + "," + std::to_string(options.axes) +
                                   "," + std::to_string(options.inplace) + "," + options.layout +
                                   "," + std::to_string(round) + "," +
+                                  std::to_string(options.graph_calls) + "," +
                                   metrics.csv(result.gpu.median_us));
                 }
     }
@@ -112,7 +118,7 @@ void measure_indexer(const qsa::Options& options, DeviceContext& device, L2Flush
 void measure_sparse(const qsa::Options& options, DeviceContext& device, L2FlushBuffer& flush) {
     measurement::Csv csv(options.timing.csv_out,
                          std::string("contexts,context_capacity,selection,selected_blocks,"
-                                     "physical_cache_bytes,round,") +
+                                     "physical_cache_bytes,round,graph_calls,") +
                              qsa::Metrics::columns);
     for (int tokens : options.tokens) {
         qsa::SparseGqaFixture fixture(options, tokens, device.execution_view());
@@ -145,17 +151,24 @@ void measure_sparse(const qsa::Options& options, DeviceContext& device, L2FlushB
                  measurement::selections(options.timing.execution, "graph", "eager"))
                 for (const auto& cache :
                      measurement::selections(options.timing.cache, "cold", "warm")) {
-                    const auto result = measurement::measure(
-                        [&](CudaExecutionView cuda) { fixture.launch(cuda); }, [](auto) {}, flush,
-                        device.execution_view(), options.timing, execution, cache);
+                    auto result = measurement::measure(
+                        [&](CudaExecutionView cuda) {
+                            for (int i = 0; i < options.graph_calls; ++i) fixture.launch(cuda);
+                        },
+                        [](auto) {}, flush, device.execution_view(), options.timing, execution,
+                        cache);
+                    result.gpu.median_us /= options.graph_calls;
+                    result.gpu.min_us /= options.graph_calls;
+                    result.gpu.p95_us /= options.graph_calls;
                     row.workspace_peak = fixture.workspace->peak_used();
-                    csv.write(row, result, execution, cache,
-                              qsa::csv_list(fixture.contexts) + "," +
-                                  std::to_string(fixture.envelope.max_visible_tokens) + "," +
-                                  options.selection + "," +
-                                  std::to_string(options.selected_blocks) + "," +
-                                  std::to_string(fixture.packed->storage().bytes) + "," +
-                                  std::to_string(round) + "," + metrics.csv(result.gpu.median_us));
+                    csv.write(
+                        row, result, execution, cache,
+                        qsa::csv_list(fixture.contexts) + "," +
+                            std::to_string(fixture.envelope.max_visible_tokens) + "," +
+                            options.selection + "," + std::to_string(options.selected_blocks) +
+                            "," + std::to_string(fixture.packed->storage().bytes) + "," +
+                            std::to_string(round) + "," + std::to_string(options.graph_calls) +
+                            "," + metrics.csv(result.gpu.median_us));
                 }
     }
 }

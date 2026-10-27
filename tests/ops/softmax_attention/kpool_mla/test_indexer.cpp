@@ -50,7 +50,7 @@ void exact_inputs(kp::IndexerFixture& f, int kind) {
 int run(int T, int B, int E, int kind = -1, bool fp8 = false) {
     auto& d = cuda_environment().context;
     kp::IndexerFixture f(d.execution_view(), T, B, E, E == 1048576 ? 11 : 1, B > 1,
-                         fp8 ? ops::KpoolMlaStorage::Fp8E4m3fnGroup128F32
+                         fp8 ? ops::KpoolMlaStorage::Fp8E4m3fnGroup128Ue8m0
                              : ops::KpoolMlaStorage::BFloat16);
     if (kind >= 0) exact_inputs(f, kind);
     if (E <= 2051) {

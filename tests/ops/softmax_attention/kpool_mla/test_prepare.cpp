@@ -235,7 +235,7 @@ int admission() {
     failures += rejects([&] { f.launch(device.execution_view()); });
     failures += rejects([&] {
         (void)ops::kpool_mla_prepare_record_workspace_capacity_bytes(
-            weights.profile(), ops::KpoolMlaStorage::Fp8E4m3fnGroup128F32, 1, 1, 1,
+            weights.profile(), ops::KpoolMlaStorage::Fp8E4m3fnGroup128Ue8m0, 1, 1, 1,
             device.execution_view().multiprocessor_count());
     });
     return failures;

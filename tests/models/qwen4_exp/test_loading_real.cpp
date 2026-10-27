@@ -324,7 +324,7 @@ int main(int argc, char** argv) {
                         multi.context_capacity = ContextCapacityPolicy::automatic();
                         for (const auto format :
                              {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64,
-                              KvCacheStorage::Fp8E4M3Row256, KvCacheStorage::Nvfp4Group16,
+                              KvCacheStorage::Fp8E4m3fnGroup128Ue8m0, KvCacheStorage::Nvfp4Group16,
                               KvCacheStorage::Fp8KeyNvfp4Value}) {
                             multi.kv_cache = format;
                             auto plan =

@@ -187,7 +187,7 @@ struct QsaSparseGqaExecutionEnvelope {
  *
  * Domain / numeric:
  * T>0, B=1..8. Query, gate and out are contiguous, 16-byte-aligned BF16 [256,Hq,T,B], (Hq,Hkv) in
- * {(24,2),(12,1)}. Cache supports BFloat16 (BF16 K / FP16 V), Fp8E4M3Row256, Int8Group64,
+ * {(24,2),(12,1)}. Cache supports BFloat16 (BF16 K / FP16 V), Fp8E4m3fnGroup128Ue8m0, Int8Group64,
  * Nvfp4Group16 and Fp8KeyNvfp4Value. Data/scale planes follow paged_kv_storage_layout(storage,256),
  * with dense, naturally aligned [leading_extent,64,Hkv] geometry per 64-token record. Q and softmax
  * probabilities are not quantized to low-bit operands. The A16 numerical policy applies to the
@@ -264,7 +264,8 @@ void qsa_sparse_gqa(const Tensor& query, const Tensor& output_gate,
  *
  * - BFloat16: BF16 K / FP16 V [256,64,Hkv] per record; no scales.
  * - Int8Group64: I8 K/V [256,64,Hkv] per record; FP16 scales [4,64,Hkv] per record.
- * - Fp8E4M3Row256: FP8_E4M3FN K/V [256,64,Hkv] per record; FP16 scales [1,64,Hkv] per record.
+ * - Fp8E4m3fnGroup128Ue8m0: FP8_E4M3FN K/V [256,64,Hkv] per record; UE8M0 U8 scales [2,64,Hkv] per
+ * record.
  * - Nvfp4Group16: packed U8 K/V [128,64,Hkv] per record; U8 E4M3 scales [16,64,Hkv] per record.
  * - Fp8KeyNvfp4Value: the FP8 key planes and NVFP4 value planes above.
  *

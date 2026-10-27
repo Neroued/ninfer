@@ -51,7 +51,7 @@ int main() {
         ninfer::ContextCapacityPolicy::explicit_capacity(8ULL << 30);
     options.launch.engine.prefill_chunk             = 1024;
     options.launch.logging.stats_interval_ms        = 2500;
-    options.launch.engine.kv_cache                  = ninfer::KvCacheStorage::Fp8E4M3Row256;
+    options.launch.engine.kv_cache = ninfer::KvCacheStorage::Fp8E4m3fnGroup128Ue8m0;
     options.launch.engine.speculative.backend       = ninfer::SpeculativeBackend::Mtp;
     options.launch.engine.speculative.draft_tokens  = 3;
     options.launch.engine.speculative.proposal_head = ninfer::ProposalHead::Optimized;
@@ -124,7 +124,7 @@ int main() {
     auto& memory                               = snapshot.ranks[0].memory;
     auto& budget                               = startup_report.ranks[0];
     description.max_context                    = 262144;
-    description.kv_cache                       = ninfer::KvCacheStorage::Fp8E4M3Row256;
+    description.kv_cache                       = ninfer::KvCacheStorage::Fp8E4m3fnGroup128Ue8m0;
     memory.allocations.device_weights_bytes    = 100;
     memory.allocations.persistent_device_bytes = 200;
     memory.allocations.workspace_device_bytes  = 500;
@@ -194,7 +194,7 @@ int main() {
                       "request log path missing");
     failures += check(server.at("server").at("default_thinking_budget") == 512,
                       "server thinking budget missing");
-    failures += check(server.at("engine").at("kv_cache") == "fp8-e4m3-row256", "KV type missing");
+    failures += check(server.at("engine").at("kv_cache") == "fp8", "KV type missing");
     options.launch.engine.kv_cache = ninfer::KvCacheStorage::Nvfp4Group16;
     engine_options.kv_cache        = options.launch.engine.kv_cache;
     description.kv_cache           = options.launch.engine.kv_cache;

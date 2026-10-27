@@ -138,7 +138,7 @@ Bf16KvCacheView<Writable> bf16_kv_cache_view(const Cache& cache, const Tensor* v
 }
 
 template <bool Writable>
-using Fp8KvCacheView = QuantizedCausalCacheView<std::uint8_t, __half, __half, Writable>;
+using Fp8KvCacheView = QuantizedCausalCacheView<std::uint8_t, std::uint8_t, std::uint8_t, Writable>;
 using Fp8KvReadView  = Fp8KvCacheView<false>;
 
 template <bool Writable>
@@ -151,7 +151,8 @@ using Nvfp4KvCacheView =
 using Nvfp4KvReadView = Nvfp4KvCacheView<false>;
 
 template <bool Writable>
-using K8V4KvCacheView = QuantizedCausalCacheView<std::uint8_t, __half, std::uint8_t, Writable>;
+using K8V4KvCacheView =
+    QuantizedCausalCacheView<std::uint8_t, std::uint8_t, std::uint8_t, Writable>;
 using K8V4KvReadView  = K8V4KvCacheView<false>;
 
 } // namespace ninfer::ops::detail

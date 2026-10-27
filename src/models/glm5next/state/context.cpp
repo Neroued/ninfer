@@ -33,8 +33,8 @@ ops::KpoolMlaStorage latent_storage(KvCacheStorage storage) {
     switch (storage) {
     case KvCacheStorage::BFloat16:
         return ops::KpoolMlaStorage::BFloat16;
-    case KvCacheStorage::Fp8E4M3Row256:
-        return ops::KpoolMlaStorage::Fp8E4m3fnGroup128F32;
+    case KvCacheStorage::Fp8E4m3fnGroup128Ue8m0:
+        return ops::KpoolMlaStorage::Fp8E4m3fnGroup128Ue8m0;
     default:
         throw std::invalid_argument("GLM5Next has no latent representation for this KV format");
     }

@@ -279,13 +279,7 @@ ReasoningEffort reasoning_effort(std::string_view name) {
     return ReasoningEffort::Max;
 }
 
-KvCacheStorage kv_storage(std::string_view name) {
-    if (name == "bf16") return KvCacheStorage::BFloat16;
-    if (name == "int8") return KvCacheStorage::Int8Group64;
-    if (name == "fp8") return KvCacheStorage::Fp8E4M3Row256;
-    if (name == "nvfp4") return KvCacheStorage::Nvfp4Group16;
-    return KvCacheStorage::Fp8KeyNvfp4Value;
-}
+KvCacheStorage kv_storage(std::string_view name) { return kv_cache_storage_from_option(name); }
 
 ConstraintKind constraint_kind(std::string_view name) {
     if (name == "none") return ConstraintKind::None;

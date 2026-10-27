@@ -162,6 +162,12 @@ public:
         CUDA_CHECK(cudaGraphLaunch(exec_, stream));
     }
 
+    double launch_timed(CudaExecutionView cuda) const {
+        launch(cuda);
+        CUDA_CHECK(cudaStreamSynchronize(cuda.stream()));
+        return elapsed_us();
+    }
+
     double elapsed_us() const {
         float ms = 0;
         CUDA_CHECK(cudaEventElapsedTime(&ms, start_, stop_));
@@ -171,6 +177,8 @@ public:
     std::size_t kernels() const { return kernels_; }
 
     std::size_t nodes() const { return nodes_; }
+
+    std::size_t body_nodes() const { return nodes_ - 2; }
 private:
     cudaGraph_t graph_    = nullptr;
     cudaGraphExec_t exec_ = nullptr;

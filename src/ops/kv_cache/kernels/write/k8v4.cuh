@@ -1,12 +1,12 @@
 #pragma once
 
-// Asymmetric K8V4 append kernel. K uses the existing row-256 E4M3 cache codec; V uses the
+// Asymmetric K8V4 append kernel. K uses the existing G128 E4M3/UE8M0 cache codec; V uses the
 // group-16 packed E2M1 cache codec. Both operands receive the fixed FP32 D256 Hadamard rotation.
 
 #include "ops/common/cuda/memory.cuh"
 #include "ops/common/cuda/reduce.cuh"
 #include "ops/kv_cache/kernels/layout.cuh"
-#include "ops/common/quant/fp8.cuh"
+#include "ops/kv_cache/kernels/fp8.cuh"
 #include "ops/kv_cache/kernels/hadamard.cuh"
 #include "ops/common/quant/nvfp4.cuh"
 
@@ -22,29 +22,17 @@ template <typename Geometry>
 __device__ __forceinline__ void
 write_k8v4_row(const __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,
                std::uint8_t* __restrict__ cache_k, std::uint8_t* __restrict__ cache_v,
-               __half* __restrict__ scale_k, std::uint8_t* __restrict__ scale_v, int token,
+               std::uint8_t* __restrict__ scale_k, std::uint8_t* __restrict__ scale_v, int token,
                int kv_head, std::int64_t record, int page_offset, int lane, float* scratch) {
-    constexpr unsigned FullMask = 0xffffffffU;
     float values[8];
-    float local_absmax = 0.0F;
 #pragma unroll
     for (int r = 0; r < 8; ++r) {
         const int d = lane + 32 * r;
         values[r]   = __bfloat162float(k[source_offset<Geometry>(kv_head, d, token)]);
     }
     normalized_hadamard_d256_inplace(values, lane);
-#pragma unroll
-    for (float value : values) local_absmax = fmaxf(local_absmax, fabsf(value));
-    const auto k_quant = common::fp8_fp16_scale(common::warp_max(local_absmax, FullMask));
-#pragma unroll
-    for (int r = 0; r < 8; ++r) {
-        const int d = lane + 32 * r;
-        cache_k[Fp8RowLayout::code_offset(record, kv_head, d, page_offset)] =
-            common::fp8_quant_code(values[r], k_quant.inverse_scale);
-    }
-    if (lane == 0) {
-        scale_k[Fp8RowLayout::scale_offset(record, kv_head, page_offset)] = k_quant.scale;
-    }
+    store_fp8_d256(values, cache_k + Fp8G128Layout::code_offset(record, kv_head, 0, page_offset),
+                   scale_k + Fp8G128Layout::scale_offset(record, kv_head, page_offset), lane);
 
 #pragma unroll
     for (int r = 0; r < 8; ++r) {
@@ -70,7 +58,7 @@ __launch_bounds__(256) __global__
     void write_k8v4_kernel(const __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,
                            const std::int32_t* __restrict__ positions, Metadata metadata,
                            std::uint8_t* __restrict__ cache_k, std::uint8_t* __restrict__ cache_v,
-                           __half* __restrict__ scale_k, std::uint8_t* __restrict__ scale_v,
+                           std::uint8_t* __restrict__ scale_k, std::uint8_t* __restrict__ scale_v,
                            std::int32_t width) {
     if constexpr (MultiBatch) {
         const int batch = blockIdx.z;
@@ -107,7 +95,8 @@ __launch_bounds__(256) __global__
                                 const __nv_bfloat16* __restrict__ v,
                                 const std::int32_t* __restrict__ positions, Metadata metadata,
                                 std::uint8_t* __restrict__ cache_k,
-                                std::uint8_t* __restrict__ cache_v, __half* __restrict__ scale_k,
+                                std::uint8_t* __restrict__ cache_v,
+                                std::uint8_t* __restrict__ scale_k,
                                 std::uint8_t* __restrict__ scale_v, std::int32_t width) {
     constexpr int Warps         = 8;
     constexpr int TokensPerTile = 8;

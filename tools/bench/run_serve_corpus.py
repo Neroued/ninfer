@@ -31,13 +31,7 @@ SPECULATIVE_MODES = {
 }
 DEFAULT_MODES = ("mtp0", "mtp3")
 SAMPLING_MODES = ("stochastic", "greedy")
-KV_CACHE_NAMES = {
-    "bf16": "bf16",
-    "int8": "int8-group64",
-    "fp8": "fp8-e4m3-row256",
-    "nvfp4": "nvfp4",
-    "k8v4": "k8v4",
-}
+KV_CACHE_NAMES = ("bf16", "int8", "fp8", "nvfp4", "k8v4")
 
 SEEDS = (
     7632647173703958409,
@@ -494,7 +488,7 @@ def validate_server_start(event: dict[str, Any], spec: RunSpec, device: int) -> 
         "max_context": 262144,
         "context_capacity_mode": "auto",
         "prefill_chunk": 1024,
-        "kv_cache": KV_CACHE_NAMES[spec.kv_dtype],
+        "kv_cache": spec.kv_dtype,
         "cuda_graph": True,
         "prefix_reuse": False,
         "speculative_backend": spec.speculative_backend,

@@ -17,13 +17,13 @@ int main() {
     options.artifact_path = artifact;
     options.purpose       = ninfer::EnginePurpose::CausalScoring;
     options.max_context   = 2048;
-    options.kv_cache      = ninfer::KvCacheStorage::Fp8E4M3Row256;
+    options.kv_cache      = ninfer::KvCacheStorage::Fp8E4m3fnGroup128Ue8m0;
     ninfer::Engine engine(options);
     const auto& effective = engine.options();
     if (effective.max_concurrency != 1 || effective.prefill_chunk == 0 ||
         effective.context_cache.enabled ||
         effective.speculative.backend != ninfer::SpeculativeBackend::None ||
-        effective.kv_cache != ninfer::KvCacheStorage::Fp8E4M3Row256) {
+        effective.kv_cache != ninfer::KvCacheStorage::Fp8E4m3fnGroup128Ue8m0) {
         std::cerr << "causal scoring options were not normalized correctly\n";
         return 1;
     }

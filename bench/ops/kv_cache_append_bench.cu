@@ -12,7 +12,7 @@
 #include "core/cyclic_kv_cache.h"
 #include "core/paged_kv_cache.h"
 #include "core/paged_kv_storage.h"
-#include "ninfer_bench_common.h"
+#include "op_measurement.cuh"
 
 #include <cuda_profiler_api.h>
 #include <cuda_runtime.h>
@@ -431,21 +431,7 @@ private:
 
 const char* mode_name(Mode mode) { return mode == Mode::Full ? "full" : "prefix"; }
 
-const char* storage_name(KvCacheStorage storage) {
-    switch (storage) {
-    case KvCacheStorage::BFloat16:
-        return "bf16";
-    case KvCacheStorage::Int8Group64:
-        return "int8";
-    case KvCacheStorage::Fp8E4M3Row256:
-        return "fp8";
-    case KvCacheStorage::Nvfp4Group16:
-        return "nvfp4";
-    case KvCacheStorage::Fp8KeyNvfp4Value:
-        return "k8v4";
-    }
-    return "unknown";
-}
+const char* storage_name(KvCacheStorage storage) { return kv_cache_profile_info(storage).name; }
 
 const char* execution_name(Execution execution) {
     return execution == Execution::Eager ? "eager" : "graph";
@@ -484,7 +470,7 @@ double prefix_useful_bytes(std::int32_t committed, std::int32_t batch) {
 
 template <class Case>
 bench::ColdTiming measure(Case& data, Execution execution, CacheState cache,
-                          bench::TimedGraph* graph, bench::L2FlushBuffer& flush,
+                          bench::measurement::BodyTimedGraph* graph, bench::L2FlushBuffer& flush,
                           CudaExecutionView cuda, int warmup, int repeat) {
     if (execution == Execution::Eager) {
         const auto launch = [&](CudaExecutionView cuda) { data.launch(cuda); };
@@ -546,7 +532,7 @@ void profile_case(Case& data, const char* label, const Options& options,
     const Execution execution = options.execution;
     const CacheState cache = options.cache == CacheMode::Cold ? CacheState::Cold : CacheState::Warm;
     const bool empty       = options.mode == Mode::Prefix && options.max_count == 0;
-    bench::TimedGraph graph;
+    bench::measurement::BodyTimedGraph graph;
     if (execution == Execution::Graph && !empty) {
         data.launch(cuda);
         CUDA_CHECK(cudaStreamSynchronize(stream));
@@ -581,11 +567,12 @@ std::vector<FullGeometry> selected_geometries(FullGeometryChoice choice) {
 std::vector<KvCacheStorage> selected_storages(KvChoice choice) {
     if (choice == KvChoice::Bf16) return {KvCacheStorage::BFloat16};
     if (choice == KvChoice::Int8) return {KvCacheStorage::Int8Group64};
-    if (choice == KvChoice::Fp8) return {KvCacheStorage::Fp8E4M3Row256};
+    if (choice == KvChoice::Fp8) return {KvCacheStorage::Fp8E4m3fnGroup128Ue8m0};
     if (choice == KvChoice::Nvfp4) return {KvCacheStorage::Nvfp4Group16};
     if (choice == KvChoice::K8V4) return {KvCacheStorage::Fp8KeyNvfp4Value};
-    return {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64, KvCacheStorage::Fp8E4M3Row256,
-            KvCacheStorage::Nvfp4Group16, KvCacheStorage::Fp8KeyNvfp4Value};
+    return {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64,
+            KvCacheStorage::Fp8E4m3fnGroup128Ue8m0, KvCacheStorage::Nvfp4Group16,
+            KvCacheStorage::Fp8KeyNvfp4Value};
 }
 
 template <class Case>
@@ -597,7 +584,7 @@ void collect_case(Case& data, Mode mode, const char* geometry, KvCacheStorage st
                   CudaExecutionView cuda, std::vector<Result>& results) {
     const auto stream = cuda.stream();
     const bool empty  = mode == Mode::Prefix && options.max_count == 0;
-    bench::TimedGraph graph;
+    bench::measurement::BodyTimedGraph graph;
     if (empty) {
         data.launch(cuda);
         CUDA_CHECK(cudaStreamSynchronize(stream));
@@ -632,7 +619,7 @@ void collect_case(Case& data, Mode mode, const char* geometry, KvCacheStorage st
                           mode == Mode::Prefix
                               ? (options.max_count < 0 ? tokens : options.max_count)
                               : tokens,
-                          execution == Execution::Graph && !empty ? graph.nodes() : 0,
+                          execution == Execution::Graph && !empty ? graph.body_nodes() : 0,
                           options.graph_calls,
                           logical_cache_bytes,
                           key_vector_bytes,

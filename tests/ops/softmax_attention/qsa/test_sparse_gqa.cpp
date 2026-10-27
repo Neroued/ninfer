@@ -139,8 +139,12 @@ int gate_rounding(DeviceContext& device, KvCacheStorage storage = KvCacheStorage
                                      ? 1
                                      : cache_reference::encode_minifloat(1.0f, false);
                 std::fill_n(v.data.host.begin() + db, 256, one);
-                for (int g = 0; g < v.format.scale_extent; ++g)
-                    cache_reference::write_u16(v.scales.host, sb + 2 * g, half(1.00390625f));
+                for (int g = 0; g < v.format.scale_extent; ++g) {
+                    if (v.format.encoding == cache_reference::Encoding::Fp8)
+                        v.scales.host[sb + g] = 127;
+                    else
+                        cache_reference::write_u16(v.scales.host, sb + 2 * g, half(1.00390625f));
+                }
             }
         }
         v.data.upload();
@@ -312,9 +316,9 @@ int validation(DeviceContext& device) {
     failures += rejects([&] { f.launch(workspace, device.execution_view()); });
     f.cache.k_pages      = k;
     const auto execution = device.execution_view();
-    for (auto storage :
-         {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64, KvCacheStorage::Fp8E4M3Row256,
-          KvCacheStorage::Nvfp4Group16, KvCacheStorage::Fp8KeyNvfp4Value}) {
+    for (auto storage : {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64,
+                         KvCacheStorage::Fp8E4m3fnGroup128Ue8m0, KvCacheStorage::Nvfp4Group16,
+                         KvCacheStorage::Fp8KeyNvfp4Value}) {
         for (int batch : {1, 8}) {
             std::size_t maximum = 0;
             for (int t = 1; t <= 512; ++t)
@@ -346,6 +350,50 @@ int scale_layout(DeviceContext& device, KvCacheStorage storage, int tokens, int 
     device.synchronize();
     return verify(f, "independent scale layout storage=" + std::to_string(int(storage)) +
                          " T=" + std::to_string(tokens));
+}
+
+int wide_scales(DeviceContext& device, KvCacheStorage storage, int tokens, int history) {
+    Fixture f(tokens, 1, history, false, storage);
+    f.dense_rows = true;
+    f.reset();
+    for (auto& value : f.qhost) value = f32_to_bf16(bf16_to_f32(value) / 128.0F);
+    f.q.copy_from_host(f.qhost.data(), f.qhost.size() * sizeof(std::uint16_t));
+    std::fill(f.ghost.begin(), f.ghost.end(), 0);
+    f.gate.copy_from_host(f.ghost.data(), f.ghost.size() * sizeof(std::uint16_t));
+    for (auto* vector : {f.encoded_key.get(), f.encoded_value.get()}) {
+        if (vector->format.encoding != cache_reference::Encoding::Fp8) continue;
+        const bool key = vector == f.encoded_key.get();
+        for (int p = 0; p < f.pages; ++p)
+            for (int h = 0; h < f.kv_heads; ++h)
+                for (int r = 0; r < 64; ++r) {
+                    const auto db = vector->data.offset(r, h, p);
+                    const auto sb = vector->scales.offset(r, h, p);
+                    for (int group = 0; group < 2; ++group) {
+                        const bool wide = key ? (r + h + group) % 3 == 0 : group == 0;
+                        // The scale exceeds FP16, while the decoded operands remain finite
+                        // and exactly representable. Mix these groups with ordinary scales.
+                        vector->scales.host[sb + group] = wide ? 143 : 127;
+                        for (int d = 0; d < 128; ++d) {
+                            const int ordinal = d + (key ? r : 0);
+                            const auto code   = wide ? 1 + ordinal % 3 : 0x30 + 8 * (ordinal % 3);
+                            const auto sign   = key && (hash(d + 256 * r + h) & 1) ? 128 : 0;
+                            vector->data.host[db + group * 128 + d] = std::uint8_t(code | sign);
+                        }
+                    }
+                }
+        vector->data.upload();
+        vector->scales.upload();
+    }
+    CUDA_CHECK(cudaStreamSynchronize(nullptr));
+    const auto bytes = ops::qsa_sparse_gqa_workspace_capacity_bytes(
+        storage, f.q_heads, f.kv_heads, tokens, tokens, 1, f.envelope,
+        device.execution_view().multiprocessor_count());
+    DeviceBuffer scratch(device.device(), std::max<std::size_t>(bytes, 256));
+    MemoryArena arena(scratch.span());
+    f.launch(arena, device.execution_view());
+    device.synchronize();
+    return verify(f, "FP8 exponent range storage=" + std::to_string(int(storage)) +
+                         " T=" + std::to_string(tokens) + " L=" + std::to_string(history));
 }
 
 int quantized_validation(DeviceContext& device, KvCacheStorage storage) {
@@ -422,6 +470,17 @@ void add_cases(OpSuite& suite, KvCacheStorage storage) {
         add_case(suite, 4096, 1, 8192, false, 0);
         for (float magnitude : {0.1f, 1.8f}) add_case(suite, 8, 1, 32772, false, 512, magnitude);
     } else {
+        if (storage == KvCacheStorage::Fp8E4m3fnGroup128Ue8m0 ||
+            storage == KvCacheStorage::Fp8KeyNvfp4Value)
+            for (int t : {64, 256})
+                special("wide_scales/t" + std::to_string(t),
+                        [=](auto& device) { return wide_scales(device, storage, t, t + 63); });
+        if (storage == KvCacheStorage::Fp8E4m3fnGroup128Ue8m0) {
+            special("wide_scales/t256/l8192",
+                    [=](auto& device) { return wide_scales(device, storage, 256, 8192); });
+            special("scale_layout/t512",
+                    [=](auto& device) { return scale_layout(device, storage, 512, 8195); });
+        }
         special("read_footprint/contiguous",
                 [=](auto& device) { return read_footprint(device, storage, false, 1); });
         for (auto [t, l] : {std::pair{1, 2051}, {192, 8195}, {256, 65}})
@@ -519,9 +578,9 @@ void add_local_cases(OpSuite& suite, KvCacheStorage storage) {
 
 int main(int argc, char** argv) {
     OpSuite suite;
-    for (auto storage :
-         {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64, KvCacheStorage::Fp8E4M3Row256,
-          KvCacheStorage::Nvfp4Group16, KvCacheStorage::Fp8KeyNvfp4Value}) {
+    for (auto storage : {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64,
+                         KvCacheStorage::Fp8E4m3fnGroup128Ue8m0, KvCacheStorage::Nvfp4Group16,
+                         KvCacheStorage::Fp8KeyNvfp4Value}) {
         add_cases(suite, storage);
         add_local_cases(suite, storage);
     }

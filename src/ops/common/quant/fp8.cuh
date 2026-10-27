@@ -59,20 +59,23 @@ __device__ __forceinline__ float2 fp8_code2_to_float2(std::uint16_t storage) {
     return static_cast<float2>(value);
 }
 
-// Codes use the reciprocal of the represented FP16 scale; nonzero scales clamp to
-// [2^-24, 65504] before FP16-RNE. A zero absmax produces a zero scale and codes.
-struct Fp8Fp16Scale {
-    __half scale;
+// UE8M0 is a positive binary exponent, biased by 127; byte zero is 2^-127.
+__device__ __forceinline__ float ue8m0_to_float(std::uint8_t scale) {
+    return __uint_as_float(scale ? unsigned(scale) << 23 : 0x00400000u);
+}
+
+struct Fp8Ue8m0Scale {
+    std::uint8_t scale;
     float inverse_scale;
 };
 
-__device__ __forceinline__ Fp8Fp16Scale fp8_fp16_scale(float absmax) {
-    if (absmax == 0.0F) { return {.scale = __float2half_rn(0.0F), .inverse_scale = 0.0F}; }
-    const float raw_scale         = absmax / kFp8E4M3MaxFinite;
-    const float bounded           = fminf(65504.0F, fmaxf(0x1p-24F, raw_scale));
-    const __half scale            = __float2half_rn(bounded);
-    const float represented_scale = __half2float(scale);
-    return {.scale = scale, .inverse_scale = 1.0F / represented_scale};
+__device__ __forceinline__ Fp8Ue8m0Scale fp8_ue8m0_scale(float absmax) {
+    if (absmax == 0.0F) return {127, 1.0F};
+    // 448 = 1.75 * 2^8. Compare the significand before division to round the
+    // exponent upward without log2 or rounding amax/448 at a power-of-two seam.
+    const unsigned bits = __float_as_uint(absmax);
+    const int exponent  = max(0, int(bits >> 23) - 8 + int((bits & 0x7fffffu) > 0x600000u));
+    return {static_cast<std::uint8_t>(exponent), __uint_as_float(unsigned(254 - exponent) << 23)};
 }
 
 __device__ __forceinline__ std::uint8_t fp8_quant_code(float x, float inverse_scale) {
@@ -92,22 +95,35 @@ __device__ __forceinline__ __half2 fp8_code2_to_half2(std::uint16_t storage) {
     return static_cast<__half2>(value);
 }
 
-__device__ __forceinline__ __half2 fp8_dequant_code2_to_half2(std::uint16_t storage, __half scale) {
-    return __hmul2(fp8_code2_to_half2(storage), __halves2half2(scale, scale));
-}
-
-// Eight code bytes share one represented FP16 scale; expansion multiplies in FP16.
-__device__ __forceinline__ int4 fp8_dequant_f16x8(const std::uint8_t* codes, __half scale) {
-    const int2 raw         = load_vec<int2>(codes);
-    const std::uint16_t* c = reinterpret_cast<const std::uint16_t*>(&raw);
+// An already decoded FP16 multiplier, shared by all values in one G128 group.
+__device__ __forceinline__ int4 fp8_dequant_f16x8_scaled(const std::uint8_t* codes, __half scale) {
+    const int2 raw    = load_vec<int2>(codes);
+    const auto* c     = reinterpret_cast<const std::uint16_t*>(&raw);
+    const auto scale2 = __halves2half2(scale, scale);
     unsigned packed[4];
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
-        const __half2 value2 = fp8_dequant_code2_to_half2(c[i], scale);
-        packed[i]            = *reinterpret_cast<const unsigned*>(&value2);
+        const __half2 value = __hmul2(fp8_code2_to_half2(c[i]), scale2);
+        packed[i]           = *reinterpret_cast<const unsigned*>(&value);
     }
-    return make_int4(static_cast<int>(packed[0]), static_cast<int>(packed[1]),
-                     static_cast<int>(packed[2]), static_cast<int>(packed[3]));
+    return make_int4(packed[0], packed[1], packed[2], packed[3]);
+}
+
+// Full UE8M0 range: the first power-of-two multiply is exact for finite E4M3
+// results, and the residual multiplier performs the single final FP16 rounding.
+__device__ __forceinline__ int4 fp8_dequant_f16x8(const std::uint8_t* codes, std::uint8_t scale) {
+    const int primary = min(142, max(113, int(scale)));
+    const auto first  = __ushort_as_half(static_cast<unsigned short>((primary - 112) << 10));
+    int4 result       = fp8_dequant_f16x8_scaled(codes, first);
+    if (int(scale) != primary) {
+        const int residual    = min(15, max(-24, int(scale) - primary));
+        const auto second     = __float2half_rn(__uint_as_float(unsigned(residual + 127) << 23));
+        const auto multiplier = __halves2half2(second, second);
+        auto* pairs           = reinterpret_cast<__half2*>(&result);
+#pragma unroll
+        for (int i = 0; i < 4; ++i) pairs[i] = __hmul2(pairs[i], multiplier);
+    }
+    return result;
 }
 
 } // namespace ninfer::ops::common

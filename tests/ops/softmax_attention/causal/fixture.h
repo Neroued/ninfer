@@ -36,7 +36,7 @@ constexpr std::int32_t kHeadDim          = 256;
 constexpr std::int32_t kQuantGroup       = 64;
 constexpr std::int32_t kQuantGroups      = kHeadDim / kQuantGroup;
 constexpr std::int32_t kFp8QuantGroup    = kHeadDim;
-constexpr std::int32_t kFp8QuantGroups   = 1;
+constexpr std::int32_t kFp8QuantGroups   = 2;
 constexpr std::int32_t kNvfp4QuantGroup  = 16;
 constexpr std::int32_t kNvfp4QuantGroups = kHeadDim / kNvfp4QuantGroup;
 constexpr std::int32_t kNvfp4CodeBytes   = kHeadDim / 2;
@@ -251,6 +251,7 @@ struct HostCache {
     std::vector<std::int8_t> v_i8;
     std::vector<std::uint8_t> k_fp8;
     std::vector<std::uint8_t> v_fp8;
+    std::vector<std::uint8_t> k_fp8_scale, v_fp8_scale;
     std::vector<std::uint16_t> k_scale;
     std::vector<std::uint16_t> v_scale;
     std::vector<std::uint8_t> k_nvfp4;
@@ -272,12 +273,12 @@ void encode_nvfp4_rotated_row(std::span<const float> source, std::size_t source_
                               std::vector<std::uint8_t>& scales, std::size_t scale_base);
 
 void encode_fp8_row(const std::array<float, kHeadDim>& values, std::vector<std::uint8_t>& codes,
-                    std::size_t code_base, std::vector<std::uint16_t>& scales,
+                    std::size_t code_base, std::vector<std::uint8_t>& scales,
                     std::size_t scale_offset);
 
 void encode_fp8_rotated_row(std::span<const float> source, std::size_t source_base,
                             std::vector<std::uint8_t>& codes, std::size_t code_base,
-                            std::vector<std::uint16_t>& scales, std::size_t scale_offset);
+                            std::vector<std::uint8_t>& scales, std::size_t scale_offset);
 
 void encode_rotated_key_row(std::span<const float> source, std::size_t source_base,
                             std::vector<std::int8_t>& codes, std::size_t code_base,

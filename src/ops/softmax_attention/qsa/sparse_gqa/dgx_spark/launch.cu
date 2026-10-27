@@ -1,7 +1,7 @@
 #include "ops/softmax_attention/qsa/sparse_gqa/plan.h"
 #include "ops/common/host/launch.h"
 #include "ops/softmax_attention/qsa/sparse_gqa/columns.cuh"
-#include "ops/softmax_attention/qsa/sparse_gqa/grouped.cuh"
+#include "ops/softmax_attention/qsa/sparse_gqa/dgx_spark/grouped.cuh"
 #include "ops/softmax_attention/qsa/sparse_gqa/kernel.cuh"
 #include "ops/softmax_attention/qsa/sparse_gqa/simt.cuh"
 
@@ -10,10 +10,13 @@ namespace {
 template <KvCacheStorage Storage, bool Vector, SparseGqaLoad Load, int N, int Parts,
           int PrefixQueries = 0, int KvHeads>
 void launch_columns(SparseGqaKernelArguments<KvHeads> a, int queries, cudaStream_t stream) {
-    constexpr auto kernel =
-        sparse_gqa_columns_kernel<Storage, N, Parts, Vector, Load, PrefixQueries, KvHeads>;
+    constexpr bool SharedScales =
+        SparseGqaCodec<Storage, true>::format == KvCacheVectorFormat::Fp8E4m3fnGroup128Ue8m0 &&
+        N == 16 && Parts == 2 && PrefixQueries == 8 && Vector && Load == SparseGqaLoad::Staged;
+    constexpr auto kernel = sparse_gqa_columns_kernel<Storage, N, Parts, Vector, Load,
+                                                      PrefixQueries, SharedScales, KvHeads>;
     constexpr int bytes =
-        sizeof(SparseGqaStorage<Storage, N, Parts, Load, SparseGqaWarpSplit::Output>);
+        sizeof(SparseGqaOutputTile<Storage, N, Parts, Vector, Load, SharedScales>);
     const int shared = common::prepare_shared<bytes, kernel, true>();
     a.key_rows       = N;
     kernel<<<dim3(queries * a.kv_heads, a.splits), Parts * 32, shared, stream>>>(a);
@@ -50,21 +53,22 @@ void launch(const SparseGqaArguments& arguments, SparseGqaPlan plan, SparseGqaLa
     a.key_rows           = selected.kernel == SparseGqaKernel::Columns16 ? 16 : 32;
     constexpr bool Async = kSparseQuantized<Storage> && Vector;
     if (plan.instance == SparseGqaInstance::Grouped) {
-        constexpr int Queries = 8, N = 32, Parts = kSparseQuantized<Storage> ? 2 : 1;
-        constexpr int Warps   = Queries * 12 / 16 * Parts;
-        constexpr auto load   = Async ? SparseGqaLoad::Staged : SparseGqaLoad::Direct;
-        constexpr auto kernel =
-            sparse_gqa_grouped_kernel<Storage, N, Parts, Queries, Vector, load, KvHeads>;
-        constexpr int bytes   = std::max(
-            (sizeof(SparseGqaStorage<Storage, N, Warps, load, SparseGqaWarpSplit::Output>) + 15) /
-                    16 * 16 +
-                Queries * 12 * 256 * 2,
-            std::size_t(Queries * 12 * 256 * sizeof(float)));
-        const int shared = common::prepare_shared<bytes, kernel, true>();
-        auto prefix      = a;
-        prefix.key_rows  = N;
-        kernel<<<(queries + Queries - 1) / Queries * a.kv_heads, Warps * 32, shared, stream>>>(
-            prefix);
+        using Instance        = SparseGqaGroupedInstance<Storage>;
+        constexpr int Queries = Instance::kQueries, N = Instance::kKeyRows,
+                      Parts = Instance::kParts, Warps = Instance::kWarps;
+        constexpr auto load = Async ? SparseGqaLoad::Staged : SparseGqaLoad::Direct;
+        if constexpr (Storage == KvCacheStorage::Fp8E4m3fnGroup128Ue8m0 && Vector)
+            launch_sparse_gqa_fp8_grouped(arguments, KvHeads, selected.splits, queries, execution);
+        else {
+            constexpr auto kernel =
+                sparse_gqa_grouped_kernel<Storage, N, Parts, Queries, Vector, load, KvHeads>;
+            constexpr int bytes = Instance::template shared_bytes<Vector, load>;
+            const int shared    = common::prepare_shared<bytes, kernel, true>();
+            auto prefix         = a;
+            prefix.key_rows     = N;
+            kernel<<<(queries + Queries - 1) / Queries * a.kv_heads, Warps * 32, shared, stream>>>(
+                prefix);
+        }
         // Device metadata gives each query to exactly one pass, including mixed histories
         // and partial groups. Both nodes remain present for every execution envelope.
         // The two passes remain selected only by Device metadata. Avoid a nearly
@@ -121,8 +125,8 @@ void launch_sparse_gqa_instance(SparseGqaArguments a, KvCacheStorage storage, in
     case KvCacheStorage::BFloat16:
         dispatch.template operator()<KvCacheStorage::BFloat16>();
         break;
-    case KvCacheStorage::Fp8E4M3Row256:
-        dispatch.template operator()<KvCacheStorage::Fp8E4M3Row256>();
+    case KvCacheStorage::Fp8E4m3fnGroup128Ue8m0:
+        dispatch.template operator()<KvCacheStorage::Fp8E4m3fnGroup128Ue8m0>();
         break;
     case KvCacheStorage::Int8Group64:
         dispatch.template operator()<KvCacheStorage::Int8Group64>();

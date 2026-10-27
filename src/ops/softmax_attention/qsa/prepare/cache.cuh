@@ -1,7 +1,7 @@
 #pragma once
 
 #include "ninfer/types.h"
-#include "ops/common/quant/fp8.cuh"
+#include "ops/kv_cache/kernels/fp8.cuh"
 #include "ops/kv_cache/kernels/hadamard.cuh"
 #include "ops/common/quant/integer.cuh"
 #include "ops/common/quant/nvfp4.cuh"
@@ -26,14 +26,7 @@ __device__ __forceinline__ void store_int8(const float (&values)[8], std::uint8_
 
 __device__ __forceinline__ void store_fp8(const float (&values)[8], std::uint8_t* codes,
                                           std::uint8_t* scales, int lane) {
-    float absmax = 0;
-#pragma unroll
-    for (float value : values) absmax = fmaxf(absmax, fabsf(value));
-    const auto quant = common::fp8_fp16_scale(common::warp_max(absmax));
-#pragma unroll
-    for (int j = 0; j < 8; ++j)
-        codes[lane + 32 * j] = common::fp8_quant_code(values[j], quant.inverse_scale);
-    if (lane == 0) *reinterpret_cast<__half*>(scales) = quant.scale;
+    kv::store_fp8_d256(values, codes, scales, lane);
 }
 
 __device__ __forceinline__ void store_nvfp4(const float (&values)[8], std::uint8_t* codes,
@@ -65,7 +58,7 @@ __device__ __forceinline__ void store_quantized(const float (&values)[8], std::u
                                                 std::uint8_t* scales, int lane, float* scratch) {
     if constexpr (Storage == KvCacheStorage::Int8Group64)
         store_int8(values, codes, scales, lane);
-    else if constexpr (Storage == KvCacheStorage::Fp8E4M3Row256)
+    else if constexpr (Storage == KvCacheStorage::Fp8E4m3fnGroup128Ue8m0)
         store_fp8(values, codes, scales, lane);
     else {
         static_assert(Storage == KvCacheStorage::Nvfp4Group16);
@@ -97,8 +90,9 @@ __device__ __forceinline__ void prepare_kv(const PrepareArguments& a, int head, 
         norm_rotate<256>(values, a.wk, a.epsilon, sc, lane);
         // The transformed FP32 key enters the codec directly, without a BF16 intermediate.
         kv::normalized_hadamard_d256_inplace(values, lane);
-        constexpr auto key_storage =
-            Storage == KvCacheStorage::Fp8KeyNvfp4Value ? KvCacheStorage::Fp8E4M3Row256 : Storage;
+        constexpr auto key_storage = Storage == KvCacheStorage::Fp8KeyNvfp4Value
+                                         ? KvCacheStorage::Fp8E4m3fnGroup128Ue8m0
+                                         : Storage;
         constexpr auto value_storage =
             Storage == KvCacheStorage::Fp8KeyNvfp4Value ? KvCacheStorage::Nvfp4Group16 : Storage;
         store_quantized<key_storage>(values, key, a.key_scales.at(p % 64, head, page), lane,

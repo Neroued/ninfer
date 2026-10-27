@@ -1,5 +1,5 @@
 #pragma once
-#include "ops/softmax_attention/qsa/sparse_gqa/tile.cuh"
+#include "ops/softmax_attention/qsa/sparse_gqa/grouped_tile.cuh"
 #include "ops/softmax_attention/qsa/sparse_gqa/epilogue.cuh"
 #include "ops/softmax_attention/kernels/softmax.cuh"
 
@@ -12,8 +12,9 @@ __global__ __launch_bounds__(Queries* Parts * 24) void sparse_gqa_grouped_kernel
     // Twelve heads per query occupy consecutive MMA rows, without per-query padding.
     constexpr int Rows = Queries * 12, Warps = Rows / 16 * Parts, Columns = 256 / Parts / 8;
     extern __shared__ __align__(16) unsigned char packed_smem[];
-    using Tile = SparseGqaStorage<Storage, N, Warps, Load, SparseGqaWarpSplit::Output>;
-    auto& s    = *reinterpret_cast<Tile*>(packed_smem);
+    using Tile       = SparseGqaGroupedTile<Storage, N, Warps, Vector, Load>;
+    auto& tile       = *reinterpret_cast<Tile*>(packed_smem);
+    auto& s          = static_cast<typename Tile::Base&>(tile);
     auto* qs   = reinterpret_cast<std::uint16_t*>(packed_smem + (sizeof(Tile) + 15) / 16 * 16);
     const auto first = a.begin + std::int64_t(a.group_query(blockIdx.x)) * Queries,
                total = std::int64_t(a.tokens) * a.batch;
@@ -67,16 +68,19 @@ __global__ __launch_bounds__(Queries* Parts * 24) void sparse_gqa_grouped_kernel
     OnlineSoftmaxRow state[2];
     constexpr float scale = common::kLog2E / 16;
     const SparseGqaWork work{end / 4, end / 4, end, 0, 1};
+    typename Tile::State scale_state;
     if (end) {
         sparse_gqa_addresses<Storage>(a, s, work, last - 1, head, 0, end);
-        sparse_gqa_stage<Storage, N, Warps, Vector, true>(a, s, 0, end);
+        scale_state = tile.prefetch(a, 0, end);
         common::cp_commit();
     }
     for (int k0 = 0; k0 < end; k0 += N) {
-        common::cp_wait<0>();
-        __syncthreads();
-        sparse_gqa_expand_stage<Storage, true>(s);
-        sparse_gqa_stage<Storage, N, Warps, Vector, false>(a, s, k0, end);
+        tile.wait_key(scale_state);
+        tile.template expand<true>(scale_state);
+        if constexpr (Tile::joint_scales)
+            tile.stage_value(a, k0, end);
+        else
+            tile.stage_value(scale_state, a, k0, end);
         common::cp_commit();
         float score[N / 8][4]{};
 #pragma unroll
@@ -95,12 +99,14 @@ __global__ __launch_bounds__(Queries* Parts * 24) void sparse_gqa_grouped_kernel
                 sparse_gqa_qk<Storage>(score[n], qf, bf);
             }
         }
-        common::cp_wait<0>();
-        __syncthreads();
-        sparse_gqa_expand_stage<Storage, false>(s);
+        if constexpr (Tile::joint_scales)
+            tile.wait_value();
+        else
+            tile.wait_value(scale_state);
+        tile.template expand<false>(scale_state);
         if (k0 + N < end) {
             sparse_gqa_addresses<Storage>(a, s, work, last - 1, head, k0 + N, end);
-            sparse_gqa_stage<Storage, N, Warps, Vector, true>(a, s, k0 + N, end);
+            scale_state = tile.prefetch(a, k0 + N, end);
             common::cp_commit();
         }
         float maximum[2] = {-CUDART_INF_F, -CUDART_INF_F};

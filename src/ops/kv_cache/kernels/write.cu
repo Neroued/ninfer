@@ -48,7 +48,7 @@ void launch_quantized(const WriteArguments& a, Metadata metadata, cudaStream_t s
                 return write_i8_page_kernel<G, Metadata>;
             else
                 return write_i8_kernel<G, Metadata, Batch>;
-        } else if constexpr (Storage == KvCacheStorage::Fp8E4M3Row256) {
+        } else if constexpr (Storage == KvCacheStorage::Fp8E4m3fnGroup128Ue8m0) {
             if constexpr (Page)
                 return write_fp8_page_kernel<G, Metadata>;
             else if constexpr (Batch)
@@ -71,10 +71,8 @@ void launch_quantized(const WriteArguments& a, Metadata metadata, cudaStream_t s
     using Code =
         std::conditional_t<Storage == KvCacheStorage::Int8Group64, std::int8_t, std::uint8_t>;
     using KeyScale =
-        std::conditional_t<Storage == KvCacheStorage::Nvfp4Group16, std::uint8_t, __half>;
-    using ValueScale = std::conditional_t<Storage == KvCacheStorage::Nvfp4Group16 ||
-                                              Storage == KvCacheStorage::Fp8KeyNvfp4Value,
-                                          std::uint8_t, __half>;
+        std::conditional_t<Storage == KvCacheStorage::Int8Group64, __half, std::uint8_t>;
+    using ValueScale = KeyScale;
     const dim3 grid  = Page ? dim3(common::div_up(a.width + 7, 8), G::KVHeads)
                             : dim3(common::div_up(a.width * G::KVHeads, 8), 1, Batch ? a.batch : 1);
     kernel<<<grid, 256, 0, stream>>>(
@@ -136,8 +134,9 @@ void storage_dispatch(KvCacheStorage storage, PagedWriteInstance instance, const
         return launch_instance<KvCacheStorage::BFloat16, G>(instance, a, metadata, stream);
     case KvCacheStorage::Int8Group64:
         return launch_instance<KvCacheStorage::Int8Group64, G>(instance, a, metadata, stream);
-    case KvCacheStorage::Fp8E4M3Row256:
-        return launch_instance<KvCacheStorage::Fp8E4M3Row256, G>(instance, a, metadata, stream);
+    case KvCacheStorage::Fp8E4m3fnGroup128Ue8m0:
+        return launch_instance<KvCacheStorage::Fp8E4m3fnGroup128Ue8m0, G>(instance, a, metadata,
+                                                                          stream);
     case KvCacheStorage::Nvfp4Group16:
         return launch_instance<KvCacheStorage::Nvfp4Group16, G>(instance, a, metadata, stream);
     case KvCacheStorage::Fp8KeyNvfp4Value:

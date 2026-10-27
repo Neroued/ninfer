@@ -126,6 +126,9 @@ private:
                 CUDA_CHECK(cudaMemcpy2D(dense_plane, width, record_plane, stride_, width, pages_,
                                         cudaMemcpyDefault));
         }
+        // Device-to-device cudaMemcpy2D may return before completion. Callers launch
+        // on independent nonblocking streams, so complete this fixture-owned copy.
+        CUDA_CHECK(cudaStreamSynchronize(nullptr));
     }
 
     KVPageLayout layout_;

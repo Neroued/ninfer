@@ -1,4 +1,5 @@
 #pragma once
+#include "ops/kv_cache/kernels/write/fp8.cuh"
 #include "ops/common/quant/fp8.cuh"
 #include "ops/kv_cache/kernels/layout.cuh"
 #include "ops/softmax_attention/kernels/causal/tile_io.cuh"
@@ -8,6 +9,8 @@
 #include "ops/softmax_attention/kernels/causal/epilogue.cuh"
 #include "ops/softmax_attention/kernels/softmax.cuh"
 #include "ops/kv_cache/kernels/hadamard.cuh"
+
+#include <type_traits>
 
 namespace ninfer::ops::detail {
 
@@ -63,8 +66,11 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
     __nv_bfloat16* k_b16 = reinterpret_cast<__nv_bfloat16*>(k_fp8);
     __shared__ __align__(16) __half p_s[Br * PStride];
     __shared__ float alpha_s[Br];
-    __shared__ __align__(16) __half k_scale_s[Bc];
-    __shared__ __align__(16) __half v_scale_s[Bc];
+    __shared__ __align__(16) std::uint8_t k_scale_s[2 * Bc];
+    // Parallel query CTAs decode each G128 multiplier once, retaining its raw exponent
+    // for the uncommon full-range decoder. Other schedules keep their own scale loads.
+    using ValueScale = std::conditional_t<ParallelQueries, unsigned, std::uint8_t>;
+    __shared__ __align__(16) ValueScale v_scale_s[2 * Bc];
 
     static_assert(!ParallelQueries || !CacheInput::writes_cache,
                   "Parallel query tiles read the completed represented cache");
@@ -128,56 +134,12 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
     const int first_page       = first_tile >> kv::kPageShift;
 
     if constexpr (CacheInput::writes_cache) {
-        // One warp owns the complete D256 K row and then the complete V row. This is the
-        // same operation and rounding order as standalone append, including the represented
-        // FP16 scale feedback before code formation.
         for (int token = warp; token < valid_tokens; token += Wc) {
             const int position = positions[token];
             if (position < split_start || position >= split_end) continue;
-            const std::int64_t record_offset = block_table[position >> kv::kPageShift];
-            const int page_offset            = position & kv::kPageMask;
-            float values[8];
-            float local_absmax = 0.0F;
-#pragma unroll
-            for (int r = 0; r < 8; ++r) {
-                const int d = lane + 32 * r;
-                values[r] =
-                    __bfloat162float(input.k[kv::source_offset<Geometry>(kv_head, d, token)]);
-            }
-            kv::normalized_hadamard_d256_inplace(values, lane);
-#pragma unroll
-            for (float value : values) local_absmax = fmaxf(local_absmax, fabsf(value));
-            const auto k_quant = common::fp8_fp16_scale(common::warp_max(local_absmax, FullMask));
-#pragma unroll
-            for (int r = 0; r < 8; ++r) {
-                const int d = lane + 32 * r;
-                cache_k[kv::Fp8RowLayout::code_offset(record_offset, kv_head, d, page_offset)] =
-                    common::fp8_quant_code(values[r], k_quant.inverse_scale);
-            }
-            if (lane == 0) {
-                cache_k_scale[kv::Fp8RowLayout::scale_offset(record_offset, kv_head, page_offset)] =
-                    k_quant.scale;
-            }
-
-            local_absmax = 0.0F;
-#pragma unroll
-            for (int r = 0; r < 8; ++r) {
-                const int d = lane + 32 * r;
-                values[r] =
-                    __bfloat162float(input.v[kv::source_offset<Geometry>(kv_head, d, token)]);
-                local_absmax = fmaxf(local_absmax, fabsf(values[r]));
-            }
-            const auto v_quant = common::fp8_fp16_scale(common::warp_max(local_absmax, FullMask));
-#pragma unroll
-            for (int r = 0; r < 8; ++r) {
-                const int d = lane + 32 * r;
-                cache_v[kv::Fp8RowLayout::code_offset(record_offset, kv_head, d, page_offset)] =
-                    common::fp8_quant_code(values[r], v_quant.inverse_scale);
-            }
-            if (lane == 0) {
-                cache_v_scale[kv::Fp8RowLayout::scale_offset(record_offset, kv_head, page_offset)] =
-                    v_quant.scale;
-            }
+            kv::write_fp8_row<Geometry>(
+                input.k, input.v, cache_k, cache_v, cache_k_scale, cache_v_scale, token, kv_head,
+                block_table[position >> kv::kPageShift], position & kv::kPageMask, lane);
         }
         __syncthreads();
     }
@@ -246,31 +208,47 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
     float l1 = 0.0F;
 
     auto issue_kv_tile = [&](int tile_k0, std::int64_t record_offset) {
-        if constexpr (TokenTile == 1 && Bc == 32) {
+        bool single_factor = true;
+        if constexpr (TokenTile == 1 && Bc == 32 && !ParallelQueries) {
             for (int chunk = tid; chunk < Bc / 8; chunk += Threads) {
                 const int key_l      = chunk * 8;
                 const int key        = tile_k0 + key_l;
                 const int valid_keys = max(0, min(8, split_end - key));
                 const std::int64_t scale_offset =
-                    kv::Fp8RowLayout::scale_offset(record_offset, kv_head, key & kv::kPageMask);
-                common::cp_async_zfill<16, Cache::cg>(
-                    &k_scale_s[key_l], &cache_k_scale[scale_offset],
-                    valid_keys * static_cast<int>(sizeof(__half)));
-                common::cp_async_zfill<16, Cache::cg>(
-                    &v_scale_s[key_l], &cache_v_scale[scale_offset],
-                    valid_keys * static_cast<int>(sizeof(__half)));
+                    kv::Fp8G128Layout::scale_offset(record_offset, kv_head, key & kv::kPageMask);
+                common::cp_async_zfill<16, Cache::cg>(&k_scale_s[2 * key_l],
+                                                      &cache_k_scale[scale_offset], valid_keys * 2);
+                common::cp_async_zfill<16, Cache::cg>(&v_scale_s[2 * key_l],
+                                                      &cache_v_scale[scale_offset], valid_keys * 2);
             }
         } else {
             for (int key_l = tid; key_l < Bc; key_l += Threads) {
                 const int key = tile_k0 + key_l;
                 if (key >= split_start && key < split_end) {
-                    const std::int64_t scale_offset =
-                        kv::Fp8RowLayout::scale_offset(record_offset, kv_head, key & kv::kPageMask);
-                    k_scale_s[key_l] = cache_k_scale[scale_offset];
-                    v_scale_s[key_l] = cache_v_scale[scale_offset];
+                    const std::int64_t scale_offset = kv::Fp8G128Layout::scale_offset(
+                        record_offset, kv_head, key & kv::kPageMask);
+                    *reinterpret_cast<std::uint16_t*>(k_scale_s + 2 * key_l) =
+                        *reinterpret_cast<const std::uint16_t*>(cache_k_scale + scale_offset);
+                    const unsigned pair =
+                        *reinterpret_cast<const std::uint16_t*>(cache_v_scale + scale_offset);
+                    if constexpr (ParallelQueries) {
+#pragma unroll
+                        for (int group = 0; group < 2; ++group) {
+                            const unsigned raw = pair >> (group * 8) & 255u;
+                            const auto factor  = __float2half_rn(__uint_as_float(raw << 23));
+                            v_scale_s[2 * key_l + group] =
+                                unsigned(__half_as_ushort(factor)) | (raw << 16);
+                            single_factor &= raw >= 103 && raw <= 142;
+                        }
+                    } else
+                        *reinterpret_cast<std::uint16_t*>(v_scale_s + 2 * key_l) = pair;
                 } else {
-                    k_scale_s[key_l] = __float2half_rn(0.0F);
-                    v_scale_s[key_l] = __float2half_rn(0.0F);
+                    *reinterpret_cast<std::uint16_t*>(k_scale_s + 2 * key_l) = 0;
+                    if constexpr (ParallelQueries) {
+                        v_scale_s[2 * key_l]     = 0;
+                        v_scale_s[2 * key_l + 1] = 0;
+                    } else
+                        *reinterpret_cast<std::uint16_t*>(v_scale_s + 2 * key_l) = 0;
                 }
             }
         }
@@ -284,7 +262,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
                 &k_fp8[(key_l * DB16 + common::swizzle_xor_64(key_l, dc * 8)) * 2];
             if (key >= split_start && key < split_end) {
                 const std::int64_t code_offset =
-                    kv::Fp8RowLayout::code_offset(record_offset, kv_head, d, key & kv::kPageMask);
+                    kv::Fp8G128Layout::code_offset(record_offset, kv_head, d, key & kv::kPageMask);
                 common::cp_async<16, Cache::cg>(k_dst, &cache_k[code_offset]);
                 common::cp_async<16, Cache::cg>(&v_fp8[key_l * D + d], &cache_v[code_offset]);
             } else {
@@ -293,12 +271,16 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
             }
         }
         common::cp_commit();
+        return single_factor;
     };
 
     std::int64_t record_offset = block_table[first_page];
-    issue_kv_tile(first_tile, record_offset);
+    bool value_half            = issue_kv_tile(first_tile, record_offset);
     common::cp_wait<0>();
-    __syncthreads();
+    if constexpr (ParallelQueries)
+        value_half = __syncthreads_and(value_half);
+    else
+        __syncthreads();
 
     for (int kb = 0; kb < key_blocks; ++kb) {
         const int k0 = first_tile + kb * Bc;
@@ -330,22 +312,18 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
                             bf[0], bf[1],
                             common::smem_addr(
                                 &k_b16[brow * DB16 + common::swizzle_xor_64(brow, bcol)]));
-                        common::mma_fp8_e4m3(score[nt][0], score[nt][1], score[nt][2], score[nt][3],
-                                             af[0], af[1], af[2], af[3], bf[0], bf[1]);
+                        common::mma_fp8_e4m3_scaled(score[nt][0], score[nt][1], score[nt][2],
+                                                    score[nt][3], af[0], af[1], af[2], af[3], bf[0],
+                                                    bf[1], 0x7fu,
+                                                    k_scale_s[2 * (nt * 8 + gid) + kk / 4]);
                     }
                 }
 #pragma unroll
                 for (int nt = 0; nt < QKNt; ++nt) {
-                    const int keya = nt * 8 + 2 * lid;
-                    const int keyb = keya + 1;
-                    float ks0      = gid == 0 ? __half2float(k_scale_s[keya]) : 0.0F;
-                    float ks1      = gid == 0 ? __half2float(k_scale_s[keyb]) : 0.0F;
-                    ks0            = __shfl_sync(FullMask, ks0, lid);
-                    ks1            = __shfl_sync(FullMask, ks1, lid);
-                    score[nt][0] *= q_scale_r0 * ks0;
-                    score[nt][1] *= q_scale_r0 * ks1;
-                    score[nt][2] *= q_scale_r1 * ks0;
-                    score[nt][3] *= q_scale_r1 * ks1;
+                    score[nt][0] *= q_scale_r0;
+                    score[nt][1] *= q_scale_r0;
+                    score[nt][2] *= q_scale_r1;
+                    score[nt][3] *= q_scale_r1;
                 }
 
                 const int row0 = row_base + gid;
@@ -428,30 +406,47 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
             }
         } else {
             const int loader_tid = tid - ProducerThreads;
+            const auto expand_values = [&]<bool SingleFactor>() {
 #pragma unroll 1
-            for (int chunk = loader_tid; chunk < Bc * (D / 8); chunk += VLoaderThreads) {
-                const int key_l = chunk / (D / 8);
-                const int dc    = chunk - key_l * (D / 8);
-                const int d     = dc * 8;
-                const int key   = k0 + key_l;
-                __half* dst     = &v_f16[key_l * D + common::swizzle_xor_64(key_l, d)];
-                if (key >= split_start && key < split_end) {
-                    common::store_vec(
-                        dst, common::fp8_dequant_f16x8(&v_fp8[key_l * D + d], v_scale_s[key_l]));
-                } else {
-                    common::store_vec(dst, make_int4(0, 0, 0, 0));
+                for (int chunk = loader_tid; chunk < Bc * (D / 8); chunk += VLoaderThreads) {
+                    const int key_l = chunk / (D / 8);
+                    const int dc    = chunk - key_l * (D / 8);
+                    const int d     = dc * 8;
+                    const int key   = k0 + key_l;
+                    __half* dst     = &v_f16[key_l * D + common::swizzle_xor_64(key_l, d)];
+                    if (key >= split_start && key < split_end) {
+                        const auto factor = v_scale_s[2 * key_l + d / 128];
+                        int4 value;
+                        if constexpr (SingleFactor)
+                            value = common::fp8_dequant_f16x8_scaled(&v_fp8[key_l * D + d],
+                                                                     __ushort_as_half(factor));
+                        else
+                            value = common::fp8_dequant_f16x8(
+                                &v_fp8[key_l * D + d], ParallelQueries ? factor >> 16 : factor);
+                        common::store_vec(dst, value);
+                    } else {
+                        common::store_vec(dst, make_int4(0, 0, 0, 0));
+                    }
                 }
-            }
+            };
+            if constexpr (ParallelQueries) {
+                if (value_half)
+                    expand_values.template operator()<true>();
+                else
+                    expand_values.template operator()<false>();
+            } else
+                expand_values.template operator()<false>();
         }
         __syncthreads();
 
         const bool has_next = kb + 1 < key_blocks;
+        bool next_value_half = true;
         if (has_next) {
             const int next_k0 = k0 + Bc;
             if ((next_k0 & kv::kPageMask) == 0) {
                 record_offset = block_table[next_k0 >> kv::kPageShift];
             }
-            issue_kv_tile(next_k0, record_offset);
+            next_value_half = issue_kv_tile(next_k0, record_offset);
         }
 
         const int consumer_tile     = warp % RowTiles;
@@ -491,7 +486,10 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
             }
         }
         if (has_next) { common::cp_wait<0>(); }
-        __syncthreads();
+        if constexpr (ParallelQueries)
+            value_half = __syncthreads_and(next_value_half);
+        else
+            __syncthreads();
     }
 
     if (warp < RowTiles && lid == 0) {

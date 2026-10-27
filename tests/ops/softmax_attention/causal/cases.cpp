@@ -143,7 +143,7 @@ void add_batch_cases(OpSuite& suite, KvCacheStorage storage) {
                         502u});
         add_batch_case(suite, kGeometries[0], storage,
                        {6, {61, 127, 511}, {6, 3, 0}, {2, 0, 1}, MappingPattern::Fragmented, 503u});
-    } else if (storage == KvCacheStorage::Fp8E4M3Row256) {
+    } else if (storage == KvCacheStorage::Fp8E4m3fnGroup128Ue8m0) {
         add_batch_case(suite, kGeometries[0], storage,
                        {6, {61, 127, 511}, {6, 3, 0}, {2, 0, 1}, MappingPattern::Fragmented, 505u});
     }
@@ -239,7 +239,7 @@ void add_quantized_causal_cases(OpSuite& suite, KvCacheStorage storage) {
         const std::array<int, 4> queries{0, 63, 64, 1023};
         add_append_case(suite, geometry, storage, {1024, 8192, 9216, 611u},
                         MappingPattern::Fragmented, queries);
-        if (storage == KvCacheStorage::Fp8E4M3Row256 ||
+        if (storage == KvCacheStorage::Fp8E4m3fnGroup128Ue8m0 ||
             storage == KvCacheStorage::Fp8KeyNvfp4Value) {
             // Ragged prefill, changing page metadata, and wholly masked query tiles.
             add_batch_case(suite, geometry, storage,
@@ -396,7 +396,7 @@ void add_small_prefill_cases(OpSuite& suite, KvCacheStorage storage) {
                         boundary_queries);
         add_batch_case(suite, geometry, storage,
                        {65, {8191}, {17}, {0}, MappingPattern::Fragmented, 1304u}, 32768);
-        if (storage == KvCacheStorage::Fp8E4M3Row256 ||
+        if (storage == KvCacheStorage::Fp8E4m3fnGroup128Ue8m0 ||
             storage == KvCacheStorage::Fp8KeyNvfp4Value) {
             add_cached_case(suite, geometry, storage,
                             {34, 8192, 32768, 1305u, false, false, 1.8f * std::sqrt(3.0f)},
@@ -442,9 +442,9 @@ void add_storage_cases(OpSuite& suite, KvCacheStorage storage) {
 } // namespace
 
 void add_cases(OpSuite& suite) {
-    for (auto storage :
-         {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64, KvCacheStorage::Fp8E4M3Row256,
-          KvCacheStorage::Nvfp4Group16, KvCacheStorage::Fp8KeyNvfp4Value})
+    for (auto storage : {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64,
+                         KvCacheStorage::Fp8E4m3fnGroup128Ue8m0, KvCacheStorage::Nvfp4Group16,
+                         KvCacheStorage::Fp8KeyNvfp4Value})
         add_storage_cases(suite, storage);
 }
 } // namespace ninfer::test::causal_attention

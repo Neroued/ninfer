@@ -1,5 +1,7 @@
 #pragma once
 
+#include "ninfer/kv_cache_format.h"
+
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -11,14 +13,6 @@ namespace ninfer {
 enum class ContextCapacityMode : std::uint8_t {
     Explicit,
     Automatic,
-};
-
-enum class KvCacheStorage : std::uint8_t {
-    BFloat16,
-    Int8Group64,
-    Fp8E4M3Row256,
-    Nvfp4Group16,
-    Fp8KeyNvfp4Value,
 };
 
 // Vision fields describe subsets of the instance's owned allocations.

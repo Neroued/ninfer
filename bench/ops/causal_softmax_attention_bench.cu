@@ -12,7 +12,7 @@
 #include "core/device.h"
 #include "core/paged_kv_cache.h"
 #include "core/paged_kv_storage.h"
-#include "ninfer_bench_common.h"
+#include "op_measurement.cuh"
 
 #include <cuda_profiler_api.h>
 #include <cuda_runtime.h>
@@ -553,21 +553,7 @@ private:
 
 const char* entry_name(Entry entry) { return entry == Entry::Append ? "append" : "cached"; }
 
-const char* storage_name(KvCacheStorage storage) {
-    switch (storage) {
-    case KvCacheStorage::BFloat16:
-        return "bf16";
-    case KvCacheStorage::Int8Group64:
-        return "int8";
-    case KvCacheStorage::Fp8E4M3Row256:
-        return "fp8";
-    case KvCacheStorage::Nvfp4Group16:
-        return "nvfp4";
-    case KvCacheStorage::Fp8KeyNvfp4Value:
-        return "k8v4";
-    }
-    return "unknown";
-}
+const char* storage_name(KvCacheStorage storage) { return kv_cache_profile_info(storage).name; }
 
 const char* execution_name(Execution execution) {
     return execution == Execution::Eager ? "eager" : "graph";
@@ -659,7 +645,7 @@ double unique_kv_bytes(const Geometry& geometry, KvCacheStorage storage,
 }
 
 bench::ColdTiming measure(Case& data, Entry entry, Execution execution, CacheState cache,
-                          bench::TimedGraph* graph, bench::L2FlushBuffer& flush,
+                          bench::measurement::BodyTimedGraph* graph, bench::L2FlushBuffer& flush,
                           CudaExecutionView cuda, int warmup, int repeat) {
     if (execution == Execution::Eager) {
         const auto launch = [&](CudaExecutionView cuda) { data.launch(entry, cuda); };
@@ -741,7 +727,7 @@ void profile(Case& data, Entry entry, const Geometry& geometry, KvCacheStorage s
     const auto stream         = cuda.stream();
     const Execution execution = options.execution;
     const CacheState cache = options.cache == CacheMode::Cold ? CacheState::Cold : CacheState::Warm;
-    bench::TimedGraph graph;
+    bench::measurement::BodyTimedGraph graph;
     if (execution == Execution::Graph) {
         data.launch(entry, cuda);
         CUDA_CHECK(cudaStreamSynchronize(stream));
@@ -784,11 +770,12 @@ std::vector<Geometry> selected_geometries(GeometryChoice choice) {
 std::vector<KvCacheStorage> selected_storages(KvChoice choice) {
     if (choice == KvChoice::Bf16) { return {KvCacheStorage::BFloat16}; }
     if (choice == KvChoice::Int8) { return {KvCacheStorage::Int8Group64}; }
-    if (choice == KvChoice::Fp8) { return {KvCacheStorage::Fp8E4M3Row256}; }
+    if (choice == KvChoice::Fp8) { return {KvCacheStorage::Fp8E4m3fnGroup128Ue8m0}; }
     if (choice == KvChoice::Nvfp4) { return {KvCacheStorage::Nvfp4Group16}; }
     if (choice == KvChoice::K8V4) { return {KvCacheStorage::Fp8KeyNvfp4Value}; }
-    return {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64, KvCacheStorage::Fp8E4M3Row256,
-            KvCacheStorage::Nvfp4Group16, KvCacheStorage::Fp8KeyNvfp4Value};
+    return {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64,
+            KvCacheStorage::Fp8E4m3fnGroup128Ue8m0, KvCacheStorage::Nvfp4Group16,
+            KvCacheStorage::Fp8KeyNvfp4Value};
 }
 
 struct RowProfile {
@@ -880,7 +867,7 @@ int main(int argc, char** argv) {
                                     (entry == Entry::Cached && batch != 1)) {
                                     continue;
                                 }
-                                bench::TimedGraph graph;
+                                bench::measurement::BodyTimedGraph graph;
                                 if (options.execution != Execution::Eager) {
                                     data.launch(entry, cuda);
                                     CUDA_CHECK(cudaStreamSynchronize(stream));
@@ -939,7 +926,7 @@ int main(int argc, char** argv) {
                                             measure(data, entry, execution, cache, &graph, flush,
                                                     cuda, options.warmup, options.repeat)};
                                         result.graph_nodes =
-                                            execution == Execution::Graph ? graph.nodes() : 0;
+                                            execution == Execution::Graph ? graph.body_nodes() : 0;
                                         result.workspace_peak = data.workspace_peak();
                                         result.envelope       = data.envelope();
                                         result.graph_calls =

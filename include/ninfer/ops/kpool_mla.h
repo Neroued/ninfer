@@ -41,11 +41,19 @@ namespace ninfer::ops {
 enum class KpoolMlaStorage {
     // RN_BF16 of the FP32 normalized latent, shared by K and V; no scales.
     BFloat16,
-    // E4M3FN codes, one FP32 multiplier per contiguous 128 latent features of each token.
-    // Encoder/decoder: docs/maintainer/glm5next-quantization.md, section 3.
-    // Decode on chip as RN_BF16(RN_FP32(E4M3FN(code)*scale)); no basis transform.
-    Fp8E4m3fnGroup128F32,
+    // Shared G128/UE8M0 cache codec, in the original latent basis.
+    Fp8E4m3fnGroup128Ue8m0,
 };
+
+[[nodiscard]] constexpr KvCacheVectorFormat kpool_mla_vector_format(KpoolMlaStorage storage) {
+    switch (storage) {
+    case KpoolMlaStorage::BFloat16:
+        return KvCacheVectorFormat::BFloat16;
+    case KpoolMlaStorage::Fp8E4m3fnGroup128Ue8m0:
+        return KvCacheVectorFormat::Fp8E4m3fnGroup128Ue8m0;
+    }
+    throw std::invalid_argument("Kpool cache: unknown storage");
+}
 
 inline constexpr std::int32_t kKpoolPoolSize          = 4;
 inline constexpr std::int32_t kKpoolSelectedPools     = 512;
@@ -66,7 +74,7 @@ struct KpoolExecutionEnvelope {
 };
 
 // A layer borrows planes of one page-group record. The data plane is BF16 or E4M3FN [Dc,64,1]
-// according to storage, with tokens_per_row=1; the optional scale plane is FP32 [Dc/128,64,1],
+// according to storage, with tokens_per_row=1; the optional scale plane is U8 UE8M0 [Dc/128,64,1],
 // also tokens_per_row=1.
 // BF16 has no scale plane. FP8 requires Dc divisible by 128. Planes start at 256-byte-aligned
 // record offsets and are dense [feature,row,head]. The I64 [logical_pages,table_rows] table
@@ -326,9 +334,9 @@ struct KpoolMlaFactors {
  * is no RoPE, bias, output gate, sink or forced self token. attention_scale is finite positive,
  * supplied by the caller (1/16 for Dq=256); it is not derived from Dc.
  *
- * c_j is the actual stored BF16 value or the FP8 profile's decoded BF16 operand. The same c_j
- * serves both latent K/V roles, including newly written tokens. Factor/QK/weighted contractions
- * follow BF16/F32 computation; softmax statistics, exponentials and split merges are FP32.
+ * The implemented BF16 path uses the actual stored BF16 c_j for both latent K/V roles,
+ * including newly written tokens. Factor/QK/weighted contractions follow BF16/F32 computation;
+ * softmax statistics, exponentials and split merges are FP32. FP8 execution is not yet supported.
  * q_latent/u are private intermediates, may retain FP32, and impose no additional observable
  * BF16 seam or global materialization. Final O projection is outside this Op. Inputs/results
  * participating in the mathematics are finite; all inputs/cache/selection are preserved.

@@ -5,13 +5,8 @@
 namespace ninfer::ops {
 namespace {
 int planes_per_layer(KpoolMlaStorage storage) {
-    switch (storage) {
-    case KpoolMlaStorage::BFloat16:
-        return 2;
-    case KpoolMlaStorage::Fp8E4m3fnGroup128F32:
-        return 3;
-    }
-    throw std::invalid_argument("Kpool cache: unknown storage");
+    const auto format = kv_cache_format_info(kpool_mla_vector_format(storage));
+    return 2 + (format.scale != KvCacheScaleFormat::None);
 }
 
 void check_layer(const KpoolMlaCacheLayout& layout, int layer, std::uint32_t page_tokens) {
@@ -24,15 +19,15 @@ void check_layer(const KpoolMlaCacheLayout& layout, int layer, std::uint32_t pag
 } // namespace
 
 KpoolMlaCacheLayout plan_kpool_mla_cache_layout(const KpoolMlaCacheSpec& spec) {
-    const int count = planes_per_layer(spec.storage);
-    if (spec.latent_dim <= 0 || spec.index_dim <= 0 || spec.layers <= 0 ||
-        (count == 3 && spec.latent_dim % 128))
+    const auto latent =
+        paged_kv_vector_layout(kpool_mla_vector_format(spec.storage), spec.latent_dim);
+    if (spec.latent_dim <= 0 || spec.index_dim <= 0 || spec.layers <= 0)
         throw std::invalid_argument("Kpool cache: invalid geometry");
     KVPageGeometry geometry{64, {}};
     for (int layer = 0; layer < spec.layers; ++layer) {
-        geometry.planes.push_back(
-            {count == 2 ? DType::BF16 : DType::FP8_E4M3FN, spec.latent_dim, 1, 256, 1});
-        if (count == 3) geometry.planes.push_back({DType::FP32, spec.latent_dim / 128, 1, 256, 1});
+        geometry.planes.push_back({latent.data_dtype, latent.data_leading_extent, 1, 256, 1});
+        if (latent.has_scale())
+            geometry.planes.push_back({latent.scale_dtype, latent.scale_leading_extent, 1, 256, 1});
         geometry.planes.push_back({DType::BF16, spec.index_dim, 1, 256, 4});
     }
     return {spec, plan_kv_page_layout(geometry)};

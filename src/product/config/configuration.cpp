@@ -21,21 +21,7 @@ ConfigurationValue optional_value(const std::optional<T>& value, const char* fal
         return static_cast<std::uint64_t>(*value);
 }
 
-const char* kv_name(KvCacheStorage storage) {
-    switch (storage) {
-    case KvCacheStorage::BFloat16:
-        return "bf16";
-    case KvCacheStorage::Int8Group64:
-        return "int8";
-    case KvCacheStorage::Fp8E4M3Row256:
-        return "fp8";
-    case KvCacheStorage::Nvfp4Group16:
-        return "nvfp4";
-    case KvCacheStorage::Fp8KeyNvfp4Value:
-        return "k8v4";
-    }
-    return "unknown";
-}
+const char* kv_name(KvCacheStorage storage) { return kv_cache_profile_info(storage).name; }
 
 const char* effort_name(ReasoningEffort effort) {
     switch (effort) {

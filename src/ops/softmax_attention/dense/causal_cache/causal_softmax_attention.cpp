@@ -208,7 +208,7 @@ std::size_t causal_softmax_attention_workspace_capacity_bytes(
         return detail::bf16_kv_workspace_bytes(q_heads, batch_size, min_width, max_width, envelope,
                                                multiprocessor_count);
 
-    if (cache_storage == KvCacheStorage::Fp8E4M3Row256)
+    if (cache_storage == KvCacheStorage::Fp8E4m3fnGroup128Ue8m0)
         return detail::fp8_kv_workspace_bytes(q_heads, batch_size, min_width, max_width, envelope,
                                               multiprocessor_count);
 
@@ -254,7 +254,7 @@ void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
         return;
     }
 
-    if (cache.storage == KvCacheStorage::Fp8E4M3Row256) {
+    if (cache.storage == KvCacheStorage::Fp8E4m3fnGroup128Ue8m0) {
         detail::fp8_kv_append_attention(q, k, v, positions, valid_columns, kv_table_rows, scale,
                                         cache, envelope, workspace, out, execution);
         return;
@@ -296,7 +296,7 @@ void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,
         return;
     }
 
-    if (cache.storage == KvCacheStorage::Fp8E4M3Row256) {
+    if (cache.storage == KvCacheStorage::Fp8E4m3fnGroup128Ue8m0) {
         detail::fp8_kv_cached_attention(q, positions, scale, cache, envelope, workspace, out,
                                         execution);
         return;

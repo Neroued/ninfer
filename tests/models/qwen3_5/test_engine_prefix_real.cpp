@@ -72,7 +72,7 @@ ninfer::EngineOptions shared_rewrite_materialization_engine_options(const char* 
     options.artifact_path                     = artifact;
     options.max_context                       = 100000;
     options.prefill_chunk                     = 1024;
-    options.kv_cache                          = ninfer::KvCacheStorage::Fp8E4M3Row256;
+    options.kv_cache                          = ninfer::KvCacheStorage::Fp8E4m3fnGroup128Ue8m0;
     options.speculative.backend               = ninfer::SpeculativeBackend::Mtp;
     options.speculative.draft_tokens          = 3;
     options.speculative.proposal_head         = ninfer::ProposalHead::Optimized;

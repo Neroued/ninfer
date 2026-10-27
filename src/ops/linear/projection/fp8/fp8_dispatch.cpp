@@ -1,4 +1,5 @@
 #include "ops/linear/projection/fp8/fp8_dispatch.h"
+#include "core/platform.h"
 #include "ops/common/host/operands.h"
 #include "ops/linear/projection/fp8/fp8_shapes.h"
 #include <array>
@@ -7,6 +8,9 @@
 namespace ninfer::ops::detail {
 namespace {
 const std::array kShapes{&kFp8N14336K5120, &kFp8N16384K5120, &kFp8N34816K5120,
+#if NINFER_TARGET_RTX5090
+                         &kFp8N14976K5120,
+#endif
                          &kFp8N5120K6144,  &kFp8N5120K17408, &kFp8N248320K5120};
 
 const Fp8LinearShape& resolve_shape(std::int32_t n, std::int32_t k, LinearPolicy policy) {

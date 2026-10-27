@@ -12,6 +12,7 @@ struct Fp8LinearShape {
 };
 
 extern const Fp8LinearShape kFp8N14336K5120;
+extern const Fp8LinearShape kFp8N14976K5120;
 extern const Fp8LinearShape kFp8N16384K5120;
 extern const Fp8LinearShape kFp8N34816K5120;
 extern const Fp8LinearShape kFp8N5120K6144;

@@ -1,4 +1,5 @@
 #include "core/weight.h"
+#include "core/platform.h"
 #include "cuda_fixture.h"
 #include "core/buffer.h"
 #include "ops/linear/projection/runner.h"
@@ -335,4 +336,28 @@ void run_fp8_a8(Suite& suite) {
 void ninfer::test::linear::add_fp8_cases(Suite& suite) {
     run_fp8_a16(suite);
     run_fp8_a8(suite);
+#if NINFER_TARGET_RTX5090
+    const std::vector<Invocation> a16{
+        {1, CallForm::A16Convenience}, {2}, {16}, {24}, {32}, {64}, {128}, {2048}};
+    add_shape(suite, QType::FP8_E4M3FN_ROW_BF16, ActivationRecipe::TokenBlocks,
+              make_fp8_weight, {14976, 5120, 861U, Comparison::Sampled, true, a16});
+    const std::vector<Invocation> a8{
+        {16, CallForm::Policy, ops::LinearPolicy::AllowA8},
+        {17, CallForm::Policy, ops::LinearPolicy::AllowA8, true},
+        {32, CallForm::Policy, ops::LinearPolicy::AllowA8},
+        {64, CallForm::Policy, ops::LinearPolicy::AllowA4},
+        {128, CallForm::Policy, ops::LinearPolicy::AllowA8},
+        {129, CallForm::Policy, ops::LinearPolicy::AllowA8, true},
+        {1536, CallForm::Policy, ops::LinearPolicy::AllowA8, true},
+        {512, CallForm::Policy, ops::LinearPolicy::AllowA8},
+        {1024, CallForm::Policy, ops::LinearPolicy::AllowA8},
+        {2048, CallForm::Policy, ops::LinearPolicy::AllowA8}};
+    add_shape(suite, QType::FP8_E4M3FN_ROW_BF16, ActivationRecipe::Hashed,
+              make_fp8_weight, {14976, 5120, 863U, Comparison::Sampled, true, a8});
+    const std::vector<Invocation> tail{{257, CallForm::Policy, ops::LinearPolicy::AllowA8, true}};
+    add_shape(suite, QType::FP8_E4M3FN_ROW_BF16, ActivationRecipe::Hashed,
+              make_fp8_weight,
+              {14976, 5120, 865U, Comparison::Sampled, true, tail, ActivationPattern::KTail});
+    add_workspace_cases(suite, QType::FP8_E4M3FN_ROW_BF16, 14976, 5120);
+#endif
 }

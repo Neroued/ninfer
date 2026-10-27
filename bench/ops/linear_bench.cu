@@ -626,6 +626,16 @@ double registered_tensor_peak_tflops(const BenchPoint& point, const char*& profi
         profile = "BF16_F32ACC";
         return bench::kRoofline.bf16_f32_tflops;
     }
+    if (point.qtype == QType::FP8_E4M3FN_ROW_BF16 && point.n == 14976 && point.k == 5120) {
+        if (point.policy != LinearPolicy::A16Only && point.t >= 17) {
+            profile = "MXFP8_F32ACC";
+            return bench::kRoofline.mxfp8_f32_tflops;
+        }
+        if (point.t > 1) {
+            profile = "BF16_F32ACC";
+            return bench::kRoofline.bf16_f32_tflops;
+        }
+    }
     const bool fp8_problem =
         (point.n == 14336 && point.k == 5120) || (point.n == 16384 && point.k == 5120) ||
         (point.n == 34816 && point.k == 5120) || (point.n == 5120 && point.k == 6144) ||

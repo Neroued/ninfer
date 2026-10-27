@@ -1,8 +1,8 @@
 #pragma once
 
-#include "ops/moe/kernels/cuda/block_scaled/h4096_i2048_e288_k8/fp8/compute.cuh"
+#include "ops/moe/kernels/cuda/block_scaled/clamped/fp8/compute.cuh"
 
-namespace ninfer::ops::detail::moe_cuda::block_scaled::h4096_i2048_e288_k8::fp8 {
+namespace ninfer::ops::detail::moe_cuda::block_scaled::clamped::fp8 {
 
 // A CTA owns each output tile across all eight experts, eliminating inter-expert
 // atomic updates. G128 weight/input scales and route coefficients stay in FP32.
@@ -135,4 +135,4 @@ __global__ void dense_eight_down(const std::uint8_t* input, const float* input_s
     }
 }
 
-} // namespace ninfer::ops::detail::moe_cuda::block_scaled::h4096_i2048_e288_k8::fp8
+} // namespace ninfer::ops::detail::moe_cuda::block_scaled::clamped::fp8

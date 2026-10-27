@@ -1,14 +1,14 @@
 #pragma once
 
-#include "ops/moe/kernels/cuda/block_scaled/h4096_i2048_e288_k8/fp8/launch.h"
-#include "ops/moe/kernels/cuda/block_scaled/h4096_i2048_e288_k8/output.cuh"
+#include "ops/moe/kernels/cuda/block_scaled/clamped/fp8/launch.h"
+#include "ops/moe/kernels/cuda/block_scaled/clamped/output.cuh"
 #include "ops/common/cuda/mma.cuh"
 #include "ops/common/cuda/reduce.cuh"
 #include "ops/common/cuda/pipeline.cuh"
 #include "ops/common/numeric/math.cuh"
 #include "ops/common/quant/fp8.cuh"
 
-namespace ninfer::ops::detail::moe_cuda::block_scaled::h4096_i2048_e288_k8::fp8 {
+namespace ninfer::ops::detail::moe_cuda::block_scaled::clamped::fp8 {
 using common::load_vec;
 using common::warp_reduce_sum;
 using common::warp_max;
@@ -431,4 +431,4 @@ __global__ void vector_down(const float* activation, ExpertMatrixDeviceView bank
         output.store(i, output.initial(i) + result);
     }
 }
-} // namespace ninfer::ops::detail::moe_cuda::block_scaled::h4096_i2048_e288_k8::fp8
+} // namespace ninfer::ops::detail::moe_cuda::block_scaled::clamped::fp8

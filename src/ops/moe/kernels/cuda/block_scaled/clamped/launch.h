@@ -3,7 +3,7 @@
 #include "ninfer/ops/moe.h"
 #include "ops/moe/kernels/cuda/block_scaled/nvfp4/schedule.h"
 
-namespace ninfer::ops::detail::moe_cuda::block_scaled::h4096_i2048_e288_k8 {
+namespace ninfer::ops::detail::moe_cuda::block_scaled::clamped {
 
 inline constexpr int kHidden = 4096, kIntermediate = 2048, kExperts = 288, kTopK = 8;
 
@@ -22,8 +22,10 @@ struct Plan {
     // Policies select these widths from slice M, but each tile covers assignments
     // belonging to one expert. The entry policy owns the maximum slice size.
     QType format     = QType::NVFP4;
+    int intermediate = kIntermediate;
     int gate_columns = 0, down_columns = 0;
-    bool vector                = false;
+    int dense_down_columns     = 0;
+    bool direct_assignments    = false;
     bool atomic_output         = false;
     bool single_block_grouping = false;
     // GU consumes the original expert-major jobs; only down may reorder them.
@@ -72,7 +74,7 @@ struct Storage {
     std::uint8_t* product_codes = nullptr;
     void* product_scales        = nullptr;
     float* contributions        = nullptr;
-    float* vector_activation    = nullptr;
+    float* direct_product       = nullptr;
     float* routed_sum           = nullptr;
     int* active_tokens          = nullptr;
     Groups groups{};
@@ -88,4 +90,4 @@ void launch(const Tensor& x, const CudaSwiGLUExperts& experts, const ExpertRoute
 void launch_column_jobs(Groups groups, int tokens, int columns, bool preserve_balanced,
                         CudaExecutionView execution);
 
-} // namespace ninfer::ops::detail::moe_cuda::block_scaled::h4096_i2048_e288_k8
+} // namespace ninfer::ops::detail::moe_cuda::block_scaled::clamped

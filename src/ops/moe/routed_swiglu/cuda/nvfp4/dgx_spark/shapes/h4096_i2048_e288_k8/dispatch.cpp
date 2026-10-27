@@ -11,7 +11,7 @@ Plan select_plan(const SwiGLUProfile& ffn, int t, int) {
     p                   = {.format                 = ffn.gate_up_type,
                            .gate_columns           = 8,
                            .down_columns           = 8,
-                           .vector                 = t == 1,
+                           .direct_assignments     = t == 1,
                            .atomic_output          = t > 64,
                            .single_block_grouping  = t <= 64,
                            .column_major_down      = t >= 1024,

@@ -3,7 +3,7 @@
 #include "ops/moe/kernels/cuda/groupwise_int/launch.h"
 #include "ops/moe/kernels/cuda/block_scaled/launch.h"
 
-#include "ops/moe/kernels/cuda/block_scaled/h4096_i2048_e288_k8/launch.h"
+#include "ops/moe/kernels/cuda/block_scaled/clamped/launch.h"
 
 #include <span>
 
@@ -17,7 +17,7 @@ struct Plan {
     Implementation implementation = Implementation::GroupwiseInt;
     kernel::groupwise_int::Plan integer;
     kernel::block_scaled::Plan block_scaled;
-    kernel::block_scaled::h4096_i2048_e288_k8::Plan clamped;
+    kernel::block_scaled::clamped::Plan clamped;
 };
 
 struct ShapePolicy {
@@ -44,6 +44,7 @@ const ShapePolicy& q8_q8_h2048_i512_e256_k8();
 const ShapePolicy& nvfp4_h2560_i640_e512_k10();
 const ShapePolicy& fp8_h2560_i640_e512_k10();
 const ShapePolicy& nvfp4_h4096_i2048_e288_k8();
+const ShapePolicy& nvfp4_h4096_i1024_e288_k8();
 const ShapePolicy& fp8_h4096_i2048_e288_k8();
 
 } // namespace ninfer::ops::detail::moe_routed

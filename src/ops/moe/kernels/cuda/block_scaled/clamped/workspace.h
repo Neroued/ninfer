@@ -1,16 +1,16 @@
 #pragma once
 
-#include "ops/moe/kernels/cuda/block_scaled/h4096_i2048_e288_k8/launch.h"
+#include "ops/moe/kernels/cuda/block_scaled/clamped/launch.h"
 
-namespace ninfer::ops::detail::moe_cuda::block_scaled::h4096_i2048_e288_k8 {
+namespace ninfer::ops::detail::moe_cuda::block_scaled::clamped {
 
 template <class Arena>
 Storage allocate(Arena& arena, const Plan& plan, int tokens, bool routed, bool partial_output) {
     Storage out;
     out.partial_output = partial_output && routed;
-    if (routed && plan.vector) {
-        out.vector_activation =
-            static_cast<float*>(arena.alloc(DType::FP32, {kIntermediate, kTopK * tokens}).data);
+    if (routed && plan.direct_assignments) {
+        out.direct_product =
+            static_cast<float*>(arena.alloc(DType::FP32, {plan.intermediate, kTopK * tokens}).data);
     } else if (routed) {
         const int assignments = tokens * kTopK;
         const auto bytes      = [&](std::size_t size) {
@@ -24,9 +24,9 @@ Storage allocate(Arena& arena, const Plan& plan, int tokens, bool routed, bool p
         const auto scale_bytes = fp8 ? sizeof(float) : sizeof(std::uint8_t);
         out.input_codes        = bytes(std::size_t(tokens) * kHidden / packing);
         out.input_scales       = bytes(std::size_t(tokens) * (kHidden / scale_group) * scale_bytes);
-        out.product_codes      = bytes(std::size_t(assignments) * kIntermediate / packing);
+        out.product_codes      = bytes(std::size_t(assignments) * plan.intermediate / packing);
         out.product_scales =
-            bytes(std::size_t(assignments) * (kIntermediate / scale_group) * scale_bytes);
+            bytes(std::size_t(assignments) * (plan.intermediate / scale_group) * scale_bytes);
         if (plan.atomic_output && !partial_output) {
             out.routed_sum = static_cast<float*>(arena.alloc(DType::FP32, {kHidden, tokens}).data);
         } else if (!plan.atomic_output) {
@@ -42,13 +42,13 @@ Storage allocate(Arena& arena, const Plan& plan, int tokens, bool routed, bool p
         g.job_experts      = integers(max_jobs);
         g.job_columns      = integers(max_jobs);
         g.jobs             = integers(fp8 ? 4 : 2);
-        if (plan.dense.gate_columns) g.load_range = integers(2);
+        if (plan.dense.gate_columns || plan.dense_down_columns) g.load_range = integers(2);
         g.assignments = integers(assignments);
-        if (!plan.atomic_output || (fp8 && plan.fp8.dense_down)) {
+        if (!plan.atomic_output || (fp8 && plan.fp8.dense_down) || plan.dense_down_columns) {
             g.inverse = integers(assignments);
         }
     }
     return out;
 }
 
-} // namespace ninfer::ops::detail::moe_cuda::block_scaled::h4096_i2048_e288_k8
+} // namespace ninfer::ops::detail::moe_cuda::block_scaled::clamped

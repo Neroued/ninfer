@@ -1,12 +1,12 @@
 #include "ops/moe/kernels/cuda/block_scaled/grouping.cuh"
-#include "ops/moe/kernels/cuda/block_scaled/h4096_i2048_e288_k8/nvfp4/launch.h"
-#include "ops/moe/kernels/cuda/block_scaled/h4096_i2048_e288_k8/fp8/launch.h"
-#include "ops/moe/kernels/cuda/block_scaled/h4096_i2048_e288_k8/output.cuh"
+#include "ops/moe/kernels/cuda/block_scaled/clamped/nvfp4/launch.h"
+#include "ops/moe/kernels/cuda/block_scaled/clamped/fp8/launch.h"
+#include "ops/moe/kernels/cuda/block_scaled/clamped/output.cuh"
 
 #include <algorithm>
 #include <stdexcept>
 
-namespace ninfer::ops::detail::moe_cuda::block_scaled::h4096_i2048_e288_k8 {
+namespace ninfer::ops::detail::moe_cuda::block_scaled::clamped {
 namespace {
 
 __device__ __forceinline__ bool selected(ExpertSubsetKind kind, const int* mask, int e) {
@@ -269,7 +269,7 @@ void launch(const Tensor& x, const CudaSwiGLUExperts& experts, const ExpertRoute
     if (s.partial_output && plan.atomic_output)
         s.routed_sum = static_cast<float*>(destination.data);
     const auto stream = execution.stream();
-    if (plan.vector) {
+    if (plan.direct_assignments) {
         if (plan.format == QType::NVFP4)
             nvfp4::launch_vector(x, experts, routes, subset, mode, destination, s, plan, execution);
         else
@@ -312,4 +312,4 @@ void launch(const Tensor& x, const CudaSwiGLUExperts& experts, const ExpertRoute
     });
     CUDA_CHECK(cudaGetLastError());
 }
-} // namespace ninfer::ops::detail::moe_cuda::block_scaled::h4096_i2048_e288_k8
+} // namespace ninfer::ops::detail::moe_cuda::block_scaled::clamped

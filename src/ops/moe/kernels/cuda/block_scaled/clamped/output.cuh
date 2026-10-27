@@ -1,9 +1,9 @@
 #pragma once
 
 #include "ops/moe/kernels/cuda/output.cuh"
-#include "ops/moe/kernels/cuda/block_scaled/h4096_i2048_e288_k8/launch.h"
+#include "ops/moe/kernels/cuda/block_scaled/clamped/launch.h"
 
-namespace ninfer::ops::detail::moe_cuda::block_scaled::h4096_i2048_e288_k8 {
+namespace ninfer::ops::detail::moe_cuda::block_scaled::clamped {
 
 // A vector tail writes a dense contribution, including zero local hits. Publish
 // those columns as readable when it follows grouped slices in a composed call.
@@ -38,4 +38,4 @@ __device__ __forceinline__ float routed_value(int token, int row, const Storage&
     return value;
 }
 
-} // namespace ninfer::ops::detail::moe_cuda::block_scaled::h4096_i2048_e288_k8
+} // namespace ninfer::ops::detail::moe_cuda::block_scaled::clamped

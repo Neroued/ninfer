@@ -1,8 +1,8 @@
 #pragma once
 
-#include "ops/moe/kernels/cuda/block_scaled/h4096_i2048_e288_k8/fp8/compute.cuh"
+#include "ops/moe/kernels/cuda/block_scaled/clamped/fp8/compute.cuh"
 
-namespace ninfer::ops::detail::moe_cuda::block_scaled::h4096_i2048_e288_k8::fp8 {
+namespace ninfer::ops::detail::moe_cuda::block_scaled::clamped::fp8 {
 
 inline constexpr int kPairGateRowsPerCta = 4, kPairDownRowsPerWarp = 4;
 
@@ -213,4 +213,4 @@ __global__ void pair_down(const float* activation, ExpertMatrixDeviceView bank, 
     }
 }
 
-} // namespace ninfer::ops::detail::moe_cuda::block_scaled::h4096_i2048_e288_k8::fp8
+} // namespace ninfer::ops::detail::moe_cuda::block_scaled::clamped::fp8

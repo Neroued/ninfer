@@ -56,6 +56,12 @@ ninfer_add_op_bench(ninfer_vocabulary_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/v
 ninfer_add_op_bench(ninfer_sampling_select_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/sampling_select_bench.cu")
 ninfer_add_op_bench(ninfer_moe_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/moe/main.cu")
 ninfer_add_op_bench(ninfer_moe_block_scaled_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/moe/block_scaled.cu")
+if(NINFER_TARGET STREQUAL "dgx_spark")
+  ninfer_add_op_bench(ninfer_moe_tp2_bench
+    SOURCES "${CMAKE_CURRENT_LIST_DIR}/moe/tp2.cu"
+            "${PROJECT_SOURCE_DIR}/tests/ops/moe/tp2_fixture.cu")
+  target_include_directories(ninfer_moe_tp2_bench PRIVATE "${PROJECT_SOURCE_DIR}/tests")
+endif()
 if(NINFER_TARGET STREQUAL "rtx5090")
   ninfer_add_op_bench(ninfer_moe_cpu_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/moe/cpu.cpp")
   target_link_libraries(ninfer_moe_cpu_bench PRIVATE ninfer_cpu_executor)

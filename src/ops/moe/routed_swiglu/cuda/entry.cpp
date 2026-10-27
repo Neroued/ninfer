@@ -1,6 +1,6 @@
 #include "core/nvtx.h"
 #include "core/platform.h"
-#include "ops/moe/kernels/cuda/block_scaled/h4096_i2048_e288_k8/workspace.h"
+#include "ops/moe/kernels/cuda/block_scaled/clamped/workspace.h"
 #include "ninfer/ops/moe.h"
 #include "ops/moe/operands.h"
 #include "ops/moe/routed_swiglu/cuda/dispatch.h"
@@ -15,7 +15,7 @@ namespace kernel       = detail::moe_cuda;
 namespace integer      = kernel::groupwise_int;
 namespace block_scaled = kernel::block_scaled;
 namespace impl         = detail::moe_routed;
-namespace clamped      = block_scaled::h4096_i2048_e288_k8;
+namespace clamped      = block_scaled::clamped;
 
 struct CallStorage {
     integer::ExpertStorage integer;
@@ -209,7 +209,7 @@ RoutedSwiGLUContribution execute_contribution(const Tensor& x, const RoutedSwiGL
     const auto& shape       = shape_dispatch(profile);
     const int tokens        = x.ne[1];
     const bool dense_vector = tokens > 0 && tokens <= shape.slice_tokens(subset.kind) &&
-                              shape.select(profile.ffn, tokens, 0).clamped.vector;
+                              shape.select(profile.ffn, tokens, 0).clamped.direct_assignments;
     execute(x, profile, experts, routes, subset, nullptr, MoeEpilogue::Write, values, workspace,
             execution, dense_vector ? nullptr : valid_tokens);
     return {static_cast<const float*>(values.data), dense_vector ? nullptr : valid_tokens};

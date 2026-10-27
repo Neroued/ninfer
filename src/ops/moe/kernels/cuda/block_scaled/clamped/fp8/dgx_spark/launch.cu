@@ -1,12 +1,12 @@
-#include "ops/moe/kernels/cuda/block_scaled/h4096_i2048_e288_k8/fp8/launch.h"
-#include "ops/moe/kernels/cuda/block_scaled/h4096_i2048_e288_k8/fp8/compute.cuh"
-#include "ops/moe/kernels/cuda/block_scaled/h4096_i2048_e288_k8/fp8/dense_down.cuh"
-#include "ops/moe/kernels/cuda/block_scaled/h4096_i2048_e288_k8/fp8/vector_pair.cuh"
+#include "ops/moe/kernels/cuda/block_scaled/clamped/fp8/launch.h"
+#include "ops/moe/kernels/cuda/block_scaled/clamped/fp8/compute.cuh"
+#include "ops/moe/kernels/cuda/block_scaled/clamped/fp8/dense_down.cuh"
+#include "ops/moe/kernels/cuda/block_scaled/clamped/fp8/vector_pair.cuh"
 #include "ops/common/host/launch.h"
 
 #include <algorithm>
 
-namespace ninfer::ops::detail::moe_cuda::block_scaled::h4096_i2048_e288_k8::fp8 {
+namespace ninfer::ops::detail::moe_cuda::block_scaled::clamped::fp8 {
 namespace {
 __global__ void quantize_input(const __nv_bfloat16* input, std::uint8_t* codes, float* scales,
                                int tokens, int* counts, float* routed_sum, bool clear_counts,
@@ -147,22 +147,20 @@ void launch_vector(const Tensor& x, const CudaSwiGLUExperts& experts, const Expe
                      execution.multiprocessor_count() * plan.vector_gate_ctas_per_sm);
         pair_gate<<<blocks, kPairGateRowsPerCta * 32, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(x.data), experts.bank.gate_up, ids, subset.kind, mask,
-            s.vector_activation, plan.clamp_limit);
+            s.direct_product, plan.clamp_limit);
     } else {
         vector_gate<<<dim3(kIntermediate / 4, x.ne[1] * kTopK), 128, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(x.data), experts.bank.gate_up, ids, subset.kind, mask,
-            s.vector_activation, plan.clamp_limit);
+            s.direct_product, plan.clamp_limit);
     }
     CUDA_CHECK(cudaGetLastError());
     const auto down = [&](auto output) {
         if (x.ne[1] == 2) {
             pair_down<<<kHidden / kPairDownRowsPerWarp, kTopK * 32, 0, stream>>>(
-                s.vector_activation, experts.bank.down, ids, coefficients, subset.kind, mask,
-                output);
+                s.direct_product, experts.bank.down, ids, coefficients, subset.kind, mask, output);
         } else {
             vector_down<4><<<dim3(kHidden / 4, x.ne[1]), kTopK * 32, 0, stream>>>(
-                s.vector_activation, experts.bank.down, ids, coefficients, subset.kind, mask,
-                output);
+                s.direct_product, experts.bank.down, ids, coefficients, subset.kind, mask, output);
         }
         CUDA_CHECK(cudaGetLastError());
     };
@@ -171,4 +169,4 @@ void launch_vector(const Tensor& x, const CudaSwiGLUExperts& experts, const Expe
     else
         with_output(destination, mode, down);
 }
-} // namespace ninfer::ops::detail::moe_cuda::block_scaled::h4096_i2048_e288_k8::fp8
+} // namespace ninfer::ops::detail::moe_cuda::block_scaled::clamped::fp8

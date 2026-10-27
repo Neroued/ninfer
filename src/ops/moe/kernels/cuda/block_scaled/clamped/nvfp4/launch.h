@@ -1,8 +1,8 @@
 #pragma once
 
-#include "ops/moe/kernels/cuda/block_scaled/h4096_i2048_e288_k8/launch.h"
+#include "ops/moe/kernels/cuda/block_scaled/clamped/launch.h"
 
-namespace ninfer::ops::detail::moe_cuda::block_scaled::h4096_i2048_e288_k8::nvfp4 {
+namespace ninfer::ops::detail::moe_cuda::block_scaled::clamped::nvfp4 {
 
 void launch_input(const Tensor& x, const CudaSwiGLUExperts& experts, const ExpertRoutes& routes,
                   ExpertSubset subset, const Storage& storage, CudaExecutionView execution,
@@ -12,4 +12,4 @@ void launch_experts(const Tensor& x, const CudaSwiGLUExperts& experts, const Exp
 void launch_vector(const Tensor& x, const CudaSwiGLUExperts& experts, const ExpertRoutes& routes,
                    ExpertSubset subset, MoeEpilogue mode, Tensor& destination,
                    const Storage& storage, const Plan& plan, CudaExecutionView execution);
-} // namespace ninfer::ops::detail::moe_cuda::block_scaled::h4096_i2048_e288_k8::nvfp4
+} // namespace ninfer::ops::detail::moe_cuda::block_scaled::clamped::nvfp4

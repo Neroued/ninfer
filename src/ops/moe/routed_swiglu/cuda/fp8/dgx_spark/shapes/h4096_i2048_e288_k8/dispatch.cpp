@@ -4,7 +4,7 @@ namespace ninfer::ops::detail::moe_routed {
 namespace {
 constexpr int kOrderedExperts = 16, kWideAverage = 128;
 constexpr int kWideStart =
-    (kOrderedExperts + 1) * kWideAverage / kernel::block_scaled::h4096_i2048_e288_k8::kTopK + 1;
+    (kOrderedExperts + 1) * kWideAverage / kernel::block_scaled::clamped::kTopK + 1;
 
 Plan select_plan(const SwiGLUProfile& ffn, int t, int) {
     Plan plan;
@@ -13,7 +13,7 @@ Plan select_plan(const SwiGLUProfile& ffn, int t, int) {
     plan.clamped        = {.format                  = ffn.gate_up_type,
                            .gate_columns            = t >= 257 ? 128 : c,
                            .down_columns            = c,
-                           .vector                  = t <= 2,
+                           .direct_assignments      = t <= 2,
                            .atomic_output           = t >= 3,
                            .single_block_grouping   = t <= 64,
                            .token_ordered_groups    = true,

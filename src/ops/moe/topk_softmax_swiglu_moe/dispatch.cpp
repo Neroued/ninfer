@@ -7,7 +7,9 @@ namespace ninfer::ops::detail::moe_complete {
 const ShapePolicy& shape_dispatch(const MoeProfile& profile) {
     validate_moe_profile(profile);
 #if NINFER_TARGET_SPARK
-    if (profile.routed.ffn.intermediate == 320) return nvfp4_h2560_i320_e512_k10();
+    if (profile.routed.ffn.intermediate == 320)
+        return profile.routed.ffn.down_type == QType::NVFP4 ? nvfp4_h2560_i320_e512_k10()
+                                                            : fp8_h2560_i320_e512_k10();
 #endif
     switch (profile.routed.ffn.down_type) {
     case QType::FP8_E4M3FN_BLOCK128X128_BF16:

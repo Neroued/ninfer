@@ -2,6 +2,7 @@
 #include "ops/moe/kernels/cuda/block_scaled/fp8/compute.cuh"
 #include "ops/moe/kernels/cuda/block_scaled/fp8/vector_pair.cuh"
 #include "ops/common/host/launch.h"
+#include "ops/moe/kernels/cuda/block_scaled/fp8/block64/launch.h"
 
 #include <algorithm>
 
@@ -87,6 +88,11 @@ void launch_input(const Tensor& x, const CudaSwiGLUExperts&, const Storage& s,
 
 void launch_experts(const Tensor& x, const CudaSwiGLUExperts& experts, const ExpertRoutes& routes,
                     const Plan& plan, const Storage& s, CudaExecutionView execution) {
+    if (plan.format == QType::FP8_E4M3FN_BLOCK64X64_BF16) {
+        if (plan.intermediate != 320) throw std::logic_error("unregistered block64 FP8 geometry");
+        block64::launch_experts(x, experts, routes, plan, s, execution);
+        return;
+    }
     with_columns<true>(plan.gate_columns, [&]<int C>() {
         launch_mma<true, C>(x, experts, routes, s, plan, execution);
     });
@@ -105,7 +111,12 @@ void launch_experts(const Tensor& x, const CudaSwiGLUExperts& experts, const Exp
 
 void launch_vector(const Tensor& x, const CudaSwiGLUExperts& experts, const ExpertRoutes& routes,
                    ExpertSubset subset, bool shared, MoeEpilogue mode, Tensor& destination,
-                   const Storage& s, CudaExecutionView execution) {
+                   const Storage& s, const Plan& plan, CudaExecutionView execution) {
+    if (plan.format == QType::FP8_E4M3FN_BLOCK64X64_BF16) {
+        if (plan.intermediate != 320) throw std::logic_error("unregistered block64 FP8 geometry");
+        block64::launch_vector(x, experts, routes, subset, shared, mode, destination, s, execution);
+        return;
+    }
     const auto stream        = execution.stream();
     const auto* ids          = static_cast<const int*>(routes.ids.data);
     const auto* mask         = static_cast<const int*>(subset.mask.data);

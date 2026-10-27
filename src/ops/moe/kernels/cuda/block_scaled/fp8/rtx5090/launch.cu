@@ -100,7 +100,7 @@ void launch_experts(const Tensor& x, const CudaSwiGLUExperts& experts, const Exp
 
 void launch_vector(const Tensor& x, const CudaSwiGLUExperts& experts, const ExpertRoutes& routes,
                    ExpertSubset subset, bool shared, MoeEpilogue mode, Tensor& destination,
-                   const Storage& s, CudaExecutionView execution) {
+                   const Storage& s, const Plan&, CudaExecutionView execution) {
     const auto stream        = execution.stream();
     const auto* ids          = static_cast<const int*>(routes.ids.data);
     const auto* mask         = static_cast<const int*>(subset.mask.data);

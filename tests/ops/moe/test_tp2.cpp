@@ -11,6 +11,7 @@ namespace {
 constexpr Shape kM1{4096, 1024, 288, 8, true, QType::NVFP4};
 constexpr Shape kM2{4096, 1024, 288, 8, true, QType::FP8_E4M3FN_BLOCK128X128_BF16};
 constexpr Shape kM3{2560, 320, 512, 10, false, QType::NVFP4};
+constexpr Shape kM4{2560, 320, 512, 10, false, QType::FP8_E4M3FN_BLOCK64X64_BF16};
 constexpr ReductionCriterion kA4{.25, 1e-6, .35, 1e-6};
 constexpr ReductionCriterion kA8{.08, 1e-7, .12, 1e-7};
 constexpr ReductionCriterion kA16{1.0 / 256, 1.0 / 256, 2.0 / 256};
@@ -168,8 +169,8 @@ int run_case(Fixture& fixture, Case c, CudaExecutionView cuda) {
                     sizeof(float), cudaMemcpyDeviceToHost));
                 const std::array actual_gate{double(gate)};
                 const std::array expected_gate{oracle.shared_coefficient(token)};
-                failures += verify_reduction(label + "/shared gate", actual_gate, expected_gate,
-                                             kRouting);
+                failures +=
+                    verify_reduction(label + "/shared gate", actual_gate, expected_gate, kRouting);
             }
             for (int row : rows) {
                 const auto index = std::size_t(token) * fixture.shape.hidden + row;
@@ -262,7 +263,10 @@ void add_profile(OpSuite& suite, Shape shape, const std::string& name) {
                {"policy", shape.format == QType::NVFP4 ? "a4" : "a8"},
                {"execution", "eager"}});
     std::vector<int> extents =
-        shape.format == QType::NVFP4
+        !shape.clamped && shape.format != QType::NVFP4
+            ? std::vector<int>{1,   2,   3,   16,  17,  32,  33,   64,   65,   127,  128, 129,
+                               256, 257, 258, 511, 512, 513, 3071, 3072, 3073, 4096, 4097}
+        : shape.format == QType::NVFP4
             ? std::vector<int>{1,   2,   8,   9,    16,   17,   64,   65,   127,  128,  129,
                                256, 512, 513, 1023, 1024, 1025, 2048, 2049, 2050, 4096, 4097}
             : std::vector<int>{1,   2,   3,   4,   8,   9,   16,   17,   32,   33,   64,  65,
@@ -303,7 +307,7 @@ void add_profile(OpSuite& suite, Shape shape, const std::string& name) {
         if (rank == 0 && shape.clamped && shape.format != QType::NVFP4) {
             cases.push_back({513, rank, true, true, false, "reuse", true});
             catalogue.push_back({"tp2/" + name + "/complete/rank0/route-population/T513",
-                {{"format", "fp8"}, {"policy", "a8"}, {"execution", "graph"}}});
+                                 {{"format", "fp8"}, {"policy", "a8"}, {"execution", "graph"}}});
         }
         if (rank == 0)
             for (bool complete : {false, true}) {
@@ -341,5 +345,6 @@ int main(int argc, char** argv) {
     ninfer::test::moe_tp2::add_profile(suite, ninfer::test::moe_tp2::kM1, "m1");
     ninfer::test::moe_tp2::add_profile(suite, ninfer::test::moe_tp2::kM2, "m2");
     ninfer::test::moe_tp2::add_profile(suite, ninfer::test::moe_tp2::kM3, "m3");
+    ninfer::test::moe_tp2::add_profile(suite, ninfer::test::moe_tp2::kM4, "m4");
     return suite.main(argc, argv);
 }

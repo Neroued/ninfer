@@ -80,8 +80,8 @@ __global__ void index_assignments(const int* ids, ExpertSubsetKind kind, const i
         if (g.inverse) { g.inverse[a] = -1; }
         return;
     }
-    const int packed = fully_covered_groups(g, assignments)
-        ? g.offsets[expert] + a / kTopK : atomicAdd(g.cursors + expert, 1);
+    const int packed      = fully_covered_groups(g, assignments) ? g.offsets[expert] + a / kTopK
+                                                                 : atomicAdd(g.cursors + expert, 1);
     g.assignments[packed] = a;
     if (g.inverse) { g.inverse[a] = packed; }
 }
@@ -130,7 +130,8 @@ __global__ void group_small(const int* ids, ExpertSubsetKind kind, const int* ma
     if (tid == kExperts - 1) { *g.jobs = scan[tid]; }
     const bool ordered = fully_covered_groups(g, assignments);
     for (int a = tid; a < assignments; a += kExperts) {
-        const int packed = ranks[a] >= 0 ? g.offsets[ids[a]] + (ordered ? a / kTopK : ranks[a]) : -1;
+        const int packed =
+            ranks[a] >= 0 ? g.offsets[ids[a]] + (ordered ? a / kTopK : ranks[a]) : -1;
         if (g.inverse) { g.inverse[a] = packed; }
         if (packed >= 0) { g.assignments[packed] = a; }
     }
@@ -235,7 +236,7 @@ void launch(const Tensor& x, const CudaSwiGLUExperts& experts, const ExpertRoute
                                  s, plan, execution);
         } else {
             fp8::launch_vector(x, experts, routes, subset, shared != nullptr, mode, destination, s,
-                               execution);
+                               plan, execution);
         }
         if (!shared) { return; }
     } else if (subset.kind != ExpertSubsetKind::None) {

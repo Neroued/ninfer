@@ -10,6 +10,12 @@ inline constexpr int kScoreRows = (kExperts + 4) / 4 * 4;
 
 enum class SharedAlgorithm { Vector, Mma };
 
+struct Fp8LoadTuning {
+    int maximum_small_load = 0;
+    int large_gate_columns = 0, large_down_columns = 0;
+    int large_queued_ctas_per_sm = 0;
+};
+
 struct Plan {
     // Policies select these widths from slice M, but each tile covers assignments
     // belonging to one expert. The entry policy owns the maximum slice size.
@@ -31,11 +37,16 @@ struct Plan {
     int queued_ctas_per_sm = 0;
 
     Nvfp4Tuning nvfp4;
+    Fp8LoadTuning fp8;
     int group_columns = 0, small_expert_limit = 0;
     Nvfp4LoadSchedule medium, dense;
 
     int job_columns() const {
-        const int columns = gate_columns > down_columns ? gate_columns : down_columns;
+        int columns = gate_columns > down_columns ? gate_columns : down_columns;
+        if (fp8.maximum_small_load) {
+            if (fp8.large_gate_columns > columns) columns = fp8.large_gate_columns;
+            if (fp8.large_down_columns > columns) columns = fp8.large_down_columns;
+        }
         return columns > group_columns ? columns : group_columns;
     }
 };

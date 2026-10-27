@@ -21,7 +21,8 @@ Storage allocate(Arena& arena, const Plan& plan, int tokens, bool routed, int sh
         const auto integers = [&](int count) {
             return static_cast<int*>(arena.alloc(DType::I32, {count}).data);
         };
-        const bool fp8    = plan.format == QType::FP8_E4M3FN_BLOCK128X128_BF16;
+        const bool fp8 = plan.format == QType::FP8_E4M3FN_BLOCK128X128_BF16 ||
+                         plan.format == QType::FP8_E4M3FN_BLOCK64X64_BF16;
         const int packing = fp8 ? 1 : 2, scale_group = fp8 ? 128 : 16;
         const auto scale_bytes = fp8 ? sizeof(float) : sizeof(std::uint8_t);
         out.input_codes        = bytes(std::size_t(tokens) * kHidden / packing);
@@ -44,7 +45,7 @@ Storage allocate(Arena& arena, const Plan& plan, int tokens, bool routed, int sh
         g.job_experts      = integers(max_jobs);
         g.job_columns      = integers(max_jobs);
         g.jobs             = integers(1);
-        if (plan.dense.gate_columns) g.load_range = integers(2);
+        if (plan.dense.gate_columns || plan.fp8.maximum_small_load) g.load_range = integers(2);
         g.assignments = integers(assignments);
         if (!plan.atomic_output) { g.inverse = integers(assignments); }
     }

@@ -30,7 +30,7 @@ Options parse(int argc, char** argv) {
         if (flag == "--help") {
             std::cout
                 << "TP2 MoE, all distinct expert payloads and verified router distributions.\n"
-                   "  --profile-id m1|m2|m3 --entry complete|routed|both --rank 0|1\n"
+                   "  --profile-id m1|m2|m3|m4 --entry complete|routed|both --rank 0|1\n"
                    "  --distribution reuse|pool|tail|spread|all\n"
                    "  --tokens T[,T...] --sweep FIRST:LAST[:STEP]\n"
                    "Default extents: every T=1..256, then 512,1024,2048,4096.\n";
@@ -54,7 +54,7 @@ Options parse(int argc, char** argv) {
         else
             throw std::invalid_argument("unknown TP2 benchmark option");
     }
-    if ((o.profile != "m1" && o.profile != "m2" && o.profile != "m3") ||
+    if ((o.profile != "m1" && o.profile != "m2" && o.profile != "m3" && o.profile != "m4") ||
         (o.entry != "complete" && o.entry != "routed" && o.entry != "both") ||
         (o.distribution != "all" && o.distribution != "reuse" && o.distribution != "pool" &&
          o.distribution != "tail" && o.distribution != "spread"))
@@ -63,12 +63,14 @@ Options parse(int argc, char** argv) {
 }
 
 void run(const Options& o) {
-    const bool clamped = o.profile != "m3";
-    const bool fp8     = o.profile == "m2";
+    const bool clamped      = o.profile == "m1" || o.profile == "m2";
+    const bool fp8          = o.profile == "m2" || o.profile == "m4";
+    const int direct_tokens = fp8 ? 2 : clamped ? 1 : 3;
     const tp::Shape shape =
         clamped ? tp::Shape{4096, 1024, 288,
                             8,    true, fp8 ? QType::FP8_E4M3FN_BLOCK128X128_BF16 : QType::NVFP4}
-                : tp::Shape{2560, 320, 512, 10, false, QType::NVFP4};
+                : tp::Shape{2560, 320,   512,
+                            10,   false, fp8 ? QType::FP8_E4M3FN_BLOCK64X64_BF16 : QType::NVFP4};
     const auto cuda   = device_context().execution_view();
     const int maximum = *std::max_element(o.tokens.begin(), o.tokens.end());
     tp::Fixture fixture(cuda, shape, o.rank, maximum);
@@ -137,7 +139,7 @@ void run(const Options& o) {
                     6.0 * shape.hidden * shape.intermediate * shape.top_k * tokens;
                 const double memory_reference = bytes / (kRoofline.sustained_read_gbs * 1000);
                 const double compute_reference =
-                    (tokens <= (clamped ? (fp8 ? 2 : 1) : 3) || (complete && !clamped && tokens < 8))
+                    (tokens <= direct_tokens || (complete && !clamped && tokens < 8))
                         ? std::numeric_limits<double>::quiet_NaN()
                         : (router_flops + shared_flops * (clamped ? (tokens <= 48 ? 4.0 / 3 : 2)
                                                                   : (tokens < 128 ? 4.0 / 3 : 1))) /
@@ -179,7 +181,7 @@ void run(const Options& o) {
                                                 ops::MoeEpilogue::Write, tokens, tokens);
                 // Quantized input/product publication and reduction scratch are separate
                 // from the unique public operands. This is a minimum, not measured DRAM.
-                const bool direct = tokens <= (clamped ? (fp8 ? 2 : 1) : 3);
+                const bool direct = tokens <= direct_tokens;
                 const auto elements =
                     std::uint64_t(tokens) * (shape.hidden + shape.intermediate * shape.top_k);
                 const int group        = fp8 ? 128 : 16;

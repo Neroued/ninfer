@@ -139,6 +139,41 @@ __device__ __forceinline__ void store_fp8_contiguous(const float (&values)[8], s
     if (lane == 0) *reinterpret_cast<__half*>(scales) = quant.scale;
 }
 
+__device__ __forceinline__ void store_int8_contiguous(const float (&values)[8], std::uint8_t* codes,
+                                                      std::uint8_t* scales, int lane) {
+    float maximum = 0;
+#pragma unroll
+    for (float x : values) maximum = fmaxf(maximum, fabsf(x));
+    // Eight contiguous lanes cover one G64 group, using its represented FP16 scale.
+    const auto quant = common::int8_fp16_scale(common::warp_max<8>(maximum));
+    unsigned words[2]{};
+#pragma unroll
+    for (int j = 0; j < 8; ++j)
+        words[j / 4] |=
+            unsigned(std::uint8_t(common::int8_quant_code(values[j], quant.inverse_scale)))
+            << (8 * (j % 4));
+    auto* output = codes + 8 * lane;
+    if (reinterpret_cast<std::uintptr_t>(output) % 8 == 0)
+        *reinterpret_cast<uint2*>(output) = make_uint2(words[0], words[1]);
+    else {
+#pragma unroll
+        for (int j = 0; j < 8; ++j) output[j] = std::uint8_t(words[j / 4] >> (8 * (j % 4)));
+    }
+    if (lane % 8 == 0) reinterpret_cast<__half*>(scales)[lane / 8] = quant.scale;
+}
+
+template <KvCacheStorage Storage>
+__device__ __forceinline__ void store_quantized_contiguous(const float (&values)[8],
+                                                           std::uint8_t* codes,
+                                                           std::uint8_t* scales, int lane) {
+    if constexpr (Storage == KvCacheStorage::Int8Group64)
+        store_int8_contiguous(values, codes, scales, lane);
+    else {
+        static_assert(Storage == KvCacheStorage::Fp8E4M3Row256);
+        store_fp8_contiguous(values, codes, scales, lane);
+    }
+}
+
 // Natural cache alignment is two bytes, while the common packed row admits a 16-byte store.
 template <bool Half>
 __device__ __forceinline__ void store_16bit_contiguous(const float (&values)[8],
@@ -179,10 +214,9 @@ __device__ __forceinline__ void prepare_kv_vector(const PrepareArguments& a, int
     if constexpr (Storage == KvCacheStorage::BFloat16) {
         store_16bit_contiguous<false>(x, a.keys.at(p % 64, head, page), lane);
     } else {
-        static_assert(Storage == KvCacheStorage::Fp8E4M3Row256);
         kv::normalized_hadamard_d256_contiguous_inplace(x, lane);
-        store_fp8_contiguous(x, a.keys.at(p % 64, head, page), a.key_scales.at(p % 64, head, page),
-                             lane);
+        store_quantized_contiguous<Storage>(x, a.keys.at(p % 64, head, page),
+                                            a.key_scales.at(p % 64, head, page), lane);
     }
     const auto v = reinterpret_cast<const uint4*>(value)[lane];
     const unsigned words[4]{v.x, v.y, v.z, v.w};
@@ -192,8 +226,8 @@ __device__ __forceinline__ void prepare_kv_vector(const PrepareArguments& a, int
     if constexpr (Storage == KvCacheStorage::BFloat16)
         store_16bit_contiguous<true>(x, a.values.at(p % 64, head, page), lane);
     else
-        store_fp8_contiguous(x, a.values.at(p % 64, head, page),
-                             a.value_scales.at(p % 64, head, page), lane);
+        store_quantized_contiguous<Storage>(x, a.values.at(p % 64, head, page),
+                                            a.value_scales.at(p % 64, head, page), lane);
 }
 
 } // namespace ninfer::ops::detail::qsa

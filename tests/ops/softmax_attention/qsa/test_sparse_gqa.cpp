@@ -590,6 +590,7 @@ void add_four_head_storage_cases(OpSuite& suite, KvCacheStorage storage) {
     add(8, 1, 8192);
     add(9, 1, 8192);
     add(65, 1, 2051, false, 17, true);
+    if (storage != KvCacheStorage::BFloat16) add(255, 1, 255);
     add(256, 1, 2051);
     add(257, 1, 8192);
     add(6, 8, 32771, true, 512, true);
@@ -623,6 +624,9 @@ void add_four_head_storage_cases(OpSuite& suite, KvCacheStorage storage) {
     });
     special("read_footprint",
             [=] { return read_footprint(cuda_environment().context, storage, true, 4, 24, 4); });
+    if (storage != KvCacheStorage::BFloat16)
+        special("scale_layout",
+                [=] { return scale_layout(cuda_environment().context, storage, 9, 8192, 24, 4); });
 }
 
 } // namespace
@@ -638,6 +642,7 @@ int main(int argc, char** argv) {
 #if NINFER_TARGET_RTX5090
     add_four_head_cases(suite);
     add_four_head_storage_cases(suite, KvCacheStorage::BFloat16);
+    add_four_head_storage_cases(suite, KvCacheStorage::Int8Group64);
 #endif
     return suite.main(argc, argv);
 }

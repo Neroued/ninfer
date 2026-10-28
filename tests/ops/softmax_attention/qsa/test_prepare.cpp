@@ -823,7 +823,7 @@ int main(int argc, char** argv) {
               {{"format", "fp8"}});
     // Each additional codec covers both semantic entries and distinct cache/record layouts,
     // with one compact set of mathematical risks rather than a storage/layout cross product.
-    for (auto storage : {KvCacheStorage::BFloat16}) {
+    for (auto storage : {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64}) {
         const std::string format = kv_cache_storage_name(storage);
         for (bool kv_only : {false, true}) {
             const std::string prefix =
@@ -849,6 +849,18 @@ int main(int argc, char** argv) {
         suite.add("qsa_prepare/" + format + "/h24_4/norm_alignment",
                   [=] { return norm_alignment_and_phase(cuda_environment().context, storage, 4); },
                   {{"format", format}});
+        if (storage != KvCacheStorage::BFloat16)
+            suite.add("qsa_prepare/" + format + "/h24_4/encoding_boundaries",
+                      [=] {
+                          auto& device = cuda_environment().context;
+                          int failed   = 0;
+                          for (bool kv_only : {false, true}) {
+                              failed += exact_key_encoding(device, storage, kv_only, 4);
+                              failed += scale_edges(device, storage, kv_only, 4);
+                          }
+                          return failed;
+                      },
+                      {{"format", format}});
     }
 
 #endif

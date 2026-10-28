@@ -249,7 +249,8 @@ sparse_gqa_compact(SparseGqaKernelArguments<4> a,
             }
         }
         __syncwarp();
-        if constexpr (Storage == KvCacheStorage::BFloat16) {
+        if constexpr (Storage == KvCacheStorage::BFloat16 ||
+                      Storage == KvCacheStorage::Int8Group64) {
             if (live)
                 sparse_gqa_compact_store_vector(
                     a, q, head, s.partial + (Prefix ? warp * PaddedHeads : 0) * 256);
@@ -304,7 +305,7 @@ __launch_bounds__(Warps * 32) __global__
     const auto group = std::int64_t(a.group_query(blockIdx.x));
     auto first       = a.begin + group * (Prefix ? Warps : 1);
     int packed       = Prefix ? Warps : 1;
-    if constexpr (Storage == KvCacheStorage::BFloat16 && Prefix) {
+    if constexpr (Storage != KvCacheStorage::Fp8E4M3Row256 && Prefix) {
         // Anchor complete packets at the slab end. Growing a fixed-end query window adds
         // an older leading packet without repartitioning all existing query/KV work.
         const int leading = (slab_queries - 1) % Warps + 1;

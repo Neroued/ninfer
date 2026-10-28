@@ -103,7 +103,8 @@ void launch_sparse_gqa_instance(SparseGqaArguments a, KvCacheStorage storage, in
             geometry.template operator()<1>();
         else if (kv_heads == 4) {
             if constexpr (Storage == KvCacheStorage::Fp8E4M3Row256 ||
-                          Storage == KvCacheStorage::BFloat16)
+                          Storage == KvCacheStorage::BFloat16 ||
+                          Storage == KvCacheStorage::Int8Group64)
                 geometry.template operator()<4>();
         } else
             geometry.template operator()<2>();

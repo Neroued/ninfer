@@ -45,7 +45,7 @@ SparseGqaPlan select_sparse_gqa_plan(KvCacheStorage storage, int tokens, int bat
             }
         }
         return {rows, splits, prefix ? SparseGqaInstance::FullPrefix : SparseGqaInstance::Mma,
-                partial && (!bf16 || splits > 1)};
+                partial && (storage == KvCacheStorage::Fp8E4M3Row256 || splits > 1)};
     }
     if (queries >= sparse_gqa_direct_queries(kv_heads, sms))
         return visible <= 2051 ? SparseGqaPlan{64, 1, SparseGqaInstance::FullPrefix, false}

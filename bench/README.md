@@ -1189,7 +1189,7 @@ and `--axes 1|3` selects current RoPE coordinates. `--base-positions` and
 tail/record views. `--inplace` aliases both Q/IQ outputs and restores their original projection
 words outside every timed call. CSV rows include positions, axes, alias mode, layout and round.
 
-The RTX 5090 BF16 and FP8 row256 fixtures also support `--kv-heads 4`, with 24 query heads.
+The RTX 5090 BF16, INT8 G64 and FP8 row256 fixtures also support `--kv-heads 4`, with 24 query heads.
 `prepare-kv` uses the same four-head cache geometry and produces KV, index cache and raw
 records without allocating query projections or outputs. Other head/storage admission belongs
 to the public Op. Metrics use the fixture's actual query and KV extents.
@@ -1238,7 +1238,7 @@ prefixes; T/B describe physical extents. Indexer reports scoring queries and com
 blocks, excluding the C<=512 all-select case. QK FLOPs count the four 128-dimensional heads only
 for scored queries. Sparse GQA reports separate useful QK/PV FLOPs over selected blocks plus the
 incomplete tail, with the selected query/KV geometry (`value_heads` in the common CSV). RTX 5090 also admits
-24Q/4KV with `--query-heads 24 --kv-heads 4 --kv-cache bf16|fp8`.
+24Q/4KV with `--query-heads 24 --kv-heads 4 --kv-cache bf16|int8|fp8`.
 
 `logical_read_bytes` and `logical_write_bytes` count unique boundary payloads by direction,
 including activations, relevant metadata and all required output writes. `kv_read_bytes` is the

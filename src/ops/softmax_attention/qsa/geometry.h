@@ -15,8 +15,8 @@ inline int registered_query_heads(int kv, KvCacheStorage storage) {
     if (kv == 1) return HeadGeometry<1>::query_heads;
     if (kv == 2) return HeadGeometry<2>::query_heads;
 #if NINFER_TARGET_RTX5090
-    if (kv == 4 &&
-        (storage == KvCacheStorage::Fp8E4M3Row256 || storage == KvCacheStorage::BFloat16))
+    if (kv == 4 && (storage == KvCacheStorage::Fp8E4M3Row256 ||
+                    storage == KvCacheStorage::BFloat16 || storage == KvCacheStorage::Int8Group64))
         return HeadGeometry<4>::query_heads;
 #endif
     return 0;

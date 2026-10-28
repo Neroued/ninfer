@@ -187,7 +187,7 @@ struct QsaSparseGqaExecutionEnvelope {
  *
  * Domain / numeric:
  * T>0, B=1..8. Query, gate and out are contiguous, 16-byte-aligned BF16 [256,Hq,T,B], (Hq,Hkv) in
- * {(24,2),(12,1)}, plus (24,4) on RTX 5090 with BFloat16 or Fp8E4M3Row256. Cache supports BFloat16 (BF16 K /
+ * {(24,2),(12,1)}, plus (24,4) on RTX 5090 with BFloat16, Int8Group64 or Fp8E4M3Row256. Cache supports BFloat16 (BF16 K /
  * FP16 V), Fp8E4M3Row256, Int8Group64, Nvfp4Group16 and Fp8KeyNvfp4Value. Data/scale planes follow
  * paged_kv_storage_layout(storage,256), with dense, naturally aligned [leading_extent,64,Hkv]
  * geometry per 64-token record. Q and softmax probabilities are not quantized to low-bit operands.

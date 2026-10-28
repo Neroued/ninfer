@@ -1,6 +1,17 @@
 #pragma once
 
+#include <optional>
+
 namespace ninfer::ops::detail::moe_cuda::block_scaled {
+
+// G16 scale rows are padded to eight bytes for aligned K128 loads.
+#if defined(__CUDACC__)
+__host__ __device__
+#endif
+    inline constexpr int
+    nvfp4_activation_scale_stride(int features) {
+    return ((features + 127) / 128) * 8;
+}
 
 enum class Nvfp4Pipeline { K128, K256Deep, K512, K256 };
 
@@ -28,6 +39,7 @@ struct Nvfp4LoadSchedule {
     int max_load = 0x7fffffff;
     Nvfp4Tuning tuning;
     int queued_ctas_per_sm = 6;
+    std::optional<Nvfp4Tuning> down_tuning;
 };
 
 } // namespace ninfer::ops::detail::moe_cuda::block_scaled

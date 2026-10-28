@@ -44,6 +44,9 @@ struct Plan {
     int vector_gate_ctas_per_sm = 0;
     float clamp_limit           = 0;
 
+    int pool_min_experts = 0, pool_expert_limit = 0, pool_columns = 0;
+    int pool_row_window = 0, pool_queued_ctas_per_sm = 0;
+
     Fp8PopulationTuning fp8;
     Nvfp4Tuning nvfp4;
     int group_columns = 0, small_expert_limit = 0;

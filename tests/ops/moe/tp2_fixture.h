@@ -4,6 +4,7 @@
 #include "ninfer/ops/moe.h"
 
 #include <memory>
+#include <span>
 #include <string_view>
 #include <vector>
 
@@ -74,7 +75,8 @@ public:
     explicit Oracle(const Fixture&);
     ~Oracle();
     std::pair<std::vector<int>, std::vector<double>> routing(int token);
-    double output(int row, int token, bool complete, bool signed_coefficients = false);
+    double output(int row, int token, bool complete, bool signed_coefficients = false,
+                  std::span<const int> expert_mask = {});
     double shared_coefficient(int token);
 private:
     struct Impl;

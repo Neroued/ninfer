@@ -25,7 +25,7 @@ Plan select_plan(const SwiGLUProfile& ffn, int t, int) {
     if (t >= 3)
         p.fp8 = {.row_window           = 4,
                  .ordered_expert_limit = 16,
-                 .dense_down           = t >= 128,
+                 .dense_down           = t >= 64,
                  .k_step               = t <= 64 ? 256 : 0,
                  .k256_max_load        = 32,
                  .large_gate_columns   = 128,
@@ -38,7 +38,7 @@ Plan select_plan(const SwiGLUProfile& ffn, int t, int) {
 } // namespace
 
 const ShapePolicy& fp8_h4096_i1024_e288_k8() {
-    static constexpr int boundaries[]{2, 3, 9, 33, 65, 128, 129};
+    static constexpr int boundaries[]{2, 3, 9, 33, 64, 65, 128, 129};
     static const ShapePolicy policy{.select                = select_plan,
                                     .allocation_boundaries = boundaries,
                                     .all_slice_tokens      = 4096,

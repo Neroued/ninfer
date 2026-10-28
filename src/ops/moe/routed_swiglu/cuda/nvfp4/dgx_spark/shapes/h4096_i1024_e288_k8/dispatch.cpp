@@ -37,6 +37,13 @@ Plan select_plan(const SwiGLUProfile& ffn, int tokens, int) {
                                 .queued_ctas_per_sm = 2};
         p.group_columns      = 128;
     }
+    if (tokens >= 1024) {
+        p.pool_min_experts        = 8;
+        p.pool_expert_limit       = 16;
+        p.pool_columns            = 128;
+        p.pool_row_window         = 4;
+        p.pool_queued_ctas_per_sm = 3;
+    }
     Plan plan;
     plan.implementation = Implementation::ClampedBlockScaled;
     plan.clamped        = p;

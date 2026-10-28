@@ -3,7 +3,10 @@
 
 #include "ops/moe/kernels/cuda/block_scaled/nvfp4/dgx_spark/launch.cuh"
 
+#include "ops/moe/kernels/cuda/block_scaled/pool_down.cuh"
+
 #include <algorithm>
+#include <bit>
 #include <climits>
 
 namespace ninfer::ops::detail::moe_cuda::block_scaled::nvfp4 {
@@ -38,7 +41,9 @@ void launch_mma(const Tensor& x, const CudaSwiGLUExperts& experts, const ExpertR
     using S                   = Schedule<Columns, Gate, stages, KStep, Eviction, Intermediate>;
     constexpr int rows        = Gate ? Intermediate : kHidden;
     const int job_columns     = plan.job_columns();
-    const int subtiles        = job_columns / Columns;
+    // A load class never visits column tiles beyond its maximum expert count.
+    const int covered_columns = std::min(job_columns, maximum_expert_count);
+    const int subtiles        = std::bit_ceil(unsigned((covered_columns + Columns - 1) / Columns));
     const int max_jobs        = (kTopK * x.ne[1] / job_columns + kExperts) * subtiles;
     const int blocks          = std::min(max_jobs * (rows / S::rows),
                                          execution.multiprocessor_count() * plan.queued_ctas_per_sm);
@@ -59,7 +64,7 @@ void launch_mma(const Tensor& x, const CudaSwiGLUExperts& experts, const ExpertR
         static_cast<std::uint8_t*>(s.product_scales), s.contributions,
         static_cast<const float*>(routes.coefficients.data), s.routed_sum, subtiles,
         plan.nvfp4.down_row_window, static_cast<int>(plan.nvfp4.cache), minimum_expert_count,
-        maximum_expert_count);
+        maximum_expert_count, plan.pool_expert_limit, plan.pool_min_experts);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -120,8 +125,12 @@ void launch_experts_impl(const Tensor& x, const CudaSwiGLUExperts& experts,
                          CudaExecutionView execution) {
     const int limit  = plan.dense.gate_columns ? plan.small_expert_limit : INT_MAX;
     const auto phase = [&]<bool Gate>() {
-        const auto project = [&](const Plan& tuning, int first, int last) {
+        const auto project = [&](const Plan& selected, int first, int last) {
             if (first >= x.ne[1]) return;
+            auto tuning = selected;
+            if constexpr (!Gate) {
+                if (tuning.nvfp4_down) tuning.nvfp4 = *tuning.nvfp4_down;
+            }
             with_columns(Gate ? tuning.gate_columns : tuning.down_columns, [&]<int C>() {
                 const auto launch = [&]<bool Atomic>() {
                     launch_tuned_mma<Intermediate, Gate, C, Atomic>(x, experts, routes, s, tuning,
@@ -146,6 +155,7 @@ void launch_experts_impl(const Tensor& x, const CudaSwiGLUExperts& experts,
             tuning.gate_columns       = schedule.gate_columns;
             tuning.down_columns       = schedule.down_columns;
             tuning.nvfp4              = schedule.tuning;
+            tuning.nvfp4_down         = schedule.down_tuning;
             tuning.queued_ctas_per_sm = schedule.queued_ctas_per_sm;
             project(tuning, first, last);
         };
@@ -159,6 +169,26 @@ void launch_experts_impl(const Tensor& x, const CudaSwiGLUExperts& experts,
     if (plan.column_major_down) {
         launch_column_jobs(s.groups, x.ne[1], plan.job_columns(), plan.preserve_balanced_down,
                            execution);
+    }
+    if constexpr (Intermediate == 320) {
+        if (plan.pool_expert_limit) {
+            const auto run = [&]<int C>() {
+                launch_pool_down<kHidden, kExperts, kTopK, C>(
+                    PoolContraction<C>{s.product_codes,
+                                       static_cast<const std::uint8_t*>(s.product_scales),
+                                       experts.bank.down, *experts.activation_divisors.down},
+                    s.groups, static_cast<const int*>(routes.ids.data),
+                    static_cast<const float*>(routes.coefficients.data), s.routed_sum, x.ne[1],
+                    plan.pool_min_experts, plan.pool_expert_limit, plan.pool_row_window,
+                    plan.pool_queued_ctas_per_sm, execution);
+            };
+            if (plan.pool_columns == 32)
+                run.template operator()<32>();
+            else if (plan.pool_columns == 128)
+                run.template operator()<128>();
+            else
+                throw std::logic_error("invalid expert pool column tile");
+        }
     }
     phase.template operator()<false>();
 }

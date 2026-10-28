@@ -1,6 +1,7 @@
 #include "ops/moe/kernels/cuda/block_scaled/fp8/block64/launch.h"
 #include "ops/moe/kernels/cuda/block_scaled/fp8/block64/compute.cuh"
 #include "ops/common/host/launch.h"
+#include "ops/moe/kernels/cuda/block_scaled/pool_down.cuh"
 
 #include <algorithm>
 #include <bit>
@@ -11,10 +12,12 @@ template <bool Gate, int Columns, bool Atomic = false>
 void launch_mma(const Tensor& x, const CudaSwiGLUExperts& experts, const ExpertRoutes& routes,
                 const Storage& storage, const Plan& plan, CudaExecutionView execution,
                 int minimum_count = 0, int maximum_count = 0x7fffffff) {
-    using S                 = Schedule<Columns, Gate>;
-    constexpr int row_tiles = Gate ? (kLocalIntermediate + 127) / 128 : kHidden / 128;
-    const int job_columns = plan.job_columns(), subtiles = job_columns / Columns;
-    const int max_jobs = (kTopK * x.ne[1] / job_columns + kExperts) * subtiles;
+    using S                   = Schedule<Columns, Gate>;
+    constexpr int row_tiles   = Gate ? (kLocalIntermediate + 127) / 128 : kHidden / 128;
+    const int job_columns     = plan.job_columns();
+    const int covered_columns = std::min(job_columns, maximum_count);
+    const int subtiles        = std::bit_ceil(unsigned((covered_columns + Columns - 1) / Columns));
+    const int max_jobs        = (kTopK * x.ne[1] / job_columns + kExperts) * subtiles;
     const int blocks =
         std::min(max_jobs * row_tiles, execution.multiprocessor_count() * plan.queued_ctas_per_sm);
     const int bytes =
@@ -25,7 +28,8 @@ void launch_mma(const Tensor& x, const CudaSwiGLUExperts& experts, const ExpertR
         Gate ? experts.bank.gate_up : experts.bank.down, storage.groups, storage.product_codes,
         static_cast<float*>(storage.product_scales), storage.contributions,
         static_cast<const float*>(routes.coefficients.data), storage.routed_sum,
-        std::countr_zero(unsigned(subtiles)), minimum_count, maximum_count);
+        std::countr_zero(unsigned(subtiles)), minimum_count, maximum_count, plan.pool_expert_limit,
+        plan.pool_min_experts);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -92,6 +96,18 @@ void launch_experts(const Tensor& x, const CudaSwiGLUExperts& experts, const Exp
     if (plan.column_major_down)
         launch_column_jobs(storage.groups, x.ne[1], plan.job_columns(), plan.preserve_balanced_down,
                            execution);
+    if (plan.pool_expert_limit) {
+        if (plan.pool_columns != 64)
+            throw std::logic_error("invalid block64 expert pool column tile");
+        launch_pool_down<kHidden, kExperts, kTopK, 64>(
+            PoolContraction<64>{storage.product_codes,
+                                static_cast<const float*>(storage.product_scales),
+                                experts.bank.down},
+            storage.groups, static_cast<const int*>(routes.ids.data),
+            static_cast<const float*>(routes.coefficients.data), storage.routed_sum, x.ne[1],
+            plan.pool_min_experts, plan.pool_expert_limit, plan.pool_row_window,
+            plan.pool_queued_ctas_per_sm, execution);
+    }
     phase.template operator()<false>();
 }
 

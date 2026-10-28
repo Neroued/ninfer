@@ -38,12 +38,23 @@ Plan select_plan(const SwiGLUProfile&, int t, int shared_intermediate) {
                            .queued_ctas_per_sm = t <= 512 ? 6 : 2};
         p.group_columns = t <= 512 ? 64 : 128;
     }
+    if (t >= 4 && t <= 32) {
+        p.nvfp4_down         = {Nvfp4Pipeline::K512, Nvfp4CachePolicy::Cached, 0};
+        p.medium.down_tuning = p.nvfp4_down;
+        p.dense.down_tuning  = p.nvfp4_down;
+    }
+    if (t >= 96) {
+        p.pool_expert_limit       = t < 256 ? 10 : 20;
+        p.pool_columns            = t < 256 ? 32 : 128;
+        p.pool_row_window         = 4;
+        p.pool_queued_ctas_per_sm = 3;
+    }
     return plan;
 }
 } // namespace
 
 const ShapePolicy& nvfp4_h2560_i320_e512_k10() {
-    static constexpr int boundaries[]{4, 5, 8, 65, 128, 512, 513, 1024};
+    static constexpr int boundaries[]{4, 5, 8, 33, 65, 96, 128, 256, 512, 513, 1024};
     static const ShapePolicy policy{.select = select_plan, .allocation_boundaries = boundaries};
     return policy;
 }

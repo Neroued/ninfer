@@ -151,20 +151,22 @@ double Oracle::shared_coefficient(int token) {
     return impl_->shared_coefficient.at(token);
 }
 
-double Oracle::output(int row, int token, bool complete, bool signed_coefficients) {
+double Oracle::output(int row, int token, bool complete, bool signed_coefficients,
+                      std::span<const int> expert_mask) {
     auto& f       = *impl_;
     const auto s  = f.fixture.shape;
     double result = 0;
     if (complete) {
         const auto& [ids, coefficients] = f.routing(token);
         for (int j = 0; j < s.top_k; ++j)
-            result += coefficients[j] * f.expert_output(ids[j], token, row);
+            if (expert_mask.empty() || expert_mask[ids[j]])
+                result += coefficients[j] * f.expert_output(ids[j], token, row);
         result += f.shared_coefficient[token] * f.expert_output(-1, token, row);
     } else {
         for (int j = 0; j < s.top_k; ++j) {
             const int e    = f.fixture.expected_ids()[std::size_t(token) * s.top_k + j];
             const double c = (signed_coefficients && j % 3 == 0 ? -.375 : .75) * (1 + j * .125);
-            result += c * f.expert_output(e, token, row);
+            if (expert_mask.empty() || expert_mask[e]) result += c * f.expert_output(e, token, row);
         }
     }
     return result;

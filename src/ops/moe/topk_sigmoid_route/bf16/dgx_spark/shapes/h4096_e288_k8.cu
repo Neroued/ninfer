@@ -55,10 +55,17 @@ void moe_sigmoid::launch(const Tensor& x, const Weight& w, const Tensor& bias, E
         launch_bf16_a16_tma_mma<Tma32>(p, out, epi, stream);
     else
         launch_bf16_a16_tma_mma<Tma64>(p, out, epi, stream);
-    moe_cuda::routing::sigmoid_correction_top8<4><<<(p.tokens + 3) / 4, 128, 0, stream>>>(
-        scores, static_cast<const float*>(bias.data), static_cast<int*>(routes.ids.data),
-        static_cast<float*>(routes.coefficients.data), p.tokens, profile.scaling_factor,
-        profile.normalization_epsilon);
+    const auto select = [&]<int Warps>() {
+        moe_cuda::routing::sigmoid_correction_top8<Warps>
+            <<<(p.tokens + Warps - 1) / Warps, Warps * 32, 0, stream>>>(
+                scores, static_cast<const float*>(bias.data), static_cast<int*>(routes.ids.data),
+                static_cast<float*>(routes.coefficients.data), p.tokens, profile.scaling_factor,
+                profile.normalization_epsilon);
+    };
+    if (p.tokens < 512)
+        select.template operator()<4>();
+    else
+        select.template operator()<8>();
     CUDA_CHECK(cudaGetLastError());
 }
 } // namespace ninfer::ops::detail

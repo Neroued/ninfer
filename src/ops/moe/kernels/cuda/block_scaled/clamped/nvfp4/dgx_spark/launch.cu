@@ -3,7 +3,10 @@
 
 #include "ops/moe/kernels/cuda/block_scaled/nvfp4/dgx_spark/launch.cuh"
 
+#include "ops/moe/kernels/cuda/block_scaled/pool_down.cuh"
+
 #include <algorithm>
+#include <bit>
 
 namespace ninfer::ops::detail::moe_cuda::block_scaled::clamped::nvfp4 {
 namespace {
@@ -52,13 +55,15 @@ void launch_mma(const Tensor& x, const CudaSwiGLUExperts& experts, const ExpertR
     using S               = Schedule<Columns, Gate, Stages, KStep, Eviction, Intermediate>;
     constexpr int rows    = Gate ? Intermediate : kHidden;
     const int job_columns = plan.job_columns();
-    const int subtiles    = job_columns / Columns;
-    const int max_jobs    = (kTopK * x.ne[1] / job_columns + kExperts) * subtiles;
-    const int blocks      = std::min(max_jobs * (rows / S::rows),
-                                     execution.multiprocessor_count() * plan.queued_ctas_per_sm);
-    constexpr auto kernel = grouped_mma<Columns, Gate, Atomic, Stages, KStep, Eviction,
-                                        CachedExpertMajor, FilterLoads, Intermediate>;
-    constexpr int bytes   = sizeof(TileStorage<S>) > 48 * 1024 ? sizeof(TileStorage<S>) : 0;
+    // A load class never visits column tiles beyond its maximum expert count.
+    const int covered_columns = std::min(job_columns, maximum_expert_count);
+    const int subtiles        = std::bit_ceil(unsigned((covered_columns + Columns - 1) / Columns));
+    const int max_jobs        = (kTopK * x.ne[1] / job_columns + kExperts) * subtiles;
+    const int blocks          = std::min(max_jobs * (rows / S::rows),
+                                         execution.multiprocessor_count() * plan.queued_ctas_per_sm);
+    constexpr auto kernel     = grouped_mma<Columns, Gate, Atomic, Stages, KStep, Eviction,
+                                            CachedExpertMajor, FilterLoads, Intermediate>;
+    constexpr int bytes       = sizeof(TileStorage<S>) > 48 * 1024 ? sizeof(TileStorage<S>) : 0;
     if constexpr (bytes) {
         static const auto status =
             cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes);
@@ -75,7 +80,8 @@ void launch_mma(const Tensor& x, const CudaSwiGLUExperts& experts, const ExpertR
         std::countr_zero(unsigned(subtiles)), plan.clamp_limit, plan.nvfp4.down_row_window,
         static_cast<int>(plan.nvfp4.cache), minimum_expert_count, maximum_expert_count, regime,
         plan.broad_short_limit, plan.broad_long_limit, plan.broad.max_load, x.ne[1],
-        Intermediate == 1024 && plan.dense_down_columns != 0);
+        Intermediate == 1024 && plan.dense_down_columns != 0, plan.pool_expert_limit,
+        plan.pool_min_experts);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -201,7 +207,8 @@ void launch_experts_impl(const Tensor& x, const CudaSwiGLUExperts& experts,
                     s.product_codes, static_cast<const std::uint8_t*>(s.product_scales),
                     experts.bank.down, *experts.activation_divisors.down, s.groups,
                     static_cast<const int*>(routes.ids.data),
-                    static_cast<const float*>(routes.coefficients.data), s.routed_sum, x.ne[1]);
+                    static_cast<const float*>(routes.coefficients.data), s.routed_sum, x.ne[1],
+                    plan.pool_expert_limit, plan.pool_min_experts);
                 CUDA_CHECK(cudaGetLastError());
             };
             switch (plan.dense_down_columns) {
@@ -225,6 +232,20 @@ void launch_experts_impl(const Tensor& x, const CudaSwiGLUExperts& experts,
     if (plan.column_major_down) {
         launch_column_jobs(s.groups, x.ne[1], plan.job_columns(), plan.preserve_balanced_down,
                            execution);
+    }
+    if constexpr (Intermediate == 1024) {
+        if (plan.pool_expert_limit) {
+            if (plan.pool_columns != 128)
+                throw std::logic_error("invalid clamped expert pool column tile");
+            launch_pool_down<kHidden, kExperts, kTopK, 128>(
+                PoolContraction<128>{s.product_codes,
+                                     static_cast<const std::uint8_t*>(s.product_scales),
+                                     experts.bank.down, *experts.activation_divisors.down},
+                s.groups, static_cast<const int*>(routes.ids.data),
+                static_cast<const float*>(routes.coefficients.data), s.routed_sum, x.ne[1],
+                plan.pool_min_experts, plan.pool_expert_limit, plan.pool_row_window,
+                plan.pool_queued_ctas_per_sm, execution);
+        }
     }
     phase.template operator()<false>();
 }

@@ -110,11 +110,16 @@ __global__ __launch_bounds__(Schedule<Columns, Gate>::threads) void grouped_mma(
     ExpertMatrixDeviceView bank, Groups groups, std::uint8_t* __restrict__ product,
     float* __restrict__ product_scales, float* __restrict__ contributions,
     const float* __restrict__ coefficients, float* __restrict__ routed_sum, int subtile_bits,
-    int minimum_count, int maximum_count) {
+    int minimum_count, int maximum_count, int pool_expert_limit = 0, int pool_min_experts = 0) {
     if (groups.load_range &&
         (groups.load_range[1] <= minimum_count || groups.load_range[0] > maximum_count))
         return;
     using S = Schedule<Columns, Gate>;
+    if constexpr (!Gate) {
+        if (pool_expert_limit && groups.load_range[2] > pool_min_experts &&
+            groups.load_range[2] <= pool_expert_limit)
+            return;
+    }
     extern __shared__ __align__(16) unsigned char bytes[];
     auto& tile              = *reinterpret_cast<TileStorage<S>*>(bytes);
     constexpr int row_tiles = Gate ? (kLocalIntermediate + 127) / 128 : kHidden / 128;
@@ -251,6 +256,50 @@ __global__ __launch_bounds__(Schedule<Columns, Gate>::threads) void grouped_mma(
         __syncthreads();
     }
 }
+
+template <int Columns>
+struct PoolContraction {
+    using S                      = Schedule<Columns, false>;
+    using Tile                   = TileStorage<S>;
+    static constexpr int threads = S::threads;
+    const std::uint8_t* input;
+    const float* scales;
+    ExpertMatrixDeviceView bank;
+
+    __device__ __forceinline__ float operator()(Tile& tile, int row0, int expert, int begin,
+                                                int end, float (&acc)[2][S::mma_columns][4]) const {
+        const int warp = threadIdx.x >> 5, wm = warp % S::warp_rows;
+        const int active_columns = min(Columns, ((end - begin + 7) / 8) * 8);
+        const auto weight        = resolve(bank, expert);
+        stage_inputs<S, false>(tile, 0, 0, row0, weight, input, active_columns);
+        stage_inputs<S, false>(tile, 1, 1, row0, weight, input, active_columns);
+        for (int kt = 0; kt < S::groups; ++kt) {
+            const int stage = kt % 2;
+            cp_wait<1>();
+            __syncthreads();
+            const int row   = row0 + wm * 32;
+            const bool full = kt * 128 + 128 <= S::k;
+            const float s0  = __bfloat162float(weight.scales[(row / 64) * (S::k / 64) + 2 * kt]);
+            const float s1 =
+                full ? __bfloat162float(weight.scales[(row / 64) * (S::k / 64) + 2 * kt + 1]) : 0;
+            if (full && s0 == s1)
+                contract_segment<S, false, 4>(tile, stage, 0, kt, begin, end, scales, s0, s0, acc);
+            else {
+                contract_segment<S, false, 2>(tile, stage, 0, kt, begin, end, scales, s0, s0, acc);
+                if (full)
+                    contract_segment<S, false, 2>(tile, stage, 2, kt, begin, end, scales, s1, s1,
+                                                  acc);
+            }
+            __syncthreads();
+            if (kt + 2 < S::groups)
+                stage_inputs<S, false>(tile, stage, kt + 2, row0, weight, input, active_columns);
+            else
+                cp_commit();
+        }
+        cp_wait<0>();
+        return 1;
+    }
+};
 
 __global__ void vector_gate(const __nv_bfloat16* x, ExpertMatrixDeviceView bank, const int* ids,
                             ExpertSubsetKind kind, const int* mask, float* activation) {

@@ -37,7 +37,11 @@ struct Plan {
     int shared_columns     = 32;
     int queued_ctas_per_sm = 0;
 
+    int pool_min_experts = 0, pool_expert_limit = 0, pool_columns = 0;
+    int pool_row_window = 0, pool_queued_ctas_per_sm = 0;
+
     Nvfp4Tuning nvfp4;
+    std::optional<Nvfp4Tuning> nvfp4_down;
     Fp8LoadTuning fp8;
     int group_columns = 0, small_expert_limit = 0;
     Nvfp4LoadSchedule medium, dense;

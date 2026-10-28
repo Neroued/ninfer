@@ -4,6 +4,7 @@
 #include "core/decode_graph.h"
 
 #include <array>
+#include <optional>
 #include <set>
 #include <utility>
 
@@ -25,21 +26,21 @@ struct Case {
     bool transition   = false;
     DType output_type = DType::BF16;
     bool shared_only  = false;
+    bool masked       = false;
 };
 
 std::size_t capacity(const Fixture& fixture, bool complete, int first, int last,
-                     DType output_type = DType::BF16) {
+                     DType output_type            = DType::BF16,
+                     ops::ExpertSubsetKind subset = ops::ExpertSubsetKind::All) {
     if (complete) {
         if (fixture.shape.clamped)
-            return ops::topk_sigmoid_swiglu_moe_workspace_capacity_bytes(
-                fixture.sigmoid_profile(), ops::ExpertSubsetKind::All, first, last);
+            return ops::topk_sigmoid_swiglu_moe_workspace_capacity_bytes(fixture.sigmoid_profile(),
+                                                                         subset, first, last);
         return ops::topk_softmax_swiglu_moe_workspace_capacity_bytes(
-            fixture.softmax_profile(), ops::ExpertSubsetKind::All, ops::MoeEpilogue::Write, first,
-            last);
+            fixture.softmax_profile(), subset, ops::MoeEpilogue::Write, first, last);
     }
-    return ops::routed_swiglu_workspace_capacity_bytes(fixture.routed_profile(),
-                                                       ops::ExpertSubsetKind::All, output_type,
-                                                       ops::MoeEpilogue::Write, first, last);
+    return ops::routed_swiglu_workspace_capacity_bytes(
+        fixture.routed_profile(), subset, output_type, ops::MoeEpilogue::Write, first, last);
 }
 
 int run_case(Fixture& fixture, Case c, CudaExecutionView cuda) {
@@ -47,7 +48,23 @@ int run_case(Fixture& fixture, Case c, CudaExecutionView cuda) {
         std::string(c.complete ? "complete" : "routed") + "/T" + std::to_string(c.tokens);
     GuardedDeviceBuffer destination(std::size_t(fixture.shape.hidden) * c.tokens *
                                     (c.output_type == DType::FP32 ? 4 : 2));
-    const auto bytes = capacity(fixture, c.complete, c.tokens, c.tokens, c.output_type);
+    std::vector<int> mask(c.masked ? fixture.shape.experts : 0);
+    std::optional<GuardedDeviceBuffer> mask_storage;
+    ops::ExpertSubset subset;
+    if (c.masked) {
+        mask_storage.emplace(mask.size() * sizeof(int));
+        subset = {ops::ExpertSubsetKind::MaskOnes,
+                  Tensor(mask_storage->span(), DType::I32, {fixture.shape.experts})};
+    }
+    const auto update_mask = [&](int phase) {
+        if (!c.masked) return;
+        for (int e = 0; e < fixture.shape.experts; ++e)
+            mask[e] = phase == 1 ? 0 : phase == 3 ? 1 : e % 4 != 0;
+        mask_storage->copy_from_host(mask.data(), mask.size() * sizeof(int));
+    };
+    update_mask(0);
+    const auto bytes =
+        capacity(fixture, c.complete, c.tokens, c.tokens, c.output_type, subset.kind);
     GuardedDeviceBuffer scratch(bytes);
     MemoryArena workspace(scratch.span());
     Tensor y(destination.span(), c.output_type, {fixture.shape.hidden, c.tokens});
@@ -68,12 +85,12 @@ int run_case(Fixture& fixture, Case c, CudaExecutionView cuda) {
     const auto launch = [&] {
         if (c.complete) {
             if (fixture.shape.clamped)
-                ops::topk_sigmoid_swiglu_moe(x, full_profile, weights, {}, y, workspace, cuda);
+                ops::topk_sigmoid_swiglu_moe(x, full_profile, weights, subset, y, workspace, cuda);
             else
-                ops::topk_softmax_swiglu_moe(x, softmax_profile, softmax_weights, {},
+                ops::topk_softmax_swiglu_moe(x, softmax_profile, softmax_weights, subset,
                                              ops::MoeEpilogue::Write, y, workspace, cuda);
         } else
-            ops::routed_swiglu(x, profile, experts, routes, {}, ops::MoeEpilogue::Write, y,
+            ops::routed_swiglu(x, profile, experts, routes, subset, ops::MoeEpilogue::Write, y,
                                workspace, cuda);
     };
     launch();
@@ -86,6 +103,7 @@ int run_case(Fixture& fixture, Case c, CudaExecutionView cuda) {
     }
     int failures = 0;
     for (int phase = 0; phase < (c.transition ? 4 : c.graph ? 2 : 1); ++phase) {
+        update_mask(phase);
         const auto distribution = c.transition && phase == 1   ? "tail"
                                   : c.transition && phase == 2 ? "spread"
                                                                : c.distribution;
@@ -177,7 +195,7 @@ int run_case(Fixture& fixture, Case c, CudaExecutionView cuda) {
                 const auto index = std::size_t(token) * fixture.shape.hidden + row;
                 got.push_back(c.output_type == DType::BF16 ? bf16_to_f32(words[index])
                                                            : floats[index]);
-                reference.push_back(oracle.output(row, token, c.complete, true));
+                reference.push_back(oracle.output(row, token, c.complete, true, mask));
             }
         }
         failures += verify_reduction(label, got, reference,
@@ -185,6 +203,12 @@ int run_case(Fixture& fixture, Case c, CudaExecutionView cuda) {
                                      : fixture.shape.format == QType::NVFP4 ? kA4
                                                                             : kA8);
         failures += destination.verify_guards(label) + scratch.verify_guards(label);
+        if (c.masked) {
+            std::vector<int> preserved_mask(mask.size());
+            mask_storage->copy_to_host(preserved_mask.data(), preserved_mask.size() * sizeof(int));
+            if (preserved_mask != mask) throw std::runtime_error("TP2 expert mask was modified");
+            failures += mask_storage->verify_guards(label);
+        }
         if (workspace.used() != 0) throw std::runtime_error("TP2 workspace cursor was retained");
     }
     return failures;
@@ -278,6 +302,11 @@ void add_profile(OpSuite& suite, Shape shape, const std::string& name) {
         extents.push_back(5);
         std::sort(extents.begin(), extents.end());
     }
+    const std::vector<int> transition_extents =
+        !shape.clamped && shape.format != QType::NVFP4 ? std::vector<int>{31, 255, 2047, 2048, 2049}
+        : !shape.clamped               ? std::vector<int>{31, 32, 33, 34, 63, 95, 96, 97, 255, 257}
+        : shape.format != QType::NVFP4 ? std::vector<int>{63}
+                                       : std::vector<int>{};
     for (int rank : {0, 1}) {
         std::vector<Case> cases;
         std::vector<OpCase> catalogue;
@@ -298,6 +327,17 @@ void add_profile(OpSuite& suite, Shape shape, const std::string& name) {
                                       {"execution", graph ? "graph" : "eager"}}});
             }
         if (rank == 0)
+            for (bool complete : {false, true})
+                for (int t : transition_extents) {
+                    cases.push_back({t, rank, complete, true, false, "pool", true});
+                    catalogue.push_back(
+                        {"tp2/" + name + "/" + (complete ? "complete" : "routed") + "/rank0/T" +
+                             std::to_string(t),
+                         {{"format", shape.format == QType::NVFP4 ? "nvfp4" : "fp8"},
+                          {"policy", shape.format == QType::NVFP4 ? "a4" : "a8"},
+                          {"execution", "graph"}}});
+                }
+        if (rank == 0)
             for (int t : {1, 513}) {
                 cases.push_back({t, rank, false, true, false, "reuse", t == 513, DType::FP32});
                 catalogue.push_back({"tp2/" + name + "/routed/rank0/fp32/T" + std::to_string(t),
@@ -317,6 +357,19 @@ void add_profile(OpSuite& suite, Shape shape, const std::string& name) {
                     {"tp2/" + name + "/" + (complete ? "complete" : "routed") +
                          "/rank0/route-population/T4096",
                      {{"format", "fp8"}, {"policy", "a8"}, {"execution", "graph"}}});
+            }
+        if (rank == 0)
+            for (bool complete : {false, true}) {
+                if (shape.clamped && shape.format != QType::NVFP4) continue;
+                const int t = shape.clamped ? 1024 : shape.format == QType::NVFP4 ? 256 : 2048;
+                Case c{t, rank, complete, true, false, "pool", true};
+                c.masked = true;
+                cases.push_back(c);
+                catalogue.push_back({"tp2/" + name + "/" + (complete ? "complete" : "routed") +
+                                         "/rank0/route-pool/T" + std::to_string(t),
+                                     {{"format", shape.format == QType::NVFP4 ? "nvfp4" : "fp8"},
+                                      {"policy", shape.format == QType::NVFP4 ? "a4" : "a8"},
+                                      {"execution", "graph"}}});
             }
         if (rank == 0)
             for (bool complete : {false, true}) {

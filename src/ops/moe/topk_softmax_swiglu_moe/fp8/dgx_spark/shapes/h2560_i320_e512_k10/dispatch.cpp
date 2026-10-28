@@ -28,12 +28,23 @@ Plan select_plan(int t, int shared_intermediate, ExpertSubsetKind) {
                  .large_queued_ctas_per_sm = 6,
                  .maximum_large_load       = t >= 2048 ? 128 : 0,
                  .dense_queued_ctas_per_sm = 3};
+    if (t >= 32 && t <= 512) {
+        p.gate_columns = p.down_columns = 64;
+        p.fp8                           = {};
+        p.queued_ctas_per_sm            = 6;
+    }
+    if (t >= 256) {
+        p.pool_expert_limit       = t < 2048 ? 10 : 20;
+        p.pool_columns            = 64;
+        p.pool_row_window         = 4;
+        p.pool_queued_ctas_per_sm = 3;
+    }
     return plan;
 }
 } // namespace
 
 const ShapePolicy& fp8_h2560_i320_e512_k10() {
-    static constexpr int boundaries[]{3, 8, 17, 65, 128, 129, 257, 512, 1024};
+    static constexpr int boundaries[]{3, 8, 17, 32, 65, 128, 129, 256, 257, 512, 513, 1024, 2048};
     static const ShapePolicy policy{.select = select_plan, .allocation_boundaries = boundaries};
     return policy;
 }

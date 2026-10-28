@@ -35,7 +35,8 @@ void gate_up(const Q8LinearOperands& p, ProductOutput output, float limit, cudaS
     if (p.tokens <= 128) return launch_q8_swiglu_tma<T64Rows32>(p, output, product, stream);
     if (p.tokens <= 192) return launch_q8_swiglu_tma<Medium>(p, output, product, stream);
     if (p.tokens <= 288) return launch_q8_swiglu_tma<T96>(p, output, product, stream);
-    if (p.tokens <= 1024) return launch_q8_swiglu_tma<T128>(p, output, product, stream);
+    if (p.tokens <= 2048) return launch_q8_swiglu_tma<T128>(p, output, product, stream);
+    if (p.tokens <= 4096) return launch_q8_swiglu_tma<T96>(p, output, product, stream);
     return launch_q8_swiglu_tma<Bulk>(p, output, product, stream);
 }
 

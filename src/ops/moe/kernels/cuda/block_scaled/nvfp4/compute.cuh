@@ -70,10 +70,10 @@ __device__ __forceinline__ Matrix resolve(const ExpertMatrixDeviceView& matrix, 
 }
 
 template <class S, bool Gate>
-__device__ __forceinline__ void stage_inputs(TileStorage<S>& tile, int stage, int kt, int row0,
-                                             Matrix weight, const std::uint8_t* x,
-                                             const std::uint8_t* scales, int cache_policy,
-                                             std::uint64_t stream, std::uint64_t retained) {
+__device__ __forceinline__ void
+stage_inputs(TileStorage<S>& tile, int stage, int kt, int row0, Matrix weight,
+             const std::uint8_t* x, const std::uint8_t* scales, int cache_policy,
+             std::uint64_t stream, std::uint64_t retained, int active_columns) {
     for (int task = threadIdx.x; task < 128 * (S::k_step / 32); task += S::threads) {
         const int row = task / (S::k_step / 32), segment = task % (S::k_step / 32);
         const int wr     = row0 + (Gate ? (row < 64 ? row : row - 64 + S::intermediate) : row);
@@ -118,7 +118,7 @@ __device__ __forceinline__ void stage_inputs(TileStorage<S>& tile, int stage, in
                 nvfp4_scale_byte_offset(wr, valid ? kt * (S::k_step / 16) + k64 * 4 : 0, S::k),
             valid ? bytes : 0);
     }
-    for (int task = threadIdx.x; task < S::columns * (S::k_step / 32); task += S::threads) {
+    for (int task = threadIdx.x; task < active_columns * (S::k_step / 32); task += S::threads) {
         const int row = task / (S::k_step / 32), segment = task % (S::k_step / 32);
         const int source = tile.sources[row];
         const bool valid =
@@ -149,29 +149,16 @@ __device__ __forceinline__ void stage_inputs(TileStorage<S>& tile, int stage, in
                                    (valid ? kt * (S::k_step / 2) + segment * 16 : 0),
                                valid ? 16 : 0);
     }
-    if constexpr (S::k % 128 == 0) {
-        for (int task = threadIdx.x; task < S::columns * (S::k_step / 128); task += S::threads) {
-            const int row = task / (S::k_step / 128), part = task % (S::k_step / 128);
-            const int source = tile.sources[row];
-            const bool valid =
-                source >= 0 && (S::k % S::k_step == 0 || kt * S::k_step + part * 128 < S::k);
-            cp_async_zfill<8>(&tile.input_scales[stage][row * (S::k_step / 64) + part * 2],
-                              scales + std::int64_t(source >= 0 ? source : 0) * (S::k / 16) +
-                                  (valid ? kt * (S::k_step / 16) + part * 8 : 0),
-                              valid ? 8 : 0);
-        }
-    } else {
-        // A K320 product has 20 G16 scale bytes per assignment. Copy aligned
-        // K64 words individually; an 8-byte copy would misalign every odd row.
-        for (int task = threadIdx.x; task < S::columns * (S::k_step / 64); task += S::threads) {
-            const int row = task / (S::k_step / 64), part = task % (S::k_step / 64);
-            const int source = tile.sources[row];
-            const bool valid = source >= 0 && kt * S::k_step + part * 64 < S::k;
-            cp_async_zfill<4>(&tile.input_scales[stage][row * (S::k_step / 64) + part],
-                              scales + std::int64_t(source >= 0 ? source : 0) * (S::k / 16) +
-                                  (valid ? kt * (S::k_step / 16) + part * 4 : 0),
-                              valid ? 4 : 0);
-        }
+    constexpr int scale_stride = nvfp4_activation_scale_stride(S::k);
+    for (int task = threadIdx.x; task < active_columns * (S::k_step / 128); task += S::threads) {
+        const int row = task / (S::k_step / 128), part = task % (S::k_step / 128);
+        const int source = tile.sources[row];
+        const bool valid =
+            source >= 0 && (S::k % S::k_step == 0 || kt * S::k_step + part * 128 < S::k);
+        cp_async_zfill<8>(&tile.input_scales[stage][row * (S::k_step / 64) + part * 2],
+                          scales + std::int64_t(source >= 0 ? source : 0) * scale_stride +
+                              (valid ? kt * (S::k_step / 16) + part * 8 : 0),
+                          valid ? 8 : 0);
     }
     cp_commit();
 }
@@ -197,29 +184,108 @@ __device__ __forceinline__ void store_product(float lo, float hi, float divisor,
     if (!r && assignment >= 0) {
         *reinterpret_cast<uint2*>(codes + std::int64_t(assignment) * (Intermediate / 2) +
                                   feature / 2) = make_uint2(low, high);
-        scales[std::int64_t(assignment) * (Intermediate / 16) + feature / 16] = scale;
+        constexpr int stride                   = nvfp4_activation_scale_stride(Intermediate);
+        auto* row_scales                       = scales + std::int64_t(assignment) * stride;
+        row_scales[feature / 16]               = scale;
+        if constexpr (Intermediate % 128 != 0) {
+            if (feature == Intermediate - 16)
+                *reinterpret_cast<unsigned*>(row_scales + Intermediate / 16) = 0;
+        }
     }
+}
+
+template <class S, bool Gate, bool FullColumns = false>
+__device__ __forceinline__ void
+contract_tile(TileStorage<S>& tile, int row0, Matrix weight, const std::uint8_t* input,
+              const std::uint8_t* input_scales, int begin, int end, int cache_policy,
+              std::uint64_t stream, std::uint64_t retained, float (&acc)[2][S::mma_columns][4]) {
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int warp_m = warp % 4, warp_n = warp / 4;
+    const int active_columns =
+        FullColumns || S::columns <= 32 ? S::columns : min(S::columns, (end - begin + 7) / 8 * 8);
+#pragma unroll
+    for (int stage = 0; stage < S::stages; ++stage) {
+        stage_inputs<S, Gate>(tile, stage, stage, row0, weight, input, input_scales, cache_policy,
+                              stream, retained, active_columns);
+    }
+#pragma unroll 1
+    for (int kt = 0; kt < ((S::k + S::k_step - 1) / S::k_step); ++kt) {
+        const int stage = kt % S::stages;
+        cp_wait<S::stages - 1>();
+        __syncthreads();
+#pragma unroll
+        for (int ki = 0; ki < S::k_step / 64; ++ki) {
+            if constexpr (S::k % S::k_step != 0)
+                if (kt * S::k_step + ki * 64 >= S::k) break;
+            unsigned a[2][4], as[2];
+#pragma unroll
+            for (int m = 0; m < 2; ++m) {
+                const int row_base = Gate ? warp_m * 16 + m * 64 : warp_m * 32 + m * 16;
+                const int row      = row_base + (lane & 7) + ((lane >> 3 & 1) * 8);
+                const int col      = ki * 32 + (lane >> 4) * 16;
+                ldmatrix_x4(
+                    a[m][0], a[m][1], a[m][2], a[m][3],
+                    smem_addr(tile.weight[stage] + row * (S::k_step / 2) + swizzle(row, col)));
+                const int sr = row_base + ((lane & 1) << 3) + (lane >> 2);
+                as[m]        = tile.weight_scales[stage][ki * 128 + (sr % 32) * 4 + sr / 32];
+            }
+#pragma unroll
+            for (int n = 0; n < S::mma_columns; ++n) {
+                const int column = warp_n * S::warp_columns + n * 8;
+                if (begin + column < end) {
+                    const int row = column + (lane & 7);
+                    const int col = ki * 32 + ((lane >> 3) & 1) * 16;
+                    unsigned b[2];
+                    ldmatrix_x2(
+                        b[0], b[1],
+                        smem_addr(tile.input[stage] + row * (S::k_step / 2) + swizzle(row, col)));
+                    const auto bs =
+                        tile.input_scales[stage][(column + (lane >> 2)) * (S::k_step / 64) + ki];
+#pragma unroll
+                    for (int m = 0; m < 2; ++m) {
+                        mma_nvfp4_e4m3(acc[m][n][0], acc[m][n][1], acc[m][n][2], acc[m][n][3],
+                                       a[m][0], a[m][1], a[m][2], a[m][3], b[0], b[1], as[m], bs);
+                    }
+                }
+            }
+        }
+        __syncthreads();
+        const int next = kt + S::stages;
+        if (next < ((S::k + S::k_step - 1) / S::k_step)) {
+            stage_inputs<S, Gate>(tile, stage, next, row0, weight, input, input_scales,
+                                  cache_policy, stream, retained, active_columns);
+        } else {
+            // Empty groups drain the fixed-distance pipeline without reusing a live stage.
+            cp_commit();
+        }
+    }
+    cp_wait<0>();
 }
 
 template <int Columns, bool Gate, bool Atomic = false, int Stages = 2, int KStep = 128,
           int Eviction = 0, bool CachedExpertMajor = true, int Intermediate = kIntermediate>
-__global__
-__launch_bounds__(Schedule<Columns, Gate, Stages, KStep, Eviction, Intermediate>::threads,
-                  Schedule<Columns, Gate, Stages, KStep, Eviction, Intermediate>::
-                      min_blocks) void grouped_mma(const std::uint8_t* __restrict__ input,
-                                                   const std::uint8_t* __restrict__ input_scales,
-                                                   ExpertMatrixDeviceView bank,
-                                                   float activation_divisor, float product_divisor,
-                                                   Groups groups,
-                                                   std::uint8_t* __restrict__ product,
-                                                   std::uint8_t* __restrict__ product_scales,
-                                                   float* __restrict__ contributions,
-                                                   const float* __restrict__ coefficients,
-                                                   float* __restrict__ routed_sum, int subtiles,
-                                                   int feature_rows = 0, int cache_policy = 0,
-                                                   int minimum_expert_count = 0,
-                                                   int maximum_expert_count = 0x7fffffff) {
+__global__ __launch_bounds__(
+    Schedule<Columns, Gate, Stages, KStep, Eviction, Intermediate>::threads,
+    Schedule<Columns, Gate, Stages, KStep, Eviction, Intermediate>::
+        min_blocks) void grouped_mma(const std::uint8_t* __restrict__ input,
+                                     const std::uint8_t* __restrict__ input_scales,
+                                     ExpertMatrixDeviceView bank, float activation_divisor,
+                                     float product_divisor, Groups groups,
+                                     std::uint8_t* __restrict__ product,
+                                     std::uint8_t* __restrict__ product_scales,
+                                     float* __restrict__ contributions,
+                                     const float* __restrict__ coefficients,
+                                     float* __restrict__ routed_sum, int subtiles,
+                                     int feature_rows = 0, int cache_policy = 0,
+                                     int minimum_expert_count = 0,
+                                     int maximum_expert_count = 0x7fffffff,
+                                     int pool_expert_limit = 0, int pool_min_experts = 0) {
     using S = Schedule<Columns, Gate, Stages, KStep, Eviction, Intermediate>;
+    if constexpr (!Gate) {
+        if (pool_expert_limit && groups.load_range[2] > pool_min_experts &&
+            groups.load_range[2] <= pool_expert_limit)
+            return;
+    }
     static_assert(!CachedExpertMajor || (Stages == 2 && KStep == 128 && Eviction == 0));
     static_assert(S::stages <= (S::k + S::k_step - 1) / S::k_step);
     if (groups.load_range && (groups.load_range[1] <= minimum_expert_count ||
@@ -264,64 +330,9 @@ __launch_bounds__(Schedule<Columns, Gate, Stages, KStep, Eviction, Intermediate>
                 packed < end ? (Gate ? groups.assignments[packed] / kTopK : packed) : -1;
         }
         __syncthreads();
-#pragma unroll
-        for (int stage = 0; stage < S::stages; ++stage) {
-            stage_inputs<S, Gate>(tile, stage, stage, row0, weight, input, input_scales,
-                                  cache_policy, stream, retained);
-        }
         float acc[2][S::mma_columns][4] = {};
-#pragma unroll 1
-        for (int kt = 0; kt < ((S::k + S::k_step - 1) / S::k_step); ++kt) {
-            const int stage = kt % S::stages;
-            cp_wait<S::stages - 1>();
-            __syncthreads();
-#pragma unroll
-            for (int ki = 0; ki < S::k_step / 64; ++ki) {
-                unsigned a[2][4], as[2];
-#pragma unroll
-                for (int m = 0; m < 2; ++m) {
-                    const int row_base = Gate ? warp_m * 16 + m * 64 : warp_m * 32 + m * 16;
-                    const int row      = row_base + (lane & 7) + ((lane >> 3 & 1) * 8);
-                    const int col      = ki * 32 + (lane >> 4) * 16;
-                    ldmatrix_x4(
-                        a[m][0], a[m][1], a[m][2], a[m][3],
-                        smem_addr(tile.weight[stage] + row * (S::k_step / 2) + swizzle(row, col)));
-                    const int sr = row_base + ((lane & 1) << 3) + (lane >> 2);
-                    as[m]        = tile.weight_scales[stage][ki * 128 + (sr % 32) * 4 + sr / 32];
-                }
-#pragma unroll
-                for (int n = 0; n < S::mma_columns; ++n) {
-                    const int column = warp_n * S::warp_columns + n * 8;
-                    if (begin + column < end) {
-                        const int row = column + (lane & 7);
-                        const int col = ki * 32 + ((lane >> 3) & 1) * 16;
-                        unsigned b[2];
-                        ldmatrix_x2(b[0], b[1],
-                                    smem_addr(tile.input[stage] + row * (S::k_step / 2) +
-                                              swizzle(row, col)));
-                        const auto bs =
-                            tile.input_scales[stage]
-                                             [(column + (lane >> 2)) * (S::k_step / 64) + ki];
-#pragma unroll
-                        for (int m = 0; m < 2; ++m) {
-                            mma_nvfp4_e4m3(acc[m][n][0], acc[m][n][1], acc[m][n][2], acc[m][n][3],
-                                           a[m][0], a[m][1], a[m][2], a[m][3], b[0], b[1], as[m],
-                                           bs);
-                        }
-                    }
-                }
-            }
-            __syncthreads();
-            const int next = kt + S::stages;
-            if (next < ((S::k + S::k_step - 1) / S::k_step)) {
-                stage_inputs<S, Gate>(tile, stage, next, row0, weight, input, input_scales,
-                                      cache_policy, stream, retained);
-            } else {
-                // Empty groups drain the fixed-distance pipeline without reusing a live stage.
-                cp_commit();
-            }
-        }
-        cp_wait<0>();
+        contract_tile<S, Gate, CachedExpertMajor>(tile, row0, weight, input, input_scales, begin,
+                                                  end, cache_policy, stream, retained, acc);
         const float factor = 1.0F / (activation_divisor * weight.divisor);
 #pragma unroll
         for (int n = 0; n < S::mma_columns; ++n) {
@@ -372,6 +383,24 @@ __launch_bounds__(Schedule<Columns, Gate, Stages, KStep, Eviction, Intermediate>
         __syncthreads();
     }
 }
+
+template <int Columns>
+struct PoolContraction {
+    using S                      = Schedule<Columns, false, 2, 128, 0, 320>;
+    using Tile                   = TileStorage<S>;
+    static constexpr int threads = S::threads;
+    const std::uint8_t* input;
+    const std::uint8_t* scales;
+    ExpertMatrixDeviceView bank;
+    float divisor;
+
+    __device__ __forceinline__ float operator()(Tile& tile, int row, int expert, int begin, int end,
+                                                float (&acc)[2][S::mma_columns][4]) const {
+        const auto weight = resolve(bank, expert);
+        contract_tile<S, false, true>(tile, row, weight, input, scales, begin, end, 0, 0, 0, acc);
+        return 1.F / (divisor * weight.divisor);
+    }
+};
 
 __device__ __forceinline__ bool includes(ExpertSubsetKind kind, const int* mask, int expert) {
     return kind == ExpertSubsetKind::All || mask[expert] == (kind == ExpertSubsetKind::MaskOnes);

@@ -123,12 +123,12 @@ __device__ __forceinline__ void stage_weights(TileStorage<S>& tile, int stage, i
 }
 
 template <class S, bool Gate>
-__device__ __forceinline__ void stage_inputs(TileStorage<S>& tile, int stage, int kt, int row0,
-                                             Matrix weight, const std::uint8_t* x,
-                                             const std::uint8_t* scales, int cache_policy,
-                                             std::uint64_t stream, std::uint64_t retained) {
+__device__ __forceinline__ void
+stage_inputs(TileStorage<S>& tile, int stage, int kt, int row0, Matrix weight,
+             const std::uint8_t* x, const std::uint8_t* scales, int cache_policy,
+             std::uint64_t stream, std::uint64_t retained, int active_columns) {
     stage_weights<S, Gate>(tile, stage, kt, row0, weight, cache_policy, stream, retained);
-    for (int task = threadIdx.x; task < S::columns * (S::k_step / 32); task += S::threads) {
+    for (int task = threadIdx.x; task < active_columns * (S::k_step / 32); task += S::threads) {
         const int row = task / (S::k_step / 32), segment = task % (S::k_step / 32);
         const int source = tile.sources[row];
         const bool valid =
@@ -159,7 +159,7 @@ __device__ __forceinline__ void stage_inputs(TileStorage<S>& tile, int stage, in
                                    (valid ? kt * (S::k_step / 2) + segment * 16 : 0),
                                valid ? 16 : 0);
     }
-    for (int task = threadIdx.x; task < S::columns * (S::k_step / 128); task += S::threads) {
+    for (int task = threadIdx.x; task < active_columns * (S::k_step / 128); task += S::threads) {
         const int row = task / (S::k_step / 128), part = task % (S::k_step / 128);
         const int source = tile.sources[row];
         const bool valid =
@@ -172,17 +172,19 @@ __device__ __forceinline__ void stage_inputs(TileStorage<S>& tile, int stage, in
     cp_commit();
 }
 
-template <class S, bool Gate>
+template <class S, bool Gate, bool FullColumns = false>
 __device__ __forceinline__ void
 contract_tile(TileStorage<S>& tile, int row0, Matrix weight, const std::uint8_t* input,
               const std::uint8_t* input_scales, int begin, int end, int cache_policy,
               std::uint64_t stream, std::uint64_t retained, float (&acc)[2][S::mma_columns][4]) {
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     const int warp_m = warp % 4, warp_n = warp / 4;
+    const int active_columns =
+        FullColumns || S::columns <= 32 ? S::columns : min(S::columns, (end - begin + 7) / 8 * 8);
 #pragma unroll
     for (int stage = 0; stage < S::stages; ++stage) {
         stage_inputs<S, Gate>(tile, stage, stage, row0, weight, input, input_scales, cache_policy,
-                              stream, retained);
+                              stream, retained, active_columns);
     }
 #pragma unroll 1
     for (int kt = 0; kt < ((S::k + S::k_step - 1) / S::k_step); ++kt) {
@@ -227,7 +229,7 @@ contract_tile(TileStorage<S>& tile, int row0, Matrix weight, const std::uint8_t*
         const int next = kt + S::stages;
         if (next < ((S::k + S::k_step - 1) / S::k_step)) {
             stage_inputs<S, Gate>(tile, stage, next, row0, weight, input, input_scales,
-                                  cache_policy, stream, retained);
+                                  cache_policy, stream, retained, active_columns);
         } else {
             // Empty groups drain the fixed-distance pipeline without reusing a live stage.
             cp_commit();
@@ -281,11 +283,15 @@ __global__ __launch_bounds__(
                                      int maximum_expert_count = 0x7fffffff,
                                      ExpertLoadRegime regime  = ExpertLoadRegime::All,
                                      int broad_short_limit = 0, int broad_long_limit = 0,
-                                     int broad_split = 0, int tokens = 0, bool dense_down = false) {
+                                     int broad_split = 0, int tokens = 0, bool dense_down = false,
+                                     int pool_expert_limit = 0, int pool_min_experts = 0) {
     using S = Schedule<Columns, Gate, Stages, KStep, Eviction, Intermediate>;
     static_assert(!CachedExpertMajor || (Stages == 2 && KStep == 128 && Eviction == 0));
     static_assert(S::stages <= (S::k + S::k_step - 1) / S::k_step);
     if constexpr (!Gate) {
+        if (pool_expert_limit && groups.load_range[2] > pool_min_experts &&
+            groups.load_range[2] <= pool_expert_limit)
+            return;
         if (dense_down && groups.load_range && groups.load_range[0] == tokens &&
             groups.load_range[1] == tokens)
             return;
@@ -355,8 +361,8 @@ __global__ __launch_bounds__(
         }
         __syncthreads();
         float acc[2][S::mma_columns][4] = {};
-        contract_tile<S, Gate>(tile, row0, weight, input, input_scales, begin, end, cache_policy,
-                               stream, retained, acc);
+        contract_tile<S, Gate, CachedExpertMajor>(tile, row0, weight, input, input_scales, begin,
+                                                  end, cache_policy, stream, retained, acc);
         const float factor = 1.0F / (activation_divisor * weight.divisor);
 #pragma unroll
         for (int n = 0; n < S::mma_columns; ++n) {
@@ -418,9 +424,13 @@ __global__ __launch_bounds__(Schedule<Columns, false>::threads) void dense_token
     const std::uint8_t* __restrict__ input, const std::uint8_t* __restrict__ input_scales,
     ExpertMatrixDeviceView bank, float activation_divisor, Groups groups,
     const int* __restrict__ ids, const float* __restrict__ coefficients,
-    float* __restrict__ destination, int tokens) {
+    float* __restrict__ destination, int tokens, int pool_expert_limit = 0,
+    int pool_min_experts = 0) {
     using S = Schedule<Columns, false, 2, 128, 0, 1024>;
-    if (groups.load_range[1] != tokens) return;
+    if (groups.load_range[1] != tokens ||
+        (pool_expert_limit && groups.load_range[2] > pool_min_experts &&
+         groups.load_range[2] <= pool_expert_limit))
+        return;
     __shared__ TileStorage<S> tile;
     __shared__ int full_experts[kTopK], full_count;
     __shared__ float probabilities[Columns];
@@ -454,8 +464,8 @@ __global__ __launch_bounds__(Schedule<Columns, false>::threads) void dense_token
             __syncthreads();
             const auto weight                   = resolve(bank, expert);
             float partial[2][S::mma_columns][4] = {};
-            contract_tile<S, false>(tile, row0, weight, input, input_scales, begin, tokens, 0, 0, 0,
-                                    partial);
+            contract_tile<S, false, true>(tile, row0, weight, input, input_scales, begin, tokens, 0,
+                                          0, 0, partial);
             const float factor = 1.F / (activation_divisor * weight.divisor);
 #pragma unroll
             for (int n = 0; n < S::mma_columns; ++n) {
@@ -487,6 +497,24 @@ __global__ __launch_bounds__(Schedule<Columns, false>::threads) void dense_token
         __syncthreads();
     }
 }
+
+template <int Columns>
+struct PoolContraction {
+    using S                      = Schedule<Columns, false, 2, 128, 0, 1024>;
+    using Tile                   = TileStorage<S>;
+    static constexpr int threads = S::threads;
+    const std::uint8_t* input;
+    const std::uint8_t* scales;
+    ExpertMatrixDeviceView bank;
+    float divisor;
+
+    __device__ __forceinline__ float operator()(Tile& tile, int row, int expert, int begin, int end,
+                                                float (&acc)[2][S::mma_columns][4]) const {
+        const auto weight = resolve(bank, expert);
+        contract_tile<S, false, true>(tile, row, weight, input, scales, begin, end, 0, 0, 0, acc);
+        return 1.F / (divisor * weight.divisor);
+    }
+};
 
 __device__ __forceinline__ bool includes(ExpertSubsetKind kind, const int* mask, int expert) {
     return kind == ExpertSubsetKind::All || mask[expert] == (kind == ExpertSubsetKind::MaskOnes);

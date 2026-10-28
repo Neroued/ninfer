@@ -48,11 +48,22 @@ std::string value_text(const ConfigurationItem& item) {
 
 std::string format_configuration(const StartupConfigurationView& view) {
     std::ostringstream out;
-    out << "configuration  "
-        << (view.entry == EntryPoint::Cli     ? "cli"
-            : view.entry == EntryPoint::Serve ? "serve"
-                                              : "bench")
-        << '\n';
+    out << "configuration  ";
+    switch (view.entry) {
+    case EntryPoint::Cli:
+        out << "cli";
+        break;
+    case EntryPoint::Serve:
+        out << "serve";
+        break;
+    case EntryPoint::Bench:
+        out << "bench";
+        break;
+    case EntryPoint::Perplexity:
+        out << "perplexity";
+        break;
+    }
+    out << '\n';
     if (!view.config_path.empty())
         out << "  file         " << format_pretty_text(view.config_path.string()) << '\n';
     std::string previous;

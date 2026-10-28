@@ -1,8 +1,14 @@
 # 启动配置
 
-`ninfer` 与 `ninfer-serve` 共用 TOML 1.0 配置、命令行覆盖和启动参数展示。
+`ninfer`、`ninfer-serve`、`ninfer_bench` 与 `ninfer-perplexity` 共用 TOML 1.0 配置、
+命令行覆盖和启动参数展示。
 本文件维护字段、默认值、来源规则与资源语义；请求和协议行为分别见
 [CLI](cli.md)与[Serving](serving.md)。
+
+[PPL](perplexity.md) 只消费模型路径、device、max_context、KV 类型、Context 容量、
+prefill chunk、GPU timing、日志级别和 distributed 配置；其他入口的已知字段仍进行
+类型检查，但不参与 PPL 的配置合并、跨字段关系检查或展示。PPL 默认 KV 为 FP8，
+未显式指定的 Engine max_context 跟随评分窗口；窗口、stride、语料和输出路径由 PPL 参数定义。
 
 项目根目录的 [ninfer.example.toml](../ninfer.example.toml) 是完整参考，注释为英文，
 互斥选项的替代字段以注释列出。其他本地 TOML 文件由 Git 忽略：
@@ -109,7 +115,7 @@ Patch 区分未出现、显式恢复默认、具体值；恢复默认不能被�
 HTTP(S)、data URI、绝对路径保持原含义；显式 `--media-root` 的工具行为继续明确覆盖。
 不改写 prompt、正则、grammar 或 JSON Schema 文本中的普通字符串。
 
-同一 TOML 可包含 CLI 和 serve 配置。全部字段执行语法、类型和范围检查，必填输入、
+同一 TOML 可供多个入口使用。全部字段执行语法、类型和范围检查，必填输入、
 互斥关系和资源消费按活动入口检查；未使用入口的路径不打开。未知 section/key 报错，
 错误包含文件、字段和位置。
 

@@ -70,7 +70,7 @@ enum class Field {
     Count,
 };
 
-enum class Scope { Common, Cli, Serve };
+enum class Scope { Common, Generation, Cli, Serve };
 
 struct FieldSpec {
     Field field;
@@ -79,7 +79,7 @@ struct FieldSpec {
     std::string_view negative_flag;
     std::string_view argument;
     std::string_view description;
-    Scope scope            = Scope::Common;
+    Scope scope            = Scope::Generation;
     ConfigurationUnit unit = ConfigurationUnit::None;
 };
 

@@ -1,20 +1,23 @@
 # 产品入口、工具链与分布式执行收尾清单
 
-核对基点：`dev / 1fcc6dc5`，2026-10-23。保留原问题编号，逐项推进。
-第 8 项的旧根因已被统一 Context 池重构消除；第 10 项先定性，再决定是否修复。
+更新日期：2026-10-28。保留原问题编号，逐项推进。
+
+当前剩余：**6、7、9 待实现，10 待定性**。1、2、3、4、5、8 已完成。
+状态依据当前源码和各项实测记录。
 
 ## 1. Perplexity 接入公共启动配置与 deployment
 
-- [ ] 完成入口接入。
+- [x] 完成入口接入。
 
 入口：[apps/perplexity/main.cpp](../apps/perplexity/main.cpp)。
 
-任务：复用公共启动配置，将 deployment 和引擎资源配置传给公共 Engine；保留 PPL
-自身的语料、窗口、stride、NLL 聚合与输出逻辑。报告使用公共启动资源统计，包含实际
-rank 信息与总量。
+已使用公共 `EntryPoint::Perplexity`、TOML／CLI 解析及 deployment；生成专用配置按入口隔离。
+PPL 保留自己的语料、评分窗口与 stride；窗口决定未显式配置的 Engine context 默认值。
+报告使用公共启动资源统计，记录实际各 rank 与总量，窗口规划和 NLL 聚合数学不变。
 
-完成条件：当前受支持的单机、双 Spark 组合能通过真实 PPL 命令评分；配置覆盖正确；
-窗口覆盖、NLL 聚合及实际 rank／资源信息正确。
+验证：5090 Qwen3.5、Spark Qwen4Exp 单机／双机和 GLM 双机均通过真实 PPL 命令评分，
+覆盖 BF16／FP8 KV、多窗口与分块执行。配置覆盖、目标范围、NLL 聚合、各 rank 资源与总量
+已核对；记录位于 `.agent-tmp/ppl-integration/`。
 
 ## 2. 串行 serving 基准对齐生产日志
 
@@ -52,6 +55,11 @@ Host 阶段统计和求和补齐 `executor_flush`，与生产端的 total 保持
 
 完成条件：单机、双机报告均保留实际启动资源；缺失数据可识别，不静默生成正常空报告。
 
+复查：2—4 的消费者仍与生产端一致；共用提取函数为
+[serve_log.py](../tools/bench/serve_log.py)。现有 `tests/test_serve_corpus.py` 的 25 项检查通过，
+覆盖未测量／实测零值、server TTFT、Host 阶段求和及单／双 rank 资源。
+本次还用刚关闭的双 Spark 服务启动日志确认：资源提取结果为 `available`，保留两 rank 和总量。
+
 ## 5. Profiler 与峰值重置使用完整执行边界
 
 - [x] 接通实际执行 rank，并统一测量窗口的生命周期。
@@ -71,15 +79,27 @@ Session 待提交的 residency release 和相关 context work，不能直接以�
 完成条件：5090 与双 Spark 的各 rank 捕获只包含正式测量请求，覆盖最终提交，排除加载、
 Graph 准备和预热；结果返回后的尾部工作能正常收尾；失败后不遗留开启的测量状态。
 
-5090 短 bench 已通过预热和连续两组测量；双 Spark 实际捕获留到随后性能分析时验收。
+复查：bench 已调用公共 `begin_measurement()`／`end_measurement()`，不再自行控制 CUDA
+profiler；Engine 执行线程等待请求及尾部 context work 完成，worker 等待命令退役后再执行
+测量命令，并向协调端返回全 rank 结果。异常路径保留 Cancel 清理。
+
+5090 短 bench 已通过预热和连续两组测量；2026-10-25～26 的 GLM 双 Spark 实测也已完成
+预热、三轮正式 bench 和两个 worker 的 profiler 采集，覆盖 P64K 与 D/B1、B4、B8。
+原来的“等待双机验收”已过时。记录见 `.agent-tmp/measurement-boundary/` 与
+`.agent-tmp/glm5next-perf-20261025/`；D trace 按时长截取，P64K 采集完整测量请求。
 
 ## 6. 分布式 worker 启动进度贯通
 
 - [ ] 将已有启动阶段传回协调端并按来源展示。
 
-入口：[rank preparation](../src/models/qwen4_exp/parallel/preparation.cpp)、
+入口：[Qwen4Exp rank preparation](../src/models/qwen4_exp/parallel/preparation.cpp)、
+[GLM rank preparation](../src/models/glm5next/parallel/rank_preparation.cpp)、
 [StartupEvent](../include/ninfer/types.h)、
 [StartupLogRenderer](../src/product/logging/startup_log.cpp)。
+
+现状：`StartupEvent` 仍无 rank／node 来源，renderer 仍只按 phase 保存一套状态；
+worker 解码后的启动 observer 没有接上协调端。当前 `wire::Kind::Progress` 传递的是
+运行时命令进度，不是启动阶段事件。Qwen4Exp 和 GLM 双机路径均需接入。
 
 任务：为事件明确 rank／node 来源，贯通 worker observer 到协调端；renderer 按来源和 phase
 分别维护进度、耗时及失败状态。转发有界，日志回调异常沿用诊断发布边界的隔离规则。
@@ -93,6 +113,9 @@ Graph 准备和预热；结果返回后的尾部工作能正常收尾；失败�
 入口：[bootstrap.cpp](../src/distributed/bootstrap.cpp)、
 [executor/preparation.cpp](../src/runtime/executor/preparation.cpp)。
 
+现状：`ExecutionGroup::Impl::await()` 和模型准备阶段的 `receive()` 都仍先调用
+`check_processes()`，再读取 transport 队列；进程退出或连接错误仍可能覆盖已收到的 `Failed`。
+
 任务：协调已接收／在途的 `Failed`、进程退出和连接关闭，保留具体失败原因并补充 rank、
 启动阶段上下文；避免先检查退出状态而覆盖 worker 已发送的原始错误。
 
@@ -105,7 +128,10 @@ Graph 准备和预热；结果返回后的尾部工作能正常收尾；失败�
 
 当前 [KV page 布局](../src/core/paged_kv_geometry.cpp)将各层、各 plane 及其对齐纳入完整
 page record；容量规划直接使用真实 `page_bytes` 和统一池几何，最终资源构造仍保留相等检查。
-原来的相邻页数差分公式已删除，不再安排该旧公式的修复。当时的双 Spark FP8 启动组合本轮未重跑。
+原来的相邻页数差分公式已删除，不再安排该旧公式的修复。
+
+实测补充：2026-10-28 双 Spark 的 Qwen4Exp TP2、FP8 KV、262144 context、MTP3、
+Graph／Vision 配置已成功启动并完成请求，Context 池自动规划与最终资源构造正常。
 
 ## 9. Vision 前缀索引的摘要查询边界
 
@@ -113,6 +139,10 @@ page record；容量规划直接使用真实 `page_bytes` 和统一池几何，�
 
 入口：[session/request.cpp](../src/models/qwen4_exp/session/request.cpp)、
 [PrefixIndex](../src/runtime/engine/context_cache/prefix_index.h)。
+
+现状：Qwen4Exp 的 `RequestBasePlan::prefix_shortlist_key()` 仍调用 `can_checkpoint()`。
+压缩索引的中间分支可以位于图像内部，因此后面的合法 checkpoint 仍可能从候选中遗漏。
+Qwen3.5 与 GLM 当前的摘要查询没有这个限制；问题范围是 Qwen4Exp 的查询合同实现。
 
 任务：合法输入范围内的摘要查询不受 `can_checkpoint()` 限制，使图像内部的索引分支也能
 完成身份比较；捕获和恢复继续检查各自的合法边界，保持现有容量和保留策略。
@@ -126,6 +156,11 @@ checkpoint 捕获和恢复仍被拒绝。
 
 参考：[现有 grammar 用例](../tests/models/qwen3_5/test_engine_grammar_real.cpp)。
 
+现状：旧双机失败日志仍保存在 `.50` 的 `.agent-tmp/capability-fixes/dual-grammar-mtp.log`，
+错误为 `schema switch did not exercise prefix reuse`。当前用例仍检查
+`reused_prompt_tokens > 0`，但该序列中历史是否应当持续保留尚无定性证据。
+后来的普通 grammar／工具切换验证不能替代这一序列的缓存前提检查。
+
 任务：固定失败序列、部署、缓存容量和保留前提，分别核对 schema 输出、历史是否仍保留、
 索引候选与实际来源选择；明确该场景要求复用的合同依据，再决定是否存在引擎缺陷。
 保留原始负载，不通过更换提示词或增加预热追求断言通过。
@@ -136,5 +171,4 @@ checkpoint 捕获和恢复仍被拒绝。
 ## 验证范围
 
 优先复用现有用例和真实产品入口，新增测试只覆盖具体风险。上述任务不包含八组测试的
-机械迁移、重复测试入口、测试框架改造或新的性能对比活动。GLM5Next 集成与 Qwen3.5 的
-Spark 移植独立推进；稳定文档在阶段性完成后集中整理。
+机械迁移、重复测试入口、测试框架改造或新的性能对比活动。

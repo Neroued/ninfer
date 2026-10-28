@@ -15,7 +15,7 @@
 
 namespace ninfer::product {
 
-enum class EntryPoint { Cli, Serve, Bench };
+enum class EntryPoint { Cli, Serve, Bench, Perplexity };
 enum class ConfigSourceKind { Default, File, CommandLine };
 
 struct ConfigSource {

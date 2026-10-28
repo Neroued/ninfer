@@ -10,40 +10,42 @@ namespace ninfer::product::config_detail {
 namespace {
 
 constexpr FieldSpec kFields[] = {
-    {Field::ModelPath, "model.path", "", "", "FILE", "Model artifact (.ninfer)."},
+    {Field::ModelPath, "model.path", "", "", "FILE", "Model artifact (.ninfer).", Scope::Common},
     {Field::ChatTemplate, "model.chat_template", "--chat-template", "", "FILE",
      "Chat template override; empty uses the artifact."},
     {Field::Vision, "model.vision", "--vision", "--no-vision", "", "Load Vision resources."},
     {Field::VisionMemoryBudget, "vision.memory_budget", "--vision-memory-budget", "", "SIZE",
-     "Per-rank Vision activation and output-window budget (1GiB); excludes weights.", Scope::Common,
-     ConfigurationUnit::Bytes},
-    {Field::Device, "engine.device", "--device", "", "N", "Local CUDA device ordinal."},
+     "Per-rank Vision activation and output-window budget (1GiB); excludes weights.",
+     Scope::Generation, ConfigurationUnit::Bytes},
+    {Field::Device, "engine.device", "--device", "", "N", "Local CUDA device ordinal.",
+     Scope::Common},
     {Field::MaxContext, "engine.max_context", "--max-context", "", "N",
-     "Per-request context limit (8192)."},
+     "Per-request context limit (8192; perplexity defaults to its scoring window).", Scope::Common},
     {Field::KvDtype, "engine.kv_dtype", "--kv-dtype", "", "bf16|int8|fp8|nvfp4|k8v4",
-     "KV representation."},
+     "KV representation.", Scope::Common},
     {Field::ContextCapacity, "engine.context_capacity", "--context-capacity", "", "SIZE|auto",
      "Per-rank Device capacity shared by KV and State; auto uses the startup budget.",
      Scope::Common, ConfigurationUnit::Bytes},
     {Field::PrefillChunk, "engine.prefill_chunk", "--prefill-chunk", "", "N|default",
-     "Positive multiple of 128; default is resolved by the model."},
+     "Positive multiple of 128; default is resolved by the model.", Scope::Common},
     {Field::CudaGraph, "engine.cuda_graph", "--cuda-graph", "--no-cuda-graph", "",
      "Enable CUDA Graph execution."},
     {Field::GpuTiming, "observability.gpu_timing", "--gpu-timing", "--no-gpu-timing", "",
-     "Collect result/commit CUDA stream intervals at existing completion boundaries."},
+     "Collect result/commit CUDA stream intervals at existing completion boundaries.",
+     Scope::Common},
     {Field::MaxConcurrency, "engine.max_concurrency", "--max-concurrency", "", "N",
      "Resident execution lanes (1..8)."},
     {Field::MaxPendingRequests, "engine.max_pending_requests", "--max-pending-requests", "", "N",
      "Pending request capacity (16)."},
     {Field::PendingTimeout, "engine.pending_timeout", "--pending-timeout", "", "DURATION",
-     "Queue timeout before execution (30s).", Scope::Common, ConfigurationUnit::Milliseconds},
+     "Queue timeout before execution (30s).", Scope::Generation, ConfigurationUnit::Milliseconds},
     {Field::PrefixReuse, "context_cache.prefix_reuse", "--prefix-reuse", "--no-prefix-reuse", "",
      "Cross-request history reuse; also accepts =default."},
     {Field::CheckpointInterval, "context_cache.checkpoint_interval", "--checkpoint-interval", "",
      "N", "Target token spacing for intermediate prefill checkpoints (8192)."},
     {Field::HostCapacity, "context_cache.host_capacity", "--host-cache-capacity", "",
      "SIZE|default", "Shared Host State/KV and in-flight capacity; 0B disables backing.",
-     Scope::Common, ConfigurationUnit::Bytes},
+     Scope::Generation, ConfigurationUnit::Bytes},
     {Field::CostPresets, "context_cache.cost_presets", "--context-cost-presets", "", "FILE",
      "Context-cost JSON overrides; empty uses built-in defaults."},
     {Field::SpecBackend, "speculative.backend", "--spec", "", "none|mtp|dflash|dflash2",
@@ -53,9 +55,10 @@ constexpr FieldSpec kFields[] = {
     {Field::ProposalHead, "speculative.proposal_head", "--proposal-head", "", "full|optimized",
      "Proposal head representation."},
     {Field::MediaCache, "media.cache_capacity", "--media-cache-capacity", "", "SIZE",
-     "Retained media cache (1GiB); 0B disables reuse.", Scope::Common, ConfigurationUnit::Bytes},
+     "Retained media cache (1GiB); 0B disables reuse.", Scope::Generation,
+     ConfigurationUnit::Bytes},
     {Field::MediaLive, "media.live_capacity", "--media-live-capacity", "", "SIZE",
-     "All live BF16 patch payloads, including retained cache (2GiB).", Scope::Common,
+     "All live BF16 patch payloads, including retained cache (2GiB).", Scope::Generation,
      ConfigurationUnit::Bytes},
     {Field::MediaThreads, "media.preprocess_threads", "--media-preprocess-threads", "", "N|auto",
      "Explicit workers: 1..64; auto: at most 16."},
@@ -97,7 +100,7 @@ constexpr FieldSpec kFields[] = {
     {Field::ResponseSize, "server.responses.max_size", "--response-store-max-size", "", "SIZE",
      "Responses store capacity (256MiB).", Scope::Serve, ConfigurationUnit::Bytes},
     {Field::LogLevel, "logging.level", "--log-level", "", "LEVEL",
-     "trace/debug/info/warning/error/critical/off."},
+     "trace/debug/info/warning/error/critical/off.", Scope::Common},
     {Field::StatsInterval, "logging.stats_interval", "--stats-interval", "", "DURATION",
      "Throughput log interval (5s); 0ms disables it.", Scope::Serve,
      ConfigurationUnit::Milliseconds},
@@ -262,7 +265,11 @@ std::span<const FieldSpec> fields() { return kFields; }
 const FieldSpec& field_spec(Field field) { return kFields[static_cast<std::size_t>(field)]; }
 
 bool applies_to(const FieldSpec& spec, EntryPoint entry) {
-    return spec.scope == Scope::Common || (spec.scope == Scope::Cli && entry == EntryPoint::Cli) ||
+    return spec.scope == Scope::Common ||
+           (spec.scope == Scope::Generation &&
+            (entry == EntryPoint::Cli || entry == EntryPoint::Serve ||
+             entry == EntryPoint::Bench)) ||
+           (spec.scope == Scope::Cli && entry == EntryPoint::Cli) ||
            (spec.scope == Scope::Serve && entry == EntryPoint::Serve);
 }
 

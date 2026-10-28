@@ -208,7 +208,8 @@ void check_layer(const StartupPatch& patch, EntryPoint entry, const std::filesys
         field_error(field_spec(field), assignment(patch, field)->source, path, message);
     };
     if (const auto& backend = assignment(patch, Field::SpecBackend);
-        backend && std::get<std::string>(backend->value) == "none") {
+        backend && applies_to(field_spec(Field::SpecBackend), entry) &&
+        std::get<std::string>(backend->value) == "none") {
         if (const auto& drafts = assignment(patch, Field::DraftTokens);
             drafts && std::get<std::uint64_t>(drafts->value) != 0)
             fail(Field::DraftTokens, "disabled speculative backend requires zero drafts");
@@ -243,7 +244,8 @@ void check_layer(const StartupPatch& patch, EntryPoint entry, const std::filesys
 
 void merge_layer(StartupPatch& merged, StartupPatch layer, EntryPoint entry) {
     if (const auto& backend = assignment(layer, Field::SpecBackend);
-        backend && std::get<std::string>(backend->value) == "none") {
+        backend && applies_to(field_spec(Field::SpecBackend), entry) &&
+        std::get<std::string>(backend->value) == "none") {
         assignment(merged, Field::DraftTokens)  = Assignment{std::uint64_t{0}, backend->source};
         assignment(merged, Field::ProposalHead) = Assignment{std::string("full"), backend->source};
     }
@@ -550,21 +552,23 @@ ParsedOptions parse(int argc, char** argv, EntryPoint entry,
     };
     if (engine.artifact_path.empty())
         throw std::invalid_argument("model.path or a model artifact argument is required");
-    try {
-        validate_speculative_cli_options(engine.speculative);
-    } catch (const std::invalid_argument& error) {
-        fail(assignment(merged, Field::DraftTokens)    ? Field::DraftTokens
-             : assignment(merged, Field::ProposalHead) ? Field::ProposalHead
-                                                       : Field::SpecBackend,
-             error.what());
+    if (applies_to(field_spec(Field::SpecBackend), entry)) {
+        try {
+            validate_speculative_cli_options(engine.speculative);
+        } catch (const std::invalid_argument& error) {
+            fail(assignment(merged, Field::DraftTokens)    ? Field::DraftTokens
+                 : assignment(merged, Field::ProposalHead) ? Field::ProposalHead
+                                                           : Field::SpecBackend,
+                 error.what());
+        }
     }
     if (entry == EntryPoint::Cli) {
         if (parsed.cli.prompt.empty() && parsed.cli.messages_path.empty())
             throw std::invalid_argument(
                 "select cli.prompt or cli.messages (or --prompt/--messages)");
     }
-    if (entry != EntryPoint::Serve && generation.enable_thinking == false &&
-        generation.thinking_budget)
+    if (entry != EntryPoint::Serve && applies_to(field_spec(Field::ThinkingBudget), entry) &&
+        generation.enable_thinking == false && generation.thinking_budget)
         fail(Field::ThinkingBudget, "requires thinking to be enabled");
     return parsed;
 }
@@ -573,6 +577,10 @@ ParsedOptions parse(int argc, char** argv, EntryPoint entry,
 
 LaunchOptions default_launch_options(EntryPoint entry) {
     LaunchOptions options;
+    if (entry == EntryPoint::Perplexity) {
+        options.engine.purpose  = EnginePurpose::CausalScoring;
+        options.engine.kv_cache = KvCacheStorage::Fp8E4m3fnGroup128Ue8m0;
+    }
     if (entry != EntryPoint::Serve) {
         if (entry == EntryPoint::Cli) { options.engine.context_cache.enabled = false; }
         options.engine.context_cache.host_capacity_bytes = 0;
@@ -631,9 +639,10 @@ std::string startup_usage_text(std::string_view executable, EntryPoint entry) {
     out << "\nCapacities: bytes or B/KiB/MiB/GiB; durations: milliseconds or ms/s.\n"
         << "Boolean options also accept --flag=true|false.\n"
         << "Default prefill chunk: Qwen4Exp/CPU expert offload 4096, otherwise 1024.\n"
-        << "Context capacity defaults to auto; KV and State share each rank's Device budget.\n"
-        << "Host context: CLI 0B; serve RTX 5090 8GiB + 8 StateImages, Spark 0B.\n"
-        << "Environment: NINFER_VRAM_BUDGET_MIB, NINFER_CUDA_SYNC.\n";
+        << "Context capacity defaults to auto; KV and State share each rank's Device budget.\n";
+    if (applies_to(field_spec(Field::HostCapacity), entry))
+        out << "Host context: CLI 0B; serve RTX 5090 8GiB + 8 StateImages, Spark 0B.\n";
+    out << "Environment: NINFER_VRAM_BUDGET_MIB, NINFER_CUDA_SYNC.\n";
     return out.str();
 }
 

@@ -103,6 +103,12 @@ void host() {
                 require(p.state.common.image_bytes == recurrent_bytes + conv_bytes + 4096 * 2 &&
                             p.state.owner.image_bytes == p.state.common.image_bytes + tails,
                         "GLM State does not contain the required KDA/hidden/owner-tail payload");
+                for (const auto& plan : f.plans) {
+                    const auto& reference = plan.capacity.reference;
+                    require(reference.tokens_per_request == 129 && reference.request_count == 2 &&
+                                reference.device_bytes == (5ULL + mtp) * p.state.owner.image_bytes,
+                            "ADP capacity reference omitted remote-owner State or local KV");
+                }
                 const auto latent_bytes = storage == KvCacheStorage::BFloat16 ? 1024ULL : 516ULL;
                 const auto index_bytes =
                     index_format == KvCacheVectorFormat::BFloat16 ? 256ULL : 129ULL;

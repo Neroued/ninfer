@@ -4,6 +4,7 @@
 #include "models/qwen4_exp/parallel/wire.h"
 #include "models/glm5next/parallel/wire.h"
 #include "runtime/executor/protocol.h"
+#include "runtime/executor/preparation.h"
 #include "runtime/executor/input.h"
 #include "models/common/parallel_wire.h"
 
@@ -92,6 +93,19 @@ void topology_identity() {
 
 void model_preparation() {
     namespace glm = models::glm5next;
+    runtime::RankPreparationReport report;
+    report.capacity.plan.reference  = {1048576, 2, 9ULL << 30};
+    report.capacity.available_bytes = 30ULL << 30;
+    wire::Encoder capacity_out;
+    runtime::encode_preparation_report(capacity_out, report);
+    const auto capacity_bytes = std::move(capacity_out).take();
+    wire::Decoder capacity_in(capacity_bytes);
+    const auto reported = runtime::decode_preparation_report(capacity_in);
+    capacity_in.finish();
+    require(reported.capacity.plan.reference == report.capacity.plan.reference &&
+                reported.capacity.available_bytes == report.capacity.available_bytes,
+            "preparation report lost the model's capacity reference");
+
     glm::RankLoadRequest request;
     request.artifact[3]              = std::byte{17};
     request.rank.rank                = 1;

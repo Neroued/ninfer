@@ -210,9 +210,31 @@ resolve_group_context_capacity(const ContextCapacityPolicy& policy,
             .planned_slack_bytes   = owner.offer.available_bytes - runtime_bytes - device_control,
             .metadata_budget_bytes = owner.metadata(owner.selected),
             .control_reservation_bytes = control_bytes,
+            .reference                 = owner.offer.plan.reference,
         });
     }
     return result;
+}
+
+std::uint64_t
+estimate_context_token_capacity(std::span<const ContextCapacityResolution> capacities) {
+    if (capacities.empty())
+        throw std::invalid_argument("Context capacity estimate requires rank capacities");
+    const auto& reference = capacities.front().reference;
+    std::uint64_t tokens  = UINT64_MAX;
+    for (const auto& capacity : capacities) {
+        const auto& local = capacity.reference;
+        if (!capacity.block_bytes || !local.device_bytes || !local.tokens_per_request ||
+            !local.request_count || local.tokens_per_request != reference.tokens_per_request ||
+            local.request_count != reference.request_count)
+            throw std::invalid_argument(
+                "Context capacity estimate requires matching model references");
+        const auto usable   = capacity.device_bytes / capacity.block_bytes * capacity.block_bytes;
+        const auto estimate = static_cast<unsigned __int128>(usable) * local.request_count *
+                              local.tokens_per_request / local.device_bytes;
+        if (estimate < tokens) tokens = static_cast<std::uint64_t>(estimate);
+    }
+    return tokens;
 }
 
 ContextCapacityResolution

@@ -143,19 +143,29 @@ runtime::ContextCapacityPlan describe_execution_capacity(const ExecutionPlan& p)
         set.records.push_back({geometry.spec_classes[rank], states});
         set.records.push_back({geometry.spec_classes[size], main});
         if (p.mtp) set.records.push_back({geometry.spec_classes[size + 1], mtp});
-        out.working_sets.push_back(std::move(set));
+        return set;
     };
     // A retained source and a writable destination coexist through publication. COW/provisional
     // suffixes are reserved with the same unit; this does not reserve a full history per draft.
-    const auto suffix_pages = pages(std::uint64_t(p.shape.draft_tokens) + 1) + 1;
-    working_set("maximum owner context", 2, pages(p.shape.max_context) + 1,
-                pages(p.shape.max_context - 1) + suffix_pages);
+    const auto suffix_pages     = pages(std::uint64_t(p.shape.draft_tokens) + 1) + 1;
+    constexpr auto state_copies = 2U;
+    auto maximum =
+        working_set("maximum owner context", state_copies, pages(p.shape.max_context) + 1,
+                    pages(p.shape.max_context - 1) + suffix_pages);
+    auto reference_records = maximum.records;
+    // One full-context request per attention owner: remote owners still need this KDA shard.
+    for (std::uint32_t owner = 0; owner < size; ++owner)
+        if (owner != rank)
+            reference_records.push_back({geometry.spec_classes[owner], state_copies});
+    out.reference = {p.shape.max_context, size, geometry.required_bytes(reference_records)};
+    out.working_sets.push_back(std::move(maximum));
     const auto concurrent   = p.shape.max_concurrency;
     const auto short_tokens = std::min<std::uint64_t>(
         p.shape.max_context, std::uint64_t(p.shape.prefill_chunk) + p.shape.draft_tokens + 1);
-    working_set("concurrent owner requests", count(2ULL * concurrent),
-                count(std::uint64_t(concurrent) * (pages(short_tokens) + 1)),
-                count(std::uint64_t(concurrent) * (pages(short_tokens - 1) + suffix_pages)));
+    out.working_sets.push_back(
+        working_set("concurrent owner requests", count(std::uint64_t(state_copies) * concurrent),
+                    count(std::uint64_t(concurrent) * (pages(short_tokens) + 1)),
+                    count(std::uint64_t(concurrent) * (pages(short_tokens - 1) + suffix_pages))));
     out.fixed_device_bytes = p.fixed_bytes + p.workspace.bytes +
                              (p.workspace.vision ? p.workspace.vision->output_bytes : 0) +
                              (NINFER_SHARED_PHYSICAL_MEMORY ? p.pinned_bytes() : 0);

@@ -26,4 +26,7 @@ struct RankCapacityOffer {
 resolve_group_context_capacity(const ContextCapacityPolicy&, std::span<const RankCapacityOffer>,
                                std::optional<std::size_t> control_memory_owner);
 
+[[nodiscard]] std::uint64_t
+estimate_context_token_capacity(std::span<const ContextCapacityResolution> capacities);
+
 } // namespace ninfer::runtime

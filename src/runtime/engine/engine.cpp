@@ -237,6 +237,8 @@ private:
         description.kv_cache        = options.kv_cache;
         std::visit(
             [&](const auto& instance) {
+                description.context_token_capacity_estimate =
+                    runtime::estimate_context_token_capacity(instance->context_capacities);
                 const auto usage = instance->session->physical_usage();
                 for (const auto& pool : usage.pools)
                     description.context_pools.push_back(

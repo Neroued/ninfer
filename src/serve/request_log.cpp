@@ -542,6 +542,7 @@ std::string format_server_start_json(const std::string& server_instance_id, std:
                                       {"max_context", engine_options.max_context},
                                       {"context_capacity_mode", context_capacity_mode_name(engine_options.context_capacity.mode)},
                                       {"context_pools", product::context_capacity_json(description.context_pools)},
+                                      {"context_token_capacity_estimate", description.context_token_capacity_estimate},
                                       {"max_concurrency", engine_options.max_concurrency},
                                       {"max_pending_requests", engine_options.max_pending_requests},
                                       {"pending_timeout_ms", engine_options.pending_timeout_ms},

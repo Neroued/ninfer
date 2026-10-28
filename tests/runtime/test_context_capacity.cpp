@@ -27,6 +27,7 @@ int main() {
                                {"concurrent short requests", {{{0}, 2}, {{1}, 1}}}},
         .fixed_device_bytes = 100,
         .metadata           = {80, 8, {2, 4}},
+        .reference          = {1024, 1, 3 * block},
     };
     const auto geometry = describe_context_pool(plan.records);
     const auto metadata = [&](std::size_t blocks) {
@@ -67,6 +68,22 @@ int main() {
                           group[0].control_reservation_bytes == metadata(9) + metadata(13) &&
                           group[1].control_reservation_bytes == 0,
                       "rank budgets did not keep independent backings and one metadata owner");
+    failures += check(group[0].reference == plan.reference &&
+                          estimate_context_token_capacity(group) == 3072,
+                      "TP estimate did not use the limiting rank's Context capacity");
+    auto corrected            = group;
+    corrected[0].device_bytes = 6 * block;
+    failures += check(estimate_context_token_capacity(corrected) == 2048,
+                      "Context estimate ignored the final corrected backing capacity");
+    auto partial         = explicit_capacity;
+    partial.device_bytes = 4 * block - 1;
+    failures += check(estimate_context_token_capacity(std::span(&partial, 1)) == 1024,
+                      "Context estimate counted an unusable partial block");
+    auto adp         = group;
+    adp[0].reference = {1024, 2, 3 * block};
+    adp[1].reference = {1024, 2, 5 * block};
+    failures += check(estimate_context_token_capacity(adp) == 5324,
+                      "ADP estimate lost reference multiplicity or rank-local costs");
     bool explicit_rejected = false;
     try {
         (void)resolve_group_context_capacity(ContextCapacityPolicy::explicit_capacity(11 * block),

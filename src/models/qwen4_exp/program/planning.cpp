@@ -189,16 +189,20 @@ runtime::ContextCapacityPlan capacity_plan(const ExecutionPlan& base, const Engi
         set.records.push_back({geometry.spec_classes[0], states});
         set.records.push_back({geometry.spec_classes[1], main});
         if (base.persistent.mtp) set.records.push_back({geometry.spec_classes[2], mtp});
-        plan.working_sets.push_back(std::move(set));
+        return set;
     };
     const auto pages = [](std::uint64_t tokens) {
         return static_cast<std::uint32_t>((tokens + 63) / 64);
     };
-    work("maximum context", 1, pages(o.max_context), pages(o.max_context ? o.max_context - 1 : 0));
+    auto maximum   = work("maximum context", 1, pages(o.max_context),
+                          pages(o.max_context ? o.max_context - 1 : 0));
+    plan.reference = {o.max_context, 1, geometry.required_bytes(maximum.records)};
+    plan.working_sets.push_back(std::move(maximum));
     const auto short_tokens = std::min<std::uint64_t>(
         o.max_context, std::uint64_t(o.prefill_chunk) + o.speculative.draft_tokens + 1);
-    work("concurrent requests", o.max_concurrency, o.max_concurrency * pages(short_tokens),
-         o.max_concurrency * pages(short_tokens ? short_tokens - 1 : 0));
+    plan.working_sets.push_back(
+        work("concurrent requests", o.max_concurrency, o.max_concurrency * pages(short_tokens),
+             o.max_concurrency * pages(short_tokens ? short_tokens - 1 : 0)));
     plan.fixed_device_bytes = base.device_reservation_bytes();
     plan.fixed_host_bytes   = base.host_reservation_bytes();
     plan.metadata           = session_metadata_plan(base, geometry);

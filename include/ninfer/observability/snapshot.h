@@ -148,7 +148,8 @@ struct EngineDescription {
     std::vector<RankDescriptor> ranks;
     std::uint32_t max_context = 0, max_concurrency = 0, prefill_chunk = 0;
     std::vector<ContextPoolCapacity> context_pools;
-    KvCacheStorage kv_cache = KvCacheStorage::BFloat16;
+    std::uint64_t context_token_capacity_estimate = 0;
+    KvCacheStorage kv_cache                       = KvCacheStorage::BFloat16;
     std::vector<ContextKvPoolUsage> kv_pools;
 };
 

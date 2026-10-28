@@ -333,6 +333,23 @@ device = 0
     }
 }
 
+void test_context_display() {
+    ninfer::EngineDescription description;
+    description.ranks.resize(2);
+    description.max_context                     = 262144;
+    description.context_token_capacity_estimate = 1048576;
+    description.context_pools = {{0, ninfer::ContextMemoryDomain::Device, 8ULL << 30, 1ULL << 20},
+                                 {1, ninfer::ContextMemoryDomain::Device, 6ULL << 30, 1ULL << 20},
+                                 {0, ninfer::ContextMemoryDomain::Host, 1ULL << 30, 1ULL << 20}};
+    const auto text           = ninfer::product::format_context_capacity(description);
+    require(text.find("across 2 ranks") != std::string::npos &&
+                text.find("host ") != std::string::npos &&
+                text.find("KV ~1,048,576 tokens") != std::string::npos &&
+                text.find("~4.0 x 262144-token contexts") != std::string::npos &&
+                text.find('\n') == std::string::npos,
+            "Context display lost the shared estimate or expanded beyond one line");
+}
+
 } // namespace
 
 int main() {
@@ -342,6 +359,7 @@ int main() {
         test_file_merge(files);
         test_file_errors_and_example(files);
         test_deployment(files);
+        test_context_display();
         std::cout << "ok\n";
         return 0;
     } catch (const std::exception& error) {

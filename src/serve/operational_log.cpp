@@ -2,6 +2,7 @@
 #include "product/statistics.h"
 
 #include "product/logging/pretty_format.h"
+#include "product/logging/configuration.h"
 #include "product/speculative_options.h"
 
 #include <spdlog/logger.h>
@@ -447,11 +448,7 @@ void OperationalLog::engine_capacity(const GenerationService& service) const {
     const auto& context_cost = startup.load.context_cost;
     logger_->info("capacity | {} | {} ranks | {} active lanes", kv_cache_name(description.kv_cache),
                   description.ranks.size(), engine.max_concurrency);
-    for (const auto& pool : description.context_pools)
-        logger_->info("context rank {} | {} {} | block {}", pool.rank,
-                      pool.domain == ninfer::ContextMemoryDomain::Device ? "device" : "host",
-                      product::format_pretty_bytes(pool.capacity_bytes),
-                      product::format_pretty_bytes(pool.block_bytes));
+    product::log_context_capacity(*logger_, description);
     for (std::size_t i = 0; i < description.ranks.size(); ++i) {
         const auto& rank   = description.ranks[i];
         const auto& budget = startup.ranks.at(i);

@@ -49,11 +49,11 @@ int main() {
     options.launch.engine.max_context    = 262144;
     options.launch.engine.context_capacity =
         ninfer::ContextCapacityPolicy::explicit_capacity(8ULL << 30);
-    options.launch.engine.prefill_chunk             = 1024;
-    options.launch.logging.stats_interval_ms        = 2500;
-    options.launch.engine.kv_cache = ninfer::KvCacheStorage::Fp8E4m3fnGroup128Ue8m0;
-    options.launch.engine.speculative.backend       = ninfer::SpeculativeBackend::Mtp;
-    options.launch.engine.speculative.draft_tokens  = 3;
+    options.launch.engine.prefill_chunk            = 1024;
+    options.launch.logging.stats_interval_ms       = 2500;
+    options.launch.engine.kv_cache                 = ninfer::KvCacheStorage::Fp8E4m3fnGroup128Ue8m0;
+    options.launch.engine.speculative.backend      = ninfer::SpeculativeBackend::Mtp;
+    options.launch.engine.speculative.draft_tokens = 3;
     options.launch.engine.speculative.proposal_head = ninfer::ProposalHead::Optimized;
     options.launch.engine.enable_vision             = false;
     options.launch.engine.context_cache.enabled     = true;
@@ -121,26 +121,27 @@ int main() {
     startup_report.ranks.resize(1);
     ninfer::EngineSnapshot snapshot;
     snapshot.ranks.resize(1);
-    auto& memory                               = snapshot.ranks[0].memory;
-    auto& budget                               = startup_report.ranks[0];
-    description.max_context                    = 262144;
-    description.kv_cache                       = ninfer::KvCacheStorage::Fp8E4m3fnGroup128Ue8m0;
-    memory.allocations.device_weights_bytes    = 100;
-    memory.allocations.persistent_device_bytes = 200;
-    memory.allocations.workspace_device_bytes  = 500;
-    memory.vision                              = ninfer::VisionMemorySummary{.budget_bytes            = 600,
-                                                                             .max_window_features     = 16384,
-                                                                             .encoder_workspace_bytes = 400,
-                                                                             .output_capacity_bytes   = 200,
-                                                                             .input_staging_bytes     = 256,
-                                                                             .output_active_bytes     = 0,
-                                                                             .output_peak_bytes       = 150};
-    budget.minimum_runtime_reservation_bytes   = 1300;
-    budget.context_capacity_bytes              = 8ULL << 30;
-    budget.runtime_reservation_bytes           = 1600;
-    budget.available_after_weights_bytes       = 1700;
-    budget.available_after_startup_bytes       = 180;
-    budget.planned_slack_bytes                 = 100;
+    auto& memory                                = snapshot.ranks[0].memory;
+    auto& budget                                = startup_report.ranks[0];
+    description.max_context                     = 262144;
+    description.context_token_capacity_estimate = 1048576;
+    description.kv_cache                        = ninfer::KvCacheStorage::Fp8E4m3fnGroup128Ue8m0;
+    memory.allocations.device_weights_bytes     = 100;
+    memory.allocations.persistent_device_bytes  = 200;
+    memory.allocations.workspace_device_bytes   = 500;
+    memory.vision                               = ninfer::VisionMemorySummary{.budget_bytes            = 600,
+                                                                              .max_window_features     = 16384,
+                                                                              .encoder_workspace_bytes = 400,
+                                                                              .output_capacity_bytes   = 200,
+                                                                              .input_staging_bytes     = 256,
+                                                                              .output_active_bytes     = 0,
+                                                                              .output_peak_bytes       = 150};
+    budget.minimum_runtime_reservation_bytes    = 1300;
+    budget.context_capacity_bytes               = 8ULL << 30;
+    budget.runtime_reservation_bytes            = 1600;
+    budget.available_after_weights_bytes        = 1700;
+    budget.available_after_startup_bytes        = 180;
+    budget.planned_slack_bytes                  = 100;
     budget.graphs                  = ninfer::GraphMemorySummary{.rebuild_estimate_bytes      = 600,
                                                                 .warmup_increment_bytes      = 200,
                                                                 .preparation_increment_bytes = -30,
@@ -183,6 +184,8 @@ int main() {
               "server weights id missing");
     failures += check(server.at("artifact").at("size_bytes") == 123456, "artifact size missing");
     failures += check(server.at("engine").at("max_context") == 262144, "max context missing");
+    failures += check(server.at("engine").at("context_token_capacity_estimate") == 1048576,
+                      "Context token capacity estimate missing");
     failures += check(server.at("engine").at("context_capacity_mode") == "explicit" &&
                           server.at("engine").at("context_pools").at(0).at("capacity_bytes") ==
                               (8ULL << 30) &&

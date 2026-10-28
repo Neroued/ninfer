@@ -814,13 +814,6 @@ int main(int argc, char** argv) {
                           ++failed;
                       } catch (const std::invalid_argument&) {}
                   };
-                  const auto storage   = f.cache.main.storage;
-                  f.cache.main.storage = KvCacheStorage::BFloat16;
-                  rejects([&] { f.launch(e); });
-                  f.kv_only = true;
-                  rejects([&] { f.launch(e); });
-                  f.kv_only               = false;
-                  f.cache.main.storage    = storage;
                   const auto q            = f.projected.query;
                   f.projected.query.ne[1] = 48;
                   rejects([&] { f.launch(e); });
@@ -828,6 +821,36 @@ int main(int argc, char** argv) {
                   return failed;
               },
               {{"format", "fp8"}});
+    // Each additional codec covers both semantic entries and distinct cache/record layouts,
+    // with one compact set of mathematical risks rather than a storage/layout cross product.
+    for (auto storage : {KvCacheStorage::BFloat16}) {
+        const std::string format = kv_cache_storage_name(storage);
+        for (bool kv_only : {false, true}) {
+            const std::string prefix =
+                std::string(kv_only ? "qsa_prepare_kv/" : "qsa_prepare/") + format + "/h24_4/";
+
+            struct Case {
+                int t, b, axes, alias, layout, capacity;
+            };
+
+            const Case cases[]{
+                {1, 1, 1, 0, 0, 0}, {33, 8, 3, kv_only ? 0 : 3, 2, 5}, {257, 1, 3, 0, 1, 0}};
+            for (auto c : cases)
+                suite.add(prefix + "t" + std::to_string(c.t) + "/b" + std::to_string(c.b),
+                          [=] {
+                              return run(cuda_environment().context, c.t, c.b, c.axes, c.alias,
+                                         c.layout, c.capacity, storage, 4, kv_only);
+                          },
+                          {{"format", format}, {"execution", "graph"}});
+            suite.add(prefix + "continuation",
+                      [=] { return continuation(cuda_environment().context, storage, 4, kv_only); },
+                      {{"format", format}});
+        }
+        suite.add("qsa_prepare/" + format + "/h24_4/norm_alignment",
+                  [=] { return norm_alignment_and_phase(cuda_environment().context, storage, 4); },
+                  {{"format", format}});
+    }
+
 #endif
 
     return suite.main(argc, argv);

@@ -22,9 +22,11 @@ template <KvCacheStorage Storage, int N, int Warps, SparseGqaLoad Load = SparseG
           SparseGqaWarpSplit Split = SparseGqaWarpSplit::Sequence, int PaddedHeads = 16>
 struct SparseGqaStorage : SparseGqaRaw<Storage, N, Load == SparseGqaLoad::Staged> {
     union {
-        // Aliased decode needs one FP16 tile and one native packed tile.
+        // Reused serializes native K/V copies into one tile. Aliased decode retains
+        // one FP16 tile and one native packed tile to overlap quantized K/V loads.
         alignas(16) std::uint16_t
-            kv[Load == SparseGqaLoad::Aliased
+            kv[Load == SparseGqaLoad::Reused ? N * 256
+               : Load == SparseGqaLoad::Aliased
                    ? N * 256 + N *
                                    (std::max(SparseGqaCodec<Storage, true>::code_bytes,
                                              SparseGqaCodec<Storage, false>::code_bytes) +
@@ -83,8 +85,10 @@ __device__ void sparse_gqa_stage(const SparseGqaArguments& a,
     const auto plane = Key ? a.key : a.value, scale_plane = Key ? a.key_scale : a.value_scale;
     const auto* addresses       = Key ? s.addresses.key : s.addresses.value;
     const auto* scale_addresses = Key ? s.addresses.key_scale : s.addresses.value_scale;
-    auto* decoded               = s.kv + (Key || Load == SparseGqaLoad::Aliased ? 0 : N * 256);
-    if constexpr (Load != SparseGqaLoad::Direct) {
+    auto* decoded =
+        s.kv +
+        (Key || Load == SparseGqaLoad::Aliased || Load == SparseGqaLoad::Reused ? 0 : N * 256);
+    if constexpr (Load != SparseGqaLoad::Direct && Load != SparseGqaLoad::Reused) {
         static_assert(kSparseQuantized<Storage> && Vector);
         constexpr int Row = Load == SparseGqaLoad::InPlace ? Codec::packed_row : Codec::code_bytes;
         std::uint8_t *codes, *scales;
@@ -211,7 +215,9 @@ template <KvCacheStorage Storage, bool Key, int N, int Warps, SparseGqaLoad Load
 __device__ void
 sparse_gqa_expand_stage(SparseGqaStorage<Storage, N, Warps, Load, Split, PaddedHeads>& s) {
     using Codec = SparseGqaCodec<Storage, Key>;
-    auto* dst   = s.kv + (Key || Load == SparseGqaLoad::Aliased ? 0 : N * 256);
+    auto* dst =
+        s.kv +
+        (Key || Load == SparseGqaLoad::Aliased || Load == SparseGqaLoad::Reused ? 0 : N * 256);
     if constexpr (Load == SparseGqaLoad::InPlace) {
         constexpr int Row = Codec::packed_row;
         auto* raw         = reinterpret_cast<std::uint8_t*>(dst) + N * (512 - Row);

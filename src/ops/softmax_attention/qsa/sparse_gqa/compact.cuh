@@ -59,13 +59,11 @@ compact_probabilities(float (&score)[Tiles][4], OnlineSoftmaxRow (&state)[2], fl
     state[1].accumulate(alpha[1], tile_sum[1]);
 }
 
-template <int N, int Warps, bool Vector, SparseGqaLoad Load, bool Prefix>
+template <KvCacheStorage Storage, int N, int Warps, bool Vector, SparseGqaLoad Load, bool Prefix>
 __device__ __forceinline__ void
 sparse_gqa_compact(SparseGqaKernelArguments<4> a,
-                   SparseGqaStorage<KvCacheStorage::Fp8E4M3Row256, N, Warps, Load,
-                                    SparseGqaWarpSplit::Sequence, 8>& s,
-                   std::int64_t first, int head, int split) {
-    constexpr auto Storage    = KvCacheStorage::Fp8E4M3Row256;
+                   SparseGqaStorage<Storage, N, Warps, Load, SparseGqaWarpSplit::Sequence, 8>& s,
+                   std::int64_t first, int head, int split, int packed = Prefix ? Warps : 1) {
     constexpr int PaddedHeads = 8;
     constexpr int Queries = Prefix ? Warps : 1, NK = Prefix ? N : N / Warps, Tiles = NK / 16;
     static_assert(NK % 16 == 0 && (!Prefix || Warps <= N));
@@ -73,7 +71,7 @@ sparse_gqa_compact(SparseGqaKernelArguments<4> a,
     const int gid = lane / 4, lid = lane % 4;
     const auto total = std::int64_t(a.tokens) * a.batch;
     const int batch  = first / a.tokens;
-    const auto last  = min(first + Queries, std::int64_t(batch) * a.tokens + a.valid[batch]);
+    const auto last  = min(first + packed, std::int64_t(batch) * a.tokens + a.valid[batch]);
     const auto q     = first + (Prefix ? warp : 0);
     const bool live  = q < last;
     auto work        = a.work(first);
@@ -83,12 +81,14 @@ sparse_gqa_compact(SparseGqaKernelArguments<4> a,
         work            = {end / 4, end / 4, end, tiles, min(a.splits, tiles)};
     }
     if (!work.size) {
-        for (int i = threadIdx.x; i < Queries * 6 * 128; i += Warps * 32) {
-            const auto dstq = first + i / (6 * 128);
-            if (dstq < total)
-                *reinterpret_cast<unsigned*>(a.out + (dstq * 24 + head * 6 + i / 128 % 6) * 256 +
-                                             i % 128 * 2) = 0;
-        }
+        // Split kernels leave empty-query output ownership to the following merge.
+        if (!a.numerator)
+            for (int i = threadIdx.x; i < packed * 6 * 128; i += Warps * 32) {
+                const auto dstq = first + i / (6 * 128);
+                if (dstq < total)
+                    *reinterpret_cast<unsigned*>(
+                        a.out + (dstq * 24 + head * 6 + i / 128 % 6) * 256 + i % 128 * 2) = 0;
+            }
         return;
     }
     if (split >= work.splits) return;
@@ -96,7 +96,8 @@ sparse_gqa_compact(SparseGqaKernelArguments<4> a,
     const int end      = min(work.size, (split + 1) * work.tiles / work.splits * N);
     const int position = Prefix ? (live ? a.positions[q] : -1) : end - 1;
     auto* ks           = s.kv;
-    auto* vs           = s.kv + (Load == SparseGqaLoad::Aliased ? 0 : N * 256);
+    auto* vs =
+        s.kv + (Load == SparseGqaLoad::Aliased || Load == SparseGqaLoad::Reused ? 0 : N * 256);
     sparse_gqa_prepare_query<Storage, Warps, Queries, 8>(a, first, last, head, ks);
     unsigned qf[16][2];
 #pragma unroll
@@ -118,8 +119,10 @@ sparse_gqa_compact(SparseGqaKernelArguments<4> a,
         common::cp_wait<0>();
         __syncthreads();
         sparse_gqa_expand_stage<Storage, true>(s);
-        sparse_gqa_stage<Storage, N, Warps, Vector, false>(a, s, k0, end);
-        common::cp_commit();
+        if constexpr (Load != SparseGqaLoad::Reused) {
+            sparse_gqa_stage<Storage, N, Warps, Vector, false>(a, s, k0, end);
+            common::cp_commit();
+        }
         float score[Tiles][4]{};
 #pragma unroll
         for (int n = 0; n < Tiles; ++n) {
@@ -131,8 +134,12 @@ sparse_gqa_compact(SparseGqaKernelArguments<4> a,
                 const int d = k * 16 + (lane >> 4) * 8;
                 common::ldmatrix_x4(kf[0], kf[1], kf[2], kf[3],
                                     common::smem_addr(ks + r * 256 + common::swizzle_xor_64(r, d)));
-                common::mma_f16(score[n][0], score[n][1], score[n][2], score[n][3], kf[0], kf[1],
-                                kf[2], kf[3], qf[k][0], qf[k][1]);
+                if constexpr (kSparseQuantized<Storage>)
+                    common::mma_f16(score[n][0], score[n][1], score[n][2], score[n][3], kf[0],
+                                    kf[1], kf[2], kf[3], qf[k][0], qf[k][1]);
+                else
+                    common::mma_bf16(score[n][0], score[n][1], score[n][2], score[n][3], kf[0],
+                                     kf[1], kf[2], kf[3], qf[k][0], qf[k][1]);
             }
         }
         float alpha[2];
@@ -141,10 +148,15 @@ sparse_gqa_compact(SparseGqaKernelArguments<4> a,
         // The one-warp schedule retains its measured late-softmax order.
         if constexpr (Warps > 1)
             compact_probabilities(score, state, alpha, pf, k0 + (Prefix ? 0 : warp * NK), position);
+        if constexpr (Load == SparseGqaLoad::Reused) {
+            __syncthreads();
+            sparse_gqa_stage<Storage, N, Warps, Vector, false>(a, s, k0, end);
+            common::cp_commit();
+        }
         common::cp_wait<0>();
         __syncthreads();
         sparse_gqa_expand_stage<Storage, false>(s);
-        if (k0 + N < end) {
+        if (Load != SparseGqaLoad::Reused && k0 + N < end) {
             sparse_gqa_addresses<Storage>(a, s, work, address_q, head, k0 + N, end);
             sparse_gqa_stage<Storage, N, Warps, Vector, true>(a, s, k0 + N, end);
             common::cp_commit();
@@ -168,6 +180,11 @@ sparse_gqa_compact(SparseGqaKernelArguments<4> a,
             }
         }
         __syncthreads();
+        if (Load == SparseGqaLoad::Reused && k0 + N < end) {
+            sparse_gqa_addresses<Storage>(a, s, work, address_q, head, k0 + N, end);
+            sparse_gqa_stage<Storage, N, Warps, Vector, true>(a, s, k0 + N, end);
+            common::cp_commit();
+        }
     }
     float maximum[2] = {state[0].maximum * scale, state[1].maximum * scale};
     float sum[2]     = {sparse_gqa_key_sum(state[0].sum), sparse_gqa_key_sum(state[1].sum)};
@@ -216,7 +233,7 @@ sparse_gqa_compact(SparseGqaKernelArguments<4> a,
             }
         }
     }
-    if (q >= total) return;
+    if (q >= total || q >= first + packed) return;
     if (!a.numerator) {
         const float inv[2] = {live ? __frcp_rn(sum[0]) : 0, live ? __frcp_rn(sum[1]) : 0};
         // Redistribute FP32 attention before the gate. A compact loop keeps rounded
@@ -232,15 +249,25 @@ sparse_gqa_compact(SparseGqaKernelArguments<4> a,
             }
         }
         __syncwarp();
+        if constexpr (Storage == KvCacheStorage::BFloat16) {
+            if (live)
+                sparse_gqa_compact_store_vector(
+                    a, q, head, s.partial + (Prefix ? warp * PaddedHeads : 0) * 256);
+            else
+                for (int i = lane; i < 6 * 128; i += 32)
+                    *reinterpret_cast<unsigned*>(a.out + (q * 24 + head * 6 + i / 128) * 256 +
+                                                 i % 128 * 2) = 0;
+        } else {
 #pragma unroll 1
-        for (int i = lane; i < 6 * 128; i += 32) {
-            const int h = i / 128, d = i % 128 * 2;
-            if (live) {
-                const auto value = *reinterpret_cast<const float2*>(
-                    s.partial + ((Prefix ? warp * PaddedHeads : 0) + h) * 256 + d);
-                sparse_gqa_store(a, q, head * 6 + h, d, value.x, value.y);
-            } else
-                *reinterpret_cast<unsigned*>(a.out + (q * 24 + head * 6 + h) * 256 + d) = 0;
+            for (int i = lane; i < 6 * 128; i += 32) {
+                const int h = i / 128, d = i % 128 * 2;
+                if (live) {
+                    const auto value = *reinterpret_cast<const float2*>(
+                        s.partial + ((Prefix ? warp * PaddedHeads : 0) + h) * 256 + d);
+                    sparse_gqa_store(a, q, head * 6 + h, d, value.x, value.y);
+                } else
+                    *reinterpret_cast<unsigned*>(a.out + (q * 24 + head * 6 + h) * 256 + d) = 0;
+            }
         }
         return;
     }
@@ -267,26 +294,37 @@ sparse_gqa_compact(SparseGqaKernelArguments<4> a,
     }
 }
 
-template <int N, int Warps, bool Vector, SparseGqaLoad Load, bool Prefix = false>
+template <KvCacheStorage Storage, int N, int Warps, bool Vector, SparseGqaLoad Load,
+          bool Prefix = false>
 __launch_bounds__(Warps * 32) __global__
-    void sparse_gqa_compact_kernel(SparseGqaKernelArguments<4> a) {
+    void sparse_gqa_compact_kernel(SparseGqaKernelArguments<4> a, int slab_queries) {
     extern __shared__ __align__(16) unsigned char smem[];
-    auto& s = *reinterpret_cast<SparseGqaStorage<KvCacheStorage::Fp8E4M3Row256, N, Warps, Load,
-                                                 SparseGqaWarpSplit::Sequence, 8>*>(smem);
-    const auto first = a.begin + std::int64_t(a.group_query(blockIdx.x)) * (Prefix ? Warps : 1);
-    const int head   = a.group_head(blockIdx.x);
+    auto& s = *reinterpret_cast<
+        SparseGqaStorage<Storage, N, Warps, Load, SparseGqaWarpSplit::Sequence, 8>*>(smem);
+    const auto group = std::int64_t(a.group_query(blockIdx.x));
+    auto first       = a.begin + group * (Prefix ? Warps : 1);
+    int packed       = Prefix ? Warps : 1;
+    if constexpr (Storage == KvCacheStorage::BFloat16 && Prefix) {
+        // Anchor complete packets at the slab end. Growing a fixed-end query window adds
+        // an older leading packet without repartitioning all existing query/KV work.
+        const int leading = (slab_queries - 1) % Warps + 1;
+        first             = a.begin + (group ? leading + (group - 1) * Warps : 0);
+        if (!group) packed = leading;
+    }
+    const int head = a.group_head(blockIdx.x);
     if constexpr (Prefix) {
-        if (sparse_gqa_all_selected<Warps>(a, first))
-            sparse_gqa_compact<N, Warps, Vector, Load, true>(a, s, first, head, blockIdx.y);
+        if (sparse_gqa_all_selected<Warps>(a, first, packed))
+            sparse_gqa_compact<Storage, N, Warps, Vector, Load, true>(a, s, first, head, blockIdx.y,
+                                                                      packed);
         else {
             const auto total = std::int64_t(a.tokens) * a.batch;
-            for (int i = 0; i < Warps && first + i < total; ++i) {
-                sparse_gqa_compact<N, Warps, Vector, Load, false>(a, s, first + i, head,
-                                                                  blockIdx.y);
+            for (int i = 0; i < packed && first + i < total; ++i) {
+                sparse_gqa_compact<Storage, N, Warps, Vector, Load, false>(a, s, first + i, head,
+                                                                           blockIdx.y);
                 __syncthreads();
             }
         }
     } else
-        sparse_gqa_compact<N, Warps, Vector, Load, false>(a, s, first, head, blockIdx.y);
+        sparse_gqa_compact<Storage, N, Warps, Vector, Load, false>(a, s, first, head, blockIdx.y);
 }
 } // namespace ninfer::ops::detail::qsa

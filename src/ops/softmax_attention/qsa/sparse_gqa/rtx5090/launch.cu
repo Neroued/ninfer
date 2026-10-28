@@ -14,28 +14,49 @@ void launch(const SparseGqaArguments& arguments, SparseGqaPlan plan,
     constexpr bool Async = kSparseQuantized<Storage> && VectorCache;
     if constexpr (KvHeads == 4) {
         const auto compact = [&]<int N, int Warps, SparseGqaLoad Load, bool Prefix>() {
-            constexpr auto kernel = sparse_gqa_compact_kernel<N, Warps, VectorCache, Load, Prefix>;
+            constexpr auto kernel =
+                sparse_gqa_compact_kernel<Storage, N, Warps, VectorCache, Load, Prefix>;
             constexpr int bytes =
                 sizeof(SparseGqaStorage<Storage, N, Warps, Load, SparseGqaWarpSplit::Sequence, 8>);
             const int shared = common::prepare_shared<bytes, kernel, true>();
             const int groups = Prefix ? (queries + Warps - 1) / Warps : queries;
-            kernel<<<dim3(groups * 4, a.splits), Warps * 32, shared, execution.stream()>>>(a);
+            kernel<<<dim3(groups * 4, a.splits), Warps * 32, shared, execution.stream()>>>(a,
+                                                                                           queries);
+        };
+        const auto submit = [&]<int N, int Warps, bool Prefix>() {
+            if constexpr (Storage == KvCacheStorage::BFloat16 && VectorCache) {
+                if (launch_plan.load == SparseGqaLoad::Reused)
+                    compact.template operator()<N, Warps, SparseGqaLoad::Reused, Prefix>();
+                else
+                    compact.template operator()<N, Warps, SparseGqaLoad::Direct, Prefix>();
+            } else {
+                constexpr auto load = Async ? SparseGqaLoad::Aliased : SparseGqaLoad::Direct;
+                compact.template operator()<N, Warps, load, Prefix>();
+            }
         };
         if (plan.instance == SparseGqaInstance::FullPrefix) {
-            constexpr auto load = Async ? SparseGqaLoad::Aliased : SparseGqaLoad::Direct;
-            compact.template operator()<64, 4, load, true>();
+            if constexpr (Storage == KvCacheStorage::BFloat16) {
+                if (plan.key_rows == 32)
+                    submit.template operator()<32, 2, true>();
+                else
+                    submit.template operator()<64, 4, true>();
+            } else
+                submit.template operator()<64, 4, true>();
         } else if (plan.instance == SparseGqaInstance::Simt) {
             sparse_gqa_simt_kernel<Storage, 8, VectorCache>
                 <<<dim3(queries * a.query_heads, a.splits), 256, 0, execution.stream()>>>(a);
+        } else if constexpr (Storage == KvCacheStorage::BFloat16) {
+            if (plan.key_rows == 32)
+                submit.template operator()<32, 2, false>();
+            else
+                submit.template operator()<64, 4, false>();
         } else if (plan.key_rows == 64) {
-            constexpr auto load = Async ? SparseGqaLoad::Aliased : SparseGqaLoad::Direct;
-            compact.template operator()<64, 4, load, false>();
+            submit.template operator()<64, 4, false>();
         } else {
-            constexpr auto load = Async ? SparseGqaLoad::Aliased : SparseGqaLoad::Direct;
-            compact.template operator()<16, 1, load, false>();
+            submit.template operator()<16, 1, false>();
         }
     } else if (plan.instance == SparseGqaInstance::FullPrefix) {
-        constexpr auto load   = Async ? SparseGqaLoad::InPlace : SparseGqaLoad::Direct;
+        constexpr auto load = Async ? SparseGqaLoad::InPlace : SparseGqaLoad::Direct;
         constexpr auto kernel =
             sparse_gqa_all_select_kernel<Storage, 64, 4, VectorCache, load, KvHeads>;
         constexpr int bytes =
@@ -81,7 +102,8 @@ void launch_sparse_gqa_instance(SparseGqaArguments a, KvCacheStorage storage, in
         if (kv_heads == 1)
             geometry.template operator()<1>();
         else if (kv_heads == 4) {
-            if constexpr (Storage == KvCacheStorage::Fp8E4M3Row256)
+            if constexpr (Storage == KvCacheStorage::Fp8E4M3Row256 ||
+                          Storage == KvCacheStorage::BFloat16)
                 geometry.template operator()<4>();
         } else
             geometry.template operator()<2>();

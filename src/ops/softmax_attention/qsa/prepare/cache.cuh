@@ -139,11 +139,33 @@ __device__ __forceinline__ void store_fp8_contiguous(const float (&values)[8], s
     if (lane == 0) *reinterpret_cast<__half*>(scales) = quant.scale;
 }
 
-// Native FP8 row stores can consume eight adjacent features per lane. This
-// avoids transposing codes through shared memory or adding a represented K cast.
-template <int KvHeads>
-__device__ __forceinline__ void prepare_fp8_kv_vector(const PrepareArguments& a, int head, int t,
-                                                      int b, int lane, const float2* coefficients) {
+// Natural cache alignment is two bytes, while the common packed row admits a 16-byte store.
+template <bool Half>
+__device__ __forceinline__ void store_16bit_contiguous(const float (&values)[8],
+                                                       std::uint8_t* output, int lane) {
+    unsigned words[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        if constexpr (Half)
+            words[j] = common::pack_f16x2(values[2 * j], values[2 * j + 1]);
+        else
+            words[j] = common::pack_bf16x2(values[2 * j], values[2 * j + 1]);
+    }
+    if (reinterpret_cast<std::uintptr_t>(output) % 16 == 0)
+        reinterpret_cast<uint4*>(output)[lane] = {words[0], words[1], words[2], words[3]};
+    else {
+#pragma unroll
+        for (int j = 0; j < 8; ++j)
+            reinterpret_cast<std::uint16_t*>(output)[lane * 8 + j] =
+                std::uint16_t(words[j / 2] >> (16 * (j % 2)));
+    }
+}
+
+// A warp consumes eight adjacent features per lane. Each codec receives the
+// norm/RoPE result at its declared rounding boundary, without an extra K cast.
+template <KvCacheStorage Storage, int KvHeads>
+__device__ __forceinline__ void prepare_kv_vector(const PrepareArguments& a, int head, int t, int b,
+                                                  int lane, const float2* coefficients) {
     const auto m      = t + std::int64_t(b) * a.tokens;
     const int p       = a.positions[m];
     const auto page   = a.tables[p / 64 + std::int64_t(a.table_rows[b]) * a.table_stride];
@@ -154,16 +176,24 @@ __device__ __forceinline__ void prepare_fp8_kv_vector(const PrepareArguments& a,
         vector_norm_rotate<256, true>(key, a.wk, a.epsilon, coefficients, lane, x);
     else
         vector_norm_rotate<256, false>(key, a.wk, a.epsilon, coefficients, lane, x);
-    kv::normalized_hadamard_d256_contiguous_inplace(x, lane);
-    store_fp8_contiguous(x, a.keys.at(p % 64, head, page), a.key_scales.at(p % 64, head, page),
-                         lane);
+    if constexpr (Storage == KvCacheStorage::BFloat16) {
+        store_16bit_contiguous<false>(x, a.keys.at(p % 64, head, page), lane);
+    } else {
+        static_assert(Storage == KvCacheStorage::Fp8E4M3Row256);
+        kv::normalized_hadamard_d256_contiguous_inplace(x, lane);
+        store_fp8_contiguous(x, a.keys.at(p % 64, head, page), a.key_scales.at(p % 64, head, page),
+                             lane);
+    }
     const auto v = reinterpret_cast<const uint4*>(value)[lane];
     const unsigned words[4]{v.x, v.y, v.z, v.w};
 #pragma unroll
     for (int j = 0; j < 8; ++j)
         x[j] = __uint_as_float(((words[j / 2] >> (16 * (j % 2))) & 0xffff) << 16);
-    store_fp8_contiguous(x, a.values.at(p % 64, head, page), a.value_scales.at(p % 64, head, page),
-                         lane);
+    if constexpr (Storage == KvCacheStorage::BFloat16)
+        store_16bit_contiguous<true>(x, a.values.at(p % 64, head, page), lane);
+    else
+        store_fp8_contiguous(x, a.values.at(p % 64, head, page),
+                             a.value_scales.at(p % 64, head, page), lane);
 }
 
 } // namespace ninfer::ops::detail::qsa

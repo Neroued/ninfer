@@ -5,17 +5,28 @@
 namespace ninfer::ops::detail::qsa {
 int sparse_gqa_direct_queries(int, int) { return 256; }
 
-SparseGqaPlan select_sparse_gqa_plan(KvCacheStorage, int tokens, int batch, int kv_heads,
+SparseGqaPlan select_sparse_gqa_plan(KvCacheStorage storage, int tokens, int batch, int kv_heads,
                                      QsaSparseGqaExecutionEnvelope envelope, int sms) {
     const auto queries = std::int64_t(tokens) * batch;
     const auto visible = envelope.max_visible_tokens;
     if (kv_heads == 4) {
+        const bool bf16    = storage == KvCacheStorage::BFloat16;
         const bool partial = queries < sparse_gqa_direct_queries(kv_heads, sms);
-        const bool prefix  = visible <= 2051 && queries >= 2 && (visible > 64 || queries >= 32);
+        if (bf16 && visible <= 64 && (queries < 16 || (visible <= 16 && queries < 32)))
+            return {32, 1, SparseGqaInstance::Simt, true};
+        const bool prefix =
+            visible <= 2051 && (bf16 || (queries >= 2 && (visible > 64 || queries >= 32)));
         if (!prefix && visible <= 64) return {32, 1, SparseGqaInstance::Simt, true};
-        const int rows     = prefix || queries <= 8 ? 64 : 16;
-        const auto groups  = prefix ? (queries + 3) / 4 * 4 : queries * 4;
-        const int resident = rows == 16 ? 7 : 2;
+        const int rows     = bf16 && prefix && visible <= 32 ? 32
+                             : prefix || queries <= 8        ? 64
+                             : bf16                          ? 32
+                                                             : 16;
+        const int packet   = prefix ? rows / 16 : 1;
+        const auto groups  = (queries + packet - 1) / packet * 4;
+        const int resident = bf16 ? (rows == 32               ? (prefix ? 3 : 5)
+                                     : prefix && queries <= 8 ? 1
+                                                              : 2)
+                                  : (rows == 16 ? 7 : 2);
         const int tiles    = std::max(1, (int(std::min(visible, 2051u)) + rows - 1) / rows);
         int splits         = 1;
         if (partial) {
@@ -34,7 +45,7 @@ SparseGqaPlan select_sparse_gqa_plan(KvCacheStorage, int tokens, int batch, int 
             }
         }
         return {rows, splits, prefix ? SparseGqaInstance::FullPrefix : SparseGqaInstance::Mma,
-                partial};
+                partial && (!bf16 || splits > 1)};
     }
     if (queries >= sparse_gqa_direct_queries(kv_heads, sms))
         return visible <= 2051 ? SparseGqaPlan{64, 1, SparseGqaInstance::FullPrefix, false}
@@ -62,6 +73,11 @@ SparseGqaLaunchPlan select_sparse_gqa_launch(const ConstPagedKVBatchLayerView& c
     if (cache.num_kv_heads == 4) {
         const auto load = !vector || plan.instance == SparseGqaInstance::Simt
                               ? SparseGqaLoad::Direct
+                          : cache.storage == KvCacheStorage::BFloat16
+                              ? (plan.instance == SparseGqaInstance::FullPrefix &&
+                                         (queries <= 8 || plan.key_rows == 32)
+                                     ? SparseGqaLoad::Direct
+                                     : SparseGqaLoad::Reused)
                               : SparseGqaLoad::Aliased;
         return {load, vector, plan.splits};
     }

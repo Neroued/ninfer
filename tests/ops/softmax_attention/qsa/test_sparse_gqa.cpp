@@ -1,4 +1,5 @@
 #include "ops/suite.h"
+#include "core/platform.h"
 #include "kv_cache_storage.h"
 #include "sparse_gqa_fixture.h"
 #include "cuda_fixture.h"
@@ -356,7 +357,7 @@ int quantized_validation(DeviceContext& device, KvCacheStorage storage) {
     const auto key_scales       = invalid.cache.k_scale_pages;
     invalid.cache.k_scale_pages = {};
     int failures = rejects([&] { invalid.launch(workspace, device.execution_view()); });
-    invalid.cache.k_scale_pages = key_scales;
+    invalid.cache.k_scale_pages                    = key_scales;
     invalid.cache.k_scale_pages.plane.tensor.dtype = DType::BF16;
     failures += rejects([&] { invalid.launch(workspace, device.execution_view()); });
     invalid.cache.k_scale_pages                         = key_scales;
@@ -552,12 +553,6 @@ void add_four_head_cases(OpSuite& suite) {
                 failures += maximum != ops::qsa_sparse_gqa_workspace_capacity_bytes(
                                            storage, 24, 4, 1, 257, b, {bound}, sms);
             }
-        for (auto format : {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64,
-                            KvCacheStorage::Nvfp4Group16, KvCacheStorage::Fp8KeyNvfp4Value})
-            failures += rejects([&] {
-                (void)ops::qsa_sparse_gqa_workspace_capacity_bytes(format, 24, 4, 1, 8, 1, {8192},
-                                                                   sms);
-            });
         return failures;
     });
     special(
@@ -577,6 +572,59 @@ void add_four_head_cases(OpSuite& suite) {
             [=] { return scale_layout(cuda_environment().context, storage, 256, 65, 24, 4); });
 }
 
+// New storage profiles qualify the actual compact, prefix, fallback and scalar-cache routes.
+// The larger FP8 catalogue already establishes shared exhaustive seam neighborhoods.
+void add_four_head_storage_cases(OpSuite& suite, KvCacheStorage storage) {
+    const auto add = [&](int t, int b, int history, bool padded = false, int cap = 512,
+                         bool graph = false) {
+        add_case(suite, t, b, history, padded, cap, 1.F, graph, storage,
+                 std::numeric_limits<int>::max(), 24, false, 4);
+    };
+    add(1, 1, 3);
+    if (storage == KvCacheStorage::BFloat16) {
+        add(17, 1, 31);
+        add(13, 1, 2048, false, 512, true);
+    }
+    add(1, 1, 2051);
+    add(4, 1, 2051);
+    add(8, 1, 8192);
+    add(9, 1, 8192);
+    add(65, 1, 2051, false, 17, true);
+    add(256, 1, 2051);
+    add(257, 1, 8192);
+    add(6, 8, 32771, true, 512, true);
+    add(3, 2, 2052, true, 0, true);
+    const std::string format = kv_cache_storage_name(storage);
+    const std::string prefix = "sparse_gqa_h24_4/" + format + "/";
+    const auto special       = [&](std::string id, auto run, const char* execution = "eager") {
+        suite.add(prefix + id, std::move(run), {{"format", format}, {"execution", execution}});
+    };
+    special("capacity", [=] {
+        const int sms = cuda_environment().context.multiprocessor_count();
+        int failures  = 0;
+        for (int b : {1, 8})
+            for (unsigned bound : {64u, 2051u, 262144u}) {
+                std::size_t maximum = 0;
+                for (int t = 1; t <= 257; ++t)
+                    maximum = std::max(maximum, ops::qsa_sparse_gqa_workspace_capacity_bytes(
+                                                    storage, 24, 4, t, t, b, {bound}, sms));
+                failures += maximum != ops::qsa_sparse_gqa_workspace_capacity_bytes(
+                                           storage, 24, 4, 1, 257, b, {bound}, sms);
+            }
+        return failures;
+    });
+    special(
+        "metadata_update",
+        [=] { return graph_update(cuda_environment().context, 33, 8, storage, true, 24, 4); },
+        "graph");
+    special("gate_rounding", [=] {
+        return gate_rounding(cuda_environment().context, storage, 1, 1, 24, 4) +
+               gate_rounding(cuda_environment().context, storage, 256, 8192, 24, 4);
+    });
+    special("read_footprint",
+            [=] { return read_footprint(cuda_environment().context, storage, true, 4, 24, 4); });
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -587,6 +635,9 @@ int main(int argc, char** argv) {
         add_cases(suite, storage);
         add_local_cases(suite, storage);
     }
+#if NINFER_TARGET_RTX5090
     add_four_head_cases(suite);
+    add_four_head_storage_cases(suite, KvCacheStorage::BFloat16);
+#endif
     return suite.main(argc, argv);
 }

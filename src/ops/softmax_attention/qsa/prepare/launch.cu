@@ -104,10 +104,11 @@ template <KvCacheStorage Storage, bool BoundedPhase, bool VectorWeights, int KvH
 void submit(const PrepareArguments& args, PreparePlan plan, cudaStream_t stream) {
     constexpr int groups = PrepareGeometry<KvHeads, Queries>::groups;
     const auto launch    = [&]<bool TokenMajor>() {
-        const dim3 grid = TokenMajor ? dim3(args.tokens * groups, args.batch)
-                                        : dim3(args.tokens, args.batch, groups);
-        prepare_kernel<Storage, BoundedPhase, VectorWeights, TokenMajor, KvHeads, Queries>
-            <<<grid, 128, 0, stream>>>(args);
+        const dim3 grid          = TokenMajor ? dim3(args.tokens * groups, args.batch)
+                                                 : dim3(args.tokens, args.batch, groups);
+        constexpr bool vector_kv = KvHeads == 4 || (NINFER_TARGET_RTX5090 && KvHeads == 2);
+        prepare_kernel<Storage, BoundedPhase, VectorWeights, TokenMajor, KvHeads, Queries,
+                          vector_kv><<<grid, 128, 0, stream>>>(args);
     };
     if constexpr (!Queries && KvHeads != 4)
         launch.template operator()<true>();

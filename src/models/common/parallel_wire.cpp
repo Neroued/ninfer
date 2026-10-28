@@ -51,6 +51,26 @@ TokenCounts decode_token_counts(Decoder& in) {
     }
 }
 
+void encode_expert_partitions(Encoder& out, std::span<const ExpertPartition> partitions) {
+    out.u64(partitions.size());
+    for (const auto& bank : partitions) {
+        out.u32(bank.intermediate.begin);
+        out.u32(bank.intermediate.size);
+        out.u64(bank.ids.size());
+        for (auto id : bank.ids) out.u32(id);
+    }
+}
+
+std::vector<ExpertPartition> decode_expert_partitions(Decoder& in) {
+    std::vector<ExpertPartition> partitions(in.count(16));
+    for (auto& bank : partitions) {
+        bank.intermediate = {in.u32(), in.u32()};
+        bank.ids.resize(in.count(4));
+        for (auto& id : bank.ids) id = in.u32();
+    }
+    return partitions;
+}
+
 void encode_assemblies(Encoder& out, std::span<const ParameterAssembly> assemblies) {
     out.u64(assemblies.size());
     for (const auto& a : assemblies) {

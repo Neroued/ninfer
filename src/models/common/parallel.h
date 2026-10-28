@@ -11,6 +11,12 @@ struct IndexRange {
     friend bool operator==(IndexRange, IndexRange) = default;
 };
 
+// Global expert IDs; intermediate selects matching gate/up rows and down columns.
+struct ExpertPartition {
+    std::vector<std::uint32_t> ids;
+    IndexRange intermediate;
+};
+
 [[nodiscard]] IndexRange partition_range(std::uint32_t total, std::uint32_t parts,
                                          std::uint32_t rank);
 

@@ -109,6 +109,109 @@ void selection(QType format, QuantLayout layout, const char* name, const char* e
             "overlapping destination accepted");
 }
 
+void expert_shards(bool nvfp4, std::optional<CudaExecutionView> execution) {
+    // I=640 exercises the 320-row gate/up seam and K=320 down slices. Distinct per-expert
+    // divisors and scale words detect cross-expert or cross-block aliasing.
+    for (const bool down : {false, true}) {
+        Fixture f;
+        const Shape shape = down ? Shape{2, 256, 640} : Shape{2, 1280, 256};
+        const auto g = weight_geometry(nvfp4 ? QType::NVFP4 : QType::FP8_E4M3FN_BLOCK128X128_BF16,
+                                       nvfp4 ? QuantLayout::BatchedBlockScaleK16M128x4
+                                             : QuantLayout::BlockScaleM128K128,
+                                       shape);
+        f.payload.resize(g.bytes);
+        for (std::size_t i = 0; i < f.payload.size(); ++i)
+            f.payload[i] = std::byte((i * 37 + i / 73) % 251);
+        for (std::uint64_t e = 0; e < g.divisor_count; ++e)
+            put_word(f.payload, g.divisor_offset + e * 4, std::bit_cast<std::uint32_t>(2.5F + e),
+                     4);
+        f.root["components"] = {{"text", {{"config", Json::object()}}}};
+        f.root["objects"]    = Json::array(
+            {{{"id", "source"},
+                 {"kind", "tensor"},
+                 {"shape", shape},
+                 {"format", nvfp4 ? "nvfp4" : "fp8_e4m3fn_block128x128_bf16"},
+                 {"layout", nvfp4 ? "batched_block_scale_k16_m128x4_v1" : "block_scale_m128_k128_v1"},
+                 {"offset", 0},
+                 {"bytes", g.bytes}}});
+        f.root["bindings"] = {{"source", {{"object", "source"}}}};
+        f.root["uses"]     = Json::array();
+        f.root["files"]    = Json::array({{{"path", nullptr}, {"payload_bytes", g.bytes}}});
+        f.write();
+        Reader reader(f.entry);
+        const auto object = reader.find("source");
+        if (nvfp4 && !down) {
+            const std::array mixed_divisors{MatrixSlice{object, 0, 0, 320, 256, 0, 0},
+                                            MatrixSlice{object, 1920, 0, 320, 256, 320, 0}};
+            rejects([&] { (void)slice_tensor(reader, Shape{640, 256}, mixed_divisors); },
+                    "NVFP4 assembly accepted different expert divisors in one matrix");
+        }
+        for (std::uint64_t rank = 0; rank < 2; ++rank) {
+            std::vector<MatrixSlice> slices;
+            for (std::uint64_t e = 0; e < 2; ++e) {
+                if (down)
+                    slices.push_back({object, e * 256, rank * 320, 256, 320, e * 256, 0});
+                else
+                    for (std::uint64_t half = 0; half < 2; ++half)
+                        slices.push_back({object, e * 1280 + half * 640 + rank * 320, 0, 320, 256,
+                                          e * 640 + half * 320, 0});
+            }
+            const auto tensor =
+                slice_tensor(reader, down ? Shape{2, 256, 320} : Shape{2, 640, 256}, slices);
+            require(nvfp4 || tensor.geometry.format == QType::FP8_E4M3FN_BLOCK64X64_BF16,
+                    "FP8 slice did not refine its scale blocks");
+            std::vector<TensorRequest> requests{{tensor, Device::cpu()}};
+            if (execution) requests.push_back({tensor, execution->device()});
+            auto plan          = plan_materialization(reader, requests);
+            const auto id      = plan.requests[0];
+            auto backing       = materialize(reader, std::move(plan), execution);
+            const auto& parent = backing.parent(id, Device::cpu());
+            const auto& d      = parent.geometry;
+            const auto equal   = [&](std::uint64_t destination, std::uint64_t source,
+                                   std::size_t bytes) {
+                require(std::memcmp(parent.data + destination, f.payload.data() + source, bytes) ==
+                              0,
+                          "expert shard changed represented codes/scales/divisors");
+            };
+            const auto scale = [](const WeightGeometry& g, std::uint64_t row,
+                                  std::uint64_t column) {
+                if (g.format == QType::NVFP4) {
+                    const auto group = column / 16;
+                    return g.scale_offset + (row / 128 * (g.shape.back() / 64) + group / 4) * 512 +
+                           row % 32 * 16 + row % 128 / 32 * 4 + group % 4;
+                }
+                const auto block = g.format == QType::FP8_E4M3FN_BLOCK64X64_BF16 ? 64U : 128U;
+                return g.scale_offset +
+                       (row / block * (g.shape.back() / block) + column / block) * 2;
+            };
+            const auto word_divisor = nvfp4 ? 2U : 1U;
+            for (std::uint64_t row = 0; row < d.elements / d.shape.back(); ++row) {
+                const auto source_row =
+                    down ? row : row / 640 * 1280 + row % 640 / 320 * 640 + row % 320 + rank * 320;
+                const auto column = down ? rank * 320 : 0;
+                equal(row * d.code_bytes_per_row,
+                      source_row * g.code_bytes_per_row + column / word_divisor,
+                      d.shape.back() / word_divisor);
+                for (std::uint64_t k = 0; k < d.shape.back(); k += nvfp4 ? 16 : 64)
+                    equal(scale(d, row, k), scale(g, source_row, column + k), nvfp4 ? 1 : 2);
+            }
+            if (nvfp4) {
+                for (std::uint64_t e = 0; e < 2; ++e) {
+                    equal(d.divisor_offset + e * 4, g.divisor_offset + e * 4, 4);
+                    require(parent.weight_divisors[e] == 2.5F + e, "local expert divisor differs");
+                }
+            }
+            if (execution) {
+                std::vector<std::byte> actual(d.bytes);
+                CUDA_CHECK(cudaMemcpy(actual.data(), backing.parent(id, execution->device()).data,
+                                      actual.size(), cudaMemcpyDeviceToHost));
+                require(std::memcmp(actual.data(), parent.data, d.bytes) == 0,
+                        "expert shard GPU upload differs");
+            }
+        }
+    }
+}
+
 void assembly_and_padding(std::optional<CudaExecutionView> execution) {
     Fixture f;
     f.payload.assign(192, std::byte{});
@@ -177,6 +280,8 @@ void assembly_and_padding(std::optional<CudaExecutionView> execution) {
 
 void encoded_slice_checks(std::optional<CudaExecutionView> execution) {
     assembly_and_padding(execution);
+    expert_shards(true, execution);
+    expert_shards(false, execution);
     selection(QType::BF16, QuantLayout::Contiguous, "bf16", "contiguous_le_v1", execution);
     selection(QType::Q4_G64_FP16, QuantLayout::RowSplit, "q4_g64_fp16", "row_split_k128_v1",
               execution);

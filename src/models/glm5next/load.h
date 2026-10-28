@@ -18,6 +18,10 @@ public:
 
     [[nodiscard]] const RankPlan& rank_plan() const { return rank_; }
 
+    [[nodiscard]] std::span<const moe::ExpertDescription> expert_data() const {
+        return selection_.expert_descriptions;
+    }
+
     [[nodiscard]] const artifact::MaterializationPlan& materialization() const {
         return materialization_;
     }

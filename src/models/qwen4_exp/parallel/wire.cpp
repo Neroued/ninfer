@@ -22,16 +22,13 @@ void encode_rank_load(Encoder& out, const RankLoadRequest& request) {
     const auto& p = request.rank;
     out.u32(p.rank);
     out.u32(p.size);
+    out.u32(p.ep_size);
     out.u8(static_cast<std::uint8_t>(p.ple_placement));
     for (auto r : {p.gdn_keys, p.gdn_values, p.qsa_queries, p.qsa_kv, p.vocabulary, p.ple_shards})
         range(out, r);
     out.u32(p.shared_intermediate);
     encode_assemblies(out, p.assemblies);
-    out.u64(p.experts.size());
-    for (const auto& bank : p.experts) {
-        out.u64(bank.size());
-        for (auto e : bank) out.u32(e);
-    }
+    encode_expert_partitions(out, p.experts);
     encode_rank_options(out, request.options);
     out.u64(request.host_reservation_bytes);
     out.boolean(request.control_owner);
@@ -41,23 +38,20 @@ RankLoadRequest decode_rank_load(Decoder& in) {
     RankLoadRequest request;
     const auto artifact = in.raw(request.artifact.size());
     std::copy(artifact.begin(), artifact.end(), request.artifact.begin());
-    auto& p               = request.rank;
-    p.rank                = in.u32();
-    p.size                = in.u32();
-    p.ple_placement       = static_cast<ple::Placement>(in.u8());
-    p.gdn_keys            = range(in);
-    p.gdn_values          = range(in);
-    p.qsa_queries         = range(in);
-    p.qsa_kv              = range(in);
-    p.vocabulary          = range(in);
-    p.ple_shards          = range(in);
-    p.shared_intermediate = in.u32();
-    p.assemblies          = decode_assemblies(in);
-    p.experts.resize(in.count(8));
-    for (auto& bank : p.experts) {
-        bank.resize(in.count(4));
-        for (auto& e : bank) e = in.u32();
-    }
+    auto& p                        = request.rank;
+    p.rank                         = in.u32();
+    p.size                         = in.u32();
+    p.ep_size                      = in.u32();
+    p.ple_placement                = static_cast<ple::Placement>(in.u8());
+    p.gdn_keys                     = range(in);
+    p.gdn_values                   = range(in);
+    p.qsa_queries                  = range(in);
+    p.qsa_kv                       = range(in);
+    p.vocabulary                   = range(in);
+    p.ple_shards                   = range(in);
+    p.shared_intermediate          = in.u32();
+    p.assemblies                   = decode_assemblies(in);
+    p.experts                      = decode_expert_partitions(in);
     request.options                = decode_rank_options(in);
     request.host_reservation_bytes = in.u64();
     request.control_owner          = in.boolean();

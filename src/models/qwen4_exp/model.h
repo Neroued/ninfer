@@ -33,6 +33,10 @@ public:
 
     [[nodiscard]] std::span<const ExpertBankSource> expert_banks() const { return banks_; }
 
+    [[nodiscard]] std::span<const moe::ExpertDescription> expert_data() const {
+        return expert_descriptions_;
+    }
+
     [[nodiscard]] const artifact::MaterializationStats& storage_stats() const {
         return backing_.stats();
     }
@@ -60,6 +64,7 @@ private:
     std::vector<BoundWeight> bound_;
     std::vector<ExpertBankSource> banks_;
     RankPlan rank_;
+    std::vector<moe::ExpertDescription> expert_descriptions_;
     std::vector<WeightParent> local_parents_;
     std::vector<moe::ResidentExpertBank> local_banks_;
 };

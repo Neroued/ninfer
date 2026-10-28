@@ -6,8 +6,9 @@ namespace ninfer::models::glm5next::execution {
 namespace {
 class Describe {
 public:
-    Describe(const ModelDefinition& definition, std::span<const BoundWeight> weights)
-        : definition_(definition), weights_(weights) {}
+    Describe(const ModelDefinition& definition, std::span<const BoundWeight> weights,
+             std::span<const moe::ExpertDescription> experts)
+        : definition_(definition), weights_(weights), experts_(experts) {}
 
     ops::LinearProfile linear(std::initializer_list<WeightId> ids) const {
         std::vector<ops::WeightInput> inputs;
@@ -58,14 +59,13 @@ public:
 
     MoeProfile moe(const MoeWeights& w) const {
         const auto& c    = definition_.config().text;
-        const auto& bank = definition_.expert_banks()[w.bank.index];
+        const auto& bank = experts_[w.bank.index];
         ops::ExpertInputUsage gate_up, down;
         gate_up.include(weight_input(weights_, w.gate));
         gate_up.include(weight_input(weights_, w.up));
         down.include(weight_input(weights_, w.down));
         auto routed =
-            ops::routed_swiglu_profile(bank.gate_up.layout, bank.down.layout,
-                                       dimension(c.moe.top_k), gate_up.policy(), down.policy());
+            moe::describe_experts(bank, dimension(c.moe.top_k), gate_up.policy(), down.policy());
         routed.ffn.clamp_limit = c.swiglu_limit;
         // GLM's current routing semantics select globally, without a preliminary group filter.
         if (c.moe.groups != 1 || c.moe.selected_groups != 1)
@@ -76,8 +76,9 @@ public:
                  routed,
                  dense(w.shared, c.swiglu_limit).math},
                 w.bank,
-                {gate_up.activation_divisor(bank.gate_up.layout.format),
-                 down.activation_divisor(bank.down.layout.format)}};
+                {gate_up.activation_divisor(bank.gate_up.format),
+                 down.activation_divisor(bank.down.format)},
+                bank.subset};
     }
 
     BlockProfile block(const BlockWeights& w) const {
@@ -106,12 +107,16 @@ public:
 private:
     const ModelDefinition& definition_;
     std::span<const BoundWeight> weights_;
+    std::span<const moe::ExpertDescription> experts_;
 };
 } // namespace
 
 std::shared_ptr<const ModelProfile> describe_model(const ModelDefinition& definition,
                                                    std::span<const BoundWeight> weights,
+                                                   std::span<const moe::ExpertDescription> experts,
                                                    const RankPlan& rank) {
+    if (experts.size() != definition.expert_banks().size())
+        throw std::invalid_argument("GLM5Next local expert descriptions are incomplete");
     auto out                 = std::make_shared<ModelProfile>();
     out->config              = definition.config();
     out->options             = definition.options();
@@ -125,7 +130,7 @@ std::shared_ptr<const ModelProfile> describe_model(const ModelDefinition& defini
     out->control_token_limit = definition.resources().text.control_tokens->size();
     const auto& c            = out->config.text;
     const auto& w            = definition.weights();
-    const Describe d(definition, weights);
+    const Describe d(definition, weights, experts);
     out->text.mhc            = {dimension(c.hidden), dimension(c.mhc.streams)};
     out->text.mhc_parameters = {c.norm_epsilon, c.norm_epsilon,
                                 c.mhc.epsilon,  c.mhc.epsilon,

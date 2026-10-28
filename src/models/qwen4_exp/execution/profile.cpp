@@ -10,8 +10,9 @@ namespace ninfer::models::qwen4_exp::execution {
 namespace {
 class Describe {
 public:
-    Describe(const ModelDefinition& source, std::span<const BoundWeight> weights)
-        : source_(source), weights_(weights) {}
+    Describe(const ModelDefinition& source, std::span<const BoundWeight> weights,
+             std::span<const moe::ExpertDescription> experts)
+        : source_(source), weights_(weights), experts_(experts) {}
 
     ops::WeightInput input(WeightId id) const { return weight_input(weights_, id); }
 
@@ -79,24 +80,33 @@ public:
         gu.include(input(m.gate));
         gu.include(input(m.up));
         down.include(input(m.down));
-        out.moe = {
-            {ops::routed_swiglu_profile(bank.gate_up.layout, bank.down.layout,
-                                        source_.config().text.moe.top_k, gu.policy(),
-                                        down.policy()),
-             ops::swiglu_profile(linear({m.shared_gate, m.shared_up}), linear({m.shared_down}))},
-            m.bank,
-            {gu.activation_divisor(bank.gate_up.layout.format),
-             down.activation_divisor(bank.down.layout.format)}};
+        const auto routed =
+            experts_.empty()
+                ? ops::routed_swiglu_profile(bank.gate_up.layout, bank.down.layout,
+                                             source_.config().text.moe.top_k, gu.policy(),
+                                             down.policy())
+                : moe::describe_experts(experts_[m.bank.index], source_.config().text.moe.top_k,
+                                        gu.policy(), down.policy());
+        out.moe = {{routed, ops::swiglu_profile(linear({m.shared_gate, m.shared_up}),
+                                                linear({m.shared_down}))},
+                   m.bank,
+                   {gu.activation_divisor(routed.ffn.gate_up_type),
+                    down.activation_divisor(routed.ffn.down_type)},
+                   experts_.empty() ? ops::ExpertSubsetKind::All : experts_[m.bank.index].subset};
         return out;
     }
 private:
     const ModelDefinition& source_;
     std::span<const BoundWeight> weights_;
+    std::span<const moe::ExpertDescription> experts_;
 };
 
 std::shared_ptr<const ModelProfile> describe(const ModelDefinition& source,
                                              std::span<const BoundWeight> weights,
+                                             std::span<const moe::ExpertDescription> experts,
                                              const RankPlan& rank) {
+    if (rank.size > 1 && experts.size() != source.expert_banks().size())
+        throw std::invalid_argument("Qwen4Exp local expert descriptions are incomplete");
     auto out                   = std::make_shared<ModelProfile>();
     out->config                = source.config();
     out->options               = source.options();
@@ -113,7 +123,7 @@ std::shared_ptr<const ModelProfile> describe(const ModelDefinition& source,
     out->local.qsa.kv_heads    = rank.qsa_kv.size;
     out->public_tokens         = source.resources().text.public_token_count;
     out->control_token_limit   = source.resources().text.control_tokens->size();
-    const Describe d(source, weights);
+    const Describe d(source, weights, experts);
     const auto& w = source.weights();
     for (const auto& layer : w.text.layers) out->text.layers.push_back(d.block(layer, false));
     out->text.final_hc = d.final_hc(w.text.final_hc);
@@ -127,21 +137,23 @@ std::shared_ptr<const ModelProfile> describe(const ModelDefinition& source,
     if (w.vision)
         out->vision = qwen::describe_vision(*w.vision,
                                             [&](WeightId id) { return weight_input(weights, id); });
-    for (const auto& b : source.expert_banks())
-        out->banks.push_back({b.gate_up.layout, b.down.layout});
+    if (rank.size == 1)
+        for (const auto& b : source.expert_banks())
+            out->banks.push_back({b.gate_up.layout, b.down.layout});
     return out;
 }
 
 } // namespace
 
 std::shared_ptr<const ModelProfile> describe_model(const ModelDefinition& source) {
-    return describe(source, source.weight_data(), plan_single_rank(source));
+    return describe(source, source.weight_data(), {}, plan_single_rank(source));
 }
 
 std::shared_ptr<const ModelProfile> describe_model(const ModelDefinition& source,
                                                    std::span<const BoundWeight> weights,
+                                                   std::span<const moe::ExpertDescription> experts,
                                                    const RankPlan& rank) {
-    return describe(source, weights, rank);
+    return describe(source, weights, experts, rank);
 }
 
 std::size_t qsa_projection_workspace_bytes(const QsaProfile& p, std::int32_t first,

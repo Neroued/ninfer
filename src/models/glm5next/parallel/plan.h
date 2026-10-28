@@ -7,10 +7,10 @@
 namespace ninfer::models::glm5next {
 
 struct RankPlan {
-    std::uint32_t rank = 0, size = 1;
+    std::uint32_t rank = 0, size = 1, ep_size = 1;
     IndexRange kda_heads, vocabulary, dense_intermediate, shared_intermediate;
     std::vector<ParameterAssembly> assemblies;
-    std::vector<std::vector<std::uint32_t>> experts;
+    std::vector<ExpertPartition> experts;
 };
 
 struct ParallelPlan {

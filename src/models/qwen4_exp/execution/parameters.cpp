@@ -81,7 +81,7 @@ public:
         out.moe.shared = {linear({m.shared_gate, m.shared_up}), linear({m.shared_down})};
         if (const auto* bank = model_.resident_experts(m.bank)) {
             out.moe.resident = bank->view();
-            out.moe.subset   = {ops::ExpertSubsetKind::MaskOnes, bank->mask()};
+            out.moe.subset   = bank->subset();
         } else {
             const auto& source = model_.expert_banks()[m.bank.index];
             if (source.gate_up.parent->device.type() == DeviceType::CUDA)

@@ -36,8 +36,8 @@ struct EncodedTensor {
 };
 
 [[nodiscard]] EncodedTensor whole_tensor(const Reader&, ObjectHandle);
-// Slices preserve the source encoding and cover the destination exactly. The compiler derives
-// the destination layout and checks encoded block and divisor boundaries.
+// Slices preserve represented values and cover the destination exactly. The compiler repacks
+// scale tiles, refines block-FP8 scales when needed, and preserves matrix divisor domains.
 [[nodiscard]] EncodedTensor slice_tensor(const Reader&, std::span<const std::uint64_t> shape,
                                          std::span<const MatrixSlice>);
 

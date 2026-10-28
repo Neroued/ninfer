@@ -31,6 +31,7 @@ struct MoeProfile {
     ops::SigmoidMoeProfile math;
     ExpertBankId bank;
     ops::ExpertActivationDivisors activation_divisors;
+    ops::ExpertSubsetKind subset = ops::ExpertSubsetKind::All;
 };
 
 struct BlockProfile {
@@ -78,6 +79,7 @@ struct ModelProfile {
 };
 
 [[nodiscard]] std::shared_ptr<const ModelProfile>
-describe_model(const ModelDefinition&, std::span<const BoundWeight>, const RankPlan&);
+describe_model(const ModelDefinition&, std::span<const BoundWeight>,
+               std::span<const moe::ExpertDescription>, const RankPlan&);
 
 } // namespace ninfer::models::glm5next::execution

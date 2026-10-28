@@ -57,19 +57,11 @@ std::unique_ptr<ModelShard> materialize_model(ResolvedLoadPlan&& plan, DeviceCon
     out->parents_.reserve(parent_count);
     for (std::size_t i = 0; i < parent_count; ++i)
         out->parents_.push_back(out->backing_.parent({i}, device.device()));
-    out->weights_     = bind_selected_weights(out->definition_->weight_data(), plan.selection_,
-                                              requests, out->parents_);
-    const auto parent = [&](std::size_t request) -> const WeightParent& {
-        return out->parents_.at(requests.at(request).index);
-    };
-    for (const auto& bank : plan.selection_.experts) {
-        std::vector<moe::ResidentExpertEntry> entries;
-        entries.reserve(bank.entries.size());
-        for (const auto& e : bank.entries)
-            entries.push_back({e.expert, &parent(e.gate_up), &parent(e.down)});
-        out->experts_.emplace_back(entries, out->definition_->config().text.moe.experts,
-                                   device.device());
-    }
+    out->weights_ = bind_selected_weights(out->definition_->weight_data(), plan.selection_,
+                                          requests, out->parents_);
+    out->experts_ =
+        bind_selected_experts(plan.selection_, requests, out->parents_, device.device());
+    out->expert_descriptions_ = std::move(plan.selection_.expert_descriptions);
     return out;
 }
 

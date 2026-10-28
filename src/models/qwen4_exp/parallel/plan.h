@@ -7,12 +7,12 @@
 namespace ninfer::models::qwen4_exp {
 
 struct RankPlan {
-    std::uint32_t rank = 0, size = 1;
+    std::uint32_t rank = 0, size = 1, ep_size = 1;
     ple::Placement ple_placement = ple::Placement::Disk;
     IndexRange gdn_keys, gdn_values, qsa_queries, qsa_kv, vocabulary, ple_shards;
     std::uint32_t shared_intermediate = 0;
     std::vector<ParameterAssembly> assemblies;
-    std::vector<std::vector<std::uint32_t>> experts;
+    std::vector<ExpertPartition> experts;
 };
 
 struct ParallelPlan {

@@ -86,7 +86,7 @@ private:
 };
 
 [[nodiscard]] std::string prefill_signature(const ModelDefinition&, std::uint32_t chunk,
-                                            std::uint32_t ranks);
+                                            std::uint32_t ranks, std::uint32_t ep_size);
 
 [[nodiscard]] Frontend create_frontend(const ModelDefinition&, const EngineOptions&);
 

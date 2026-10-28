@@ -22,6 +22,12 @@ public:
         return descriptions_.empty() ? definition_->weight_data() : descriptions_;
     }
 
+    [[nodiscard]] std::span<const moe::ExpertDescription> expert_data() const {
+        return selection_ ? std::span<const moe::ExpertDescription>(
+                                selection_->weights.expert_descriptions)
+                          : std::span<const moe::ExpertDescription>{};
+    }
+
     [[nodiscard]] const artifact::MaterializationPlan& materialization() const {
         return materialization_;
     }

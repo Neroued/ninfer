@@ -85,13 +85,9 @@ std::unique_ptr<ModelShard> materialize_model(ResolvedLoadPlan&& plan, DeviceCon
         const auto parent = [&](std::size_t request) -> const WeightParent& {
             return out->local_parents_.at(requests.at(request).index);
         };
-        for (const auto& bank : plan.selection_->weights.experts) {
-            std::vector<moe::ResidentExpertEntry> entries;
-            for (const auto& e : bank.entries)
-                entries.push_back({e.expert, &parent(e.gate_up), &parent(e.down)});
-            out->local_banks_.emplace_back(entries, definition->config().text.moe.experts,
-                                           device.device());
-        }
+        out->local_banks_         = bind_selected_experts(plan.selection_->weights, requests,
+                                                          out->local_parents_, device.device());
+        out->expert_descriptions_ = std::move(plan.selection_->weights.expert_descriptions);
         auto& table = out->ple_.emplace<DevicePleTable>();
         table.decode =
             DeviceBuffer(device.device(), plan.selection_->ple.size() * sizeof(Nf4Bf16Lut));

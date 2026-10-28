@@ -72,6 +72,7 @@ std::vector<RankMemoryBudget> ParallelStartup::memory_budgets() const {
 }
 
 std::string ParallelStartup::prefill_signature(std::uint32_t chunk) const {
-    return glm5next::prefill_signature(*definition_, chunk, parallel_.ranks.size());
+    return glm5next::prefill_signature(*definition_, chunk, parallel_.ranks.size(),
+                                       parallel_.ranks.front().ep_size);
 }
 } // namespace ninfer::models::glm5next

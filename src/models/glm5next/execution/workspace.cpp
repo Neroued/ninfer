@@ -77,7 +77,7 @@ std::size_t body(const ModelProfile& p, const ExecutionShape& s, int first, int 
         }
         mla(a, p, p.mtp->attention, s, first, last, batch, sm_count, false, true);
         scratch(a, ops::topk_sigmoid_swiglu_moe_workspace_capacity_bytes(
-                       p.mtp->moe.math, ops::ExpertSubsetKind::MaskOnes, minimum, columns));
+                       p.mtp->moe.math, p.mtp->moe.subset, minimum, columns));
         return a.peak_bytes();
     }
     (void)workspace::roots(a, p.config.text, columns);
@@ -119,8 +119,8 @@ std::size_t body(const ModelProfile& p, const ExecutionShape& s, int first, int 
             scratch(a, ops::swiglu_workspace_capacity_bytes(d->math, minimum, columns));
         else
             scratch(a, ops::topk_sigmoid_swiglu_moe_workspace_capacity_bytes(
-                           std::get<MoeProfile>(layer.ffn).math, ops::ExpertSubsetKind::MaskOnes,
-                           minimum, columns));
+                           std::get<MoeProfile>(layer.ffn).math,
+                           std::get<MoeProfile>(layer.ffn).subset, minimum, columns));
     }
     return a.peak_bytes();
 }

@@ -20,9 +20,9 @@ RankPreparation::RankPreparation(const artifact::Reader& reader, std::span<const
     auto request = decode_rank_load(in);
     in.finish();
     if (request.rank.rank != identity.rank || request.rank.size != identity.tp.size ||
-        identity.tp.rank != identity.rank || identity.ep.size != request.rank.size ||
-        identity.ep.rank != identity.rank || identity.dp.size != 1 || identity.pp.size != 1 ||
-        identity.adp.size != 1)
+        identity.tp.rank != identity.rank || identity.ep.size != request.rank.ep_size ||
+        identity.ep.rank != (request.rank.ep_size == 1 ? 0U : request.rank.rank) ||
+        identity.dp.size != 1 || identity.pp.size != 1 || identity.adp.size != 1)
         throw std::invalid_argument("Qwen4Exp rank plan differs from worker identity");
     if (request.artifact != reader.artifact_id())
         throw artifact::ArtifactError("Qwen4Exp worker artifact differs from coordinator");
@@ -32,8 +32,8 @@ RankPreparation::RankPreparation(const artifact::Reader& reader, std::span<const
     auto definition         = read_definition(reader, models::load_options(options_));
     load_.emplace(resolve_rank_load(reader, std::move(definition), std::move(request.rank),
                                     device_.device()));
-    profile_ =
-        execution::describe_model(load_->definition(), load_->weight_data(), load_->rank_plan());
+    profile_       = execution::describe_model(load_->definition(), load_->weight_data(),
+                                               load_->expert_data(), load_->rank_plan());
     capacity_plan_ = describe_execution_capacity(profile_, options_, device_);
     const WorkContract contract{describe_execution_shape(*profile_, options_),
                                 profile_->config.text.vocabulary,

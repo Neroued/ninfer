@@ -17,7 +17,7 @@ using test::artifact_fixture::require;
 constexpr std::size_t GiB = 1024ULL * 1024 * 1024;
 
 void rank_loading(const artifact::Reader& reader, DeviceContext& device, std::uint32_t rank,
-                  bool load) {
+                  bool load, std::uint32_t ep) {
     EngineOptions options;
     options.use_cuda_graph   = false;
     options.enable_vision    = true;
@@ -30,14 +30,15 @@ void rank_loading(const artifact::Reader& reader, DeviceContext& device, std::ui
     auto definition     = q4::read_definition(reader, models::load_options(options));
     DeploymentOptions deployment;
     deployment.control_host = "127.0.0.1";
-    deployment.parallel     = {2, 2, 1, 1};
+    deployment.parallel     = {2, ep, 1, 1};
     deployment.nodes        = {{0, {}, "/worker", "/model.ninfer", {}},
                                {1, "rank1", "/worker", "/model.ninfer", {}}};
     deployment.ranks        = {{0, 0, 0}, {1, 1, 0}};
     const auto parallel     = q4::plan_parallel(*definition, deployment);
     const auto& r           = parallel.ranks.at(rank);
     auto selected           = q4::resolve_rank_load(reader, definition, r, device.device());
-    auto profile            = q4::execution::describe_model(*definition, selected.weight_data(), r);
+    auto profile            = q4::execution::describe_model(*definition, selected.weight_data(),
+                                                            selected.expert_data(), r);
     const auto& g           = std::get<q4::execution::GdnProfile>(profile->text.layers[0].mixer);
     require(g.output.n == 2560 && g.output.k == 3072 && profile->local.gdn.key_heads == 8 &&
                 profile->local.gdn.value_heads == 24 && profile->local.qsa.query_heads == 12 &&
@@ -47,12 +48,19 @@ void rank_loading(const artifact::Reader& reader, DeviceContext& device, std::ui
     for (std::size_t b = 0; b < r.experts.size(); ++b) {
         std::vector<int> owners(512);
         for (const auto& p : parallel.ranks) {
-            require(p.experts[b].size() == 256, "EP partition size");
-            for (const auto e : p.experts[b]) ++owners.at(e);
+            require(p.experts[b].ids.size() == 512 / ep, "expert partition size");
+            for (const auto e : p.experts[b].ids) ++owners.at(e);
         }
-        require(std::all_of(owners.begin(), owners.end(), [](int n) { return n == 1; }),
-                "EP coverage");
+        require(std::all_of(owners.begin(), owners.end(),
+                            [&](int n) { return n == (ep == 1 ? 2 : 1); }),
+                "expert ID coverage");
     }
+    require(
+        profile->text.layers[0].moe.math.routed.ffn.intermediate == (ep == 1 ? 320 : 640) &&
+            profile->mtp->layer.moe.math.routed.ffn.intermediate == (ep == 1 ? 320 : 640) &&
+            profile->mtp->layer.moe.math.routed.ffn.gate_up_type ==
+                (ep == 1 ? QType::FP8_E4M3FN_BLOCK64X64_BF16 : QType::FP8_E4M3FN_BLOCK128X128_BF16),
+        "local expert geometry or FP8 refinement differs");
     const auto weight_bytes = selected.materialization().device_capacity_bytes;
     auto plan               = q4::plan_execution(profile, {}, options, device, 16 * GiB);
     require(plan && !plan->ple_prepare_bytes && !plan->ple_upload.device_bytes &&
@@ -72,17 +80,28 @@ void rank_loading(const artifact::Reader& reader, DeviceContext& device, std::ui
         const auto* bank = model->resident_experts({static_cast<std::uint32_t>(b)});
         require(bank && bank->view().count == 512, "resident global domain");
         std::vector<std::uint64_t> offsets(512);
-        CUDA_CHECK(cudaMemcpy(offsets.data(), bank->view().gate_up.offsets, offsets.size() * 8,
-                              cudaMemcpyDeviceToHost));
-        for (std::uint32_t e = 0; e < 512; ++e)
-            require((offsets[e] != kExpertAbsentOffset) ==
-                        std::binary_search(r.experts[b].begin(), r.experts[b].end(), e),
-                    "indexed bank ownership");
-        const auto e        = r.experts[b][r.experts[b].size() / 2];
+        if (ep == 2) {
+            CUDA_CHECK(cudaMemcpy(offsets.data(), bank->view().gate_up.offsets, offsets.size() * 8,
+                                  cudaMemcpyDeviceToHost));
+            for (std::uint32_t e = 0; e < 512; ++e)
+                require((offsets[e] != kExpertAbsentOffset) ==
+                            std::binary_search(r.experts[b].ids.begin(), r.experts[b].ids.end(), e),
+                        "indexed bank ownership");
+        } else {
+            require(!bank->view().gate_up.offsets &&
+                        bank->subset().kind == ops::ExpertSubsetKind::All,
+                    "TP expert bank is not affine");
+            for (std::uint32_t e = 0; e < 512; ++e)
+                offsets[e] = e * bank->view().gate_up.code_stride;
+        }
+        const auto e        = r.experts[b].ids[r.experts[b].ids.size() / 2];
         const auto& source  = definition->expert_banks()[b].gate_up;
         const auto& object  = reader.directory().tensor(source.object);
         const auto expected = reader.read_range(
-            object.offset + source.layout.codes.offset + e * source.layout.codes.expert_stride, 64);
+            object.offset + source.layout.codes.offset + e * source.layout.codes.expert_stride +
+                r.experts[b].intermediate.begin * source.layout.codes.expert_bytes /
+                    source.layout.region.rows,
+            64);
         std::array<std::byte, 64> actual;
         CUDA_CHECK(cudaMemcpy(actual.data(), bank->view().gate_up.codes + offsets[e], 64,
                               cudaMemcpyDeviceToHost));
@@ -222,20 +241,24 @@ int main(int argc, char** argv) {
         DeviceContext device;
         bool materialize = false, host = false;
         int rank = -1;
+        std::uint32_t ep = 2;
         for (int i = 2; i < argc; ++i) {
             const std::string_view arg(argv[i]);
             if (arg == "--materialize")
                 materialize = true;
             else if (arg == "--host-experts")
                 host = true;
+            else if (arg == "--ep" && i + 1 < argc)
+                ep = std::stoul(argv[++i]);
             else if (arg == "--rank" && i + 1 < argc)
                 rank = std::stoi(argv[++i]);
             else
-                throw std::invalid_argument("expected --materialize, --host-experts, or --rank N");
+                throw std::invalid_argument(
+                    "expected --materialize, --host-experts, --rank N, or --ep N");
         }
         if (rank >= 0) {
             artifact::Reader reader(argv[1]);
-            rank_loading(reader, device, rank, materialize);
+            rank_loading(reader, device, rank, materialize, ep);
             return 0;
         }
         const auto plan_for = [&](const auto& profile, const auto& geometry,

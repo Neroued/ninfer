@@ -96,11 +96,12 @@ void model_preparation() {
     request.artifact[3]              = std::byte{17};
     request.rank.rank                = 1;
     request.rank.size                = 2;
+    request.rank.ep_size             = 2;
     request.rank.kda_heads           = {32, 32};
     request.rank.vocabulary          = {77440, 77440};
     request.rank.dense_intermediate  = {6144, 6144};
     request.rank.shared_intermediate = {1024, 1024};
-    request.rank.experts             = {{0, 7, 31}, {2, 9}};
+    request.rank.experts             = {{{0, 7, 31}, {0, 2048}}, {{2, 9}, {0, 2048}}};
     request.rank.assemblies          = {
         {{256, 128}, {{{5}, 128, 64, 128, 128, 128, 0}}, {{{5}, {128, 128}, 16384, 32768}}}};
     auto& o                             = request.options;
@@ -132,6 +133,9 @@ void model_preparation() {
     q::RankLoadRequest qwen;
     qwen.options         = o;
     qwen.rank.assemblies = request.rank.assemblies;
+    qwen.rank.rank       = 1;
+    qwen.rank.size       = 2;
+    qwen.rank.experts    = {{{0, 1, 2}, {320, 320}}};
     wire::Encoder qw;
     q::encode_rank_load(qw, qwen);
     const auto qb = std::move(qw).take();

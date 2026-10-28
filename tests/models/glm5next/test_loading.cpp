@@ -33,10 +33,10 @@ LoadOptions options(bool mtp, bool vision, bool optimized = false) {
             .proposal_head = optimized ? ProposalHead::Optimized : ProposalHead::Full};
 }
 
-DeploymentOptions deployment() {
+DeploymentOptions deployment(std::uint32_t ep = 2) {
     DeploymentOptions d;
     d.control_host = "127.0.0.1";
-    d.parallel     = {.tp = 2, .ep = 2, .dp = 1, .pp = 1, .adp = 2};
+    d.parallel     = {.tp = 2, .ep = ep, .dp = 1, .pp = 1, .adp = 2};
     d.nodes        = {{0, {}, "/worker", "/model.ninfer", {}},
                       {1, "rank1", "/worker", "/model.ninfer", {}}};
     d.ranks        = {{0, 0, 0}, {1, 1, 0}};
@@ -136,30 +136,43 @@ void selection_and_planning(const std::filesystem::path& directory) {
                 "expert use policy or activation divisor lost");
         source_words(reader, *full, directory);
         layouts(full->weight_data(), w);
-        const auto parallel = glm::plan_parallel(*full, deployment());
-        require(parallel.ranks.size() == 2 && parallel.topology.ranks[1].adp.rank == 1,
-                "ADP topology differs");
-        for (const auto& rank : parallel.ranks) {
-            auto load       = glm::resolve_rank_load(reader, full, rank, Device::cuda(0));
-            const auto data = load.weight_data();
-            require(rank.kda_heads.begin == rank.rank && rank.kda_heads.size == 1 &&
-                        rank.experts.size() == 2 && rank.experts[0] == std::vector{rank.rank} &&
-                        rank.experts[1] == std::vector{rank.rank},
-                    "TP/EP ownership differs");
-            require(data[k.query.index].view.shape == artifact::Shape{64, 128} &&
-                        data[k.convolution.index].view.shape == artifact::Shape{4, 192} &&
-                        data[d.down.index].view.shape == artifact::Shape{128, 128} &&
-                        data[w.text.head.index].view.shape == artifact::Shape{8, 128},
-                    "rank-local weight shapes differ");
-            layouts(data, w);
-            require(data[w.text.embedding.index].view.parts[0].parent ==
-                            data[w.mtp->embedding.index].view.parts[0].parent &&
-                        data[w.text.head.index].view.parts[0].parent ==
-                            data[w.mtp->head.index].view.parts[0].parent,
-                    "Main/MTP sharing duplicated planned storage");
-            for (const auto& weight : data)
-                for (const auto& part : weight.view.parts)
-                    require(!part.parent->data, "planning materialized payload storage");
+        for (const auto ep : {1U, 2U}) {
+            const auto parallel = glm::plan_parallel(*full, deployment(ep));
+            require(parallel.ranks.size() == 2 && parallel.topology.ranks[1].adp.rank == 1,
+                    "ADP topology differs");
+            for (const auto& rank : parallel.ranks) {
+                auto load       = glm::resolve_rank_load(reader, full, rank, Device::cuda(0));
+                const auto data = load.weight_data();
+                require(rank.kda_heads.begin == rank.rank && rank.kda_heads.size == 1 &&
+                            rank.experts.size() == 2 &&
+                            rank.experts[0].ids ==
+                                (ep == 2 ? std::vector{rank.rank} : std::vector{0U, 1U}) &&
+                            rank.experts[1].ids == rank.experts[0].ids,
+                        "TP/EP ownership differs");
+                require(data[k.query.index].view.shape == artifact::Shape{64, 128} &&
+                            data[k.convolution.index].view.shape == artifact::Shape{4, 192} &&
+                            data[d.down.index].view.shape == artifact::Shape{128, 128} &&
+                            data[w.text.head.index].view.shape == artifact::Shape{8, 128},
+                        "rank-local weight shapes differ");
+                const auto local_i = full->config().text.moe.intermediate / (ep == 1 ? 2 : 1);
+                const auto profile =
+                    glm::execution::describe_model(*full, data, load.expert_data(), rank);
+                require(std::get<glm::execution::MoeProfile>(profile->text.layers[1].ffn)
+                                    .math.routed.ffn.intermediate == local_i &&
+                            profile->mtp->moe.math.routed.ffn.intermediate == local_i &&
+                            parallel.topology.ranks[rank.rank].ep.size == ep &&
+                            parallel.topology.ranks[rank.rank].ep.rank == (ep == 1 ? 0 : rank.rank),
+                        "expert TP/EP geometry or rank identity differs");
+                layouts(data, w);
+                require(data[w.text.embedding.index].view.parts[0].parent ==
+                                data[w.mtp->embedding.index].view.parts[0].parent &&
+                            data[w.text.head.index].view.parts[0].parent ==
+                                data[w.mtp->head.index].view.parts[0].parent,
+                        "Main/MTP sharing duplicated planned storage");
+                for (const auto& weight : data)
+                    for (const auto& part : weight.view.parts)
+                        require(!part.parent->data, "planning materialized payload storage");
+            }
         }
     }
     require(full->resources().text.chat_template_jinja == "{{ messages }}" &&
@@ -232,7 +245,7 @@ void matrix_words(const BoundWeight& weight, const Encoded& expected, std::uint6
 }
 
 void materialization(const std::filesystem::path& directory, DeviceContext& device,
-                     std::uint32_t size, std::uint32_t rank, bool optimized) {
+                     std::uint32_t size, std::uint32_t rank, bool optimized, std::uint32_t ep = 2) {
     std::unique_ptr<glm::ModelShard> model;
     std::map<std::size_t, Encoded> expected;
 
@@ -241,6 +254,7 @@ void materialization(const std::filesystem::path& directory, DeviceContext& devi
         bool down;
         std::vector<std::byte> codes, scales;
         float divisor;
+        WeightGeometry geometry;
     };
 
     std::vector<ExpertWords> expert_words;
@@ -248,7 +262,7 @@ void materialization(const std::filesystem::path& directory, DeviceContext& devi
         artifact::Reader reader(directory / "model.ninfer");
         auto definition = glm::read_definition(reader, options(true, true, optimized));
         auto plan       = size == 1 ? glm::plan_single_rank(*definition)
-                                    : glm::plan_parallel(*definition, deployment()).ranks.at(rank);
+                                    : glm::plan_parallel(*definition, deployment(ep)).ranks.at(rank);
         for (std::size_t i = 0; i < definition->parameters().size(); ++i)
             if (definition->parameter({i}).binding.parts.size() == 1)
                 expected.emplace(i, source(reader, *definition, {i}));
@@ -257,7 +271,7 @@ void materialization(const std::filesystem::path& directory, DeviceContext& devi
                 const auto& description = definition->expert_banks()[b];
                 const auto& bank        = down ? description.down : description.gate_up;
                 const auto& object      = reader.directory().tensor(bank.object);
-                for (const auto e : plan.experts[b]) {
+                for (const auto e : plan.experts[b].ids) {
                     const auto codes = reader.read_range(object.offset + bank.layout.codes.offset +
                                                              e * bank.layout.codes.expert_stride,
                                                          bank.layout.codes.expert_bytes);
@@ -265,8 +279,9 @@ void materialization(const std::filesystem::path& directory, DeviceContext& devi
                         reader.read_range(object.offset + bank.layout.scales.offset +
                                               e * bank.layout.scales.expert_stride,
                                           bank.layout.scales.expert_bytes);
-                    expert_words.push_back(
-                        {b, e, down, codes, scales, b == 0 ? 1.0F / (e + 1) : 1.0F});
+                    expert_words.push_back({b, e, down, codes, scales,
+                                            b == 0 ? 1.0F / (e + 1) : 1.0F,
+                                            reader.geometry(bank.object)});
                 }
             }
         }
@@ -275,7 +290,7 @@ void materialization(const std::filesystem::path& directory, DeviceContext& devi
     }
     const auto& w      = model->definition().weights();
     const auto profile = glm::execution::describe_model(model->definition(), model->weight_data(),
-                                                        model->rank_plan());
+                                                        model->expert_data(), model->rank_plan());
     const glm::execution::Parameters parameters(*model, profile);
     const auto& prepared_kda =
         std::get<glm::execution::KdaParameters>(parameters.text.layers[0].mixer);
@@ -346,18 +361,54 @@ void materialization(const std::filesystem::path& directory, DeviceContext& devi
         const auto& bank = model->experts({e.bank}).view();
         require(bank.count == 2, "local EP bank lost the global routing domain");
         const auto& matrix = e.down ? bank.down : bank.gate_up;
-        std::array<std::uint64_t, 2> offsets{};
-        CUDA_CHECK(
-            cudaMemcpy(offsets.data(), matrix.offsets, sizeof(offsets), cudaMemcpyDeviceToHost));
-        for (unsigned id = 0; id < 2; ++id)
-            require((offsets[id] != kExpertAbsentOffset) == (size == 1 || id == rank),
-                    "EP global-ID presence differs");
-        std::vector<std::byte> codes(e.codes.size()), scales(e.scales.size());
-        CUDA_CHECK(cudaMemcpy(codes.data(), matrix.codes + offsets[e.expert], codes.size(),
+        const auto& description = model->expert_data()[e.bank];
+        const auto& g           = e.down ? description.down : description.gate_up;
+        const auto rows = g.shape[g.shape.size() - 2], columns = g.shape.back();
+        const auto& src            = e.geometry;
+        std::uint64_t code_offset  = e.expert * matrix.code_stride;
+        std::uint64_t scale_offset = e.expert * matrix.scale_stride;
+        if (matrix.offsets) {
+            std::array<std::uint64_t, 2> offsets{};
+            CUDA_CHECK(cudaMemcpy(offsets.data(), matrix.offsets, sizeof(offsets),
+                                  cudaMemcpyDeviceToHost));
+            for (unsigned id = 0; id < 2; ++id)
+                require((offsets[id] != kExpertAbsentOffset) == (id == rank),
+                        "EP global-ID presence differs");
+            code_offset = scale_offset = offsets[e.expert];
+        }
+        std::vector<std::byte> codes(rows * g.code_bytes_per_row),
+            scales(rows / g.scale_block_rows * g.scale_row_bytes);
+        CUDA_CHECK(cudaMemcpy(codes.data(), matrix.codes + code_offset, codes.size(),
                               cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(scales.data(), matrix.scales + offsets[e.expert], scales.size(),
+        CUDA_CHECK(cudaMemcpy(scales.data(), matrix.scales + scale_offset, scales.size(),
                               cudaMemcpyDeviceToHost));
-        require(codes == e.codes && scales == e.scales, "resident expert encoded planes changed");
+        const auto selected      = model->rank_plan().experts[e.bank].intermediate;
+        const auto original_i    = model->definition().config().text.moe.intermediate;
+        const auto scale_address = [](const WeightGeometry& g, std::uint64_t row,
+                                      std::uint64_t col) {
+            if (g.format == QType::NVFP4)
+                return (row / 128 * (g.shape.back() / 64) + col / 64) * 512 + row % 32 * 16 +
+                       row % 128 / 32 * 4 + col % 64 / 16;
+            return (row / g.scale_block_rows * (g.shape.back() / g.group_size) +
+                    col / g.group_size) *
+                   2;
+        };
+        const auto codes_per_byte = g.format == QType::NVFP4 ? 2 : 1;
+        for (std::uint64_t row = 0; row < rows; ++row) {
+            const auto sr =
+                e.down ? row
+                       : row / selected.size * original_i + row % selected.size + selected.begin;
+            const auto sc = e.down ? selected.begin : 0;
+            require(std::memcmp(codes.data() + row * g.code_bytes_per_row,
+                                e.codes.data() + sr * src.code_bytes_per_row + sc / codes_per_byte,
+                                columns / codes_per_byte) == 0,
+                    "local expert codes differ");
+            for (std::uint64_t col = 0; col < columns; col += g.group_size)
+                require(std::memcmp(scales.data() + scale_address(g, row, col),
+                                    e.scales.data() + scale_address(src, sr, sc + col),
+                                    g.format == QType::NVFP4 ? 1 : 2) == 0,
+                        "local expert scales differ");
+        }
         if (e.bank == 0) {
             float divisor = 0;
             CUDA_CHECK(cudaMemcpy(&divisor, matrix.divisors + e.expert, sizeof(float),
@@ -365,7 +416,8 @@ void materialization(const std::filesystem::path& directory, DeviceContext& devi
             require(divisor == e.divisor, "resident expert divisor lost global-ID addressing");
         }
     }
-    require(model->storage_stats().host_capacity_bytes == 0 && model->metadata_bytes() > 0 &&
+    require(model->storage_stats().host_capacity_bytes == 0 &&
+                (model->metadata_bytes() > 0) == (size > 1 && ep == 2) &&
                 model->definition().resources().text.chat_template_jinja == "{{ messages }}",
             "materialized ownership or retained resource lifetime differs");
 }
@@ -386,6 +438,8 @@ int main(int argc, char** argv) {
             materialization(directory, device, 2, 0, true);
             materialization(directory, device, 2, 1, true);
             materialization(directory, device, 2, 1, false);
+            materialization(directory, device, 2, 0, true, 1);
+            materialization(directory, device, 2, 1, true, 1);
         }
         std::cout << "PASS GLM conversion, binding and rank loading\n";
         return 0;

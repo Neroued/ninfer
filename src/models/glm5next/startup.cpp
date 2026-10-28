@@ -26,14 +26,14 @@ RankPreparation::RankPreparation(const artifact::Reader& reader, RankLoadRequest
     auto definition = read_definition(reader, load_options(options_));
     load_.emplace(
         resolve_rank_load(reader, std::move(definition), std::move(request.rank), device.device()));
-    memory_ = {load_->materialization().device_capacity_bytes,
-               load_->materialization().host_capacity_bytes,
-               options_.context_capacity.automatic_headroom_bytes, request.host_reservation_bytes};
-    auto profile =
-        execution::describe_model(load_->definition(), load_->weight_data(), load_->rank_plan());
-    plan_     = plan_execution(std::move(profile), options_, request.index_format,
-                               device.multiprocessor_count());
-    capacity_ = describe_execution_capacity(plan_);
+    memory_      = {load_->materialization().device_capacity_bytes,
+                    load_->materialization().host_capacity_bytes,
+                    options_.context_capacity.automatic_headroom_bytes, request.host_reservation_bytes};
+    auto profile = execution::describe_model(load_->definition(), load_->weight_data(),
+                                             load_->expert_data(), load_->rank_plan());
+    plan_        = plan_execution(std::move(profile), options_, request.index_format,
+                                  device.multiprocessor_count());
+    capacity_    = describe_execution_capacity(plan_);
 }
 
 RankPreparation::~RankPreparation() = default;
@@ -225,15 +225,16 @@ PreparedSession Startup::session(const RankResourceDescription& rank,
     return prepare_session(definition_, prepare_context(group, {&rank, 1}), interval);
 }
 
-std::string prefill_signature(const ModelDefinition& d, std::uint32_t chunk, std::uint32_t ranks) {
+std::string prefill_signature(const ModelDefinition& d, std::uint32_t chunk, std::uint32_t ranks,
+                              std::uint32_t ep_size) {
     const auto& c = d.config().text;
     return "glm5next:h=" + std::to_string(c.hidden) + ";layers=" + std::to_string(c.layers.size()) +
            ";chunk=" + std::to_string(chunk) + ";tp=" + std::to_string(ranks) +
-           ";ep=" + std::to_string(ranks) + ";adp=" + std::to_string(ranks);
+           ";ep=" + std::to_string(ep_size) + ";adp=" + std::to_string(ranks);
 }
 
 std::string Startup::prefill_signature(std::uint32_t chunk) const {
-    return glm5next::prefill_signature(*definition_, chunk, 1);
+    return glm5next::prefill_signature(*definition_, chunk, 1, 1);
 }
 
 } // namespace ninfer::models::glm5next

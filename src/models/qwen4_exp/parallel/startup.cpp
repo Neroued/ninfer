@@ -57,7 +57,7 @@ ParallelStartup::Codec ParallelStartup::codec() const {
 std::string ParallelStartup::prefill_signature(std::uint32_t chunk) const {
     return qwen4_exp::prefill_signature(*definition_, nullptr, chunk) +
            ";tp=" + std::to_string(parallel_.ranks.size()) +
-           ";ep=" + std::to_string(parallel_.ranks.size());
+           ";ep=" + std::to_string(parallel_.ranks.front().ep_size);
 }
 
 std::vector<RankSnapshot> ParallelStartup::observations() const {

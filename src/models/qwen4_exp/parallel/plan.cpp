@@ -1,15 +1,18 @@
 #include "models/qwen4_exp/parallel/plan.h"
 
 #include <algorithm>
+#include <numeric>
 
 namespace ninfer::models::qwen4_exp {
 namespace {
-RankPlan rank_plan(const ModelDefinition& definition, std::uint32_t size, std::uint32_t rank) {
+RankPlan rank_plan(const ModelDefinition& definition, std::uint32_t size, std::uint32_t rank,
+                   std::uint32_t ep_size) {
     const auto& c = definition.config().text;
     const auto& w = definition.weights();
     RankPlan p;
     p.rank                = rank;
     p.size                = size;
+    p.ep_size             = ep_size;
     p.ple_placement       = size == 1 ? ple::Placement::Disk : ple::Placement::Device;
     p.gdn_keys            = partition_range(c.gdn.key_heads, size, rank);
     p.gdn_values          = partition_range(c.gdn.value_heads, size, rank);
@@ -18,14 +21,22 @@ RankPlan rank_plan(const ModelDefinition& definition, std::uint32_t size, std::u
     p.vocabulary          = partition_range(c.vocabulary, size, rank);
     p.ple_shards          = partition_range(c.ple.shards, size, rank);
     p.shared_intermediate = partition_range(c.moe.shared_intermediate, size, rank).size;
-    (void)partition_range(c.moe.experts, size, rank);
+    (void)partition_range(c.moe.experts, ep_size, ep_size == 1 ? 0 : rank);
     p.experts.resize(definition.expert_banks().size());
     for (std::size_t layer = 0; layer < p.experts.size(); ++layer) {
-        const auto priority = layer < w.text.layers.size() ? default_expert_priority(c, layer)
-                                                           : std::span<const std::uint32_t>{};
-        for (std::uint32_t index = rank; index < c.moe.experts; index += size)
-            p.experts[layer].push_back(priority.empty() ? index : priority[index]);
-        std::sort(p.experts[layer].begin(), p.experts[layer].end());
+        auto& bank = p.experts[layer];
+        bank.intermediate =
+            partition_range(c.moe.intermediate, size / ep_size, ep_size == 1 ? rank : 0);
+        if (ep_size == 1) {
+            bank.ids.resize(c.moe.experts);
+            std::iota(bank.ids.begin(), bank.ids.end(), 0);
+        } else {
+            const auto priority = layer < w.text.layers.size() ? default_expert_priority(c, layer)
+                                                               : std::span<const std::uint32_t>{};
+            for (std::uint32_t index = rank; index < c.moe.experts; index += ep_size)
+                bank.ids.push_back(priority.empty() ? index : priority[index]);
+            std::sort(bank.ids.begin(), bank.ids.end());
+        }
     }
     if (size == 1) return p;
 
@@ -103,22 +114,31 @@ RankPlan rank_plan(const ModelDefinition& definition, std::uint32_t size, std::u
 }
 } // namespace
 
-RankPlan plan_single_rank(const ModelDefinition& definition) { return rank_plan(definition, 1, 0); }
+RankPlan plan_single_rank(const ModelDefinition& definition) {
+    return rank_plan(definition, 1, 0, 1);
+}
 
 ParallelPlan plan_parallel(const ModelDefinition& definition, const DeploymentOptions& deployment) {
     const auto& o   = deployment.parallel;
     const auto size = static_cast<std::uint32_t>(deployment.ranks.size());
-    if ((size != 1 && size != 2) || o.tp != size || o.ep != size || o.dp != 1 || o.pp != 1 ||
-        o.adp != 1)
-        throw std::invalid_argument("Qwen4Exp supports one rank or TP2/EP2 with DP1/ADP1/PP1");
+    if ((size != 1 && size != 2) || o.tp != size || (o.ep != 1 && o.ep != size) || o.dp != 1 ||
+        o.pp != 1 || o.adp != 1)
+        throw std::invalid_argument(
+            "Qwen4Exp supports one rank or TP2 with EP1 or EP2 and DP1/ADP1/PP1");
     ParallelPlan out;
     for (const auto& r : deployment.ranks) {
-        out.ranks.push_back(rank_plan(definition, size, r.rank));
+        out.ranks.push_back(rank_plan(definition, size, r.rank, o.ep));
         std::uint32_t local = 0;
         for (const auto& other : deployment.ranks)
             if (other.node == r.node && other.rank < r.rank) ++local;
-        out.topology.ranks.push_back(
-            {r.rank, r.node, local, r.device, {r.rank, size}, {r.rank, size}, {0, 1}, {0, 1}});
+        out.topology.ranks.push_back({r.rank,
+                                      r.node,
+                                      local,
+                                      r.device,
+                                      {r.rank, size},
+                                      {o.ep == 1 ? 0U : r.rank, o.ep},
+                                      {0, 1},
+                                      {0, 1}});
     }
     std::sort(out.ranks.begin(), out.ranks.end(),
               [](const auto& a, const auto& b) { return a.rank < b.rank; });
@@ -133,6 +153,7 @@ ParallelPlan plan_parallel(const ModelDefinition& definition, const DeploymentOp
     };
     for (const auto byte : definition.artifact_id()) mix(std::to_integer<unsigned>(byte));
     mix(size);
+    mix(o.ep);
     mix(definition.options().vision);
     mix(static_cast<std::uint64_t>(definition.options().purpose));
     mix(static_cast<std::uint64_t>(definition.options().speculative));
@@ -140,8 +161,11 @@ ParallelPlan plan_parallel(const ModelDefinition& definition, const DeploymentOp
     for (const auto& rank : out.ranks) {
         mix(rank.rank);
         mix(static_cast<std::uint64_t>(rank.ple_placement));
-        for (const auto& bank : rank.experts)
-            for (auto expert : bank) mix(expert);
+        for (const auto& bank : rank.experts) {
+            mix(bank.intermediate.begin);
+            mix(bank.intermediate.size);
+            for (auto expert : bank.ids) mix(expert);
+        }
         for (const auto& a : rank.assemblies) {
             for (auto dimension : a.shape) mix(dimension);
             for (const auto& s : a.slices) {

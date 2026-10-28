@@ -76,8 +76,7 @@ std::size_t body(const ModelProfile& p, const EngineOptions& options, int first,
         }
         scratch(ops::hc_mix_workspace_capacity_bytes(layer.moe_hc, minimum, columns));
         scratch(moe::workspace_bytes(layer.moe.math, ops::MoeEpilogue::Write, minimum, columns,
-                                     p.local.size > 1 ? ops::ExpertSubsetKind::MaskOnes
-                                                      : ops::ExpertSubsetKind::All));
+                                     layer.moe.subset));
         if (!mtp && offload) {
             scratch(offload->workspace_bytes(layer.moe.bank, minimum, columns));
         }

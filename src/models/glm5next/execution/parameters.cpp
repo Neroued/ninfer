@@ -82,7 +82,7 @@ public:
                  tensor(w.correction_bias),
                  {bank.view(), profile.activation_divisors},
                  dense(w.shared)},
-                {ops::ExpertSubsetKind::MaskOnes, bank.mask()}};
+                bank.subset()};
     }
 
     BlockParameters block(const BlockWeights& w, const BlockProfile& profile) const {

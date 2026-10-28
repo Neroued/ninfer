@@ -15,9 +15,10 @@ RankLoadRequest request(std::span<const std::byte> payload,
     auto r = decode_rank_load(in);
     in.finish();
     if (r.rank.rank != identity.rank || r.rank.size != identity.tp.size ||
-        identity.tp.rank != identity.rank || identity.ep.size != r.rank.size ||
-        identity.ep.rank != identity.rank || identity.adp.size != r.rank.size ||
-        identity.adp.rank != identity.rank || identity.dp.size != 1 || identity.pp.size != 1)
+        identity.tp.rank != identity.rank || identity.ep.size != r.rank.ep_size ||
+        identity.ep.rank != (r.rank.ep_size == 1 ? 0U : r.rank.rank) ||
+        identity.adp.size != r.rank.size || identity.adp.rank != identity.rank ||
+        identity.dp.size != 1 || identity.pp.size != 1)
         throw std::invalid_argument("GLM5Next rank plan differs from worker identity");
     return r;
 }

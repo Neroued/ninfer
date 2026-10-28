@@ -11,21 +11,25 @@ std::uint32_t dimension(std::uint64_t value) {
     return static_cast<std::uint32_t>(value);
 }
 
-RankPlan rank_plan(const ModelDefinition& definition, std::uint32_t size, std::uint32_t rank) {
+RankPlan rank_plan(const ModelDefinition& definition, std::uint32_t size, std::uint32_t rank,
+                   std::uint32_t ep_size) {
     const auto& c = definition.config().text;
     const auto& w = definition.weights();
     RankPlan p;
     p.rank                = rank;
     p.size                = size;
+    p.ep_size             = ep_size;
     p.kda_heads           = partition_range(c.kda.heads, size, rank);
     p.vocabulary          = partition_range(c.vocabulary, size, rank);
     p.dense_intermediate  = partition_range(c.dense_intermediate, size, rank);
     p.shared_intermediate = partition_range(dimension(c.moe.shared_intermediate()), size, rank);
-    const auto experts    = partition_range(c.moe.experts, size, rank);
+    const auto experts    = partition_range(c.moe.experts, ep_size, ep_size == 1 ? 0 : rank);
     p.experts.resize(definition.expert_banks().size());
-    for (auto& ids : p.experts) {
-        ids.resize(experts.size);
-        std::iota(ids.begin(), ids.end(), experts.begin);
+    for (auto& bank : p.experts) {
+        bank.ids.resize(experts.size);
+        std::iota(bank.ids.begin(), bank.ids.end(), experts.begin);
+        bank.intermediate =
+            partition_range(c.moe.intermediate, size / ep_size, ep_size == 1 ? rank : 0);
     }
     if (size == 1) return p;
 
@@ -93,18 +97,20 @@ RankPlan rank_plan(const ModelDefinition& definition, std::uint32_t size, std::u
 
 } // namespace
 
-RankPlan plan_single_rank(const ModelDefinition& definition) { return rank_plan(definition, 1, 0); }
+RankPlan plan_single_rank(const ModelDefinition& definition) {
+    return rank_plan(definition, 1, 0, 1);
+}
 
 ParallelPlan plan_parallel(const ModelDefinition& definition, const DeploymentOptions& deployment) {
     const auto& o   = deployment.parallel;
     const auto size = static_cast<std::uint32_t>(deployment.ranks.size());
-    if ((size != 1 && size != 2) || o.tp != size || o.ep != size || o.adp != size || o.dp != 1 ||
-        o.pp != 1)
+    if ((size != 1 && size != 2) || o.tp != size || (o.ep != 1 && o.ep != size) || o.adp != size ||
+        o.dp != 1 || o.pp != 1)
         throw std::invalid_argument(
-            "GLM5Next weight placement supports one rank or TP2/EP2/ADP2 with DP1/PP1");
+            "GLM5Next weight placement supports one rank or TP2/ADP2 with EP1 or EP2 and DP1/PP1");
     ParallelPlan out;
     for (const auto& r : deployment.ranks) {
-        out.ranks.push_back(rank_plan(definition, size, r.rank));
+        out.ranks.push_back(rank_plan(definition, size, r.rank, o.ep));
         std::uint32_t local = 0;
         for (const auto& other : deployment.ranks)
             if (other.node == r.node && other.rank < r.rank) ++local;
@@ -113,7 +119,7 @@ ParallelPlan plan_parallel(const ModelDefinition& definition, const DeploymentOp
                                       local,
                                       r.device,
                                       {r.rank, size},
-                                      {r.rank, size},
+                                      {o.ep == 1 ? 0U : r.rank, o.ep},
                                       {0, 1},
                                       {0, 1},
                                       {r.rank, size}});
@@ -131,10 +137,19 @@ ParallelPlan plan_parallel(const ModelDefinition& definition, const DeploymentOp
     };
     for (const auto byte : definition.artifact_id()) mix(std::to_integer<unsigned>(byte));
     mix(size);
+    mix(o.ep);
     mix(definition.options().vision);
     mix(static_cast<std::uint64_t>(definition.options().purpose));
     mix(static_cast<std::uint64_t>(definition.options().speculative));
     mix(static_cast<std::uint64_t>(definition.options().proposal_head));
+    for (const auto& rank : out.ranks) {
+        mix(rank.rank);
+        for (const auto& bank : rank.experts) {
+            mix(bank.intermediate.begin);
+            mix(bank.intermediate.size);
+            for (auto expert : bank.ids) mix(expert);
+        }
+    }
     out.topology.plan = identity ? identity : 1;
     if (size > 1) {
         out.topology.groups.push_back({0, {0, 1}});

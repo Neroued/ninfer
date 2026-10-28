@@ -26,6 +26,10 @@ public:
         return experts_.at(id.index);
     }
 
+    [[nodiscard]] std::span<const moe::ExpertDescription> expert_data() const {
+        return expert_descriptions_;
+    }
+
     [[nodiscard]] const artifact::MaterializationStats& storage_stats() const {
         return backing_.stats();
     }
@@ -39,6 +43,7 @@ private:
 
     std::shared_ptr<const ModelDefinition> definition_;
     RankPlan rank_;
+    std::vector<moe::ExpertDescription> expert_descriptions_;
     artifact::MaterializedArtifact backing_;
     std::vector<WeightParent> parents_;
     std::vector<BoundWeight> weights_;

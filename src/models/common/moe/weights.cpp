@@ -3,6 +3,12 @@
 namespace ninfer::models::moe {
 namespace {
 
+std::int32_t dimension(std::uint64_t value) {
+    if (!value || value > INT32_MAX)
+        throw std::invalid_argument("expert dimension exceeds the Tensor domain");
+    return static_cast<std::int32_t>(value);
+}
+
 artifact::Part region(const artifact::ParameterReference& reference) {
     if (reference.binding.parts.empty()) { throw artifact::ArtifactError("empty expert Binding"); }
     auto out = reference.binding.parts.front();
@@ -17,6 +23,21 @@ artifact::Part region(const artifact::ParameterReference& reference) {
 }
 
 } // namespace
+
+ops::RoutedSwiGLUProfile describe_experts(const ExpertDescription& bank, std::int32_t top_k,
+                                          ops::LinearPolicy gate_up, ops::LinearPolicy down) {
+    const auto matrix = [](const WeightGeometry& g, ops::LinearPolicy policy) {
+        const auto layout = g.layout == QuantLayout::BatchedBlockScaleK16M128x4
+                                ? QuantLayout::BlockScaleK16M128x4
+                                : g.layout;
+        return ops::LinearProfile{g.format, dimension(g.shape.at(g.shape.size() - 2)),
+                                  dimension(g.shape.back()), policy, layout};
+    };
+    if (!bank.count || top_k <= 0 || std::uint32_t(top_k) > bank.count)
+        throw std::invalid_argument("local expert routing domain is invalid");
+    return {ops::swiglu_profile(matrix(bank.gate_up, gate_up), matrix(bank.down, down)),
+            dimension(bank.count), top_k};
+}
 
 BankDescription describe_bank(const artifact::Reader& reader,
                               std::span<const ExpertBinding> experts) {
@@ -127,7 +148,8 @@ std::vector<ExpertBankSource> bind_banks(std::span<const BankDescription> banks,
 }
 
 ResidentExpertBank::ResidentExpertBank(std::span<const ResidentExpertEntry> entries,
-                                       std::uint32_t count, Device device) {
+                                       std::uint32_t count, Device device)
+    : subset_(ops::ExpertSubsetKind::MaskOnes) {
     if (entries.empty() || !count) throw std::invalid_argument("empty resident expert ownership");
     LayoutBuilder layout;
     const auto index  = layout.add(count * sizeof(std::uint64_t), 8, "expert offsets");
@@ -176,6 +198,18 @@ ResidentExpertBank::ResidentExpertBank(std::span<const ResidentExpertEntry> entr
                                    payload),
              count, device};
     mask_ = Tensor(mask.bind(data), DType::I32, {static_cast<std::int32_t>(count)});
+}
+
+ResidentExpertBank::ResidentExpertBank(const WeightParent& gate_up, const WeightParent& down) {
+    const auto bank = [](const WeightParent& parent) {
+        const auto& s = parent.geometry.shape;
+        if (s.size() != 3 || s[0] > UINT32_MAX)
+            throw std::invalid_argument("affine expert storage requires rank-3 matrices");
+        return bind_weight_bank(
+            parent, describe_weight_bank(parent.geometry,
+                                         {0, static_cast<std::uint32_t>(s[0]), s[1], s[1]}));
+    };
+    view_ = device_expert_bank(bank(gate_up), bank(down));
 }
 
 } // namespace ninfer::models::moe

@@ -1,6 +1,5 @@
 #pragma once
 #include "core/platform.h"
-#include "core/paged_kv_cache.h"
 
 namespace ninfer::ops::detail::qsa {
 template <int KvHeads>
@@ -11,14 +10,11 @@ struct HeadGeometry {
 };
 
 // Represented head geometries. Each Op admits only its implemented profiles.
-inline int registered_query_heads(int kv, KvCacheStorage storage) {
+inline int registered_query_heads(int kv) {
     if (kv == 1) return HeadGeometry<1>::query_heads;
     if (kv == 2) return HeadGeometry<2>::query_heads;
 #if NINFER_TARGET_RTX5090
-    if (kv == 4 &&
-        (storage == KvCacheStorage::Fp8E4M3Row256 || storage == KvCacheStorage::BFloat16 ||
-         storage == KvCacheStorage::Int8Group64 || storage == KvCacheStorage::Nvfp4Group16))
-        return HeadGeometry<4>::query_heads;
+    if (kv == 4) return HeadGeometry<4>::query_heads;
 #endif
     return 0;
 }

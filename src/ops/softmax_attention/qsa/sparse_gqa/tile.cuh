@@ -21,19 +21,19 @@ struct SparseGqaRaw<Storage, N, true> {
 template <KvCacheStorage Storage, int N, int Warps, SparseGqaLoad Load = SparseGqaLoad::Direct,
           SparseGqaWarpSplit Split = SparseGqaWarpSplit::Sequence, int PaddedHeads = 16>
 struct SparseGqaStorage : SparseGqaRaw<Storage, N, Load == SparseGqaLoad::Staged> {
+    using K = SparseGqaCodec<Storage, true>;
+    using V = SparseGqaCodec<Storage, false>;
+    // K and V occupy this slot consecutively, each with its own scale-plane offset.
+    static constexpr int packed_bytes =
+        std::max(K::code_bytes + K::scale_bytes, V::code_bytes + V::scale_bytes);
+
     union {
         // Reused serializes native K/V copies into one tile. Aliased decode retains
         // one FP16 tile and one native packed tile to overlap quantized K/V loads.
         alignas(16) std::uint16_t
-            kv[Load == SparseGqaLoad::Reused ? N * 256
-               : Load == SparseGqaLoad::Aliased
-                   ? N * 256 + N *
-                                   (std::max(SparseGqaCodec<Storage, true>::code_bytes,
-                                             SparseGqaCodec<Storage, false>::code_bytes) +
-                                    std::max(SparseGqaCodec<Storage, true>::scale_bytes,
-                                             SparseGqaCodec<Storage, false>::scale_bytes)) /
-                                   2
-                   : 2 * N * 256];
+            kv[Load == SparseGqaLoad::Reused    ? N * 256
+               : Load == SparseGqaLoad::Aliased ? N * 256 + N * packed_bytes / 2
+                                                : 2 * N * 256];
         float partial[(Split == SparseGqaWarpSplit::Sequence ? Warps : 1) * PaddedHeads * 256];
     };
 

@@ -16,8 +16,7 @@ SparseGqaPlan select_sparse_gqa_plan(KvCacheStorage storage, int tokens, int bat
         const bool partial = queries < sparse_gqa_direct_queries(kv_heads, sms);
         if (bf16 && visible <= 64 && (queries < 16 || (visible <= 16 && queries < 32)))
             return {32, 1, SparseGqaInstance::Simt, true};
-        // The final-output FP4 SIMT kernel admits two CTAs/SM. Avoid a third wave
-        // of per-head CTAs once a cooperative query packet is cheaper.
+        // Bound per-head SIMT work by its measured crossover with cooperative query packets.
         const bool short_prefix =
             fp4_value ? queries * HeadGeometry<4>::query_heads > std::int64_t(sms) * 4
                       : queries >= 32;

@@ -4,6 +4,7 @@
 #include "ops/common/quant/fp8.cuh"
 #include "ops/kv_cache/kernels/hadamard.cuh"
 #include "ops/common/quant/nvfp4.cuh"
+#include "ops/softmax_attention/qsa/cache_format.h"
 #include "ops/softmax_attention/kernels/causal/tile_io.cuh"
 #include "ops/softmax_attention/qsa/sparse_gqa/arguments.h"
 
@@ -14,14 +15,11 @@ inline constexpr bool kSparseQuantized = Storage != KvCacheStorage::BFloat16;
 
 template <KvCacheStorage Storage>
 inline constexpr bool kSparseRotatedValue =
-    Storage == KvCacheStorage::Nvfp4Group16 || Storage == KvCacheStorage::Fp8KeyNvfp4Value;
+    kCachePlaneFormat<Storage, false> == KvCacheStorage::Nvfp4Group16;
 
 template <KvCacheStorage Storage, bool Key>
 struct SparseGqaCodec {
-    static constexpr auto format =
-        Storage == KvCacheStorage::Fp8KeyNvfp4Value
-            ? (Key ? KvCacheStorage::Fp8E4M3Row256 : KvCacheStorage::Nvfp4Group16)
-            : Storage;
+    static constexpr auto format     = kCachePlaneFormat<Storage, Key>;
     static constexpr int code_bytes  = format == KvCacheStorage::BFloat16       ? 512
                                        : format == KvCacheStorage::Nvfp4Group16 ? 128
                                                                                 : 256;

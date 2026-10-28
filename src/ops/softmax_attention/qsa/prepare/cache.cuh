@@ -5,6 +5,7 @@
 #include "ops/kv_cache/kernels/hadamard.cuh"
 #include "ops/common/quant/integer.cuh"
 #include "ops/common/quant/nvfp4.cuh"
+#include "ops/softmax_attention/qsa/cache_format.h"
 #include "ops/softmax_attention/qsa/prepare/norm_rope.cuh"
 #include "ops/softmax_attention/qsa/prepare/arguments.cuh"
 
@@ -97,10 +98,8 @@ __device__ __forceinline__ void prepare_kv(const PrepareArguments& a, int head, 
         norm_rotate<256>(values, a.wk, a.epsilon, sc, lane);
         // The transformed FP32 key enters the codec directly, without a BF16 intermediate.
         kv::normalized_hadamard_d256_inplace(values, lane);
-        constexpr auto key_storage =
-            Storage == KvCacheStorage::Fp8KeyNvfp4Value ? KvCacheStorage::Fp8E4M3Row256 : Storage;
-        constexpr auto value_storage =
-            Storage == KvCacheStorage::Fp8KeyNvfp4Value ? KvCacheStorage::Nvfp4Group16 : Storage;
+        constexpr auto key_storage   = kCachePlaneFormat<Storage, true>;
+        constexpr auto value_storage = kCachePlaneFormat<Storage, false>;
         store_quantized<key_storage>(values, key, a.key_scales.at(p % 64, head, page), lane,
                                      scratch);
 #pragma unroll
@@ -245,8 +244,8 @@ __device__ __forceinline__ void prepare_kv_vector(const PrepareArguments& a, int
         store_16bit_contiguous<false>(x, a.keys.at(p % 64, head, page), lane);
     } else {
         kv::normalized_hadamard_d256_contiguous_inplace(x, lane);
-        store_quantized_contiguous<Storage>(x, a.keys.at(p % 64, head, page),
-                                            a.key_scales.at(p % 64, head, page), lane);
+        store_quantized_contiguous<kCachePlaneFormat<Storage, true>>(
+            x, a.keys.at(p % 64, head, page), a.key_scales.at(p % 64, head, page), lane);
     }
     const auto v = reinterpret_cast<const uint4*>(value)[lane];
     const unsigned words[4]{v.x, v.y, v.z, v.w};
@@ -256,10 +255,10 @@ __device__ __forceinline__ void prepare_kv_vector(const PrepareArguments& a, int
     if constexpr (Storage == KvCacheStorage::BFloat16)
         store_16bit_contiguous<true>(x, a.values.at(p % 64, head, page), lane);
     else {
-        if constexpr (Storage == KvCacheStorage::Nvfp4Group16)
+        if constexpr (kCachePlaneFormat<Storage, false> == KvCacheStorage::Nvfp4Group16)
             kv::normalized_hadamard_d256_contiguous_inplace(x, lane);
-        store_quantized_contiguous<Storage>(x, a.values.at(p % 64, head, page),
-                                            a.value_scales.at(p % 64, head, page), lane);
+        store_quantized_contiguous<kCachePlaneFormat<Storage, false>>(
+            x, a.values.at(p % 64, head, page), a.value_scales.at(p % 64, head, page), lane);
     }
 }
 

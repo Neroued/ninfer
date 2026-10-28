@@ -823,8 +823,8 @@ int main(int argc, char** argv) {
               {{"format", "fp8"}});
     // Each additional codec covers both semantic entries and distinct cache/record layouts,
     // with one compact set of mathematical risks rather than a storage/layout cross product.
-    for (auto storage :
-         {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64, KvCacheStorage::Nvfp4Group16}) {
+    for (auto storage : {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64,
+                         KvCacheStorage::Nvfp4Group16, KvCacheStorage::Fp8KeyNvfp4Value}) {
         const std::string format = kv_cache_storage_name(storage);
         for (bool kv_only : {false, true}) {
             const std::string prefix =

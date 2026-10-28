@@ -86,11 +86,7 @@ __global__ __launch_bounds__(128) void prepare_kernel(const __grid_constant__ Pr
         }
     }
     if (live && task < Geometry::raw_task) {
-        if constexpr ((Storage == KvCacheStorage::Fp8E4M3Row256 ||
-                       Storage == KvCacheStorage::BFloat16 ||
-                       Storage == KvCacheStorage::Int8Group64 ||
-                       Storage == KvCacheStorage::Nvfp4Group16) &&
-                      KvHeads == 4) {
+        if constexpr (KvHeads == 4) {
             prepare_kv_vector<Storage, KvHeads>(a, task - Geometry::key_task, t, b, lane,
                                                 coefficients);
         } else if constexpr (Storage == KvCacheStorage::Nvfp4Group16 ||

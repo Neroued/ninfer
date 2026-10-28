@@ -652,6 +652,7 @@ int main(int argc, char** argv) {
     add_four_head_storage_cases(suite, KvCacheStorage::BFloat16);
     add_four_head_storage_cases(suite, KvCacheStorage::Int8Group64);
     add_four_head_storage_cases(suite, KvCacheStorage::Nvfp4Group16);
+    add_four_head_storage_cases(suite, KvCacheStorage::Fp8KeyNvfp4Value);
 #endif
     return suite.main(argc, argv);
 }

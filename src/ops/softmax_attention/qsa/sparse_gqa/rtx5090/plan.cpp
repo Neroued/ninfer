@@ -10,26 +10,34 @@ SparseGqaPlan select_sparse_gqa_plan(KvCacheStorage storage, int tokens, int bat
     const auto queries = std::int64_t(tokens) * batch;
     const auto visible = envelope.max_visible_tokens;
     if (kv_heads == 4) {
-        const bool bf16    = storage == KvCacheStorage::BFloat16;
+        const bool bf16 = storage == KvCacheStorage::BFloat16;
+        const bool fp4_value =
+            storage == KvCacheStorage::Nvfp4Group16 || storage == KvCacheStorage::Fp8KeyNvfp4Value;
         const bool partial = queries < sparse_gqa_direct_queries(kv_heads, sms);
         if (bf16 && visible <= 64 && (queries < 16 || (visible <= 16 && queries < 32)))
             return {32, 1, SparseGqaInstance::Simt, true};
+        // The final-output FP4 SIMT kernel admits two CTAs/SM. Avoid a third wave
+        // of per-head CTAs once a cooperative query packet is cheaper.
+        const bool short_prefix =
+            fp4_value ? queries * HeadGeometry<4>::query_heads > std::int64_t(sms) * 4
+                      : queries >= 32;
         const bool prefix =
-            visible <= 2051 && (bf16 || (queries >= 2 && (visible > 64 || queries >= 32)));
-        if (!prefix && visible <= 64) return {32, 1, SparseGqaInstance::Simt, true};
-        const int rows     = bf16 && prefix && visible <= 32 ? 32
-                             : prefix || queries <= 8        ? 64
-                             : bf16                          ? 32
-                                                             : 16;
-        const int packet   = prefix ? rows / 16 : 1;
-        const auto groups  = (queries + packet - 1) / packet * 4;
-        const int resident = bf16 ? (rows == 32               ? (prefix ? 3 : 5)
-                                     : prefix && queries <= 8 ? 1
-                                                              : 2)
-                                  : (rows == 16 ? 7 : 2);
-        const int tiles    = std::max(1, (int(std::min(visible, 2051u)) + rows - 1) / rows);
-        int splits         = 1;
-        if (partial) {
+            visible <= 2051 && (bf16 || (queries >= 2 && (visible > 64 || short_prefix)));
+        if (!prefix && visible <= 64) return {32, 1, SparseGqaInstance::Simt, !fp4_value};
+        const int rows    = bf16 && prefix && visible <= 32 ? 32
+                            : prefix || queries <= 8        ? 64
+                            : bf16                          ? 32
+                                                            : 16;
+        const int packet  = prefix ? rows / 16 : 1;
+        const auto groups = (queries + packet - 1) / packet * 4;
+        const int resident =
+            bf16 ? (rows == 32               ? (prefix ? 3 : 5)
+                    : prefix && queries <= 8 ? 1
+                                             : 2)
+                 : (rows == 16 ? (storage == KvCacheStorage::Nvfp4Group16 ? 8 : 7) : 2);
+        const int tiles = std::max(1, (int(std::min(visible, 2051u)) + rows - 1) / rows);
+        int splits      = 1;
+        if (partial && !(fp4_value && prefix && visible <= 256)) {
             // Compare complete waves, including the Q prologue. A fixed CTA target can
             // spill one partition into another wave and create a latency inversion.
             std::int64_t best = std::numeric_limits<std::int64_t>::max();

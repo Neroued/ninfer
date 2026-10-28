@@ -162,9 +162,9 @@ int gate_rounding(DeviceContext& device, KvCacheStorage storage = KvCacheStorage
 }
 
 int read_footprint(DeviceContext& device, KvCacheStorage storage, bool padded, int batch = 4,
-                   int query_heads = 24, int kv_heads = 0) {
-    Fixture f(3, batch, 2053, padded, storage, false, query_heads, kv_heads);
-    f.reset(0, 1);
+                   int query_heads = 24, int kv_heads = 0, int history = 2053, int cap = 1) {
+    Fixture f(3, batch, history, padded, storage, false, query_heads, kv_heads);
+    f.reset(0, cap);
     DeviceBuffer q(ninfer::test::cuda_environment().context.device(), f.q.bytes());
     DeviceBuffer gate(ninfer::test::cuda_environment().context.device(), f.gate.bytes());
     DeviceBuffer pos(ninfer::test::cuda_environment().context.device(), f.pos.bytes());
@@ -580,7 +580,10 @@ void add_four_head_storage_cases(OpSuite& suite, KvCacheStorage storage) {
         add_case(suite, t, b, history, padded, cap, 1.F, graph, storage,
                  std::numeric_limits<int>::max(), 24, false, 4);
     };
-    add(1, 1, 3);
+    if (storage == KvCacheStorage::Nvfp4Group16 || storage == KvCacheStorage::Fp8KeyNvfp4Value)
+        add(17, 1, 31);
+    else
+        add(1, 1, 3);
     if (storage == KvCacheStorage::BFloat16) {
         add(17, 1, 31);
         add(13, 1, 2048, false, 512, true);
@@ -622,8 +625,13 @@ void add_four_head_storage_cases(OpSuite& suite, KvCacheStorage storage) {
         return gate_rounding(cuda_environment().context, storage, 1, 1, 24, 4) +
                gate_rounding(cuda_environment().context, storage, 256, 8192, 24, 4);
     });
-    special("read_footprint",
-            [=] { return read_footprint(cuda_environment().context, storage, true, 4, 24, 4); });
+    special("read_footprint", [=] {
+        auto& device = cuda_environment().context;
+        int failures = read_footprint(device, storage, true, 4, 24, 4);
+        if (storage == KvCacheStorage::Nvfp4Group16 || storage == KvCacheStorage::Fp8KeyNvfp4Value)
+            failures += read_footprint(device, storage, true, 4, 24, 4, 4, 0);
+        return failures;
+    });
     if (storage != KvCacheStorage::BFloat16)
         special("scale_layout",
                 [=] { return scale_layout(cuda_environment().context, storage, 9, 8192, 24, 4); });
@@ -643,6 +651,7 @@ int main(int argc, char** argv) {
     add_four_head_cases(suite);
     add_four_head_storage_cases(suite, KvCacheStorage::BFloat16);
     add_four_head_storage_cases(suite, KvCacheStorage::Int8Group64);
+    add_four_head_storage_cases(suite, KvCacheStorage::Nvfp4Group16);
 #endif
     return suite.main(argc, argv);
 }

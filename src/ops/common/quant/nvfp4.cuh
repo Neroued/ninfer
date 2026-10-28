@@ -163,6 +163,19 @@ struct Nvfp4Group16 {
     std::uint8_t scale     = 0;
 };
 
+struct Nvfp4Fp32Scale {
+    std::uint8_t code;
+    float represented;
+};
+
+__device__ __forceinline__ Nvfp4Fp32Scale nvfp4_fp32_scale(float max_abs) {
+    if (max_abs == 0.0F) return {0, 0};
+    const float raw_scale = __fdiv_rn(max_abs, 6.0F);
+    const float bounded   = fminf(448.0F, fmaxf(0x1p-9F, raw_scale));
+    const auto code       = __nv_cvt_float_to_fp8(bounded, __NV_SATFINITE, __NV_E4M3);
+    return {code, decode_e4m3(code)};
+}
+
 __device__ __forceinline__ Nvfp4Group16 quantize_nvfp4_group16_f32(const float* source) {
     float2 values[8];
     float max_abs = 0.0F;
@@ -176,14 +189,12 @@ __device__ __forceinline__ Nvfp4Group16 quantize_nvfp4_group16_f32(const float* 
     Nvfp4Group16 result{};
     if (max_abs == 0.0F) return result;
 
-    const float raw_scale         = __fdiv_rn(max_abs, 6.0F);
-    const float bounded           = fminf(448.0F, fmaxf(0x1p-9F, raw_scale));
-    result.scale                  = __nv_cvt_float_to_fp8(bounded, __NV_SATFINITE, __NV_E4M3);
-    const float represented_scale = decode_e4m3(result.scale);
+    const auto scale = nvfp4_fp32_scale(max_abs);
+    result.scale     = scale.code;
 #pragma unroll
     for (int pair = 0; pair < 8; ++pair) {
-        values[pair].x = __fdiv_rn(values[pair].x, represented_scale);
-        values[pair].y = __fdiv_rn(values[pair].y, represented_scale);
+        values[pair].x = __fdiv_rn(values[pair].x, scale.represented);
+        values[pair].y = __fdiv_rn(values[pair].y, scale.represented);
     }
     pack_nvfp4_e2m1x16(values, result.codes_lo, result.codes_hi);
     return result;

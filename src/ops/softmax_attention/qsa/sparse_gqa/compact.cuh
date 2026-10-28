@@ -250,9 +250,10 @@ sparse_gqa_compact(SparseGqaKernelArguments<4> a,
         }
         __syncwarp();
         if constexpr (Storage == KvCacheStorage::BFloat16 ||
-                      Storage == KvCacheStorage::Int8Group64) {
+                      Storage == KvCacheStorage::Int8Group64 ||
+                      Storage == KvCacheStorage::Nvfp4Group16) {
             if (live)
-                sparse_gqa_compact_store_vector(
+                sparse_gqa_compact_store_vector<kSparseRotatedValue<Storage>>(
                     a, q, head, s.partial + (Prefix ? warp * PaddedHeads : 0) * 256);
             else
                 for (int i = lane; i < 6 * 128; i += 32)

@@ -19,7 +19,7 @@ __device__ __forceinline__ void sparse_gqa_store(const SparseGqaKernelArguments<
 
 // One warp writes its six-head group. Fetch the following head's gates while
 // processing the current FP32 row, rather than serializing 24 narrow gate loads.
-template <int KvHeads>
+template <bool Inverse, int KvHeads>
 __device__ __forceinline__ void
 sparse_gqa_compact_store_vector(const SparseGqaKernelArguments<KvHeads>& a, std::int64_t q,
                                 int head, const float* rows) {
@@ -33,7 +33,8 @@ sparse_gqa_compact_store_vector(const SparseGqaKernelArguments<KvHeads>& a, std:
         if (h + 1 < a.ratio) next = common::load_vec<uint4>(a.gate + base + (h + 1) * 256);
         const auto low  = common::load_vec<float4>(rows + h * 256 + lane * 8);
         const auto high = common::load_vec<float4>(rows + h * 256 + lane * 8 + 4);
-        const float values[8]{low.x, low.y, low.z, low.w, high.x, high.y, high.z, high.w};
+        float values[8]{low.x, low.y, low.z, low.w, high.x, high.y, high.z, high.w};
+        if constexpr (Inverse) kv::normalized_hadamard_d256_contiguous_inplace(values, lane);
         const unsigned words[4]{gates.x, gates.y, gates.z, gates.w};
         unsigned output[4];
 #pragma unroll

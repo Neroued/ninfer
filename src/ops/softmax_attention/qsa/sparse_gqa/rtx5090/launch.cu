@@ -43,7 +43,7 @@ void launch(const SparseGqaArguments& arguments, SparseGqaPlan plan,
             } else
                 submit.template operator()<64, 4, true>();
         } else if (plan.instance == SparseGqaInstance::Simt) {
-            sparse_gqa_simt_kernel<Storage, 8, VectorCache>
+            sparse_gqa_simt_kernel<Storage, 8, VectorCache, KvHeads, kSparseRotatedValue<Storage>>
                 <<<dim3(queries * a.query_heads, a.splits), 256, 0, execution.stream()>>>(a);
         } else if constexpr (Storage == KvCacheStorage::BFloat16) {
             if (plan.key_rows == 32)
@@ -104,7 +104,8 @@ void launch_sparse_gqa_instance(SparseGqaArguments a, KvCacheStorage storage, in
         else if (kv_heads == 4) {
             if constexpr (Storage == KvCacheStorage::Fp8E4M3Row256 ||
                           Storage == KvCacheStorage::BFloat16 ||
-                          Storage == KvCacheStorage::Int8Group64)
+                          Storage == KvCacheStorage::Int8Group64 ||
+                          Storage == KvCacheStorage::Nvfp4Group16)
                 geometry.template operator()<4>();
         } else
             geometry.template operator()<2>();

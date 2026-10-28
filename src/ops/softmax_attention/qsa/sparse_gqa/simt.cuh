@@ -4,15 +4,20 @@
 #include "ops/softmax_attention/qsa/sparse_gqa/kernel.cuh"
 
 namespace ninfer::ops::detail::qsa {
-template <KvCacheStorage Storage, int Warps, bool Vector, int KvHeads>
+template <KvCacheStorage Storage, int Warps, bool Vector, int KvHeads, bool Final = false>
 __launch_bounds__(Warps * 32) __global__
     void sparse_gqa_simt_kernel(SparseGqaKernelArguments<KvHeads> a) {
     const auto q   = a.begin + a.head_query(blockIdx.x);
     const int head = a.head_index(blockIdx.x), kvh = head / a.ratio, split = blockIdx.y;
     const int tid = threadIdx.x, lane = tid & 31, warp = tid / 32;
     const auto work = a.work(q);
-    // This route always publishes FP32 partials; merge owns basis inversion and the gate.
-    if (!work.size) return;
+    if (!work.size) {
+        if constexpr (Final)
+            if (tid < 128)
+                *reinterpret_cast<unsigned*>(a.out + (q * a.query_heads + head) * 256 + tid * 2) =
+                    0;
+        return;
+    }
     if (split >= work.splits) return;
     const int start = split * work.tiles / work.splits * a.key_rows;
     const int end   = min(work.size, (split + 1) * work.tiles / work.splits * a.key_rows);
@@ -85,6 +90,23 @@ __launch_bounds__(Warps * 32) __global__
     for (int w = 0; w < Warps; ++w) {
         weights[w] = softmax_log2_state_weight(maxima[w], sums[w], maximum);
         sum += weights[w] * sums[w];
+    }
+    if constexpr (Final) {
+        float values[8]{};
+#pragma unroll
+        for (int w = 0; w < Warps; ++w) {
+#pragma unroll
+            for (int i = 0; i < 8; ++i) values[i] += weights[w] * output[w][lane * 8 + i];
+        }
+        const float inverse = __frcp_rn(sum);
+#pragma unroll
+        for (float& value : values) value *= inverse;
+        if constexpr (kSparseRotatedValue<Storage>)
+            kv::normalized_hadamard_d256_contiguous_inplace(values, lane);
+#pragma unroll
+        for (int i = 0; i < 4; ++i)
+            sparse_gqa_store(a, q, head, lane * 8 + 2 * i, values[2 * i], values[2 * i + 1]);
+        return;
     }
     const auto partial = a.partial_row(q, split, head);
 #pragma unroll

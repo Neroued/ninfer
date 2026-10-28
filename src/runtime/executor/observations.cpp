@@ -69,7 +69,8 @@ auto fields(T& v) {
                         v.minimum_runtime_reservation_bytes, v.context_capacity_bytes,
                         v.minimum_context_capacity_bytes, v.context_control_budget_bytes,
                         v.available_after_weights_bytes, v.available_after_startup_bytes,
-                        v.headroom_bytes, v.planned_slack_bytes, v.retained_bytes, v.graphs);
+                        v.headroom_bytes, v.host_reservation_bytes, v.planned_slack_bytes,
+                        v.retained_bytes, v.graphs);
     }
 }
 

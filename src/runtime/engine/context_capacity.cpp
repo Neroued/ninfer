@@ -134,9 +134,8 @@ resolve_group_context_capacity(const ContextCapacityPolicy& policy,
         const auto& offer  = offers[rank];
         auto geometry      = describe_context_pool(offer.plan.records);
         const auto minimum = minimum_bytes(offer.plan, geometry);
-        const auto fixed =
-            checked_add(offer.plan.fixed_device_bytes, policy.automatic_headroom_bytes);
-        const auto usable = offer.available_bytes > fixed ? offer.available_bytes - fixed : 0;
+        const auto fixed   = offer.plan.fixed_device_bytes;
+        const auto usable  = offer.available_bytes > fixed ? offer.available_bytes - fixed : 0;
         const auto selected =
             policy.mode == ContextCapacityMode::Explicit ? policy.explicit_bytes : minimum;
         if (selected < minimum || selected > usable)
@@ -206,7 +205,6 @@ resolve_group_context_capacity(const ContextCapacityPolicy& policy,
                 checked_add(owner.offer.plan.fixed_device_bytes, owner.minimum),
             .runtime_reservation_bytes     = runtime_bytes,
             .available_after_weights_bytes = owner.offer.available_bytes,
-            .automatic_headroom_bytes      = policy.automatic_headroom_bytes,
             .planned_slack_bytes   = owner.offer.available_bytes - runtime_bytes - device_control,
             .metadata_budget_bytes = owner.metadata(owner.selected),
             .control_reservation_bytes = control_bytes,

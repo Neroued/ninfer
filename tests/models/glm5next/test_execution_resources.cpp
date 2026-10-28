@@ -64,9 +64,9 @@ struct Fixture {
         parallel.ranks.resize(2);
         parallel.ranks[1].rank = 1;
         const std::array offers{
-            runtime::RankCapacityOffer{glm::describe_execution_capacity(plans[0]), 2ULL << 30,
+            runtime::RankCapacityOffer{glm::describe_execution_capacity(plans[0]), 1ULL << 30,
                                        2ULL << 30, NINFER_SHARED_PHYSICAL_MEMORY != 0},
-            runtime::RankCapacityOffer{glm::describe_execution_capacity(plans[1]), 3ULL << 30,
+            runtime::RankCapacityOffer{glm::describe_execution_capacity(plans[1]), 2ULL << 30,
                                        2ULL << 30, NINFER_SHARED_PHYSICAL_MEMORY != 0}};
         const auto capacities = runtime::resolve_group_context_capacity(
             ContextCapacityPolicy::automatic(1ULL << 30), offers, 0);

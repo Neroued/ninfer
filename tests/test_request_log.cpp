@@ -142,6 +142,8 @@ int main() {
     budget.available_after_weights_bytes        = 1700;
     budget.available_after_startup_bytes        = 180;
     budget.planned_slack_bytes                  = 100;
+    budget.headroom_bytes                       = 500;
+    budget.host_reservation_bytes               = 800;
     budget.graphs                  = ninfer::GraphMemorySummary{.rebuild_estimate_bytes      = 600,
                                                                 .warmup_increment_bytes      = 200,
                                                                 .preparation_increment_bytes = -30,
@@ -309,7 +311,9 @@ int main() {
                     .at(0)
                     .at("budget")
                     .at("available_after_startup_bytes") == 180 &&
-            server.at("resources").at("ranks").at(0).at("budget").at("headroom_bytes") == 0 &&
+            server.at("resources").at("ranks").at(0).at("budget").at("headroom_bytes") == 500 &&
+            server.at("resources").at("ranks").at(0).at("budget").at("host_reservation_bytes") ==
+                800 &&
             server.at("resources").at("ranks").at(0).at("budget").at("planned_slack_bytes") == 100,
         "adaptive KV memory ledger missing");
     failures +=

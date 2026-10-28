@@ -323,7 +323,8 @@ std::string Metrics::render(const EngineSnapshot& snapshot, bool ready) const {
     header("workspace_measurement_peak_bytes", "gauge",
            "Peak extent in the explicit measurement window.");
     header("memory_budget_bytes", "gauge", "Startup memory budget by rank.");
-    header("memory_headroom_bytes", "gauge", "Startup headroom outside planned rank allocations.");
+    header("memory_headroom_bytes", "gauge", "Planning headroom available to startup allocations.");
+    header("memory_host_reservation_bytes", "gauge", "Required Host capacity after startup.");
     header("cuda_memory_free_bytes", "gauge", "Sampled CUDA free memory, not process-owned bytes.");
     header("system_memory_available_bytes", "gauge", "Linux MemAvailable, once per node.");
     header("resource_sample_age_seconds", "gauge",
@@ -458,6 +459,7 @@ std::string Metrics::render(const EngineSnapshot& snapshot, bool ready) const {
         if (rank.rank < startup_.ranks.size()) {
             emit("memory_budget_bytes", startup_.ranks[rank.rank].limit_bytes);
             emit("memory_headroom_bytes", startup_.ranks[rank.rank].headroom_bytes);
+            emit("memory_host_reservation_bytes", startup_.ranks[rank.rank].host_reservation_bytes);
         }
         const auto& a = rank.memory.allocations;
         allocation("weights", "device", a.device_weights_bytes);

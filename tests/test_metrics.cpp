@@ -21,6 +21,9 @@ int main() {
     EngineDescription description;
     description.context_pools = {{0, ContextMemoryDomain::Host, 1048576, 4096}};
     StartupReport startup;
+    startup.ranks.resize(1);
+    startup.ranks[0].headroom_bytes         = 512;
+    startup.ranks[0].host_reservation_bytes = 1024;
     EngineSnapshot baseline;
     baseline.runtime.generated_tokens         = 4;
     baseline.runtime.speculative_draft_tokens = 3;
@@ -50,6 +53,11 @@ int main() {
     running.runtime.context_transfers.state[4].bytes = 1024;
     metrics.first_token({.prepare_seconds = 0.05, .elapsed_since_submit_seconds = 0.2});
     const auto live = metrics.render(running, true);
+    check(live.find("ninfer_memory_headroom_bytes{rank=\"0\",node=\"0\"} 512\n") !=
+                  std::string::npos &&
+              live.find("ninfer_memory_host_reservation_bytes{rank=\"0\",node=\"0\"} 1024\n") !=
+                  std::string::npos,
+          "startup metrics conflated consumable headroom with required Host capacity");
     check(live.find("ninfer_execution_units_total{kind=\"decode\"} 2\n") != std::string::npos &&
               live.find("ninfer_execution_rows_total{kind=\"decode\"} 4\n") != std::string::npos &&
               live.find("ninfer_rank_gpu_interval_samples_total{rank=\"0\",node=\"0\",interval="

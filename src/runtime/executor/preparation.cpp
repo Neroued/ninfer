@@ -19,6 +19,7 @@ void enter(dist::ExecutionGroup& group, const GroupPreparation& prepared, std::u
         out.u8(static_cast<std::uint8_t>(action));
         out.u64(capacity ? capacity->device_bytes : 0);
         out.u64(capacity ? capacity->control_reservation_bytes : 0);
+        out.u64(capacity ? capacity->planned_slack_bytes : 0);
         messages.push_back(
             {rank.rank, std::make_shared<const wire::Message>(wire::Message{
                             wire::Kind::Enter, group.epoch(), std::move(out).take()})});
@@ -123,8 +124,6 @@ GroupPreparation prepare_execution_group(dist::ExecutionGroup& group,
                                          ControlPreparation control) {
     if (payloads.size() != group.topology().ranks.size())
         throw std::invalid_argument("preparation payload count differs from rank count");
-    // Each rank's StartupMemoryBudget has already reserved its headroom.
-    policy.automatic_headroom_bytes = 0;
     try {
         std::vector<dist::OutgoingMessage> requests;
         for (const auto& rank : group.topology().ranks) {
@@ -220,8 +219,9 @@ GroupPreparation prepare_execution_group(dist::ExecutionGroup& group,
                     return result;
                 }
             }
+            if (attempt == 1 || policy.mode == ContextCapacityMode::Explicit)
+                throw std::runtime_error(allocation_failure);
             if (control.release) control.release();
-            if (attempt == 1) throw std::runtime_error(allocation_failure);
             enter_phase(PreparationAction::Release);
         }
         throw std::logic_error("preparation attempt exhausted");

@@ -1,5 +1,6 @@
 #include "models/qwen4_exp/parallel/preparation.h"
 #include "models/common/vocabulary.h"
+#include "core/platform.h"
 
 #include <algorithm>
 
@@ -160,7 +161,17 @@ void RankPreparation::prepare(runtime::ContextCapacity capacity, std::size_t ava
     auto plan                = plan_execution(profile_, {}, options, device_,
                                available > reserve ? available - reserve : 0, {}, control_owner_,
                                               available_host_bytes);
-    if (!plan) throw DeviceAllocationError("rank runtime capacity exceeds available memory");
+    if (!plan) {
+        const auto control   = control_owner_ && NINFER_SHARED_PHYSICAL_MEMORY
+                                   ? capacity_plan_.control_bytes(capacity)
+                                   : 0;
+        const auto required  = capacity_plan_.reservation_bytes(capacity) + control;
+        const auto remaining = available > reserve ? available - reserve : 0;
+        throw std::runtime_error("Qwen4Exp rank allocation budget exceeded: required " +
+                                 std::to_string(required) + " bytes, available " +
+                                 std::to_string(remaining) + " bytes, shortfall " +
+                                 std::to_string(required - remaining) + " bytes");
+    }
     instance_->program = std::make_unique<RankProgram>(
         instance_->parameters, std::move(*plan), device_, options_.startup_observer, binding_);
 }

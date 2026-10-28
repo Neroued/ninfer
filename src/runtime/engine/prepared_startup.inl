@@ -34,7 +34,7 @@ build_prepared_local_model(const artifact::Reader& reader, EngineOptions& option
     StartupMemoryBudget budget(initial, device_budget(initial.available_bytes()),
                                std::max(kDefaultContextHeadroomBytes, requirement.headroom_bytes),
                                requirement.host_reservation_bytes);
-    const auto available = budget.available(initial);
+    const auto available = budget.planning_available(initial);
     if (requirement.weight_bytes > available ||
         (initial.shared_physical_memory &&
          requirement.host_weight_bytes > available - requirement.weight_bytes) ||
@@ -51,7 +51,7 @@ build_prepared_local_model(const artifact::Reader& reader, EngineOptions& option
     preparation->materialize();
     device->synchronize();
     const auto after_weights = device_memory_snapshot(device->device());
-    if (preparation->report(budget.available(after_weights)).preparation_required) {
+    if (preparation->report(budget.planning_available(after_weights)).preparation_required) {
         StartupPhaseScope phase(options.startup_observer, StartupPhase::CudaGraphCalibration);
         preparation->prepare_probe();
         preparation->calibrate();
@@ -66,7 +66,7 @@ build_prepared_local_model(const artifact::Reader& reader, EngineOptions& option
         StartupPhaseScope phase(options.startup_observer, StartupPhase::ProgramInitialize);
         for (unsigned attempt = 0; attempt < 2; ++attempt) {
             const auto before  = device_memory_snapshot(device->device());
-            const auto room    = budget.available(before);
+            const auto room    = budget.planning_available(before);
             const auto report  = preparation->report(room);
             const auto offered = std::min(report.capacity.available_bytes, maximum_runtime);
             capacity = resolve_context_capacity(options.context_capacity, report.capacity.plan,
@@ -75,7 +75,8 @@ build_prepared_local_model(const artifact::Reader& reader, EngineOptions& option
             std::optional<DeviceMemorySnapshot> ready;
             std::exception_ptr allocation_error;
             try {
-                preparation->prepare({capacity.device_bytes}, room, budget.available_host(before));
+                preparation->prepare({capacity.device_bytes}, budget.allocation_available(before),
+                                                budget.available_host(before));
                 preparation->prepare_execution();
                 auto described = preparation->describe();
                 session.emplace(
@@ -83,14 +84,15 @@ build_prepared_local_model(const artifact::Reader& reader, EngineOptions& option
                 device->synchronize();
                 ready = device_memory_snapshot(device->device());
                 if (budget.fits(*ready)) {
-                    described.budget.limit_bytes    = budget.limit();
-                    described.budget.headroom_bytes = budget.headroom();
+                    described.budget.limit_bytes            = budget.limit();
+                    described.budget.headroom_bytes         = budget.headroom();
+                    described.budget.host_reservation_bytes = budget.host_reservation();
                     described.budget.available_after_weights_bytes =
                         after_weights.available_bytes();
                     described.budget.available_after_startup_bytes = ready->available_bytes();
                     described.budget.retained_bytes =
                         budget.retained(before, requirement.weight_bytes);
-                    described.budget.planned_slack_bytes   = budget.available(*ready);
+                    described.budget.planned_slack_bytes   = capacity.planned_slack_bytes;
                     capacity.available_after_weights_bytes = after_weights.available_bytes();
                     capacity.available_after_startup_bytes = ready->available_bytes();
                     capacity.automatic_headroom_bytes      = budget.headroom();
@@ -98,16 +100,21 @@ build_prepared_local_model(const artifact::Reader& reader, EngineOptions& option
                     return described;
                 }
             } catch (const DeviceAllocationError&) { allocation_error = std::current_exception(); }
+            std::string failure;
             if (ready) {
                 const auto cost =
                     capacity.runtime_reservation_bytes +
                     (before.shared_physical_memory ? capacity.control_reservation_bytes : 0);
                 maximum_runtime = budget.corrected_runtime_limit(*ready, cost);
+                failure         = "prepared runtime exceeds startup budget by " +
+                          std::to_string(budget.shortfall(*ready)) + " bytes";
             }
             session.reset();
             preparation->release_resources();
             device->synchronize();
             if (allocation_error) std::rethrow_exception(allocation_error);
+            if (attempt == 1 || options.context_capacity.mode == ContextCapacityMode::Explicit)
+                throw std::runtime_error(failure);
         }
         throw DeviceAllocationError("prepared runtime exceeds local resource budget");
     }();

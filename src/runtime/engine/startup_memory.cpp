@@ -33,12 +33,18 @@ StartupMemoryBudget::StartupMemoryBudget(DeviceMemorySnapshot initial, std::size
         throw std::invalid_argument("Host reservation exceeds available RAM");
 }
 
-std::size_t StartupMemoryBudget::available(DeviceMemorySnapshot current) const {
+std::size_t StartupMemoryBudget::planning_available(DeviceMemorySnapshot current) const noexcept {
+    const auto available = allocation_available(current);
+    return available > headroom_ ? available - headroom_ : 0;
+}
+
+std::size_t StartupMemoryBudget::allocation_available(DeviceMemorySnapshot current) const noexcept {
     const auto consumed = static_cast<std::size_t>(
         std::max<std::int64_t>(0, device_memory_growth(initial_, current)));
     const auto remaining =
         std::min(current.available_bytes(), consumed < limit_ ? limit_ - consumed : 0);
-    return remaining > headroom() ? remaining - headroom() : 0;
+    const auto reserve = initial_.shared_physical_memory ? host_reservation_ : 0;
+    return remaining > reserve ? remaining - reserve : 0;
 }
 
 bool StartupMemoryBudget::fits(DeviceMemorySnapshot current) const noexcept {

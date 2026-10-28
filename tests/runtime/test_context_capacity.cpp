@@ -35,16 +35,16 @@ int main() {
     };
     failures += check(plan.minimum_capacity().device_bytes == 3 * block,
                       "startup worksets did not use independent slab packing peaks");
-    const auto budget_bytes = 10 * block + 150;
-    const auto automatic    = resolve_context_capacity(ContextCapacityPolicy::automatic(50), plan,
+    const auto budget_bytes = 10 * block + 100;
+    const auto automatic    = resolve_context_capacity(ContextCapacityPolicy::automatic(), plan,
                                                        budget_bytes, SIZE_MAX, true);
     failures += check(automatic.device_bytes == 9 * block && automatic.block_bytes == block &&
                           automatic.runtime_reservation_bytes == 9 * block + 100 &&
                           automatic.metadata_budget_bytes == metadata(9) &&
                           automatic.control_reservation_bytes == metadata(9) &&
-                          automatic.planned_slack_bytes == block + 50 - metadata(9),
+                          automatic.planned_slack_bytes == block - metadata(9),
                       "shared-memory capacity omitted directory budget or slab rounding");
-    const auto discrete = resolve_context_capacity(ContextCapacityPolicy::automatic(50), plan,
+    const auto discrete = resolve_context_capacity(ContextCapacityPolicy::automatic(), plan,
                                                    budget_bytes, SIZE_MAX, false);
     failures += check(discrete.device_bytes == 10 * block &&
                           discrete.metadata_budget_bytes == metadata(10) &&
@@ -61,9 +61,9 @@ int main() {
     auto remote_plan               = plan;
     remote_plan.fixed_device_bytes = 500;
     const std::array offers{RankCapacityOffer{plan, budget_bytes, SIZE_MAX, true},
-                            RankCapacityOffer{remote_plan, 13 * block + 550, SIZE_MAX, true}};
+                            RankCapacityOffer{remote_plan, 13 * block + 500, SIZE_MAX, true}};
     const auto group =
-        resolve_group_context_capacity(ContextCapacityPolicy::automatic(50), offers, 0);
+        resolve_group_context_capacity(ContextCapacityPolicy::automatic(), offers, 0);
     failures += check(group[0].device_bytes == 9 * block && group[1].device_bytes == 13 * block &&
                           group[0].control_reservation_bytes == metadata(9) + metadata(13) &&
                           group[1].control_reservation_bytes == 0,
@@ -116,7 +116,7 @@ int main() {
     auto host_plan             = plan;
     host_plan.fixed_host_bytes = 400;
     const auto host_limited    = resolve_context_capacity(
-        ContextCapacityPolicy::automatic(50), host_plan, budget_bytes, 400 + metadata(9), false);
+        ContextCapacityPolicy::automatic(), host_plan, budget_bytes, 400 + metadata(9), false);
     failures += check(host_limited.device_bytes == 9 * block &&
                           host_limited.control_reservation_bytes == metadata(9),
                       "Host directory budget did not constrain an otherwise fitting Device pool");
@@ -140,9 +140,9 @@ int main() {
 
     // The probe left 200 bytes in the driver; the new free snapshot already includes it.
     const ninfer::runtime::StartupMemoryBudget budget({10000, 12000}, 8000, 500, 0);
-    failures += check(budget.available({7800, 12000}) == 5300,
+    failures += check(budget.planning_available({7800, 12000}) == 5300,
                       "startup retained allocation was not charged exactly once");
-    failures += check(budget.available({9800, 12000}) == 7300,
+    failures += check(budget.planning_available({9800, 12000}) == 7300,
                       "destroyed candidate backing was not returned to the budget");
     failures += check(budget.retained({7800, 12000}, 2000) == 200,
                       "owned weights were included in opaque retained storage");
@@ -156,14 +156,15 @@ int main() {
     failures += check(budget.corrected_runtime_limit({1900, 12000}, 2000) == 1900,
                       "runtime correction did not reclaim the observed Device deficit");
     const ninfer::runtime::StartupMemoryBudget physical({3000, 12000}, 8000, 500, 0);
-    failures += check(physical.available({2000, 12000}) == 1500,
+    failures += check(physical.planning_available({2000, 12000}) == 1500,
                       "physical availability did not bound the configured budget");
 
     const auto unified = [](std::size_t available) {
         return DeviceMemorySnapshot{available, 12000, available, 12000, true};
     };
     const StartupMemoryBudget shared(unified(10000), 8000, 500, 1000);
-    failures += check(shared.available(unified(7800)) == 4300 && shared.headroom() == 1500,
+    failures += check(shared.planning_available(unified(7800)) == 4300 &&
+                          shared.headroom() == 500 && shared.host_reservation() == 1000,
                       "shared Host payload capacity was not reserved");
     failures += check(shared.fits(unified(3000)) && !shared.fits(unified(2999)),
                       "startup consumed the shared Host payload reservation");
@@ -171,9 +172,47 @@ int main() {
                       "shared Host reservation was counted twice in the shortfall");
     failures += check(shared.corrected_runtime_limit(unified(2999), 2000) == 1999,
                       "shared physical shortage cannot reclaim runtime capacity");
+    // Plan against a net allowance, then consume part of the headroom without changing capacity.
+    for (bool shared_memory : {false, true}) {
+        constexpr auto headroom = block, host_reserve = 2 * block, graph = block / 2;
+        constexpr std::size_t slack = 128, drift = block / 4;
+        const auto snapshot = [&](std::size_t free) {
+            return DeviceMemorySnapshot{free, 32 * block, shared_memory ? free : 32 * block,
+                                        32 * block, shared_memory};
+        };
+        const StartupMemoryBudget envelope(snapshot(32 * block), 24 * block, headroom,
+                                           host_reserve);
+        const auto required = 10 * block + 100 + (shared_memory ? metadata(10) : 0);
+        const auto free_before =
+            required + graph + headroom + (shared_memory ? host_reserve : 0) + slack + 8 * block;
+        const auto before = snapshot(free_before);
+        const auto selected =
+            resolve_context_capacity(ContextCapacityPolicy::automatic(headroom), plan,
+                                     envelope.planning_available(before) - graph,
+                                     envelope.available_host(before), shared_memory);
+        const auto observed = snapshot(free_before - drift);
+        failures +=
+            check(selected.device_bytes == 10 * block && selected.planned_slack_bytes == slack,
+                  "startup headroom was charged twice during capacity selection");
+        failures += check(envelope.planning_available(observed) < required + graph &&
+                              envelope.allocation_available(observed) >= required + graph &&
+                              envelope.fits(snapshot(free_before - drift - required - graph)),
+                          "normal startup drift rejected a plan that fits the allocation budget");
+        const auto exhausted = snapshot(free_before - headroom - slack - 1);
+        failures +=
+            check(envelope.allocation_available(exhausted) == required + graph - 1 &&
+                      !envelope.fits(snapshot(exhausted.cuda_free_bytes - required - graph)),
+                  "allocation allowance exceeded the hard budget or spent the Host reserve");
+        const auto explicit_plan = resolve_context_capacity(
+            ContextCapacityPolicy::explicit_capacity(selected.device_bytes), plan,
+            envelope.allocation_available(observed) - graph, envelope.available_host(observed),
+            shared_memory);
+        failures += check(explicit_plan.device_bytes == selected.device_bytes,
+                          "allocation replanned the selected Context capacity using headroom");
+    }
     const DeviceMemorySnapshot discrete_start{10000, 12000, 5000, 6000, false};
     const StartupMemoryBudget host_media(discrete_start, 8000, 500, 1000);
-    failures += check(host_media.available({7800, 12000, 5000, 6000, false}) == 5300 &&
+    failures += check(host_media.planning_available({7800, 12000, 5000, 6000, false}) == 5300 &&
                           host_media.available_host(discrete_start) == 4000 &&
                           !host_media.fits({7800, 12000, 999, 6000, false}),
                       "discrete Host reservation was charged to VRAM or not protected in RAM");

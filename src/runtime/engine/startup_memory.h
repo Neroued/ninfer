@@ -13,7 +13,9 @@ class StartupMemoryBudget {
 public:
     StartupMemoryBudget(DeviceMemorySnapshot initial, std::size_t limit, std::size_t headroom,
                         std::size_t host_reservation);
-    [[nodiscard]] std::size_t available(DeviceMemorySnapshot current) const;
+    // Both allowances preserve mandatory Host capacity. Only planning also reserves headroom.
+    [[nodiscard]] std::size_t planning_available(DeviceMemorySnapshot current) const noexcept;
+    [[nodiscard]] std::size_t allocation_available(DeviceMemorySnapshot current) const noexcept;
     [[nodiscard]] std::size_t available_host(DeviceMemorySnapshot current) const noexcept;
     [[nodiscard]] bool fits(DeviceMemorySnapshot current) const noexcept;
     [[nodiscard]] std::size_t shortfall(DeviceMemorySnapshot current) const noexcept;
@@ -26,9 +28,9 @@ public:
 
     [[nodiscard]] std::size_t limit() const noexcept { return limit_; }
 
-    [[nodiscard]] std::size_t headroom() const noexcept {
-        return headroom_ + (initial_.shared_physical_memory ? host_reservation_ : 0);
-    }
+    [[nodiscard]] std::size_t headroom() const noexcept { return headroom_; }
+
+    [[nodiscard]] std::size_t host_reservation() const noexcept { return host_reservation_; }
 
 private:
     DeviceMemorySnapshot initial_;

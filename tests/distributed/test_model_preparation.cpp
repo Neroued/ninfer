@@ -30,6 +30,7 @@ std::vector<wire::Payload> exchange(distributed::ExecutionGroup& group,
         out.u8(static_cast<std::uint8_t>(action));
         out.u64(capacity.device_bytes);
         out.u64(capacity.control_reservation_bytes);
+        out.u64(capacity.planned_slack_bytes);
         messages.push_back(
             {rank.rank, std::make_shared<const wire::Message>(wire::Message{
                             wire::Kind::Enter, group.epoch(), std::move(out).take()})});
@@ -73,6 +74,7 @@ void rebuild(distributed::ExecutionGroup& group, rt::GroupPreparation& prepared)
         wire::Decoder in(bytes);
         require(in.u64() == group.topology().plan && in.u32() == prepared.attempt && in.boolean(),
                 "Program rebuild did not fit");
+        require(in.string().empty(), "successful rebuild returned a failure");
         const auto layout = in.bytes();
         prepared.layouts.emplace_back(wire::Bytes(layout.begin(), layout.end()));
         in.finish();

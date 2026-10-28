@@ -118,9 +118,13 @@ void RankPreparation::prepare(runtime::ContextCapacity capacity, std::size_t ava
     const auto reserved = capacity_.reservation_bytes(capacity);
     const auto control =
         control_owner_ && NINFER_SHARED_PHYSICAL_MEMORY ? capacity_.control_bytes(capacity) : 0;
-    if (reserved > available || control > available - reserved)
-        throw DeviceAllocationError("GLM5Next rank runtime capacity exceeds available memory",
-                                    reserved);
+    if (reserved > available || control > available - reserved) {
+        const auto required = reserved + control;
+        throw std::runtime_error("GLM5Next rank allocation budget exceeded: required " +
+                                 std::to_string(required) + " bytes, available " +
+                                 std::to_string(available) + " bytes, shortfall " +
+                                 std::to_string(required - available) + " bytes");
+    }
     auto plan     = plan_;
     plan.capacity = runtime::resolve_context_capacity(
         ContextCapacityPolicy::explicit_capacity(capacity.device_bytes), capacity_, available,
@@ -159,7 +163,6 @@ RankResourceDescription RankPreparation::describe() const {
                   .minimum_context_capacity_bytes    = c.minimum_device_bytes,
                   .context_control_budget_bytes      = c.control_reservation_bytes,
                   .available_after_weights_bytes     = c.available_after_weights_bytes,
-                  .headroom_bytes                    = c.automatic_headroom_bytes,
                   .planned_slack_bytes               = c.planned_slack_bytes};
     if (plan_.use_cuda_graph) {
         auto observed     = instance_->program->resource_budget().graphs;

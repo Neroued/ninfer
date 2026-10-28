@@ -49,7 +49,7 @@ calibrate_plan(const Setup& setup, RankModelInstance<typename Setup::Types>& ins
         const auto graph          = found->memory;
         const auto graph_bytes    = graph.rebuild_estimate_bytes;
         const auto snapshot       = device_memory_snapshot(device.device());
-        auto available            = budget.available(snapshot);
+        auto available            = budget.planning_available(snapshot);
         const auto available_host = budget.available_host(snapshot);
         if (graph_bytes > available) return std::nullopt;
         const auto offered = std::min(available - graph_bytes, maximum_runtime);
@@ -146,7 +146,7 @@ prepare_program(const Setup& setup, RankModelInstance<typename Setup::Types>& in
         device.synchronize();
         if (attempts == 1) return std::nullopt;
         const auto after_cleanup = device_memory_snapshot(device.device());
-        const auto available     = budget.available(after_cleanup);
+        const auto available     = budget.planning_available(after_cleanup);
         if (reserve > available) return std::nullopt;
         auto candidate = setup.plan(device, options, startup.placement,
                                     std::min(available - reserve, maximum_runtime),
@@ -214,7 +214,7 @@ BuiltModel<typename Setup::Types> build_local_model(const artifact::Reader& read
     const auto choices   = setup.placements();
     std::size_t selected = 0;
     const auto choose    = [&](DeviceMemorySnapshot snapshot) {
-        const auto available      = budget.available(snapshot);
+        const auto available      = budget.planning_available(snapshot);
         const auto host_available = budget.available_host(snapshot);
         for (; selected < choices.size(); ++selected) {
             const auto& choice = choices[selected];
@@ -316,7 +316,8 @@ BuiltModel<typename Setup::Types> build_local_model(const artifact::Reader& read
          .context_control_budget_bytes      = capacity.metadata_budget_bytes,
          .available_after_weights_bytes     = capacity.available_after_weights_bytes,
          .available_after_startup_bytes     = capacity.available_after_startup_bytes,
-         .headroom_bytes                    = capacity.automatic_headroom_bytes,
+         .headroom_bytes                    = budget.headroom(),
+         .host_reservation_bytes            = budget.host_reservation(),
          .planned_slack_bytes               = capacity.planned_slack_bytes,
          .retained_bytes                    = memory.startup_retained_bytes,
          .graphs                            = memory.cuda_graph});

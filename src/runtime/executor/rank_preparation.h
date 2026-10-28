@@ -48,7 +48,7 @@ prepare_rank(distributed::WorkerConnection& connection, std::unique_ptr<artifact
     {
         StartupPhaseScope phase(observer, StartupPhase::RuntimeMemoryCheck);
         const auto before_weights    = device_memory_snapshot(device.device());
-        const auto available_weights = budget.available(before_weights);
+        const auto available_weights = budget.planning_available(before_weights);
         if (requirement.weight_bytes > available_weights ||
             (before_weights.shared_physical_memory &&
              requirement.host_weight_bytes > available_weights - requirement.weight_bytes))
@@ -66,7 +66,7 @@ prepare_rank(distributed::WorkerConnection& connection, std::unique_ptr<artifact
     ContextCapacityPlan capacity_plan;
     const auto report = [&] {
         const auto snapshot  = device_memory_snapshot(device.device());
-        const auto available = budget.available(snapshot);
+        const auto available = budget.planning_available(snapshot);
         wire::Encoder out;
         out.u64(topology.plan);
         out.u32(attempt);
@@ -86,7 +86,7 @@ prepare_rank(distributed::WorkerConnection& connection, std::unique_ptr<artifact
     bool entered = false, accepted = false;
     ContextCapacity allocated_capacity;
     DeviceMemorySnapshot allocation_snapshot{};
-    std::size_t control_reservation_bytes = 0;
+    std::size_t control_reservation_bytes = 0, planned_slack_bytes = 0;
     std::string failure;
     const auto describe = [&] {
         auto result = preparing->describe();
@@ -108,9 +108,10 @@ prepare_rank(distributed::WorkerConnection& connection, std::unique_ptr<artifact
         result.budget.limit_bytes                   = budget.limit();
         result.budget.context_control_budget_bytes  = control_reservation_bytes;
         result.budget.headroom_bytes                = budget.headroom();
+        result.budget.host_reservation_bytes        = budget.host_reservation();
         result.budget.available_after_weights_bytes = after_weights.available_bytes();
         result.budget.available_after_startup_bytes = after.available_bytes();
-        result.budget.planned_slack_bytes           = budget.available(after);
+        result.budget.planned_slack_bytes           = planned_slack_bytes;
         result.budget.retained_bytes =
             budget.retained(allocation_snapshot, requirement.weight_bytes);
         accepted = budget.fits(after);
@@ -146,6 +147,7 @@ prepare_rank(distributed::WorkerConnection& connection, std::unique_ptr<artifact
         const auto action = static_cast<PreparationAction>(command.u8());
         const ContextCapacity capacity{command.u64()};
         const auto planned_control_bytes = command.u64();
+        const auto planning_slack        = command.u64();
         command.finish();
         if (action == PreparationAction::PrepareCommunication) {
             StartupPhaseScope phase(observer, StartupPhase::CommunicationWarmup);
@@ -252,8 +254,9 @@ prepare_rank(distributed::WorkerConnection& connection, std::unique_ptr<artifact
         StartupPhaseScope phase(observer, StartupPhase::ProgramInitialize);
         const auto before         = device_memory_snapshot(device.device());
         allocation_snapshot       = before;
-        const auto available      = budget.available(before);
+        const auto available      = budget.allocation_available(before);
         control_reservation_bytes = planned_control_bytes;
+        planned_slack_bytes       = planning_slack;
         const auto local_control  = capacity_plan.control_bytes(capacity);
         const auto remote_control =
             planned_control_bytes > local_control ? planned_control_bytes - local_control : 0;

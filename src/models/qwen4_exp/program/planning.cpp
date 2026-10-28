@@ -217,11 +217,10 @@ std::optional<ExecutionPlan> plan_execution(std::shared_ptr<const execution::Mod
                                             std::shared_ptr<const moe::Plan> prototype,
                                             bool control_owner, std::size_t available_host_bytes) {
     if (!profile) throw std::invalid_argument("execution planning requires a model profile");
-    const auto o = options(*profile, supplied);
-    auto out     = physical_plan(std::move(profile), table, o, device, prototype.get());
-    auto budget  = capacity_plan(out, o);
-    auto policy  = o.context_capacity;
-    policy.automatic_headroom_bytes = 0;
+    const auto o       = options(*profile, supplied);
+    auto out           = physical_plan(std::move(profile), table, o, device, prototype.get());
+    auto budget        = capacity_plan(out, o);
+    const auto& policy = o.context_capacity;
     if (prototype) {
         const auto capacity = policy.mode == ContextCapacityMode::Explicit
                                   ? runtime::ContextCapacity{policy.explicit_bytes}

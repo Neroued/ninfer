@@ -764,11 +764,14 @@ int main() {
         memory.memory.workspace                                 = {64, 96, 80};
         memory.memory.experts.emplace().fixed_experts_per_layer = {1, 7, 3};
         RankMemoryBudget budget;
-        budget.graphs = GraphMemorySummary{.rebuild_estimate_bytes      = 42,
-                                           .warmup_increment_bytes      = -8,
-                                           .preparation_increment_bytes = -12,
-                                           .preparation_peak_bytes      = 23,
-                                           .calibration_increment_bytes = 5};
+        budget.headroom_bytes         = 512;
+        budget.host_reservation_bytes = 1024;
+        budget.planned_slack_bytes    = 7;
+        budget.graphs                 = GraphMemorySummary{.rebuild_estimate_bytes      = 42,
+                                                           .warmup_increment_bytes      = -8,
+                                                           .preparation_increment_bytes = -12,
+                                                           .preparation_peak_bytes      = 23,
+                                                           .calibration_increment_bytes = 5};
         memory.communication.push_back(
             {.group = 1, .size = 2, .startup_memory = CommunicationMemory{100, 20, 80}});
         wire::Encoder out;
@@ -781,6 +784,8 @@ int main() {
         in.finish();
         require(report.rank == 1 && report.node == 3 &&
                     report.memory.workspace.required_peak_bytes == 96 &&
+                    planning.headroom_bytes == 512 && planning.host_reservation_bytes == 1024 &&
+                    planning.planned_slack_bytes == 7 &&
                     planning.graphs->preparation_increment_bytes == -12 &&
                     planning.graphs->preparation_peak_bytes == 23 &&
                     report.communication.at(0).startup_memory->tracked_device_bytes == 100 &&

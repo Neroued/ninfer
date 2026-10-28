@@ -47,6 +47,7 @@ Json budget_json(const RankMemoryBudget& b) {
             {"available_after_weights_bytes", b.available_after_weights_bytes},
             {"available_after_startup_bytes", b.available_after_startup_bytes},
             {"headroom_bytes", b.headroom_bytes},
+            {"host_reservation_bytes", b.host_reservation_bytes},
             {"planned_slack_bytes", b.planned_slack_bytes},
             {"retained_bytes", b.retained_bytes},
             {"graph_calibration", std::move(graphs)}};

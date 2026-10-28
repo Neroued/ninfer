@@ -122,9 +122,11 @@ struct RankMemoryBudget {
     std::uint64_t context_control_budget_bytes      = 0;
     std::uint64_t available_after_weights_bytes     = 0;
     std::uint64_t available_after_startup_bytes     = 0;
-    std::uint64_t headroom_bytes                    = 0;
-    std::uint64_t planned_slack_bytes               = 0;
-    std::int64_t retained_bytes                     = 0;
+    // Planning headroom may be consumed during startup; Host reservation must remain available.
+    std::uint64_t headroom_bytes         = 0;
+    std::uint64_t host_reservation_bytes = 0;
+    std::uint64_t planned_slack_bytes    = 0;
+    std::int64_t retained_bytes          = 0;
     std::optional<GraphMemorySummary> graphs;
 };
 

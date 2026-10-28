@@ -154,7 +154,7 @@ int coordinator(int argc, char** argv) {
     topology.roles  = {{"tp", 0}, {"ep", 0}};
     const std::array<std::string, 1> args{"--worker"};
     dist::ExecutionGroup group(
-        deployment, topology,
+        deployment, topology, {},
         [](auto rank, auto line) { std::cerr << "rank=" << rank << " " << line << '\n'; }, args);
     const auto receive = [&] {
         std::vector<wire::Payload> results(size);
@@ -164,11 +164,7 @@ int coordinator(int argc, char** argv) {
         while (count != size) {
             if (Clock::now() >= deadline)
                 throw std::runtime_error("collective benchmark timed out");
-            if (auto value = group.transport().poll()) {
-                if (value->message.kind == wire::Kind::Failed) {
-                    wire::Decoder failure(value->message.payload);
-                    throw std::runtime_error(failure.string());
-                }
+            if (auto value = group.poll()) {
                 if (value->message.epoch != group.epoch() ||
                     value->message.kind != wire::Kind::Ready || seen.at(value->peer))
                     throw std::runtime_error("invalid benchmark completion");
@@ -176,7 +172,6 @@ int coordinator(int argc, char** argv) {
                 results[value->peer] = std::move(value->message.payload);
                 ++count;
             } else {
-                group.check_processes();
                 std::this_thread::yield();
             }
         }
@@ -197,7 +192,7 @@ int coordinator(int argc, char** argv) {
                     wire::Message{wire::Kind::Prepare, group.epoch(), std::move(request).take()});
                 const std::array sends{dist::OutgoingMessage{0, message},
                                        dist::OutgoingMessage{1, message}};
-                if (!group.transport().try_send(sends))
+                if (!group.try_send(sends))
                     throw std::runtime_error("benchmark command queue is full");
                 const auto results = receive();
                 std::array<double, 2> gpu{}, host{};

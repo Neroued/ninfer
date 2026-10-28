@@ -161,10 +161,8 @@ public:
         if (failure_) return Event{std::exchange(failure_, {}).value()};
         if (failed_ || closed_) return {};
         try {
-            while (auto incoming = group_->transport().poll()) {
+            while (auto incoming = group_->poll()) {
                 auto& message = incoming->message;
-                if (message.epoch != epoch().value)
-                    throw std::logic_error("stale rank event epoch");
                 distributed::wire::Decoder in(message.payload);
                 if (message.kind == distributed::wire::Kind::Observation) {
                     auto snapshot = protocol::rank_snapshot(in);
@@ -202,12 +200,6 @@ public:
                     in.finish();
                     inputs_.complete(incoming->peer, id);
                     continue;
-                }
-                if (message.kind == distributed::wire::Kind::Failed) {
-                    auto detail = in.string();
-                    in.finish();
-                    throw std::runtime_error("rank " + std::to_string(incoming->peer) + ": " +
-                                             detail);
                 }
                 if (message.kind == distributed::wire::Kind::Progress) {
                     const auto applied = in.u64(), retired = in.u64();
@@ -254,7 +246,6 @@ public:
                 consume(incoming->peer, std::move(event));
             }
             progress_inputs();
-            group_->check_processes();
         } catch (const std::exception& e) {
             fail(e.what());
             return Event{std::exchange(failure_, {}).value()};
@@ -269,7 +260,7 @@ public:
         if (!failed_ && !closed_) {
             try {
                 progress_inputs();
-                group_->check_processes();
+                group_->progress();
             } catch (const std::exception& e) { fail(e.what()); }
         }
     }
@@ -367,7 +358,7 @@ private:
     }
 
     void progress_inputs() {
-        inputs_.progress(group_->transport(), epoch().value);
+        inputs_.progress(*group_, epoch().value);
         for (auto* flights : {&compute_, &context_})
             for (auto& flight : *flights) {
                 if (flight.phase != Phase::Inputs || !inputs_.ready(flight.inputs)) continue;
@@ -404,8 +395,7 @@ private:
 
     void validate_control_capacity() const {
         protocol::validate_control_capacity(codec_.control_budget(), pool_.capacity(),
-                                            group_->transport().limits(),
-                                            group_->topology().ranks.size());
+                                            group_->limits(), group_->topology().ranks.size());
     }
 
     void measurement_boundary(MeasurementCommand command) {
@@ -480,9 +470,8 @@ private:
     }
 
     void send(std::span<const distributed::OutgoingMessage> messages, bool continuation) {
-        if (!group_->transport().try_send(messages, continuation
-                                                        ? distributed::Traffic::Continuation
-                                                        : distributed::Traffic::Work))
+        if (!group_->try_send(messages, continuation ? distributed::Traffic::Continuation
+                                                     : distributed::Traffic::Work))
             throw std::logic_error("execution exceeded its reserved control capacity");
     }
 

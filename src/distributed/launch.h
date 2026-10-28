@@ -33,6 +33,7 @@ public:
     [[nodiscard]] std::optional<int> exit_status();
     void terminate() noexcept;
     [[nodiscard]] RankId rank() const noexcept;
+    [[nodiscard]] std::string_view log_tail() const noexcept;
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

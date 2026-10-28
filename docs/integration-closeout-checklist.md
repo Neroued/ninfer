@@ -2,7 +2,8 @@
 
 更新日期：2026-10-28。保留原问题编号，逐项推进。
 
-当前剩余：**6、7、9 待实现，10 待定性**。1、2、3、4、5、8 已完成。
+当前剩余：**9 待实现，10 待定性**。1—8 已完成。
+本轮另定位了启动 headroom 的规划／分配额度混用，见第 7 项验收备注。
 状态依据当前源码和各项实测记录。
 
 ## 1. Perplexity 接入公共启动配置与 deployment
@@ -90,37 +91,35 @@ profiler；Engine 执行线程等待请求及尾部 context work 完成，worker
 
 ## 6. 分布式 worker 启动进度贯通
 
-- [ ] 将已有启动阶段传回协调端并按来源展示。
+- [x] 将已有启动阶段传回协调端并按来源展示。
 
-入口：[Qwen4Exp rank preparation](../src/models/qwen4_exp/parallel/preparation.cpp)、
-[GLM rank preparation](../src/models/glm5next/parallel/rank_preparation.cpp)、
-[StartupEvent](../include/ninfer/types.h)、
-[StartupLogRenderer](../src/product/logging/startup_log.cpp)。
+`StartupEvent` 携带 rank／node、准备次数与阶段实例；耗时由产生事件的 rank 计算。
+Qwen4Exp 与 GLM 的 worker observer 已接入加载、通信预热、资源准备、Graph 校准／捕获及 Ready。
 
-现状：`StartupEvent` 仍无 rank／node 来源，renderer 仍只按 phase 保存一套状态；
-worker 解码后的启动 observer 没有接上协调端。当前 `wire::Kind::Progress` 传递的是
-运行时命令进度，不是启动阶段事件。Qwen4Exp 和 GLM 双机路径均需接入。
+启动诊断与运行时命令进度分开。诊断队列有独立容量，中间进度合并；阶段回复携带最终快照。
+Renderer 按来源和阶段实例维护状态，忽略重复／过期事件。Ready 后停止转发，日志回调异常不影响启动。
 
-任务：为事件明确 rank／node 来源，贯通 worker observer 到协调端；renderer 按来源和 phase
-分别维护进度、耗时及失败状态。转发有界，日志回调异常沿用诊断发布边界的隔离规则。
-
-完成条件：能辨认各 rank 正在执行和已完成的阶段；耗时不串用；进度与日志失败不改变启动结果。
+验证：本机与 Spark 的日志／协议测试通过；双机执行用例覆盖抛异常的 observer。
+Qwen4Exp、GLM 均完成双机 Graph 启动与请求，保留各 rank 的独立阶段耗时；GLM 还检查了终端交互展示。
+记录位于 `.agent-tmp/startup-closeout/`。
 
 ## 7. 分布式启动失败保留原始原因
 
-- [ ] 修正失败消息与进程退出的处理次序。
+- [x] 修正失败消息、进程退出与连接结束的处理次序。
 
-入口：[bootstrap.cpp](../src/distributed/bootstrap.cpp)、
-[executor/preparation.cpp](../src/runtime/executor/preparation.cpp)。
+Transport 按 peer 交付完整消息及连接结束事件；写端失败后继续接收，单个 peer 失败不停止其他连接。
+ExecutionGroup 统一消费诊断、业务消息与进程状态，优先保存完整 `Failed`，补充 rank／node、阶段及准备次数。
+进程启动失败保留有界日志尾部；清理错误不覆盖原始原因。模型准备与运行时调用方不再各自检查退出状态。
 
-现状：`ExecutionGroup::Impl::await()` 和模型准备阶段的 `receive()` 都仍先调用
-`check_processes()`，再读取 transport 队列；进程退出或连接错误仍可能覆盖已收到的 `Failed`。
+验证：协议测试覆盖分片消息、紧随其后的 EOF、截断消息、其他 peer 继续接收、诊断额度耗尽及正常退出。
+真实双机缺失模型路径完整保留远端路径和 `No such file or directory`；执行失败与缺失 worker 用例保留原始原因，
+没有遗留子进程。RTX 5090 和两台 Spark 均完成完整构建。
 
-任务：协调已接收／在途的 `Failed`、进程退出和连接关闭，保留具体失败原因并补充 rank、
-启动阶段上下文；避免先检查退出状态而覆盖 worker 已发送的原始错误。
-
-完成条件：worker 模型路径不存在等实际启动错误能显示具体路径和原因；退出、断连及超时
-仍能结束启动并完成所属资源清理。
+验收备注：GLM 的日常 `auto` 配置曾在分配前被容量复核拒绝，同配置后续启动及请求成功。
+两机启动前均清过文件缓存。现有 `StartupMemoryBudget::available()` 已扣除 headroom，
+worker 在实际分配前仍用该规划额度复核；正常内存变化超过 Context 按块取整留下的余量时，
+即使尚有 headroom 也会提前失败。需要分别提供规划额度与实际分配额度，后者允许消耗规划 headroom，
+并继续由最终预算检查保护总额度和 Host 保留容量；该预算修正尚未实施。
 
 ## 8. KV 容量曲线的旧差分外推
 

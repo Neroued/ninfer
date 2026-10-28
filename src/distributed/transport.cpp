@@ -17,6 +17,7 @@
 #include <deque>
 #include <limits>
 #include <mutex>
+#include <map>
 #include <stdexcept>
 #include <system_error>
 #include <type_traits>
@@ -216,6 +217,7 @@ namespace {
 struct ReceiveCredits {
     Socket wake{::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC)};
     std::atomic<std::size_t> bytes{0}, count{0};
+    std::atomic<std::size_t> diagnostic_bytes{0}, diagnostic_count{0};
 
     ReceiveCredits() {
         if (wake.fd() < 0) socket_error("eventfd");
@@ -230,16 +232,21 @@ struct ReceiveCredits {
 struct ReceiveReservation {
     std::shared_ptr<ReceiveCredits> owner;
     std::size_t bytes;
+    bool diagnostic;
 
-    ReceiveReservation(std::shared_ptr<ReceiveCredits> owner, std::size_t bytes)
-        : owner(std::move(owner)), bytes(bytes) {
-        this->owner->bytes.fetch_add(bytes, std::memory_order_relaxed);
-        this->owner->count.fetch_add(1, std::memory_order_relaxed);
+    ReceiveReservation(std::shared_ptr<ReceiveCredits> owner, std::size_t bytes, bool diagnostic)
+        : owner(std::move(owner)), bytes(bytes), diagnostic(diagnostic) {
+        (diagnostic ? this->owner->diagnostic_bytes : this->owner->bytes)
+            .fetch_add(bytes, std::memory_order_relaxed);
+        (diagnostic ? this->owner->diagnostic_count : this->owner->count)
+            .fetch_add(1, std::memory_order_relaxed);
     }
 
     ~ReceiveReservation() {
-        owner->bytes.fetch_sub(bytes, std::memory_order_relaxed);
-        owner->count.fetch_sub(1, std::memory_order_relaxed);
+        (diagnostic ? owner->diagnostic_bytes : owner->bytes)
+            .fetch_sub(bytes, std::memory_order_relaxed);
+        (diagnostic ? owner->diagnostic_count : owner->count)
+            .fetch_sub(1, std::memory_order_relaxed);
         owner->notify();
     }
 };
@@ -261,6 +268,7 @@ struct Transport::Impl {
         std::size_t position = 0;
         std::optional<wire::Message> reading;
         bool blocked = false, stopped = false;
+        bool receiving = false, discard = false, write_failed = false;
     };
 
     struct Pending {
@@ -295,12 +303,16 @@ struct Transport::Impl {
         incoming.clear();
         queued_bytes = queued_count = continuation_bytes = continuation_count = 0;
         input_bytes = input_count = 0;
+        diagnostic_bytes = diagnostic_count = 0;
+        receiving.store(0, std::memory_order_release);
     }
 
-    void complete(const Write& write) {
-        std::lock_guard lock(mutex);
+    void complete_locked(const Write& write) {
         const auto n = write.header.size() + write.message->payload.size();
-        if (write.traffic == Traffic::Input) {
+        if (write.traffic == Traffic::Diagnostic) {
+            diagnostic_bytes -= n;
+            --diagnostic_count;
+        } else if (write.traffic == Traffic::Input) {
             input_bytes -= n;
             --input_count;
         } else if (write.traffic == Traffic::Continuation) {
@@ -310,6 +322,42 @@ struct Transport::Impl {
             queued_bytes -= n;
             --queued_count;
         }
+    }
+
+    void complete(const Write& write) {
+        std::lock_guard lock(mutex);
+        complete_locked(write);
+    }
+
+    void stop_writes(Peer& peer, const std::string& reason) {
+        peer.write_failed = true;
+        std::lock_guard lock(mutex);
+        send_errors.try_emplace(peer.rank, reason);
+        for (const auto& write : peer.writes) complete_locked(write);
+        peer.writes.clear();
+        std::erase_if(pending, [&](const auto& item) {
+            if (item.peer != peer.rank) return false;
+            complete_locked(item.write);
+            return true;
+        });
+    }
+
+    void end_peer(Peer& peer, std::string reason) {
+        if (peer.socket.fd() < 0) return;
+        if (!peer.stopped) failure_signal->store(true, std::memory_order_release);
+        stop_writes(peer, reason.empty() ? "control peer stopped" : reason);
+        peer.socket.close();
+        peer.reading.reset();
+        peer.position = 0;
+        if (std::exchange(peer.receiving, false)) receiving.fetch_sub(1, std::memory_order_release);
+        std::lock_guard lock(mutex);
+        incoming.emplace_back(PeerStatus{peer.rank, std::move(reason), true, peer.stopped});
+    }
+
+    void receive_peer(Peer& peer) {
+        try {
+            read_peer(peer);
+        } catch (const std::exception& e) { end_peer(peer, e.what()); }
     }
 
     void write_peer(Peer& peer) {
@@ -348,19 +396,31 @@ struct Transport::Impl {
                                              " has " + std::to_string(h.bytes) +
                                              " bytes; transport limit is " +
                                              std::to_string(limits.message_bytes));
+                const bool diagnostic = h.kind == wire::Kind::StartupProgress;
+                if (diagnostic && h.bytes > limits.diagnostic_bytes)
+                    throw std::runtime_error("startup diagnostic exceeds its transport capacity");
                 {
                     std::lock_guard lock(mutex);
-                    if (receive->count.load(std::memory_order_relaxed) >=
-                            limits.queued_messages + limits.continuation_messages +
-                                limits.input_messages ||
-                        h.bytes > limits.queued_bytes + limits.continuation_bytes +
-                                      limits.input_bytes -
-                                      receive->bytes.load(std::memory_order_relaxed)) {
+                    if (diagnostic) {
+                        peer.discard =
+                            receive->diagnostic_count.load(std::memory_order_relaxed) >=
+                                limits.diagnostic_messages ||
+                            h.bytes > limits.diagnostic_bytes -
+                                          receive->diagnostic_bytes.load(std::memory_order_relaxed);
+                    } else if (receive->count.load(std::memory_order_relaxed) >=
+                                   limits.queued_messages + limits.continuation_messages +
+                                       limits.input_messages ||
+                               h.bytes > limits.queued_bytes + limits.continuation_bytes +
+                                             limits.input_bytes -
+                                             receive->bytes.load(std::memory_order_relaxed)) {
                         peer.blocked = true;
                         return;
                     }
                 }
-                auto reservation = std::make_shared<ReceiveReservation>(receive, h.bytes);
+                auto reservation =
+                    peer.discard
+                        ? nullptr
+                        : std::make_shared<ReceiveReservation>(receive, h.bytes, diagnostic);
                 peer.reading.emplace(
                     wire::Message{h.kind, h.epoch,
                                   wire::Payload(wire::Bytes(static_cast<std::size_t>(h.bytes)),
@@ -372,9 +432,13 @@ struct Transport::Impl {
                 if (peer.reading->kind == wire::Kind::Failed)
                     failure_signal->store(true, std::memory_order_release);
                 if (peer.reading->kind == wire::Kind::Stopped) peer.stopped = true;
-                incoming.push_back({peer.rank, std::move(*peer.reading)});
+                if (!peer.discard)
+                    incoming.emplace_back(IncomingMessage{peer.rank, std::move(*peer.reading)});
                 peer.reading.reset();
                 peer.position = 0;
+                peer.discard  = false;
+                if (std::exchange(peer.receiving, false))
+                    receiving.fetch_sub(1, std::memory_order_release);
                 return;
             }
             std::span<std::byte> data =
@@ -382,15 +446,19 @@ struct Transport::Impl {
                              : std::span<std::byte>(peer.header).subspan(peer.position);
             const auto n = ::recv(peer.socket.fd(), data.data(), data.size(), 0);
             if (n > 0) {
+                if (!std::exchange(peer.receiving, true))
+                    receiving.fetch_add(1, std::memory_order_release);
                 peer.position += static_cast<std::size_t>(n);
                 continue;
             }
             if (n == 0 && peer.stopped) {
-                peer.socket.close();
+                end_peer(peer, {});
                 return;
             }
             if (n == 0)
-                throw std::runtime_error("rank " + std::to_string(peer.rank) + " disconnected");
+                throw std::runtime_error(peer.reading || peer.position
+                                             ? "control connection ended inside a message"
+                                             : "control connection closed");
             if (errno == EINTR) continue;
             if (errno == EAGAIN || errno == EWOULDBLOCK) return;
             socket_error("receive control message");
@@ -409,10 +477,12 @@ struct Transport::Impl {
                             std::find_if(peers.begin(), peers.end(),
                                          [&](const auto& peer) { return peer.rank == p.peer; });
                         auto position = it->writes.end();
-                        if (p.write.traffic != Traffic::Input)
+                        if (p.write.traffic != Traffic::Diagnostic)
                             position = std::find_if(
-                                it->writes.begin(), it->writes.end(), [](const auto& w) {
-                                    return w.traffic == Traffic::Input && w.position == 0;
+                                it->writes.begin(), it->writes.end(), [&](const auto& w) {
+                                    return w.position == 0 && (w.traffic == Traffic::Diagnostic ||
+                                                               (p.write.traffic != Traffic::Input &&
+                                                                w.traffic == Traffic::Input));
                                 });
                         it->writes.insert(position, std::move(p.write));
                     }
@@ -420,7 +490,7 @@ struct Transport::Impl {
                 }
                 pollers[0] = {receive->wake.fd(), POLLIN, 0};
                 for (std::size_t i = 0; i < peers.size(); ++i) {
-                    read_peer(peers[i]);
+                    receive_peer(peers[i]);
                     pollers[i + 1] = {peers[i].socket.fd(),
                                       static_cast<short>((peers[i].blocked ? 0 : POLLIN) |
                                                          (peers[i].writes.empty() ? 0 : POLLOUT)),
@@ -438,9 +508,19 @@ struct Transport::Impl {
                 }
                 for (std::size_t i = 0; i < peers.size(); ++i) {
                     const auto events = pollers[i + 1].revents;
-                    if (events & POLLOUT) write_peer(peers[i]);
-                    if (events & (POLLIN | POLLHUP | POLLERR)) read_peer(peers[i]);
-                    if (events & POLLNVAL) throw std::runtime_error("invalid control socket");
+                    auto& peer        = peers[i];
+                    if (events & (POLLIN | POLLHUP | POLLERR)) receive_peer(peer);
+                    if ((events & POLLOUT) && peer.socket.fd() >= 0 && !peer.write_failed) {
+                        try {
+                            write_peer(peer);
+                        } catch (const std::exception& e) {
+                            failure_signal->store(true, std::memory_order_release);
+                            stop_writes(peer, e.what());
+                            std::lock_guard lock(mutex);
+                            incoming.emplace_back(PeerStatus{peer.rank, e.what(), false, false});
+                        }
+                    }
+                    if (events & POLLNVAL) end_peer(peer, "invalid control socket");
                 }
             }
         } catch (const std::exception& e) {
@@ -463,9 +543,12 @@ struct Transport::Impl {
     std::vector<std::thread> threads;
     mutable std::mutex mutex;
     std::deque<Pending> pending;
-    std::deque<IncomingMessage> incoming;
+    std::deque<TransportEvent> incoming;
+    std::map<RankId, std::string> send_errors;
+    std::atomic<std::size_t> receiving{0};
     std::size_t queued_bytes = 0, queued_count = 0, continuation_bytes = 0, continuation_count = 0;
     std::size_t input_bytes = 0, input_count = 0;
+    std::size_t diagnostic_bytes = 0, diagnostic_count = 0;
     bool started = false, closed = false;
     std::string error;
 };
@@ -497,6 +580,10 @@ bool Transport::try_send(std::span<const OutgoingMessage> messages, Traffic traf
     std::size_t bytes = 0;
     for (const auto& item : messages) {
         if (!item.message) throw std::invalid_argument("outgoing control message is empty");
+        if ((traffic == Traffic::Diagnostic) != (item.message->kind == wire::Kind::StartupProgress))
+            throw std::invalid_argument("diagnostic traffic kind differs");
+        if (const auto error = p.send_errors.find(item.peer); error != p.send_errors.end())
+            throw std::runtime_error("rank " + std::to_string(item.peer) + ": " + error->second);
         if (item.message->payload.size() > p.limits.message_bytes)
             throw std::invalid_argument("rank " + std::to_string(item.peer) + " message " +
                                         std::to_string(static_cast<unsigned>(item.message->kind)) +
@@ -510,16 +597,20 @@ bool Transport::try_send(std::span<const OutgoingMessage> messages, Traffic traf
         if (n > SIZE_MAX - bytes) throw std::overflow_error("control batch size overflow");
         bytes += n;
     }
-    auto& used_bytes     = traffic == Traffic::Input          ? p.input_bytes
+    auto& used_bytes     = traffic == Traffic::Diagnostic     ? p.diagnostic_bytes
+                           : traffic == Traffic::Input        ? p.input_bytes
                            : traffic == Traffic::Continuation ? p.continuation_bytes
                                                               : p.queued_bytes;
-    auto& used_count     = traffic == Traffic::Input          ? p.input_count
+    auto& used_count     = traffic == Traffic::Diagnostic     ? p.diagnostic_count
+                           : traffic == Traffic::Input        ? p.input_count
                            : traffic == Traffic::Continuation ? p.continuation_count
                                                               : p.queued_count;
-    const auto max_bytes = traffic == Traffic::Input          ? p.limits.input_bytes
+    const auto max_bytes = traffic == Traffic::Diagnostic     ? p.limits.diagnostic_bytes
+                           : traffic == Traffic::Input        ? p.limits.input_bytes
                            : traffic == Traffic::Continuation ? p.limits.continuation_bytes
                                                               : p.limits.queued_bytes;
-    const auto max_count = traffic == Traffic::Input          ? p.limits.input_messages
+    const auto max_count = traffic == Traffic::Diagnostic     ? p.limits.diagnostic_messages
+                           : traffic == Traffic::Input        ? p.limits.input_messages
                            : traffic == Traffic::Continuation ? p.limits.continuation_messages
                                                               : p.limits.queued_messages;
     if (bytes > max_bytes - used_bytes || messages.size() > max_count - used_count) return false;
@@ -538,13 +629,17 @@ bool Transport::try_send(std::span<const OutgoingMessage> messages, Traffic traf
     return true;
 }
 
-std::optional<IncomingMessage> Transport::poll() {
+std::optional<TransportEvent> Transport::poll() {
     auto& p = *impl_;
     std::lock_guard lock(p.mutex);
     if (p.incoming.empty()) return {};
     auto out = std::move(p.incoming.front());
     p.incoming.pop_front();
     return out;
+}
+
+bool Transport::receiving() const noexcept {
+    return impl_->receiving.load(std::memory_order_acquire) != 0;
 }
 
 std::string Transport::failure() const {

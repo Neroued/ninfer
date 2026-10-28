@@ -6,6 +6,7 @@
 #include <atomic>
 #include <memory>
 #include <optional>
+#include <variant>
 
 namespace ninfer::distributed {
 
@@ -52,9 +53,11 @@ struct TransportLimits {
     std::size_t continuation_messages = 64;
     std::size_t input_bytes           = 8ULL << 20;
     std::size_t input_messages        = 16;
+    std::size_t diagnostic_bytes      = 64ULL << 10;
+    std::size_t diagnostic_messages   = 16;
 };
 
-enum class Traffic { Work, Continuation, Input };
+enum class Traffic { Work, Continuation, Input, Diagnostic };
 
 struct OutgoingMessage {
     RankId peer;
@@ -65,6 +68,15 @@ struct IncomingMessage {
     RankId peer;
     wire::Message message;
 };
+
+struct PeerStatus {
+    RankId peer;
+    std::string error;
+    bool receive_closed = false;
+    bool stopped        = false;
+};
+
+using TransportEvent = std::variant<IncomingMessage, PeerStatus>;
 
 // One I/O owner services every connection in this process. The caller consumes decoded frames;
 // model state and CUDA calls remain on its execution thread.
@@ -78,7 +90,9 @@ public:
     void start();
     // Takes all messages atomically or none. Continuations use dedicated queue headroom.
     [[nodiscard]] bool try_send(std::span<const OutgoingMessage>, Traffic = Traffic::Work);
-    [[nodiscard]] std::optional<IncomingMessage> poll();
+    // A peer's complete frames precede its end event. Other peers continue receiving.
+    [[nodiscard]] std::optional<TransportEvent> poll();
+    [[nodiscard]] bool receiving() const noexcept;
     [[nodiscard]] std::string failure() const;
     [[nodiscard]] bool sending() const;
     [[nodiscard]] const TransportLimits& limits() const noexcept;

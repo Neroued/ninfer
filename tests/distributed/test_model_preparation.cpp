@@ -34,18 +34,13 @@ std::vector<wire::Payload> exchange(distributed::ExecutionGroup& group,
             {rank.rank, std::make_shared<const wire::Message>(wire::Message{
                             wire::Kind::Enter, group.epoch(), std::move(out).take()})});
     }
-    require(group.transport().try_send(messages, distributed::Traffic::Continuation),
+    require(group.try_send(messages, distributed::Traffic::Continuation),
             "preparation queue is full");
     std::vector<wire::Payload> responses(messages.size());
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::minutes(2);
     for (std::size_t n = 0; n < responses.size();) {
-        group.check_processes();
         require(std::chrono::steady_clock::now() < deadline, "preparation response timed out");
-        if (auto incoming = group.transport().poll()) {
-            if (incoming->message.kind == wire::Kind::Failed) {
-                wire::Decoder in(incoming->message.payload);
-                throw std::runtime_error(in.string());
-            }
+        if (auto incoming = group.poll()) {
             require(incoming->message.epoch == group.epoch() && incoming->message.kind == reply &&
                         responses.at(incoming->peer).empty(),
                     "unexpected preparation response");
@@ -242,7 +237,7 @@ int main(int argc, char** argv) {
             payloads.push_back(std::move(out).take());
         }
         auto group = std::make_unique<distributed::ExecutionGroup>(
-            deployment, parallel.topology, [](auto rank, std::string_view text) {
+            deployment, parallel.topology, StartupObserver{}, [](auto rank, std::string_view text) {
                 std::cerr << "[rank " << rank << "] " << text << '\n';
             });
         auto prepared = rt::prepare_execution_group(*group, payloads, options.context_capacity,

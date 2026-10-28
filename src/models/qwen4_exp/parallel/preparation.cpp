@@ -8,7 +8,8 @@ namespace ninfer::models::qwen4_exp {
 RankPreparation::RankPreparation(const artifact::Reader& reader, std::span<const std::byte> payload,
                                  const distributed::RankIdentity& identity, DeviceContext& device,
                                  const distributed::ExecutionTopology& topology,
-                                 distributed::CommunicationContext& communication)
+                                 distributed::CommunicationContext& communication,
+                                 const StartupObserver& observer)
     : device_(device) {
     const auto role = std::find_if(topology.roles.begin(), topology.roles.end(),
                                    [](const auto& r) { return r.role == "tensor"; });
@@ -26,10 +27,11 @@ RankPreparation::RankPreparation(const artifact::Reader& reader, std::span<const
         throw std::invalid_argument("Qwen4Exp rank plan differs from worker identity");
     if (request.artifact != reader.artifact_id())
         throw artifact::ArtifactError("Qwen4Exp worker artifact differs from coordinator");
-    options_                = std::move(request.options);
-    host_reservation_bytes_ = request.host_reservation_bytes;
-    control_owner_          = request.control_owner;
-    auto definition         = read_definition(reader, models::load_options(options_));
+    options_                  = std::move(request.options);
+    options_.startup_observer = observer;
+    host_reservation_bytes_   = request.host_reservation_bytes;
+    control_owner_            = request.control_owner;
+    auto definition           = read_definition(reader, models::load_options(options_));
     load_.emplace(resolve_rank_load(reader, std::move(definition), std::move(request.rank),
                                     device_.device()));
     profile_       = execution::describe_model(load_->definition(), load_->weight_data(),

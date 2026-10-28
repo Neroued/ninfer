@@ -685,21 +685,18 @@ int coordinator(int argc, char** argv) {
     const std::array<std::string, 1> arguments{"--worker"};
     const auto prepare = [&] {
         auto group = std::make_unique<dist::ExecutionGroup>(
-            deployment, topology, [](auto, auto line) { std::cerr << line << '\n'; }, arguments);
+            deployment, topology,
+            ninfer::StartupObserver{[](const auto&) { throw std::runtime_error("log failure"); }},
+            [](auto, auto line) { std::cerr << line << '\n'; }, arguments);
         std::size_t ready = 0;
         const auto until  = std::chrono::steady_clock::now() + std::chrono::seconds(60);
         while (ready != size) {
             require(std::chrono::steady_clock::now() < until, "worker preparation timed out");
-            if (auto message = group->transport().poll()) {
-                if (message->message.kind == wire::Kind::Failed) {
-                    wire::Decoder in(message->message.payload);
-                    throw std::runtime_error(in.string());
-                }
+            if (auto message = group->poll()) {
                 require(message->message.kind == wire::Kind::Ready,
                         "unexpected fixture preparation response");
                 ++ready;
             } else {
-                group->check_processes();
                 std::this_thread::yield();
             }
         }
@@ -773,7 +770,10 @@ int coordinator(int argc, char** argv) {
                     "worker failure did not terminate the collective");
             if (auto event = failing.poll()) {
                 if (const auto* failure = std::get_if<rt::ExecutionFailed>(&*event)) {
-                    require(!failure->message.empty(), "worker failure lost its diagnostic");
+                    require(failure->message.find("rank 1") != std::string::npos &&
+                                failure->message.find("injected rank execution failure") !=
+                                    std::string::npos,
+                            "worker failure lost its original diagnostic");
                     std::cout << "expected failure: " << failure->message << '\n';
                     observed = true;
                 }
@@ -788,8 +788,13 @@ int coordinator(int argc, char** argv) {
         unavailable.nodes.back().worker = "/ninfer-missing-worker";
         bool rejected                   = false;
         try {
-            dist::ExecutionGroup missing(unavailable, topology, {}, arguments);
-        } catch (const std::exception&) { rejected = true; }
+            dist::ExecutionGroup missing(unavailable, topology, {}, {}, arguments);
+        } catch (const std::exception& error) {
+            rejected = true;
+            require(std::string_view(error.what()).find("/ninfer-missing-worker") !=
+                        std::string_view::npos,
+                    "remote launch failure lost its executable path");
+        }
         require(rejected, "failed remote launch was accepted");
         int status = 0;
         require(::waitpid(-1, &status, WNOHANG) == -1 && errno == ECHILD,

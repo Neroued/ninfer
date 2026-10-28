@@ -15,10 +15,15 @@ build_distributed_model(const artifact::Reader& reader, EngineOptions& options,
                         std::chrono::steady_clock::time_point start) {
     using Types       = typename Setup::Types;
     using Distributed = DistributedExecutor<typename Types::ExecutionTypes, typename Setup::Codec>;
+    StartupPhaseScope plan(options.startup_observer, StartupPhase::TargetPlan);
     Setup setup(reader, options);
+    plan.complete();
+    StartupPhaseScope frontend_phase(options.startup_observer, StartupPhase::FrontendInitialize);
     auto frontend = setup.frontend(options);
-    auto group    = std::make_unique<distributed::ExecutionGroup>(
-        *options.deployment, setup.topology(), [](auto rank, std::string_view message) {
+    frontend_phase.complete();
+    auto group = std::make_unique<distributed::ExecutionGroup>(
+        *options.deployment, setup.topology(), options.startup_observer,
+        [](auto rank, std::string_view message) {
             std::cerr << "[rank " << rank << "] " << message << '\n';
         });
     std::optional<typename Types::PreparedSession> session;
@@ -31,8 +36,8 @@ build_distributed_model(const artifact::Reader& reader, EngineOptions& options,
                                              [&] { session.reset(); }});
     setup.resolve(prepared.layouts, options);
     auto codec = setup.codec();
-    protocol::validate_control_capacity(codec.control_budget(), setup.capacity(),
-                                         group->transport().limits(), setup.topology().ranks.size());
+    protocol::validate_control_capacity(codec.control_budget(), setup.capacity(), group->limits(),
+                                        setup.topology().ranks.size());
     activate_execution_group(*group, prepared,
                              std::chrono::milliseconds(options.deployment->connect_timeout_ms));
     auto executor = std::make_unique<Distributed>(std::move(group), setup.capacity(),

@@ -14,8 +14,8 @@ namespace ninfer::runtime {
 inline distributed::wire::Message
 receive_preparation_command(distributed::WorkerConnection& connection) {
     for (;;) {
-        connection.communication().check();
         if (auto message = connection.poll()) return std::move(*message);
+        connection.communication().check();
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
 }
@@ -33,21 +33,31 @@ prepare_rank(distributed::WorkerConnection& connection, std::unique_ptr<artifact
     auto& device         = connection.device();
     const auto& topology = connection.topology();
     const auto initial   = connection.memory_origin();
-    preparing = std::make_unique<Preparation>(*reader, payload, connection.bootstrap().identity,
-                                              device, topology, connection.communication());
+    const auto observer  = connection.startup_observer();
+    {
+        StartupPhaseScope phase(observer, StartupPhase::TargetPlan);
+        preparing =
+            std::make_unique<Preparation>(*reader, payload, connection.bootstrap().identity, device,
+                                          topology, connection.communication(), observer);
+        phase.complete();
+    }
     const auto requirement = preparing->memory();
     StartupMemoryBudget budget(initial, device_budget(initial.available_bytes()),
                                std::max(kDefaultContextHeadroomBytes, requirement.headroom_bytes),
                                requirement.host_reservation_bytes);
-    const auto before_weights    = device_memory_snapshot(device.device());
-    const auto available_weights = budget.available(before_weights);
-    if (requirement.weight_bytes > available_weights ||
-        (before_weights.shared_physical_memory &&
-         requirement.host_weight_bytes > available_weights - requirement.weight_bytes))
-        throw DeviceAllocationError("rank immutable weights exceed device budget",
-                                    requirement.weight_bytes);
-    if (requirement.host_weight_bytes > budget.available_host(before_weights))
-        throw std::invalid_argument("rank immutable Host weights exceed available RAM");
+    {
+        StartupPhaseScope phase(observer, StartupPhase::RuntimeMemoryCheck);
+        const auto before_weights    = device_memory_snapshot(device.device());
+        const auto available_weights = budget.available(before_weights);
+        if (requirement.weight_bytes > available_weights ||
+            (before_weights.shared_physical_memory &&
+             requirement.host_weight_bytes > available_weights - requirement.weight_bytes))
+            throw DeviceAllocationError("rank immutable weights exceed device budget",
+                                        requirement.weight_bytes);
+        if (requirement.host_weight_bytes > budget.available_host(before_weights))
+            throw std::invalid_argument("rank immutable Host weights exceed available RAM");
+        phase.complete();
+    }
     preparing->materialize();
     reader.reset();
     const auto after_weights    = device_memory_snapshot(device.device());
@@ -138,14 +148,17 @@ prepare_rank(distributed::WorkerConnection& connection, std::unique_ptr<artifact
         const auto planned_control_bytes = command.u64();
         command.finish();
         if (action == PreparationAction::PrepareCommunication) {
+            StartupPhaseScope phase(observer, StartupPhase::CommunicationWarmup);
             preparing->prepare_communication();
             device.synchronize();
             connection.communication().sample_startup_memory();
+            phase.complete();
             report();
             continue;
         }
         if (action == PreparationAction::PrepareProbe ||
             action == PreparationAction::PrepareRebuildProbe) {
+            StartupPhaseScope phase(observer, StartupPhase::ProgramInitialize);
             bool success = true;
             try {
                 if constexpr (requires {
@@ -162,6 +175,10 @@ prepare_rank(distributed::WorkerConnection& connection, std::unique_ptr<artifact
                 success = false;
                 failure = error.what();
             }
+            if (success)
+                phase.complete();
+            else
+                phase.fail();
             wire::Encoder out;
             out.u64(topology.plan);
             out.u32(attempt);
@@ -172,6 +189,7 @@ prepare_rank(distributed::WorkerConnection& connection, std::unique_ptr<artifact
         }
         if (action == PreparationAction::Calibrate ||
             action == PreparationAction::CalibrateRebuild) {
+            StartupPhaseScope phase(observer, StartupPhase::CudaGraphCalibration);
             if constexpr (requires {
                               preparing->calibrate();
                               preparing->calibrate_rebuild();
@@ -182,16 +200,19 @@ prepare_rank(distributed::WorkerConnection& connection, std::unique_ptr<artifact
                     preparing->calibrate_rebuild();
             } else
                 throw std::logic_error("rank preparation has no calibration phase");
+            phase.complete();
             report();
             continue;
         }
         if (action == PreparationAction::Release) {
             if (!entered) throw std::logic_error("rank has not entered this allocation attempt");
+            connection.startup_attempt(++attempt);
+            StartupPhaseScope phase(observer, StartupPhase::RuntimeRelease);
             preparing->release_resources();
             device.synchronize();
             failure.clear();
             entered = accepted = false;
-            ++attempt;
+            phase.complete();
             report();
             continue;
         }
@@ -203,19 +224,32 @@ prepare_rank(distributed::WorkerConnection& connection, std::unique_ptr<artifact
         if (action == PreparationAction::CheckMemory) {
             if (!entered || capacity != allocated_capacity)
                 throw std::logic_error("rank memory check has no allocation");
-            allocated(describe());
+            StartupPhaseScope phase(observer, StartupPhase::RuntimeMemoryCheck);
+            auto description = describe();
+            if (accepted)
+                phase.complete();
+            else
+                phase.fail();
+            allocated(std::move(description));
             continue;
         }
         if (action == PreparationAction::PrepareExecution) {
             if (!accepted || capacity != allocated_capacity)
                 throw std::logic_error("rank execution preparation has no accepted allocation");
+            StartupPhaseScope phase(observer, StartupPhase::CudaGraphPrepare);
             if constexpr (requires { preparing->prepare_execution(); })
                 preparing->prepare_execution();
-            allocated(describe());
+            auto description = describe();
+            if (accepted)
+                phase.complete();
+            else
+                phase.fail();
+            allocated(std::move(description));
             continue;
         }
         if (action != PreparationAction::Allocate || entered)
             throw std::logic_error("rank allocation is already entered");
+        StartupPhaseScope phase(observer, StartupPhase::ProgramInitialize);
         const auto before         = device_memory_snapshot(device.device());
         allocation_snapshot       = before;
         const auto available      = budget.available(before);
@@ -233,6 +267,10 @@ prepare_rank(distributed::WorkerConnection& connection, std::unique_ptr<artifact
         auto description   = describe();
         entered            = true;
         allocated_capacity = capacity;
+        if (accepted)
+            phase.complete();
+        else
+            phase.fail();
         allocated(std::move(description));
     }
 }

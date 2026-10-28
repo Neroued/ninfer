@@ -10,6 +10,7 @@
 #include <unistd.h>
 
 #include <array>
+#include <algorithm>
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
@@ -152,7 +153,7 @@ struct WorkerProcess::Impl {
     pid_t pid   = -1;
     RankId rank = 0;
     Socket output;
-    std::string partial;
+    std::string partial, tail;
     std::optional<int> status;
 };
 
@@ -224,9 +225,17 @@ WorkerProcess::WorkerProcess(const DeploymentNode& node, WorkerBootstrap bootstr
     child_output.close();
     // Local workers are terminated directly by this process group owner. Do not bind them to
     // the spawning thread: an Engine may outlive the thread that constructed it.
-    send_message(parent_input, bootstrap_message(bootstrap, !local),
-                 std::chrono::steady_clock::now() +
-                     std::chrono::milliseconds(bootstrap.connect_timeout_ms));
+    try {
+        send_message(parent_input, bootstrap_message(bootstrap, !local),
+                     std::chrono::steady_clock::now() +
+                         std::chrono::milliseconds(bootstrap.connect_timeout_ms));
+    } catch (const std::exception& e) {
+        try {
+            read_logs({});
+        } catch (...) {}
+        throw std::runtime_error(std::string(e.what()) +
+                                 (impl_->tail.empty() ? "" : "\n" + impl_->tail));
+    }
 }
 
 WorkerProcess::~WorkerProcess()                                   = default;
@@ -234,6 +243,8 @@ WorkerProcess::WorkerProcess(WorkerProcess&&) noexcept            = default;
 WorkerProcess& WorkerProcess::operator=(WorkerProcess&&) noexcept = default;
 
 RankId WorkerProcess::rank() const noexcept { return impl_->rank; }
+
+std::string_view WorkerProcess::log_tail() const noexcept { return impl_->tail; }
 
 void WorkerProcess::terminate() noexcept { impl_->terminate(); }
 
@@ -255,9 +266,16 @@ void WorkerProcess::read_logs(const LogSink& sink) {
         } catch (...) {}
     };
     std::array<char, 8192> buffer;
-    for (;;) {
-        const auto n = ::read(impl_->output.fd(), buffer.data(), buffer.size());
+    std::size_t remaining = 64 * 1024;
+    while (remaining) {
+        const auto n =
+            ::read(impl_->output.fd(), buffer.data(), std::min(buffer.size(), remaining));
         if (n > 0) {
+            remaining -= static_cast<std::size_t>(n);
+            impl_->tail.append(buffer.data(), static_cast<std::size_t>(n));
+            constexpr std::size_t kTailBytes = 32 * 1024;
+            if (impl_->tail.size() > kTailBytes)
+                impl_->tail.erase(0, impl_->tail.size() - kTailBytes);
             impl_->partial.append(buffer.data(), static_cast<std::size_t>(n));
             std::size_t begin = 0;
             for (;;) {

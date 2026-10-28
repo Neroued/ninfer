@@ -1,4 +1,5 @@
 #include "distributed/transport.h"
+#include "distributed/startup.h"
 #include "models/common/qwen/vision/control.h"
 #include "models/qwen4_exp/wire.h"
 #include "models/qwen4_exp/parallel/wire.h"
@@ -22,6 +23,23 @@ namespace ctx  = models::context;
 
 void require(bool value, const char* message) {
     if (!value) throw std::runtime_error(message);
+}
+
+std::optional<dist::IncomingMessage> poll_message(dist::Transport& transport) {
+    if (auto event = transport.poll()) {
+        if (auto* message = std::get_if<dist::IncomingMessage>(&*event)) return std::move(*message);
+        throw std::runtime_error(std::get<dist::PeerStatus>(*event).error);
+    }
+    return {};
+}
+
+dist::TransportEvent next_event(dist::Transport& transport) {
+    const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    for (;;) {
+        if (auto event = transport.poll()) return std::move(*event);
+        require(std::chrono::steady_clock::now() < until, "transport event timed out");
+        std::this_thread::yield();
+    }
 }
 
 void cache_profiles_roundtrip() {
@@ -428,7 +446,7 @@ void queues() {
     const auto until     = std::chrono::steady_clock::now() + std::chrono::seconds(2);
     while (received != 2) {
         require(std::chrono::steady_clock::now() < until, "control transport stalled");
-        if (auto value = target.poll()) {
+        if (auto value = poll_message(target)) {
             require(value->message.epoch == 11 &&
                         value->message.kind ==
                             (received ? wire::Kind::Discard : wire::Kind::Submit) &&
@@ -439,10 +457,10 @@ void queues() {
             std::this_thread::yield();
     }
     source.close();
-    while (target.failure().empty()) {
-        require(std::chrono::steady_clock::now() < until, "closed owner left its socket alive");
-        std::this_thread::yield();
-    }
+    const auto event   = next_event(target);
+    const auto& closed = std::get<dist::PeerStatus>(event);
+    require(closed.receive_closed && !closed.stopped && target.failure().empty(),
+            "peer termination was not separated from transport failure");
 }
 
 void compact_payloads() {
@@ -522,7 +540,8 @@ void retained_payload() {
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
         const auto receive  = [&] {
             for (;;) {
-                if (auto incoming = target.poll()) return std::move(incoming->message.payload);
+                if (auto incoming = poll_message(target))
+                    return std::move(incoming->message.payload);
                 require(std::chrono::steady_clock::now() < deadline, "retained payload stalled");
                 std::this_thread::yield();
             }
@@ -536,7 +555,8 @@ void retained_payload() {
         require(source.try_send(messages), "second send failed");
         const auto held_until = std::chrono::steady_clock::now() + std::chrono::milliseconds(20);
         while (std::chrono::steady_clock::now() < held_until) {
-            require(!target.poll(), "poll released credit while the payload was still retained");
+            require(!poll_message(target),
+                    "poll released credit while the payload was still retained");
             std::this_thread::yield();
         }
         retained = {};
@@ -580,7 +600,7 @@ void inputs() {
     while (!ended) {
         require(std::chrono::steady_clock::now() < until, "bounded input transfer stalled");
         transfers.progress(source, 11);
-        auto value = target.poll();
+        auto value = poll_message(target);
         if (!value) {
             std::this_thread::yield();
             continue;
@@ -614,6 +634,114 @@ void inputs() {
     require(transfers.ready(keys) && owner.expired(), "ready input retained its source payload");
     transfers.release(7);
 }
+
+void startup_diagnostics() {
+    std::vector<wire::Bytes> sent;
+    dist::StartupReporter reporter([&](wire::Bytes bytes) {
+        sent.push_back(std::move(bytes));
+        return true;
+    });
+    const auto observer = reporter.observer();
+    {
+        StartupPhaseScope phase(observer, StartupPhase::WeightsMaterialize,
+                                StartupProgressUnit::Bytes, 100);
+        for (std::uint64_t i = 1; i <= 100; ++i) phase.progress(i, 100);
+        phase.complete(100, 100);
+    }
+    require(sent.size() < 10, "startup progress was not coalesced");
+    auto snapshot = dist::decode_startup(reporter.snapshot());
+    require(snapshot.size() == 1 && snapshot[0].status == StartupStatus::Complete &&
+                snapshot[0].current == 100 && snapshot[0].elapsed_ns > 0,
+            "startup final snapshot lost producer timing or completion");
+    reporter.attempt(1);
+    {
+        StartupPhaseScope phase(observer, StartupPhase::ProgramInitialize);
+        phase.fail();
+    }
+    const auto failure = dist::decode_failure(
+        dist::encode_failure({"allocation rejected", reporter.failure_context()}));
+    require(failure.reason == "allocation rejected" && failure.startup &&
+                failure.startup->attempt == 1 &&
+                failure.startup->phase == StartupPhase::ProgramInitialize,
+            "failure lost its startup attempt or phase");
+    reporter.close();
+    const auto count = sent.size();
+    observer.callback({.phase = StartupPhase::CudaGraphPrepare});
+    require(sent.size() == count && reporter.snapshot().empty(),
+            "retained startup observer remained connected after Ready");
+    StartupObserver throwing{[](const StartupEvent&) { throw std::runtime_error("log failed"); }};
+    StartupPhaseScope phase(throwing, StartupPhase::TargetPlan);
+    phase.complete();
+}
+
+void terminal_messages() {
+    for (bool truncated : {false, true}) {
+        int sockets[2], healthy[2];
+        require(
+            ::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0, sockets) == 0 &&
+                ::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0, healthy) == 0,
+            "terminal socketpair failed");
+        dist::Socket sender(sockets[0]), other(healthy[0]);
+        dist::Transport target;
+        target.add(1, dist::Socket(sockets[1]));
+        target.add(2, dist::Socket(healthy[1]));
+        target.start();
+        wire::Message failed{wire::Kind::Failed, 11,
+                             dist::encode_failure({"missing /models/example.ninfer", {}})};
+        auto frame = wire::encode_header(failed);
+        frame.insert(frame.end(), failed.payload.begin(), failed.payload.end());
+        if (truncated) frame.pop_back();
+        // Fragment both header and payload; EOF immediately follows the final byte.
+        for (const auto byte : frame)
+            require(::send(sender.fd(), &byte, 1, MSG_NOSIGNAL) == 1, "fragment send failed");
+        sender.close();
+        if (!truncated) {
+            auto event           = next_event(target);
+            const auto& incoming = std::get<dist::IncomingMessage>(event);
+            require(incoming.peer == 1 && incoming.message.kind == wire::Kind::Failed &&
+                        dist::decode_failure(incoming.message.payload).reason ==
+                            "missing /models/example.ninfer",
+                    "complete failure was lost before EOF");
+        }
+        const auto event   = next_event(target);
+        const auto& closed = std::get<dist::PeerStatus>(event);
+        require(closed.peer == 1 && closed.receive_closed && !closed.stopped &&
+                    (!truncated || closed.error.find("inside a message") != std::string::npos),
+                "EOF did not distinguish a complete failure from a truncated frame");
+        dist::send_message(other, {wire::Kind::Ready, 11, {}},
+                           std::chrono::steady_clock::now() + std::chrono::seconds(2));
+        const auto next = next_event(target);
+        require(std::get<dist::IncomingMessage>(next).peer == 2 && target.failure().empty() &&
+                    target.failure_signal()->load(),
+                "one failed peer stopped reception from another peer");
+    }
+}
+
+void diagnostic_backpressure() {
+    int sockets[2];
+    require(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0, sockets) == 0,
+            "diagnostic socketpair failed");
+    dist::Socket sender(sockets[0]);
+    dist::TransportLimits limits;
+    limits.diagnostic_messages = 1;
+    dist::Transport target(limits);
+    target.add(0, dist::Socket(sockets[1]));
+    target.start();
+    const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    dist::send_message(sender, {wire::Kind::StartupProgress, 11, wire::Bytes(64)}, until);
+    auto retained = next_event(target);
+    dist::send_message(sender, {wire::Kind::StartupProgress, 11, wire::Bytes(64)}, until);
+    dist::send_message(sender, {wire::Kind::Stopped, 11, {}}, until);
+    sender.close();
+    const auto stopped = next_event(target);
+    require(std::get<dist::IncomingMessage>(stopped).message.kind == wire::Kind::Stopped,
+            "full diagnostic credit blocked a control response");
+    const auto closed = std::get<dist::PeerStatus>(next_event(target));
+    require(closed.stopped && closed.receive_closed && closed.error.empty() &&
+                !target.failure_signal()->load(),
+            "normal shutdown was reported as transport failure");
+}
+
 } // namespace
 
 int main() {
@@ -624,6 +752,9 @@ int main() {
         native_work();
         context_observations();
         queues();
+        startup_diagnostics();
+        terminal_messages();
+        diagnostic_backpressure();
         retained_payload();
         compact_payloads();
         inputs();

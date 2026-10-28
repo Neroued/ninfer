@@ -25,7 +25,8 @@ public:
                     ContextCommunication = {});
     RankPreparation(const artifact::Reader&, std::span<const std::byte>,
                     const distributed::RankIdentity&, DeviceContext&,
-                    const distributed::ExecutionTopology&, distributed::CommunicationContext&);
+                    const distributed::ExecutionTopology&, distributed::CommunicationContext&,
+                    const StartupObserver&);
     ~RankPreparation();
     RankPreparation(const RankPreparation&)            = delete;
     RankPreparation& operator=(const RankPreparation&) = delete;

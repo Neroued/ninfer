@@ -10,7 +10,8 @@ namespace ninfer::models::glm5next {
 namespace {
 
 RankLoadRequest request(std::span<const std::byte> payload,
-                        const distributed::RankIdentity& identity) {
+                        const distributed::RankIdentity& identity,
+                        const StartupObserver& observer) {
     distributed::wire::Decoder in(payload);
     auto r = decode_rank_load(in);
     in.finish();
@@ -20,6 +21,7 @@ RankLoadRequest request(std::span<const std::byte> payload,
         identity.adp.size != r.rank.size || identity.adp.rank != identity.rank ||
         identity.dp.size != 1 || identity.pp.size != 1)
         throw std::invalid_argument("GLM5Next rank plan differs from worker identity");
+    r.options.startup_observer = observer;
     return r;
 }
 
@@ -39,8 +41,9 @@ ContextCommunication context_group(const distributed::ExecutionTopology& topolog
 RankPreparation::RankPreparation(const artifact::Reader& reader, std::span<const std::byte> payload,
                                  const distributed::RankIdentity& identity, DeviceContext& device,
                                  const distributed::ExecutionTopology& topology,
-                                 distributed::CommunicationContext& communication)
-    : RankPreparation(reader, request(payload, identity), device,
+                                 distributed::CommunicationContext& communication,
+                                 const StartupObserver& observer)
+    : RankPreparation(reader, request(payload, identity, observer), device,
                       context_group(topology, communication)) {
     const WorkContract contract{plan_.shape,
                                 plan_.profile->config.text.vocabulary,

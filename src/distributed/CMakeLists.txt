@@ -6,7 +6,7 @@ if(NINFER_ENABLE_DISTRIBUTED)
   add_library(ninfer_distributed_wire STATIC wire.cpp)
   ninfer_internal_includes(ninfer_distributed_wire)
   target_link_libraries(ninfer_distributed_wire PUBLIC ninfer_deployment)
-  add_library(ninfer_distributed_control STATIC transport.cpp launch.cpp bootstrap.cpp)
+  add_library(ninfer_distributed_control STATIC transport.cpp launch.cpp startup.cpp bootstrap.cpp)
   ninfer_internal_includes(ninfer_distributed_control)
   target_link_libraries(ninfer_distributed_control PUBLIC
     ninfer_distributed_wire ninfer_cpu ninfer_distributed_cuda)

@@ -17,7 +17,8 @@ public:
 
     RankPreparation(const artifact::Reader&, std::span<const std::byte>,
                     const distributed::RankIdentity&, DeviceContext&,
-                    const distributed::ExecutionTopology&, distributed::CommunicationContext&);
+                    const distributed::ExecutionTopology&, distributed::CommunicationContext&,
+                    const StartupObserver&);
 
     [[nodiscard]] runtime::PreparationMemory memory() const;
     void materialize();

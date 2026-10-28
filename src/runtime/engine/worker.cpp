@@ -25,6 +25,8 @@ void run_rank(distributed::WorkerConnection& connection, std::unique_ptr<artifac
     try {
         const auto attempt = prepare_rank(connection, std::move(reader), payload, preparing);
         if (attempt) {
+            const auto observer = connection.startup_observer();
+            StartupPhaseScope phase(observer, StartupPhase::EngineFinalize);
             auto codec = preparing->codec(connection.topology());
             instance   = std::move(*preparing).finish();
             preparing.reset();
@@ -33,6 +35,7 @@ void run_rank(distributed::WorkerConnection& connection, std::unique_ptr<artifac
             wire::Encoder ready;
             ready.u64(connection.topology().plan);
             ready.u32(*attempt);
+            phase.complete();
             connection.send(wire::Kind::Ready, std::move(ready).take());
             while (loop.advance()) std::this_thread::yield();
         }
@@ -63,7 +66,13 @@ void run_worker(distributed::WorkerBootstrap bootstrap) {
             throw std::runtime_error("worker model plan identity differs");
         const auto payload = in.bytes();
         in.finish();
-        auto reader = std::make_unique<artifact::Reader>(connection.bootstrap().artifact);
+        const auto observer = connection.startup_observer();
+        std::unique_ptr<artifact::Reader> reader;
+        {
+            StartupPhaseScope phase(observer, StartupPhase::ArtifactInspect);
+            reader = std::make_unique<artifact::Reader>(connection.bootstrap().artifact);
+            phase.complete();
+        }
         switch (models::resolve_architecture(reader->directory())) {
         case models::Architecture::Qwen4Exp:
             run_rank<models::qwen4_exp::RankPreparation>(connection, std::move(reader), payload);

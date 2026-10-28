@@ -7,6 +7,7 @@
 #include <span>
 #include <memory>
 #include <string>
+#include <stdexcept>
 #include <utility>
 #include <vector>
 
@@ -37,6 +38,7 @@ enum class Kind : std::uint32_t {
     InputEnd,
     InputReady,
     InputRelease,
+    StartupProgress,
     Submit = 32,
     Supply,
     Commit,
@@ -68,6 +70,11 @@ public:
     [[nodiscard]] std::size_t size() const noexcept { return bytes_.size(); }
 
     [[nodiscard]] bool empty() const noexcept { return bytes_.empty(); }
+
+    void consume_prefix(std::size_t bytes) {
+        if (bytes > bytes_.size()) throw std::out_of_range("payload prefix exceeds its size");
+        bytes_.erase(bytes_.begin(), bytes_.begin() + bytes);
+    }
 
     [[nodiscard]] auto data() noexcept { return bytes_.data(); }
 

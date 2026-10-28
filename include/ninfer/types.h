@@ -79,6 +79,10 @@ enum class StartupPhase : std::uint8_t {
     HostContextPin,
     CudaGraphPrepare,
     CudaGraphCalibration,
+    CommunicationInitialize,
+    CommunicationWarmup,
+    RuntimeMemoryCheck,
+    RuntimeRelease,
     EngineFinalize,
 };
 
@@ -94,6 +98,11 @@ enum class StartupProgressUnit : std::uint8_t {
     Bytes,
 };
 
+struct StartupOrigin {
+    std::uint32_t rank = 0, node = 0;
+    friend bool operator==(const StartupOrigin&, const StartupOrigin&) = default;
+};
+
 struct StartupEvent {
     StartupPhase phase                = StartupPhase::EngineStartup;
     StartupStatus status              = StartupStatus::Begin;
@@ -101,6 +110,9 @@ struct StartupEvent {
     std::uint64_t current             = 0;
     std::uint64_t total               = 0;
     std::uint64_t elapsed_ns          = 0;
+    std::optional<StartupOrigin> origin;
+    std::uint32_t attempt    = 0;
+    std::uint64_t invocation = 0;
 };
 
 struct StartupObserver {

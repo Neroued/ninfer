@@ -1,7 +1,6 @@
 #include "runtime/executor/preparation.h"
 
 #include <algorithm>
-#include <thread>
 
 namespace ninfer::runtime {
 namespace {
@@ -24,37 +23,15 @@ void enter(dist::ExecutionGroup& group, const GroupPreparation& prepared, std::u
             {rank.rank, std::make_shared<const wire::Message>(wire::Message{
                             wire::Kind::Enter, group.epoch(), std::move(out).take()})});
     }
-    if (!group.transport().try_send(messages, distributed::Traffic::Continuation))
+    if (!group.try_send(messages, distributed::Traffic::Continuation))
         throw std::runtime_error("preparation control queue is full");
 }
 
 std::vector<wire::Payload> receive(dist::ExecutionGroup& group, wire::Kind kind,
                                    std::chrono::milliseconds timeout) {
     std::vector<wire::Payload> result(group.topology().ranks.size());
-    std::vector<bool> received(result.size());
-    std::size_t remaining = result.size();
-    const auto deadline   = std::chrono::steady_clock::now() + timeout;
-    while (remaining) {
-        group.check_processes();
-        if (std::chrono::steady_clock::now() >= deadline)
-            throw std::runtime_error("rank model preparation timed out");
-        auto message = group.transport().poll();
-        if (!message) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-            continue;
-        }
-        if (message->message.epoch != group.epoch())
-            throw std::runtime_error("stale preparation epoch");
-        if (message->message.kind == wire::Kind::Failed) {
-            wire::Decoder in(message->message.payload);
-            throw std::runtime_error("rank " + std::to_string(message->peer) + ": " + in.string());
-        }
-        if (message->message.kind != kind || received.at(message->peer))
-            throw std::runtime_error("unexpected rank preparation phase");
-        received[message->peer] = true;
-        result[message->peer]   = std::move(message->message.payload);
-        --remaining;
-    }
+    for (auto& message : group.receive_all(kind, timeout))
+        result.at(message.peer) = std::move(message.message.payload);
     return result;
 }
 } // namespace
@@ -158,7 +135,7 @@ GroupPreparation prepare_execution_group(dist::ExecutionGroup& group,
                 {rank.rank, std::make_shared<const wire::Message>(wire::Message{
                                 wire::Kind::Prepare, group.epoch(), std::move(out).take()})});
         }
-        if (!group.transport().try_send(requests))
+        if (!group.try_send(requests))
             throw std::runtime_error("rank preparation payloads exceed control capacity");
         GroupPreparation result;
         std::string allocation_failure;

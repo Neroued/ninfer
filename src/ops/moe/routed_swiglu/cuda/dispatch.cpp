@@ -13,8 +13,6 @@ const ShapePolicy& shape_dispatch(const RoutedSwiGLUProfile& profile) {
                                                        : nvfp4_h4096_i2048_e288_k8())
                    : (profile.ffn.intermediate == 1024 ? fp8_h4096_i1024_e288_k8()
                                                        : fp8_h4096_i2048_e288_k8());
-#endif
-#if NINFER_TARGET_SPARK
     if (profile.ffn.intermediate == 320)
         return profile.ffn.down_type == QType::NVFP4 ? nvfp4_h2560_i320_e512_k10()
                                                      : fp8_h2560_i320_e512_k10();

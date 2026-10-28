@@ -18,8 +18,8 @@ struct Fp8PopulationTuning {
     bool dense_down                       = false;
     // Zero partitions expert loads at k256_max_load: K256 for short groups,
     // K128 with the large column tiles for long groups.
-    int k_step                            = 128;
-    int k256_max_load                     = 0;
+    int k_step             = 128;
+    int k256_max_load      = 0;
     int large_gate_columns = 0, large_down_columns = 0;
 };
 

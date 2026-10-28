@@ -50,16 +50,16 @@ int test_weights() {
                                std::numeric_limits<float>::quiet_NaN()})
         rejects([&] { usage.include({weight, ops::LinearPolicy::AllowA4, divisor}); });
 
-    const auto gu = weight_geometry(QType::FP8_E4M3FN_BLOCK64X64_BF16,
-                                    QuantLayout::BlockScaleM64K64,
-                                    std::array<std::uint64_t, 3>{512, 640, 2560});
-    const auto dn = weight_geometry(QType::FP8_E4M3FN_BLOCK64X64_BF16,
-                                    QuantLayout::BlockScaleM64K64,
-                                    std::array<std::uint64_t, 3>{512, 2560, 320});
-    const auto profile = ops::routed_swiglu_profile(
-        describe_weight_bank(gu, {0, 512, 640, 640}),
-        describe_weight_bank(dn, {0, 512, 2560, 2560}), 10, ops::LinearPolicy::AllowA8,
-        ops::LinearPolicy::AllowA8);
+    const auto gu =
+        weight_geometry(QType::FP8_E4M3FN_BLOCK64X64_BF16, QuantLayout::BlockScaleM64K64,
+                        std::array<std::uint64_t, 3>{512, 640, 2560});
+    const auto dn =
+        weight_geometry(QType::FP8_E4M3FN_BLOCK64X64_BF16, QuantLayout::BlockScaleM64K64,
+                        std::array<std::uint64_t, 3>{512, 2560, 320});
+    const auto profile =
+        ops::routed_swiglu_profile(describe_weight_bank(gu, {0, 512, 640, 640}),
+                                   describe_weight_bank(dn, {0, 512, 2560, 2560}), 10,
+                                   ops::LinearPolicy::AllowA8, ops::LinearPolicy::AllowA8);
     require(profile.ffn.hidden == 2560 && profile.ffn.intermediate == 320 &&
                 profile.experts == 512 && profile.top_k == 10 &&
                 profile.ffn.gate_up_type == QType::FP8_E4M3FN_BLOCK64X64_BF16 &&

@@ -93,8 +93,8 @@ WeightGeometry weight_geometry(QType format, QuantLayout layout,
         return out;
     }
     const bool nvfp4_bank = layout == QuantLayout::BatchedBlockScaleK16M128x4;
-    const bool fp8_block  = layout == QuantLayout::BlockScaleM128K128 ||
-                           layout == QuantLayout::BlockScaleM64K64;
+    const bool fp8_block =
+        layout == QuantLayout::BlockScaleM128K128 || layout == QuantLayout::BlockScaleM64K64;
     if ((nvfp4_bank && shape.size() != 3) ||
         (fp8_block && shape.size() != 2 && shape.size() != 3) ||
         (!nvfp4_bank && !fp8_block && shape.size() != 2)) {
@@ -163,10 +163,11 @@ WeightGeometry weight_geometry(QType format, QuantLayout layout,
         out.scale_offset       = aligned(out.code_bytes, 256);
     } else if (fp8_block) {
         const auto block = layout == QuantLayout::BlockScaleM64K64 ? 64U : 128U;
-        const auto expected = block == 64 ? QType::FP8_E4M3FN_BLOCK64X64_BF16
-                                          : QType::FP8_E4M3FN_BLOCK128X128_BF16;
+        const auto expected =
+            block == 64 ? QType::FP8_E4M3FN_BLOCK64X64_BF16 : QType::FP8_E4M3FN_BLOCK128X128_BF16;
         if (format != expected || n % block || k % block) {
-            throw std::invalid_argument("block-scaled FP8 format or matrix block alignment differs");
+            throw std::invalid_argument(
+                "block-scaled FP8 format or matrix block alignment differs");
         }
         out.group_size         = block;
         out.scale_block_rows   = block;

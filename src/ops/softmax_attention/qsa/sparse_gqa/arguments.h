@@ -31,6 +31,8 @@ struct SparseGqaArguments {
     float *numerator, *maximum, *sum;
     int tokens, batch, splits, key_rows;
     std::int64_t begin;
+    int min_split_tiles = 1;
+    bool direct_single  = false;
 
     __device__ SparseGqaWork work(std::int64_t query_id) const {
         const int b = int(query_id / tokens), t = int(query_id % tokens);
@@ -38,7 +40,13 @@ struct SparseGqaArguments {
         const int p = positions[query_id], c = counts[query_id];
         const int n     = c * 4 + (p + 1) % 4;
         const int tiles = (n + key_rows - 1) / key_rows;
-        return {c, (p + 1) / 4, n, tiles, tiles < splits ? tiles : splits};
+        int partitions  = tiles < splits ? tiles : splits;
+        if (min_split_tiles > 1 && partitions > 1) {
+            const int capacity = tiles / min_split_tiles;
+            const int limit    = capacity > 0 ? capacity : 1;
+            partitions         = limit < partitions ? limit : partitions;
+        }
+        return {c, (p + 1) / 4, n, tiles, partitions};
     }
 };
 

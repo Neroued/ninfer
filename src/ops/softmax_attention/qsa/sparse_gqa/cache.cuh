@@ -10,6 +10,15 @@
 
 namespace ninfer::ops::detail::qsa {
 
+// A one-warp CTA shares tiles only within its own warp.
+template <int Warps>
+__device__ __forceinline__ void sparse_gqa_sync() {
+    if constexpr (Warps == 1)
+        __syncwarp();
+    else
+        __syncthreads();
+}
+
 template <KvCacheStorage Storage>
 inline constexpr bool kSparseQuantized = Storage != KvCacheStorage::BFloat16;
 
@@ -115,17 +124,19 @@ __device__ __forceinline__ int4 sparse_gqa_expand(const std::uint8_t* data,
 
 // Q is transformed only in registers and the existing shared prologue space. No A8/A4 operand
 // or additional global Q tensor is formed. Padded head rows match the chosen contraction.
-template <KvCacheStorage Storage, int Warps, int Queries, int PaddedHeads = 16, int KvHeads>
+template <KvCacheStorage Storage, int Warps, int Queries, int PaddedHeads = 16, int PacketHeads = 0,
+          int KvHeads>
 __device__ void sparse_gqa_prepare_query(const SparseGqaKernelArguments<KvHeads>& a,
                                          std::int64_t first, std::int64_t last, int head,
                                          std::uint16_t* target) {
     const int tid = threadIdx.x, lane = tid % 32, warp = tid / 32;
     if constexpr (kSparseQuantized<Storage>) {
         for (int row = warp; row < Queries * PaddedHeads; row += Warps) {
-            const int h  = row % PaddedHeads;
-            const auto q = first + row / PaddedHeads;
+            const int column = row % PaddedHeads;
+            const int h      = PacketHeads ? column / 8 * PacketHeads + column % 8 : column;
+            const auto q     = first + row / PaddedHeads;
             float values[8]{};
-            if (q < last && h < a.ratio) {
+            if (q < last && h < a.ratio && (!PacketHeads || column % 8 < PacketHeads)) {
 #pragma unroll
                 for (int i = 0; i < 8; ++i)
                     values[i] = __bfloat162float(
@@ -139,9 +150,11 @@ __device__ void sparse_gqa_prepare_query(const SparseGqaKernelArguments<KvHeads>
         }
     } else {
         for (int i = tid; i < Queries * PaddedHeads * 32; i += Warps * 32) {
-            const int row = i / 32, d = i % 32 * 8, h = row % PaddedHeads;
-            auto* dst = target + row * 256 + common::swizzle_xor_64(row, d);
-            if (first + row / PaddedHeads < last && h < a.ratio)
+            const int row = i / 32, d = i % 32 * 8, column = row % PaddedHeads;
+            const int h = PacketHeads ? column / 8 * PacketHeads + column % 8 : column;
+            auto* dst   = target + row * 256 + common::swizzle_xor_64(row, d);
+            if (first + row / PaddedHeads < last && h < a.ratio &&
+                (!PacketHeads || column % 8 < PacketHeads))
                 common::cp_async<16>(
                     dst,
                     a.query +
@@ -153,7 +166,7 @@ __device__ void sparse_gqa_prepare_query(const SparseGqaKernelArguments<KvHeads>
         common::cp_commit();
         common::cp_wait<0>();
     }
-    __syncthreads();
+    sparse_gqa_sync<Warps>();
 }
 
 template <KvCacheStorage Storage>

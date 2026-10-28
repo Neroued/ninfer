@@ -5,6 +5,7 @@
 #include "cuda_fixture.h"
 #include "core/buffer.h"
 #include "core/decode_graph.h"
+#include <utility>
 
 using namespace ninfer;
 using namespace ninfer::test;
@@ -171,7 +172,12 @@ int read_footprint(DeviceContext& device, KvCacheStorage storage, bool padded, i
     DeviceBuffer ids(ninfer::test::cuda_environment().context.device(), f.selections.bytes());
     DeviceBuffer counts(ninfer::test::cuda_environment().context.device(), f.sizes.bytes());
     DeviceBuffer table(ninfer::test::cuda_environment().context.device(), f.table.bytes());
-    DeviceBuffer payload(device.device(), f.packed->storage().bytes);
+    // Exercise both the aligned path and the cache format's natural record alignment
+    // in the existing read-footprint cases, including odd-byte NVFP4 records.
+    const int record_offset = padded ? (storage == KvCacheStorage::Nvfp4Group16 ? 1 : 2) : 0;
+    DeviceBuffer payload(device.device(), f.packed->storage().bytes + record_offset);
+    for (auto& offset : f.table_offsets)
+        if (offset >= 0) offset += record_offset;
     const std::uint8_t* host[4]{};
     PagedPlaneView* targets[]{&f.cache.k_pages, &f.cache.v_pages, &f.cache.k_scale_pages,
                               &f.cache.v_scale_pages};
@@ -188,6 +194,9 @@ int read_footprint(DeviceContext& device, KvCacheStorage storage, bool padded, i
         if (!plane->data()) continue;
         plane->records.storage           = payload.span();
         plane->records.page_offsets.data = table.data();
+        if (record_offset)
+            plane->plane.tensor.region.alignment =
+                std::min<std::size_t>(plane->plane.tensor.region.alignment, record_offset);
     }
     f.query.data                 = q.data();
     f.output_gate.data           = gate.data();
@@ -316,16 +325,27 @@ int validation(DeviceContext& device) {
     for (auto storage :
          {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64, KvCacheStorage::Fp8E4M3Row256,
           KvCacheStorage::Nvfp4Group16, KvCacheStorage::Fp8KeyNvfp4Value}) {
-        for (int batch : {1, 8}) {
-            std::size_t maximum = 0;
-            for (int t = 1; t <= 512; ++t)
-                maximum = std::max(maximum, ops::qsa_sparse_gqa_workspace_capacity_bytes(
-                                                storage, 24, 2, t, t, batch, f.envelope,
-                                                execution.multiprocessor_count()));
-            failures += maximum != ops::qsa_sparse_gqa_workspace_capacity_bytes(
-                                       storage, 24, 2, 1, 512, batch, f.envelope,
-                                       execution.multiprocessor_count());
-        }
+        for (int batch : {1, 8})
+            for (std::uint32_t bound : {f.envelope.max_visible_tokens, 262144u}) {
+                std::size_t maximum = 0;
+                for (int t = 1; t <= 4096; ++t)
+                    maximum = std::max(maximum, ops::qsa_sparse_gqa_workspace_capacity_bytes(
+                                                    storage, 24, 2, t, t, batch, {bound},
+                                                    execution.multiprocessor_count()));
+                failures += maximum != ops::qsa_sparse_gqa_workspace_capacity_bytes(
+                                           storage, 24, 2, 1, 4096, batch, {bound},
+                                           execution.multiprocessor_count());
+            }
+    }
+    // Reserving a larger envelope must cover recapture at a smaller one, even
+    // when the latter changes between prefix and gathered attention inside a tile.
+    for (const auto [tokens, bound] : {std::pair{34, 375u}, std::pair{182, 2003u}}) {
+        const auto capacity = [&](unsigned visible) {
+            return ops::qsa_sparse_gqa_workspace_capacity_bytes(
+                KvCacheStorage::Nvfp4Group16, 24, 2, tokens, tokens, 1, {visible},
+                execution.multiprocessor_count());
+        };
+        failures += capacity(bound) > capacity(2052);
     }
     return failures;
 }
@@ -547,18 +567,18 @@ void add_four_head_cases(OpSuite& suite) {
         for (int b : {1, 8})
             for (unsigned bound : {0u, 64u, 2051u, 262144u}) {
                 std::size_t maximum = 0;
-                for (int t = 1; t <= 257; ++t)
+                for (int t = 1; t <= 4096; ++t)
                     maximum = std::max(maximum, ops::qsa_sparse_gqa_workspace_capacity_bytes(
                                                     storage, 24, 4, t, t, b, {bound}, sms));
                 failures += maximum != ops::qsa_sparse_gqa_workspace_capacity_bytes(
-                                           storage, 24, 4, 1, 257, b, {bound}, sms);
+                                           storage, 24, 4, 1, 4096, b, {bound}, sms);
             }
         return failures;
     });
     special(
         "metadata_update",
         [=] {
-            return graph_update(cuda_environment().context, 33, 8, storage, true, 24, 4) +
+            return graph_update(cuda_environment().context, 129, 8, storage, true, 24, 4) +
                    graph_update(cuda_environment().context, 8, 8, storage, true, 24, 4);
         },
         "graph");
@@ -609,17 +629,20 @@ void add_four_head_storage_cases(OpSuite& suite, KvCacheStorage storage) {
         for (int b : {1, 8})
             for (unsigned bound : {64u, 2051u, 262144u}) {
                 std::size_t maximum = 0;
-                for (int t = 1; t <= 257; ++t)
+                for (int t = 1; t <= 4096; ++t)
                     maximum = std::max(maximum, ops::qsa_sparse_gqa_workspace_capacity_bytes(
                                                     storage, 24, 4, t, t, b, {bound}, sms));
                 failures += maximum != ops::qsa_sparse_gqa_workspace_capacity_bytes(
-                                           storage, 24, 4, 1, 257, b, {bound}, sms);
+                                           storage, 24, 4, 1, 4096, b, {bound}, sms);
             }
         return failures;
     });
     special(
         "metadata_update",
-        [=] { return graph_update(cuda_environment().context, 33, 8, storage, true, 24, 4); },
+        [=] {
+            return graph_update(cuda_environment().context, 129, 8, storage, true, 24, 4) +
+                   graph_update(cuda_environment().context, 8, 8, storage, true, 24, 4);
+        },
         "graph");
     special("gate_rounding", [=] {
         return gate_rounding(cuda_environment().context, storage, 1, 1, 24, 4) +

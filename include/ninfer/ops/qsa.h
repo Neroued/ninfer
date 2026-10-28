@@ -162,7 +162,9 @@ struct QsaSparseGqaExecutionEnvelope {
 };
 
 /** Capacity over every positive T in [min_tokens,max_tokens], with fixed storage, query/KV heads, B
- * and envelope. Includes only Op-local scratch, measured from a 256-byte-aligned workspace cursor.
+ * and envelopes at or below the supplied bound. Includes only Op-local scratch, measured from a
+ * 256-byte-aligned workspace cursor, including recapture/update at a smaller envelope.
+ * Covers every supported cache view.
  * multiprocessor_count is the positive physical SM count used by execution.
  */
 [[nodiscard]] std::size_t qsa_sparse_gqa_workspace_capacity_bytes(

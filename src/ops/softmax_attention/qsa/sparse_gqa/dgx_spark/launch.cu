@@ -1,4 +1,5 @@
 #include "ops/softmax_attention/qsa/sparse_gqa/plan.h"
+#include "ops/softmax_attention/qsa/sparse_gqa/merge.cuh"
 #include "ops/common/host/launch.h"
 #include "ops/softmax_attention/qsa/sparse_gqa/columns.cuh"
 #include "ops/softmax_attention/qsa/sparse_gqa/grouped.cuh"

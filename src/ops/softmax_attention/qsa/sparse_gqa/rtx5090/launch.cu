@@ -3,6 +3,7 @@
 #include "ops/softmax_attention/qsa/sparse_gqa/prefill.cuh"
 #include "ops/softmax_attention/qsa/sparse_gqa/simt.cuh"
 #include "ops/softmax_attention/qsa/sparse_gqa/compact.cuh"
+#include "ops/softmax_attention/qsa/sparse_gqa/merge.cuh"
 
 namespace ninfer::ops::detail::qsa {
 namespace {
@@ -12,39 +13,55 @@ void launch(const SparseGqaArguments& arguments, SparseGqaPlan plan,
     SparseGqaKernelArguments<KvHeads> a{arguments};
     a.splits             = launch_plan.splits;
     constexpr bool Async = kSparseQuantized<Storage> && VectorCache;
-    if constexpr (KvHeads == 4) {
-        const auto compact = [&]<int N, int Warps, SparseGqaLoad Load, bool Prefix>() {
-            constexpr auto kernel =
-                sparse_gqa_compact_kernel<Storage, N, Warps, VectorCache, Load, Prefix>;
+    const auto compact =
+        [&]<int N, int Warps, SparseGqaLoad Load, bool Prefix, bool Delay = false>() {
+            // Keep the compiled register allocation consistent with the five-CTA
+            // 16-row schedule used by the partition model.
+            constexpr int resident =
+                KvHeads == 2 && (N == 16 || (!Prefix && Load == SparseGqaLoad::Reused &&
+                                             (Delay || kSparseQuantized<Storage>)))
+                    ? 5
+                : KvHeads == 4 && Storage == KvCacheStorage::BFloat16 && !Prefix && N == 32 ? 5
+                : KvHeads == 4 && kSparseQuantized<Storage> && Load == SparseGqaLoad::Reused &&
+                        !Prefix && N == 16
+                    ? 10
+                    : 1;
+            constexpr auto kernel = sparse_gqa_compact_kernel<Storage, N, Warps, VectorCache, Load,
+                                                              Prefix, Delay, KvHeads, resident>;
             constexpr int bytes =
                 sizeof(SparseGqaStorage<Storage, N, Warps, Load, SparseGqaWarpSplit::Sequence, 8>);
-            const int shared = common::prepare_shared<bytes, kernel, true>();
-            const int groups = Prefix ? (queries + Warps - 1) / Warps : queries;
-            kernel<<<dim3(groups * 4, a.splits), Warps * 32, shared, execution.stream()>>>(a,
-                                                                                           queries);
+            const int shared     = common::prepare_shared<bytes, kernel, true>();
+            constexpr int packet = Warps / (HeadGeometry<KvHeads>::ratio / 6);
+            const int groups     = Prefix ? (queries + packet - 1) / packet : queries;
+            kernel<<<dim3(groups * a.kv_heads, a.splits), Warps * 32, shared, execution.stream()>>>(
+                a, queries);
         };
-        const auto submit = [&]<int N, int Warps, bool Prefix>() {
-            if constexpr (Storage == KvCacheStorage::BFloat16 && VectorCache) {
-                if (launch_plan.load == SparseGqaLoad::Reused)
-                    compact.template operator()<N, Warps, SparseGqaLoad::Reused, Prefix>();
-                else
-                    compact.template operator()<N, Warps, SparseGqaLoad::Direct, Prefix>();
-            } else {
-                constexpr auto load = Async ? SparseGqaLoad::Aliased : SparseGqaLoad::Direct;
-                compact.template operator()<N, Warps, load, Prefix>();
-            }
-        };
+    const auto submit = [&]<int N, int Warps, bool Prefix, bool Delay = false>() {
+        if constexpr (Storage == KvCacheStorage::BFloat16) {
+            if (launch_plan.load == SparseGqaLoad::Reused)
+                compact.template operator()<N, Warps, SparseGqaLoad::Reused, Prefix, Delay>();
+            else
+                compact.template operator()<N, Warps, SparseGqaLoad::Direct, Prefix, Delay>();
+        } else {
+            if (launch_plan.load == SparseGqaLoad::Reused)
+                compact.template operator()<N, Warps, SparseGqaLoad::Reused, Prefix, Delay>();
+            else
+                compact.template operator()<N, Warps, SparseGqaLoad::Aliased, Prefix, Delay>();
+        }
+    };
+    if constexpr (KvHeads == 4) {
         if (plan.instance == SparseGqaInstance::FullPrefix) {
-            if constexpr (Storage == KvCacheStorage::BFloat16) {
-                if (plan.key_rows == 32)
-                    submit.template operator()<32, 2, true>();
-                else
-                    submit.template operator()<64, 4, true>();
-            } else
+            if (plan.key_rows == 32)
+                submit.template operator()<32, 2, true>();
+            else
                 submit.template operator()<64, 4, true>();
         } else if (plan.instance == SparseGqaInstance::Simt) {
-            sparse_gqa_simt_kernel<Storage, 8, VectorCache, KvHeads, kSparseRotatedValue<Storage>>
-                <<<dim3(queries * a.query_heads, a.splits), 256, 0, execution.stream()>>>(a);
+            if (plan.partial)
+                sparse_gqa_simt_kernel<Storage, 8, VectorCache, KvHeads, false>
+                    <<<dim3(queries * a.query_heads, a.splits), 256, 0, execution.stream()>>>(a);
+            else
+                sparse_gqa_simt_kernel<Storage, 8, VectorCache, KvHeads, true>
+                    <<<dim3(queries * a.query_heads, a.splits), 256, 0, execution.stream()>>>(a);
         } else if constexpr (Storage == KvCacheStorage::BFloat16) {
             if (plan.key_rows == 32)
                 submit.template operator()<32, 2, false>();
@@ -55,6 +72,25 @@ void launch(const SparseGqaArguments& arguments, SparseGqaPlan plan,
         } else {
             submit.template operator()<16, 1, false>();
         }
+    } else if constexpr (KvHeads == 2) {
+        if (plan.instance == SparseGqaInstance::FullPrefix) {
+            if (plan.key_rows == 32)
+                submit.template operator()<32, 4, true>();
+            else
+                submit.template operator()<64, 8, true>();
+        } else if (plan.instance == SparseGqaInstance::Simt) {
+            if (plan.partial)
+                sparse_gqa_simt_kernel<Storage, 8, VectorCache, KvHeads, false>
+                    <<<dim3(queries * a.query_heads, a.splits), 256, 0, execution.stream()>>>(a);
+            else
+                sparse_gqa_simt_kernel<Storage, 8, VectorCache, KvHeads, true>
+                    <<<dim3(queries * a.query_heads, a.splits), 256, 0, execution.stream()>>>(a);
+        } else if (plan.key_rows == 16)
+            submit.template operator()<16, 2, false>();
+        else if (launch_plan.kernel == SparseGqaKernel::CompactLateSoftmax)
+            submit.template operator()<32, 2, false, true>();
+        else
+            submit.template operator()<32, 2, false>();
     } else if (plan.instance == SparseGqaInstance::FullPrefix) {
         constexpr auto load = Async ? SparseGqaLoad::InPlace : SparseGqaLoad::Direct;
         constexpr auto kernel =
@@ -82,9 +118,19 @@ void launch(const SparseGqaArguments& arguments, SparseGqaPlan plan,
             <<<dim3(queries * a.kv_heads, a.splits), 64, sizeof(SparseGqaStorage<Storage, 32, 2>),
                execution.stream()>>>(a);
     }
-    if (plan.partial)
-        sparse_gqa_merge_kernel<Storage>
-            <<<queries * a.query_heads, 128, 0, execution.stream()>>>(a);
+    if (plan.merge_node) {
+        if (!plan.partial)
+            sparse_gqa_merge_kernel<Storage><<<1, 1, 0, execution.stream()>>>(a);
+        else if (queries >= 256)
+            sparse_gqa_merge_warp_kernel<Storage, 8>
+                <<<queries*((a.query_heads + 7) / 8), 256, 0, execution.stream()>>>(a);
+        else if (queries >= 8)
+            sparse_gqa_merge_warp_kernel<Storage, 4>
+                <<<queries*((a.query_heads + 3) / 4), 128, 0, execution.stream()>>>(a);
+        else
+            sparse_gqa_merge_kernel<Storage>
+                <<<queries * a.query_heads, 128, 0, execution.stream()>>>(a);
+    }
 }
 
 } // namespace

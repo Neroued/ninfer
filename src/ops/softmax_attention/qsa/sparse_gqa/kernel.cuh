@@ -15,7 +15,7 @@ __device__ __forceinline__ void sparse_gqa_mma(SparseGqaKernelArguments<KvHeads>
     constexpr int NK = N / Warps, QKNt = NK / 8, PVKs = NK / 16;
     static_assert(NK >= 16 && NK % 16 == 0);
     auto* ks      = s.kv;
-    auto* vs      = s.kv + N * 256;
+    auto* vs      = s.kv + (Load == SparseGqaLoad::Aliased ? 0 : N * 256);
     const int tid = threadIdx.x, lane = tid & 31, warp = tid / 32;
     const auto work = a.work(q);
     if (work.size == 0) {
@@ -227,54 +227,5 @@ __launch_bounds__(Warps * 32) __global__
         a, s, a.begin + a.group_query(blockIdx.x), a.group_head(blockIdx.x), blockIdx.y);
 }
 
-template <KvCacheStorage Storage, int KvHeads>
-__global__ void sparse_gqa_merge_kernel(SparseGqaKernelArguments<KvHeads> a) {
-    const auto q = a.begin + a.head_query(blockIdx.x);
-    const int h = a.head_index(blockIdx.x), d = threadIdx.x * 2;
-    const auto work = a.work(q);
-    if (!work.size) {
-        *reinterpret_cast<unsigned*>(a.out + (q * a.query_heads + h) * 256 + d) = 0;
-        return;
-    }
-    __shared__ float weights[64], denominator;
-    if (threadIdx.x < 32) {
-        const int lane = threadIdx.x;
-        float m        = -CUDART_INF_F;
-        for (int s = lane; s < work.splits; s += 32)
-            m = fmaxf(m, a.maximum[a.partial_row(q, s, h)]);
-        m         = common::warp_max(m);
-        float sum = 0;
-        for (int s = lane; s < work.splits; s += 32) {
-            const auto i  = a.partial_row(q, s, h);
-            const float w = softmax_log2_state_weight(a.maximum[i], a.sum[i], m);
-            weights[s]    = w;
-            sum += w * a.sum[i];
-        }
-        sum = common::warp_sum(sum);
-        if (lane == 0) denominator = sum;
-    }
-    __syncthreads();
-    float x = 0, y = 0;
-    for (int s = 0; s < work.splits; ++s) {
-        const auto v =
-            *reinterpret_cast<const float2*>(a.numerator + a.partial_row(q, s, h) * 256 + d);
-        x += weights[s] * v.x;
-        y += weights[s] * v.y;
-    }
-    const float inv = __frcp_rn(denominator);
-    if constexpr (kSparseRotatedValue<Storage>) {
-        __shared__ float row[256];
-        row[d]     = x * inv;
-        row[d + 1] = y * inv;
-        __syncthreads();
-        if (threadIdx.x < 32) {
-            float values[8];
-#pragma unroll
-            for (int i = 0; i < 8; ++i) values[i] = row[threadIdx.x + 32 * i];
-            sparse_gqa_inverse_gate(a, q, h, values);
-        }
-    } else
-        sparse_gqa_store(a, q, h, d, x * inv, y * inv);
-}
 
 } // namespace ninfer::ops::detail::qsa

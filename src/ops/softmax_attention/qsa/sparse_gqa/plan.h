@@ -5,6 +5,7 @@
 #include "ninfer/ops/qsa.h"
 
 #include <algorithm>
+#include <array>
 
 namespace ninfer::ops::detail::qsa {
 
@@ -16,12 +17,34 @@ struct SparseGqaPlan {
     SparseGqaInstance instance;
     bool partial;
     std::uint32_t visible_tokens = 0;
+    int min_split_tiles          = 1;
+    bool direct_single           = false;
+    bool delay_softmax           = false;
+    bool merge_node              = false;
+    bool reuse_buffer            = false;
 };
 
 SparseGqaPlan select_sparse_gqa_plan(KvCacheStorage storage, int tokens, int batch, int kv_heads,
                                      QsaSparseGqaExecutionEnvelope envelope, int sms);
 
-enum class SparseGqaKernel { Sequence, Columns16, Columns32, Columns32Wide, Simt4, Simt8 };
+struct SparseGqaCapacityEnvelopes {
+    std::array<std::uint32_t, 136> values{};
+    int count = 0;
+};
+
+SparseGqaCapacityEnvelopes sparse_gqa_capacity_envelopes(KvCacheStorage storage, int tokens,
+                                                         int batch, int kv_heads,
+                                                         QsaSparseGqaExecutionEnvelope envelope);
+
+enum class SparseGqaKernel {
+    Sequence,
+    Columns16,
+    Columns32,
+    Columns32Wide,
+    Simt4,
+    Simt8,
+    CompactLateSoftmax
+};
 
 struct SparseGqaLaunchPlan {
     SparseGqaLoad load;

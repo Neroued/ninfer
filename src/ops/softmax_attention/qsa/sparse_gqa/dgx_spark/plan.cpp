@@ -25,6 +25,16 @@ int sparse_gqa_direct_queries(int kv_heads, int sms) {
     return kv_heads == 1 ? 8 * sms : 256;
 }
 
+SparseGqaCapacityEnvelopes sparse_gqa_capacity_envelopes(KvCacheStorage, int, int, int,
+                                                         QsaSparseGqaExecutionEnvelope envelope) {
+    SparseGqaCapacityEnvelopes out;
+    // Short SIMT calls materialize partials even when MMA can write a single partition directly.
+    for (std::uint32_t bound : {0u, 8u, 64u})
+        if (bound <= envelope.max_visible_tokens) out.values[out.count++] = bound;
+    out.values[out.count++] = envelope.max_visible_tokens;
+    return out;
+}
+
 SparseGqaPlan select_sparse_gqa_plan(KvCacheStorage storage, int tokens, int batch, int kv_heads,
                                      QsaSparseGqaExecutionEnvelope envelope, int sms) {
     const auto queries = std::int64_t(tokens) * batch;

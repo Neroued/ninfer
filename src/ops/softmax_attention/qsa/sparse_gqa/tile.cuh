@@ -6,6 +6,140 @@
 
 namespace ninfer::ops::detail::qsa {
 
+// Interior chunks may realign within their own live row. Boundary chunks use
+// exact natural-width loads; no selected row borrows bytes from its neighbours.
+template <bool Aligned, int RowBytes>
+__device__ __forceinline__ void sparse_gqa_copy_16(void* dst, const std::uint8_t* row, int d) {
+    const auto* src = row + d;
+    if constexpr (Aligned) {
+        common::cp_async<16>(dst, src);
+    } else if (reinterpret_cast<std::uintptr_t>(src) % 16 == 0) {
+        common::cp_async<16>(dst, src);
+    } else if (reinterpret_cast<std::uintptr_t>(src) % 4 == 0) {
+#pragma unroll
+        for (int i = 0; i < 4; ++i)
+            common::cp_async<4>(static_cast<std::uint8_t*>(dst) + 4 * i, src + 4 * i);
+    } else if (d && d + 16 < RowBytes) {
+        const auto address   = reinterpret_cast<std::uintptr_t>(src);
+        const auto* words    = reinterpret_cast<const unsigned*>(address & ~std::uintptr_t(3));
+        const unsigned shift = (address & 3) * 8;
+        const auto lo        = reinterpret_cast<std::uintptr_t>(words) % 16 == 0
+                                   ? common::load_vec<uint4>(words)
+                                   : make_uint4(words[0], words[1], words[2], words[3]);
+        const unsigned tail  = words[4];
+        common::store_vec(dst, make_uint4(__funnelshift_r(lo.x, lo.y, shift),
+                                          __funnelshift_r(lo.y, lo.z, shift),
+                                          __funnelshift_r(lo.z, lo.w, shift),
+                                          __funnelshift_r(lo.w, tail, shift)));
+    } else {
+        uint4 value{};
+        if (reinterpret_cast<std::uintptr_t>(src) % 2 == 0) {
+#pragma unroll
+            for (int i = 0; i < 8; ++i)
+                reinterpret_cast<std::uint16_t*>(&value)[i] =
+                    reinterpret_cast<const std::uint16_t*>(src)[i];
+        } else {
+#pragma unroll
+            for (int i = 0; i < 16; ++i) reinterpret_cast<std::uint8_t*>(&value)[i] = src[i];
+        }
+        common::store_vec(dst, value);
+    }
+}
+
+struct SparseGqaCopyPacket {
+    unsigned words[5]{};
+    unsigned kind = 0;
+};
+
+// Delay bit assembly until several independent rows have been fetched. No
+// prefix or suffix load extends past the bytes owned by its selected row.
+template <int Bytes>
+__device__ __forceinline__ SparseGqaCopyPacket sparse_gqa_load_copy(void* dst,
+                                                                    const std::uint8_t* row,
+                                                                    int d) {
+    const auto* src    = row + d;
+    const auto address = reinterpret_cast<std::uintptr_t>(src);
+    SparseGqaCopyPacket packet;
+    if (address % 16 == 0) {
+        common::cp_async<16>(dst, src);
+    } else if (address % 4 == 0) {
+#pragma unroll
+        for (int j = 0; j < 4; ++j)
+            common::cp_async<4>(static_cast<std::uint8_t*>(dst) + 4 * j, src + 4 * j);
+    } else if (address % 2 == 0) {
+        if (d && d + 16 < Bytes) {
+            const auto* words = reinterpret_cast<const unsigned*>(address & ~std::uintptr_t(3));
+            const auto lo     = reinterpret_cast<std::uintptr_t>(words) % 16 == 0
+                                    ? common::load_vec<uint4>(words)
+                                    : make_uint4(words[0], words[1], words[2], words[3]);
+            packet            = {{lo.x, lo.y, lo.z, lo.w, words[4]}, 1};
+        } else {
+            packet.words[0] = *reinterpret_cast<const std::uint16_t*>(src);
+            packet.words[4] = *reinterpret_cast<const std::uint16_t*>(src + 14);
+            if (address % 8 == 2) {
+                packet.words[1]   = *reinterpret_cast<const unsigned*>(src + 2);
+                const auto middle = common::load_vec<uint2>(src + 6);
+                packet.words[2]   = middle.x;
+                packet.words[3]   = middle.y;
+            } else {
+                const auto middle = common::load_vec<uint2>(src + 2);
+                packet.words[1]   = middle.x;
+                packet.words[2]   = middle.y;
+                packet.words[3]   = *reinterpret_cast<const unsigned*>(src + 10);
+            }
+            packet.kind = 2;
+        }
+    } else {
+        sparse_gqa_copy_16<false, Bytes>(dst, row, d);
+    }
+    return packet;
+}
+
+__device__ __forceinline__ void sparse_gqa_store_copy(void* dst,
+                                                      const SparseGqaCopyPacket& packet) {
+    const auto* x = packet.words;
+    if (packet.kind == 1)
+        common::store_vec(
+            dst, make_uint4(__funnelshift_r(x[0], x[1], 16), __funnelshift_r(x[1], x[2], 16),
+                            __funnelshift_r(x[2], x[3], 16), __funnelshift_r(x[3], x[4], 16)));
+    else if (packet.kind == 2)
+        common::store_vec(
+            dst, make_uint4(__byte_perm(x[0], x[1], 0x5410), __funnelshift_r(x[1], x[2], 16),
+                            __funnelshift_r(x[2], x[3], 16), __byte_perm(x[3], x[4], 0x5432)));
+}
+
+template <int Bytes, int Stride, int N, int Warps, bool Swizzled, int Pipeline>
+__device__ __forceinline__ void
+sparse_gqa_stage_natural(std::uint8_t* dst, const std::uint8_t* data, std::int64_t row_stride,
+                         const std::int64_t* addresses, int start, int end) {
+    constexpr int Chunks = Bytes / 16, Threads = Warps * 32;
+#pragma unroll 1
+    for (int i = threadIdx.x; i < N * Chunks; i += Pipeline * Threads) {
+        SparseGqaCopyPacket pending[Pipeline];
+#pragma unroll
+        for (int j = 0; j < Pipeline; ++j) {
+            const int index = i + j * Threads, row = index / Chunks, d = index % Chunks * 16;
+            if (index < N * Chunks) {
+                auto* target =
+                    dst + row * Stride + (Swizzled ? 2 * common::swizzle_xor_64(row, d / 2) : d);
+                if (start + row < end)
+                    pending[j] = sparse_gqa_load_copy<Bytes>(
+                        target, data + addresses[row / 4] + row % 4 * row_stride, d);
+                else
+                    common::store_vec(target, make_uint4(0, 0, 0, 0));
+            }
+        }
+#pragma unroll
+        for (int j = 0; j < Pipeline; ++j) {
+            const int index = i + j * Threads, row = index / Chunks, d = index % Chunks * 16;
+            if (index < N * Chunks)
+                sparse_gqa_store_copy(dst + row * Stride +
+                                          (Swizzled ? 2 * common::swizzle_xor_64(row, d / 2) : d),
+                                      pending[j]);
+        }
+    }
+}
+
 template <KvCacheStorage Storage, int N, bool Separate>
 struct SparseGqaRaw {};
 
@@ -28,12 +162,12 @@ struct SparseGqaStorage : SparseGqaRaw<Storage, N, Load == SparseGqaLoad::Staged
         std::max(K::code_bytes + K::scale_bytes, V::code_bytes + V::scale_bytes);
 
     union {
-        // Reused serializes native K/V copies into one tile. Aliased decode retains
-        // one FP16 tile and one native packed tile to overlap quantized K/V loads.
-        alignas(16) std::uint16_t
-            kv[Load == SparseGqaLoad::Reused    ? N * 256
-               : Load == SparseGqaLoad::Aliased ? N * 256 + N * packed_bytes / 2
-                                                : 2 * N * 256];
+        // Reused serializes K/V loads, expanding quantized rows in their own tile.
+        // Aliased retains a decoded tile and a packed slot to overlap K/V loads.
+        alignas(
+            16) std::uint16_t kv[Load == SparseGqaLoad::Reused    ? N * 256
+                                 : Load == SparseGqaLoad::Aliased ? N * 256 + N * packed_bytes / 2
+                                                                  : 2 * N * 256];
         float partial[(Split == SparseGqaWarpSplit::Sequence ? Warps : 1) * PaddedHeads * 256];
     };
 
@@ -73,11 +207,11 @@ sparse_gqa_addresses(const SparseGqaArguments& a,
             s.addresses.value_scale[i] = page + head * a.value_scale.head + row * a.value_scale.row;
         }
     }
-    __syncthreads();
+    sparse_gqa_sync<Warps>();
 }
 
-template <KvCacheStorage Storage, int N, int Warps, bool Vector, bool Key, SparseGqaLoad Load,
-          SparseGqaWarpSplit Split, int PaddedHeads>
+template <KvCacheStorage Storage, int N, int Warps, bool Vector, bool Key, int NaturalPipeline = 0,
+          SparseGqaLoad Load, SparseGqaWarpSplit Split, int PaddedHeads>
 __device__ void sparse_gqa_stage(const SparseGqaArguments& a,
                                  SparseGqaStorage<Storage, N, Warps, Load, Split, PaddedHeads>& s,
                                  int start, int end) {
@@ -88,11 +222,11 @@ __device__ void sparse_gqa_stage(const SparseGqaArguments& a,
     auto* decoded =
         s.kv +
         (Key || Load == SparseGqaLoad::Aliased || Load == SparseGqaLoad::Reused ? 0 : N * 256);
-    if constexpr (Load != SparseGqaLoad::Direct && Load != SparseGqaLoad::Reused) {
-        static_assert(kSparseQuantized<Storage> && Vector);
-        constexpr int Row = Load == SparseGqaLoad::InPlace ? Codec::packed_row : Codec::code_bytes;
+    if constexpr (Load != SparseGqaLoad::Direct && kSparseQuantized<Storage>) {
+        constexpr bool inplace = Load == SparseGqaLoad::InPlace || Load == SparseGqaLoad::Reused;
+        constexpr int Row      = inplace ? Codec::packed_row : Codec::code_bytes;
         std::uint8_t *codes, *scales;
-        if constexpr (Load == SparseGqaLoad::InPlace) {
+        if constexpr (inplace) {
             codes  = reinterpret_cast<std::uint8_t*>(decoded) + N * (512 - Row);
             scales = codes + Codec::code_bytes;
         } else if constexpr (Load == SparseGqaLoad::Aliased) {
@@ -104,16 +238,20 @@ __device__ void sparse_gqa_stage(const SparseGqaArguments& a,
             codes  = s.codes;
             scales = s.scales;
         }
-        constexpr int ScaleRow = Load == SparseGqaLoad::InPlace ? Row : Codec::scale_bytes;
-        for (int i = threadIdx.x; i < N * (Codec::code_bytes / 16); i += Warps * 32) {
-            const int row = i / (Codec::code_bytes / 16), d = i % (Codec::code_bytes / 16) * 16;
-            auto* dst = codes + row * Row + d;
-            if (start + row < end)
-                common::cp_async<16>(dst,
-                                     plane.data + addresses[row / 4] + row % 4 * plane.row + d);
-            else
-                common::store_vec(dst, make_int4(0, 0, 0, 0));
-        }
+        constexpr int ScaleRow = inplace ? Row : Codec::scale_bytes;
+        if constexpr (NaturalPipeline && !Vector) {
+            sparse_gqa_stage_natural<Codec::code_bytes, Row, N, Warps, false, NaturalPipeline>(
+                codes, plane.data, plane.row, addresses, start, end);
+        } else
+            for (int i = threadIdx.x; i < N * (Codec::code_bytes / 16); i += Warps * 32) {
+                const int row = i / (Codec::code_bytes / 16), d = i % (Codec::code_bytes / 16) * 16;
+                auto* dst = codes + row * Row + d;
+                if (start + row < end)
+                    sparse_gqa_copy_16<Vector, Codec::code_bytes>(
+                        dst, plane.data + addresses[row / 4] + row % 4 * plane.row, d);
+                else
+                    common::store_vec(dst, make_int4(0, 0, 0, 0));
+            }
         if constexpr (Codec::scale_bytes == 2) {
             // Async copies require at least four bytes. Pair rows within the same logical
             // four-token block; a partial final pair reads only its live half.
@@ -147,7 +285,24 @@ __device__ void sparse_gqa_stage(const SparseGqaArguments& a,
                         scale_plane.data + scale_addresses[row / 4] + row % 4 * scale_plane.row;
                     if (reinterpret_cast<std::uintptr_t>(src) % Bytes == 0)
                         common::cp_async<Bytes>(dst, src);
-                    else {
+                    else if constexpr (NaturalPipeline) {
+                        if constexpr (Bytes == 16) {
+                            const auto packet = sparse_gqa_load_copy<16>(dst, src, 0);
+                            sparse_gqa_store_copy(dst, packet);
+                        } else if (reinterpret_cast<std::uintptr_t>(src) % 4 == 0) {
+                            common::cp_async<4>(dst, src);
+                            common::cp_async<4>(dst + 4, src + 4);
+                        } else if (reinterpret_cast<std::uintptr_t>(src) % 2 == 0) {
+                            const auto head   = *reinterpret_cast<const std::uint16_t*>(src);
+                            const auto middle = *reinterpret_cast<const unsigned*>(src + 2);
+                            const auto tail   = *reinterpret_cast<const std::uint16_t*>(src + 6);
+                            common::store_vec(dst, make_uint2(__byte_perm(head, middle, 0x5410),
+                                                              __byte_perm(middle, tail, 0x5432)));
+                        } else {
+#pragma unroll
+                            for (int i = 0; i < Bytes; ++i) dst[i] = src[i];
+                        }
+                    } else {
 #pragma unroll
                         for (int i = 0; i < Bytes; ++i) dst[i] = src[i];
                     }
@@ -157,6 +312,9 @@ __device__ void sparse_gqa_stage(const SparseGqaArguments& a,
                 }
             }
         }
+    } else if constexpr (NaturalPipeline && !Vector && !kSparseQuantized<Storage>) {
+        sparse_gqa_stage_natural<512, 512, N, Warps, true, NaturalPipeline>(
+            reinterpret_cast<std::uint8_t*>(decoded), plane.data, plane.row, addresses, start, end);
     } else {
 #pragma unroll 1
         for (int i = threadIdx.x; i < N * 32; i += Warps * 32) {
@@ -166,8 +324,8 @@ __device__ void sparse_gqa_stage(const SparseGqaArguments& a,
                 common::store_vec(dst, make_int4(0, 0, 0, 0));
             else {
                 const auto* src = plane.data + addresses[row / 4] + row % 4 * plane.row;
-                if constexpr (!kSparseQuantized<Storage> && Vector)
-                    common::cp_async<16>(dst, src + 2 * d);
+                if constexpr (!kSparseQuantized<Storage>)
+                    sparse_gqa_copy_16<Vector, 512>(dst, src, 2 * d);
                 else {
                     const std::uint8_t* scales = nullptr;
                     if constexpr (kSparseQuantized<Storage>)
@@ -193,7 +351,7 @@ __device__ __forceinline__ void sparse_gqa_expand_in_place(std::uint16_t* dst,
         if (threadIdx.x < 32)
             values = sparse_gqa_expand<Storage, Key, true>(
                 raw + Begin * Row, raw + Begin * Row + Codec::code_bytes, threadIdx.x * 8);
-        __syncthreads();
+        sparse_gqa_sync<Warps>();
         if (threadIdx.x < 32)
             common::store_vec(dst + Begin * 256 + common::swizzle_xor_64(Begin, threadIdx.x * 8),
                               values);
@@ -205,7 +363,7 @@ __device__ __forceinline__ void sparse_gqa_expand_in_place(std::uint16_t* dst,
                                   raw + row * Row, raw + row * Row + Codec::code_bytes, d));
         }
     }
-    __syncthreads();
+    sparse_gqa_sync<Warps>();
     if constexpr (Begin + Rows < N)
         sparse_gqa_expand_in_place<Storage, Key, N, Warps, Begin + Rows>(dst, raw);
 }
@@ -213,12 +371,14 @@ __device__ __forceinline__ void sparse_gqa_expand_in_place(std::uint16_t* dst,
 template <KvCacheStorage Storage, bool Key, int N, int Warps, SparseGqaLoad Load,
           SparseGqaWarpSplit Split, int PaddedHeads>
 __device__ void
-sparse_gqa_expand_stage(SparseGqaStorage<Storage, N, Warps, Load, Split, PaddedHeads>& s) {
+sparse_gqa_expand_stage(SparseGqaStorage<Storage, N, Warps, Load, Split, PaddedHeads>& s,
+                        int live_rows = N) {
     using Codec = SparseGqaCodec<Storage, Key>;
     auto* dst =
         s.kv +
         (Key || Load == SparseGqaLoad::Aliased || Load == SparseGqaLoad::Reused ? 0 : N * 256);
-    if constexpr (Load == SparseGqaLoad::InPlace) {
+    if constexpr (Load == SparseGqaLoad::InPlace ||
+                  (Load == SparseGqaLoad::Reused && kSparseQuantized<Storage>)) {
         constexpr int Row = Codec::packed_row;
         auto* raw         = reinterpret_cast<std::uint8_t*>(dst) + N * (512 - Row);
         if constexpr (Codec::scale_bytes == 2) {
@@ -226,7 +386,7 @@ sparse_gqa_expand_stage(SparseGqaStorage<Storage, N, Warps, Load, Split, PaddedH
             if (row < N)
                 *reinterpret_cast<__half*>(raw + (row + 1) * Row + Codec::code_bytes) =
                     reinterpret_cast<const __half*>(raw + row * Row + Codec::code_bytes)[1];
-            __syncthreads();
+            sparse_gqa_sync<Warps>();
         }
         sparse_gqa_expand_in_place<Storage, Key, N, Warps>(dst, raw);
     } else if constexpr (Load == SparseGqaLoad::Staged || Load == SparseGqaLoad::Aliased) {
@@ -238,14 +398,29 @@ sparse_gqa_expand_stage(SparseGqaStorage<Storage, N, Warps, Load, Split, PaddedH
             codes  = s.codes;
             scales = s.scales;
         }
-        for (int i = threadIdx.x; i < N * 32; i += Warps * 32) {
-            const int row = i / 32, d = i % 32 * 8;
-            common::store_vec(
-                dst + row * 256 + common::swizzle_xor_64(row, d),
-                sparse_gqa_expand<Storage, Key, true>(codes + row * Codec::code_bytes,
-                                                      scales + row * Codec::scale_bytes, d));
+        if (live_rows == N) {
+            for (int i = threadIdx.x; i < N * 32; i += Warps * 32) {
+                const int row = i / 32, d = i % 32 * 8;
+                common::store_vec(
+                    dst + row * 256 + common::swizzle_xor_64(row, d),
+                    sparse_gqa_expand<Storage, Key, true>(codes + row * Codec::code_bytes,
+                                                          scales + row * Codec::scale_bytes, d));
+            }
+        } else {
+            for (int i = threadIdx.x; i < live_rows * 32; i += Warps * 32) {
+                const int row = i / 32, d = i % 32 * 8;
+                common::store_vec(
+                    dst + row * 256 + common::swizzle_xor_64(row, d),
+                    sparse_gqa_expand<Storage, Key, true>(codes + row * Codec::code_bytes,
+                                                          scales + row * Codec::scale_bytes, d));
+            }
+            for (int i = threadIdx.x + live_rows * 32; i < N * 32; i += Warps * 32) {
+                const int row = i / 32, d = i % 32 * 8;
+                common::store_vec(dst + row * 256 + common::swizzle_xor_64(row, d),
+                                  make_int4(0, 0, 0, 0));
+            }
         }
-        __syncthreads();
+        sparse_gqa_sync<Warps>();
     }
 }
 } // namespace ninfer::ops::detail::qsa

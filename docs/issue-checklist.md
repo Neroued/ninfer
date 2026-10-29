@@ -3,7 +3,48 @@
 这里保留仍需处理或取得当前证据的问题，不作为稳定架构说明，也不表示 GitHub 状态已更新。
 完成记录与旧实现补丁由 Git/Issue 历史保存。原报告没有当前复现的条目继续明确标为待核实。
 
-## 正确性与资源行为
+## 本轮处理清单
+
+按以下顺序逐项讨论、实施；完成后勾选。
+
+- [x] **1. QSA 成员模板调用语法** — [#428](https://github.com/Neroued/ninfer/issues/428)
+
+  已补齐 `indexer/select.cuh` 的依赖成员模板调用消歧义关键字 `template`；其余三处
+  `jobs.build` 的对象类型不依赖模板参数，无需修改。RTX 5090 dev 完整构建通过（CUDA 13.4）；
+  当前环境未安装 CUDA 13.2，未在该版本复测。
+
+- [ ] **2. 流式请求准入超时的 HTTP 状态** — [#420](https://github.com/Neroued/ninfer/issues/420)、[#137](https://github.com/Neroued/ninfer/issues/137)
+
+  当前在 Engine 准入结果确定前提交 HTTP 200/SSE。理清 Engine 准入、GenerationService
+  与 HTTP 响应提交的边界，覆盖 Chat、Responses、Anthropic。
+  完成条件：准入前超时返回 HTTP 503 与对应协议错误；已开始的流按协议报告后续失败，取消与清理正常。
+
+- [ ] **3. 请求终结与统计发布顺序** — [#422](https://github.com/Neroued/ninfer/issues/422)
+
+  正常完成已先移除 slot，取消和部分请求错误路径仍先通知结果。由 Engine 统一终结顺序。
+  完成条件：正常完成、取消、请求错误的结果可见前，逻辑 slot 已释放、对应统计已发布；保持异步执行退役的生命周期。
+
+- [ ] **4. Thinking 统计与 budget 解耦** — [#373](https://github.com/Neroued/ninfer/issues/373)
+
+  公共 frontend 的语义计数仍依赖是否设置 budget。独立维护模型 thinking token 统计，budget 仅负责预算控制。
+  完成条件：Qwen、GLM 在有无 budget 时均正确计数，区分模型生成与引擎注入，预算控制仍正确。
+
+- [ ] **5. HTTP listener 端口复用** — [#341](https://github.com/Neroued/ninfer/issues/341)、[PR #340](https://github.com/Neroued/ninfer/pull/340)
+
+  在 HTTP transport 为 Linux listener 设置 `SO_REUSEADDR`，参考候选 PR 并适配当前组织。
+  完成条件：服务退出后可立即切换到仅使用 `SO_REUSEADDR` 的服务；活动 listener 仍受到正确保护。
+
+- [ ] **6. 上下文超限错误信息** — [#401](https://github.com/Neroued/ninfer/issues/401)
+
+  在 Qwen、GLM 所属输入检查处报告实际 prepared token 数和上限，覆盖文本与媒体输入。
+  完成条件：超限原因和两个数值明确，保持 HTTP 400 与 `context_length_exceeded` 合同。
+
+- [ ] **7. Workspace 布局分配异常安全** — [PR #297](https://github.com/Neroued/ninfer/pull/297)
+
+  `WorkspaceLayoutBuilder::alloc/alloc_bytes` 先修改对齐后的 cursor，后续溢出会留下半更新状态。
+  改为局部计算成功后提交。完成条件：失败分配保持原 cursor/peak，成功分配及 scope 的布局语义正确。
+
+## 其余正确性与资源行为
 
 | 来源 | 剩余工作 |
 |---|---|
@@ -13,9 +54,6 @@
 | [#371](https://github.com/Neroued/ninfer/issues/371) 取消后的续接 | 检查接管旧 checkpoint 后取消、编辑和重试时上一完整恢复点的保留语义。 |
 | [#349](https://github.com/Neroued/ninfer/issues/349) proposal CDF | Candidate path 的 CDF 未命中仍回退最后项，核对累计舍入与零概率尾项边界；处理实际 draw 与 q 的一致性。 |
 | [#381](https://github.com/Neroued/ninfer/issues/381) Direct I/O | 按 read_direct 与调用者的真实短读合同检查，不把一次 pread 自身视为完整读取保证；buffered 存储支持另行决定。 |
-| [#373](https://github.com/Neroued/ninfer/issues/373) thinking 计数 | Semantic thinking 初始化仍依赖 budget；分离统计与预算控制，区分模型产生和引擎注入。 |
-| [#341](https://github.com/Neroued/ninfer/issues/341) 端口复用 | 核对 Linux socket close/rebind 与实际 reuse options，在 transport 所属层处理。 |
-| [#401](https://github.com/Neroued/ninfer/issues/401) 上下文错误信息 | 保持协议错误类型，在所属输入检查处提供实际长度与上限。 |
 
 ## 性能工作
 

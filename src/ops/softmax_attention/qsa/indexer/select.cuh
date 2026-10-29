@@ -12,7 +12,7 @@ __global__ __launch_bounds__(256, MinBlocks) void indexer_partition_kernel(
     if (a.columns <= kIndexerSelected) return;
     __shared__ IndexerJobs<MaxQueries> jobs;
     __shared__ Top512Storage<Bits, Copies> radix;
-    if (!jobs.build<1, Partition>(a)) return;
+    if (!jobs.template build<1, Partition>(a)) return;
     const int total = jobs.prefix[jobs.groups];
     for (int step = blockIdx.x; step < total; step += gridDim.x) {
         const int job  = Reverse ? total - 1 - step : step;

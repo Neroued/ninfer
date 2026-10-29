@@ -420,8 +420,7 @@ void exercise(const std::filesystem::path& artifact, ninfer::SpeculativeBackend 
     require(first_result->stats.engine_request_id != second_result.stats.engine_request_id,
             "concurrent requests lost their independent identity");
 
-    // The physical snapshot also waits for the completed worker boundary before we inspect its
-    // published counters; wait() may return as soon as the terminal response is available.
+    // wait() publishes the completed requests' scheduling state before returning.
     const auto after = engine.snapshot().runtime;
     settled(after);
     require(first_token_counts[0] == 1 && first_token_counts[1] == 1,

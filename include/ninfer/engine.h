@@ -51,6 +51,8 @@ public:
     // wait() still delivers the stream start and result. Calls on one handle must be serial.
     void wait_for_admission(const CancellationView& cancellation = {});
 
+    // A terminal result or request error is visible after logical scheduling membership is
+    // released and the corresponding Engine snapshot is published.
     GenerationResult wait(OutputSink* sink = nullptr, const CancellationView& cancellation = {});
 
 private:

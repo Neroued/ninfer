@@ -19,10 +19,10 @@
   真实服务验证：Chat、Responses 排队超时返回 HTTP 503；Anthropic 沿用 HTTP 504 / `timeout_error`。
   正常流式与非流式请求、排队取消和等待后准入均通过；Engine 检查覆盖事件顺序、错误保留、立即完成及 handle 清理。
 
-- [ ] **3. 请求终结与统计发布顺序** — [#422](https://github.com/Neroued/ninfer/issues/422)
+- [x] **3. 请求终结与统计发布顺序** — [#422](https://github.com/Neroued/ninfer/issues/422)
 
-  正常完成已先移除 slot，取消和部分请求错误路径仍先通知结果。由 Engine 统一终结顺序。
-  完成条件：正常完成、取消、请求错误的结果可见前，逻辑 slot 已释放、对应统计已发布；保持异步执行退役的生命周期。
+  Engine 统一先解除逻辑成员、发布统计，再公开终态；整体失败统一清理后分发原始错误。
+  完整构建及 RTX 5090 真实模型检查通过，覆盖完成、取消、排队/原生错误、执行失败和暂停/Replay 取消。
 
 - [ ] **4. Thinking 统计与 budget 解耦** — [#373](https://github.com/Neroued/ninfer/issues/373)
 

@@ -292,21 +292,14 @@ void EngineCore<Instance>::abandon_request(std::shared_ptr<Request> request) noe
 }
 
 template <class Instance>
-bool EngineCore<Instance>::mark_completed(const std::shared_ptr<Request>& request) noexcept {
-    bool release = false;
+bool EngineCore<Instance>::prepare_completion(const std::shared_ptr<Request>& request) {
     {
         std::lock_guard lock(request->mutex);
-        if (request->consumer_released && !request->capacity_released) {
-            request->capacity_released = true;
-            release                    = true;
-        }
+        if (request->response_done) { return false; }
     }
-    return release;
-}
-
-template <class Instance>
-void EngineCore<Instance>::release_planning_state(
-    const std::shared_ptr<Request>& request) noexcept {
+    if (request->preemption_count) {
+        observe_scheduling(request, GenerationSchedulingTransition::Terminal);
+    }
     if (admission_decision_ && admission_decision_->request == request) {
         admission_decision_.reset();
     }
@@ -323,39 +316,62 @@ void EngineCore<Instance>::release_planning_state(
     request->base_plan.reset();
     request->placement.reset();
     request->placement_tokens = 0;
+    request->prompt           = {};
+    request->model_state      = EngineRequestState::ModelFinished;
+    return true;
 }
 
 template <class Instance>
-void EngineCore<Instance>::complete_error(const std::shared_ptr<Request>& request,
-                                          std::exception_ptr error) {
-    if (request->preemption_count) {
-        observe_scheduling(request, GenerationSchedulingTransition::Terminal);
+void EngineCore<Instance>::release_request(const std::shared_ptr<Request>& request) noexcept {
+    if (request->lane) {
+        const auto lane = request->lane->value;
+        capture_decisions_[lane].reset();
+        reserved_units_[lane].reset();
+        slots_[lane].reset();
+        request_admission_check();
+        scheduler_.capacity_released();
     }
-    release_planning_state(request);
-    request->prompt      = {};
-    request->model_state = EngineRequestState::ModelFinished;
     request->sequence.reset();
     request->lane.reset();
     request->residency.reset();
     request->budget.reset();
     request->terminal_reason.reset();
+    request->terminal_error = {};
+}
+
+template <class Instance>
+void EngineCore<Instance>::publish_completion(const std::shared_ptr<Request>& request,
+                                              GenerationResult result, std::exception_ptr error) {
+    bool release = false;
     {
         std::lock_guard lock(request->mutex);
         if (request->response_done) { return; }
+        request->result        = std::move(result);
         request->error         = std::move(error);
         request->response_done = true;
+        if (request->consumer_released && !request->capacity_released) {
+            request->capacity_released = true;
+            release                    = true;
+        }
     }
-    if (mark_completed(request)) { release_reserved_capacity(); }
+    if (release) { release_reserved_capacity(); }
     request->cv.notify_one();
+}
+
+template <class Instance>
+void EngineCore<Instance>::complete_error(const std::shared_ptr<Request>& request,
+                                          std::exception_ptr error) {
+    if (!prepare_completion(request)) { return; }
+    release_request(request);
+    publish_runtime_stats();
+    publish_completion(request, {}, std::move(error));
 }
 
 template <class Instance>
 void EngineCore<Instance>::complete_success(const std::shared_ptr<Request>& request,
                                             FinishReason reason) {
     HostPhaseMeasurement completion = begin_host_phase();
-    if (request->preemption_count) {
-        observe_scheduling(request, GenerationSchedulingTransition::Terminal);
-    }
+    if (!prepare_completion(request)) { return; }
     double prompt_wall_seconds     = 0.0;
     double generation_wall_seconds = 0.0;
     if (request->first_token) {
@@ -367,9 +383,6 @@ void EngineCore<Instance>::complete_success(const std::shared_ptr<Request>& requ
         generation_wall_seconds =
             std::chrono::duration<double>(*request->last_token - *request->first_token).count();
     }
-    release_planning_state(request);
-    request->prompt      = {};
-    request->model_state = EngineRequestState::ModelFinished;
     if (!request->queue_wait_recorded) {
         request->host_timing.queue_wait_ns = elapsed_ns(request->submitted, Clock::now());
         request->queue_wait_recorded       = true;
@@ -427,50 +440,25 @@ void EngineCore<Instance>::complete_success(const std::shared_ptr<Request>& requ
     result.stats.timings.total_seconds =
         request->prepare_seconds +
         std::chrono::duration<double>(Clock::now() - request->submitted).count();
-    request->sequence.reset();
-    request->lane.reset();
-    request->residency.reset();
-    request->budget.reset();
-    request->terminal_reason.reset();
+    release_request(request);
     finish_engine_phase(completion, EngineHostPhase::CommitOutput);
     result.stats.engine_timing       = request->host_timing.public_snapshot();
     result.stats.first_output_timing = request->first_output_timing;
     publish_runtime_stats();
-    {
-        std::lock_guard lock(request->mutex);
-        if (request->response_done) { return; }
-        request->result        = std::move(result);
-        request->response_done = true;
-    }
-    if (mark_completed(request)) { release_reserved_capacity(); }
-    request->cv.notify_one();
+    publish_completion(request, std::move(result));
 }
 
 template <class Instance>
 void EngineCore<Instance>::complete_cancelled(const std::shared_ptr<Request>& request) {
-    (void)request->output.preview_terminal(FinishReason::Cancelled);
-    append_output(request, request->output.commit_preview());
-    complete_success(request, FinishReason::Cancelled);
-}
-
-template <class Instance>
-void EngineCore<Instance>::complete_detached_cancelled(const std::shared_ptr<Request>& request) {
     try {
-        complete_cancelled(request);
+        (void)request->output.preview_terminal(FinishReason::Cancelled);
+        append_output(request, request->output.commit_preview());
+        complete_success(request, FinishReason::Cancelled);
     } catch (...) {
         const std::exception_ptr error = std::current_exception();
         complete_error(request, error);
         throw;
     }
-}
-
-template <class Instance>
-void EngineCore<Instance>::remove_completed_slot(std::uint32_t lane) {
-    capture_decisions_[lane].reset();
-    reserved_units_[lane].reset();
-    slots_[lane].reset();
-    request_admission_check();
-    scheduler_.capacity_released();
 }
 
 template <class Instance>
@@ -512,7 +500,6 @@ bool EngineCore<Instance>::settle_terminal_requests(HostPhaseMeasurement& bounda
         }
         if (request->consumed_by_commit) {
             finish_engine_phase(boundary, EngineHostPhase::Boundary);
-            remove_completed_slot(lane);
             if (request->terminal_error) {
                 complete_error(request, std::exchange(request->terminal_error, {}));
             } else {
@@ -531,7 +518,6 @@ bool EngineCore<Instance>::settle_terminal_requests(HostPhaseMeasurement& bounda
             const auto error           = std::exchange(request->terminal_error, {});
             finish_engine_phase(boundary, EngineHostPhase::Boundary);
             complete_error(request, error);
-            remove_completed_slot(lane);
             boundary = begin_host_phase();
             changed  = true;
             continue;
@@ -552,12 +538,10 @@ bool EngineCore<Instance>::settle_terminal_requests(HostPhaseMeasurement& bounda
         request->terminal_reason.reset();
 
         finish_engine_phase(boundary, EngineHostPhase::Boundary);
-        remove_completed_slot(lane);
         complete_success(request, reason);
         boundary = begin_host_phase();
         changed  = true;
     }
-    if (changed) { publish_runtime_stats(); }
     return changed;
 }
 
@@ -566,9 +550,8 @@ void EngineCore<Instance>::cancel_active_requests(
     const std::array<bool, kMaximumConcurrency>& cancelled_at_boundary,
     HostPhaseMeasurement& boundary) {
     if (instance_.session->has_context_operation()) { return; }
-    bool changed = false;
     for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
-        const auto& request = slots_[lane];
+        const auto request = slots_[lane];
         if (request == nullptr || !cancelled_at_boundary[lane]) { continue; }
         if (request->capture_pending ||
             (request->sequence && instance_.session->execution_pending(*request->sequence))) {
@@ -586,11 +569,8 @@ void EngineCore<Instance>::cancel_active_requests(
         finish_engine_phase(boundary, EngineHostPhase::Boundary);
         append_output(request, request->output.commit_preview());
         complete_success(request, FinishReason::Cancelled);
-        remove_completed_slot(lane);
         boundary = begin_host_phase();
-        changed  = true;
     }
-    if (changed) { publish_runtime_stats(); }
 }
 
 template <class Instance>
@@ -617,7 +597,7 @@ template <class Instance>
         have_pending = !pending_.empty();
     }
     try {
-        for (const auto& request : cancelled) { complete_detached_cancelled(request); }
+        for (const auto& request : cancelled) { complete_cancelled(request); }
         for (const auto& request : expired) {
             complete_error(request, std::make_exception_ptr(RequestError(
                                         RequestErrorKind::QueueTimeout,
@@ -629,10 +609,7 @@ template <class Instance>
         for (const auto& request : expired) { complete_error(request, error); }
         throw;
     }
-    if (!cancelled.empty() || !expired.empty()) {
-        request_admission_check();
-        publish_runtime_stats();
-    }
+    if (!cancelled.empty() || !expired.empty()) { request_admission_check(); }
     return have_pending;
 }
 

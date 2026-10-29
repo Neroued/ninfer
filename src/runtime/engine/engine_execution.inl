@@ -620,22 +620,27 @@ void EngineCore<Instance>::fail_all(std::exception_ptr error) noexcept {
     materializing_.reset();
     admission_decision_.reset();
     for (auto& decision : capture_decisions_) { decision.reset(); }
+    for (auto& unit : reserved_units_) { unit.reset(); }
     context_owner_.reset();
-    for (auto& request : paused_) {
-        request->suspended.reset();
-        complete_error(request, error);
-    }
-    paused_.clear();
+    std::vector<std::shared_ptr<Request>> paused;
+    paused.swap(paused_);
+    const auto residents = slots_;
+    const auto release   = [&](const std::shared_ptr<Request>& request) {
+        if (request && prepare_completion(request)) { release_request(request); }
+    };
+    for (const auto& request : paused) { release(request); }
+    for (const auto& request : residents) { release(request); }
+    release(materializing_request);
+    for (const auto& request : pending) { release(request); }
     resources_.release_all(*instance_.session);
-    for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
-        if (slots_[lane] != nullptr) {
-            complete_error(slots_[lane], error);
-            slots_[lane].reset();
-        }
-    }
-    if (materializing_request != nullptr) { complete_error(materializing_request, error); }
-    for (const auto& request : pending) { complete_error(request, error); }
     publish_runtime_stats();
+    const auto publish = [&](const std::shared_ptr<Request>& request) {
+        if (request) { publish_completion(request, {}, error); }
+    };
+    for (const auto& request : paused) { publish(request); }
+    for (const auto& request : residents) { publish(request); }
+    publish(materializing_request);
+    for (const auto& request : pending) { publish(request); }
     if (measurement) measurement->completion.set_exception(error);
     queue_cv_.notify_all();
 }

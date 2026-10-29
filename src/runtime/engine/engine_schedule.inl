@@ -138,8 +138,8 @@ void EngineCore<Instance>::resolve_context_progress(
         const auto control  = std::move(*materializing_);
         const auto& request = control.request;
         if (!progress.published) {
-            complete_detached_cancelled(request);
             materializing_.reset();
+            complete_cancelled(request);
             scheduler_.capacity_released();
             request_admission_check();
             return;
@@ -206,14 +206,8 @@ void EngineCore<Instance>::resolve_context_progress(
             const auto lane = request->lane->value;
             if (!progress.published) {
                 finish_engine_phase(boundary, EngineHostPhase::Boundary);
-                slots_[lane].reset();
-                request->lane.reset();
-                request->residency.reset();
-                request->sequence.reset();
                 context_owner_.reset();
-                complete_detached_cancelled(request);
-                scheduler_.capacity_released();
-                request_admission_check();
+                complete_cancelled(request);
                 boundary = begin_host_phase();
                 return;
             }
@@ -590,7 +584,6 @@ bool EngineCore<Instance>::try_admit_one(bool restoring) {
                 }
                 complete_error(request, error);
                 request_admission_check();
-                publish_runtime_stats();
                 return true;
             }
             const auto retained = resources_.retained_source(request->id);
@@ -1026,7 +1019,7 @@ void EngineCore<Instance>::begin_cycle(HostPhaseMeasurement& boundary) {
         }
         request->suspended.reset();
         it = paused_.erase(it);
-        complete_detached_cancelled(request);
+        complete_cancelled(request);
         scheduler_.capacity_released();
     }
     const bool recovering = std::any_of(slots_.begin(), slots_.end(),

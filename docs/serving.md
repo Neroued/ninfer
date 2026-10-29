@@ -6,7 +6,7 @@ Anthropic-compatible HTTP endpoints over one resident NInfer Engine.
 Qwen3.8-Flash-Next supports Text/Vision/MTP serving with segmented CUDA Graph decode.
 Add `--vision` for media and `--spec mtp --draft-tokens 3` for native MTP with the full head.
 See the [CLI example](cli.md) for commands and the
-[execution reference](maintainer/qwen4_exp-execution.md) for support and resource limits.
+[execution reference](maintainer/qwen4_exp-model.md) for support and resource limits.
 
 ## Start the server
 
@@ -144,7 +144,7 @@ JSON mode and JSON Schema use the standard protocol fields:
 | Anthropic Messages | `output_config.format: {"type":"json_schema","schema":{...}}` |
 
 `json_object` requires an object root. Schema mode follows the supplied root type and enforces the
-[supported assertions](maintainer/constrained-decoding.md#42-json-与-schema-的执行合同), including when
+[supported assertions](../src/text/json_schema.cpp), including when
 `strict` is omitted or false. Unsupported assertions return HTTP 400 before generation. OpenAI
 errors distinguish `invalid_json_schema`, `unsupported_json_schema` and `unsatisfiable_json_schema`;
 `param` identifies the request field followed by the schema JSON Pointer. Anthropic uses its
@@ -181,7 +181,7 @@ Regex matches the complete content. It supports character classes, groups, alter
 repetition; `.` excludes line terminators, `\d`/`\w` use ASCII ranges, and `\s` includes Unicode
 whitespace. Empty regex permits only empty content. Anchors are supported at the ends of top-level
 alternatives. Lookaround, backreferences, word boundaries, Unicode properties, flags and unknown
-escapes return HTTP 400. See the [language contract](maintainer/constrained-decoding.md#41-gbnf--regex--choice).
+escapes return HTTP 400. See the [language implementation](../src/text/grammar.cpp).
 Invalid choices and regexes use `invalid_choice` and `invalid_regex`, with the request field in `param`.
 
 These constraints apply to answer content; thinking is separate. GBNF supports recursive rules,
@@ -1185,7 +1185,7 @@ A paused request keeps its committed output and protocol state. With sufficient 
 can restore a snapshot; otherwise it rebuilds model state from retained input and committed tokens.
 Replay does not resample or republish those tokens, but it consumes compute and can increase gaps in
 the output stream. The policy and ownership rules are defined in
-[Resource scheduling and context cache](maintainer/resource-scheduling-and-context-cache.md).
+[Resource scheduling and context cache](maintainer/context-management.md).
 
 Compatible prefixes are reused for both text and multimodal histories unless the server starts with
 `--no-prefix-reuse`. A multimodal hit additionally requires matching token types, three-axis MRoPE

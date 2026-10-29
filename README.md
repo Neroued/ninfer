@@ -60,7 +60,7 @@ There is no install target or packaged binary distribution; run NInfer from its 
 Executables use shared libraries in the same build's `lib/` directory through relative RPATH;
 keep that directory alongside `apps/`, `tests/` and `bench/` when moving build outputs.
 Python tools run independently of CMake; the standalone HBM probe has its own
-[build command](tools/README.md#standalone-hbm-probe).
+[build command](tools/README.md#memory-bandwidth-probe).
 
 Download the artifact used by this example with the Hugging Face CLI:
 
@@ -137,7 +137,7 @@ agent reuse. Inactive checkpoints share Device and pinned Host capacity; pressur
 resources before pausing resident requests. Paused requests resume from a snapshot or rebuild their
 state by replaying already committed tokens.
 
-See [Resource scheduling and context cache](docs/maintainer/resource-scheduling-and-context-cache.md)
+See [Resource scheduling and context cache](docs/maintainer/context-management.md)
 for the algorithm and [Serve TTFT benchmark](tools/bench/ttft/) for public-HTTP coverage of hot
 reuse, Host resume, eviction, shared prefixes, scheduling boundaries, and multimodal load.
 
@@ -256,7 +256,7 @@ Its native MTP supports the shared BF16 head or an additional full-vocabulary Q4
 `--proposal-head optimized`; DFlash/DFlash2 are unsupported for this architecture.
 See the [CLI commands](docs/cli.md),
 [conversion recipe](docs/weight-conversion.md) and
-[current support reference](docs/maintainer/qwen4_exp-execution.md).
+[current support reference](docs/maintainer/qwen4_exp-model.md).
 
 The product boundary remains intentionally small:
 
@@ -282,7 +282,7 @@ stays fixed while records are allocated, retained, reclaimed or moved within it.
 - [Performance](docs/performance.md)
 - [Perplexity evaluation](docs/perplexity.md)
 - [Weight conversion and custom recipes](docs/weight-conversion.md)
-- [Resource scheduling and context cache](docs/maintainer/resource-scheduling-and-context-cache.md)
+- [Resource scheduling and context cache](docs/maintainer/context-management.md)
 - [Serve TTFT benchmark](tools/bench/ttft/)
 - [CLI examples](examples/cli/)
 - [Contributing](CONTRIBUTING.md)

@@ -116,7 +116,7 @@ Main experts use two NVFP4 banks per layer with independent matrix divisors. MTP
 128×128 block-FP8 banks, preserving NVIDIA E4M3FN codes and BF16 multipliers; its other private
 parameters also come from the NVIDIA source. PLE alone uses the BF16-to-NF4 stored-scale method.
 See the [model and weight contract](maintainer/qwen4_exp-model.md) for layouts and precision, and
-the [execution reference](maintainer/qwen4_exp-execution.md) for runtime support and memory use.
+the [execution reference](maintainer/qwen4_exp-model.md) for runtime support and memory use.
 
 ### Conversion resources
 
@@ -134,7 +134,7 @@ row-FP8 quantization on the GPU; encoded NVFP4/block-FP8 imports retain their or
 `stored_scale_mse` first finds the whole object's maximum, then selects stored scales/codes.
 Its cache avoids rereading eligible objects between these passes. CUDA candidate pruning uses
 conservative error bounds and retains the FP64 selection and tie rules defined in the
-[numeric contract](maintainer/tensor-formats.md#36-stored_scale_mse-conversion-method).
+[stored-scale implementation](../tools/convert/quantization/stored_scale.py).
 The conversion report records resource settings and per-object conversion times.
 
 ## Change part of a recipe
@@ -225,8 +225,8 @@ E4M3FN scales per G16 group using FP64 reconstruction error. NF4 uses the fixed 
 NVFP4 uses E2M1. The method provides no activation calibration. ModelOpt import preserves
 packed codes and scale bytes while converting FP32 global multipliers to stored reciprocals.
 
-The exact numeric and packing rules are in [numeric formats](maintainer/tensor-formats.md) and
-[storage layouts](maintainer/storage-layouts.md). Source format names alone do not establish
+The exact numeric and packing rules are in [numeric formats](../tools/artifact/formats.py) and
+[storage layouts](../src/core/weight_view.cpp). Source format names alone do not establish
 compatibility: scale direction, granularity, code meaning and axis order must also match.
 
 Activation permissions are independent of the stored weight format:

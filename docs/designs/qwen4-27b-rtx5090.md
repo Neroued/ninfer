@@ -161,8 +161,8 @@ Residual 的公开表示为 BF16，下一次 norm 消费实际写入的 BF16 res
 
 ## 2. 权重格式与计算精度
 
-格式定义引用[数值格式](../maintainer/tensor-formats.md)，物理编码引用
-[存储布局](../maintainer/storage-layouts.md)。
+格式定义引用[数值格式](../maintainer/weights-and-loading.md#数值表示与物理布局)，物理编码引用
+[存储布局](../maintainer/weights-and-loading.md#数值表示与物理布局)。
 
 | 简称 | 持久格式 | 权重体积 |
 |---|---|---|

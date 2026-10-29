@@ -20,74 +20,38 @@ The executable `--help` output is the exact source for command-line option spell
 Published artifact downloads are listed in the [project README](../README.md).
 [Versioned model cards](../model-cards/) own each artifact's identity, provenance and evaluation results.
 
-## Repository-local guides
+## Internal architecture
 
-- [Benchmarks](../bench/README.md)
-- [Tests](../tests/README.md)
-- [Tools](../tools/README.md)
-- [Capability evaluation](../eval/README.md)
-
-## Designs
-
-- [Qwen4-27B on RTX 5090](designs/qwen4-27b-rtx5090.md) — architecture dimensions,
-  Main/Vision/MTP quantization, NVFP4 AllowA4 policy, and weight/context budgets.
-- [Qwen4-27B RTX 5090 Op checklist](designs/qwen4-27b-op-checklist.md) — production shapes,
-  HC/QSA contract gaps, MTP projections, existing Vision reuse, and qualification criteria.
-- [Unified Context storage pool](designs/unified-context-pool.md) — shared KV/State capacity,
-  startup guarantees, execution reservations, cache reclamation and recovery, Op views, and
-  deployment feasibility on RTX 5090 and single/dual Spark; selected design pending implementation.
-- [Distributed execution](distributed-execution-design.md) — selected architecture for centralized
-  scheduling, local/distributed executors, rank ownership, parallel plans and communication;
-  local execution and distributed execution foundations are implemented; multi-rank model
-  integration is pending.
-- [Qwen4Exp parallel strategy](qwen4_exp-parallel-design.md) — selected initial dual-Spark
-  TP2/EP2 strategy, state shards, computation/graph composition and implementation dependencies.
-- [Qwen4Exp dual-Spark roadmap](qwen4_exp-distributed-roadmap.md) — D2–D6 implementation sequence,
-  shared infrastructure, sharded loading, inference integration and stage completion checklist.
-- [GLM5Next design and implementation](designs/glm5next/README.md) — selected dual-Spark
-  placement, KDA ReplaySSM, Kpool Sparse MLA, mHC and the existing Op checklist; separates
-  decisions, implementation status and retirement of designs after code takes ownership.
-- [Attention DP placement and context management](designs/attention-dp-placement.md) — selected
-  boundaries for whole-model DP replicas and instance-local ADP, token-load and cache-affinity
-  policy, joint reservations, cross-owner restoration and pressure handling; first consumer is
-  GLM5Next, implementation pending.
-
-## Maintainer references
-
-The active references under [`maintainer/`](maintainer/) record current architecture, model,
-artifact, and maintenance contracts. These files are not additional user workflows or installed
-API documentation.
-
-[Engine architecture](maintainer/engine-architecture.md) is the single top-level reference. The
-other references own narrower contracts:
+内部文档记录跨模块设计、重要数值取舍和开发方法。具体类型、接口、支持几何与 codec
+以所属代码为准，不在文档维护重复声明。
 
 | Document | Responsibility |
 |---|---|
-| [Engine architecture](maintainer/engine-architecture.md) | model/config/weight ownership, loading-to-execution flow, requests, scheduling, transactions and graphs |
-| [Build system](maintainer/build-system.md) | CMake targets, explicit source ownership, CUDA compilation boundaries, presets and developer configuration |
-| [Artifact container](maintainer/artifact-container.md) | v3 directory, objects, logical bindings, Uses, resources and file framing/sharding |
-| [Numeric formats](maintainer/tensor-formats.md) | represented values, codes/scales, conversion arithmetic and numerical interpretation |
-| [Storage layouts](maintainer/storage-layouts.md) | packing, plane offsets, padding, encoded sizes and view addressing |
-| [Qwen3.5 model](maintainer/qwen3_5-model.md) | Dense/MoE mathematics, instance config, logical parameters, MTP, Vision and state semantics |
-| [Qwen4Exp model and weights](maintainer/qwen4_exp-model.md) | Flash Next architecture, quantization recipe, merged projections, expert banks and PLE representation |
-| [Qwen4Exp execution and state](maintainer/qwen4_exp-execution.md) | current support, layer flow, PLE pipeline, MTP/Vision, continuation, resource planning and CUDA Graph |
-| [GLM5Next model semantics](maintainer/glm5next-model.md) | architecture, complete mathematics, logical weights, Main/MTP/Vision and history dependencies |
-| [GLM5Next quantization and numerics](maintainer/glm5next-quantization.md) | selected source/weight/cache representations, exact codecs, activation policy and rounding boundaries; implementation status belongs to the design index |
-| [Expert weight cache](maintainer/expert-weight-cache.md) | Host/GPU bank sources, replica cache, mixed CPU/GPU execution, streaming and graph handoffs |
-| [DFlash and DFlash2](maintainer/dflash.md) | conditioning, masked draft computation, proposal distributions and backend state |
-| [Constrained decoding](maintainer/constrained-decoding.md) | GBNF/JSON/choice/regex, tool policies, masks, speculative transactions and observations |
-| [Resource scheduling and context cache](maintainer/resource-scheduling-and-context-cache.md) | core design for continuation, retention, incremental resources, preemption and recovery |
-| [Paged KV context store](maintainer/paged-kv-cache.md) | typed pools, pages, replicas, address spaces, reservations and consumer views |
-| [ReplaySSM GDN](maintainer/replayssm-gdn.md) | raw transition records and faithful commitment of the verified state prefix |
-| [Op development](maintainer/op-development.md) | semantic boundaries, source ownership, numerical qualification and performance evidence |
-| [Operational logging](maintainer/logging.md) | log ownership, presentation, severity and data policy |
-| [Linear tuning and measurement](maintainer/linear-tuning.md) | logical metrics, timing, tuning ranges, dispatch tradeoffs and performance reports |
+| [Engine architecture](maintainer/engine-architecture.md) | 所有权、启动预算、请求与执行事务、提交和退役 |
+| [Distributed execution](maintainer/distributed-execution.md) | 集中调度、rank 准备、控制与数据通信、完整完成与失败 |
+| [Context management](maintainer/context-management.md) | KV/State 统一容量、身份、预留、前缀策略、ADP 与恢复 |
+| [Frontend](maintainer/frontend.md) | 模型策略与共享文本/媒体基础、输入身份、输出与 grammar 事务 |
+| [Weights and loading](maintainer/weights-and-loading.md) | 表示、绑定、转换、保值分片物化与 backing |
+| [Qwen3.5](maintainer/qwen3_5-model.md) | Dense/MoE、Main/MTP/DFlash、Vision 与状态组合 |
+| [Qwen4Exp](maintainer/qwen4_exp-model.md) | Flash Next、HC/QSA/PLE、量化、TP/EP 与执行组合 |
+| [GLM5Next](maintainer/glm5next-model.md) | KDA/MLA/mHC、量化、ADP、MTP/Vision 与 Graph |
+| [Speculative execution](maintainer/speculative-decoding.md) | MTP 对齐、ReplaySSM、DFlash 分布与接受前缀 |
+| [Expert cache](maintainer/expert-weight-cache.md) | 固定与流式缓存、CPU/GPU 分工、上传和消费寿命 |
+| [Observability](maintainer/observability.md) | 时间和资源口径、测量窗口、rank 统计与日志边界 |
+| [Op development](maintainer/op-development.md) | 语义、实现组织、数值验证与调优方法 |
+| [Build system](maintainer/build-system.md) | Target、编译与链接、源码和依赖归属 |
 
-Model cards contain official artifact facts and source provenance. The
-[conversion guide](weight-conversion.md) is the entry point for making an artifact. Exact config
-fields, parameter expansion and native supported domains are maintained by the code linked from
-these references.
+## Development tools
 
-Qwen3.8-Flash-Next is the Qwen4Exp instance; Qwen3.8-27B uses the Qwen3.5 architecture.
-The model references own mathematical and stored-representation facts, and the execution reference
-owns integrated support and its limits. Concrete Op contracts live in `include/ninfer/ops/`.
+- [Tests](../tests/README.md)：测试组织、筛选与真实模型检查。
+- [Benchmarks](../bench/README.md)：Engine/Op 微测、roofline 与外部 profiling。
+- [Tools](../tools/README.md)：转换检查、Serve runners 与带宽工具入口。
+- [Capability evaluation](../eval/README.md)：API 评测、并发与结果恢复。
+
+## Open work
+
+[未完成事项](issue-checklist.md)保留待处理问题与 MLA 性能工作。
+Qwen4-27B 的[架构与量化](designs/qwen4-27b-rtx5090.md)及
+[Op 需求](designs/qwen4-27b-op-checklist.md)属于独立适配计划。
+
+Qwen3.8-Flash-Next 使用 Qwen4Exp；Qwen3.8-27B 使用 Qwen3.5。

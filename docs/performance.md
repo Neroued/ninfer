@@ -28,7 +28,7 @@ use INT8 group-64 KV. Each model page records its build and run conditions.
 
 Qwen3.8-Flash-Next is supported, but has no published result page in this campaign.
 The Qwen3.8-27B measurements above describe a different architecture and artifact.
-Flash Next's current execution scope is documented [here](maintainer/qwen4_exp-execution.md).
+Flash Next's current execution scope is documented [here](maintainer/qwen4_exp-model.md).
 
 ## Reading the results
 

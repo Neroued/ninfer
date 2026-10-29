@@ -97,7 +97,7 @@ kind = "none" # none / grammar / json_object / json_schema / regex / choice
 # Environment controls remain separate: NINFER_VRAM_BUDGET_MIB, NINFER_CUDA_SYNC.
 
 # Distributed execution-group example. Keep disabled for local CLI/serve execution.
-# Current model integration status: docs/qwen4_exp-distributed-roadmap.md.
+# Model placement: docs/maintainer/qwen4_exp-model.md.
 # Worker and artifact paths are absolute paths on each node. Control port 0 selects a free port.
 # The execution test and collective benchmark use their own executable as the worker path.
 # [distributed]

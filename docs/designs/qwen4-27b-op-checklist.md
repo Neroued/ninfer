@@ -23,7 +23,7 @@ MoE 或 PLE。源码状态来自本次合同与生产分派检查；“已有”
   shape 已注册，不代表 LinearSplit、SwiGLU 或 HC 已支持；不要求为每个融合 Op
   再新增一个无调用方的纯 Linear 入口。
 - 数学、资源和验证规则引用 [Op 开发](../maintainer/op-development.md)；
-  Linear 调优范围引用 [Linear tuning](../maintainer/linear-tuning.md)。
+  Linear 调优范围引用 [Linear tuning](../maintainer/op-development.md#调优与测量)。
   权重物化属于准备阶段，Op 借用权重与 caller-owned workspace，执行中不隐藏分配或重打包。
 
 ## 2. 首批新增矩阵计算
@@ -153,7 +153,7 @@ H2/H3 的融合可以由实现选择，保留 BF16 injection 不意味着必须�
 连续 chunk 接上旧 conditioning；接受后的重建沿用真实 bridge，仅补后续所需列。
 没有历史工作时不提交空 Linear。历史补齐不能直接采用后续 draft 的投影结果，因为
 它们可能消费 MTP conditioning，而需要重建的是以 Main conditioning 配对的历史。
-配对与前沿由[模型执行合同](../maintainer/qwen4_exp-execution.md#5-mtp-的生成与采用)负责。
+配对与前沿由[模型执行合同](../maintainer/qwen4_exp-model.md)负责。
 
 ### 4.3 MTP 三段前缀投影与权重生命周期
 
@@ -256,7 +256,7 @@ spatial merge。模型接入时验证 merger 输出与 Text 5120 维输入交接
 ### 7.1 Op 完成条件
 
 通用要求执行 [Op 开发](../maintainer/op-development.md) 和
-[Linear tuning](../maintainer/linear-tuning.md)，本任务补充以下实际负载与风险点：
+[Linear tuning](../maintainer/op-development.md#调优与测量)，本任务补充以下实际负载与风险点：
 
 - Linear 类热区覆盖实际调用的 M=1…128，优先看 1、4、8；大 M 分别测 512、1024。
   MTP draft 使用 M=B，现有 draft 数 d=1…5 的 target verification 使用

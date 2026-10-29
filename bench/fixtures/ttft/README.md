@@ -1,48 +1,21 @@
-# Serve TTFT corpus
+# Serve TTFT 冻结语料
 
-This directory contains the frozen inputs for the external Serve TTFT benchmark. The timed runner
-only reads these files, checks their hashes, converts committed media to data URLs, and serializes
-requests. It never loads a tokenizer, generates images, resizes media, or calls an input-token
-endpoint.
+本目录保存外部 TTFT 场景的固定输入。Runner 读取文件、检查身份、编码媒体与发送请求，
+计时期间不加载 tokenizer、生成图像或调用 token-count API。
 
-`manifest.json` is the authority for each file path, SHA-256, exact prompt token count, output
-limit, shared-prefix frontier, and media envelope fact. Text shapes use the common Qwen3.6-family
-frontend resources embedded in every registered artifact.
+[manifest.json](manifest.json)维护文件路径、hash、prompt token 数、共享位置和媒体事实。
+这些 token 事实来自其声明的 Qwen3.6-family tokenizer/template，不适用于所有已注册模型。
 
-`long_8k_independent.json` is the cold long arm of `mixed-four`. It has the same 7680-token
-prompt size as the seed but diverges at the first system-content token, so the completed seed
-cannot turn that arm into a stable-prefix hit.
+独立长请求在早期 source content 分叉，用于区分私有工作集与意外共享命中；
+多轮和两组工作集使用 cases 中声明的改写规则。图片为确定性生成内容，重型输入分别覆盖
+合法媒体准备与超出 envelope 的拒绝。具体文件和大小以 manifest 为准，不重复维护清单。
 
-`rotation_55k_0.json` through `rotation_55k_5.json` are six byte-distinct, exactly 55000-token
-Responses roots. They diverge at the first system-content token so the six-session Host-KV
-rotation case measures independent private owners rather than accidental shared-prefix reuse.
-The two-cohort stream case derives its second cohort by replacing each leading session label with
-a distinct same-length label. It therefore preserves the frozen long-request shape without adding
-a second copy of the large corpus, while still diverging at the first system-content token.
-
-`state_working_set_a.json` through `state_working_set_f.json` are six 2048-token Chat roots that
-split at the first system-content token. The manifest also fixes short user-suffix probes and their
-token counts. The State-pressure cases reuse these roots for cohort changes, complete-history
-private continuations, and a hot prefix interleaved with one-shot conversations.
-
-The generated media consists of 56 deterministic, byte-distinct 1024×1024 PNGs. The two legal
-heavy inputs use disjoint sets of 28 images each. Every image expands to a 12 MiB Vision
-preprocessing patch tensor (this is media payload, not KV storage), so the files exercise media
-live-byte and preprocess-cache policy without creating large HTTP bodies. The 33-image input is an
-intentional aggregate Vision-envelope rejection.
-
-Regenerate only when a case contract changes, using a local tokenizer checkout:
+仅在负载合同改变时使用明确的本地 tokenizer 重建：
 
 ```bash
-python3 tools/bench/ttft/build_fixtures.py \
-  --tokenizer /path/to/local/Qwen3.8-27B/tokenizer
-```
-
-Verify committed files without loading a tokenizer:
-
-```bash
+python3 tools/bench/ttft/build_fixtures.py --tokenizer /path/to/local/tokenizer
 python3 tools/bench/ttft/build_fixtures.py --check
 ```
 
-See [the benchmark contract](../../../tools/bench/ttft/README.md) for formulas, Serve profiles,
-and the audited case catalog.
+`--check` 不加载 tokenizer。测量边界和资源解释见
+[TTFT 说明](../../../tools/bench/ttft/README.md)。

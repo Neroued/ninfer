@@ -35,7 +35,7 @@ NF4 rows from the artifact on disk. Add `--vision` for image/video messages. Nat
 [conversion](weight-conversion.md). MTP's own experts remain on GPU. Serving uses the same execution path;
 offline causal scoring remains text-only without speculative decoding. Use `--no-cuda-graph`
 to select eager decode; prefill and Vision encode use the same eager path in both modes.
-The [Qwen4Exp execution reference](maintainer/qwen4_exp-execution.md) records the complete support
+The [Qwen4Exp execution reference](maintainer/qwen4_exp-model.md) records the complete support
 scope, state handling and resource limits.
 
 ```bash
@@ -116,7 +116,7 @@ printf 'root ::= "yes" | "no"\n' > answer.gbnf
 ```
 
 Candidates preserve exact text; `--choice ''` explicitly permits empty content. `--regex ''`
-permits only empty content. See the [language contract](maintainer/constrained-decoding.md#41-gbnf--regex--choice)
+permits only empty content. See the [language implementation](../src/text/grammar.cpp)
 for supported regex syntax.
 
 `--json-object` constrains the answer to a JSON object. `--json-schema-file FILE` applies a JSON
@@ -135,7 +135,7 @@ limit or cancellation can leave it incomplete. JSON modes can accompany tools su
 the answer is either JSON or a tool-call sequence. GBNF, choice and regex require no active tools.
 Constraints reject custom stops and `--raw-output`. JSON uses compact separators and declared property order. Describe
 the desired content in the prompt; the schema is not added to it automatically. See the
-[supported schema subset](maintainer/constrained-decoding.md#42-json-与-schema-的执行合同).
+[supported schema subset](../src/text/json_schema.cpp).
 
 Omitted thinking and effort options use the selected template's defaults. `--no-thinking` or
 `--reasoning-effort none` requests disabled thinking; other effort values cannot be combined with

@@ -143,7 +143,7 @@ Choose the verification details relevant to your change:
 | Bug fix | The trigger, expected behavior, and verification of the fix. |
 | Recipe or conversion method | The source, target representation, conversion command, and which stages were actually verified: conversion, loading, or execution. |
 | New Op or shape | Supported inputs, independent numerical verification, and relevant boundaries. Follow [Op development](docs/maintainer/op-development.md). |
-| Performance tuning | Correctness evidence and a final performance report. Linear tuning follows the [existing report format](docs/maintainer/linear-tuning.md#4-report-format) and [Q4 example](docs/maintainer/examples/q4-linear.md). |
+| Performance tuning | Correctness evidence and a final performance report. Follow the [tuning and measurement guidance](docs/maintainer/op-development.md#调优与测量). |
 | Runtime or interface change | Reproduction and verification of the affected behavior. |
 | Documentation, build, or tooling | Checks relevant to the change, such as links, affected build targets, or tool invocations. |
 

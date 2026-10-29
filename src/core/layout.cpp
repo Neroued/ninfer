@@ -107,16 +107,16 @@ WorkspaceLayoutBuilder::Scope::Scope(Scope&& other) noexcept
 Tensor WorkspaceLayoutBuilder::alloc(DType dtype, std::initializer_list<std::int32_t> shape,
                                      std::size_t alignment) {
     const auto tensor = Tensor::metadata(dtype, shape);
-    cursor_           = align_up(cursor_, alignment, "workspace layout");
-    cursor_           = checked_add(cursor_, tensor.bytes(), "workspace layout");
+    const auto offset = align_up(cursor_, alignment, "workspace layout");
+    cursor_           = checked_add(offset, tensor.bytes(), "workspace layout");
     if (cursor_ > peak_) { peak_ = cursor_; }
     return tensor;
 }
 
 MemorySpan WorkspaceLayoutBuilder::alloc_bytes(std::size_t bytes, std::size_t alignment) {
     if (bytes == 0) { return {}; }
-    cursor_ = align_up(cursor_, alignment, "workspace layout");
-    cursor_ = checked_add(cursor_, bytes, "workspace layout");
+    const auto offset = align_up(cursor_, alignment, "workspace layout");
+    cursor_           = checked_add(offset, bytes, "workspace layout");
     if (cursor_ > peak_) { peak_ = cursor_; }
     return MemorySpan{nullptr, bytes, Device{}};
 }

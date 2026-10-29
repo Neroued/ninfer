@@ -5,6 +5,7 @@
 
 #include <cstring>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <utility>
 
@@ -74,6 +75,32 @@ int main() {
         const auto metadata = planned.alloc(DType::FP32, {8, 4});
         require(!metadata.data && metadata.device == Device{}, "planning has no residency");
         require(planned.peak_bytes(1) == matrix.bytes(), "planning and allocation agree");
+
+        const auto limit = std::numeric_limits<std::size_t>::max();
+        WorkspaceLayoutBuilder bytes;
+        (void)bytes.alloc_bytes(3, 1);
+        rejects<std::overflow_error>([&] { (void)bytes.alloc_bytes(limit, 8); });
+        require(bytes.peak_bytes(1) == 3, "failed byte layout changed the peak");
+        (void)bytes.alloc_bytes(1, 1);
+        require(bytes.peak_bytes(1) == 4, "failed byte layout retained alignment padding");
+        {
+            auto scope = bytes.scope();
+            (void)bytes.alloc_bytes(3, 8);
+            rejects<std::overflow_error>([&] { (void)bytes.alloc_bytes(limit, 16); });
+            require(bytes.peak_bytes(1) == 11, "failed scoped layout changed the peak");
+            (void)bytes.alloc_bytes(1, 1);
+            require(bytes.peak_bytes(1) == 12, "failed scoped layout changed the cursor");
+        }
+        (void)bytes.alloc_bytes(9, 1);
+        require(bytes.peak_bytes(1) == 13, "layout scope did not restore the saved cursor");
+
+        WorkspaceLayoutBuilder tensors;
+        (void)tensors.alloc_bytes(limit - 14, 1);
+        rejects<std::overflow_error>([&] { (void)tensors.alloc(DType::BF16, {2, 2}, 8); });
+        require(tensors.peak_bytes(1) == limit - 14, "failed tensor layout changed the peak");
+        (void)tensors.alloc_bytes(1, 1);
+        require(tensors.peak_bytes(1) == limit - 13,
+                "failed tensor layout retained alignment padding");
         std::cout << "OK memory\n";
         return 0;
     } catch (const std::exception& error) {

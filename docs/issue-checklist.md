@@ -39,10 +39,10 @@
   Qwen、GLM 与 Engine 共用错误格式，区分完整 token 计数与提前拒绝时的下界，保留分词早停。
   文本、原始 token、媒体及协议测试通过；HTTP 400 与 `context_length_exceeded` 保持一致。
 
-- [ ] **7. Workspace 布局分配异常安全** — [PR #297](https://github.com/Neroued/ninfer/pull/297)
+- [x] **7. Workspace 布局分配异常安全** — [PR #297](https://github.com/Neroued/ninfer/pull/297)
 
-  `WorkspaceLayoutBuilder::alloc/alloc_bytes` 先修改对齐后的 cursor，后续溢出会留下半更新状态。
-  改为局部计算成功后提交。完成条件：失败分配保持原 cursor/peak，成功分配及 scope 的布局语义正确。
+  对齐与大小检查成功后才提交 cursor/peak；现有内存测试覆盖字节、Tensor 分配溢出后的
+  继续分配及 scope 回退，检查通过。
 
 ## 其余正确性与资源行为
 

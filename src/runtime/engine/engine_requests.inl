@@ -3,6 +3,33 @@
 namespace ninfer::runtime {
 
 template <class Instance>
+void EngineCore<Instance>::wait_for_admission(const std::shared_ptr<Request>& request,
+                                              const CancellationView& cancellation) {
+    try {
+        for (;;) {
+            const bool cancelled = cancellation.requested();
+            std::unique_lock lock(request->mutex);
+            if (request->error) { std::rethrow_exception(request->error); }
+            if (cancelled || request->cancelled.load(std::memory_order_acquire) ||
+                (request->response_done &&
+                 request->result.finish_reason == FinishReason::Cancelled)) {
+                throw RequestError(RequestErrorKind::Cancelled,
+                                   "inference request cancelled while waiting for admission");
+            }
+            if (request->generation_start || request->response_done) { return; }
+            request->cv.wait_for(lock, std::chrono::milliseconds(10), [&] {
+                return request->generation_start.has_value() || request->response_done;
+            });
+        }
+    } catch (...) {
+        request->cancelled.store(true, std::memory_order_release);
+        request_admission_check();
+        queue_cv_.notify_one();
+        throw;
+    }
+}
+
+template <class Instance>
 GenerationResult EngineCore<Instance>::wait_for_request(std::shared_ptr<Request> request,
                                                         OutputSink* sink,
                                                         const CancellationView& cancellation) {
@@ -22,6 +49,7 @@ GenerationResult EngineCore<Instance>::wait_for_request(std::shared_ptr<Request>
         queue_cv_.notify_one();
     };
     std::optional<GenerationStart> start;
+    bool start_delivered = false;
     std::optional<PromptProgress> progress;
     std::vector<typename Request::StreamEvent> events;
     for (;;) {
@@ -32,11 +60,13 @@ GenerationResult EngineCore<Instance>::wait_for_request(std::shared_ptr<Request>
         {
             std::unique_lock lock(request->mutex);
             request->cv.wait_for(lock, std::chrono::milliseconds(10), [&] {
-                return request->response_done || request->stream_start.has_value() ||
+                return request->response_done || (!start_delivered && request->generation_start) ||
                        request->stream_progress.has_value() || !request->events.empty();
             });
-            start = std::move(request->stream_start);
-            request->stream_start.reset();
+            if (!start_delivered && request->generation_start) {
+                start           = request->generation_start;
+                start_delivered = true;
+            }
             progress = std::move(request->stream_progress);
             request->stream_progress.reset();
             events.swap(request->events);
@@ -220,13 +250,12 @@ void EngineCore<Instance>::publish_generation_start(const std::shared_ptr<Reques
             throw std::logic_error("generation start has no binding timestamp");
         }
     }
-    if (request->consumer_mode != OutputConsumerMode::Streaming) { return; }
     {
         std::lock_guard lock(request->mutex);
-        if (request->stream_start || request->response_done) {
-            throw std::logic_error("streaming request has an invalid generation-start state");
+        if (request->generation_start || request->response_done) {
+            throw std::logic_error("request has an invalid generation-start state");
         }
-        request->stream_start = GenerationStart{
+        request->generation_start = GenerationStart{
             .prompt               = request->prompt_summary,
             .reused_prompt_tokens = begin.reused_prompt_tokens,
         };

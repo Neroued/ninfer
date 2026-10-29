@@ -244,7 +244,7 @@ struct RequestRecord {
 
     std::mutex mutex;
     std::condition_variable cv;
-    std::optional<GenerationStart> stream_start;
+    std::optional<GenerationStart> generation_start;
     std::optional<PromptProgress> stream_progress;
     std::vector<StreamEvent> events;
     GenerationResult result;

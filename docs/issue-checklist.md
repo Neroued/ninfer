@@ -13,11 +13,11 @@
   `jobs.build` 的对象类型不依赖模板参数，无需修改。RTX 5090 dev 完整构建通过（CUDA 13.4）；
   当前环境未安装 CUDA 13.2，未在该版本复测。
 
-- [ ] **2. 流式请求准入超时的 HTTP 状态** — [#420](https://github.com/Neroued/ninfer/issues/420)、[#137](https://github.com/Neroued/ninfer/issues/137)
+- [x] **2. 流式请求准入超时的 HTTP 状态** — [#420](https://github.com/Neroued/ninfer/issues/420)、[#137](https://github.com/Neroued/ninfer/issues/137)
 
-  当前在 Engine 准入结果确定前提交 HTTP 200/SSE。理清 Engine 准入、GenerationService
-  与 HTTP 响应提交的边界，覆盖 Chat、Responses、Anthropic。
-  完成条件：准入前超时返回 HTTP 503 与对应协议错误；已开始的流按协议报告后续失败，取消与清理正常。
+  Engine 提供不消费输出的准入等待，三个 HTTP 入口在准入成功后才提交 SSE。
+  真实服务验证：Chat、Responses 排队超时返回 HTTP 503；Anthropic 沿用 HTTP 504 / `timeout_error`。
+  正常流式与非流式请求、排队取消和等待后准入均通过；Engine 检查覆盖事件顺序、错误保留、立即完成及 handle 清理。
 
 - [ ] **3. 请求终结与统计发布顺序** — [#422](https://github.com/Neroued/ninfer/issues/422)
 

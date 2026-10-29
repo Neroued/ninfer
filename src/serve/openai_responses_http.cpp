@@ -297,27 +297,33 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
         req_id, "openai_responses", resolved.generation, metadata, prepared));
     resolved.generation.messages.clear();
 
-    if (!request.stream) {
-        GenerationOutcome outcome;
-        try {
-            outcome = service_->run(prepared, nullptr, [&req] { return client_disconnected(req); });
-        } catch (const ApiException& exception) {
-            const ApiError error = responses_error(exception.error());
-            lifecycle->failure(make_generation_request_failure(error));
-            write_openai_error(res, error);
-            return;
-        } catch (const std::exception& exception) {
-            lifecycle->failure(
-                make_internal_request_failure(RequestFailurePhase::Generation, exception.what()));
-            write_openai_error(res, internal_error(exception));
-            return;
+    GenerationOutcome aggregate;
+    try {
+        if (request.stream) {
+            service_->wait_for_admission(prepared, [&req] { return client_disconnected(req); });
+        } else {
+            aggregate =
+                service_->run(prepared, nullptr, [&req] { return client_disconnected(req); });
         }
-        lifecycle->done(outcome);
+    } catch (const ApiException& exception) {
+        const ApiError error = responses_error(exception.error());
+        lifecycle->failure(make_generation_request_failure(error));
+        write_openai_error(res, error);
+        return;
+    } catch (const std::exception& exception) {
+        lifecycle->failure(
+            make_internal_request_failure(RequestFailurePhase::Generation, exception.what()));
+        write_openai_error(res, internal_error(exception));
+        return;
+    }
+
+    if (!request.stream) {
+        lifecycle->done(aggregate);
 
         std::optional<BuiltOpenAIResponse> response;
         try {
-            const OpenAIResponsesRuntimeValues runtime = runtime_values(prepared, &outcome);
-            response.emplace(make_openai_response_object(id, created, request, runtime, outcome));
+            const OpenAIResponsesRuntimeValues runtime = runtime_values(prepared, &aggregate);
+            response.emplace(make_openai_response_object(id, created, request, runtime, aggregate));
         } catch (const ApiException& exception) {
             const ApiError error = responses_error(exception.error());
             lifecycle->response_failure(

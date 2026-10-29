@@ -134,6 +134,13 @@ public:
         Submission(const Submission&)            = delete;
         Submission& operator=(const Submission&) = delete;
 
+        void wait_for_admission(const CancellationView& cancellation) {
+            if (owner_ == nullptr || request_ == nullptr) {
+                throw std::logic_error("concurrent submission is empty");
+            }
+            owner_->wait_for_admission(request_, cancellation);
+        }
+
         GenerationResult wait(OutputSink* sink, const CancellationView& cancellation) {
             if (owner_ == nullptr || request_ == nullptr) {
                 throw std::logic_error("concurrent submission is empty");
@@ -431,6 +438,9 @@ private:
     };
 
     void publish_runtime_stats();
+
+    void wait_for_admission(const std::shared_ptr<Request>& request,
+                            const CancellationView& cancellation);
 
     GenerationResult wait_for_request(std::shared_ptr<Request> request, OutputSink* sink,
                                       const CancellationView& cancellation);

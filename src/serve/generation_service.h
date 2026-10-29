@@ -120,6 +120,10 @@ public:
     [[nodiscard]] int count_prompt_tokens(const GenerationRequest& req,
                                           std::function<bool()> is_cancelled = {}) const;
 
+    // Establishes admission before an HTTP adapter commits its streaming response.
+    void wait_for_admission(PreparedRequest& prepared,
+                            std::function<bool()> is_cancelled = {}) const;
+
     // Consumes prepared.generation. A PreparedRequest is single-use.
     GenerationOutcome run(PreparedRequest& prepared, const StreamSink* sink,
                           std::function<bool()> is_cancelled = {});

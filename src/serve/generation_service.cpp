@@ -492,6 +492,15 @@ int GenerationService::count_prompt_tokens(const GenerationRequest& request,
     }
 }
 
+void GenerationService::wait_for_admission(PreparedRequest& prepared,
+                                           std::function<bool()> is_cancelled) const {
+    try {
+        prepared.generation.wait_for_admission(ninfer::CancellationView(is_cancelled));
+    } catch (const ninfer::RequestError& exception) {
+        throw_request_error(exception, prepared.constraint_param, prepared.tool_schema_params);
+    }
+}
+
 GenerationOutcome GenerationService::run(PreparedRequest& prepared, const StreamSink* sink,
                                          std::function<bool()> is_cancelled) {
     std::unique_ptr<ServiceOutputSink> output_sink;

@@ -46,6 +46,11 @@ public:
     [[nodiscard]] explicit operator bool() const noexcept;
     [[nodiscard]] const ResolvedSamplingParameters& resolved_sampling() const noexcept;
 
+    // Waits for initial admission or successful completion without execution. Errors and
+    // cancellation are reported before returning. Does not consume output or the handle;
+    // wait() still delivers the stream start and result. Calls on one handle must be serial.
+    void wait_for_admission(const CancellationView& cancellation = {});
+
     GenerationResult wait(OutputSink* sink = nullptr, const CancellationView& cancellation = {});
 
 private:

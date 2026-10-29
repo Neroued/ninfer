@@ -2,6 +2,7 @@
 #include "context_budget.h"
 #include "kv_cache_storage.h"
 
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
@@ -222,6 +223,8 @@ int exercise_stream_observations(ninfer::Engine& engine) {
     ninfer::GenerationHandle generation =
         engine.submit(engine.prepare_tokens(std::move(prompt)), std::move(request),
                       ninfer::OutputConsumerMode::Streaming, observation);
+    generation.wait_for_admission();
+    generation.wait_for_admission();
     const ninfer::GenerationResult result = generation.wait(&sink);
     if (result.generated_token_ids.size() != 3 || !sink.valid_for(result)) {
         std::cerr
@@ -252,6 +255,75 @@ int exercise_stream_observations(ninfer::Engine& engine) {
         cancelled_sink.published_output() || !cancelled_result.generated_token_ids.empty() ||
         cancelled_result.stats.first_output_timing) {
         std::cerr << "cancellation before output fabricated a first-output snapshot\n";
+        return 1;
+    }
+    return 0;
+}
+
+int exercise_admission_wait(ninfer::Engine& engine) {
+    const auto prompt = [&] {
+        return engine.prepare_tokens({248045, 846, 198, 5834, 248046, 198});
+    };
+    ninfer::RequestOptions request;
+    request.execution.requested_output_tokens = 4090;
+    request.execution.sampling.temperature    = 0.0F;
+    request.execution.allow_prefix_reuse      = false;
+    request.stop.include_model_defaults       = false;
+
+    auto active = engine.submit(prompt(), request);
+    active.wait_for_admission();
+    request.execution.requested_output_tokens = 1;
+
+    auto prepared = prompt();
+    auto pending =
+        engine.submit(std::move(prepared), request, ninfer::OutputConsumerMode::Streaming, {},
+                      std::chrono::steady_clock::now() + std::chrono::milliseconds(30));
+    bool timed_out = false;
+    try {
+        pending.wait_for_admission();
+    } catch (const ninfer::RequestError& error) {
+        timed_out = error.kind() == ninfer::RequestErrorKind::QueueTimeout;
+    }
+    ObservationSink pending_sink;
+    bool retained_error = false;
+    try {
+        (void)pending.wait(&pending_sink);
+    } catch (const ninfer::RequestError& error) {
+        retained_error = error.kind() == ninfer::RequestErrorKind::QueueTimeout;
+    }
+    if (!timed_out || !retained_error || pending_sink.published_output()) {
+        std::cerr << "admission wait lost the pending deadline or consumed the failure\n";
+        return 1;
+    }
+
+    auto cancelled             = engine.submit(prompt(), request);
+    bool cancellation_reported = false;
+    try {
+        cancelled.wait_for_admission(ninfer::CancellationView([] { return true; }));
+    } catch (const ninfer::RequestError& error) {
+        cancellation_reported = error.kind() == ninfer::RequestErrorKind::Cancelled;
+    }
+    const auto cancelled_result = cancelled.wait();
+    if (!cancellation_reported ||
+        cancelled_result.finish_reason != ninfer::FinishReason::Cancelled ||
+        !cancelled_result.generated_token_ids.empty()) {
+        std::cerr << "admission cancellation did not settle the pending request\n";
+        return 1;
+    }
+
+    request.execution.requested_output_tokens = 0;
+    auto immediate                            = engine.submit(prompt(), request);
+    immediate.wait_for_admission();
+    const auto immediate_result = immediate.wait();
+    if (immediate_result.finish_reason != ninfer::FinishReason::OutputLimit ||
+        !immediate_result.generated_token_ids.empty()) {
+        std::cerr << "admission wait blocked or consumed an immediate result\n";
+        return 1;
+    }
+
+    const auto stopped = active.wait(nullptr, ninfer::CancellationView([] { return true; }));
+    if (stopped.finish_reason != ninfer::FinishReason::Cancelled) {
+        std::cerr << "admitted request did not retain its cancellation lifetime\n";
         return 1;
     }
     return 0;
@@ -290,6 +362,7 @@ int exercise_abandoned_handle_capacity(ninfer::Engine& engine) {
             std::cerr << "abandonment fixture did not create a generation handle\n";
             return 1;
         }
+        abandoned.wait_for_admission();
     }
     const auto crossed = engine.generate(engine.prepare_tokens(prompt), request);
     if (crossed.generated_token_ids.size() != 1) {
@@ -1823,6 +1896,7 @@ int exercise_artifact(const char* artifact) {
         if (const int result = verify_loaded_product(engine); result != 0) { return result; }
         if (const int result = exercise_artifact_frontend(engine); result != 0) { return result; }
         if (const int result = exercise_stream_observations(engine); result != 0) { return result; }
+        if (const int result = exercise_admission_wait(engine); result != 0) { return result; }
         if (const int result = exercise_full_prefill_chunk(engine); result != 0) { return result; }
         if (const int result = exercise_rewrite_checkpoints(engine); result != 0) { return result; }
         if (const int result = exercise_prefix(engine); result != 0) { return result; }
@@ -2009,6 +2083,8 @@ int main() {
         ninfer::test::qwen3_5::set_context_capacity(options);
         ninfer::Engine engine(std::move(options));
         result = exercise_stream_observations(engine);
+        if (result == 0) { result = exercise_admission_wait(engine); }
+        if (result == 0) { result = exercise_abandoned_handle_capacity(engine); }
     } else {
         throw std::invalid_argument("unknown prefix integration scenario");
     }

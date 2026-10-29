@@ -5,7 +5,7 @@
 
 namespace ninfer::ops::detail::moe_cuda::block_scaled {
 
-template <int Columns, bool IncludeK256 = false, class Function>
+template <int Columns, bool IncludeK256 = false, bool IncludeSingleStage = false, class Function>
 void with_nvfp4_tuning(Nvfp4Pipeline pipeline, Nvfp4CachePolicy cache, Function&& function) {
     const auto memory = [&]<int RequestedStages, int RequestedK>() {
         // Keep one complete stage within the Spark shared-memory budget. Wider
@@ -36,6 +36,12 @@ void with_nvfp4_tuning(Nvfp4Pipeline pipeline, Nvfp4CachePolicy cache, Function&
     case Nvfp4Pipeline::K256:
         if constexpr (IncludeK256) {
             memory.template operator()<2, 256>();
+            break;
+        }
+        throw std::logic_error("unregistered NVFP4 MoE pipeline");
+    case Nvfp4Pipeline::K256SingleStage:
+        if constexpr (IncludeSingleStage) {
+            memory.template operator()<1, 256>();
             break;
         }
         throw std::logic_error("unregistered NVFP4 MoE pipeline");

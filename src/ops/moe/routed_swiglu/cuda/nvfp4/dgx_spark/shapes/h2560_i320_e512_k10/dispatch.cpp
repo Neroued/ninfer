@@ -23,6 +23,7 @@ Plan select_plan(const SwiGLUProfile&, int t, int shared_intermediate) {
                            .queued_ctas_per_sm      = 6};
     using kernel::block_scaled::Nvfp4Pipeline;
     using kernel::block_scaled::Nvfp4CachePolicy;
+    using kernel::block_scaled::Nvfp4Tuning;
     p.nvfp4 = {Nvfp4Pipeline::K512, Nvfp4CachePolicy::RetainInputs, 4};
     if (t > 4) {
         p.small_expert_limit = t <= 64 ? 4 : t <= 512 ? 16 : 128;
@@ -37,6 +38,24 @@ Plan select_plan(const SwiGLUProfile&, int t, int shared_intermediate) {
                            .tuning             = {Nvfp4Pipeline::K128, Nvfp4CachePolicy::Cached, 0},
                            .queued_ctas_per_sm = t <= 512 ? 6 : 2};
         p.group_columns = t <= 512 ? 64 : 128;
+    }
+    if (t > 512) {
+        p.down_columns          = 32;
+        p.small_expert_limit    = 32;
+        p.queued_ctas_per_sm    = 2;
+        p.nvfp4.down_row_window = 8;
+        p.pool_token_threshold  = (t + 1) / 2;
+        p.medium                = {.gate_columns       = 64,
+                                   .down_columns       = 128,
+                                   .max_load           = 64,
+                                   .tuning             = p.nvfp4,
+                                   .queued_ctas_per_sm = 2};
+        p.medium.down_tuning =
+            Nvfp4Tuning{Nvfp4Pipeline::K256SingleStage, Nvfp4CachePolicy::StreamingAll, 1};
+        p.large = {
+            .gate_columns = 128, .down_columns = 128, .max_load = 128, .queued_ctas_per_sm = 2};
+        p.large.tuning      = {Nvfp4Pipeline::K512, Nvfp4CachePolicy::StreamingAll, 1};
+        p.large.down_tuning = p.medium.down_tuning;
     }
     if (t >= 4 && t <= 32) {
         p.nvfp4_down         = {Nvfp4Pipeline::K512, Nvfp4CachePolicy::Cached, 0};

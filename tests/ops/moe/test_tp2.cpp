@@ -137,7 +137,8 @@ int run_case(Fixture& fixture, Case c, CudaExecutionView cuda) {
         if (preserved != fixture.input_words()) throw std::runtime_error("TP2 input was modified");
         Oracle oracle(fixture);
         std::vector<double> got, reference;
-        const std::set<int> tokens{0, c.tokens - 1};
+        std::set<int> tokens{0, c.tokens - 1};
+        if (c.distribution == "partial") tokens.insert(1);
         std::set<int> rows{0,
                            1,
                            63,
@@ -350,13 +351,25 @@ void add_profile(OpSuite& suite, Shape shape, const std::string& name) {
             catalogue.push_back({"tp2/" + name + "/complete/rank0/route-population/T513",
                                  {{"format", "fp8"}, {"policy", "a8"}, {"execution", "graph"}}});
         }
-        if (rank == 0 && !shape.clamped && shape.format != QType::NVFP4)
+        if (rank == 0 && !shape.clamped)
             for (bool complete : {false, true}) {
-                cases.push_back({4096, rank, complete, true, false, "reuse", true});
+                const bool nvfp4 = shape.format == QType::NVFP4;
+                for (int t : nvfp4 ? std::vector<int>{2048, 4096} : std::vector<int>{4096}) {
+                    cases.push_back({t, rank, complete, true, false, "reuse", true});
+                    catalogue.push_back({"tp2/" + name + "/" + (complete ? "complete" : "routed") +
+                                             "/rank0/route-population/T" + std::to_string(t),
+                                         {{"format", nvfp4 ? "nvfp4" : "fp8"},
+                                          {"policy", nvfp4 ? "a4" : "a8"},
+                                          {"execution", "graph"}}});
+                }
+            }
+        if (rank == 0 && !shape.clamped && shape.format == QType::NVFP4)
+            for (bool complete : {false, true}) {
+                cases.push_back({2049, rank, complete, true, false, "partial"});
                 catalogue.push_back(
                     {"tp2/" + name + "/" + (complete ? "complete" : "routed") +
-                         "/rank0/route-population/T4096",
-                     {{"format", "fp8"}, {"policy", "a8"}, {"execution", "graph"}}});
+                         "/rank0/partial-hot/T2049",
+                     {{"format", "nvfp4"}, {"policy", "a4"}, {"execution", "graph"}}});
             }
         if (rank == 0)
             for (bool complete : {false, true}) {

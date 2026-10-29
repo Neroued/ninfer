@@ -13,7 +13,7 @@ __host__ __device__
     return ((features + 127) / 128) * 8;
 }
 
-enum class Nvfp4Pipeline { K128, K256Deep, K512, K256 };
+enum class Nvfp4Pipeline { K128, K256Deep, K512, K256, K256SingleStage };
 
 // Low bits bypass L1 for weight/input codes; high bits request L2 eviction
 // priorities for streaming weights and reused activations. Scales stay cached.

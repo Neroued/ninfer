@@ -259,6 +259,11 @@ void Fixture::input(int tokens, std::string_view distribution, int phase, bool s
                               ? position
                               : s.top_k / 2 + (t * (s.top_k / 2) + position - s.top_k / 2) %
                                                   (s.experts - s.top_k / 2);
+            else if (distribution == "partial")
+                ordinal = position < s.top_k / 2
+                              ? (t % 2) * (s.top_k / 2) + position
+                              : s.top_k + (t * (s.top_k / 2) + position - s.top_k / 2) %
+                                              (s.experts - s.top_k);
             else if (distribution == "spread")
                 ordinal = (t * s.top_k + position) % s.experts;
             else

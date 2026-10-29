@@ -8,6 +8,7 @@ run the CLI or HTTP server.
 | Document | Purpose |
 |---|---|
 | [Startup configuration](startup-configuration.md) | shared CLI/serve TOML schema, defaults, overrides, resource controls and startup display |
+| [Deployment configurations](../examples/configs/) | RTX 5090, single Spark and dual-Spark TOML examples |
 | [CLI](cli.md) | text, chat-history, image/video input, output streams, sampling, MTP, and common runtime options |
 | [HTTP serving](serving.md) | OpenAI Responses/Chat Completions, Anthropic Messages, state, streaming, token counting, authentication, and tool calls |
 | [Performance](performance.md) | RTX 5090 measurement coverage, per-model serving results, methodology, and publication rules |

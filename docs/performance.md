@@ -26,7 +26,8 @@ The Qwen3.6-27B NVFP4 MTP3 phase table comes from a corpus C=1 point whose full 
 not published here. Qwen3.8 measurements use FP8 E4M3 row-256 KV; the Qwen3.6 measurements
 use INT8 group-64 KV. Each model page records its build and run conditions.
 
-Qwen3.8-Flash-Next is supported, but has no published result page in this campaign.
+Flash Next, GLM and Spark deployments have no published result page in this campaign.
+Their current support is listed in the [README](../README.md#supported-models-and-deployments).
 The Qwen3.8-27B measurements above describe a different architecture and artifact.
 Flash Next's current execution scope is documented [here](maintainer/qwen4_exp-model.md).
 

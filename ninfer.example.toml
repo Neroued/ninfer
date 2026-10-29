@@ -1,6 +1,7 @@
 # Complete NInfer startup configuration reference.
 # Schema and behavior: docs/startup-configuration.md.
 # Copy this file and adjust the model path for local use.
+# Focused deployment examples: examples/configs/.
 # All configurable fields are listed; mutually exclusive alternatives are commented out.
 # Relative paths use this file's directory. Explicit command-line values take precedence.
 
@@ -97,32 +98,34 @@ kind = "none" # none / grammar / json_object / json_schema / regex / choice
 # Environment controls remain separate: NINFER_VRAM_BUDGET_MIB, NINFER_CUDA_SYNC.
 
 # Distributed execution-group example. Keep disabled for local CLI/serve execution.
-# Model placement: docs/maintainer/qwen4_exp-model.md.
+# Deployment instructions: docs/startup-configuration.md#distributed-deployment.
 # Worker and artifact paths are absolute paths on each node. Control port 0 selects a free port.
-# The execution test and collective benchmark use their own executable as the worker path.
+# Build both nodes with NINFER_ENABLE_DISTRIBUTED=ON. Launch CLI/Serve on node 0.
 # [distributed]
 # coordinator_node = 0
-# control_host = "192.168.100.51"
+# control_host = "192.0.2.10"
 # control_port = 0
 # connect_timeout = "60s"
 # shutdown_timeout = "30s"
 # [distributed.parallel]
 # tp = 2
-# ep = 2
-# dp = 1 # Independent full-model replicas.
+# ep = 1 # 1: expert TP; 2: whole-expert EP when tp = 2.
+# dp = 1 # Independent model replicas; current model deployments use 1.
 # pp = 1
-# adp = 1 # Attention DP: request-local attention ownership within each replica.
+# adp = 1 # Flash Next: 1; GLM TP2 deployment: 2 (attention DP).
 # [[distributed.nodes]]
 # id = 0
-# worker = "/home/neroued/ninfer/build/dgx-spark-dev/tests/ninfer_distributed_execution_test"
-# artifact = "/home/neroued/models/Qwen3.8-Flash-Next-NInfer/qwen3_8_flash_next.ninfer"
-# environment = { NCCL_SOCKET_IFNAME = "=enp1s0f0np0", NCCL_IB_HCA = "=rocep1s0f0,roceP2p1s0f0" }
+# worker = "/opt/ninfer/build/dgx-spark-release/apps/ninfer-worker"
+# artifact = "/srv/models/qwen3_8_flash_next.ninfer"
+# Optional; replace interface/HCA names before uncommenting.
+# environment = { NCCL_SOCKET_IFNAME = "=your-net-device", NCCL_IB_HCA = "=your-rdma-device" }
 # [[distributed.nodes]]
 # id = 1
-# ssh = "neroued@192.168.100.50"
-# worker = "/home/neroued/ninfer/build/dgx-spark-dev/tests/ninfer_distributed_execution_test"
-# artifact = "/home/neroued/models/Qwen3.8-Flash-Next-NInfer/qwen3_8_flash_next.ninfer"
-# environment = { NCCL_SOCKET_IFNAME = "=enp1s0f0np0", NCCL_IB_HCA = "=rocep1s0f0,roceP2p1s0f0" }
+# ssh = "user@192.0.2.11"
+# worker = "/opt/ninfer/build/dgx-spark-release/apps/ninfer-worker"
+# artifact = "/srv/models/qwen3_8_flash_next.ninfer"
+# Optional; replace interface/HCA names before uncommenting.
+# environment = { NCCL_SOCKET_IFNAME = "=your-net-device", NCCL_IB_HCA = "=your-rdma-device" }
 # [[distributed.ranks]]
 # rank = 0
 # node = 0

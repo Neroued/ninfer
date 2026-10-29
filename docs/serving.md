@@ -1,60 +1,44 @@
 # HTTP serving
 
-`build/rtx5090-release/apps/ninfer-serve` loads one v3 `.ninfer` artifact and exposes OpenAI- and
-Anthropic-compatible HTTP endpoints over one resident NInfer Engine.
-
-Qwen3.8-Flash-Next supports Text/Vision/MTP serving with segmented CUDA Graph decode.
-Add `--vision` for media and `--spec mtp --draft-tokens 3` for native MTP with the full head.
-See the [CLI example](cli.md) for commands and the
-[execution reference](maintainer/qwen4_exp-model.md) for support and resource limits.
+`ninfer-serve` exposes OpenAI- and Anthropic-compatible HTTP endpoints over one NInfer Engine.
+The Engine can execute locally or across a configured pair of Sparks; clients use the same HTTP
+endpoint and request formats. Supported models and deployments are listed in the
+[README](../README.md#supported-models-and-deployments).
 
 ## Start the server
 
-See [CUDA synchronization](cli.md#cuda-synchronization) for the shared `NINFER_CUDA_SYNC` setting.
+Choose a [deployment configuration](../examples/configs/), edit its paths and network settings,
+and launch it on the coordinator:
+
+```bash
+./build/rtx5090-release/apps/ninfer-serve --config ninfer.local.toml
+```
+
+Use `build/dgx-spark-release/apps/ninfer-serve` on Spark. Dual-node deployments automatically start
+local and remote workers; see [distributed launch](startup-configuration.md#distributed-deployment).
+A minimal command without a file is:
 
 ```bash
 ./build/rtx5090-release/apps/ninfer-serve models/qwen3_8_27b_nvfp4.ninfer \
-  --host 127.0.0.1 \
-  --port 8080 \
-  --max-context 240000 \
-  --context-capacity auto \
-  --max-concurrency 2 \
-  --kv-dtype fp8 \
-  --spec mtp --draft-tokens 3 \
-  --proposal-head optimized \
-  --preserve-thinking
+  --host 127.0.0.1 --port 8080 --max-context 8192 --kv-dtype fp8
 ```
 
-The command uses Qwen3.8-27B NVFP4. Each request has a 240,000-token logical ceiling.
-State and all enabled KV histories share the Device Context byte capacity resolved at startup.
-Requests allocate records as execution advances; if concurrent growth exhausts the pool, the
-scheduler can pause a request and restore it later.
+`max_context` limits each request. The separate Context byte pool is shared by KV and continuation
+state, with capacity reported at startup. See [resource controls](startup-configuration.md#context-and-memory).
 
-The default shared
-pinned Host budget on RTX 5090 is 8 GiB plus eight model StateImages. This pool holds retained
-state, KV and pause snapshots, including in-flight destinations; `--host-cache-capacity` sets an
-explicit total instead. DGX Spark uses Device context storage with zero Host context capacity.
+The public model ID defaults to the artifact's `metadata.name`, falling back to its architecture
+name. `--model-id` overrides that HTTP alias without changing model execution. Use the advertised
+ID in requests; `GET /v1/models` returns it.
 
-Other artifacts use the same command shape with their own path. For 35B-A3B DFlash, replace the MTP
-selection with `--spec dflash --draft-tokens 7 --proposal-head optimized`. Qwen3.8-27B
-artifacts with DFlash2 companion weights also support `--spec dflash2 --draft-tokens 7`, with
-`--proposal-head optimized` optional. DFlash2 accepts draft counts 1..15 and supports the same sampling,
-concurrency, prefix reuse, and image/video request surfaces. It may remain combined with
-`--vision`.
+Enable `--vision` at startup for image/video requests. Without it, media generation and media
+counting requests return HTTP 400 `vision_disabled`. Select a speculative backend with
+`--spec mtp|dflash|dflash2` and `--draft-tokens`; `--proposal-head optimized` loads the additional
+head when available. Components omitted at startup cannot be enabled by a later HTTP request.
+The [CLI guide](cli.md#speculative-decoding) describes backend and head differences across models.
 
-When `--model-id` is omitted, the server advertises and accepts the artifact's `metadata.name`,
-falling back to its architecture name when no name is stored. An explicit `--model-id` is a public
-HTTP alias override and does not select or alter model execution.
-
-Vision is disabled by default: its weights and Vision-specific unified-workspace extent are not
-allocated, and media requests and token-count requests fail with HTTP 400 `vision_disabled`. Add
-`--vision` when the server must accept image or video input. Speculative residency is likewise
-frozen by `--spec mtp|dflash|dflash2` and `--draft-tokens`; omitting `--spec` loads no speculative backend.
-`--proposal-head optimized` additionally loads the optimized proposal head. DFlash on 35B-A3B and DFlash2 on Qwen3.8-27B can be combined
-with `--vision`; each accelerates generated-text decode after multimodal prefill, while Vision encode
-and prefill remain outside speculative acceleration. A later request cannot enable a capability
-omitted at startup. The artifact need only contain the Text backbone and the optional components
-selected for this process.
+Qwen and GLM use the same protocol surfaces with their own templates and output decoders.
+In particular, GLM supports `low/high/max` reasoning effort and requires thinking to remain enabled.
+See [thinking options](cli.md#thinking-and-sampling) before copying model-specific request settings.
 
 ## Endpoints
 
@@ -151,7 +135,7 @@ errors distinguish `invalid_json_schema`, `unsupported_json_schema` and `unsatis
 `invalid_request_error` envelope with the schema location in the message. Responses echoes the
 selected `text.format` in aggregate responses and SSE response objects.
 
-JSON output uses compact separators and declared property order. State the desired content in the
+JSON output permits whitespace and emits declared properties in schema order. State the desired content in the
 prompt; the schema is not inserted into it. Only one output constraint may be supplied.
 
 Schemas support positional arrays (`prefixItems` plus tail `items`) and inclusive/exclusive
@@ -186,8 +170,8 @@ Invalid choices and regexes use `invalid_choice` and `invalid_regex`, with the r
 
 These constraints apply to answer content; thinking is separate. GBNF supports recursive rules,
 Unicode and repetition. All modes support streaming and all speculative backends. For assistant
-continuation, the grammar covers the existing assistant content plus the generated suffix. Completion uses the model's EOS tokens;
-output limits and cancellation can produce an incomplete answer. JSON modes can be combined with
+continuation, the grammar covers the existing assistant content plus the generated suffix.
+Completion uses the model's EOS tokens; output limits and cancellation can produce an incomplete answer. JSON modes can be combined with
 active tools; GBNF, choice and regex require no active tools or `tool_choice:"none"`.
 Output constraints reject custom stops. OpenAI errors use
 `invalid_grammar` for invalid grammars and `constraint_dead_end` for a reachable prefix without a
@@ -244,16 +228,18 @@ does not commit an inferred parameter to JSON before its delimiter. These ambigu
 still have parameter-sized output delays. NInfer does not apply defaults, enforce required fields,
 or perform recursive JSON Schema validation on this non-strict route.
 
-On the unconstrained route, string parameters preserve function/tool-call markers and balanced nested
+On Qwen's unconstrained route, string parameters preserve function/tool-call markers and balanced nested
 `<parameter=...>...</parameter>` text as value bytes. The Qwen wire format has no delimiter escape,
 so an unmatched nested parameter opener or a standalone `</parameter>` cannot be represented
 unambiguously. After a declared function header has started, malformed structure fails that request
 with `invalid_tool_output`; earlier tool events are never retracted into ordinary content.
-An unrecognized header on the free-generation route can still be returned as text.
+An unrecognized Qwen header on the free-generation route can still be returned as text.
+GLM uses `<tool_call>`, `<arg_key>` and `<arg_value>` framing. Its raw argument values end at
+`</arg_value>`; clients continue to send and receive protocol tool objects, not these model markers.
 
 ### Tool constraints
 
-The three protocols share one constrained tool implementation:
+The three protocols share these tool-selection semantics; each model supplies its own framing and argument codec:
 
 | Choice | Generated calls |
 |---|---|
@@ -293,9 +279,10 @@ root must reduce to a `type:"object"` schema with `additionalProperties:false`, 
 Properties are emitted in declaration order; optional properties may be omitted. Root
 const/enum/unions are not supported. Values use the supported JSON Schema subset described above.
 Top-level pure string parameters use raw text and preserve whitespace. Other values use JSON;
-a top-level string/non-string union (such as string/null) is rejected because the Qwen parameter
-format cannot distinguish those branches. Such unions inside JSON objects or arrays are supported.
-Raw values cannot contain the delimiter `\n</parameter>`; unsatisfiable required values are rejected.
+a top-level string/non-string union (such as string/null) is rejected because the model parameter
+codec must select one representation. Such unions inside JSON objects or arrays are supported.
+Raw values cannot contain the model's terminating delimiter: `\n</parameter>` for Qwen or
+`</arg_value>` for GLM. Unsatisfiable required values are rejected.
 Integer arguments use signed 64-bit values; number arguments use finite binary64-compatible
 representations. Unsupported schemas fail with HTTP 400 before generation.
 
@@ -325,8 +312,8 @@ The resumed call emits its seeded arguments once as initialization, followed by 
 deltas. Ordinary text continuation still emits only its new suffix; seeded bytes are not billed as
 newly generated tokens.
 
-Messages enter the selected template in their input order. The maintained Qwen templates keep
-system/developer messages at their original positions.
+Messages enter the selected template in their input order. Qwen retains system/developer positions;
+GLM renders developer turns as system turns in place.
 
 Prompt-bearing JSON objects retain their received member order through request parsing and prompt
 rendering, including tool schemas and historical tool inputs. Canonical model-origin tool arguments
@@ -356,17 +343,18 @@ Add `--thinking-budget 512` to the startup command to cap model-origin thinking 
 tokens for every thinking-enabled request.
 
 At the cap boundary, Engine first honors a natural `</think>`, stop condition, cancellation, or
-total output/context limit. If thinking remains open, it commits Qwen's canonical early-close
-guidance and close marker to the same model sequence without sampling, streams the guidance as a
-reasoning delta, and continues normal content or tool-call generation. Inserted tokens count in
-completion usage and the request's `max_tokens`/`max_output_tokens` budget. If the effective output
+total output/context limit. If thinking remains open, it commits the model's closing suffix to the
+same sequence without sampling and continues normal content or tool-call generation. Qwen inserts
+early-close guidance plus `</think>` and streams the guidance as reasoning; GLM inserts `</think>`.
+Inserted tokens count in completion usage and the request's `max_tokens`/`max_output_tokens` budget. If the effective output
 capacity extends past the cap but cannot fit the complete tokenizer-derived control suffix plus one
 post-close model token, preparation is rejected with HTTP 400 code
 `thinking_budget_capacity_insufficient` rather than partially inserting control. The server does
 not promise that the model will emit nonempty content or a tool call after the marker.
 
-For Chat Completions, `reasoning_effort: "none"` requests disabled thinking. The selected template
-interprets the other standard values (`minimal`, `low`, `medium`, `high`, `xhigh`, `max`).
+For Chat Completions, `reasoning_effort: "none"` requests disabled thinking on Qwen. GLM rejects
+disabled thinking and accepts only `low`, `high` and `max`. Other Qwen effort values depend on the
+selected template; see the [model table](cli.md#thinking-and-sampling).
 Conflicting explicit `enable_thinking` and effort values return `conflicting_template_option`.
 
 `preserve_thinking` controls reasoning retention according to the selected template. Request
@@ -464,10 +452,11 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 OpenAI image and video sources may be HTTP(S) URLs or base64 data URLs.
 
 Text and media requests use one complete-prompt context contract. After chat-template rendering and
-media-token expansion, the result must fit Engine `--max-context`. The current Vision runtime also
-has a 32,768 merged-token envelope (131,072 raw patches); the effective Vision limit is therefore
-`min(--max-context, 32768)`. There is no fixed image/video item-count limit: item count is admitted
-through aggregate source-byte, decoded-pixel, raw-patch, Vision-token, and live-memory budgets.
+media-token expansion, the result must fit Engine `--max-context`. Qwen additionally limits prompt
+Vision input to 32,768 merged tokens (131,072 raw patches), bounded by the context limit. GLM uses its
+processor geometry, context limit and live-payload budget. Media admission also checks source bytes
+and decoded image/video sizes. These request limits are separate from the bounded GPU encoder/output
+window selected by `--vision-memory-budget`.
 
 Media cache misses run as independent decode → resize → BF16-pack tasks on a bounded host worker
 pool. Prepared payloads are keyed by SHA-256 of the acquired bytes plus modality, so repeated media
@@ -612,13 +601,12 @@ fail.
 
 System and developer message Items retain their positions in the input array. Top-level
 `instructions` is represented as a leading developer turn for the current request; target-specific
-role lowering occurs only in the Qwen family frontend.
+role rendering is handled by the model frontend. GLM renders developer turns as system turns.
 
 An `input_text`, `input_image`, or tool-result part may carry
 `prompt_cache_breakpoint:{"mode":"explicit"}`. Write selection follows
 [OpenAI prompt caching](#openai-prompt-caching); boundaries affect reuse opportunities, not prompt
-identity or output semantics. String message status/phase metadata is accepted but has no Qwen
-prompt representation.
+identity or output semantics. String message status/phase metadata is accepted but does not alter the model prompt.
 
 `input_file`, `input_audio`, image `file_id`, non-`auto` image detail, reasoning metadata without raw
 reasoning text, partial tool Items, and other Item/content types are not supported. HTTP media URLs
@@ -661,7 +649,7 @@ separate `namespace` and `name` fields in aggregate output, SSE events, and repl
 function name may therefore appear in different namespaces. Namespace members remain ordinary
 client-executed functions; this does not add a remote MCP executor.
 
-NInfer renders these definitions in the Qwen prompt and parses model output into separate
+NInfer renders these definitions through the model template and parses model output into separate
 `function_call` output Items. Each output has a protocol Item `id` (`fc_...`) and a distinct
 `call_id` (`call_...`). The client executes the function and sends a `function_call_output` Item in
 a later request. Selection and strict argument enforcement follow the common tool contract above.
@@ -700,7 +688,7 @@ Usage is checkpoint-native:
 
 `input_tokens` includes the chat template and expanded media tokens. `cached_tokens` is the exact
 checkpoint-proven prompt prefix reused by Engine. `output_tokens` is the count of accepted generated token
-IDs, including a withheld stop token when applicable. `reasoning_tokens` is counted in the Qwen
+IDs, including a withheld stop token when applicable. `reasoning_tokens` is counted in the model
 output decoder while accepted tokens are still in the reasoning channel; it is not estimated by
 re-tokenizing decoded text.
 
@@ -828,7 +816,8 @@ completed zero-output cache-prewarm lifecycle. `temperature`, `top_p`, `top_k`, 
 `stop_reason:"stop_sequence"` together with the actual `stop_sequence`; context exhaustion returns
 `model_context_window_exceeded`.
 
-Thinking supports `disabled`, `adaptive`, and `enabled`. Enabled Thinking requires
+The protocol accepts `disabled`, `adaptive`, and `enabled`; GLM rejects disabled thinking.
+Enabled Thinking requires
 `budget_tokens >= 1024` and less than `max_tokens`, and that budget is passed to Engine. Visible
 Thinking is returned with an opaque compatibility signature; SSE emits its `signature_delta`
 before closing the block. Request lowering reconstructs the local prompt from the visible
@@ -870,8 +859,8 @@ emits `message_start` after Engine admission commits the prefix selection and be
 transfer/prefill output, so its uncached/cache-read split is already exact; terminal cumulative
 usage matches the aggregate response.
 
-Documents, Search Results, Files, Structured Outputs, server-tool results, container uploads, and
-other execution-dependent blocks are rejected with the missing capability identified. Metadata,
+Document, search-result, file, server-tool-result and container-upload content blocks are rejected
+with the missing capability identified. Metadata,
 service tier, inference geography, protocol-version/beta headers, cache TTL, and unknown advisory
 fields do not block an otherwise executable request. The request `model` is any non-empty local
 proxy label and is echoed in the response; it does not select the resident artifact.
@@ -917,26 +906,10 @@ Startup configuration is logged at INFO before binding the port or loading the m
 includes defaults, effective overrides and their sources. Model-dependent resource values are
 reported after Engine preparation. API keys are represented only as disabled/configured.
 
-Context-cost coefficients resolve once at startup from generic defaults, matching compiled values,
-and optional transfer or prefill entries from `--context-cost-presets FILE`. Prefill entries match
-the hardware and a signature derived from the actual Text/Vision configuration, bindings and Uses.
-A new representation without a matching measurement uses generic prefill coefficients. A malformed
-file aborts startup; the operational context-cost record and JSONL `server_start` identify the
-selected source.
-
-Engine selects sampling defaults from the loaded architecture and the request's resolved thinking mode.
-Qwen3.6-27B and Qwen3.8-27B use `1.0/0.95/20/0/0` for
-temperature/top-p/top-k/min-p/presence penalty in thinking mode and `0.7/0.80/20/0/1.5` in
-non-thinking mode. Qwen3.6-35B-A3B differs only in its thinking presence penalty, which is `1.5`.
-Frequency penalty is `0` for all registered presets. Process flags override registered values,
-request fields override process settings. `--temperature 0` sets the default to greedy sampling;
-an explicit request temperature takes precedence.
-
-`--context-capacity SIZE|auto` sets the shared Device backing for KV and State on each rank.
-Host State and KV share a separate startup-fixed byte budget; `--host-cache-capacity 0B` disables
-that backing. These capacities do not limit total process RAM.
-`--no-prefix-reuse` disables cross-request history reads and writes; pause/replay recovery remains
-available, and the capacity flags may still be specified.
+Sampling defaults follow the loaded model and request thinking mode. Process settings override model
+values; request fields override process settings. See [sampling defaults](cli.md#common-options).
+Cache capacity and optional context-cost presets are described in the
+[startup reference](startup-configuration.md#context-and-memory).
 
 Run `./build/rtx5090-release/apps/ninfer-serve --help` for the exact option contract.
 
@@ -981,6 +954,9 @@ curl http://127.0.0.1:8080/metrics
 | `ninfer_constraint_{prepare,mask,matcher}_seconds_total`, `ninfer_constraint_mask_{positions,upload_bytes}_total` | Constraint work aggregated at request settlement, including truncated/cancelled results |
 | `ninfer_constraint_draft_wait_seconds_total` | Live draft-ready wait counted once per batch; a subset of device wait |
 | `ninfer_requests_total{outcome}`, `ninfer_response_failures_total` | Generation attempts entering preparation and subsequent response failures; protocol/model validation failures and token-count requests are excluded |
+| `ninfer_rank_gpu_interval_seconds_total`, `ninfer_rank_gpu_interval_samples_total` | Per-rank CUDA stream totals and sample counts; require GPU timing |
+| `ninfer_memory_allocation_bytes{rank,node,resource,location}` | Explicit per-rank allocations, separate from physical-memory snapshots |
+| `ninfer_communication_calls_total`, `ninfer_communication_payload_bytes_total` | Collectives by rank/group/path/operation; API payload bytes, not NIC traffic |
 | `ninfer_time_to_first_token_seconds` | Histogram updated once at the first committed token, including preparation, queueing and binding |
 | `ninfer_request_duration_seconds`, `ninfer_request_queue_seconds` | Histograms for settled generation outcomes, including cancellation; exceptional failures have separate counts |
 
@@ -1014,7 +990,7 @@ they do not infer request behavior from process-global counter deltas.
 | Event | Contents |
 |---|---|
 | `startup_config` | before model loading: active entry, configuration path, merged values, per-field default/file/argv sources, environment controls and redacted argv |
-| `server_start` | artifact path, architecture, public name, actual formats and prefill signature; resolved Engine and context-cache capacities, thinking/non-thinking sampler defaults plus process overrides, thinking-history and thinking-budget defaults, Device arenas, the optional non-additive Vision layout inside the unified workspace, unified Host context capacity and occupancy, KV sizing ledger, measured CUDA Graph rebuilding estimate and signed calibration/preparation deltas, CUDA/GPU environment, and redacted argv |
+| `server_start` | artifact identity, model/configuration, effective sampling defaults, per-rank resource budgets and observations under `resources.ranks`, aggregate explicit allocations under `resources.total_allocations`, environment and redacted argv |
 | `request_start` | protocol, resolved sampler and seed, requested reasoning effort, actual initial thinking mode and optional budget, Responses semantic-change flag, output budget, stream/message/tool shape |
 | `request_rejected` | parsed request shape, requested reasoning effort, media-item count, `phase: "prepare"`, and the exact HTTP status/type/code/parameter/message for a synchronous preparation rejection |
 | `request_done` | finish reason, prompt/completion/cache/computed-prefill tokens, prefix reuse path, tool-call parse diagnostics, preemption/recovery counters, thinking-budget application counters, unrounded request-stage seconds, per-request Engine Host exposure, and complete speculative-decoding counters |
@@ -1038,7 +1014,7 @@ contain no tool arguments or generated text.
 or `null` for unconstrained requests. Preparation failures and execution errors use the existing
 rejection/error records rather than successful constraint outcomes.
 
-`request_done.timings_seconds` contains `prepare`, `ttft`, `vision`, `prefill`, `decode`, and `total`
+`request_done.timings_seconds` contains `prepare`, `ttft`, `vision_stream`, `prefill`, `decode`, and `total`
 as full-precision JSON numbers. Its `speculative` object contains `backend`, `draft_window`, `rounds`,
 `drafted_tokens`, `accepted_tokens`, `fallback_steps`, and `accepted_per_position`. Rates can be
 derived downstream from raw token counts and seconds instead of rounded stderr strings.
@@ -1066,10 +1042,26 @@ other requests' completed work. In particular, `restored` to `replay_complete` e
 other work advanced during Replay without relying on periodic scheduler gauges. Events are enabled
 only with request logging and add no per-token records.
 
-For `server_start.memory`, `workspace.capacity_bytes` is the only physical workspace allocation.
-When Vision is enabled, `vision_workspace` reports the aggregate prompt and maximum-item token
-bounds plus encode peak and handoff layout/usage within that same allocation; these bytes must not
-be added to `workspace.capacity_bytes`. The field is `null` when Vision is disabled.
+`server_start.resources.ranks[]` identifies rank, node, device, hardware and shared-memory status,
+then provides `budget` and sampled `resources`. Each resource observation separates explicit
+`allocations`, workspace usage, optional Vision/expert/PLE observations, communication storage and
+`physical_memory`. `resources.total_allocations` sums explicit rank allocations. CUDA free memory,
+planning allowances and workspace usage are different observations and must not be added to that sum.
+On Spark, CUDA and Host memory use the same physical memory; those physical totals are not additive.
+
+Vision's `budget_bytes`, `max_window_features`, encoder workspace, output and staging capacities
+are reported in each rank's `resources.vision`, or `null` when disabled. Encoder workspace is shared
+with compute; output and staging have their own allocations. These detail fields describe resources
+already represented in allocation totals.
+
+`request_done.execution` reports prefill/decode/replay/control/score/context execution exposure,
+separating `result`, `resolution`, `retirement` and `total`. Each has `count`, `total_ns` and
+`maximum_ns`. `request_done.execution.max_rank_gpu_intervals` contains optional CUDA measurements for
+`result_stream`, `commit_stream`, `prefill_stream` and `vision_stream`.
+Enable `--gpu-timing` to collect these samples. A zero sample count means unmeasured, not a measured
+zero duration. Stream intervals may overlap Host work and each other; do not sum them into TTFT.
+`timings_seconds.ttft` is the server's first-token boundary, including service preparation. Client
+network TTFT and `first_output_timing` have their own boundaries.
 
 `request_done.engine_timing` separates FIFO `queue_wait_seconds`, blocking
 `device_wait_exposed_seconds`, and five mutually exclusive Host-active exposure phases under
@@ -1099,9 +1091,10 @@ Vision encode, standalone bridges and exact-hit sampling fall outside that inter
 resource reports `d2h`, `h2d`, `d2d` entries with `images`, `page_groups`, `bytes`, `copy_operations`
 and transfer-event `seconds`. Only completed request-owned copies are included, also when the
 request is later cancelled. Engine interval records expose `context_cache.state_transfers` and
-`context_cache.kv_pools`; each KV entry also carries its diagnostic `label`, `occupied_page_groups`
-and `capacity_page_groups`. GPU intervals overlap Host submission and waits, so they are
-separate evidence, not additional wall-time stages. Background reclamation remains Engine-wide.
+`context_cache.kv_pools`; each KV entry carries its diagnostic `label`, `occupied_page_groups`
+and transfers. `context_cache.occupancy` reports shared pool bytes and logical object counts.
+GPU intervals overlap Host submission and waits, so they are separate evidence, not additional
+wall-time stages. Background reclamation remains Engine-wide.
 
 `result.generated_token_ids` records committed output token IDs for exact prefix analysis.
 The JSONL file never records an API-key value; `argv` replaces it with `<redacted>`.
@@ -1114,6 +1107,12 @@ returns its outcome, or `request_error` when generation fails before an outcome 
 response rendering, Responses storage, or terminal transport failures are operational response
 events only and do not add a second JSONL terminal. Schema/model validation rejections before
 preparation and token-count-only calls are not measurement requests and do not receive request IDs.
+
+`throughput.execution` reports interval counts and elapsed/mean times for prefill, decode, replay
+and control work. `throughput.speculative` reports that interval's drafts, accepted tokens, rounds
+and acceptance, with `null` acceptance when no drafts were measured. For decode cost at a particular
+actual batch size, use [ninfer_bench](../bench/README.md#engine-微测); aggregate token/s also depends
+on speculative acceptance.
 
 By default the server persistently reports aggregate activity every five seconds. `prefill` counts
 prompt suffix tokens actually computed during the interval, excluding prefix-cache hits; `decode`
@@ -1145,11 +1144,11 @@ raw counters and seconds over rounded stderr rates.
 
 ## Execution behavior
 
-The server owns one resident Engine with `1..8` execution lanes fixed at startup. At each decode
-boundary, eligible decode-ready requests form one compact batch, processed by one model traversal
-and, when graphs are enabled, one exact-batch CUDA Graph replay. A
-request joins that batch only after its single-request prefill finishes; when it completes or is
-cancelled, the next boundary rebuilds the batch without an empty row.
+The server owns one Engine with `1..8` execution lanes fixed at startup, locally or across its
+configured ranks. Decode-ready requests are batched at execution boundaries. A request becomes
+decode-ready after prefill; completed or cancelled requests leave subsequent work. CUDA Graph
+execution follows the model's compute and commit boundaries, including owner-local attention for
+GLM attention DP.
 
 `--max-pending-requests` bounds the requests waiting behind the active set. The total generation
 request lifetime capacity is `max_concurrency + max_pending_requests`, including requests still in
@@ -1168,29 +1167,21 @@ cancellation and timeout deadline. Model output is bounded by the same finite re
 each request's effective output-token limit; output callbacks and network serialization run
 outside the GPU executor and do not delay formation of the next batch.
 
-`--max-context` is each sequence's logical ceiling. `--context-capacity` is a byte capacity for
-active and retained KV/State records. Its default `auto` accounts for the complete enabled runtime
-and the model's minimum working sets. Both explicit and automatic capacity use 1 GiB of startup
-planning headroom. On Spark, Vision's live media capacity is included in the shared-memory budget.
-Backing capacity resolves once at startup; the mix of KV and State records changes with demand.
+Context capacity is fixed at startup and shared by active and retained KV/State records. Before
+advancing, the scheduler reserves the required growth. Under pressure it can reclaim retained
+prefixes or pause active requests, allowing executable work to proceed. See
+[resource controls](startup-configuration.md#context-and-memory).
 
-Before each prefill, decode or replay unit, the runtime reserves the additional pages and temporary
-storage required by that unit. It first reclaims inactive cache resources when capacity is short.
-If resident requests still cannot advance together, it pauses a younger request while preserving
-progress for the oldest resident request. A paused request does not block fresh requests that fit
-the remaining capacity. Restoration follows original request order and reserves enough space to
-rebuild the saved frontier and complete one new execution unit.
-
-A paused request keeps its committed output and protocol state. With sufficient Host backing, it
-can restore a snapshot; otherwise it rebuilds model state from retained input and committed tokens.
+A paused request keeps its committed output and protocol state. Recovery restores a retained
+snapshot when available or rebuilds model state from retained input and committed tokens.
 Replay does not resample or republish those tokens, but it consumes compute and can increase gaps in
 the output stream. The policy and ownership rules are defined in
 [Resource scheduling and context cache](maintainer/context-management.md).
 
 Compatible prefixes are reused for both text and multimodal histories unless the server starts with
-`--no-prefix-reuse`. A multimodal hit additionally requires matching token types, three-axis MRoPE
-positions, encoded-media digest, grid, and consumer spans. Media wholly inside a matched prefix
-skips Vision execution, while new suffix media is encoded normally. The pretty completion record
+`--no-prefix-reuse`. A multimodal hit additionally requires matching model-specific token/position
+metadata and media identity, including the prepared media digest, layout and consumer spans. Media
+wholly inside a matched prefix skips Vision execution, while new suffix media is encoded normally. The pretty completion record
 shows `cache N (P%, path)` using readable path labels; JSONL retains the exact
 `prefix_cache_hit_tokens` and `prefix_reuse_path` fields (`root` or `checkpoint`). Reuse requires
 matching KV, recurrent state, hidden state, selected-backend state and exact prefix identity.

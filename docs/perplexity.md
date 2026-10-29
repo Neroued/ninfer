@@ -5,6 +5,7 @@ It uses the artifact's tokenizer, Text model, selected Main KV representation, f
 and main output head. It is an offline evaluator, not a serving endpoint or a logits-export API.
 Only Text weights and resources are loaded; Vision and speculative components are not required.
 
+For single-device and dual-Spark configuration files, see [deployment examples](../examples/configs/).
 The evaluator uses the [shared startup configuration](startup-configuration.md), including TOML,
 command-line overrides and distributed deployment. It consumes model path, device, context limit,
 KV format, Context capacity, prefill chunk, GPU timing and log level. Generation-only settings in

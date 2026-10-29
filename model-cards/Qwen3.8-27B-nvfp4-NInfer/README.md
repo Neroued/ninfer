@@ -151,23 +151,21 @@ This release includes the complete DFlash2 companion weights from
 `z-lab/Qwen3.8-27B-DFlash2` at revision
 `50307d4c4cde6860d4eee73e2547cd786fe8e8a4`. Select
 `--spec dflash2 --draft-tokens 7 --proposal-head optimized`; draft counts 1..15 are supported.
-DFlash2 requires the runtime revision listed below. Existing performance and evaluation tables
+Use the current runtime for DFlash2. Existing performance and evaluation tables
 retain their stated MTP configurations and revisions.
 
 ## Requirements
 
-- [NInfer](https://github.com/Neroued/ninfer) revision
-  [`98dada0e`](https://github.com/Neroued/ninfer/commit/98dada0e03cb073fd07f905400b5904bc6e82759)
-  or later, built from source;
+- Current [NInfer](https://github.com/Neroued/ninfer) checkout, built from source;
 - 64-bit Linux;
 - NVIDIA GeForce RTX 5090 (`sm_120a`);
-- CUDA Toolkit 13.1 or newer.
+- Build dependencies from the [build guide](https://github.com/Neroued/ninfer#build).
 
 Already have the official v2 file? [Upgrade it locally](https://github.com/Neroued/ninfer/blob/master/docs/weight-conversion.md#upgrade-an-existing-v2-artifact)
 without downloading the weights again.
 
 NInfer does not provide an install target or packaged binary. See the
-[repository README](https://github.com/Neroued/ninfer#quick-start) for source-build dependencies.
+[repository README](https://github.com/Neroued/ninfer#build) for source-build dependencies.
 
 ## Download and run a CLI example
 
@@ -176,7 +174,7 @@ hf download neroued/Qwen3.8-27B-nvfp4-NInfer \
   qwen3_8_27b_nvfp4.ninfer \
   --local-dir models
 
-./build/apps/ninfer models/qwen3_8_27b_nvfp4.ninfer \
+./build/rtx5090-release/apps/ninfer models/qwen3_8_27b_nvfp4.ninfer \
   --prompt "Explain prefill and decode in three sentences." \
   --max-context 32768 \
   --max-tokens 8192 \
@@ -191,27 +189,27 @@ For images, videos, and structured chat history, see the
 ## Start a local server
 
 ```bash
-./build/apps/ninfer-serve models/qwen3_8_27b_nvfp4.ninfer \
+./build/rtx5090-release/apps/ninfer-serve models/qwen3_8_27b_nvfp4.ninfer \
   --host 127.0.0.1 \
   --port 8080 \
   --max-context 240000 \
-  --kv-capacity 240000 \
+  --context-capacity auto \
   --max-concurrency 2 \
   --kv-dtype fp8 \
-  --extra-state-slots 2 \
   --spec mtp --draft-tokens 3 \
   --proposal-head optimized \
   --preserve-thinking
 ```
 
-Each request has a 240,000-token logical ceiling. The shared 240,000-token Device KV pool grows
-with resident execution; resource pressure can pause a request for later Snapshot or Replay
-recovery. Either request may use the full pool while running alone. Two extra Device StateImages
-and the default shared pinned Host budget (8 GiB plus eight model StateImages) retain state, KV
-and pause snapshots.
+Each request has a 240,000-token logical ceiling. KV histories and continuation state share the
+Device Context byte capacity selected at startup. The log reports the pool size and estimated
+token capacity. Requests allocate as they advance; resource pressure can reclaim retained prefixes
+or pause requests for later restoration/replay. See the
+[startup reference](https://github.com/Neroued/ninfer/blob/master/docs/startup-configuration.md)
+for capacity, Host cache and deployment controls.
 
 See the [HTTP serving guide](https://github.com/Neroued/ninfer/blob/master/docs/serving.md) for the
-API surface and the [resource scheduling reference](https://github.com/Neroued/ninfer/blob/master/docs/maintainer/resource-scheduling-and-context-cache.md)
+API surface and the [resource scheduling reference](https://github.com/Neroued/ninfer/blob/master/docs/maintainer/context-management.md)
 for cache and admission semantics.
 
 ## Supported use
@@ -325,12 +323,10 @@ AIME results.
 
 ## Limits
 
-- NInfer executes on one RTX 5090 and one CUDA device, with a startup-fixed capacity of 1–8 active
-  requests per Engine.
-- It does not provide large-scale continuous batching, priority/QoS scheduling,
-  multi-GPU execution, CPU/GPU offload, or distributed serving.
-- Context allocation is subject to GPU memory and the selected KV-cache type.
-- NInfer does not execute generated tool calls.
+- This artifact targets one RTX 5090, with one to eight active requests per Engine.
+- KV and continuation state share the startup Context pool. Usable context depends on the
+  selected KV type, enabled components, concurrency and available memory.
+- NInfer returns generated tool calls to the client; it does not execute them.
 
 ## Provenance
 
@@ -350,7 +346,7 @@ AIME results.
 The artifact identity, summarized object inventory, and conversion provenance are published in
 [`artifact-manifest.json`](https://huggingface.co/neroued/Qwen3.8-27B-nvfp4-NInfer/blob/main/artifact-manifest.json).
 The exact storage contract is maintained in the
-[v3 container reference](https://github.com/Neroued/ninfer/blob/master/docs/maintainer/artifact-container.md).
+[v3 container reference](https://github.com/Neroued/ninfer/blob/master/docs/maintainer/weights-and-loading.md).
 
 ## License
 

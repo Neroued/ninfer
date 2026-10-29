@@ -1,0 +1,55 @@
+{
+  "artifact": {
+    "entry": "qwen3_8_flash_next.ninfer",
+    "container_version": 3,
+    "artifact_id": "57cf9cd010e3475fac9481e8fc66fc0f",
+    "name": "qwen3.8-flash-next",
+    "architecture": "Qwen4ExpForCausalLM",
+    "components": [
+      "text",
+      "vision",
+      "mtp"
+    ],
+    "total_file_bytes": 108445200388,
+    "payload_bytes": 108440379396,
+    "files": [
+      {
+        "name": "qwen3_8_flash_next.ninfer",
+        "bytes": 32000000000
+      },
+      {
+        "name": "qwen3_8_flash_next.ninfer.part-0001",
+        "bytes": 32000000000
+      },
+      {
+        "name": "qwen3_8_flash_next.ninfer.part-0002",
+        "bytes": 32000000000
+      },
+      {
+        "name": "qwen3_8_flash_next.ninfer.part-0003",
+        "bytes": 12445200388
+      }
+    ]
+  },
+  "recipe": "qwen3_8_flash_next",
+  "sources": [
+    {
+      "repo_id": "Qwen/Qwen3.8-Flash-Next",
+      "role": "BF16 parameters, PLE and frontend resources"
+    },
+    {
+      "repo_id": "nvidia/Qwen3.8-Flash-Next-NVFP4",
+      "role": "Main NVFP4 experts and MTP parameters"
+    }
+  ],
+  "object_counts_by_format": {
+    "q4_g64_fp16": 1,
+    "bf16": 916,
+    "q8_g32_fp16": 96,
+    "fp32": 72,
+    "fp8_e4m3fn_block128x128_bf16": 2,
+    "nvfp4": 96,
+    "nf4_g16_e4m3fn": 128
+  },
+  "optimized_proposal_domain": "full"
+}

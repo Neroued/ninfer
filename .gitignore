@@ -64,6 +64,7 @@ profiles/
 # Claude Code personal/local settings (may contain API tokens)
 .claude/settings.local.json
 
-# Local startup configuration; keep the complete reference in version control.
+# Local startup configuration; retain the reference and deployment examples.
 *.toml
 !/ninfer.example.toml
+!/examples/configs/*.toml

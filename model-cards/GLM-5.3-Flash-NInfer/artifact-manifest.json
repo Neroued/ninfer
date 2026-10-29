@@ -1,0 +1,59 @@
+{
+  "artifact": {
+    "entry": "glm5_3_flash.ninfer",
+    "container_version": 3,
+    "artifact_id": "7f4725ce4f784697a7fe0d57a81e5de2",
+    "name": "glm5.3-flash",
+    "architecture": "Glm5NextForCausalLM",
+    "components": [
+      "text",
+      "vision",
+      "mtp"
+    ],
+    "total_file_bytes": 191484328832,
+    "payload_bytes": 191481699200,
+    "files": [
+      {
+        "name": "glm5_3_flash.ninfer",
+        "bytes": 32000000000
+      },
+      {
+        "name": "glm5_3_flash.ninfer.part-0001",
+        "bytes": 32000000000
+      },
+      {
+        "name": "glm5_3_flash.ninfer.part-0002",
+        "bytes": 32000000000
+      },
+      {
+        "name": "glm5_3_flash.ninfer.part-0003",
+        "bytes": 32000000000
+      },
+      {
+        "name": "glm5_3_flash.ninfer.part-0004",
+        "bytes": 32000000000
+      },
+      {
+        "name": "glm5_3_flash.ninfer.part-0005",
+        "bytes": 31484328832
+      }
+    ]
+  },
+  "recipe": "glm5next",
+  "sources": [
+    {
+      "repo_id": "nvidia/GLM-5.3-Flash-NVFP4",
+      "revision": "da920bb0b9f4a06727223a349e55468e38352348",
+      "role": "Primary checkpoint and frontend resources"
+    }
+  ],
+  "object_counts_by_format": {
+    "q4_g64_fp16": 1,
+    "q8_g32_fp16": 166,
+    "bf16": 954,
+    "nvfp4": 90,
+    "fp32": 145,
+    "fp8_e4m3fn_block128x128_bf16": 2
+  },
+  "optimized_proposal_domain": "full"
+}

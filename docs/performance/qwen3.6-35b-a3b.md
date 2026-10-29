@@ -1,5 +1,9 @@
 # Qwen3.6-35B-A3B serving performance
 
+This page records a historical campaign. Numbers, cache representations and commands describe
+that campaign's engine revision. For current builds and startup flags, use the
+[deployment examples](../../examples/configs/) and [startup reference](../startup-configuration.md).
+
 [Performance index](../performance.md) · [Methodology](methodology.md)
 
 On this page: [configuration](#configuration-and-runs), [context profile](#no-speculation-context-profile),

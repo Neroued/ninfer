@@ -9,12 +9,15 @@ example set, not a second correctness framework.
 recommended runtime budgets, and prepared-prompt token counts. Standalone exploratory prompts may
 also live beside them when they deliberately have no frozen output oracle.
 
+For deployment configurations, including dual Spark, see [configs](../configs/). The commands below
+use Qwen and its non-thinking mode; GLM requires thinking, and token counts depend on its own tokenizer.
+
 ## Quick start
 
 Commands below start at the repository root. Media paths inside JSON are relative to each messages file:
 
 ```bash
-CLI=./build/apps/ninfer
+CLI=./build/rtx5090-release/apps/ninfer
 MODEL=models/qwen3_6_27b.ninfer
 
 $CLI "$MODEL" \

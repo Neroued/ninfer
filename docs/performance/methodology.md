@@ -1,5 +1,10 @@
 # Serving performance methodology
 
+This document defines the recorded RTX 5090 campaigns linked from the [performance index](../performance.md).
+Their resource settings and commands belong to those campaigns. Current capacity controls and
+measurement commands are described in [startup configuration](../startup-configuration.md) and
+[benchmarks](../../bench/README.md).
+
 [Performance index](../performance.md) · [Runner usage](../../tools/bench/README.md#serving-corpus-benchmark)
 
 This is the measurement and publication reference for the serving results in this directory.

@@ -120,7 +120,7 @@ cp examples/configs/rtx5090-qwen3_8-27b-nvfp4.toml ninfer.local.toml
 ```
 
 The example enables Vision, FP8 KV, MTP3 and the optimized draft head. It sets a per-request
-context limit of 262,144 tokens; the actual shared KV/State capacity depends on available memory.
+context limit of 240,000 tokens; the actual shared KV/State capacity depends on available memory.
 The startup log reports the Context pool size and an estimated token capacity.
 
 ```bash

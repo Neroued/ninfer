@@ -7,7 +7,7 @@ components. Model sampling defaults are retained. Download the corresponding art
 
 | Configuration | Hardware | Per-request context limit | Active requests |
 |---|---|---:|---:|
-| [Qwen3.8-27B NVFP4](rtx5090-qwen3_8-27b-nvfp4.toml) | RTX 5090 | 262,144 | 2 |
+| [Qwen3.8-27B NVFP4](rtx5090-qwen3_8-27b-nvfp4.toml) | RTX 5090 | 240,000 | 2 |
 | [Qwen3.8-27B groupwise](rtx5090-qwen3_8-27b-groupwise.toml) | RTX 5090 | 262,144 | 2 |
 | [Flash Next](spark-qwen3_8-flash-next.toml) | One Spark | 262,144 | 8 |
 | [Flash Next TP2](spark2-qwen3_8-flash-next.toml) | Two Sparks | 262,144 | 8 |

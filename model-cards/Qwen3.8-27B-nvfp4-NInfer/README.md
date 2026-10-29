@@ -188,19 +188,18 @@ For images, videos, and structured chat history, see the
 
 ## Start a local server
 
+From the NInfer repository root, copy the
+[RTX 5090 deployment example](https://github.com/Neroued/ninfer/blob/master/examples/configs/rtx5090-qwen3_8-27b-nvfp4.toml)
+and set `model.path` to the downloaded artifact:
+
 ```bash
-./build/rtx5090-release/apps/ninfer-serve models/qwen3_8_27b_nvfp4.ninfer \
-  --host 127.0.0.1 \
-  --port 8080 \
-  --max-context 240000 \
-  --context-capacity auto \
-  --max-concurrency 2 \
-  --kv-dtype fp8 \
-  --spec mtp --draft-tokens 3 \
-  --proposal-head optimized \
-  --preserve-thinking
+cp examples/configs/rtx5090-qwen3_8-27b-nvfp4.toml ninfer.local.toml
+# Edit model.path for your artifact.
+./build/rtx5090-release/apps/ninfer-serve --config ninfer.local.toml
 ```
 
+The example enables Vision, FP8 KV, CUDA Graph decode, MTP3 and the optimized proposal head,
+with two active requests, a 1,024-token prefill chunk and 256 MiB of memory headroom.
 Each request has a 240,000-token logical ceiling. KV histories and continuation state share the
 Device Context byte capacity selected at startup. The log reports the pool size and estimated
 token capacity. Requests allocate as they advance; resource pressure can reclaim retained prefixes

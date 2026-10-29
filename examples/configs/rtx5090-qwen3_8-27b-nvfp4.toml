@@ -7,7 +7,7 @@ path = "/srv/models/qwen3_8_27b_nvfp4.ninfer"
 vision = true
 
 [engine]
-max_context = 262144 # Per-request limit; shared physical capacity is planned separately.
+max_context = 240000 # Per-request limit; shared physical capacity is planned separately.
 max_concurrency = 2
 kv_dtype = "fp8"
 context_capacity = "auto"

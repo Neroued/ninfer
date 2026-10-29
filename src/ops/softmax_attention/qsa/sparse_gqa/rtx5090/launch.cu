@@ -4,6 +4,7 @@
 #include "ops/softmax_attention/qsa/sparse_gqa/simt.cuh"
 #include "ops/softmax_attention/qsa/sparse_gqa/compact.cuh"
 #include "ops/softmax_attention/qsa/sparse_gqa/merge.cuh"
+#include "ops/softmax_attention/qsa/sparse_gqa/rtx5090/compact_schedule.h"
 
 namespace ninfer::ops::detail::qsa {
 namespace {
@@ -15,17 +16,8 @@ void launch(const SparseGqaArguments& arguments, SparseGqaPlan plan,
     constexpr bool Async = kSparseQuantized<Storage> && VectorCache;
     const auto compact =
         [&]<int N, int Warps, SparseGqaLoad Load, bool Prefix, bool Delay = false>() {
-            // Keep the compiled register allocation consistent with the five-CTA
-            // 16-row schedule used by the partition model.
-            constexpr int resident =
-                KvHeads == 2 && (N == 16 || (!Prefix && Load == SparseGqaLoad::Reused &&
-                                             (Delay || kSparseQuantized<Storage>)))
-                    ? 5
-                : KvHeads == 4 && Storage == KvCacheStorage::BFloat16 && !Prefix && N == 32 ? 5
-                : KvHeads == 4 && kSparseQuantized<Storage> && Load == SparseGqaLoad::Reused &&
-                        !Prefix && N == 16
-                    ? 10
-                    : 1;
+            constexpr int resident = compact_launch_min_blocks(
+                Storage, KvHeads, N, Prefix, Load == SparseGqaLoad::Reused, Delay);
             constexpr auto kernel = sparse_gqa_compact_kernel<Storage, N, Warps, VectorCache, Load,
                                                               Prefix, Delay, KvHeads, resident>;
             constexpr int bytes =

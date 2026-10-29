@@ -34,7 +34,8 @@ struct SparseGqaCapacityEnvelopes {
 
 SparseGqaCapacityEnvelopes sparse_gqa_capacity_envelopes(KvCacheStorage storage, int tokens,
                                                          int batch, int kv_heads,
-                                                         QsaSparseGqaExecutionEnvelope envelope);
+                                                         QsaSparseGqaExecutionEnvelope envelope,
+                                                         int sms);
 
 enum class SparseGqaKernel {
     Sequence,

@@ -26,7 +26,8 @@ int sparse_gqa_direct_queries(int kv_heads, int sms) {
 }
 
 SparseGqaCapacityEnvelopes sparse_gqa_capacity_envelopes(KvCacheStorage, int, int, int,
-                                                         QsaSparseGqaExecutionEnvelope envelope) {
+                                                         QsaSparseGqaExecutionEnvelope envelope,
+                                                         int) {
     SparseGqaCapacityEnvelopes out;
     // Short SIMT calls materialize partials even when MMA can write a single partition directly.
     for (std::uint32_t bound : {0u, 8u, 64u})

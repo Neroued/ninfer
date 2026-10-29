@@ -35,8 +35,8 @@ std::size_t qsa_sparse_gqa_workspace_capacity_bytes(KvCacheStorage storage,
     const int end = std::min(
         hi, (detail::qsa::sparse_gqa_direct_queries(kv_heads, multiprocessor_count) - 1) / batch);
     for (int t = lo; t <= end; ++t) {
-        const auto bounds =
-            detail::qsa::sparse_gqa_capacity_envelopes(storage, t, batch, kv_heads, envelope);
+        const auto bounds = detail::qsa::sparse_gqa_capacity_envelopes(
+            storage, t, batch, kv_heads, envelope, multiprocessor_count);
         for (int i = 0; i < bounds.count; ++i) {
             WorkspaceLayoutBuilder layout;
             detail::qsa::allocate_sparse_gqa_workspace(

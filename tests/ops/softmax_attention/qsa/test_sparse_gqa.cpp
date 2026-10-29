@@ -285,6 +285,36 @@ int graph_update(DeviceContext& device, int tokens, int batch,
     return failures;
 }
 
+int smaller_envelope_capacity(DeviceContext& device, int tokens, unsigned history) {
+    constexpr auto storage = KvCacheStorage::Nvfp4Group16;
+    constexpr unsigned reserved_bound = 2052;
+    Fixture f(tokens, 1, history, false, storage);
+    f.reset();
+    const auto bytes = ops::qsa_sparse_gqa_workspace_capacity_bytes(
+        storage, f.q_heads, f.kv_heads, tokens, tokens, 1, {reserved_bound},
+        device.execution_view().multiprocessor_count());
+    GuardedDeviceBuffer scratch(bytes);
+    MemoryArena workspace(scratch.span());
+    DecodeGraphExecutable graph;
+    int failures = 0;
+    for (unsigned bound : {reserved_bound, history}) {
+        f.envelope.max_visible_tokens = bound;
+        f.out.fill(0xff);
+        DecodeGraphDefinition definition;
+        definition.capture(device.stream(), [&] { f.launch(workspace, device.execution_view()); });
+        if (graph.ready())
+            graph.update(definition);
+        else
+            graph.instantiate(definition);
+        graph.launch(device.stream());
+        device.synchronize();
+        const auto label =
+            "smaller envelope T=" + std::to_string(tokens) + " bound=" + std::to_string(bound);
+        failures += verify(f, label) + scratch.verify_guards(label);
+    }
+    return failures;
+}
+
 template <class F>
 int rejects(F&& call) {
     try {
@@ -337,16 +367,6 @@ int validation(DeviceContext& device) {
                                            execution.multiprocessor_count());
             }
     }
-    // Reserving a larger envelope must cover recapture at a smaller one, even
-    // when the latter changes between prefix and gathered attention inside a tile.
-    for (const auto [tokens, bound] : {std::pair{34, 375u}, std::pair{182, 2003u}}) {
-        const auto capacity = [&](unsigned visible) {
-            return ops::qsa_sparse_gqa_workspace_capacity_bytes(
-                KvCacheStorage::Nvfp4Group16, 24, 2, tokens, tokens, 1, {visible},
-                execution.multiprocessor_count());
-        };
-        failures += capacity(bound) > capacity(2052);
-    }
     return failures;
 }
 
@@ -384,6 +404,11 @@ int quantized_validation(DeviceContext& device, KvCacheStorage storage) {
     invalid.cache.k_scale_pages.plane.head_stride_bytes = 0;
     failures += rejects([&] { invalid.launch(workspace, device.execution_view()); });
     invalid.cache.k_scale_pages = key_scales;
+    // Reserving a larger envelope must cover recapture at a smaller one, even
+    // when the latter changes between prefix and gathered attention inside a tile.
+    if (storage == KvCacheStorage::Nvfp4Group16)
+        for (const auto [tokens, bound] : {std::pair{34, 375u}, std::pair{182, 2003u}})
+            failures += smaller_envelope_capacity(device, tokens, bound);
     return failures;
 }
 
@@ -414,10 +439,13 @@ void add_cases(OpSuite& suite, KvCacheStorage storage) {
         suite.add(prefix + "/" + id, [=] { return run(cuda_environment().context); },
                         {{"format", kv_cache_storage_name(storage)}, {"execution", execution}});
     };
-    special("contract", [=](auto& device) {
-        return storage == KvCacheStorage::BFloat16 ? validation(device)
-                                                   : quantized_validation(device, storage);
-    });
+    special(
+        "contract",
+        [=](auto& device) {
+            return storage == KvCacheStorage::BFloat16 ? validation(device)
+                                                       : quantized_validation(device, storage);
+        },
+        storage == KvCacheStorage::Nvfp4Group16 ? "graph" : "eager");
     special("gate_rounding", [=](auto& device) { return gate_rounding(device, storage); });
     for (auto [t, b] : {std::pair{8, 3}, {33, 8}})
         special(

@@ -1,12 +1,24 @@
 #include "ops/softmax_attention/qsa/sparse_gqa/plan.h"
+#include "ops/softmax_attention/qsa/sparse_gqa/rtx5090/compact_schedule.h"
 #include "core/paged_kv_cache.h"
 #include "ops/common/host/operands.h"
 #include <limits>
 
 namespace ninfer::ops::detail::qsa {
 namespace {
-constexpr int kSplitQueries              = 4096;
-constexpr std::uint64_t kSplitCacheBytes = 64ULL << 20;
+constexpr int kSplitQueries                = 4096;
+constexpr std::uint64_t kSplitCacheBytes   = 64ULL << 20;
+constexpr std::uint32_t kMaxSelectedTokens = 512 * 4 + 3;
+
+std::uint32_t two_head_prefix_limit(KvCacheStorage storage, std::int64_t queries, int sms) {
+    if (storage == KvCacheStorage::BFloat16) {
+        if (queries + 1 >= std::int64_t(sms) * 3 / 2) return kMaxSelectedTokens;
+        return std::uint32_t(
+            std::min<std::int64_t>(kMaxSelectedTokens, std::max<std::int64_t>(128, queries)));
+    }
+    const int reuse = storage == KvCacheStorage::Nvfp4Group16 ? 11 : 12;
+    return std::uint32_t(std::min<std::int64_t>(kMaxSelectedTokens, queries * reuse));
+}
 
 int native_natural_partitions(std::int64_t queries) {
     return queries <= 6 ? 64 : queries <= 12 ? 33 : queries == 13 ? 32 : 22;
@@ -38,18 +50,86 @@ double partial_merge_rate(KvCacheStorage storage, int kv_heads, std::int64_t que
     return queries * kv_heads >= std::int64_t(resident) * sms ? 2. : .5;
 }
 
+struct MmaProblem {
+    KvCacheStorage storage;
+    int kv_heads, batch, sms;
+    std::int64_t queries;
+    bool large, long_envelope;
+};
+
+struct MmaTileCost {
+    int resident;
+    double tile, startup, merge_rate;
+    bool native_reuse_window;
+};
+
+MmaTileCost mma_tile_cost(const MmaProblem& p, int rows, bool reuse, bool delay) {
+    const bool native  = p.storage == KvCacheStorage::BFloat16;
+    const bool fp4     = p.storage == KvCacheStorage::Nvfp4Group16;
+    const int resident = compact_mma_resident_blocks(p.storage, p.kv_heads, rows, reuse, delay);
+    double tile        = 1.;
+    if (reuse && p.kv_heads == 4) {
+        if (p.large)
+            tile = fp4 ? 1.31 : 1.46;
+        else if (fp4)
+            tile = p.queries >= 256 && p.queries <= std::int64_t(p.sms) * 3 ? 1.165 : 1.20;
+        else
+            tile = 1.21;
+    } else if (reuse) {
+        switch (p.storage) {
+        case KvCacheStorage::Nvfp4Group16:
+            tile = 1.8;
+            break;
+        case KvCacheStorage::Int8Group64:
+            tile = 2.3;
+            break;
+        case KvCacheStorage::Fp8E4M3Row256:
+            tile = 2.4;
+            break;
+        default:
+            tile = 2.65;
+            break;
+        }
+    } else if (p.kv_heads == 2) {
+        if (rows == 16)
+            tile = 1.25;
+        else if (native && delay)
+            tile = p.long_envelope ? 1.63 : 1.65;
+        else
+            tile = fp4 ? 1.3 : 1.5;
+    }
+    // Once two partitions spill a five-CTA wave, three still fit in two waves.
+    const bool native_reuse = native && p.kv_heads == 4 &&
+                              p.queries * 8 > std::int64_t(p.sms) * 5 &&
+                              p.queries * 12 <= std::int64_t(p.sms) * 10;
+    double startup;
+    if (native_reuse)
+        startup = 2;
+    else if (p.kv_heads == 2)
+        startup = p.large ? 8 : 3;
+    else if (p.large)
+        startup = fp4 ? 4 : 8;
+    else
+        startup = reuse ? 3.5 : 2;
+    return {resident, tile, startup,
+            partial_merge_rate(p.storage, p.kv_heads, p.queries, p.batch, p.sms, resident, p.large,
+                               p.long_envelope),
+            native_reuse};
+}
+
 SparseGqaPlan partition_mma(KvCacheStorage storage, int kv_heads, std::int64_t queries, int batch,
                             QsaSparseGqaExecutionEnvelope envelope, int sms, SparseGqaPlan plan) {
     if (plan.instance != SparseGqaInstance::Mma || kv_heads == 1) return plan;
-    if (kv_heads == 4 && envelope.max_visible_tokens <= 2051) return plan;
+    if (kv_heads == 4 && envelope.max_visible_tokens <= kMaxSelectedTokens) return plan;
     const bool native        = storage == KvCacheStorage::BFloat16;
     const bool fp4           = storage == KvCacheStorage::Nvfp4Group16;
-    const bool long_envelope = envelope.max_visible_tokens > 2051;
+    const bool long_envelope = envelope.max_visible_tokens > kMaxSelectedTokens;
     const auto row_bytes = paged_kv_storage_layout(storage, 256).physical_bytes_per_token_head();
     // Leave space for Q and partial rows. The envelope bounds the regime without
     // assuming that Device selection visits the entire physical cache.
     const bool large = std::uint64_t(envelope.max_visible_tokens) * batch * kv_heads * row_bytes >
                        kSplitCacheBytes;
+    const MmaProblem problem{storage, kv_heads, batch, sms, queries, large, long_envelope};
     const int maximum_splits =
         queries > kSplitQueries || (kv_heads == 4 && native && queries >= std::int64_t(sms) * 4) ? 1
         : queries >= std::int64_t(sms) * 4                                                       ? 2
@@ -64,8 +144,8 @@ SparseGqaPlan partition_mma(KvCacheStorage storage, int kv_heads, std::int64_t q
     const int first_rows   = kv_heads == 2 ? 16 : plan.key_rows;
     const int last_rows    = kv_heads == 2 ? 32 : plan.key_rows;
     for (int rows = first_rows; rows <= last_rows; rows *= 2) {
-        const int tiles =
-            std::max(1, (int(std::min(envelope.max_visible_tokens, 2051u)) + rows - 1) / rows);
+        const int tiles = std::max(
+            1, (int(std::min(envelope.max_visible_tokens, kMaxSelectedTokens)) + rows - 1) / rows);
         // One-tile native partitions spend more on partial traffic and merging
         // than they recover in parallelism. Keep two tiles where history permits.
         const int partitions =
@@ -74,13 +154,12 @@ SparseGqaPlan partition_mma(KvCacheStorage storage, int kv_heads, std::int64_t q
             // Prefer the reused tile once the rotated-value workload fills a
             // five-CTA wave. INT8 also wins just beyond that wave, before the
             // aliased two-partition schedule crosses its next residency step.
-            const bool reuse_wave =
-                storage == KvCacheStorage::Fp8KeyNvfp4Value
-                    ? queries * 2 >= std::int64_t(sms) * 5
-                    : storage == KvCacheStorage::Int8Group64 &&
-                          queries * 2 > std::int64_t(sms) * 5 && queries <= std::int64_t(sms) * 3;
-            if (!reuse && kv_heads == 4 && !large && reuse_wave)
-                continue;
+            const bool reuse_wave = storage == KvCacheStorage::Fp8KeyNvfp4Value
+                                        ? queries * 2 >= std::int64_t(sms) * 5
+                                        : storage == KvCacheStorage::Int8Group64 &&
+                                              queries * 2 > std::int64_t(sms) * 5 &&
+                                              queries <= std::int64_t(sms) * 3;
+            if (!reuse && kv_heads == 4 && !large && reuse_wave) continue;
             if (reuse && (native || (kv_heads == 2 && (rows != 32 || large)) ||
                           (kv_heads == 4 && rows != 16)))
                 continue;
@@ -99,64 +178,27 @@ SparseGqaPlan partition_mma(KvCacheStorage storage, int kv_heads, std::int64_t q
             const int schedules = kv_heads == 2 && native && rows == 32 ? 2 : 1;
             for (int schedule = 0; schedule < schedules; ++schedule) {
                 const bool delay = kv_heads == 2 && rows == 32 && (native ? schedule == 1 : !reuse);
-                const int resident =
-                    reuse           ? (kv_heads == 2 ? 5 : 10)
-                    : kv_heads == 2 ? (native                                    ? (delay ? 5 : 4)
-                                       : rows == 16                              ? 5
-                                       : storage == KvCacheStorage::Nvfp4Group16 ? 4
-                                                                                 : 3)
-                    : native        ? (rows == 32 ? 5 : 2)
-                    : rows == 16    ? (storage == KvCacheStorage::Nvfp4Group16 ? 8 : 7)
-                                    : 2;
                 // Account for per-wave work as well as latency: additional
                 // resident warps share issue/decode bandwidth rather than running free.
-                const double tile =
-                    reuse
-                        ? (kv_heads == 4
-                               ? (large ? (storage == KvCacheStorage::Nvfp4Group16 ? 1.31 : 1.46)
-                                        : (storage == KvCacheStorage::Nvfp4Group16
-                                               ? (queries >= 256 && queries <= std::int64_t(sms) * 3
-                                                      ? 1.165
-                                                      : 1.20)
-                                               : 1.21))
-                           : storage == KvCacheStorage::Nvfp4Group16  ? 1.8
-                           : storage == KvCacheStorage::Int8Group64   ? 2.3
-                           : storage == KvCacheStorage::Fp8E4M3Row256 ? 2.4
-                                                                      : 2.65)
-                    : kv_heads != 2                           ? 1.
-                    : rows == 16                              ? 1.25
-                    : native && delay                         ? (long_envelope ? 1.63 : 1.65)
-                    : storage == KvCacheStorage::Nvfp4Group16 ? 1.3
-                                                              : 1.5;
-                // Retain the reuse-friendly schedule after two partitions spill
-                // a five-CTA wave and while three still fit in two waves.
-                const bool native_short = native && kv_heads == 4 &&
-                                          queries * 8 > std::int64_t(sms) * 5 &&
-                                          queries * 12 <= std::int64_t(sms) * 10;
-                const double startup = native_short    ? 2
-                                       : kv_heads == 2 ? (large ? 8 : 3)
-                                       : large ? (storage == KvCacheStorage::Nvfp4Group16 ? 4 : 8)
-                                       : reuse ? 3.5
-                                               : 2;
+                const auto model = mma_tile_cost(problem, rows, reuse, delay);
                 for (int count = 1; count <= std::min(partitions, tiles); ++count) {
                     // Separate batch rows benefit more from the three-partition
                     // two-wave schedule than from extra Q/partial traffic.
-                    if (native_short && batch >= 4 && count > 3) continue;
-                    const auto blocks       = queries * kv_heads * count;
-                    const auto waves        = (blocks + resident * sms - 1) / (resident * sms);
-                    const bool partial      = count > 1;
-                    const double merge_rate = partial_merge_rate(
-                        storage, kv_heads, queries, batch, sms, resident, large, long_envelope);
+                    if (model.native_reuse_window && batch >= 4 && count > 3) continue;
+                    const auto blocks = queries * kv_heads * count;
+                    const auto waves = (blocks + model.resident * sms - 1) / (model.resident * sms);
+                    const bool partial = count > 1;
                     // Native partitions retain a streaming wave for random gathers
                     // while recovering KV reuse when the selected union is smaller.
-                    const double merge = partial && !native_short
+                    const double merge = partial && !model.native_reuse_window
                                              ? (kv_heads == 2 ? 3.
                                                 : large       ? (fp4 ? 4. : 8.)
                                                               : 1.) +
-                                                   merge_rate * double(queries) * count / sms
+                                                   model.merge_rate * double(queries) * count / sms
                                              : 0.;
                     const double cost =
-                        waves * (((tiles + count - 1) / count) * tile + startup) + merge;
+                        waves * (((tiles + count - 1) / count) * model.tile + model.startup) +
+                        merge;
                     if (cost < best) {
                         best                   = cost;
                         selected               = {rows, count, SparseGqaInstance::Mma, partial};
@@ -186,7 +228,8 @@ int sparse_gqa_direct_queries(int kv_heads, int) { return kv_heads == 1 ? 256 : 
 
 SparseGqaCapacityEnvelopes sparse_gqa_capacity_envelopes(KvCacheStorage storage, int tokens,
                                                          int batch, int kv_heads,
-                                                         QsaSparseGqaExecutionEnvelope envelope) {
+                                                         QsaSparseGqaExecutionEnvelope envelope,
+                                                         int sms) {
     SparseGqaCapacityEnvelopes out;
     const auto add = [&](std::uint32_t bound) {
         if (bound <= envelope.max_visible_tokens) out.values[out.count++] = bound;
@@ -194,19 +237,17 @@ SparseGqaCapacityEnvelopes sparse_gqa_capacity_envelopes(KvCacheStorage storage,
     if (kv_heads != 1) {
         add(0);
         if (std::int64_t(tokens) * batch < 256) {
-            for (std::uint32_t bound = 1; bound <= 2051; bound += 16) add(bound);
-            add(2051);
-            if (kv_heads == 2) {
-                const auto queries = std::uint64_t(tokens) * batch;
-                const int reuse = storage == KvCacheStorage::BFloat16       ? 1
-                                  : storage == KvCacheStorage::Nvfp4Group16 ? 11
-                                                                           : 12;
+            for (std::uint32_t bound = 1; bound <= kMaxSelectedTokens; bound += 16) add(bound);
+            add(kMaxSelectedTokens);
+            const auto queries = std::int64_t(tokens) * batch;
+            if (kv_heads == 2 && queries >= 32) {
                 // The prefix/MMA crossover can occur inside a key-tile interval.
                 // Include its first MMA envelope before the next tile boundary.
-                if (queries * reuse < 2051) add(std::uint32_t(queries * reuse + 1));
+                const auto prefix_limit = two_head_prefix_limit(storage, queries, sms);
+                if (prefix_limit < kMaxSelectedTokens) add(prefix_limit + 1);
             }
         }
-        add(2052);
+        add(kMaxSelectedTokens + 1);
         const auto bytes = std::uint64_t(batch) * kv_heads *
                            paged_kv_storage_layout(storage, 256).physical_bytes_per_token_head();
         add(std::uint32_t(kSplitCacheBytes / bytes + 1));
@@ -235,14 +276,14 @@ SparseGqaPlan select_plan(KvCacheStorage storage, int tokens, int batch, int kv_
         if (visible <= 64 && queries < short_queries)
             return {32, 1, SparseGqaInstance::Simt, false};
         const bool short_prefix = queries >= short_queries;
-        const bool prefix =
-            visible <= 2051 && (bf16 || (queries >= 2 && (visible > 64 || short_prefix)));
+        const bool prefix       = visible <= kMaxSelectedTokens &&
+                            (bf16 || (queries >= 2 && (visible > 64 || short_prefix)));
         if (!prefix && visible <= 64) return {32, 1, SparseGqaInstance::Simt, false};
         const int rows = prefix && visible <= 32  ? 32
                          : prefix || queries <= 8 ? 64
                          : bf16                   ? 32
                                                   : 16;
-        if (!prefix && visible > 2051)
+        if (!prefix && visible > kMaxSelectedTokens)
             return partition_mma(storage, kv_heads, queries, batch, envelope, sms,
                                  {rows, 1, SparseGqaInstance::Mma, false});
         const int packet   = prefix ? rows / 16 : 1;
@@ -251,8 +292,9 @@ SparseGqaPlan select_plan(KvCacheStorage storage, int tokens, int batch, int kv_
                                      : prefix && queries <= 8 ? 1
                                                               : 2)
                                   : (rows == 32 ? 3 : 2);
-        const int tiles    = std::max(1, (int(std::min(visible, 2051u)) + rows - 1) / rows);
-        int splits         = 1;
+        const int tiles =
+            std::max(1, (int(std::min(visible, kMaxSelectedTokens)) + rows - 1) / rows);
+        int splits = 1;
         if (partial && !(fp4_value && prefix && visible <= 256)) {
             // Compare complete waves, including the Q prologue. A fixed CTA target can
             // spill one partition into another wave and create a latency inversion.
@@ -279,24 +321,15 @@ SparseGqaPlan select_plan(KvCacheStorage storage, int tokens, int batch, int kv_
                 queries >= crossover ? SparseGqaInstance::FullPrefix : SparseGqaInstance::Simt,
                 false};
     }
-    if (kv_heads == 2 && visible <= 2051 && queries >= 32) {
-        const int query_reuse = storage == KvCacheStorage::BFloat16       ? 10
-                                : storage == KvCacheStorage::Nvfp4Group16 ? 11
-                                                                          : 12;
-        const bool enough_queries =
-            storage == KvCacheStorage::BFloat16
-                ? visible <= 128 || queries >= visible || queries + 1 >= std::int64_t(sms) * 3 / 2
-                : queries * query_reuse >= visible;
-        if (enough_queries) {
-            const int rows =
-                visible <= 128 || (storage == KvCacheStorage::BFloat16 && queries <= 1024) ? 32
-                                                                                           : 64;
-            return {rows, 1, SparseGqaInstance::FullPrefix, false};
-        }
+    if (kv_heads == 2 && visible <= kMaxSelectedTokens && queries >= 32 &&
+        visible <= two_head_prefix_limit(storage, queries, sms)) {
+        const int rows =
+            visible <= 128 || (storage == KvCacheStorage::BFloat16 && queries <= 1024) ? 32 : 64;
+        return {rows, 1, SparseGqaInstance::FullPrefix, false};
     }
     if (queries >= 256)
         return partition_mma(storage, kv_heads, queries, batch, envelope, sms,
-                             visible <= 2051
+                             visible <= kMaxSelectedTokens
                                  ? SparseGqaPlan{64, 1, SparseGqaInstance::FullPrefix, false}
                                  : SparseGqaPlan{32, 1, SparseGqaInstance::Mma, false});
     // Budget parallel partitions independently of history. The envelope only bounds the
@@ -307,7 +340,7 @@ SparseGqaPlan select_plan(KvCacheStorage storage, int tokens, int batch, int kv_
     while (splits < target && splits < 32) splits *= 2;
     const bool simt = visible <= 64;
     if (simt) splits = std::max(1, splits / 12);
-    const int tiles = std::max(1, (int(std::min(visible, 2051u)) + 31) / 32);
+    const int tiles = std::max(1, (int(std::min(visible, kMaxSelectedTokens)) + 31) / 32);
     return partition_mma(storage, kv_heads, queries, batch, envelope, sms,
                          {32, std::min(splits, tiles),
                           simt ? SparseGqaInstance::Simt : SparseGqaInstance::Mma, true});
@@ -324,7 +357,7 @@ SparseGqaPlan select_sparse_gqa_plan(KvCacheStorage storage, int tokens, int bat
     // The launcher selects the actual count without allocating or repacking.
     if (storage == KvCacheStorage::BFloat16 && kv_heads == 2 && queries <= 16 &&
         plan.instance == SparseGqaInstance::Mma && plan.partial &&
-        envelope.max_visible_tokens > 2051)
+        envelope.max_visible_tokens > kMaxSelectedTokens)
         plan.splits = std::max(plan.splits, native_natural_partitions(queries));
     // The public contract keeps Graph topology compatible across envelope updates.
     plan.merge_node = kv_heads == 2 ? queries <= kSplitQueries
@@ -345,7 +378,7 @@ SparseGqaLaunchPlan select_sparse_gqa_launch(const ConstPagedKVBatchLayerView& c
     if (cache.num_kv_heads == 2 && plan.instance != SparseGqaInstance::Simt) {
         auto selected = plan;
         if (cache.storage == KvCacheStorage::BFloat16 && queries <= 16 && plan.partial &&
-            plan.instance == SparseGqaInstance::Mma && plan.visible_tokens > 2051) {
+            plan.instance == SparseGqaInstance::Mma && plan.visible_tokens > kMaxSelectedTokens) {
             if (vector)
                 selected = select_plan(cache.storage, queries / batch, batch, 2,
                                        {plan.visible_tokens}, sms);

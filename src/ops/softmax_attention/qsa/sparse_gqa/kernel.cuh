@@ -227,5 +227,4 @@ __launch_bounds__(Warps * 32) __global__
         a, s, a.begin + a.group_query(blockIdx.x), a.group_head(blockIdx.x), blockIdx.y);
 }
 
-
 } // namespace ninfer::ops::detail::qsa

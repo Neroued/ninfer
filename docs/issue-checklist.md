@@ -24,10 +24,10 @@
   Engine 统一先解除逻辑成员、发布统计，再公开终态；整体失败统一清理后分发原始错误。
   完整构建及 RTX 5090 真实模型检查通过，覆盖完成、取消、排队/原生错误、执行失败和暂停/Replay 取消。
 
-- [ ] **4. Thinking 统计与 budget 解耦** — [#373](https://github.com/Neroued/ninfer/issues/373)
+- [x] **4. Thinking 统计与 budget 解耦** — [#373](https://github.com/Neroued/ninfer/issues/373)
 
-  公共 frontend 的语义计数仍依赖是否设置 budget。独立维护模型 thinking token 统计，budget 仅负责预算控制。
-  完成条件：Qwen、GLM 在有无 budget 时均正确计数，区分模型生成与引擎注入，预算控制仍正确。
+  语义计数独立于 budget 和输出呈现；模型生成与控制注入分别计数。
+  Qwen、GLM 的自然关闭、raw、隐式工具边界、preview 丢弃及预算控制测试通过。
 
 - [ ] **5. HTTP listener 端口复用** — [#341](https://github.com/Neroued/ninfer/issues/341)、[PR #340](https://github.com/Neroued/ninfer/pull/340)
 

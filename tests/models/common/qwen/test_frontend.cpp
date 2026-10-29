@@ -2156,6 +2156,47 @@ int test_constrained_thinking_control(const Frontend& frontend) {
     return failures;
 }
 
+int test_thinking_accounting(const Frontend& frontend) {
+    int failures      = 0;
+    const auto prompt = thinking_prompt(frontend);
+    for (const bool raw : {false, true}) {
+        auto session = frontend.make_output_session(prompt, {}, {.raw = raw}, {});
+        (void)session.preview_model(std::array<ninfer::TokenId, 1>{0}, 20,
+                                    ninfer::FinishReason::OutputLimit);
+        session.discard_preview();
+        failures += check(session.thinking_stats().model_thinking_tokens == 0,
+                          "discard published unbudgeted thinking tokens");
+        (void)session.preview_model(std::array<ninfer::TokenId, 2>{0, 3}, 20,
+                                    ninfer::FinishReason::OutputLimit);
+        (void)session.commit_preview();
+        failures += check(session.thinking_stats().model_thinking_tokens == 2,
+                          "unbudgeted thinking lost a partial closing marker");
+        (void)session.preview_model(std::array<ninfer::TokenId, 2>{4, 0}, 18,
+                                    ninfer::FinishReason::OutputLimit);
+        (void)session.commit_preview();
+        const auto stats = session.thinking_stats();
+        failures +=
+            check(stats.model_thinking_tokens == 3 && !stats.configured_budget && !stats.applied &&
+                      stats.injected_tokens == 0 && session.pending_control_tokens().empty() &&
+                      session.model_token_budget_remaining(16) == 16,
+                  "thinking accounting depends on presentation or counts post-close content");
+    }
+    auto stopped        = frontend.make_output_session(prompt, {}, {}, {});
+    const auto decision = stopped.preview_model(std::array<ninfer::TokenId, 3>{0, 6, 0}, 20,
+                                                ninfer::FinishReason::OutputLimit);
+    (void)stopped.commit_preview();
+    failures +=
+        check(decision.accepted_tokens == 2 && stopped.thinking_stats().model_thinking_tokens == 2,
+              "thinking count includes unaccepted tokens after EOS");
+    auto plain = frontend.make_output_session(frontend.prepare_tokens({0}), {}, {}, {});
+    (void)plain.preview_model(std::array<ninfer::TokenId, 1>{0}, 20,
+                              ninfer::FinishReason::OutputLimit);
+    (void)plain.commit_preview();
+    failures += check(plain.thinking_stats().model_thinking_tokens == 0,
+                      "non-thinking output increased the thinking count");
+    return failures;
+}
+
 int test_thinking_budget_control(const Frontend& frontend) {
     auto prompt = thinking_prompt(frontend);
     ninfer::StopPolicy stop;
@@ -2807,6 +2848,7 @@ int main() {
     failures += test_structured_tool_output();
     failures += test_tools_and_json_output();
     failures += test_reasoning_split(frontend);
+    failures += test_thinking_accounting(frontend);
     failures += test_thinking_budget_control(frontend);
     failures += test_constrained_thinking_control(frontend);
     failures += test_utf8_and_hidden_eos(frontend);

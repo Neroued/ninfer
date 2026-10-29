@@ -378,7 +378,7 @@ public:
         semantic.budget             = options.thinking.budget;
         semantic.reasoning_close    = state.reasoning_close;
         semantic.content_open       = state.content_open;
-        semantic.in_reasoning = options.starts_in_reasoning && options.thinking.budget.has_value();
+        semantic.in_reasoning       = options.starts_in_reasoning;
     }
 
     std::shared_ptr<const text::Tokenizer> tokenizer;

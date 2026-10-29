@@ -83,6 +83,20 @@ void controls(const glm::Frontend& f, const text::Tokenizer& tokenizer) {
     Output output;
     auto word = tokenizer.encode("x");
     require(word.size() == 1, "fixture must contain x");
+    for (const bool raw : {false, true}) {
+        auto unlimited = f.make_output_session(prompt, {}, {.raw = raw}, {}, {}, {});
+        (void)unlimited.preview_model(word, 100, FinishReason::OutputLimit);
+        unlimited.discard_preview();
+        require(unlimited.thinking_stats().model_thinking_tokens == 0,
+                "discard advanced unbudgeted thinking");
+        Output visible;
+        commit(unlimited, tokenizer.encode("x</think>answer"), visible);
+        const auto stats = unlimited.thinking_stats();
+        require(stats.model_thinking_tokens == tokenizer.encode("x</think>").size() &&
+                    !stats.configured_budget && !stats.applied && stats.injected_tokens == 0 &&
+                    unlimited.model_token_budget_remaining(100) == 100,
+                "unbudgeted thinking depends on presentation or includes post-close content");
+    }
     commit(session, word, output);
     const auto decision = session.preview_model(word, 100, FinishReason::OutputLimit);
     require(decision.continuation == runtime::ContinuationAction::ApplyTargetControl,
@@ -145,6 +159,13 @@ void controls(const glm::Frontend& f, const text::Tokenizer& tokenizer) {
     require(tool_out.reasoning == "reason" && tool_out.calls.size() == 1 &&
                 !implicit.thinking_stats().applied,
             "implicit tool opener did not end reasoning");
+    auto unlimited_tools = f.make_output_session(tools, {}, {}, {}, {},
+                                                 {.constraints = ToolConstraintMode::Automatic});
+    Output unlimited_tool_out;
+    commit(unlimited_tools, ids, unlimited_tool_out);
+    require(unlimited_tools.thinking_stats().model_thinking_tokens ==
+                tokenizer.encode("reason<tool_call>").size(),
+            "implicit tool opener did not close unbudgeted thinking accounting");
 
     auto continued_input = input();
     continued_input.messages.push_back(message(ChatRole::Assistant, "prefix"));
@@ -153,7 +174,9 @@ void controls(const glm::Frontend& f, const text::Tokenizer& tokenizer) {
     auto continuation = f.make_output_session(continued, {}, {}, {.budget = 1}, {}, {});
     Output continued_out;
     commit(continuation, tokenizer.encode(" suffix<|endoftext|>"), continued_out);
-    require(continued_out.content == " suffix" && !continuation.thinking_stats().configured_budget,
+    require(continued_out.content == " suffix" &&
+                !continuation.thinking_stats().configured_budget &&
+                continuation.thinking_stats().model_thinking_tokens == 0,
             "continuation restarted reasoning or repeated its prefix");
 
     auto split = f.make_output_session(prompt, {}, {}, {}, {}, {});

@@ -36,22 +36,18 @@ enum class EnginePurpose : std::uint8_t {
 };
 
 
-inline constexpr std::size_t kDefaultContextHeadroomBytes = 1024ULL * 1024ULL * 1024ULL;
+inline constexpr std::size_t kDefaultMemoryHeadroomBytes = 512ULL << 20;
 
 struct ContextCapacityPolicy {
-    ContextCapacityMode mode             = ContextCapacityMode::Automatic;
-    std::size_t explicit_bytes           = 0;
-    std::size_t automatic_headroom_bytes = kDefaultContextHeadroomBytes;
+    ContextCapacityMode mode   = ContextCapacityMode::Automatic;
+    std::size_t explicit_bytes = 0;
 
     [[nodiscard]] static constexpr ContextCapacityPolicy
     explicit_capacity(std::size_t bytes) noexcept {
-        return ContextCapacityPolicy{ContextCapacityMode::Explicit, bytes, 0};
+        return ContextCapacityPolicy{ContextCapacityMode::Explicit, bytes};
     }
 
-    [[nodiscard]] static constexpr ContextCapacityPolicy
-    automatic(std::size_t headroom_bytes = kDefaultContextHeadroomBytes) noexcept {
-        return ContextCapacityPolicy{ContextCapacityMode::Automatic, 0, headroom_bytes};
-    }
+    [[nodiscard]] static constexpr ContextCapacityPolicy automatic() noexcept { return {}; }
 };
 
 enum class ProposalHead : std::uint8_t {
@@ -164,6 +160,8 @@ struct EngineOptions {
     int device                      = 0;
     std::uint32_t max_context       = 8192; // Logical ceiling of one request or score window.
     ContextCapacityPolicy context_capacity;
+    // Per-rank planning allowance that startup allocations may consume. Zero adds no allowance.
+    std::size_t memory_headroom_bytes  = kDefaultMemoryHeadroomBytes;
     std::uint32_t max_concurrency      = 1;
     std::uint32_t max_pending_requests = 16;
     std::uint32_t pending_timeout_ms   = 30000;

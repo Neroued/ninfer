@@ -18,12 +18,13 @@ namespace wire = distributed::wire;
 // Abort communication before releasing owners that may wait on device work.
 template <class Preparation>
 void run_rank(distributed::WorkerConnection& connection, std::unique_ptr<artifact::Reader> reader,
-              std::span<const std::byte> payload) {
+              const RankPreparationRequest& request) {
     using Types = typename Preparation::Types;
     std::unique_ptr<Preparation> preparing;
     std::unique_ptr<typename Preparation::Instance> instance;
     try {
-        const auto attempt = prepare_rank(connection, std::move(reader), payload, preparing);
+        const auto attempt = prepare_rank(connection, std::move(reader), request.model_payload,
+                                          request.memory_headroom_bytes, preparing);
         if (attempt) {
             const auto observer = connection.startup_observer();
             StartupPhaseScope phase(observer, StartupPhase::EngineFinalize);
@@ -62,10 +63,10 @@ void run_worker(distributed::WorkerBootstrap bootstrap) {
         if (message.kind != wire::Kind::Prepare)
             throw std::runtime_error("worker expected a model preparation request");
         wire::Decoder in(message.payload);
-        if (in.u64() != connection.topology().plan)
-            throw std::runtime_error("worker model plan identity differs");
-        const auto payload = in.bytes();
+        const auto request = decode_preparation_request(in);
         in.finish();
+        if (request.plan != connection.topology().plan)
+            throw std::runtime_error("worker model plan identity differs");
         const auto observer = connection.startup_observer();
         std::unique_ptr<artifact::Reader> reader;
         {
@@ -75,10 +76,10 @@ void run_worker(distributed::WorkerBootstrap bootstrap) {
         }
         switch (models::resolve_architecture(reader->directory())) {
         case models::Architecture::Qwen4Exp:
-            run_rank<models::qwen4_exp::RankPreparation>(connection, std::move(reader), payload);
+            run_rank<models::qwen4_exp::RankPreparation>(connection, std::move(reader), request);
             break;
         case models::Architecture::Glm5Next:
-            run_rank<models::glm5next::RankPreparation>(connection, std::move(reader), payload);
+            run_rank<models::glm5next::RankPreparation>(connection, std::move(reader), request);
             break;
         default:
             throw std::invalid_argument("architecture has no distributed worker implementation");

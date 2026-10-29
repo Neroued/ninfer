@@ -32,9 +32,10 @@ the file even though its own default profile is smaller.
 | Host context capacity | 0 B | RTX 5090: 8 GiB + eight native StateImages; Spark: 0 B |
 | Seed | 0 | Random per request |
 
-[PPL](perplexity.md) consumes model path, device, max context, KV type, Context capacity, prefill
-chunk, GPU timing, log level and distributed deployment. Its default KV is FP8; its Engine context
-limit follows the scoring window unless explicitly set. Generation settings do not affect scoring.
+[PPL](perplexity.md) consumes model path, device, max context, KV type, Context capacity, memory
+headroom, prefill chunk, GPU timing, log level and distributed deployment. Its default KV is FP8;
+its Engine context limit follows the scoring window unless explicitly set. Generation settings
+do not affect scoring.
 The [inference benchmark](../bench/README.md#engine-微测) uses the shared launch options and its own
 measurement controls.
 
@@ -81,6 +82,7 @@ are not opened.
 | `engine.max_context` | `--max-context` | Positive uint32 / 8192 | Per-request input plus generation limit |
 | `engine.kv_dtype` | `--kv-dtype` | `bf16/int8/fp8/nvfp4/k8v4` / `bf16` | Runtime KV representation; GLM latent KV supports BF16 and FP8 |
 | `engine.context_capacity` | `--context-capacity` | Positive bytes or `auto` / `auto` | Shared Device KV/State capacity per rank |
+| `engine.memory_headroom` | `--memory-headroom` | Nonnegative bytes / `512MiB` | Per-rank startup planning allowance; `0B` adds no headroom |
 | `engine.prefill_chunk` | `--prefill-chunk` | Positive multiple of 128 or `default` | Qwen4Exp, GLM5Next and CPU expert offload default to 4096; other paths to 1024; bounded by max context |
 | `engine.cuda_graph` | `--cuda-graph` / `--no-cuda-graph` | bool / true | CUDA Graph decode; prefill and Vision encoding remain eager |
 | `engine.max_concurrency` | `--max-concurrency` | 1..8 / 1 | Maximum active request lanes, across the deployment |
@@ -98,6 +100,13 @@ and continuation state. With `auto`, startup plans weights, workspace, Graph/com
 Vision and other required resources before selecting Context capacity. Explicit capacity, such as
 `"8GiB"`, requests that many bytes per rank. Both forms must accommodate the model's minimum working
 set and fit the available budget.
+
+`memory_headroom` applies to both automatic and explicit Context capacity. Each rank deducts it
+once from its current planning allowance, after accounting for the device budget and mandatory
+Host capacity. Startup allocations may consume this allowance; it is not a required amount of
+free memory after initialization. For example, `--memory-headroom 256MiB` overrides the TOML value.
+Setting `0B` removes only this allowance: weights, Graph/communication storage, workspace and
+other required resources still count, and actual allocations must fit the device budget.
 
 The backing is fixed at startup; KV and State allocations within it follow demand. Prefixes share
 history where possible. Pressure can reclaim retained prefixes or pause requests for snapshot/replay

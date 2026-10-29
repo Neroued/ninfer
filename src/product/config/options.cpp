@@ -383,6 +383,9 @@ ParsedOptions parse(int argc, char** argv, EntryPoint entry,
             } else
                 engine.context_capacity = ContextCapacityPolicy::automatic();
             break;
+        case Field::MemoryHeadroom:
+            engine.memory_headroom_bytes = u64();
+            break;
         case Field::PrefillChunk:
             engine.prefill_chunk = u32();
             break;

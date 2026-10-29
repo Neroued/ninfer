@@ -32,8 +32,7 @@ build_prepared_local_model(const artifact::Reader& reader, EngineOptions& option
     const auto requirement = preparation->memory();
     const auto initial     = device_memory_snapshot(device->device());
     StartupMemoryBudget budget(initial, device_budget(initial.available_bytes()),
-                               std::max(kDefaultContextHeadroomBytes, requirement.headroom_bytes),
-                               requirement.host_reservation_bytes);
+                               options.memory_headroom_bytes, requirement.host_reservation_bytes);
     const auto available = budget.planning_available(initial);
     if (requirement.weight_bytes > available ||
         (initial.shared_physical_memory &&
@@ -95,7 +94,6 @@ build_prepared_local_model(const artifact::Reader& reader, EngineOptions& option
                     described.budget.planned_slack_bytes   = capacity.planned_slack_bytes;
                     capacity.available_after_weights_bytes = after_weights.available_bytes();
                     capacity.available_after_startup_bytes = ready->available_bytes();
-                    capacity.automatic_headroom_bytes      = budget.headroom();
                     phase.complete();
                     return described;
                 }

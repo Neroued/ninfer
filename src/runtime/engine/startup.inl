@@ -110,7 +110,6 @@ prepare_program(const Setup& setup, RankModelInstance<typename Setup::Types>& in
                 options.prefill_chunk                                      = startup.chunk;
                 options.context_cache.host_capacity_bytes                  = host_bytes;
                 memory.context_capacities                                  = {startup.capacity};
-                memory.context_capacities.front().automatic_headroom_bytes = budget.headroom();
                 memory.device_budget_bytes                                 = budget.limit();
                 memory.startup_retained_bytes                              = retained;
                 memory.cuda_graph = instance.program->graph_memory_observation();
@@ -206,11 +205,9 @@ BuiltModel<typename Setup::Types> build_local_model(const artifact::Reader& read
     }
     auto& device       = *device_owner;
     const auto initial = device_memory_snapshot(device.device());
-    const auto limit   = device_budget(initial.available_bytes());
-    const auto headroom =
-        std::max(kDefaultContextHeadroomBytes, options.context_capacity.automatic_headroom_bytes);
+    const auto limit            = device_budget(initial.available_bytes());
     const auto host_reservation = options.enable_vision ? options.media_live_bytes : 0;
-    StartupMemoryBudget budget(initial, limit, headroom, host_reservation);
+    StartupMemoryBudget budget(initial, limit, options.memory_headroom_bytes, host_reservation);
     const auto choices   = setup.placements();
     std::size_t selected = 0;
     const auto choose    = [&](DeviceMemorySnapshot snapshot) {

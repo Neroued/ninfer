@@ -11,6 +11,7 @@
 
 #include <sys/socket.h>
 
+#include <algorithm>
 #include <iostream>
 #include <thread>
 
@@ -154,6 +155,18 @@ void model_preparation() {
     wire::Decoder in(bytes);
     const auto decoded = glm::decode_rank_load(in);
     in.finish();
+    for (const std::size_t headroom : {0ULL, 256ULL << 20}) {
+        wire::Encoder prepare;
+        runtime::encode_preparation_request(prepare, {42, headroom, bytes});
+        const auto message = std::move(prepare).take();
+        wire::Decoder request_in(message);
+        const auto received = runtime::decode_preparation_request(request_in);
+        request_in.finish();
+        require(received.plan == 42 && received.memory_headroom_bytes == headroom &&
+                    std::equal(received.model_payload.begin(), received.model_payload.end(),
+                               bytes.begin(), bytes.end()),
+                "rank preparation changed headroom or the native model payload");
+    }
     wire::Encoder roundtrip;
     glm::encode_rank_load(roundtrip, decoded);
     require(std::move(roundtrip).take() == bytes && decoded.rank.kda_heads.begin == 32 &&

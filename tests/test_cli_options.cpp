@@ -63,7 +63,8 @@ void test_arguments() {
     const auto defaults = parse({"ninfer", "--prompt", "hello", "model.ninfer"});
     const auto& engine  = defaults.launch.engine;
     require(engine.max_context == 8192 &&
-                engine.context_capacity.mode == ninfer::ContextCapacityMode::Automatic,
+                engine.context_capacity.mode == ninfer::ContextCapacityMode::Automatic &&
+                engine.memory_headroom_bytes == (512ULL << 20),
             "shared context defaults differ");
     require(!engine.context_cache.enabled && engine.context_cache.host_capacity_bytes == 0,
             "CLI cache defaults differ");
@@ -117,6 +118,50 @@ void test_arguments() {
         require(configured.launch.engine.speculative.draft_tokens == 3 &&
                     configured.launch.engine.enable_vision,
                 "speculative and Vision controls were not retained");
+    }
+}
+
+void test_memory_headroom(const Files& files) {
+    using namespace ninfer::product;
+    const auto path = files.write(R"(
+model.path = 'model.ninfer'
+engine.context_capacity = '2GiB'
+engine.memory_headroom = '768MiB'
+cli.prompt = 'hello'
+)");
+    for (const auto entry :
+         {EntryPoint::Cli, EntryPoint::Serve, EntryPoint::Bench, EntryPoint::Perplexity}) {
+        const auto parse_shared = [&](std::vector<std::string> arguments) {
+            std::vector<char*> argv;
+            for (auto& argument : arguments) argv.push_back(argument.data());
+            return parse_launch_options(static_cast<int>(argv.size()), argv.data(), entry);
+        };
+        const auto file = parse_shared({"ninfer", "--config", path.string()});
+        require(file.launch.engine.memory_headroom_bytes == (768ULL << 20) &&
+                    file.launch.engine.context_capacity.explicit_bytes == (2ULL << 30),
+                "file headroom was lost with explicit Context capacity");
+        for (const auto* capacity : {"auto", "2GiB"}) {
+            const auto overridden =
+                parse_shared({"ninfer", "--config", path.string(), "--memory-headroom", "0B",
+                              "--context-capacity", capacity});
+            require(overridden.launch.engine.memory_headroom_bytes == 0,
+                    "Context policy reset explicit zero headroom");
+            bool shown = false;
+            for (const auto& item : configuration_view(overridden.launch, entry).items) {
+                if (item.key != "engine.memory_headroom") continue;
+                shown = std::get<std::uint64_t>(item.value) == 0 &&
+                        item.unit == ConfigurationUnit::Bytes &&
+                        item.source.kind == ConfigSourceKind::CommandLine;
+            }
+            require(shown, "startup configuration lost effective headroom or its source");
+        }
+        const auto fractional =
+            parse_shared({"ninfer", "--config", path.string(), "--memory-headroom", "0.25GiB"});
+        require(fractional.launch.engine.memory_headroom_bytes == (256ULL << 20),
+                "headroom quantity lost exact bytes");
+    }
+    for (const auto* value : {"-1", "auto", "1.1B", "18446744073709551616B"}) {
+        rejection([&] { serve({"ninfer-serve", "model.ninfer", "--memory-headroom", value}); });
     }
 }
 
@@ -356,6 +401,7 @@ int main() {
     try {
         Files files;
         test_arguments();
+        test_memory_headroom(files);
         test_file_merge(files);
         test_file_errors_and_example(files);
         test_deployment(files);

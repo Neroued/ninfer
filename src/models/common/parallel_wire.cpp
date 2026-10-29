@@ -130,7 +130,6 @@ void encode_rank_options(Encoder& out, const EngineOptions& o) {
     out.boolean(o.context_cache.enabled);
     out.u32(o.context_cache.checkpoint_interval);
     out.u64(o.context_cache.host_capacity_bytes.value_or(0));
-    out.u64(std::max(kDefaultContextHeadroomBytes, o.context_capacity.automatic_headroom_bytes));
 }
 
 EngineOptions decode_rank_options(Decoder& in) {
@@ -150,7 +149,6 @@ EngineOptions decode_rank_options(Decoder& in) {
     o.context_cache.enabled             = in.boolean();
     o.context_cache.checkpoint_interval = in.u32();
     o.context_cache.host_capacity_bytes = in.u64();
-    o.context_capacity                  = ContextCapacityPolicy::automatic(in.u64());
     return o;
 }
 

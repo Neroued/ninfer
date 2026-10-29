@@ -37,6 +37,16 @@ std::vector<wire::Payload> receive(dist::ExecutionGroup& group, wire::Kind kind,
 }
 } // namespace
 
+void encode_preparation_request(wire::Encoder& out, const RankPreparationRequest& r) {
+    out.u64(r.plan);
+    out.u64(r.memory_headroom_bytes);
+    out.bytes(r.model_payload);
+}
+
+RankPreparationRequest decode_preparation_request(wire::Decoder& in) {
+    return {in.u64(), in.u64(), in.bytes()};
+}
+
 void encode_preparation_report(wire::Encoder& out, const RankPreparationReport& r) {
     const auto& plan = r.capacity.plan;
     out.u64(plan.fixed_device_bytes);
@@ -117,19 +127,18 @@ RankPreparationReport decode_preparation_report(wire::Decoder& in) {
     return r;
 }
 
-GroupPreparation prepare_execution_group(dist::ExecutionGroup& group,
-                                         std::span<const wire::Bytes> payloads,
-                                         ContextCapacityPolicy policy,
-                                         std::chrono::milliseconds timeout,
-                                         ControlPreparation control) {
+GroupPreparation
+prepare_execution_group(dist::ExecutionGroup& group, std::span<const wire::Bytes> payloads,
+                        ContextCapacityPolicy policy, std::size_t memory_headroom_bytes,
+                        std::chrono::milliseconds timeout, ControlPreparation control) {
     if (payloads.size() != group.topology().ranks.size())
         throw std::invalid_argument("preparation payload count differs from rank count");
     try {
         std::vector<dist::OutgoingMessage> requests;
         for (const auto& rank : group.topology().ranks) {
             wire::Encoder out;
-            out.u64(group.topology().plan);
-            out.bytes(payloads[rank.rank]);
+            encode_preparation_request(
+                out, {group.topology().plan, memory_headroom_bytes, payloads[rank.rank]});
             requests.push_back(
                 {rank.rank, std::make_shared<const wire::Message>(wire::Message{
                                 wire::Kind::Prepare, group.epoch(), std::move(out).take()})});

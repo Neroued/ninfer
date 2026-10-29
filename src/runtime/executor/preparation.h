@@ -7,7 +7,14 @@
 namespace ninfer::runtime {
 
 struct PreparationMemory {
-    std::size_t weight_bytes, host_weight_bytes, headroom_bytes, host_reservation_bytes;
+    std::size_t weight_bytes, host_weight_bytes, host_reservation_bytes;
+};
+
+struct RankPreparationRequest {
+    std::uint64_t plan                = 0;
+    std::size_t memory_headroom_bytes = 0;
+    // Borrows the received message for the duration of native model preparation.
+    std::span<const std::byte> model_payload;
 };
 
 struct RankPreparationReport {
@@ -47,13 +54,17 @@ struct ControlPreparation {
     std::function<void()> release;
 };
 
+void encode_preparation_request(distributed::wire::Encoder&, const RankPreparationRequest&);
+[[nodiscard]] RankPreparationRequest decode_preparation_request(distributed::wire::Decoder&);
 void encode_preparation_report(distributed::wire::Encoder&, const RankPreparationReport&);
 [[nodiscard]] RankPreparationReport decode_preparation_report(distributed::wire::Decoder&);
 // Rank payloads belong to the native model. Keep requested policies stable across retries;
 // control callbacks may publish resolved options.
-[[nodiscard]] GroupPreparation prepare_execution_group(
-    distributed::ExecutionGroup&, std::span<const distributed::wire::Bytes> rank_payloads,
-    ContextCapacityPolicy, std::chrono::milliseconds timeout, ControlPreparation = {});
+[[nodiscard]] GroupPreparation
+prepare_execution_group(distributed::ExecutionGroup&,
+                        std::span<const distributed::wire::Bytes> rank_payloads,
+                        ContextCapacityPolicy, std::size_t memory_headroom_bytes,
+                        std::chrono::milliseconds timeout, ControlPreparation = {});
 void activate_execution_group(distributed::ExecutionGroup&, const GroupPreparation&,
                               std::chrono::milliseconds timeout);
 

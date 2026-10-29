@@ -62,7 +62,7 @@ void validate_policy(const ContextCapacityPolicy& policy) {
         if (!policy.explicit_bytes) return;
         break;
     case ContextCapacityMode::Explicit:
-        if (policy.explicit_bytes && !policy.automatic_headroom_bytes) return;
+        if (policy.explicit_bytes) return;
         break;
     }
     throw std::invalid_argument("inconsistent Context capacity policy");

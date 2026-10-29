@@ -16,6 +16,7 @@ enum class Field {
     MaxContext,
     KvDtype,
     ContextCapacity,
+    MemoryHeadroom,
     PrefillChunk,
     CudaGraph,
     GpuTiming,

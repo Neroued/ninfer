@@ -242,8 +242,9 @@ int main(int argc, char** argv) {
             deployment, parallel.topology, StartupObserver{}, [](auto rank, std::string_view text) {
                 std::cerr << "[rank " << rank << "] " << text << '\n';
             });
-        auto prepared = rt::prepare_execution_group(*group, payloads, options.context_capacity,
-                                                    std::chrono::minutes(15));
+        auto prepared =
+            rt::prepare_execution_group(*group, payloads, options.context_capacity,
+                                        options.memory_headroom_bytes, std::chrono::minutes(15));
         rebuild(*group, prepared);
         std::vector<q4::RankExecutionDescription> descriptions;
         for (std::size_t i = 0; i < prepared.layouts.size(); ++i) {

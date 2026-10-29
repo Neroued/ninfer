@@ -68,8 +68,8 @@ struct Fixture {
                                        2ULL << 30, NINFER_SHARED_PHYSICAL_MEMORY != 0},
             runtime::RankCapacityOffer{glm::describe_execution_capacity(plans[1]), 2ULL << 30,
                                        2ULL << 30, NINFER_SHARED_PHYSICAL_MEMORY != 0}};
-        const auto capacities = runtime::resolve_group_context_capacity(
-            ContextCapacityPolicy::automatic(1ULL << 30), offers, 0);
+        const auto capacities =
+            runtime::resolve_group_context_capacity(ContextCapacityPolicy::automatic(), offers, 0);
         for (unsigned rank = 0; rank < 2; ++rank) {
             auto& p    = plans[rank];
             p.capacity = capacities[rank];

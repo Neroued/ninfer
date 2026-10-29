@@ -51,8 +51,7 @@ RankPreparation::RankPreparation(const artifact::Reader& reader, std::span<const
 
 runtime::PreparationMemory RankPreparation::memory() const {
     return {load_->materialization().device_capacity_bytes,
-            load_->materialization().host_capacity_bytes,
-            options_.context_capacity.automatic_headroom_bytes, host_reservation_bytes_};
+            load_->materialization().host_capacity_bytes, host_reservation_bytes_};
 }
 
 void RankPreparation::materialize() {

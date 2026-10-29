@@ -121,6 +121,9 @@ StartupConfigurationView view(const LaunchOptions& launch, EntryPoint entry, con
             else
                 value = std::uint64_t{e.context_capacity.explicit_bytes};
             break;
+        case Field::MemoryHeadroom:
+            value = std::uint64_t{e.memory_headroom_bytes};
+            break;
         case Field::PrefillChunk:
             if (e.prefill_chunk == 0)
                 value = std::string("default (model/placement)");

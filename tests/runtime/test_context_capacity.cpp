@@ -107,7 +107,7 @@ int main() {
         RankCapacityOffer{plan, 100 + 3 * block + minimum_metadata, SIZE_MAX, true},
         RankCapacityOffer{costly_metadata, 20 * block, SIZE_MAX, true}};
     const auto bounded =
-        resolve_group_context_capacity(ContextCapacityPolicy::automatic(0), constrained, 0);
+        resolve_group_context_capacity(ContextCapacityPolicy::automatic(), constrained, 0);
     failures +=
         check(bounded[0].device_bytes == 3 * block && bounded[1].device_bytes == 3 * block &&
                   bounded[0].control_reservation_bytes == minimum_metadata,
@@ -162,6 +162,18 @@ int main() {
     const auto unified = [](std::size_t available) {
         return DeviceMemorySnapshot{available, 12000, available, 12000, true};
     };
+    for (const std::size_t headroom : {0, 256}) {
+        const StartupMemoryBudget discrete({10000, 12000}, 8000, headroom, 0);
+        failures += check(discrete.planning_available({7800, 12000}) == 5800 - headroom &&
+                              discrete.allocation_available({7800, 12000}) == 5800 &&
+                              discrete.fits({2000, 12000}),
+                          "configured headroom was raised or became an allocation requirement");
+        const StartupMemoryBudget unified_budget(unified(10000), 8000, headroom, 1000);
+        failures += check(unified_budget.planning_available(unified(7800)) == 4800 - headroom &&
+                              unified_budget.allocation_available(unified(7800)) == 4800 &&
+                              !unified_budget.fits(unified(2999)),
+                          "lower headroom consumed mandatory shared Host capacity");
+    }
     const StartupMemoryBudget shared(unified(10000), 8000, 500, 1000);
     failures += check(shared.planning_available(unified(7800)) == 4300 &&
                           shared.headroom() == 500 && shared.host_reservation() == 1000,
@@ -185,11 +197,10 @@ int main() {
         const auto required = 10 * block + 100 + (shared_memory ? metadata(10) : 0);
         const auto free_before =
             required + graph + headroom + (shared_memory ? host_reserve : 0) + slack + 8 * block;
-        const auto before = snapshot(free_before);
-        const auto selected =
-            resolve_context_capacity(ContextCapacityPolicy::automatic(headroom), plan,
-                                     envelope.planning_available(before) - graph,
-                                     envelope.available_host(before), shared_memory);
+        const auto before   = snapshot(free_before);
+        const auto selected = resolve_context_capacity(
+            ContextCapacityPolicy::automatic(), plan, envelope.planning_available(before) - graph,
+            envelope.available_host(before), shared_memory);
         const auto observed = snapshot(free_before - drift);
         failures +=
             check(selected.device_bytes == 10 * block && selected.planned_slack_bytes == slack,

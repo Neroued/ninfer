@@ -83,5 +83,3 @@ BF16/FP8 Kpool MLA 已接入模型，完整目标区间的 roofline 验收仍未
   [Op 需求](designs/qwen4-27b-op-checklist.md)：独立的新适配任务。
 - [#395](https://github.com/Neroued/ninfer/issues/395)：是否扩展长工具名及其约束、历史和协议边界。
 - [#348](https://github.com/Neroued/ninfer/issues/348)：Responses 新字段与外部工具执行责任分别评估。
-- [#376](https://github.com/Neroued/ninfer/issues/376)：是否提供 headroom 配置属于产品选择；
-  现有规划 headroom 与必须保留 Host 容量已经分开，不能再按旧预算问题立项。

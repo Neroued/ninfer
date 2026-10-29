@@ -35,7 +35,8 @@ void rejects(Function&& function) {
 void test_resources_and_units() {
     const auto defaults = parse({"ninfer-serve", "model.ninfer"});
     const auto& engine  = defaults.launch.engine;
-    require(engine.context_cache.enabled && !engine.context_cache.host_capacity_bytes,
+    require(engine.context_cache.enabled && !engine.context_cache.host_capacity_bytes &&
+                engine.memory_headroom_bytes == (512ULL << 20),
             "server resource defaults were resolved before model preparation");
     require(defaults.launch.generation.max_tokens == 8192 &&
                 !defaults.launch.generation.sampling.seed &&

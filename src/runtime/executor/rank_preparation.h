@@ -28,7 +28,8 @@ receive_preparation_command(distributed::WorkerConnection& connection) {
 template <class Preparation>
 [[nodiscard]] std::optional<std::uint32_t>
 prepare_rank(distributed::WorkerConnection& connection, std::unique_ptr<artifact::Reader> reader,
-             std::span<const std::byte> payload, std::unique_ptr<Preparation>& preparing) {
+             std::span<const std::byte> payload, std::size_t memory_headroom_bytes,
+             std::unique_ptr<Preparation>& preparing) {
     namespace wire       = distributed::wire;
     auto& device         = connection.device();
     const auto& topology = connection.topology();
@@ -43,8 +44,7 @@ prepare_rank(distributed::WorkerConnection& connection, std::unique_ptr<artifact
     }
     const auto requirement = preparing->memory();
     StartupMemoryBudget budget(initial, device_budget(initial.available_bytes()),
-                               std::max(kDefaultContextHeadroomBytes, requirement.headroom_bytes),
-                               requirement.host_reservation_bytes);
+                               memory_headroom_bytes, requirement.host_reservation_bytes);
     {
         StartupPhaseScope phase(observer, StartupPhase::RuntimeMemoryCheck);
         const auto before_weights    = device_memory_snapshot(device.device());

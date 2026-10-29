@@ -27,8 +27,7 @@ RankPreparation::RankPreparation(const artifact::Reader& reader, RankLoadRequest
     load_.emplace(
         resolve_rank_load(reader, std::move(definition), std::move(request.rank), device.device()));
     memory_      = {load_->materialization().device_capacity_bytes,
-                    load_->materialization().host_capacity_bytes,
-                    options_.context_capacity.automatic_headroom_bytes, request.host_reservation_bytes};
+                    load_->materialization().host_capacity_bytes, request.host_reservation_bytes};
     auto profile = execution::describe_model(load_->definition(), load_->weight_data(),
                                              load_->expert_data(), load_->rank_plan());
     plan_        = plan_execution(std::move(profile), options_, request.index_format,

@@ -26,6 +26,9 @@ constexpr FieldSpec kFields[] = {
     {Field::ContextCapacity, "engine.context_capacity", "--context-capacity", "", "SIZE|auto",
      "Per-rank Device capacity shared by KV and State; auto uses the startup budget.",
      Scope::Common, ConfigurationUnit::Bytes},
+    {Field::MemoryHeadroom, "engine.memory_headroom", "--memory-headroom", "", "SIZE",
+     "Per-rank planning headroom (512MiB); startup may consume it. 0B adds no headroom.",
+     Scope::Common, ConfigurationUnit::Bytes},
     {Field::PrefillChunk, "engine.prefill_chunk", "--prefill-chunk", "", "N|default",
      "Positive multiple of 128; default is resolved by the model.", Scope::Common},
     {Field::CudaGraph, "engine.cuda_graph", "--cuda-graph", "--no-cuda-graph", "",
@@ -352,6 +355,7 @@ FieldValue parse_field_value(Field field, const RawValue& value, bool command_li
         return integer(value, command_line, 1, 64);
     case Field::HostCapacity:
     case Field::MediaCache:
+    case Field::MemoryHeadroom:
         return quantity(value, true, false);
     case Field::MediaLive:
     case Field::VisionMemoryBudget:

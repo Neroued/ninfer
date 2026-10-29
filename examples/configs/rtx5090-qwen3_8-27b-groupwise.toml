@@ -11,6 +11,7 @@ max_context = 262144 # Per-request limit; shared physical capacity is planned se
 max_concurrency = 2
 kv_dtype = "fp8"
 context_capacity = "auto"
+memory_headroom = "256MiB"
 prefill_chunk = 1024
 cuda_graph = true
 

@@ -29,10 +29,10 @@
   语义计数独立于 budget 和输出呈现；模型生成与控制注入分别计数。
   Qwen、GLM 的自然关闭、raw、隐式工具边界、preview 丢弃及预算控制测试通过。
 
-- [ ] **5. HTTP listener 端口复用** — [#341](https://github.com/Neroued/ninfer/issues/341)、[PR #340](https://github.com/Neroued/ninfer/pull/340)
+- [x] **5. HTTP listener 端口复用** — [#341](https://github.com/Neroued/ninfer/issues/341)、[PR #340](https://github.com/Neroued/ninfer/pull/340)
 
-  在 HTTP transport 为 Linux listener 设置 `SO_REUSEADDR`，参考候选 PR 并适配当前组织。
-  完成条件：服务退出后可立即切换到仅使用 `SO_REUSEADDR` 的服务；活动 listener 仍受到正确保护。
+  Linux listener 使用 `SO_REUSEADDR`，不启用 `SO_REUSEPORT`。实际连接测试覆盖双向切换、
+  NInfer 自身重绑和活动端口独占，原有连接存活检测测试通过。
 
 - [ ] **6. 上下文超限错误信息** — [#401](https://github.com/Neroued/ninfer/issues/401)
 

@@ -4,6 +4,7 @@
 #include "models/common/frontend/image_transform.h"
 #include "models/common/frontend/media_cache.h"
 #include "models/glm5next/frontend/prompt_layout.h"
+#include "runtime/contract/request.h"
 
 #include <algorithm>
 #include <atomic>
@@ -313,8 +314,9 @@ ProcessedMedia Processor::prepare(std::span<const OwnedMedia* const> sources,
             if (stats.patch_bytes > live_bytes_)
                 budget("GLM request patches exceed media live-byte capacity");
             if (stats.vision_tokens > max_context_)
-                throw RequestError(RequestErrorKind::ContextLengthExceeded,
-                                   "GLM media exceeds Engine max_context");
+                throw RequestError(
+                    RequestErrorKind::ContextLengthExceeded,
+                    runtime::context_length_error_message(stats.vision_tokens, max_context_, true));
             const auto& g = plans[i].item.grid;
             stats.attention_pairs +=
                 mul(g.temporal, mul(mul(g.height, g.width), mul(g.height, g.width)));

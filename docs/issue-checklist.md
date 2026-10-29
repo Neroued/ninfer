@@ -34,10 +34,10 @@
   Linux listener 使用 `SO_REUSEADDR`，不启用 `SO_REUSEPORT`。实际连接测试覆盖双向切换、
   NInfer 自身重绑和活动端口独占，原有连接存活检测测试通过。
 
-- [ ] **6. 上下文超限错误信息** — [#401](https://github.com/Neroued/ninfer/issues/401)
+- [x] **6. 上下文超限错误信息** — [#401](https://github.com/Neroued/ninfer/issues/401)
 
-  在 Qwen、GLM 所属输入检查处报告实际 prepared token 数和上限，覆盖文本与媒体输入。
-  完成条件：超限原因和两个数值明确，保持 HTTP 400 与 `context_length_exceeded` 合同。
+  Qwen、GLM 与 Engine 共用错误格式，区分完整 token 计数与提前拒绝时的下界，保留分词早停。
+  文本、原始 token、媒体及协议测试通过；HTTP 400 与 `context_length_exceeded` 保持一致。
 
 - [ ] **7. Workspace 布局分配异常安全** — [PR #297](https://github.com/Neroued/ninfer/pull/297)
 

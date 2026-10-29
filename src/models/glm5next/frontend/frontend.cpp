@@ -5,6 +5,7 @@
 #include "models/glm5next/frontend/processor.h"
 #include "models/glm5next/frontend/prompt_layout.h"
 #include "models/glm5next/frontend/resources.h"
+#include "runtime/contract/request.h"
 
 #include <algorithm>
 #include <chrono>
@@ -19,11 +20,6 @@ std::uint32_t checked_count(std::size_t count) {
     if (!count || count > std::numeric_limits<std::uint32_t>::max())
         throw std::invalid_argument("prepared prompt requires a nonempty uint32 token count");
     return static_cast<std::uint32_t>(count);
-}
-
-[[noreturn]] void capacity_error(std::uint32_t capacity) {
-    throw RequestError(RequestErrorKind::ContextLengthExceeded,
-                       "prepared prompt exceeds Engine max_context " + std::to_string(capacity));
 }
 
 void require_media_support(std::span<const ChatMessage> messages, bool vision_enabled) {
@@ -68,7 +64,10 @@ void encode_prompt(PreparedPromptData& output, const text::Tokenizer& tokenizer,
                                                                        {.max_tokens = std::size_t(max_context) + 1},
                                                                        chat.output.literal_spans);
     output.prepare.tokenize_seconds = std::chrono::duration<double>(Clock::now() - start).count();
-    if (encoded.input_ids.size() > max_context) capacity_error(max_context);
+    if (encoded.input_ids.size() > max_context)
+        throw RequestError(
+            RequestErrorKind::ContextLengthExceeded,
+            runtime::context_length_error_message(encoded.input_ids.size(), max_context, true));
     (void)checked_count(encoded.input_ids.size());
     const auto frontier = [&](std::size_t offset) -> std::optional<std::uint32_t> {
         const auto i = std::lower_bound(offsets.begin(), offsets.end(), offset) - offsets.begin();
@@ -240,7 +239,10 @@ std::uint32_t Frontend::count_tokens(PromptInput input, const PreparationControl
 PreparedPrompt Frontend::prepare_tokens(std::vector<TokenId> tokens,
                                         bool allow_prefix_identity) const {
     const auto start = Clock::now();
-    if (tokens.size() > impl_->max_context) capacity_error(impl_->max_context);
+    if (tokens.size() > impl_->max_context)
+        throw RequestError(
+            RequestErrorKind::ContextLengthExceeded,
+            runtime::context_length_error_message(tokens.size(), impl_->max_context));
     (void)checked_count(tokens.size());
     for (const auto token : tokens)
         if (!impl_->tokenizer->is_valid_token(token))

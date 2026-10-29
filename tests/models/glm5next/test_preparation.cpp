@@ -133,7 +133,14 @@ void behavior(const glm::Frontend& f, const std::filesystem::path& tokenizer) {
             "frontend identity is not instance-owned");
     const auto small = frontend(tokenizer, 2);
     require(small.count_tokens(same) == f.count_tokens(same), "count_tokens truncated at capacity");
-    rejects([&] { (void)small.prepare(same); }, "max_context");
+    rejects([&] { (void)small.prepare(same); },
+            "maximum context length is 2 tokens, but the prepared prompt has at least 3 tokens");
+    rejects([&] { (void)small.prepare_tokens(data.token_ids); },
+            "maximum context length is 2 tokens, but the prepared prompt has " +
+                std::to_string(data.token_ids.size()) + " tokens");
+    const auto exact = frontend(tokenizer, data.token_ids.size());
+    require(exact.prepare(same).summary().prompt_tokens == data.token_ids.size(),
+            "exact-capacity prompt was rejected");
     auto raw             = f.prepare_tokens(data.token_ids, false);
     const auto& raw_data = glm::PreparedPromptAccess::view(raw);
     require(raw_data.token_ids == data.token_ids && !raw_data.identity.reusable &&

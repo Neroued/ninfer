@@ -37,11 +37,6 @@ runtime::ResolvedRequestOptions resolve_request_options(const SamplingPreset& pr
     return resolved;
 }
 
-std::string context_capacity_error(std::size_t prompt_tokens, std::uint32_t max_context) {
-    return "prepared prompt has " + std::to_string(prompt_tokens) +
-           " tokens, exceeding Engine max_context " + std::to_string(max_context);
-}
-
 } // namespace
 
 class PreparedPrompt::Impl {
@@ -305,8 +300,9 @@ PreparedPrompt Engine::prepare_tokens(std::vector<TokenId> token_ids,
                                     static_cast<std::uint64_t>(token_ids.size()));
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
     if (token_ids.size() > impl_->options.max_context) {
-        throw RequestError(RequestErrorKind::ContextLengthExceeded,
-                           context_capacity_error(token_ids.size(), impl_->options.max_context));
+        throw RequestError(
+            RequestErrorKind::ContextLengthExceeded,
+            runtime::context_length_error_message(token_ids.size(), impl_->options.max_context));
     }
     auto prepared = std::visit(
         [&](const auto& instance) {
@@ -397,9 +393,9 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
 
     const PromptSummary prompt_summary = prompt.impl_->summary;
     if (prompt_summary.prompt_tokens > impl_->options.max_context) {
-        throw RequestError(
-            RequestErrorKind::ContextLengthExceeded,
-            context_capacity_error(prompt_summary.prompt_tokens, impl_->options.max_context));
+        throw RequestError(RequestErrorKind::ContextLengthExceeded,
+                           runtime::context_length_error_message(prompt_summary.prompt_tokens,
+                                                                 impl_->options.max_context));
     }
     const double prepare_seconds = prompt.impl_->prepare.seconds;
     if (resolved_options.execution.requested_output_tokens == 0) {

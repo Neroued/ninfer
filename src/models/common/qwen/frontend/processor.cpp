@@ -4,6 +4,7 @@
 #include "models/common/frontend/image_transform.h"
 #include "models/common/frontend/digest.h"
 #include "models/common/frontend/media_cache.h"
+#include "runtime/contract/request.h"
 
 #include <algorithm>
 #include <array>
@@ -880,8 +881,8 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
         models::frontend::check_preparation_control(control, "tokenization");
         if (preliminary_tokens > maximum_prompt_tokens) {
             throw ProcessorError(ProcessorErrorKind::ContextLengthExceeded,
-                                 "prepared prompt exceeds Engine max_context " +
-                                     std::to_string(maximum_prompt_tokens));
+                                 runtime::context_length_error_message(
+                                     preliminary_tokens, maximum_prompt_tokens, true));
         }
     }
     models::frontend::MediaPreparationPermit request_permit =
@@ -1015,8 +1016,8 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
     models::frontend::check_preparation_control(control, "tokenization");
     if (encoded.input_ids.size() > maximum_prompt_tokens) {
         throw ProcessorError(ProcessorErrorKind::ContextLengthExceeded,
-                             "prepared prompt exceeds Engine max_context " +
-                                 std::to_string(maximum_prompt_tokens));
+                             runtime::context_length_error_message(encoded.input_ids.size(),
+                                                                   maximum_prompt_tokens, true));
     }
     output.enable_thinking             = rendered.enable_thinking;
     output.starts_in_reasoning         = rendered.starts_in_reasoning;

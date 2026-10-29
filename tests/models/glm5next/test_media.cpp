@@ -155,11 +155,13 @@ void golden(const std::filesystem::path& path, const std::filesystem::path& dump
 }
 
 template <class Action>
-void request_error(Action action, RequestErrorKind kind) {
+void request_error(Action action, RequestErrorKind kind, std::string_view message = {}) {
     try {
         action();
     } catch (const RequestError& e) {
         require(e.kind() == kind, "wrong request error kind: " + std::string(e.what()));
+        require(message.empty() || message == e.what(),
+                "wrong request error message: " + std::string(e.what()));
         return;
     }
     throw std::runtime_error("expected request rejection");
@@ -236,10 +238,21 @@ void behavior(const std::filesystem::path& path, const std::filesystem::path& to
     require(glm::PreparedPromptAccess::view(retained).media_payloads[0] ==
                 glm::PreparedPromptAccess::view(recovered).media_payloads[0],
             "failed request damaged a live cached payload");
-    const auto small = make(config, 32, 16ULL << 20, tokenizer);
+    const auto small = make(config, data.token_ids.size() - 1U, 16ULL << 20, tokenizer);
     require(small.count_tokens(input) == data.token_ids.size(),
             "count_tokens enforced execution context capacity");
-    request_error([&] { (void)small.prepare(input); }, RequestErrorKind::ContextLengthExceeded);
+    request_error([&] { (void)small.prepare(input); }, RequestErrorKind::ContextLengthExceeded,
+                  "maximum context length is " + std::to_string(data.token_ids.size() - 1U) +
+                      " tokens, but the prepared prompt has at least " +
+                      std::to_string(data.token_ids.size()) + " tokens");
+    const auto vision_tokens = prepared.preparation_stats().vision_tokens;
+    require(vision_tokens > 1, "media fixture requires multiple vision tokens");
+    const auto media_only_limit = make(config, vision_tokens - 1U, 16ULL << 20, tokenizer);
+    request_error([&] { (void)media_only_limit.prepare(input); },
+                  RequestErrorKind::ContextLengthExceeded,
+                  "maximum context length is " + std::to_string(vision_tokens - 1U) +
+                      " tokens, but the prepared prompt has at least " +
+                      std::to_string(vision_tokens) + " tokens");
     std::atomic<int> checks{};
     const auto cancel_frontend = make(config, 16384, 16ULL << 20, tokenizer);
     const auto caller          = std::this_thread::get_id();

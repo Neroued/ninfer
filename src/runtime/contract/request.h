@@ -2,10 +2,21 @@
 
 #include "ninfer/types.h"
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <string>
 
 namespace ninfer::runtime {
+
+// A bounded tokenizer or partial media plan supplies a lower bound, not the full prompt length.
+[[nodiscard]] inline std::string context_length_error_message(std::size_t tokens,
+                                                              std::size_t max_context,
+                                                              bool lower_bound = false) {
+    return "maximum context length is " + std::to_string(max_context) +
+           " tokens, but the prepared prompt has " + (lower_bound ? "at least " : "") +
+           std::to_string(tokens) + " tokens";
+}
 
 // Engine has applied explicit overrides to the Frontend-selected preset and validated the result.
 struct ResolvedExecutionOptions {

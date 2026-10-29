@@ -7,9 +7,11 @@ namespace ninfer::ops::detail {
 namespace {
 
 using Gemv    = Q8A16GemvSchedule<4, 2, 2, 2560, 4>;
-using Small8  = Q8A16SlicedKMmaSchedule<8, 4, 1, 1, Q8ScaleAccess::Shared, Cache::ca, Cache::cg,
+using Small8  = Q8A16SlicedKMmaSchedule<8, 8, 1, 1, Q8ScaleAccess::Shared, Cache::ca, Cache::cg,
                                         Q8ActivationStage::PaddedZero, 2560>;
-using Small32 = Q8A16SlicedKMmaSchedule<32, 4, 2, 1, Q8ScaleAccess::Shared, Cache::ca, Cache::cg,
+using Small16 = Q8A16SlicedKMmaSchedule<16, 8, 2, 1, Q8ScaleAccess::Shared, Cache::ca, Cache::cg,
+                                        Q8ActivationStage::PaddedZero, 2560>;
+using Small32 = Q8A16SlicedKMmaSchedule<32, 8, 1, 1, Q8ScaleAccess::Shared, Cache::ca, Cache::cg,
                                         Q8ActivationStage::PaddedZero, 2560>;
 using Small40 = Q8A16SlicedKMmaSchedule<40, 4, 1, 1, Q8ScaleAccess::Shared, Cache::ca, Cache::cg,
                                         Q8ActivationStage::PaddedZero, 2560>;
@@ -32,6 +34,7 @@ struct Routes : Q8A16OutputLaunch<Output> {
 void select_route(int tokens, const Routes& routes) {
     if (tokens == 1) return routes.gemv<Gemv>();
     if (tokens <= 8) return routes.sliced<Small8>();
+    if (tokens <= 16) return routes.sliced<Small16>();
     if (tokens <= 32) return routes.sliced<Small32>();
     if (tokens <= 40) return routes.sliced<Small40>();
     if (tokens <= 96) return routes.tma<Hot32>();

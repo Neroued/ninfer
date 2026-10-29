@@ -3,7 +3,7 @@
 
 namespace ninfer::ops::detail {
 namespace {
-using Batch8  = Q4A16SlicedKMmaSchedule<16, 8, 8, 1, Cache::cg, Cache::ca, 2, 2560, 8>;
+using Batch8  = Q4A16SlicedKMmaSchedule<16, 16, 8, 2, Cache::cg, Cache::ca, 2, 2560, 8>;
 using Batch16 = Q4A16SlicedKMmaSchedule<16, 16, 8, 1, Cache::cg, Cache::ca, 2, 2560, 16>;
 } // namespace
 

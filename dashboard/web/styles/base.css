@@ -1,0 +1,322 @@
+@font-face {
+  font-family: 'Instrument Sans';
+  src: url('/fonts/instrument-sans.woff2') format('woff2');
+  font-weight: 400 600;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: 'IBM Plex Mono';
+  src: url('/fonts/plex-mono-400.woff2') format('woff2');
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: 'IBM Plex Mono';
+  src: url('/fonts/plex-mono-500.woff2') format('woff2');
+  font-weight: 500;
+  font-style: normal;
+  font-display: swap;
+}
+
+:root {
+  --sans: 'Instrument Sans', 'Noto Sans CJK SC', system-ui, sans-serif;
+  --mono: 'IBM Plex Mono', ui-monospace, monospace;
+  --page-x: clamp(18px, 1.7vw, 32px);
+  --gap: clamp(14px, 1.2vw, 22px);
+  --label-size: clamp(10.5px, 0.8vw, 11.5px);
+  font-family: var(--sans);
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+}
+
+* {
+  box-sizing: border-box;
+}
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+}
+button,
+input,
+select {
+  font: inherit;
+  color: inherit;
+}
+button {
+  background: none;
+  border: 0;
+  padding: 0;
+  cursor: pointer;
+}
+button:hover,
+summary:hover {
+  color: var(--decode);
+}
+button:focus-visible,
+select:focus-visible,
+input:focus-visible,
+summary:focus-visible {
+  outline: 1px solid var(--decode);
+  outline-offset: 4px;
+}
+select {
+  background: var(--bg);
+  border: 0;
+  border-bottom: 1px solid var(--rule);
+  border-radius: 0;
+  cursor: pointer;
+  padding: 4px 16px 4px 2px;
+}
+input {
+  background: var(--surface);
+  border: 1px solid var(--rule);
+  border-radius: 0;
+  padding: 9px;
+  min-width: 0;
+}
+h1,
+h2,
+h3,
+p {
+  margin: 0;
+}
+h1,
+h2 {
+  font-weight: 500;
+}
+strong,
+b {
+  font-weight: 500;
+}
+small {
+  font-size: 0.7em;
+}
+::selection {
+  background: var(--decode);
+  color: var(--bg);
+}
+* {
+  scrollbar-color: var(--faint) transparent;
+  scrollbar-width: thin;
+}
+.mono,
+strong,
+dd {
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+}
+.muted {
+  color: var(--muted);
+}
+.decode {
+  color: var(--decode);
+}
+.prefill {
+  color: var(--prefill);
+}
+.alert {
+  color: var(--alert);
+}
+.label {
+  font: 500 var(--label-size)/1.5 var(--mono);
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  color: var(--muted);
+}
+.text-button {
+  font: 11px var(--mono);
+  color: var(--muted);
+}
+.section-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 11px;
+}
+.dot-sep {
+  color: var(--faint);
+  padding: 0 8px;
+}
+.tabs {
+  display: flex;
+  gap: 16px;
+  align-items: center;
+}
+.tabs button {
+  font: 10.5px var(--mono);
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  padding-bottom: 6px;
+  border-bottom: 1px solid transparent;
+}
+.tabs button.selected {
+  color: var(--ink);
+  border-color: var(--decode);
+}
+.thin-meter {
+  height: 4px;
+  display: flex;
+  background: var(--rule);
+  margin-top: 10px;
+  overflow: hidden;
+}
+.thin-meter > span {
+  display: block;
+  background: var(--decode);
+  opacity: 0.65;
+}
+.prefix-meter > span {
+  background: var(--prefill);
+}
+.empty-state {
+  padding: 40px 12px;
+  text-align: center;
+  font: 12px var(--mono);
+  color: var(--muted);
+}
+.uplot {
+  font-family: var(--mono);
+}
+.u-cursor-x,
+.u-cursor-y {
+  border-color: var(--muted);
+}
+.u-select {
+  background: var(--decode-fill);
+}
+.notice {
+  padding: 10px 0;
+  color: var(--alert);
+  font-size: 11px;
+  border-bottom: 1px solid var(--rule);
+  overflow-wrap: anywhere;
+}
+
+.drawer {
+  margin: 0 0 0 auto;
+  height: 100dvh;
+  max-height: 100dvh;
+  width: min(760px, 100vw);
+  max-width: 100vw;
+  padding: 28px 32px 40px;
+  color: var(--ink);
+  background: var(--bg);
+  border: 0;
+  border-left: 1px solid var(--rule);
+  overflow-y: auto;
+}
+.drawer::backdrop {
+  background: #0008;
+}
+.drawer-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 15px;
+  padding-bottom: 22px;
+  border-bottom: 1px solid var(--rule);
+}
+.drawer-heading h2 {
+  font-size: 27px;
+  margin-top: 8px;
+  letter-spacing: -0.03em;
+}
+.close-button {
+  font-size: 30px;
+  color: var(--muted);
+  width: 36px;
+  height: 36px;
+}
+.drawer-tabs {
+  padding: 20px 0 2px;
+}
+.drawer-section {
+  padding: 24px 0;
+  border-bottom: 1px solid var(--rule);
+  overflow-x: auto;
+}
+.drawer-section h3 {
+  margin-bottom: 12px;
+}
+.drawer-section p {
+  font-size: 12px;
+  line-height: 1.7;
+  margin-bottom: 10px;
+}
+.table-scroll {
+  overflow-x: auto;
+}
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font: 11px/1.6 var(--mono);
+}
+th {
+  font-weight: 400;
+  color: var(--muted);
+  text-align: right;
+  padding: 7px 6px;
+}
+td {
+  text-align: right;
+  padding: 8px 6px;
+  border-top: 1px solid var(--rule);
+  white-space: nowrap;
+}
+th:first-child,
+td:first-child {
+  text-align: left;
+  padding-left: 0;
+}
+.detail-list {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1.15fr);
+  gap: 11px 20px;
+  font: 11.5px/1.5 var(--mono);
+  margin: 0;
+}
+.detail-list dt {
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+.detail-list dd {
+  margin: 0;
+  text-align: right;
+  overflow-wrap: anywhere;
+}
+.drawer details {
+  margin-top: 16px;
+  font-size: 12px;
+  color: var(--secondary);
+}
+.drawer details > summary {
+  cursor: pointer;
+  margin-bottom: 14px;
+}
+.event-detail {
+  display: grid;
+  grid-template-columns: 155px 1fr;
+  gap: 6px 20px;
+  padding: 12px 0;
+  border-bottom: 1px solid var(--rule);
+  font-size: 11px;
+}
+.event-detail > span {
+  grid-column: 2;
+  overflow-wrap: anywhere;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  button,
+  select {
+    transition: color 0.12s;
+  }
+}

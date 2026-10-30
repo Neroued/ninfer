@@ -1,0 +1,22 @@
+{
+  "id": "ember",
+  "name": "Ember",
+  "scheme": "dark",
+  "colors": {
+    "bg": "#0b0b0a",
+    "surface": "#111210",
+    "plot": "#1c1d19",
+    "ink": "#e8e3d7",
+    "secondary": "#bab4a6",
+    "muted": "#8f9189",
+    "faint": "#585b55",
+    "rule": "rgba(232, 227, 215, 0.14)",
+    "grid": "rgba(232, 227, 215, 0.07)",
+    "decode": "#dda866",
+    "decode-fill": "rgba(221, 168, 102, 0.12)",
+    "prefill": "#9db6c4",
+    "prefill-fill": "rgba(157, 182, 196, 0.10)",
+    "alert": "#c56b5a",
+    "hover": "rgba(232, 227, 215, 0.045)"
+  }
+}

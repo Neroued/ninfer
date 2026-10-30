@@ -1,0 +1,10 @@
+{
+  "engine_url": "http://127.0.0.1:8080",
+  "host": "0.0.0.0",
+  "port": 8899,
+  "database": "./data/monitor.sqlite",
+  "sampling_interval_ms": 1000,
+  "fine_history_hours": 24,
+  "history_days": 30,
+  "default_theme": "ember"
+}

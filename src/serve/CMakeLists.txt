@@ -20,6 +20,7 @@ add_library(ninfer_serve STATIC
   observations.cpp
   monitor.cpp
   metrics.cpp
+  admin_cache.cpp
   http_server.cpp
   openai_responses_http.cpp
 )

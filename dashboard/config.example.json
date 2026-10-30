@@ -6,5 +6,5 @@
   "sampling_interval_ms": 1000,
   "fine_history_hours": 24,
   "history_days": 30,
-  "default_theme": "ember"
+  "default_theme": "paper"
 }

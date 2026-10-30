@@ -13,11 +13,14 @@ export const themes = Object.values(
     import: 'default',
   }),
 );
-export const themeId = ref('ember');
+export const themeId = ref('paper');
 let selected = false;
 
 export function applyTheme(id: string, remember = false): void {
-  const theme = themes.find((item) => item.id === id) ?? themes[0];
+  const theme =
+    themes.find((item) => item.id === id) ??
+    themes.find((item) => item.id === 'paper') ??
+    themes[0];
   for (const [key, value] of Object.entries(theme.colors)) {
     document.documentElement.style.setProperty(`--${key}`, value);
   }
@@ -31,6 +34,11 @@ export function applyTheme(id: string, remember = false): void {
   }
 }
 
-export function initializeTheme(defaultTheme = 'ember'): void {
-  if (!selected) applyTheme(localStorage.getItem('ninfer.theme') ?? defaultTheme);
+export function initializeTheme(defaultTheme = 'paper'): void {
+  if (selected) return;
+  const stored = localStorage.getItem('ninfer.theme');
+  if (stored && !themes.some((theme) => theme.id === stored)) {
+    localStorage.removeItem('ninfer.theme');
+  }
+  applyTheme(localStorage.getItem('ninfer.theme') ?? defaultTheme);
 }

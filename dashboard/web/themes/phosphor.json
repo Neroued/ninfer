@@ -1,0 +1,22 @@
+{
+  "id": "phosphor",
+  "name": "Phosphor",
+  "scheme": "dark",
+  "colors": {
+    "bg": "#060a07",
+    "surface": "#0a110c",
+    "plot": "#08100b",
+    "ink": "#d9f2d3",
+    "secondary": "#9cbe9c",
+    "muted": "#68896f",
+    "faint": "#4d6b55",
+    "rule": "rgba(170, 235, 160, 0.13)",
+    "grid": "rgba(170, 235, 160, 0.055)",
+    "decode": "#8fea75",
+    "decode-fill": "rgba(143, 234, 117, 0.11)",
+    "prefill": "#57b7c9",
+    "prefill-fill": "rgba(87, 183, 201, 0.09)",
+    "alert": "#e0a44a",
+    "hover": "rgba(143, 234, 117, 0.045)"
+  }
+}

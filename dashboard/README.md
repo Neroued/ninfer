@@ -32,7 +32,7 @@ Configuration paths are relative to the configuration file. Defaults in the exam
 | `sampling_interval_ms` | Snapshot polling interval, 1000 ms; at least 1000 ms          |
 | `fine_history_hours`   | Retention of individual samples, 24 hours                     |
 | `history_days`         | Retention of minute aggregates, 30 days                       |
-| `default_theme`        | Initial theme, `ember`; a browser preference takes precedence |
+| `default_theme`        | Initial theme, `paper`; a browser preference takes precedence |
 
 `config.local.json`, `data/`, `dist/`, and `node_modules/` are ignored by Git. Keep the
 database and its SQLite sidecar files together on the collector's local filesystem.

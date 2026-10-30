@@ -1,0 +1,22 @@
+{
+  "id": "blueprint",
+  "name": "Blueprint",
+  "scheme": "dark",
+  "colors": {
+    "bg": "#081522",
+    "surface": "#0d1e2f",
+    "plot": "#0a1929",
+    "ink": "#e4edf5",
+    "secondary": "#b0c4d4",
+    "muted": "#7d96a8",
+    "faint": "#5b7285",
+    "rule": "rgba(215, 235, 250, 0.14)",
+    "grid": "rgba(120, 200, 255, 0.07)",
+    "decode": "#78c8ff",
+    "decode-fill": "rgba(120, 200, 255, 0.12)",
+    "prefill": "#d6b879",
+    "prefill-fill": "rgba(214, 184, 121, 0.10)",
+    "alert": "#ff8a62",
+    "hover": "rgba(120, 200, 255, 0.045)"
+  }
+}

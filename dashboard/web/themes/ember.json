@@ -3,9 +3,9 @@
   "name": "Ember",
   "scheme": "dark",
   "colors": {
-    "bg": "#0b0b0a",
-    "surface": "#111210",
-    "plot": "#1c1d19",
+    "bg": "#12110f",
+    "surface": "#191815",
+    "plot": "#1f1e19",
     "ink": "#e8e3d7",
     "secondary": "#bab4a6",
     "muted": "#8f9189",

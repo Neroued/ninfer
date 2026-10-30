@@ -7,6 +7,7 @@ target_sources(ninfer_model_execution PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/execution/ple.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/execution/text.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/execution/mtp.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/execution/tf_dump.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/state/state_image.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/state/kv_cache.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/session/planning.cpp"

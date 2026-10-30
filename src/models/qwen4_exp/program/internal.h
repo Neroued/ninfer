@@ -8,6 +8,7 @@
 #include "models/qwen4_exp/program/graphs.h"
 #include "models/qwen4_exp/execution/text.h"
 #include "models/qwen4_exp/execution/mtp.h"
+#include "models/qwen4_exp/execution/tf_dump.h"
 #include "models/common/qwen/vision/vision.h"
 #include "models/common/vocabulary.h"
 #include "ninfer/ops/sampling.h"
@@ -182,6 +183,7 @@ public:
     std::optional<ComputeFrame> compute;
     std::optional<ContextFrame> context;
     std::deque<runtime::ExecutionEvent<ExecutionTypes>> events;
+    std::unique_ptr<execution::TfDump> tf_dump;
     bool drained = false;
 };
 

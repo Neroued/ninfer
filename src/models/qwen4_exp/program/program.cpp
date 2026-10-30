@@ -34,6 +34,7 @@ RankProgramImpl::RankProgramImpl(const execution::Parameters& p, ExecutionPlan p
     if (parameters.profile->local.size != (parallel ? parallel->size() : 1))
         throw std::logic_error("Qwen4Exp Program communication differs from its weight partition");
     if (resources.ple_prepare) host_ple = std::make_unique<PlePipeline>(resources, d);
+    tf_dump = execution::TfDump::from_environment();
 }
 
 RankProgramImpl::~RankProgramImpl() {

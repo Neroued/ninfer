@@ -236,6 +236,15 @@ bool RankProgramImpl::advance_layers(std::uint32_t end) {
 void RankProgramImpl::after_main() {
     auto& f = *compute;
     f.run.reset();
+    // Teacher-forcing dump: capture the final-layer residual for prefills with MTP.
+    if (tf_dump && f.sequence && parameters.mtp) {
+        const auto& row = f.rows[0];
+        tf_dump->capture_layer(0, f.conditioning, static_cast<std::int32_t>(row.main_frontier),
+                               cuda.stream());
+        std::vector<std::int32_t> token_ids(row.ids.begin(), row.ids.end());
+        tf_dump->write_tokens(token_ids);
+        tf_dump->write_meta("ninfer", "qwen4-exp-flashnext");
+    }
     if (!f.verify) {
         if (parameters.mtp)
             align_mtp(f.rows, f.tokens, f.previous_conditioning, f.conditioning, f.visual);

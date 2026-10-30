@@ -8,6 +8,10 @@
 
 namespace ninfer {
 
+struct ParallelCoordinate {
+    std::uint32_t rank = 0, size = 1;
+};
+
 struct ParallelOptions {
     // dp counts full-model replicas; adp counts attention DP owners within a replica.
     std::uint32_t tp = 1, ep = 1, dp = 1, pp = 1, adp = 1;

@@ -20,6 +20,7 @@ void RankProgramImpl::execute_round(const execution::BatchView& main,
     upload_region(io.ingress, io.ingress.bytes);
     if (parameters.mtp) gather_decode_state(main);
     if (verify) {
+        timer.begin_draft(sections != nullptr);
         const auto& m = *io.mtp;
         auto drafts   = draft_proposals(g);
         {
@@ -31,6 +32,7 @@ void RankProgramImpl::execute_round(const execution::BatchView& main,
         const auto readback = [&] {
             copy_bytes_async(output(m.drafts), m.drafts.region.bind(resources.fixed()), cuda);
         };
+        timer.end_draft(sections != nullptr);
         if (sections) {
             sections->drafts.capture(cuda.stream(), readback);
             drafts_done.record_external(cuda.stream());
@@ -40,11 +42,13 @@ void RankProgramImpl::execute_round(const execution::BatchView& main,
         }
         auto ids = main.ids;
         ops::prepare_verify_ids(row(io.rows.anchors, g), drafts, row(m.extents, g), ids, cuda);
+        timer.begin_target(sections != nullptr);
         {
             nvtx::ScopedRange range(nvtx::Name::DecodeMtpTarget, nvtx::Category::Mtp);
             main_forward(main, execution::RecordWindow{*resources.kda_records}, hidden, {}, submit);
         }
     } else {
+        timer.begin_target(sections != nullptr);
         main_forward(main, execution::StepUpdate{}, hidden, {}, submit);
         if (parameters.mtp) align_history(main, hidden, 1);
         ops::scatter(hidden.view({h, g}), resources.states.hidden(main.destination_offsets), cuda);
@@ -54,6 +58,7 @@ void RankProgramImpl::execute_round(const execution::BatchView& main,
         sections->head.capture(cuda.stream(), project);
     else if (head)
         project();
+    timer.end_target(sections != nullptr);
 }
 
 void RankProgramImpl::forward() {
@@ -294,6 +299,8 @@ void RankProgramImpl::result() {
         }
     }
     timer.observe_result(f.gpu);
+    if (ExecutionTypes::describe_work(f.request.work).kind == ExecutionKind::Decode)
+        timer.observe_decode(f.gpu, std::holds_alternative<MtpWork>(f.request.work.operation));
     if (resources.compute_actions->occupied()) resources.compute_actions->finish();
     events.emplace_back(runtime::ResultReady<ExecutionTypes>{f.request.ticket, Result(f.result)});
     f.phase = ComputePhase::PendingCommit;
@@ -351,6 +358,7 @@ void RankProgramImpl::advance_compute() {
             observed.path = f.graph_round ? ExecutionPath::Graph : ExecutionPath::Eager;
             timer.observe_retirement(f.gpu);
             observed.gpu       = f.gpu;
+            observed.attention = {ExecutionTypes::describe_work(f.request.work).kind, f.attention};
             const auto ticket  = f.request.ticket;
             const auto command = f.retirement;
             compute.reset();

@@ -13,8 +13,6 @@ using Json = nlohmann::json;
 
 constexpr const char* kExecutions[] = {"prefill", "decode", "replay",
                                        "control", "score",  "context"};
-constexpr const char* kIntervals[]  = {"result_stream", "commit_stream", "prefill_stream",
-                                       "vision_stream"};
 
 Json ratio(double numerator, std::uint64_t denominator) {
     return denominator ? Json(numerator / denominator) : Json(nullptr);
@@ -130,7 +128,7 @@ Json rank_window(const RankSnapshot& before, const RankSnapshot& after) {
     for (std::size_t i = 0; i < after.gpu_intervals.size(); ++i) {
         const auto count = after.gpu_intervals[i].count - before.gpu_intervals[i].count;
         const auto ns    = after.gpu_intervals[i].total_ns - before.gpu_intervals[i].total_ns;
-        out["gpu_intervals"][kIntervals[i]] = {
+        out["gpu_intervals"][kGpuIntervalNames[i]] = {
             {"count", count}, {"total_ns", ns}, {"mean_ms", ratio(ns * 1e-6, count)}};
     }
     constexpr const char* paths[] = {"eager", "graph", "mixed"};

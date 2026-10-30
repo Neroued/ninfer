@@ -63,6 +63,7 @@ void RankProgramImpl::progress() {
                 if (!operation.projected) {
                     resources.work.reset();
                     project_decode(operation.batch, operation.width);
+                    gpu_timer.end_target();
                     operation.projected = true;
                 }
                 operation.stage = ComputeStage::AwaitDecision;

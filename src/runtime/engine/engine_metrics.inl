@@ -165,7 +165,78 @@ void EngineCore<Instance>::record_detail(std::uint64_t RuntimeHostWorkStats::*el
 }
 
 template <class Instance>
+RequestSnapshot EngineCore<Instance>::observe_request(const Request& request) const {
+    RequestSnapshot out;
+    out.id = request.id;
+    switch (request.model_state) {
+    case EngineRequestState::Waiting:
+        out.phase = RequestPhase::Waiting;
+        break;
+    case EngineRequestState::Materializing:
+        out.phase = RequestPhase::Materializing;
+        break;
+    case EngineRequestState::Prefill:
+        out.phase = RequestPhase::Prefill;
+        break;
+    case EngineRequestState::DecodeReady:
+        out.phase = RequestPhase::Decode;
+        break;
+    case EngineRequestState::ControlReady:
+        out.phase = RequestPhase::Control;
+        break;
+    case EngineRequestState::Replay:
+        out.phase = RequestPhase::Replay;
+        break;
+    case EngineRequestState::Pausing:
+        out.phase = RequestPhase::Pausing;
+        break;
+    case EngineRequestState::Paused:
+        out.phase = RequestPhase::Paused;
+        break;
+    case EngineRequestState::ModelFinished:
+        out.phase = RequestPhase::Finishing;
+        break;
+    }
+    if (request.terminal_reason || request.terminal_error) out.phase = RequestPhase::Finishing;
+    if (request.placement) out.placement = request.placement->value;
+    out.submitted_ns = elapsed_ns({}, request.submitted);
+    if (request.admitted_at) out.admitted_ns = elapsed_ns({}, *request.admitted_at);
+    if (request.first_token) out.first_token_ns = elapsed_ns({}, *request.first_token);
+    out.prompt_tokens = request.prompt_summary.prompt_tokens;
+    if (request.admitted_begin)
+        out.reused_prompt_tokens = request.admitted_begin->reused_prompt_tokens;
+    out.processed_prompt_tokens = out.reused_prompt_tokens + request.computed_prompt_tokens;
+    out.generated_tokens        = static_cast<std::uint32_t>(request.generated.size());
+    out.injected_control_tokens = request.injected_control_tokens;
+    out.logical_context_tokens  = out.processed_prompt_tokens + out.generated_tokens;
+    if (request.budget) out.output_token_limit = out.generated_tokens + request.budget->remaining();
+    out.capture_pending = request.capture_pending;
+    out.resident        = request.lane && slots_[request.lane->value].get() == &request;
+    out.preemptions     = request.preemption_count;
+    for (const auto* flight : {&compute_, &retiring_})
+        if (*flight)
+            for (const auto& member : (*flight)->requests)
+                if (member.get() == &request) out.execution_in_flight = true;
+    return out;
+}
+
+template <class Instance>
+void EngineCore<Instance>::record_completion(const std::shared_ptr<Request>& request,
+                                             FinishReason reason, bool failed) {
+    if (request->completion_observed) return;
+    request->completion_observed = true;
+    auto& counters               = cumulative_stats_.requests;
+    if (failed)
+        ++counters.failed;
+    else if (reason == FinishReason::Cancelled)
+        ++counters.cancelled;
+    else
+        ++counters.completed;
+}
+
+template <class Instance>
 void EngineCore<Instance>::publish_runtime_stats() {
+    const auto published_revision    = schedule_revision_.load(std::memory_order_acquire);
     HostPhaseMeasurement measurement = begin_host_phase();
     std::optional<nvtx::ScopedRange> phase_range;
     phase_range.emplace(nvtx::Name::EngineMaintenance, nvtx::Category::Runtime);
@@ -179,6 +250,8 @@ void EngineCore<Instance>::publish_runtime_stats() {
     snapshot.decode_row_rounds = executions[static_cast<std::size_t>(ExecutionKind::Decode)].rows;
     const auto physical        = instance_.session->physical_usage();
     snapshot.context_pools     = physical.pools;
+    snapshot.context_resources = physical.resources;
+    snapshot.prefix_cache      = resources_.statistics();
     snapshot.context_metadata  = physical.metadata;
     snapshot.state_objects     = physical.state_objects;
     snapshot.history_objects   = physical.history_objects;
@@ -186,9 +259,19 @@ void EngineCore<Instance>::publish_runtime_stats() {
         pool.occupied_page_groups = physical.kv_page_groups.at(pool.id);
     }
 
+    request_observations_.clear();
+    execution_observations_.clear();
+    instance_.executor->observe_in_flight(execution_observations_);
+    EngineStatus status;
     {
         std::lock_guard lock(queue_mutex_);
-        snapshot.waiting_requests = static_cast<std::uint32_t>(pending_.size());
+        snapshot.waiting_requests   = static_cast<std::uint32_t>(pending_.size());
+        snapshot.requests.submitted = submitted_requests_;
+        status                      = stopping_ ? EngineStatus::Stopping
+                                      : failed_ ? EngineStatus::Failed
+                                                : EngineStatus::Ready;
+        for (const auto& request : pending_)
+            request_observations_.push_back(observe_request(*request));
     }
     snapshot.prefilling_requests    = 0;
     snapshot.paused_requests        = static_cast<std::uint32_t>(paused_.size());
@@ -196,12 +279,37 @@ void EngineCore<Instance>::publish_runtime_stats() {
     snapshot.materializing_requests = materializing_.has_value() ? 1U : 0U;
     for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
         if (slots_[lane] == nullptr) { continue; }
+        request_observations_.push_back(observe_request(*slots_[lane]));
         ++snapshot.running_requests;
         if (slots_[lane]->is_prefilling()) { ++snapshot.prefilling_requests; }
         if (slots_[lane]->is_replaying()) { ++snapshot.replaying_requests; }
         if (slots_[lane]->is_decode_ready()) { ++snapshot.decode_ready_requests; }
         if (slots_[lane]->capture_pending) { ++snapshot.capture_pending_requests; }
         if (slots_[lane]->terminal_reason) { ++snapshot.terminal_pending_requests; }
+    }
+    for (const auto& request : paused_) request_observations_.push_back(observe_request(*request));
+    if (materializing_) request_observations_.push_back(observe_request(*materializing_->request));
+    std::sort(request_observations_.begin(), request_observations_.end(),
+              [](const auto& a, const auto& b) { return a.id < b.id; });
+    request_observations_.erase(
+        std::unique(request_observations_.begin(), request_observations_.end(),
+                    [](const auto& a, const auto& b) { return a.id == b.id; }),
+        request_observations_.end());
+    for (auto& placement : snapshot.placements) {
+        const auto id = placement.id;
+        placement     = {.id = id};
+    }
+    for (const auto& request : request_observations_) {
+        if (!request.placement) continue;
+        auto found = std::find_if(snapshot.placements.begin(), snapshot.placements.end(),
+                                  [&](const auto& item) { return item.id == *request.placement; });
+        if (found == snapshot.placements.end()) continue;
+        found->resident += request.resident;
+        found->prefilling += request.phase == RequestPhase::Prefill;
+        found->decoding += request.phase == RequestPhase::Decode;
+        found->replaying += request.phase == RequestPhase::Replay;
+        found->paused += request.phase == RequestPhase::Paused;
+        found->context_tokens += request.logical_context_tokens;
     }
     detail_range.reset();
     record_detail(&RuntimeHostWorkStats::stats_publication_ns,
@@ -217,7 +325,13 @@ void EngineCore<Instance>::publish_runtime_stats() {
     published_snapshot_.stamp   = {published_snapshot_.stamp.sequence + 1, observation_time_ns()};
     published_snapshot_.runtime = snapshot;
     published_snapshot_.executions = instance_.executor->execution_statistics();
-    const auto ranks               = instance_.executor->observations();
+    const auto batches = instance_.executor->decode_statistics().first(max_concurrency_);
+    published_snapshot_.decode_by_batch.assign(batches.begin(), batches.end());
+    published_snapshot_.in_flight = execution_observations_;
+    published_snapshot_.status    = status;
+    published_requests_           = request_observations_;
+    published_revision_           = published_revision;
+    const auto ranks              = instance_.executor->observations();
     published_snapshot_.ranks.assign(ranks.begin(), ranks.end());
 }
 

@@ -395,6 +395,7 @@ std::optional<StateId> StateDirectory::reserve_destination(RecordReservation res
     }
     auto records = reservation.materialize();
     validate_records(records, ContextMemory::Device, variant);
+    for (auto& record : records) records_->classify(record, state_record_layout(variant));
     const auto index = reservation.take_metadata(*this);
     return allocate(index, StateRole::ReservedDestination, variant, std::move(records));
 }
@@ -749,6 +750,7 @@ StateDirectory::reserve_device_to_host(StateId source, RecordReservation reserve
     if (!reserved.ready()) return std::nullopt;
     auto targets = reserved.materialize();
     validate_records(targets, ContextMemory::Host, object.variant);
+    for (auto& record : targets) records_->classify(record, state_record_layout(object.variant));
     const auto id = next_transfer();
     Transfer transfer(*this, id, StateCopyDirection::DeviceToHost, read(source), source);
     transfer.records_ = std::move(targets);
@@ -783,6 +785,7 @@ StateDirectory::reserve_host_to_device(StateId source, StateId destination,
     if (!reserved.ready()) return std::nullopt;
     auto targets = reserved.materialize();
     validate_records(targets, ContextMemory::Device, from.variant);
+    for (auto& record : targets) records_->classify(record, state_record_layout(from.variant));
     const auto id = next_transfer();
     Transfer transfer(*this, id, StateCopyDirection::HostToDevice, read(source), destination);
     transfer.records_ = std::move(targets);

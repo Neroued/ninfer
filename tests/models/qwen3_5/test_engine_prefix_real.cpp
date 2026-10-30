@@ -282,6 +282,7 @@ int exercise_stream_observations(ninfer::Engine& engine) {
 }
 
 int exercise_admission_wait(ninfer::Engine& engine) {
+    const auto before = engine.snapshot().runtime.requests;
     const auto prompt = [&] {
         return engine.prepare_tokens({248045, 846, 198, 5834, 248046, 198});
     };
@@ -292,6 +293,7 @@ int exercise_admission_wait(ninfer::Engine& engine) {
     request.stop.include_model_defaults       = false;
 
     auto active = engine.submit(prompt(), request);
+    if (!active.request_id()) throw std::runtime_error("scheduled request has no Engine identity");
     active.wait_for_admission();
     request.execution.requested_output_tokens = 1;
 
@@ -349,7 +351,7 @@ int exercise_admission_wait(ninfer::Engine& engine) {
     immediate.wait_for_admission();
     const auto immediate_result = immediate.wait();
     if (immediate_result.finish_reason != ninfer::FinishReason::OutputLimit ||
-        !immediate_result.generated_token_ids.empty()) {
+        !immediate_result.generated_token_ids.empty() || immediate.request_id() != 0) {
         std::cerr << "admission wait blocked or consumed an immediate result\n";
         return 1;
     }
@@ -357,6 +359,13 @@ int exercise_admission_wait(ninfer::Engine& engine) {
     const auto stopped = active.wait(nullptr, ninfer::CancellationView([] { return true; }));
     if (stopped.finish_reason != ninfer::FinishReason::Cancelled) {
         std::cerr << "admitted request did not retain its cancellation lifetime\n";
+        return 1;
+    }
+    const auto after = engine.snapshot({.include_requests = true});
+    if (after.runtime.requests.submitted - before.submitted != 3 ||
+        after.runtime.requests.cancelled - before.cancelled != 2 ||
+        after.runtime.requests.failed - before.failed != 1 || !after.requests->empty()) {
+        std::cerr << "timeout/cancellation accounting or current request cleanup differs\n";
         return 1;
     }
     return 0;

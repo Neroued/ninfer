@@ -362,6 +362,7 @@ template <class Instance>
 void EngineCore<Instance>::complete_error(const std::shared_ptr<Request>& request,
                                           std::exception_ptr error) {
     if (!prepare_completion(request)) { return; }
+    record_completion(request, FinishReason::None, true);
     release_request(request);
     publish_runtime_stats();
     publish_completion(request, {}, std::move(error));
@@ -444,6 +445,7 @@ void EngineCore<Instance>::complete_success(const std::shared_ptr<Request>& requ
     finish_engine_phase(completion, EngineHostPhase::CommitOutput);
     result.stats.engine_timing       = request->host_timing.public_snapshot();
     result.stats.first_output_timing = request->first_output_timing;
+    record_completion(request, reason, false);
     publish_runtime_stats();
     publish_completion(request, std::move(result));
 }

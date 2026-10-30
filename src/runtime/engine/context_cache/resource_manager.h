@@ -90,6 +90,10 @@ public:
     explicit ResourceManager(bool enabled, ContextMachineCostModel costs)
         : enabled_(enabled), costs_(std::move(costs)) {}
 
+    [[nodiscard]] const PrefixCacheStatistics& statistics() const noexcept {
+        return index_.statistics();
+    }
+
     [[nodiscard]] std::vector<SourceChoice>
     candidates(Session& session, const Base& base, std::uint32_t maximum_frontier = UINT32_MAX,
                std::optional<OwnerToken> own_resume = std::nullopt, std::uint64_t request = 0,
@@ -439,7 +443,7 @@ public:
                 }
                 const auto old = entry.handle;
                 entry.handle   = handle;
-                index_.insert(session, handle, summary.frontier);
+                index_.insert(session, handle, summary.frontier, summary.role);
                 release_unreferenced(session, old);
                 return;
             }
@@ -449,7 +453,7 @@ public:
                  .priority    = demand_priority(session.checkpoint_key(handle, summary.frontier)),
                  .retained_at = ++clock_,
                  .origin      = summary.origin});
-            index_.insert(session, handle, summary.frontier);
+            index_.insert(session, handle, summary.frontier, summary.role);
         } else {
             auto* owner = find_owner(token);
             if (!owner) {
@@ -485,7 +489,7 @@ public:
                     return;
                 }
                 owner->points.push_back({handle, summary.role});
-                index_.insert(session, handle, summary.frontier);
+                index_.insert(session, handle, summary.frontier, summary.role);
             }
         }
     }
@@ -639,7 +643,7 @@ public:
         for (const auto handle : handles) {
             if (session.valid_checkpoint(handle))
                 throw std::logic_error("Session did not consume its quoted cache victim");
-            forget(handle);
+            forget(handle, true);
         }
         cursor.sacrificed =
             loss > UINT64_MAX - cursor.sacrificed ? UINT64_MAX : cursor.sacrificed + loss;
@@ -652,7 +656,7 @@ public:
         if (session.valid_checkpoint(handle) && !session.release_checkpoint(handle)) {
             return false;
         }
-        forget(handle);
+        forget(handle, true);
         prune(session);
         return true;
     }
@@ -805,7 +809,7 @@ public:
                     for (const auto victim : action.host_victims) {
                         if (session.valid_checkpoint(victim))
                             throw std::logic_error("demotion did not release its Host victims");
-                        forget(victim);
+                        forget(victim, true);
                     }
                     if (cursor.gain_limit)
                         cursor.sacrificed = action.rank.loss > UINT64_MAX - cursor.sacrificed
@@ -1031,8 +1035,8 @@ private:
         return true;
     }
 
-    void forget(Handle handle) {
-        index_.erase(handle);
+    void forget(Handle handle, bool reclaimed = false) {
+        index_.erase(handle, reclaimed);
         for (auto& owner : owners_) {
             std::erase_if(owner.points, [&](const auto& point) { return point.handle == handle; });
         }
@@ -1061,7 +1065,7 @@ private:
                 throw std::logic_error("Native carried a public point as a private continuation");
             }
             owner.points.push_back({handle, summary.role});
-            index_.insert(session, handle, summary.frontier);
+            index_.insert(session, handle, summary.frontier, summary.role);
         }
         for (const auto handle : old) { release_unreferenced(session, handle); }
     }

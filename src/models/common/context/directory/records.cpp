@@ -15,7 +15,8 @@ RecordLease::~RecordLease() { reset(); }
 
 RecordLease::RecordLease(RecordLease&& other) noexcept
     : pool_(std::exchange(other.pool_, nullptr)), domain_(other.domain_),
-      allocation_(other.allocation_), retiring_(other.retiring_) {}
+      allocation_(other.allocation_), retiring_(other.retiring_),
+      usage_(std::exchange(other.usage_, nullptr)) {}
 
 RecordLease& RecordLease::operator=(RecordLease&& other) noexcept {
     if (this != &other) {
@@ -24,6 +25,7 @@ RecordLease& RecordLease::operator=(RecordLease&& other) noexcept {
         domain_     = other.domain_;
         allocation_ = other.allocation_;
         retiring_   = other.retiring_;
+        usage_      = std::exchange(other.usage_, nullptr);
     }
     return *this;
 }
@@ -40,12 +42,20 @@ ContextRecordBinding RecordLease::binding() const {
 void RecordLease::defer_retirement() {
     if (!pool_ || retiring_) return;
     pool_->defer_release(allocation_);
+    if (usage_) {
+        --usage_->live_records;
+        ++usage_->pending_retirement_records;
+    }
     retiring_ = true;
 }
 
 void RecordLease::cancel_retirement() {
     if (!pool_ || !retiring_) return;
     pool_->cancel_deferred_release(allocation_);
+    if (usage_) {
+        --usage_->pending_retirement_records;
+        ++usage_->live_records;
+    }
     retiring_ = false;
 }
 
@@ -55,7 +65,18 @@ void RecordLease::reset() noexcept {
         pool_->retire(allocation_);
     else
         pool_->release(allocation_);
-    pool_ = nullptr;
+    forget();
+}
+
+void RecordLease::forget() noexcept {
+    if (usage_) {
+        if (retiring_)
+            --usage_->pending_retirement_records;
+        else
+            --usage_->live_records;
+    }
+    usage_ = nullptr;
+    pool_  = nullptr;
 }
 
 bool RecordAssessment::ready() const noexcept {
@@ -151,7 +172,7 @@ void RecordReservation::restore(RecordLease&& record) {
         if (claim.pool != record.pool_ || claim.record_class != binding.record_class) continue;
         claim.pool->return_to_reservation(record.allocation_, *claim.reservation);
         ++claim.count;
-        record.pool_ = nullptr;
+        record.forget();
         return;
     }
     throw std::invalid_argument("context record does not belong to this reservation layout");
@@ -164,6 +185,10 @@ void RecordReservation::defer_return(RecordLease& record) {
             continue;
         claim.pool->defer_to_reservation(record.allocation_, *claim.reservation);
         ++claim.count;
+        if (record.usage_) {
+            --record.usage_->live_records;
+            ++record.usage_->pending_retirement_records;
+        }
         record.retiring_ = true;
         return;
     }
@@ -312,6 +337,7 @@ struct RecordDomains::Domain {
     struct Class {
         std::uint32_t layout;
         RecordClassId record_class;
+        RecordUsage usage;
     };
 
     ContextDomainId id;
@@ -366,12 +392,44 @@ RecordDomains::RecordDomains(std::span<const ContextRankSpec> ranks,
                                                         bytes, specs);
             for (std::size_t j = 0; j < specs.size(); ++j)
                 value->classes[j].record_class = value->pool->record_class(j);
+            const auto occupancy = value->pool->usage();
+            for (auto& item : value->classes)
+                item.usage.stride_bytes = occupancy.classes.at(item.record_class.index).stride;
             domains_.push_back(std::move(value));
         }
     }
 }
 
 RecordDomains::~RecordDomains() = default;
+
+const RecordUsage& RecordDomains::usage(ContextDomainId id, std::uint32_t layout) const {
+    const auto& local = domain(id);
+    const auto found  = std::find_if(local.classes.begin(), local.classes.end(),
+                                     [=](const auto& item) { return item.layout == layout; });
+    if (found == local.classes.end()) throw std::invalid_argument("unknown context record layout");
+    return found->usage;
+}
+
+void RecordDomains::classify(RecordLease& record, std::uint32_t layout) {
+    if (!record.valid() || !record.belongs_to(pool(record.domain())))
+        throw std::invalid_argument("context record belongs to a different domain");
+    const auto& local = domain(record.domain());
+    if (local.find(layout) != record.pool_->resolve(record.allocation_).record_class)
+        throw std::invalid_argument("context record classification has a different geometry");
+    auto* target = &const_cast<RecordUsage&>(usage(record.domain(), layout));
+    if (record.usage_ == target) return;
+    if (record.usage_) {
+        if (record.retiring_)
+            --record.usage_->pending_retirement_records;
+        else
+            --record.usage_->live_records;
+    }
+    record.usage_ = target;
+    if (record.retiring_)
+        ++target->pending_retirement_records;
+    else
+        ++target->live_records;
+}
 
 const ContextRecordLayout& RecordDomains::layout(std::uint32_t id) const {
     const auto it = std::find_if(layouts_.begin(), layouts_.end(),
@@ -507,7 +565,8 @@ void RecordDomains::prepare_returns(RecordReservation& reservation, const Record
 std::size_t RecordDomains::metadata_bytes() const {
     std::size_t bytes = sizeof(*this);
     for (const auto& value : domains_)
-        bytes += sizeof(Domain) + value->pool->usage().metadata_bytes;
+        bytes += sizeof(Domain) + value->classes.capacity() * sizeof(Domain::Class) +
+                 value->pool->usage().metadata_bytes;
     return bytes;
 }
 

@@ -104,7 +104,9 @@ public:
 
     [[nodiscard]] const StartupReport& startup_report() const { return engine_->startup_report(); }
 
-    [[nodiscard]] EngineSnapshot snapshot() const { return engine_->snapshot(); }
+    [[nodiscard]] EngineSnapshot snapshot(SnapshotOptions options = {}) const {
+        return engine_->snapshot(options);
+    }
 
     [[nodiscard]] bool is_available() const { return engine_->is_available(); }
 

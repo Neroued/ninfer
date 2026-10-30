@@ -16,7 +16,8 @@ GraphPreparationSample RankProgramImpl::initialize_graphs(GraphPreparationMode m
     GraphPreparation observation(device, mode);
     graphs.emplace(GraphSpec{capacity, max_concurrency, draft_window, backend});
     GraphBodies bodies;
-    bodies.prologue = [this](const GraphInvocation& call) {
+    bodies.prologue = [this, capture = observation.capturing()](const GraphInvocation& call) {
+        gpu_timer.begin_target(capture);
         if (call.phase != GraphPhase::Verify && !resources.dflash) upload_ingress();
     };
     bodies.text = [this](const GraphInvocation& call) {
@@ -46,10 +47,12 @@ GraphPreparationSample RankProgramImpl::initialize_graphs(GraphPreparationMode m
                                          resources.moe.get()},
             std::move(inputs), update, call.envelope, input.hidden, feature ? &*feature : nullptr);
     };
-    bodies.project = [this](const GraphInvocation& call) {
+    bodies.project = [this, capture = observation.capturing()](const GraphInvocation& call) {
         project_decode(call.batch, call.width);
+        gpu_timer.end_target(capture);
     };
-    bodies.draft = [this](const GraphInvocation& call) {
+    bodies.draft = [this, capture = observation.capturing()](const GraphInvocation& call) {
+        gpu_timer.begin_draft(capture);
         if (backend == SpeculativeBackend::Mtp) {
             upload_ingress();
             run_mtp_draft(call.batch, draft_window, std::max(1U, call.profile.max));
@@ -57,6 +60,7 @@ GraphPreparationSample RankProgramImpl::initialize_graphs(GraphPreparationMode m
             append_draft_history(call.batch, {0, draft_window + 1});
             run_dflash_draft(call.batch, 0, call.profile.max);
         }
+        gpu_timer.end_draft(capture);
     };
     bodies.decision = [this](const GraphInvocation& call) {
         decide_decode(call.batch, call.width);

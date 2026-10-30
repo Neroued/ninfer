@@ -34,7 +34,7 @@ int main() {
 
     bool protected_artifact_rejected = false;
     try {
-        JsonlRequestLog unsafe("same-path.ninfer", "same-path.ninfer");
+        JsonlRequestLog unsafe("test-instance", "same-path.ninfer", "same-path.ninfer");
     } catch (const std::invalid_argument&) { protected_artifact_rejected = true; }
     failures += check(protected_artifact_rejected,
                       "request log accepted the model artifact as its output path");
@@ -960,11 +960,11 @@ int main() {
          ".jsonl");
     std::filesystem::remove(log_path);
     {
-        JsonlRequestLog writer(log_path.string());
+        JsonlRequestLog writer("test-instance", log_path.string());
         writer.write_request_start(context);
     }
     {
-        JsonlRequestLog writer(log_path.string());
+        JsonlRequestLog writer("test-instance", log_path.string());
         writer.write_request_rejected(rejected_context);
         writer.write_request_error(context, "generation failed");
     }

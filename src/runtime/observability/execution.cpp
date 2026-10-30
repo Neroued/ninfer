@@ -22,19 +22,14 @@ void merge_host_observations(RankHostStatistics& into, const RankHostStatistics&
 
 void merge_gpu_intervals(GpuExecutionObservation& into,
                          const GpuExecutionObservation& from) noexcept {
-    for (auto field :
-         {&GpuExecutionObservation::result_stream_ns, &GpuExecutionObservation::commit_stream_ns,
-          &GpuExecutionObservation::prefill_stream_ns, &GpuExecutionObservation::vision_stream_ns})
+    for (auto field : kGpuIntervalFields)
         if (from.*field && (!(into.*field) || *(from.*field) > *(into.*field)))
             into.*field = from.*field;
 }
 
-void accumulate_gpu(std::array<DurationCounter, 4>& totals,
-                    const GpuExecutionObservation& value) noexcept {
-    const std::array intervals{value.result_stream_ns, value.commit_stream_ns,
-                               value.prefill_stream_ns, value.vision_stream_ns};
-    for (std::size_t i = 0; i < intervals.size(); ++i)
-        if (intervals[i]) totals[i].observe(*intervals[i]);
+void accumulate_gpu(GpuIntervalCounters& totals, const GpuExecutionObservation& value) noexcept {
+    for (std::size_t i = 0; i < kGpuIntervalCount; ++i)
+        if (value.*kGpuIntervalFields[i]) totals[i].observe(*(value.*kGpuIntervalFields[i]));
 }
 
 void ExecutionClock::start(ExecutionWork work, std::uint64_t now) noexcept {
@@ -60,12 +55,7 @@ ExecutionSample ExecutionClock::finish(std::uint64_t now) const noexcept {
 }
 
 void accumulate(ExecutionStatistics& statistics, const ExecutionSample& sample) noexcept {
-    auto& value = statistics[static_cast<std::size_t>(sample.work.kind)];
-    ++value.units;
-    value.rows += sample.work.rows;
-    value.input_tokens += sample.work.input_tokens;
-    value.scheduled_positions += sample.work.scheduled_positions;
-    value.exposure.observe(sample.latency);
+    statistics[static_cast<std::size_t>(sample.work.kind)].observe(sample);
 }
 
 } // namespace ninfer::runtime

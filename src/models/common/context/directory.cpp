@@ -794,6 +794,31 @@ ContextUsage ContextDirectory::usage() const {
             value.tail_bytes               = usage.tail_bytes;
             value.peak_occupied_bytes      = usage.peak_occupied_bytes;
             result.pools.push_back(value);
+            const auto add = [&](ninfer::ContextResourceUsage& into, std::uint32_t layout) {
+                const auto& records = records_.usage({rank.rank, memory}, layout);
+                into.live_records += records.live_records;
+                into.live_bytes += records.live_records * records.stride_bytes;
+                into.pending_retirement_records += records.pending_retirement_records;
+                into.pending_retirement_bytes +=
+                    records.pending_retirement_records * records.stride_bytes;
+            };
+            ninfer::ContextResourceUsage state{.rank = rank.rank, .domain = value.domain};
+            for (const auto& layout : spec_.state.layouts)
+                if (std::any_of(layout.parts.begin(), layout.parts.end(),
+                                [&](const auto& part) { return part.rank == rank.rank; }))
+                    add(state, state_record_layout(layout.variant));
+            result.resources.push_back(state);
+            for (const auto& history : spec_.pools) {
+                if (std::none_of(history.parts.begin(), history.parts.end(),
+                                 [&](const auto& part) { return part.rank == rank.rank; }))
+                    continue;
+                ninfer::ContextResourceUsage kv{.rank   = rank.rank,
+                                                .domain = value.domain,
+                                                .history_pool =
+                                                    static_cast<std::uint16_t>(history.pool_id)};
+                add(kv, history.pool_id + 1);
+                result.resources.push_back(kv);
+            }
         }
     result.metadata      = {spec_.metadata_budget_bytes,
                             metadata_.allocated() + records_.metadata_bytes(), metadata_.reserved()};

@@ -1,5 +1,4 @@
 #include "serve/metrics.h"
-#include <chrono>
 
 #include "product/speculative_options.h"
 #include "product/statistics.h"
@@ -15,9 +14,6 @@
 
 namespace ninfer::serve {
 namespace {
-
-constexpr std::array kBuckets{0.001, 0.002, 0.005, 0.01, 0.025, 0.05, 0.1,   0.25,  0.5,   1.0,
-                              2.5,   5.0,   10.0,  20.0, 40.0,  80.0, 160.0, 320.0, 640.0, 1280.0};
 
 std::string escape_label(std::string_view value) {
     std::string out;
@@ -42,78 +38,18 @@ std::string escape_label(std::string_view value) {
 
 } // namespace
 
-void Metrics::Histogram::observe(double seconds) {
-    if (!std::isfinite(seconds) || seconds < 0.0) { return; }
-    ++bins[std::lower_bound(kBuckets.begin(), kBuckets.end(), seconds) - kBuckets.begin()];
-    sum += seconds;
-}
-
 void Metrics::configure(std::string model, const EngineOptions& options,
-                        const EngineDescription& description, const StartupReport& startup,
-                        EngineSnapshot baseline) {
-    model_       = std::move(model);
-    options_     = options;
-    description_ = description;
-    startup_     = startup;
-    baseline_    = baseline;
-    start_seconds_ =
-        std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count();
+                        const StartupReport& startup, double start_seconds) {
+    model_         = std::move(model);
+    options_       = options;
+    startup_       = startup;
+    start_seconds_ = start_seconds;
 }
 
-void Metrics::first_token(const GenerationFirstTokenObservation& observation) {
-    std::lock_guard lock(mutex_);
-    requests_.ttft.observe(observation.prepare_seconds + observation.elapsed_since_submit_seconds);
-}
-
-void Metrics::done(const GenerationOutcome& outcome) {
-    std::lock_guard lock(mutex_);
-    if (outcome.finish_reason == FinishReason::Cancelled) {
-        ++requests_.cancelled;
-    } else {
-        ++requests_.completed;
-    }
-    if (outcome.stats.constraint) {
-        const auto& c = *outcome.stats.constraint;
-        ++requests_.constraint_outcomes[c.terminated ? 0 : c.complete ? 1 : 2];
-        ++requests_.constraint_cache[static_cast<unsigned>(c.cache)];
-        requests_.constraint_prepare_seconds += c.prepare_seconds;
-        requests_.constraint_mask_seconds += c.mask_seconds;
-        requests_.constraint_matcher_seconds += c.matcher_seconds;
-        requests_.constraint_positions += c.mask_positions;
-        requests_.constraint_upload_bytes += c.mask_upload_bytes;
-    }
-    requests_.duration.observe(outcome.stats.timings.total_seconds +
-                               outcome.service_prepare_seconds);
-    requests_.queue.observe(outcome.stats.engine_timing.queue_wait_seconds);
-}
-
-void Metrics::rejected() {
-    std::lock_guard lock(mutex_);
-    ++requests_.rejected;
-}
-
-void Metrics::failed(bool cancelled) {
-    std::lock_guard lock(mutex_);
-    if (cancelled) {
-        ++requests_.cancelled;
-    } else {
-        ++requests_.failed;
-    }
-}
-
-void Metrics::response_failed() {
-    std::lock_guard lock(mutex_);
-    ++requests_.response_failures;
-}
-
-std::string Metrics::render(const EngineSnapshot& snapshot, bool ready) const {
+std::string Metrics::render(const EngineSnapshot& snapshot, const ServiceSnapshot& service,
+                            bool ready) const {
     const auto& stats    = snapshot.runtime;
-    const auto& baseline = baseline_.runtime;
-    Requests requests;
-    {
-        std::lock_guard lock(mutex_);
-        requests = requests_;
-    }
+    const auto& requests = service.counters;
     std::ostringstream out;
     out.imbue(std::locale::classic());
     out << std::setprecision(17);
@@ -125,10 +61,9 @@ std::string Metrics::render(const EngineSnapshot& snapshot, bool ready) const {
         header(name, "gauge", help);
         out << "ninfer_" << name << ' ' << value << '\n';
     };
-    const auto counter = [&](std::string_view name, auto current, auto baseline,
-                             std::string_view help) {
+    const auto counter = [&](std::string_view name, auto current, std::string_view help) {
         header(name, "counter", help);
-        out << "ninfer_" << name << ' ' << current - baseline << '\n';
+        out << "ninfer_" << name << ' ' << current << '\n';
     };
     header("constraint_requests_total", "counter",
            "Settled constrained requests by language completion.");
@@ -142,18 +77,17 @@ std::string Metrics::render(const EngineSnapshot& snapshot, bool ready) const {
     for (std::size_t i = 0; i < 3; ++i)
         out << "ninfer_constraint_cache_total{result=\"" << cache_names[i] << "\"} "
             << requests.constraint_cache[i] << '\n';
-    counter("constraint_prepare_seconds_total", requests.constraint_prepare_seconds, 0.0,
+    counter("constraint_prepare_seconds_total", requests.constraint_prepare_seconds,
             "Observed constraint preparation work.");
-    counter("constraint_mask_seconds_total", requests.constraint_mask_seconds, 0.0,
+    counter("constraint_mask_seconds_total", requests.constraint_mask_seconds,
             "Observed CPU mask work, including lookahead rollback.");
-    counter("constraint_matcher_seconds_total", requests.constraint_matcher_seconds, 0.0,
+    counter("constraint_matcher_seconds_total", requests.constraint_matcher_seconds,
             "Observed matcher acceptance and discard work.");
-    counter("constraint_mask_positions_total", requests.constraint_positions, 0,
+    counter("constraint_mask_positions_total", requests.constraint_positions,
             "Evaluated constrained prediction positions.");
-    counter("constraint_mask_upload_bytes_total", requests.constraint_upload_bytes, 0,
+    counter("constraint_mask_upload_bytes_total", requests.constraint_upload_bytes,
             "Submitted mask payload bytes.");
     counter("executor_flush_seconds_total", stats.host_work.executor_flush_ns * 1e-9,
-            baseline.host_work.executor_flush_ns * 1e-9,
             "Draft-ready wait, counted once per batch.");
     gauge("engine_ready", ready ? 1 : 0, "Whether Engine can accept work.");
     gauge("server_start_time_seconds", start_seconds_,
@@ -167,7 +101,7 @@ std::string Metrics::render(const EngineSnapshot& snapshot, bool ready) const {
           "Configured speculative draft window.");
 
 #define GAUGE(field, name, help)   gauge(name, stats.field, help)
-#define COUNTER(field, name, help) counter(name, stats.field, baseline.field, help)
+#define COUNTER(field, name, help) counter(name, stats.field, help)
     GAUGE(running_requests, "requests_running", "Resident requests, including prefill and decode.");
     GAUGE(waiting_requests, "requests_waiting", "Requests waiting for initial admission.");
     GAUGE(paused_requests, "requests_paused", "Paused requests waiting for recovery.");
@@ -252,28 +186,22 @@ std::string Metrics::render(const EngineSnapshot& snapshot, bool ready) const {
     constexpr std::array directions{"d2h", "h2d", "d2d", "h2h", "peer_d2d"};
     for (std::size_t i = 0; i < directions.size(); ++i) {
         out << "ninfer_context_transfer_bytes_total{resource=\"state\",direction=\""
-            << directions[i] << "\"} "
-            << stats.context_transfers.state[i].bytes - baseline.context_transfers.state[i].bytes
-            << '\n';
+            << directions[i] << "\"} " << stats.context_transfers.state[i].bytes << '\n';
         for (const auto& pool : stats.kv_pools) {
-            const auto old_bytes = pool.id < baseline.context_transfers.kv.size()
-                                       ? baseline.context_transfers.kv[pool.id][i].bytes
-                                       : 0;
             out << "ninfer_context_transfer_bytes_total{resource=\"kv\",pool_id=\"" << pool.id
                 << "\",direction=\"" << directions[i] << "\"} "
-                << stats.context_transfers.kv.at(pool.id)[i].bytes - old_bytes << '\n';
+                << stats.context_transfers.kv.at(pool.id)[i].bytes << '\n';
         }
     }
     counter("context_transfer_seconds_total", stats.actual_context_transfer_seconds,
-            baseline.actual_context_transfer_seconds,
             "Accumulated context transfer operation time.");
     header("host_work_seconds_total", "counter",
            "Coordinator call wall time, excluding scheduler yield/relock.");
-    const auto host = [&](std::string_view phase, std::uint64_t value, std::uint64_t baseline) {
+    const auto host = [&](std::string_view phase, std::uint64_t value) {
         out << "ninfer_host_work_seconds_total{phase=\"" << phase << "\"} "
-            << static_cast<double>(value - baseline) * 1e-9 << '\n';
+            << static_cast<double>(value) * 1e-9 << '\n';
     };
-#define HOST(field) host(#field, stats.host_work.field##_ns, baseline.host_work.field##_ns)
+#define HOST(field) host(#field, stats.host_work.field##_ns)
     HOST(engine_boundary);
     HOST(session_call);
     HOST(executor_poll);
@@ -282,7 +210,6 @@ std::string Metrics::render(const EngineSnapshot& snapshot, bool ready) const {
     HOST(engine_maintenance);
 #undef HOST
     counter("scheduler_yield_seconds_total", stats.host_work.scheduler_yield_ns * 1e-9,
-            baseline.host_work.scheduler_yield_ns * 1e-9,
             "Scheduler yield/relock wall time; not a GPU interval.");
     header("requests_total", "counter",
            "Generation attempts entering preparation, by terminal outcome.");
@@ -291,19 +218,19 @@ std::string Metrics::render(const EngineSnapshot& snapshot, bool ready) const {
              std::pair{"failed", requests.failed}, std::pair{"rejected", requests.rejected}}) {
         out << "ninfer_requests_total{outcome=\"" << outcome << "\"} " << count << '\n';
     }
-    counter("response_failures_total", requests.response_failures, 0U,
+    counter("response_failures_total", requests.response_failures,
             "Response rendering, storage or transport failures after generation settlement.");
-    const auto histogram = [&](std::string_view name, const Histogram& value,
+    const auto histogram = [&](std::string_view name, const RequestHistogram& value,
                                std::string_view help) {
         header(name, "histogram", help);
         std::uint64_t count = 0;
         for (std::size_t i = 0; i < value.bins.size(); ++i) {
             count += value.bins[i];
             out << "ninfer_" << name << "_bucket{le=\"";
-            if (i == kBuckets.size()) {
+            if (i == kRequestDurationBounds.size()) {
                 out << "+Inf";
             } else {
-                out << kBuckets[i];
+                out << kRequestDurationBounds[i];
             }
             out << "\"} " << count << '\n';
         }
@@ -346,15 +273,13 @@ std::string Metrics::render(const EngineSnapshot& snapshot, bool ready) const {
            "Coordinator accepted-to-all-rank-retired exposure.");
     for (std::size_t i = 0; i < snapshot.executions.size(); ++i) {
         const auto& value = snapshot.executions[i];
-        const auto& old   = baseline_.executions[i];
         const auto emit   = [&](const char* name, auto value) {
             out << "ninfer_" << name << "{kind=\"" << kinds[i] << "\"} " << value << '\n';
         };
-        emit("execution_units_total", value.units - old.units);
-        emit("execution_rows_total", value.rows - old.rows);
-        emit("execution_positions_total", value.scheduled_positions - old.scheduled_positions);
-        emit("execution_elapsed_seconds_total",
-             (value.exposure.total.total_ns - old.exposure.total.total_ns) * 1e-9);
+        emit("execution_units_total", value.units);
+        emit("execution_rows_total", value.rows);
+        emit("execution_positions_total", value.scheduled_positions);
+        emit("execution_elapsed_seconds_total", value.exposure.total.total_ns * 1e-9);
     }
     header("rank_gpu_interval_seconds_total", "counter",
            "Observed stream intervals; overlapping, not kernel-active time.");
@@ -372,14 +297,12 @@ std::string Metrics::render(const EngineSnapshot& snapshot, bool ready) const {
            "Successful eager enqueues or recorded graph replays, by rank and group.");
     header("communication_payload_bytes_total", "counter",
            "Collective API payload, not NIC wire traffic.");
-    counter("score_jobs_total", snapshot.scoring.completed_jobs, baseline_.scoring.completed_jobs,
-            "Completed causal scoring jobs.");
-    counter("scored_tokens_total", snapshot.scoring.scored_tokens, baseline_.scoring.scored_tokens,
+    counter("score_jobs_total", snapshot.scoring.completed_jobs, "Completed causal scoring jobs.");
+    counter("scored_tokens_total", snapshot.scoring.scored_tokens,
             "Scored targets, separate from generation.");
-    counter("score_failed_jobs_total", snapshot.scoring.failed_jobs, baseline_.scoring.failed_jobs,
-            "Failed causal scoring jobs.");
+    counter("score_failed_jobs_total", snapshot.scoring.failed_jobs, "Failed causal scoring jobs.");
     counter("score_wall_seconds_total", snapshot.scoring.wall.total_ns * 1e-9,
-            baseline_.scoring.wall.total_ns * 1e-9, "Completed scoring-job wall time.");
+            "Completed scoring-job wall time.");
     gauge("score_active_jobs", snapshot.scoring.active_jobs, "Active causal scoring jobs.");
     std::vector<std::uint32_t> sampled_nodes;
     for (const auto& rank : snapshot.ranks) {
@@ -393,25 +316,15 @@ std::string Metrics::render(const EngineSnapshot& snapshot, bool ready) const {
             out << "ninfer_memory_allocation_bytes{" << labels << ",resource=\"" << resource
                 << "\",location=\"" << location << "\"} " << bytes << '\n';
         };
-        const auto previous =
-            std::find_if(baseline_.ranks.begin(), baseline_.ranks.end(),
-                         [&](const auto& value) { return value.rank == rank.rank; });
-        const RankSnapshot empty;
-        const auto& before                = previous == baseline_.ranks.end() ? empty : *previous;
-        constexpr const char* intervals[] = {"result_stream", "commit_stream", "prefill_stream",
-                                             "vision_stream"};
         for (std::size_t i = 0; i < rank.gpu_intervals.size(); ++i) {
             out << "ninfer_rank_gpu_interval_seconds_total{" << labels << ",interval=\""
-                << intervals[i] << "\"} "
-                << (rank.gpu_intervals[i].total_ns - before.gpu_intervals[i].total_ns) * 1e-9
-                << '\n';
+                << kGpuIntervalNames[i] << "\"} " << rank.gpu_intervals[i].total_ns * 1e-9 << '\n';
             out << "ninfer_rank_gpu_interval_samples_total{" << labels << ",interval=\""
-                << intervals[i] << "\"} "
-                << rank.gpu_intervals[i].count - before.gpu_intervals[i].count << '\n';
+                << kGpuIntervalNames[i] << "\"} " << rank.gpu_intervals[i].count << '\n';
         }
         const auto host_call = [&](const char* name, auto field) {
             out << "ninfer_rank_host_call_seconds_total{" << labels << ",call=\"" << name << "\"} "
-                << (rank.host.*field - before.host.*field) * 1e-9 << '\n';
+                << (rank.host.*field) * 1e-9 << '\n';
         };
         host_call("submit", &RankHostStatistics::submit_ns);
         host_call("progress", &RankHostStatistics::progress_ns);
@@ -422,37 +335,31 @@ std::string Metrics::render(const EngineSnapshot& snapshot, bool ready) const {
                                               "reduce_scatter", "send",      "receive"};
         for (bool graph : {false, true}) {
             const auto& value = graph ? rank.communication_graph : rank.communication_eager;
-            const auto& prior = graph ? before.communication_graph : before.communication_eager;
             for (std::size_t i = 0; i < value.calls.size(); ++i) {
                 const auto tags = labels + ",path=\"" + (graph ? "graph" : "eager") +
                                   "\",operation=\"" + operations[i] + "\"";
-                out << "ninfer_rank_communication_calls_total{" << tags << "} "
-                    << value.calls[i] - prior.calls[i] << '\n';
+                out << "ninfer_rank_communication_calls_total{" << tags << "} " << value.calls[i]
+                    << '\n';
                 out << "ninfer_rank_communication_payload_bytes_total{" << tags << "} "
-                    << value.payload_bytes[i] - prior.payload_bytes[i] << '\n';
+                    << value.payload_bytes[i] << '\n';
             }
         }
         constexpr const char* paths[] = {"eager", "graph", "mixed"};
         for (std::size_t i = 0; i < rank.compute_paths.size(); ++i)
             out << "ninfer_rank_compute_units_total{" << labels << ",path=\"" << paths[i] << "\"} "
-                << rank.compute_paths[i] - before.compute_paths[i] << '\n';
+                << rank.compute_paths[i] << '\n';
         for (const auto& group : rank.communication) {
-            const auto old = std::find_if(before.communication.begin(), before.communication.end(),
-                                          [&](const auto& g) { return g.group == group.group; });
-            const CommunicationStatistics zero;
-            const auto& base = old == before.communication.end() ? zero : *old;
             for (auto path : {false, true}) {
                 const auto& value = path ? group.graph : group.eager;
-                const auto& prior = path ? base.graph : base.eager;
                 for (std::size_t i = 0; i < value.calls.size(); ++i) {
                     const auto tags = labels + ",group=\"" + std::to_string(group.group) +
                                       "\",size=\"" + std::to_string(group.size) + "\",path=\"" +
                                       (path ? "graph" : "eager") + "\",operation=\"" +
                                       operations[i] + "\"";
-                    out << "ninfer_communication_calls_total{" << tags << "} "
-                        << value.calls[i] - prior.calls[i] << '\n';
+                    out << "ninfer_communication_calls_total{" << tags << "} " << value.calls[i]
+                        << '\n';
                     out << "ninfer_communication_payload_bytes_total{" << tags << "} "
-                        << value.payload_bytes[i] - prior.payload_bytes[i] << '\n';
+                        << value.payload_bytes[i] << '\n';
                 }
             }
         }
@@ -490,15 +397,186 @@ std::string Metrics::render(const EngineSnapshot& snapshot, bool ready) const {
             }
         }
         if (rank.memory.ple) {
-            const auto old = before.memory.ple ? *before.memory.ple : PleReadStats{};
-            emit("ple_read_bytes_total", rank.memory.ple->read_bytes - old.read_bytes);
-            emit("ple_upload_bytes_total", rank.memory.ple->uploaded_bytes - old.uploaded_bytes);
+            emit("ple_read_bytes_total", rank.memory.ple->read_bytes);
+            emit("ple_upload_bytes_total", rank.memory.ple->uploaded_bytes);
         }
         if (rank.memory.experts) {
-            const auto old = before.memory.experts ? before.memory.experts->uploaded_bytes : 0;
-            emit("expert_upload_bytes_total", rank.memory.experts->uploaded_bytes - old);
+            emit("expert_upload_bytes_total", rank.memory.experts->uploaded_bytes);
         }
     }
+    gauge("requests_preparing", service.preparing,
+          "Serve requests acquiring and preparing inputs.");
+    counter("requests_submitted_total", requests.submitted,
+            "Parsed generation requests entering preparation.");
+    counter("injected_control_tokens_total", stats.injected_control_tokens,
+            "Committed Engine-injected control tokens, a subset of generated tokens.");
+    counter("spec_decode_committed_draft_tokens_total", stats.speculative_committed_draft_tokens,
+            "Accepted draft tokens retained after output limits, stops and cancellation.");
+    header("engine_requests_total", "counter", "Engine submissions and terminal outcomes.");
+    for (const auto& [name, count] : std::array{std::pair{"submitted", stats.requests.submitted},
+                                                std::pair{"completed", stats.requests.completed},
+                                                std::pair{"cancelled", stats.requests.cancelled},
+                                                std::pair{"failed", stats.requests.failed}})
+        out << "ninfer_engine_requests_total{outcome=\"" << name << "\"} " << count << '\n';
+    header("spec_decode_position_tokens_total", "counter",
+           "Draft and accepted tokens by zero-based position.");
+    for (std::size_t i = 0; i < stats.speculative_attempted_per_position.size(); ++i) {
+        out << "ninfer_spec_decode_position_tokens_total{position=\"" << i
+            << "\",kind=\"attempted\"} " << stats.speculative_attempted_per_position[i] << '\n';
+        out << "ninfer_spec_decode_position_tokens_total{position=\"" << i
+            << "\",kind=\"accepted\"} " << stats.speculative_accepted_per_position.at(i) << '\n';
+    }
+    header("prefix_checkpoints", "gauge", "Advertised checkpoints by retention role.");
+    header("prefix_checkpoints_total", "counter",
+           "Published/released checkpoints; reclaimed is a subset of released.");
+    for (const auto& [name, field] :
+         std::array{std::pair{"input_replay", &PrefixCacheStatistics::input_replay},
+                    std::pair{"long_anchor", &PrefixCacheStatistics::long_anchor},
+                    std::pair{"shared_prefix", &PrefixCacheStatistics::shared_prefix},
+                    std::pair{"continuation", &PrefixCacheStatistics::continuation}}) {
+        const auto& value = stats.prefix_cache.*field;
+        out << "ninfer_prefix_checkpoints{role=\"" << name << "\"} " << value.retained << '\n';
+        for (const auto& [action, count] : std::array{std::pair{"published", value.published},
+                                                      std::pair{"released", value.released},
+                                                      std::pair{"reclaimed", value.reclaimed}})
+            out << "ninfer_prefix_checkpoints_total{role=\"" << name << "\",action=\"" << action
+                << "\"} " << count << '\n';
+    }
+    header("context_resource_bytes", "gauge",
+           "Physical KV/State replicas, independent of shared references.");
+    for (const auto& value : stats.context_resources) {
+        const auto labels =
+            "rank=\"" + std::to_string(value.rank) + "\",domain=\"" +
+            product::context_domain_name(value.domain) + "\",resource=\"" +
+            (value.history_pool ? "kv" : "state") + "\"" +
+            (value.history_pool ? ",pool_id=\"" + std::to_string(*value.history_pool) + "\"" : "");
+        out << "ninfer_context_resource_bytes{" << labels << ",kind=\"live\"} " << value.live_bytes
+            << '\n';
+        out << "ninfer_context_resource_bytes{" << labels << ",kind=\"pending_retirement\"} "
+            << value.pending_retirement_bytes << '\n';
+    }
+    header("placement_requests", "gauge", "Current scheduling state by attention placement.");
+    header("placement_context_tokens", "gauge",
+           "Logical request context lengths by placement, including paused requests.");
+    for (const auto& p : stats.placements) {
+        for (const auto& [name, count] :
+             std::array{std::pair{"resident", p.resident}, std::pair{"prefilling", p.prefilling},
+                        std::pair{"decoding", p.decoding}, std::pair{"replaying", p.replaying},
+                        std::pair{"paused", p.paused}})
+            out << "ninfer_placement_requests{placement=\"" << p.id << "\",kind=\"" << name
+                << "\"} " << count << '\n';
+        out << "ninfer_placement_context_tokens{placement=\"" << p.id << "\"} " << p.context_tokens
+            << '\n';
+    }
+    header("execution_stage_seconds_total", "counter",
+           "Coordinator execution intervals by boundary.");
+    header("execution_stage_samples_total", "counter", "Observed coordinator boundary intervals.");
+    header("decode_step_seconds", "histogram",
+           "All-rank decode retirement latency by actual batch size; one sample per batch.");
+    header("decode_stage_seconds_total", "counter",
+           "Decode boundary exposure by actual batch size.");
+    header("decode_stage_samples_total", "counter",
+           "Decode boundary samples by actual batch size.");
+    const auto stages = [&](const ExecutionCounters& value, const std::string& labels,
+                            const char* prefix) {
+        for (const auto& [name, field] :
+             std::array{std::pair{"result", &ExecutionExposure::result},
+                        std::pair{"resolution", &ExecutionExposure::resolution},
+                        std::pair{"retirement", &ExecutionExposure::retirement},
+                        std::pair{"total", &ExecutionExposure::total}}) {
+            const auto& duration = value.exposure.*field;
+            out << "ninfer_" << prefix << "_stage_seconds_total{" << labels << ",stage=\"" << name
+                << "\"} " << duration.total_ns * 1e-9 << '\n';
+            out << "ninfer_" << prefix << "_stage_samples_total{" << labels << ",stage=\"" << name
+                << "\"} " << duration.count << '\n';
+        }
+    };
+    header("execution_unit_seconds", "histogram", "All-rank retirement latency by execution kind.");
+    const auto execution_histogram = [&](const ExecutionCounters& value, const std::string& labels,
+                                         const char* name) {
+        std::uint64_t count = 0;
+        for (std::size_t bin = 0; bin < value.latency.bins.size(); ++bin) {
+            count += value.latency.bins[bin];
+            out << "ninfer_" << name << "_bucket{" << labels << ",le=\"";
+            if (bin == kExecutionLatencyBoundsNs.size())
+                out << "+Inf";
+            else
+                out << kExecutionLatencyBoundsNs[bin] * 1e-9;
+            out << "\"} " << count << '\n';
+        }
+        out << "ninfer_" << name << "_sum{" << labels << "} "
+            << value.exposure.total.total_ns * 1e-9 << '\n';
+        out << "ninfer_" << name << "_count{" << labels << "} " << count << '\n';
+    };
+    for (std::size_t i = 0; i < snapshot.executions.size(); ++i) {
+        const auto labels = "kind=\"" + std::string(kinds[i]) + "\"";
+        stages(snapshot.executions[i], labels, "execution");
+        execution_histogram(snapshot.executions[i], labels, "execution_unit_seconds");
+    }
+    for (std::size_t i = 0; i < snapshot.decode_by_batch.size(); ++i) {
+        const auto labels = "batch=\"" + std::to_string(i + 1) + "\"";
+        stages(snapshot.decode_by_batch[i], labels, "decode");
+        execution_histogram(snapshot.decode_by_batch[i], labels, "decode_step_seconds");
+    }
+    header("rank_attention_work_total", "counter",
+           "Target attention invocations, valid rows and valid/padded positions.");
+    header("physical_memory_sample_age_seconds", "gauge",
+           "Age of physical memory sample, including time retained at its producer.");
+    header("vision_bytes", "gauge",
+           "Vision budget and live output window by rank; subsets of owned backing.");
+    header("ple_rows_total", "counter", "PLE requested, cached and shared rows.");
+    header("ple_reads_total", "counter", "Completed PLE storage reads.");
+    header("expert_cache_bytes", "gauge", "Expert cache capacity, used and ready bytes.");
+    for (const auto& rank : snapshot.ranks) {
+        for (std::size_t i = 0; i < rank.attention.size(); ++i) {
+            const auto& a = rank.attention[i];
+            for (const auto& [name, value] :
+                 std::array{std::pair{"forwards", a.forwards}, std::pair{"rows", a.rows},
+                            std::pair{"valid_positions", a.valid_positions},
+                            std::pair{"scheduled_positions", a.scheduled_positions}})
+                out << "ninfer_rank_attention_work_total{rank=\"" << rank.rank << "\",kind=\""
+                    << kinds[i] << "\",work=\"" << name << "\"} " << value << '\n';
+        }
+        if (const auto age = product::physical_sample_age_ns(rank, now))
+            out << "ninfer_physical_memory_sample_age_seconds{rank=\"" << rank.rank << "\"} "
+                << *age * 1e-9 << '\n';
+        if (rank.memory.vision) {
+            const auto& v = *rank.memory.vision;
+            for (const auto& [name, value] :
+                 std::array{std::pair{"budget", v.budget_bytes},
+                            std::pair{"output_capacity", v.output_capacity_bytes},
+                            std::pair{"output_active", v.output_active_bytes}})
+                out << "ninfer_vision_bytes{rank=\"" << rank.rank << "\",kind=\"" << name << "\"} "
+                    << value << '\n';
+        }
+        if (rank.memory.ple) {
+            const auto& p = *rank.memory.ple;
+            for (const auto& [name, value] :
+                 std::array{std::pair{"requested", p.rows}, std::pair{"cached", p.cache_hits},
+                            std::pair{"shared", p.shared_rows}})
+                out << "ninfer_ple_rows_total{rank=\"" << rank.rank << "\",kind=\"" << name
+                    << "\"} " << value << '\n';
+            out << "ninfer_ple_reads_total{rank=\"" << rank.rank << "\"} " << p.reads << '\n';
+        }
+        if (rank.memory.experts) {
+            const auto& e = *rank.memory.experts;
+            for (const auto& [name, value] :
+                 std::array{std::pair{"capacity", e.cache_bytes}, std::pair{"used", e.used_bytes},
+                            std::pair{"ready", e.ready_bytes}})
+                out << "ninfer_expert_cache_bytes{rank=\"" << rank.rank << "\",kind=\"" << name
+                    << "\"} " << value << '\n';
+        }
+    }
+    gauge("media_live_bytes", snapshot.media.live_bytes,
+          "Prepared media pinned by current consumers.");
+    gauge("media_retained_bytes", snapshot.media.retained_bytes, "Retained reusable media.");
+    gauge("media_queued_tasks", snapshot.media.queued_tasks, "Queued preprocessing tasks.");
+    gauge("media_active_tasks", snapshot.media.active_tasks, "Active preprocessing tasks.");
+    counter("media_hits_total", snapshot.media.hits, "Media cache hits.");
+    counter("media_misses_total", snapshot.media.misses, "Media cache misses.");
+    counter("media_singleflight_waits_total", snapshot.media.singleflight_waits,
+            "Shared in-flight media preparations.");
+    counter("media_evictions_total", snapshot.media.evictions, "Media cache evictions.");
     return out.str();
 }
 

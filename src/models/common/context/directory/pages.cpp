@@ -537,6 +537,7 @@ PageId PageDirectory::create(RecordReservation& reservation, std::span<const std
                     record.binding().bytes != specification->record.bytes)
                     throw std::invalid_argument(
                         "KV materialization received a different record layout");
+                domains_->classify(record, layout_id_);
                 page.parts.push_back({rank, allocation_pages_->emplace(record, handle)});
             } catch (...) {
                 if (record.valid()) reservation.restore(std::move(record));
@@ -831,6 +832,7 @@ PageDirectory::Restore PageDirectory::reserve_device_replica(PageId handle, std:
         if (destination.domain().memory != ContextMemory::Device ||
             destination.binding().bytes != local.host->record.binding().bytes)
             throw std::invalid_argument("KV restore received a different record layout");
+        domains_->classify(destination, layout_id_);
         local.restoring = allocation_pages_->emplace(destination, handle, source.coverage());
     } catch (...) {
         reservation.restore(std::move(destination));
@@ -848,7 +850,8 @@ PageDirectory::Backup PageDirectory::prepare_host_replica(PageId handle, std::ui
         destination.binding().bytes != physical(handle, rank).bytes || local.backing_up ||
         (local.host && local.host->readers) || host_covers(handle, rank, page.required_columns))
         throw std::logic_error("KV Host backup is not reservable");
-    auto source      = read_device(handle, rank, page.required_columns);
+    auto source = read_device(handle, rank, page.required_columns);
+    domains_->classify(destination, layout_id_);
     local.backing_up = allocation_pages_->emplace(destination, handle, source.coverage());
     return Backup(*this, std::move(source), local.backing_up);
 }

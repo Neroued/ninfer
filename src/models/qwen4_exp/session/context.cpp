@@ -48,6 +48,13 @@ std::uint32_t Session::checkpoint_recovery_frontier(CheckpointHandle h, const Re
                : 0;
 }
 
+std::vector<PlacementDescriptor> Session::placement_descriptions() const {
+    PlacementDescriptor placement;
+    for (const auto& rank : impl_->plan.context.ranks)
+        placement.attention_ranks.push_back(rank.rank);
+    return {std::move(placement)};
+}
+
 std::span<const runtime::PlacementId> Session::placements(const RequestBasePlan&) const {
     static constexpr std::array placements{runtime::PlacementId{0}};
     return placements;

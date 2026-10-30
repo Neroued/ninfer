@@ -39,6 +39,8 @@ public:
 
     void bind_to_current_thread() override {}
 
+    void observe_in_flight(std::vector<ExecutionProgress>&) const override {}
+
     rt::SessionEpoch epoch() const noexcept override { return {1}; }
 
     rt::ExecutionCapacity capacity() const noexcept override { return {1, 1}; }

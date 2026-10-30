@@ -70,6 +70,7 @@ struct ComputeOperation {
     std::optional<Result> result;
     std::vector<float> scores;
     GpuExecutionObservation gpu;
+    AttentionWorkCounters attention;
     std::optional<Tensor> input_embeddings;
     std::unique_ptr<execution::TextRun> text;
 

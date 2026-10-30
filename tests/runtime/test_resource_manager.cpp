@@ -790,6 +790,14 @@ void test_shared_publication_deduplicates_complete_snapshots() {
             "shared capture lookup accepted a position without a complete state");
     require(f.cache.candidates(f.program, request).size() == 2,
             "duplicate shared publication left an extra source");
+    const auto before = f.cache.statistics().shared_prefix;
+    require(before.retained == 1 && before.published == 1 && before.released == 0,
+            "duplicate publication inflated advertised checkpoint statistics");
+    require(f.cache.erase(f.program, first), "fixture checkpoint should be reclaimable");
+    const auto after = f.cache.statistics().shared_prefix;
+    require(after.retained == 0 && after.published == 1 && after.released == 1 &&
+                after.reclaimed == 1,
+            "checkpoint reclamation did not settle its advertised role");
 }
 
 void test_shared_publication_preserves_distinct_placements() {

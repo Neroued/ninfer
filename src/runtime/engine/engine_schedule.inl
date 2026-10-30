@@ -1195,6 +1195,7 @@ void EngineCore<Instance>::worker_loop() noexcept {
             progressed    = poll_execution(boundary);
             finish_engine_phase(boundary, EngineHostPhase::Boundary);
             const auto revision = schedule_revision_.load(std::memory_order_acquire);
+            if (revision != published_revision_) publish_runtime_stats();
             const bool schedule = progressed || revision != scheduled_revision ||
                                   !execution_outstanding() || Clock::now() >= pending_deadline_;
             if (cycle_step_ == CycleStep::Boundary && !compute_pending() && schedule) {
@@ -1204,7 +1205,10 @@ void EngineCore<Instance>::worker_loop() noexcept {
                 begin_cycle(boundary);
                 finish_engine_phase(boundary, EngineHostPhase::Boundary);
             }
-            progressed |= advance_cycle();
+            if (advance_cycle()) {
+                progressed = true;
+                publish_runtime_stats();
+            }
             {
                 ExecutionCallScope call(*this, CoordinatorCall::Flush);
                 instance_.executor->flush();

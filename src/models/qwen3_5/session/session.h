@@ -339,6 +339,7 @@ public:
                    std::span<const CheckpointHandle> private_points = {},
                    std::span<const CheckpointHandle> retired_points = {},
                    runtime::PlacementId target = {}, const ResumeState* resume = nullptr) const;
+    [[nodiscard]] std::vector<PlacementDescriptor> placement_descriptions() const;
     [[nodiscard]] std::span<const runtime::PlacementId> placements(const RequestBasePlan&) const;
     [[nodiscard]] runtime::PlacementId placement(SequenceHandle) const;
     [[nodiscard]] std::uint64_t load_tokens(SequenceHandle) const;

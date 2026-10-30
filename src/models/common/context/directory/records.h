@@ -45,6 +45,11 @@ struct ContextRecordBinding {
     std::uint64_t binding_epoch = 0;
 };
 
+struct RecordUsage {
+    std::uint64_t stride_bytes = 0;
+    std::uint64_t live_records = 0, pending_retirement_records = 0;
+};
+
 // Record-relative fields supplied by the layout owner. Copies preserve represented content.
 struct RecordRangeCopy {
     std::uint32_t source_rank      = 0;
@@ -82,7 +87,9 @@ private:
     ContextPool* pool_ = nullptr;
     ContextDomainId domain_;
     AllocationId allocation_;
-    bool retiring_ = false;
+    bool retiring_      = false;
+    RecordUsage* usage_ = nullptr;
+    void forget() noexcept;
     friend class RecordReservation;
     friend class RecordDomains;
 };
@@ -182,6 +189,10 @@ public:
     [[nodiscard]] const ContextRecordLayout& layout(std::uint32_t id) const;
     [[nodiscard]] ContextPool& pool(ContextDomainId);
     [[nodiscard]] const ContextPool& pool(ContextDomainId) const;
+    // Logical directories classify an owned replica; equal physical classes may serve
+    // different layouts. Classification never changes allocation or reservation policy.
+    void classify(RecordLease&, std::uint32_t layout);
+    [[nodiscard]] const RecordUsage& usage(ContextDomainId, std::uint32_t layout) const;
     [[nodiscard]] RecordAssessment assess(std::span<const RecordDemand>,
                                           std::span<const RecordRelease> = {}) const;
     [[nodiscard]] RecordReserveResult reserve(std::span<const RecordDemand>);

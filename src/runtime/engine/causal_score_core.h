@@ -28,6 +28,11 @@ public:
     using PreparedPrompt = typename ModelContract::PreparedPrompt;
 
     explicit CausalScoreCore(Instance& instance) : instance_(instance) {
+        for (const auto& pool : instance_.session->kv_pools())
+            published_snapshot_.runtime.kv_pools.push_back(
+                {pool.id.index, std::string(pool.label), 0});
+        published_snapshot_.runtime.context_transfers.kv.resize(
+            instance_.session->kv_pools().size());
         published_snapshot_.ranks.assign(instance_.executor->observations().begin(),
                                          instance_.executor->observations().end());
         std::promise<void> startup;
@@ -35,6 +40,7 @@ public:
         worker_                   = std::thread([this, startup = std::move(startup)]() mutable {
             try {
                 instance_.executor->bind_to_current_thread();
+                publish();
                 startup.set_value();
             } catch (...) {
                 startup.set_exception(std::current_exception());
@@ -83,9 +89,11 @@ public:
         return result.get();
     }
 
-    [[nodiscard]] EngineSnapshot snapshot() const {
+    [[nodiscard]] EngineSnapshot snapshot(SnapshotOptions options = {}) const {
         std::lock_guard lock(stats_mutex_);
-        return published_snapshot_;
+        auto result = published_snapshot_;
+        if (options.include_requests) result.requests.emplace();
+        return result;
     }
 
     [[nodiscard]] bool is_available() const {
@@ -110,11 +118,29 @@ public:
 
 private:
     void publish() {
+        EngineStatus status;
+        {
+            std::lock_guard lock(queue_mutex_);
+            status = stopping_ ? EngineStatus::Stopping
+                     : failed_ ? EngineStatus::Failed
+                               : EngineStatus::Ready;
+        }
+        const auto usage = instance_.session->physical_usage();
         std::lock_guard lock(stats_mutex_);
         published_snapshot_.stamp = {published_snapshot_.stamp.sequence + 1, observation_time_ns()};
         published_snapshot_.scoring    = scoring_;
         published_snapshot_.executions = instance_.executor->execution_statistics();
-        const auto ranks               = instance_.executor->observations();
+        published_snapshot_.status     = status;
+        published_snapshot_.in_flight.clear();
+        instance_.executor->observe_in_flight(published_snapshot_.in_flight);
+        published_snapshot_.runtime.context_pools     = usage.pools;
+        published_snapshot_.runtime.context_resources = usage.resources;
+        published_snapshot_.runtime.context_metadata  = usage.metadata;
+        published_snapshot_.runtime.state_objects     = usage.state_objects;
+        published_snapshot_.runtime.history_objects   = usage.history_objects;
+        for (auto& pool : published_snapshot_.runtime.kv_pools)
+            pool.occupied_page_groups = usage.kv_page_groups.at(pool.id);
+        const auto ranks = instance_.executor->observations();
         published_snapshot_.ranks.assign(ranks.begin(), ranks.end());
     }
 
@@ -170,6 +196,7 @@ private:
                     measurement = std::move(measurement_);
                     lock.unlock();
                     instance_.session->fail_all_cleanup();
+                    publish();
                     if (measurement)
                         measurement->completion.set_exception(std::make_exception_ptr(
                             std::runtime_error("causal scoring engine is shutting down")));
@@ -196,7 +223,9 @@ private:
                         throw std::logic_error("scoring execution slot is occupied");
                     }
                     execution_started = true;
+                    publish();
                     instance_.executor->flush();
+                    auto next_observation = observation_time_ns() + 100'000'000;
                     for (;;) {
                         auto event = instance_.session->poll();
                         if (event) {
@@ -212,6 +241,11 @@ private:
                             break;
                         }
                         instance_.executor->flush();
+                        const auto now = observation_time_ns();
+                        if (now >= next_observation) {
+                            publish();
+                            next_observation = now + 100'000'000;
+                        }
                         std::this_thread::yield();
                     }
                 }

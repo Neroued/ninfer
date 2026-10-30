@@ -283,6 +283,14 @@ void CudaEventTimer::start() { CUDA_CHECK(cudaEventRecord(start_, stream_)); }
 
 void CudaEventTimer::record_stop() { CUDA_CHECK(cudaEventRecord(stop_, stream_)); }
 
+void CudaEventTimer::start_external() {
+    CUDA_CHECK(cudaEventRecordWithFlags(start_, stream_, cudaEventRecordExternal));
+}
+
+void CudaEventTimer::record_stop_external() {
+    CUDA_CHECK(cudaEventRecordWithFlags(stop_, stream_, cudaEventRecordExternal));
+}
+
 float CudaEventTimer::elapsed_ms() const {
     float ms = 0.0f;
     CUDA_CHECK(cudaEventElapsedTime(&ms, start_, stop_));

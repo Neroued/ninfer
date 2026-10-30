@@ -86,6 +86,8 @@ Session::inspect_source(const RequestBasePlan& base, std::optional<CheckpointHan
                                  target, resume);
 }
 
+std::vector<PlacementDescriptor> Session::placement_descriptions() const { return {{0, {0}}}; }
+
 std::span<const runtime::PlacementId> Session::placements(const RequestBasePlan&) const {
     static constexpr std::array<runtime::PlacementId, 1> placements{{{0}}};
     return placements;

@@ -11,7 +11,8 @@
 namespace ninfer::serve {
 
 struct RequestLogContext {
-    std::uint64_t id = 0;
+    std::uint64_t engine_request_id = 0;
+    std::uint64_t id                = 0;
     std::string http_request_id;
     std::string response_id;
     std::string protocol;

@@ -161,6 +161,16 @@ void EngineCore<Instance>::commit_pending(PendingBatch&& pending, ComputeFlight 
             counters.accepted_tokens - observed.accepted_tokens;
         cumulative_stats_.speculative_fallback_steps +=
             counters.fallback_steps - observed.fallback_steps;
+        cumulative_stats_.speculative_committed_draft_tokens +=
+            counters.committed_draft_tokens - observed.committed_draft_tokens;
+        for (std::size_t i = 0; i < counters.attempted_per_position.size(); ++i) {
+            cumulative_stats_.speculative_attempted_per_position.at(i) +=
+                counters.attempted_per_position[i] - observed.attempted_per_position.at(i);
+            cumulative_stats_.speculative_accepted_per_position.at(i) +=
+                counters.accepted_per_position[i] - observed.accepted_per_position.at(i);
+            observed.attempted_per_position[i] = counters.attempted_per_position[i];
+            observed.accepted_per_position[i]  = counters.accepted_per_position[i];
+        }
         observed.rounds                 = counters.rounds;
         observed.drafted_tokens         = counters.drafted_tokens;
         observed.accepted_tokens        = counters.accepted_tokens;
@@ -425,10 +435,12 @@ template <class Instance>
 void EngineCore<Instance>::resolve_control(const ComputeFlight& flight) {
     EnginePhaseScope phase(*this, EngineHostPhase::CommitOutput);
     cumulative_stats_.committed_decode_tokens += flight.requests.size() * flight.control_stride;
+    cumulative_stats_.injected_control_tokens += flight.requests.size() * flight.control_stride;
     for (std::size_t row = 0; row < flight.requests.size(); ++row) {
         const auto& request = flight.requests[row];
         ++request->host_timing.control_units;
         request->committed_decode_tokens += flight.control_stride;
+        request->injected_control_tokens += flight.control_stride;
         request->budget->commit(flight.control_stride);
         request->placement_tokens = instance_.session->load_tokens(*request->sequence);
         auto timing               = record_committed_output(request, flight.control_stride);
@@ -626,6 +638,7 @@ void EngineCore<Instance>::fail_all(std::exception_ptr error) noexcept {
     paused.swap(paused_);
     const auto residents = slots_;
     const auto release   = [&](const std::shared_ptr<Request>& request) {
+        if (request) record_completion(request, FinishReason::None, true);
         if (request && prepare_completion(request)) { release_request(request); }
     };
     for (const auto& request : paused) { release(request); }

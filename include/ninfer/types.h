@@ -767,7 +767,7 @@ struct RequestStats {
     // Entry B-1 records this request's full step exposure at actual decode batch B.
     // Summing a complete cohort duplicates each such step B times.
     std::vector<ExecutionExposure> decode_by_batch;
-    std::array<DurationCounter, 4> max_rank_gpu{};
+    GpuIntervalCounters max_rank_gpu{};
     GenerationEngineTiming engine_timing;
     GenerationSchedulingStats scheduling;
     GenerationAdmissionStats admission;

@@ -62,6 +62,7 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
                                 .model                  = request.model,
                                 .stream                 = request.stream,
                                 .output_tokens_explicit = request.output_tokens_explicit};
+    observations_.preparing(req_id, "anthropic_messages", metadata);
     PreparedRequest prepared;
     try {
         prepared = service_->prepare(
@@ -69,7 +70,7 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
             request.stream ? GenerationConsumerMode::Streaming : GenerationConsumerMode::Aggregate,
             {.constraint_timings = true,
              .scheduling         = scheduling_observer(req_id, metadata.http_request_id),
-             .first_token        = first_token_observer()},
+             .first_token        = first_token_observer(req_id)},
             [&req] { return client_disconnected(req); });
     } catch (const ApiException& exception) {
         const ApiError error = normalize_anthropic_error(exception.error());

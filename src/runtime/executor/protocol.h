@@ -16,6 +16,7 @@ void encode(distributed::wire::Encoder&, const RankSnapshot&);
 [[nodiscard]] RankSnapshot rank_snapshot(distributed::wire::Decoder&);
 void encode(distributed::wire::Encoder&, const RankExecutionObservation&);
 [[nodiscard]] RankExecutionObservation rank_execution_observation(distributed::wire::Decoder&);
+[[nodiscard]] std::size_t rank_execution_observation_capacity();
 
 inline constexpr std::size_t kMeasurementErrorBytes = 2048;
 [[nodiscard]] std::size_t measurement_report_capacity(std::size_t snapshot_bytes);

@@ -1,4 +1,5 @@
 #include "serve/metrics.h"
+#include "product/statistics.h"
 
 #include <iostream>
 #include <string>
@@ -31,11 +32,20 @@ int main() {
     baseline.ranks[0].gpu_intervals[0] = {1, 1000, 1000};
     baseline.executions[1].units       = 3;
     baseline.executions[1].rows        = 5;
+    baseline.decode_by_batch.resize(2);
+    baseline.decode_by_batch[1].observe(
+        {{ExecutionKind::Decode, 2, 2, 8}, {.total_ns = 10'000'000}});
+    ServiceObservations observations;
+    observations.attach(baseline);
     Metrics metrics;
-    metrics.configure("custom\"model\\name\nline", options, description, startup, baseline);
+    metrics.configure("custom\"model\\name\nline", options, startup, observations.start_seconds());
     EngineSnapshot running = baseline;
     running.executions[1].units += 2;
     running.executions[1].rows += 4;
+    running.decode_by_batch[1].observe(
+        {{ExecutionKind::Decode, 2, 2, 8}, {.total_ns = 14'000'000}});
+    running.decode_by_batch[1].observe(
+        {{ExecutionKind::Decode, 2, 2, 8}, {.total_ns = 18'000'000}});
     running.ranks[0].gpu_intervals[0] = {4, 9000, 3000};
     running.runtime.generated_tokens += 5;
     running.runtime.speculative_draft_tokens += 6;
@@ -51,8 +61,9 @@ int main() {
     running.runtime.context_transfers.kv.resize(3);
     running.runtime.context_transfers.kv[2][1].bytes = 8192;
     running.runtime.context_transfers.state[4].bytes = 1024;
-    metrics.first_token({.prepare_seconds = 0.05, .elapsed_since_submit_seconds = 0.2});
-    const auto live = metrics.render(running, true);
+    observations.first_token(1, {.prepare_seconds = 0.05, .elapsed_since_submit_seconds = 0.2});
+    const auto live =
+        metrics.render(observations.normalize(running), observations.snapshot(), true);
     check(live.find("ninfer_memory_headroom_bytes{rank=\"0\",node=\"0\"} 512\n") !=
                   std::string::npos &&
               live.find("ninfer_memory_host_reservation_bytes{rank=\"0\",node=\"0\"} 1024\n") !=
@@ -67,6 +78,10 @@ int main() {
           "metrics must distinguish batch/row deltas and measured/unmeasured GPU intervals");
     check(live.find("ninfer_generation_tokens_total 5\n") != std::string::npos,
           "live generated count must exclude startup warmup");
+    check(live.find("ninfer_decode_step_seconds_count{batch=\"2\"} 2\n") != std::string::npos &&
+              live.find("ninfer_execution_unit_seconds_count{kind=\"prefill\"} 0\n") !=
+                  std::string::npos,
+          "execution histograms must retain zero-sample kinds and subtract warmup by actual batch");
     check(live.find("ninfer_spec_decode_draft_tokens_total 6\n") != std::string::npos,
           "speculative work must be observable before request completion");
     check(live.find("ninfer_time_to_first_token_seconds_count 1\n") != std::string::npos &&
@@ -77,7 +92,8 @@ int main() {
           "TTFT must include preparation and use inclusive histogram buckets");
     check(live.find("model_name=\"custom\\\"model\\\\name\\nline\"") != std::string::npos,
           "model label must escape quotes, backslashes and newlines");
-    check(metrics.render(running, true) == live, "scrapes must not consume or reset counters");
+    check(metrics.render(observations.normalize(running), observations.snapshot(), true) == live,
+          "scrapes must not consume or reset counters");
     check(
         live.find("ninfer_context_pool_bytes{rank=\"0\",domain=\"host\",kind=\"live\"} 3072\n") !=
                 std::string::npos &&
@@ -101,16 +117,17 @@ int main() {
     std::vector<std::thread> writers;
     for (int i = 0; i < 4; ++i) {
         writers.emplace_back([&] {
-            for (int n = 0; n < 100; ++n) { metrics.done(outcome); }
+            for (int n = 0; n < 100; ++n) { observations.done(1, outcome); }
         });
     }
     for (auto& writer : writers) { writer.join(); }
     outcome.finish_reason = FinishReason::Cancelled;
-    metrics.done(outcome);
-    metrics.failed(true);
-    metrics.failed(false);
-    metrics.rejected();
-    const auto final = metrics.render(running, false);
+    observations.done(1, outcome);
+    observations.failed(1, true);
+    observations.failed(1, false);
+    observations.rejected(1);
+    const auto final =
+        metrics.render(observations.normalize(running), observations.snapshot(), false);
     check(final.find("ninfer_engine_ready 0\n") != std::string::npos,
           "unavailable engine must remain observable");
     check(final.find("ninfer_requests_total{outcome=\"completed\"} 400\n") != std::string::npos &&
@@ -131,8 +148,9 @@ int main() {
                                                      .cache          = ConstraintCacheAccess::Built,
                                                      .mask_positions = 5,
                                                      .mask_upload_bytes = 128};
-    metrics.done(outcome);
-    const auto constrained = metrics.render(running, false);
+    observations.done(1, outcome);
+    const auto constrained =
+        metrics.render(observations.normalize(running), observations.snapshot(), false);
     check(constrained.find(
               "ninfer_constraint_requests_total{outcome=\"complete_interrupted\"} 1\n") !=
                   std::string::npos &&
@@ -140,5 +158,48 @@ int main() {
               constrained.find("ninfer_constraint_mask_upload_bytes_total 128\n") !=
                   std::string::npos,
           "interrupted complete constraint lost its state or actual work");
+    const auto normalized = observations.normalize(running);
+    const auto json       = product::observation_json(normalized, 1000);
+    check(json["runtime"]["generated_tokens"] == 5 &&
+              json["context"]["pools"][0]["live_bytes"] == 3072,
+          "JSON and metrics must use the same counter baseline while preserving current gauges");
+    RankSnapshot sampled;
+    sampled.received_ns      = 700;
+    sampled.stamp.sampled_ns = 400;
+    sampled.physical_memory  = PhysicalMemorySample{.sampled_ns = 100};
+    check(product::physical_sample_age_ns(sampled, 900) == 500,
+          "physical memory age must include retention at the producer without mixing clock epochs");
+    ServiceObservations live_service;
+    live_service.attach({});
+    live_service.preparing(7, "openai_chat_completions", {.http_request_id = "http-7"});
+    check(live_service.snapshot(true).preparing == 1,
+          "preparation must be observable before Engine submission");
+    live_service.prepared({.engine_request_id = 19, .id = 7});
+    check(live_service.snapshot(true).requests.front().engine_request_id == 19 &&
+              live_service.snapshot().preparing == 0,
+          "service and Engine request identities must remain distinct and linked");
+    live_service.done(7, outcome);
+    check(live_service.snapshot(true).requests.empty(),
+          "completed requests must not remain as history");
+    auto subscriber = live_service.events.subscribe();
+    check(subscriber && !subscriber->next(std::chrono::milliseconds(0)),
+          "new monitor subscription must not replay historical events");
+    live_service.failed(8, false);
+    const auto event = subscriber->next(std::chrono::milliseconds(0));
+    check(event && event->find("request_failed") != std::string::npos &&
+              event->find(live_service.instance_id()) != std::string::npos,
+          "live lifecycle event lost its kind or service identity");
+    for (std::size_t i = 0; i <= MonitorEvents::kMaxQueuedEvents; ++i)
+        live_service.events.publish("event\n");
+    check(subscriber->closed(), "slow monitor must close at its bounded event capacity");
+    subscriber.reset();
+    std::vector<std::shared_ptr<MonitorEvents::Subscription>> subscribers;
+    for (std::size_t i = 0; i < MonitorEvents::kMaxSubscribers; ++i)
+        subscribers.push_back(live_service.events.subscribe());
+    check(!live_service.events.subscribe(),
+          "monitor subscriptions must leave HTTP worker capacity reserved");
+    live_service.stop();
+    check(subscribers.front()->closed() && !live_service.events.subscribe(),
+          "service shutdown must close subscribers and reject new ones");
     return failures == 0 ? 0 : 1;
 }

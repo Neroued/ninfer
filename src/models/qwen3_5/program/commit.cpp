@@ -167,7 +167,9 @@ void RankProgramImpl::retire_compute() {
     }
     auto observation = retirement_observation();
     gpu_timer.observe_retirement(compute->gpu);
-    observation.gpu  = compute->gpu;
+    observation.gpu = compute->gpu;
+    const auto work = ExecutionTypes::describe_work(compute->request.work);
+    if (compute->attention.forwards) observation.attention = {work.kind, compute->attention};
     observation.path = compute->graph_started
                            ? (resources.moe ? ExecutionPath::Mixed : ExecutionPath::Graph)
                            : ExecutionPath::Eager;

@@ -181,6 +181,13 @@ void RankProgramImpl::prepare_main() {
         prefill_timer.start();
         f.timer_started = true;
     }
+    ++f.attention.forwards;
+    f.attention.rows += batch;
+    f.attention.scheduled_positions += std::uint64_t(f.tokens) * batch;
+    if (f.verify)
+        for (auto extent : f.verify->extents) f.attention.valid_positions += extent + 1;
+    else
+        for (const auto& row : f.rows) f.attention.valid_positions += row.ids.size();
     if (device_graphs && !f.sequence) {
         const auto* forward    = std::get_if<ForwardWork>(&f.request.work.operation);
         const bool control     = forward && forward->sample == SampleKind::None;
@@ -192,6 +199,7 @@ void RankProgramImpl::prepare_main() {
         f.phase      = ComputePhase::AfterMain;
         return;
     }
+    if (!f.sequence) gpu_timer.begin_target();
     const execution::TextExecution execution{resources.workspace,
                                              *resources.states,
                                              *resources.main,
@@ -235,6 +243,7 @@ bool RankProgramImpl::advance_layers(std::uint32_t end) {
 
 void RankProgramImpl::after_main() {
     auto& f = *compute;
+    if (!f.sequence && !f.graph_main) gpu_timer.end_target();
     f.run.reset();
     if (!f.verify) {
         if (parameters.mtp)

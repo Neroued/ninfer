@@ -22,12 +22,8 @@ ExecutionCodec::ExecutionCodec(const ModelDefinition& definition,
     const auto ranks = topology.ranks.size(), pools = rank.context.pools.size();
     const auto payloads = contract_.payload_capacity(ranks);
     const auto width    = std::size_t(rank.shape.draft_tokens) + 1;
-    wire::Encoder observed;
-    RankExecutionObservation sample;
-    sample.gpu = {0, 0, 0, 0};
-    runtime::protocol::encode(observed, sample);
     const auto event =
-        std::move(observed).take().size() + 128 +
+        runtime::protocol::rank_execution_observation_capacity() + 128 +
         std::max<std::size_t>({batch * (24 + 4 * width), 4ULL * rank.shape.prefill_chunk,
                                64ULL * 5 * (pools + 1) * ranks});
     auto snapshot = rank.observation;

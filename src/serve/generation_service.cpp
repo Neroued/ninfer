@@ -554,6 +554,9 @@ void GenerationService::warmup() {
         prepare_impl(request, GenerationConsumerMode::Aggregate, {}, {}, {},
                      CacheParticipation::Disabled, DeadlinePolicy::UnboundedStartup);
     run(prepared, nullptr);
+    // Result delivery precedes final device retirement. Finish warmup before the service
+    // establishes its observation baseline, including all-rank execution counters.
+    engine_->reset_measurement_peaks();
 }
 
 } // namespace ninfer::serve

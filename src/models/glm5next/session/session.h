@@ -304,6 +304,7 @@ public:
     [[nodiscard]] std::span<const runtime::KvPoolDescriptor> kv_pools() const noexcept;
     [[nodiscard]] RequestBasePlan plan_request(PreparedPrompt&&,
                                                const runtime::ResolvedExecutionOptions&);
+    [[nodiscard]] std::vector<PlacementDescriptor> placement_descriptions() const;
     [[nodiscard]] std::span<const runtime::PlacementId> placements(const RequestBasePlan&) const;
     [[nodiscard]] runtime::PlacementId placement(SequenceHandle) const;
     [[nodiscard]] std::uint64_t load_tokens(SequenceHandle) const;

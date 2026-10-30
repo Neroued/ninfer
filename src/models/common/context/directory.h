@@ -174,6 +174,7 @@ class ContextTransaction;
 
 struct ContextUsage {
     std::vector<ninfer::ContextPoolUsage> pools;
+    std::vector<ninfer::ContextResourceUsage> resources;
     ninfer::ContextMetadataUsage metadata;
     std::uint64_t state_objects   = 0;
     std::uint64_t history_objects = 0;

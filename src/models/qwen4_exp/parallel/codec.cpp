@@ -23,12 +23,8 @@ runtime::protocol::ControlBudget control_budget(const ModelDefinition& definitio
     const auto payloads = contract.payload_capacity(scope.owners.size());
     // Generated tokens are bounded by speculative positions. Scoring emits
     // at most one prefill chunk; context observations are coalesced by resource/direction.
-    wire::Encoder completion;
-    RankExecutionObservation observed;
-    observed.gpu = {0, 0, 0, 0};
-    runtime::protocol::encode(completion, observed);
     const auto event =
-        std::move(completion).take().size() + 96 +
+        runtime::protocol::rank_execution_observation_capacity() + 96 +
         std::max<std::size_t>({batch * (64 + 4 * positions), 4ULL * s.prefill_chunk + 64,
                                40ULL * 3 * (p.context.pools.size() + 1)});
     wire::Encoder report;

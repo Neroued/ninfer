@@ -17,6 +17,8 @@ add_library(ninfer_serve STATIC
   request_events.cpp
   operational_log.cpp
   request_log.cpp
+  observations.cpp
+  monitor.cpp
   metrics.cpp
   http_server.cpp
   openai_responses_http.cpp

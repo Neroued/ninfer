@@ -76,6 +76,7 @@ private:
     [[nodiscard]] std::shared_ptr<RequestLifecycle> begin_request(RequestLogContext context);
 
     void register_routes();
+    void register_monitor_routes();
     void handle_chat_completions(const httplib::Request& req, httplib::Response& res);
     void handle_messages(const httplib::Request& req, httplib::Response& res);
     void handle_count_tokens(const httplib::Request& req, httplib::Response& res);
@@ -92,7 +93,8 @@ private:
     void record_request_start(const RequestLogContext& context);
     [[nodiscard]] ninfer::GenerationSchedulingObserver
     scheduling_observer(std::uint64_t request_id, std::string http_request_id);
-    [[nodiscard]] ninfer::GenerationFirstTokenObserver first_token_observer();
+    [[nodiscard]] ninfer::GenerationFirstTokenObserver
+    first_token_observer(std::uint64_t request_id);
     void record_request_rejected(const RequestRejectionLogContext& context);
     void record_request_done(const RequestLogContext& context, const GenerationOutcome& outcome);
     void record_request_failure(const RequestLogContext& context, const RequestFailure& failure);
@@ -106,6 +108,7 @@ private:
     std::string public_model_id_;
     OpenAIResponsesStore openai_responses_store_;
     OperationalLog operational_log_;
+    ServiceObservations observations_;
     JsonlRequestLog request_jsonl_;
     Metrics metrics_;
     httplib::Server server_;

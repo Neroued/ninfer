@@ -137,13 +137,12 @@ Json execution_json(const ExecutionSample& value) {
 
 Json request_execution_json(const RequestStats& value) {
     constexpr const char* names[] = {"prefill", "decode", "replay", "control", "score", "context"};
-    constexpr const char* intervals[] = {"result_stream", "commit_stream", "prefill_stream",
-                                         "vision_stream"};
+
     Json out;
     for (std::size_t i = 0; i < value.executions.size(); ++i)
         out[names[i]] = execution_json(value.executions[i]);
     for (std::size_t i = 0; i < value.max_rank_gpu.size(); ++i)
-        out["max_rank_gpu_intervals"][intervals[i]] = duration_json(value.max_rank_gpu[i]);
+        out["max_rank_gpu_intervals"][kGpuIntervalNames[i]] = duration_json(value.max_rank_gpu[i]);
     return out;
 }
 

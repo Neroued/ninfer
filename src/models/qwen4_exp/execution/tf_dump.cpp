@@ -86,30 +86,47 @@ void TfDump::capture_layer(std::int32_t layer, const Tensor& value, std::int32_t
     out.flush();
     if (!out) { throw std::runtime_error("tf_dump: short write of a compact hidden tap"); }
     out.close();
-    // Derive positions from what is ACTUALLY on disk: re-read the first tap layer's .bin,
-    // count the total columns, and write positions.npy = 0..total-1. This guarantees
-    // positions always match the features (the dump is constructed per chunk and capture_layer
-    // is also called from non-prefill phases, so a running counter would drift).
-    const std::string fpath = (directory_ / ("hidden_" + std::string(name) + ".bin")).string();
-    std::size_t total_cols = 0;
-    if (std::ifstream in(fpath, std::ios::binary); in) {
-        std::uint32_t fp, cols, rows32;
-        while (in.read(reinterpret_cast<char*>(&fp), 4) &&
-               in.read(reinterpret_cast<char*>(&cols), 4) &&
-               in.read(reinterpret_cast<char*>(&rows32), 4)) {
-            total_cols += cols;
-            in.seekg(static_cast<std::streamoff>(static_cast<std::uint64_t>(cols) * rows32 * 2),
-                     std::ios::cur);
-        }
-    }
+    // Derive positions from what is ACTUALLY on disk: count the total columns across all
+    // hidden records and write positions.npy = 0..total-1. This guarantees positions always
+    // match the features (the dump is constructed per chunk and capture_layer is also called
+    // from non-prefill phases, so a running counter would drift).
+    const std::size_t total_cols = hidden_columns();
     std::vector<std::int32_t> pos(total_cols);
     for (std::size_t i = 0; i < total_cols; ++i) { pos[i] = static_cast<std::int32_t>(i); }
     write_npy(directory_ / "positions.npy", "<i4", pos.size(), pos.data(), sizeof(std::int32_t));
 }
 
+std::size_t TfDump::hidden_columns() const {
+    std::size_t total = 0;
+    for (const auto& entry : std::filesystem::directory_iterator(directory_)) {
+        const auto file_name = entry.path().filename().string();
+        if (!file_name.starts_with("hidden_") || !file_name.ends_with(".bin")) { continue; }
+        std::uint32_t fp, cols, rows32;
+        if (std::ifstream in(entry.path(), std::ios::binary); in) {
+            while (in.read(reinterpret_cast<char*>(&fp), 4) &&
+                   in.read(reinterpret_cast<char*>(&cols), 4) &&
+                   in.read(reinterpret_cast<char*>(&rows32), 4)) {
+                total += cols;
+                in.seekg(static_cast<std::streamoff>(static_cast<std::uint64_t>(cols) * rows32 * 2),
+                         std::ios::cur);
+            }
+        }
+    }
+    return total;
+}
+
 void TfDump::write_tokens(std::span<const std::int32_t> tokens) {
-    std::vector<std::int64_t> wide(tokens.begin(), tokens.end());
-    write_npy(directory_ / "tokens.npy", "<i8", wide.size(), wide.data(), sizeof(std::int64_t));
+    for (const auto t : tokens) { all_tokens_.push_back(t); }
+    // Rewrite in full so tokens.npy always covers every appended hidden record.
+    write_npy(directory_ / "tokens.npy", "<i8", all_tokens_.size(), all_tokens_.data(),
+              sizeof(std::int64_t));
+    // Alignment guard: a misaligned dump is worse than a crash — fail loudly.
+    const std::size_t cols = hidden_columns();
+    if (cols != all_tokens_.size()) {
+        throw std::runtime_error("tf_dump: token/hidden misalignment (" +
+                                 std::to_string(all_tokens_.size()) + " tokens vs " +
+                                 std::to_string(cols) + " hidden columns)");
+    }
 }
 
 void TfDump::write_meta(const std::string& producer, const std::string& artifact) const {

@@ -48,8 +48,15 @@ public:
     [[nodiscard]] bool enabled() const noexcept { return true; }
 
 private:
+    // Total hidden columns across all hidden_*.bin records on disk.
+    [[nodiscard]] std::size_t hidden_columns() const;
+
     std::filesystem::path directory_;
     std::vector<std::uint16_t> scratch_;
+    // Accumulated token ids; tokens.npy is rewritten in full on every write_tokens call so it
+    // always aligns with the appended hidden records (a per-chunk overwrite would leave only
+    // the last chunk's ids).
+    std::vector<std::int64_t> all_tokens_;
 };
 
 } // namespace ninfer::models::qwen4_exp::execution

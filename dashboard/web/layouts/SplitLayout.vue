@@ -4,7 +4,9 @@
     <slot name="notice" />
     <main class="split-main">
       <div class="split-left">
-        <slot name="hero" /><slot name="timeline" /><slot name="requests" />
+        <slot name="hero" />
+        <div class="timeline-block"><slot name="timeline" /></div>
+        <slot name="requests" />
       </div>
       <slot name="rail" />
     </main>

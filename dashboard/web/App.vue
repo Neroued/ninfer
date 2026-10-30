@@ -225,7 +225,6 @@ async function applyDates() {
         :instance="instance"
         :summary="summary"
         :gauges="gauges"
-        :points="points"
         :events="events"
         :now="now"
         :range-label="rangeLabel"

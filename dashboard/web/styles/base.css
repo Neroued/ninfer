@@ -27,7 +27,12 @@
   --mono: 'IBM Plex Mono', ui-monospace, monospace;
   --page-x: clamp(18px, 1.7vw, 32px);
   --gap: clamp(14px, 1.2vw, 22px);
-  --label-size: clamp(10.5px, 0.8vw, 11.5px);
+  --text-micro: 10.5px;
+  --text-small: 11.5px;
+  --text-label: clamp(11.5px, 0.85vw, 12.5px);
+  --text-body: 12.5px;
+  --text-drawer: 13px;
+  --label-size: var(--text-label);
   font-family: var(--sans);
   font-synthesis: none;
   text-rendering: optimizeLegibility;
@@ -130,7 +135,7 @@ dd {
   color: var(--muted);
 }
 .text-button {
-  font: 11px var(--mono);
+  font: var(--text-small) var(--mono);
   color: var(--muted);
 }
 .section-heading {
@@ -138,7 +143,7 @@ dd {
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-  font-size: 11px;
+  font-size: 12px;
 }
 .dot-sep {
   color: var(--faint);
@@ -150,7 +155,7 @@ dd {
   align-items: center;
 }
 .tabs button {
-  font: 10.5px var(--mono);
+  font: 11.5px var(--mono);
   color: var(--muted);
   text-transform: uppercase;
   letter-spacing: 0.07em;
@@ -179,7 +184,7 @@ dd {
 .empty-state {
   padding: 40px 12px;
   text-align: center;
-  font: 12px var(--mono);
+  font: 13px var(--mono);
   color: var(--muted);
 }
 .uplot {
@@ -195,7 +200,7 @@ dd {
 .notice {
   padding: 10px 0;
   color: var(--alert);
-  font-size: 11px;
+  font-size: 12px;
   border-bottom: 1px solid var(--rule);
   overflow-wrap: anywhere;
 }
@@ -247,7 +252,7 @@ dd {
   margin-bottom: 12px;
 }
 .drawer-section p {
-  font-size: 12px;
+  font-size: 13px;
   line-height: 1.7;
   margin-bottom: 10px;
 }
@@ -257,7 +262,7 @@ dd {
 table {
   width: 100%;
   border-collapse: collapse;
-  font: 11px/1.6 var(--mono);
+  font: 12px/1.6 var(--mono);
 }
 th {
   font-weight: 400;
@@ -280,7 +285,7 @@ td:first-child {
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(0, 1.15fr);
   gap: 11px 20px;
-  font: 11.5px/1.5 var(--mono);
+  font: 12.5px/1.5 var(--mono);
   margin: 0;
 }
 .detail-list dt {
@@ -294,7 +299,7 @@ td:first-child {
 }
 .drawer details {
   margin-top: 16px;
-  font-size: 12px;
+  font-size: 13px;
   color: var(--secondary);
 }
 .drawer details > summary {
@@ -307,7 +312,7 @@ td:first-child {
   gap: 6px 20px;
   padding: 12px 0;
   border-bottom: 1px solid var(--rule);
-  font-size: 11px;
+  font-size: 12px;
 }
 .event-detail > span {
   grid-column: 2;

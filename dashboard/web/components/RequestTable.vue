@@ -35,7 +35,7 @@ function trace(row: RequestRow): string {
     <div class="request-scroll">
       <div class="request-grid request-head label">
         <span>Phase</span><span>ID</span><span>Age</span><span>Context</span><span>Speed</span
-        ><span>TTFT</span><span>Gen</span><span class="trace-column">Trace</span>
+        ><span>TTFT</span><span class="request-gen">Gen</span><span class="trace-column">Trace</span>
       </div>
       <template v-for="(group, index) in [rows, completed]" :key="index">
         <div v-if="index && group.length" class="request-divider label">Recently completed</div>

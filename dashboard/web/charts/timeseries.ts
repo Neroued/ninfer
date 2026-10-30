@@ -61,7 +61,7 @@ export class TimeSeries {
       {
         width: Math.max(200, element.clientWidth),
         height,
-        padding: [10, 8, 2, 0],
+        padding: [10, 28, 2, 0],
         legend: { show: false },
         cursor: {
           drag: { x: true, y: false, setScale: false },
@@ -76,10 +76,11 @@ export class TimeSeries {
           {
             show: showTime,
             stroke: color('muted'),
-            size: 25,
+            size: 28,
+            space: 100,
             grid: { show: false },
             ticks: { show: false },
-            font: '10px "IBM Plex Mono", monospace',
+            font: '11px "IBM Plex Mono", monospace',
             gap: 6,
             values: (plot, values) => {
               const span = (plot.scales.x.max ?? 0) - (plot.scales.x.min ?? 0);
@@ -99,8 +100,8 @@ export class TimeSeries {
           },
           {
             stroke: color('muted'),
-            size: 44,
-            font: '10px "IBM Plex Mono", monospace',
+            size: 48,
+            font: '11px "IBM Plex Mono", monospace',
             grid: { stroke: color('grid'), width: 1 },
             ticks: { show: false },
             values: (_u, values) =>

@@ -1,9 +1,24 @@
 <script setup lang="ts">
-import { computed } from 'vue';
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue';
 import type { Distribution } from '../../shared/types.js';
 import { ms } from '../format.js';
 
 const props = defineProps<{ ttft: Distribution | null | undefined }>();
+
+const plot = ref<HTMLDivElement | null>(null);
+const width = ref(400);
+let observer: ResizeObserver | null = null;
+
+onMounted(() => {
+  if (!plot.value) return;
+  width.value = Math.max(280, plot.value.clientWidth);
+  observer = new ResizeObserver(([entry]) => {
+    width.value = Math.max(280, entry.contentRect.width);
+  });
+  observer.observe(plot.value);
+});
+
+onBeforeUnmount(() => observer?.disconnect());
 
 const geometry = computed(() => {
   const ttft = props.ttft;
@@ -27,7 +42,7 @@ const geometry = computed(() => {
   );
 
   const left = 0;
-  const right = 392;
+  const right = Math.max(280, width.value) - 8;
   const top = 10;
   const bottom = 48;
   const logMin = Math.log10(minMs);
@@ -69,13 +84,18 @@ const geometry = computed(() => {
   const ticks = tickValues.map((value) => ({ value, text: ms(value) }));
 
   const aria = `TTFT distribution, ${ttft.count} samples, p50 ${ms(ttft.p50)}, p90 ${ms(ttft.p90)}, p99 ${ms(ttft.p99)}`;
-  return { bars, markers, ticks, x, aria, minMs, maxMs };
+  return { bars, markers, ticks, x, aria, minMs, maxMs, width: right + 8 };
 });
 </script>
 
 <template>
-  <div class="ttft-pdf" role="img" :aria-label="geometry?.aria ?? 'No first-token samples'">
-    <svg v-if="geometry" viewBox="0 0 400 64" preserveAspectRatio="none" aria-hidden="true">
+  <div ref="plot" class="ttft-pdf" role="img" :aria-label="geometry?.aria ?? 'No first-token samples'">
+    <svg
+      v-if="geometry"
+      :viewBox="`0 0 ${geometry.width} 64`"
+      preserveAspectRatio="none"
+      aria-hidden="true"
+    >
       <g class="ttft-pdf-bars">
         <rect
           v-for="bar in geometry.bars"

@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed } from 'vue';
-import type { ChartPoint, Instance, MonitorEvent, Numbers, Summary } from '../../shared/types.js';
+import type { Instance, MonitorEvent, Numbers, Summary } from '../../shared/types.js';
 import { age, bytes, label, ms, number, sampleAge, tokens } from '../format.js';
 import TtftDistribution from './TtftDistribution.vue';
 
@@ -8,7 +8,6 @@ const props = defineProps<{
   instance: Instance | null;
   summary: Summary | null;
   gauges: Numbers;
-  points: ChartPoint[];
   events: MonitorEvent[];
   now: number;
   rangeLabel: string;
@@ -52,22 +51,6 @@ const nowScope = computed(() =>
 const eventScope = computed(() =>
   props.mode === 'paused' ? 'paused' : props.mode === 'history' ? 'in range' : 'live',
 );
-const contextLine = computed(() => {
-  const points = props.points;
-  if (points.length < 2) return '';
-  let drawing = false;
-  return points
-    .map((point, i) => {
-      if (point.context === null) {
-        drawing = false;
-        return '';
-      }
-      const segment = `${drawing ? 'L' : 'M'}${(i * 400) / (points.length - 1)},${37 - point.context * 0.32}`;
-      drawing = true;
-      return segment;
-    })
-    .join(' ');
-});
 </script>
 
 <template>
@@ -105,14 +88,6 @@ const contextLine = computed(() => {
           >{{ bytes(pool.occupied) }}<span class="muted"> / {{ bytes(pool.capacity) }}</span></span
         >
       </div>
-      <svg
-        class="context-spark"
-        viewBox="0 0 400 40"
-        preserveAspectRatio="none"
-        aria-label="Context pool usage trend"
-      >
-        <path :d="contextLine" />
-      </svg>
       <p class="instrument-note mono">
         ≈ {{ tokens(instance?.info.model.context_token_capacity_estimate) }} token capacity
       </p>
@@ -173,9 +148,6 @@ const contextLine = computed(() => {
         accepted / drafted · fallback {{ number(summary?.fallbackPercent) }}%
       </p>
       <div class="thin-meter"><span :style="{ width: `${summary?.specPercent ?? 0}%` }" /></div>
-      <p class="instrument-note mono">
-        {{ tokens(summary?.committedDrafts) }} draft tokens committed
-      </p>
     </section>
 
     <section class="instrument instrument--prefix">

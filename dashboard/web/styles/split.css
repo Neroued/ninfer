@@ -361,16 +361,46 @@
   min-height: 0;
   overflow-y: auto;
   scrollbar-gutter: stable;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  column-gap: var(--gap);
+  align-content: start;
 }
 .instrument {
-  padding: 16px 0;
+  padding: 13px 0;
   border-bottom: 1px solid var(--rule);
+  min-width: 0;
+}
+.instrument--context,
+.instrument--ttft,
+.instrument--load {
+  grid-column: 1 / -1;
+}
+.instrument--spec,
+.instrument--prefix,
+.instrument--ranks,
+.instrument--recent {
+  grid-column: auto;
+}
+.instrument--spec .instrument-value,
+.instrument--prefix .instrument-value,
+.instrument--ranks .instrument-value,
+.instrument--recent .instrument-value {
+  font-size: clamp(21px, 1.55vw, 25px);
 }
 .instrument:first-child {
   padding-top: 0;
 }
 .instrument:last-child {
   border: 0;
+}
+.scope {
+  margin-left: 6px;
+  color: var(--faint);
+  font-size: 9px;
+  font-weight: 400;
+  letter-spacing: 0;
+  text-transform: none;
 }
 .instrument-heading {
   display: flex;
@@ -434,26 +464,45 @@
   vector-effect: non-scaling-stroke;
   fill: none;
 }
-.histogram {
-  margin: 12px 0 8px;
-  height: 54px;
-  display: flex;
-  gap: 2px;
-  align-items: flex-end;
-  background: var(--plot);
+.ttft-pdf {
   position: relative;
-  border-bottom: 1px solid var(--rule);
+  height: 64px;
+  margin: 12px 0 8px;
+  background: var(--plot);
+  overflow: hidden;
 }
-.histogram > span:not(.histogram-empty) {
-  flex: 1;
-  background: var(--secondary);
-  opacity: 0.45;
-  min-width: 0;
+.ttft-pdf svg {
+  display: block;
+  width: 100%;
+  height: 100%;
+  overflow: visible;
 }
-.histogram > span:hover {
+.ttft-pdf-bar {
+  fill: var(--decode-fill);
+  stroke: var(--decode);
+  stroke-width: 0.8;
   opacity: 0.9;
 }
-.histogram-empty {
+.ttft-pdf-bar:hover {
+  opacity: 1;
+}
+.ttft-marker-line {
+  stroke: var(--decode);
+  stroke-width: 1;
+  opacity: 0.35;
+  vector-effect: non-scaling-stroke;
+}
+.ttft-marker-line.p90 {
+  stroke: var(--prefill);
+}
+.ttft-marker-line.p99 {
+  stroke: var(--faint);
+}
+.ttft-axis text {
+  fill: var(--faint);
+  font: 9px var(--mono);
+}
+.ttft-pdf-empty {
   position: absolute;
   inset: 0;
   display: grid;
@@ -568,13 +617,11 @@
     border-left: 0;
     border-top: 1px solid var(--rule);
     padding-left: 0;
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    column-gap: 30px;
+    column-gap: var(--gap);
     overflow: visible;
   }
   .instrument:first-child {
-    padding-top: 16px;
+    padding-top: 14px;
   }
   .requests-panel {
     min-height: 200px;
@@ -714,23 +761,35 @@
     display: none;
   }
   .telemetry-rail {
-    column-gap: 20px;
+    column-gap: 16px;
   }
-  .context-instrument,
-  .instrument:nth-child(2),
-  .instrument:nth-child(3),
-  .instrument:nth-child(6),
-  .recent-instrument {
+  .instrument--context,
+  .instrument--ttft,
+  .instrument--load,
+  .instrument--ranks,
+  .instrument--recent {
     grid-column: 1 / -1;
+  }
+  .instrument--spec,
+  .instrument--prefix {
+    grid-column: auto;
   }
   .instrument-value {
     font-size: 25px;
+  }
+  .instrument--spec .instrument-value,
+  .instrument--prefix .instrument-value,
+  .instrument--ranks .instrument-value {
+    font-size: 21px;
   }
   .instrument-note {
     font-size: 9px;
   }
   .instrument-heading .label {
     font-size: 9px;
+  }
+  .scope {
+    font-size: 8px;
   }
   .page-footer,
   .footer-left,

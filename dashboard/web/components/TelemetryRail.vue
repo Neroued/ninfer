@@ -2,6 +2,7 @@
 import { computed } from 'vue';
 import type { ChartPoint, Instance, MonitorEvent, Numbers, Summary } from '../../shared/types.js';
 import { age, bytes, label, ms, number, sampleAge, tokens } from '../format.js';
+import TtftDistribution from './TtftDistribution.vue';
 
 const props = defineProps<{
   instance: Instance | null;
@@ -10,6 +11,8 @@ const props = defineProps<{
   points: ChartPoint[];
   events: MonitorEvent[];
   now: number;
+  rangeLabel: string;
+  mode: 'live' | 'paused' | 'history';
 }>();
 const emit = defineEmits<{ details: []; events: [] }>();
 const devicePools = computed(
@@ -43,7 +46,12 @@ const total = computed(() =>
   ),
 );
 const ttft = computed(() => props.summary?.ttft);
-const maximumBin = computed(() => Math.max(1, ...(ttft.value?.bins ?? [])));
+const nowScope = computed(() =>
+  props.mode === 'paused' ? 'paused' : props.mode === 'history' ? 'at end' : 'now',
+);
+const eventScope = computed(() =>
+  props.mode === 'paused' ? 'paused' : props.mode === 'history' ? 'in range' : 'live',
+);
 const contextLine = computed(() => {
   const points = props.points;
   if (points.length < 2) return '';
@@ -60,18 +68,13 @@ const contextLine = computed(() => {
     })
     .join(' ');
 });
-
-function binLabel(index: number) {
-  const bounds = ttft.value?.bounds ?? [];
-  return `${index ? ms(bounds[index - 1]) : '0'} – ${index < bounds.length ? ms(bounds[index]) : '∞'}: ${ttft.value?.bins[index] ?? 0} requests`;
-}
 </script>
 
 <template>
   <aside class="telemetry-rail">
-    <section class="instrument context-instrument">
+    <section class="instrument instrument--context">
       <div class="instrument-heading">
-        <span class="label">Context pool</span
+        <span class="label">Context pool <span class="scope">{{ nowScope }}</span></span
         ><span class="instrument-value">{{ number(gauges.context_percent) }}<small>%</small></span>
       </div>
       <p class="instrument-note mono">
@@ -115,31 +118,23 @@ function binLabel(index: number) {
       </p>
     </section>
 
-    <section class="instrument">
+    <section class="instrument instrument--ttft">
       <div class="instrument-heading">
-        <span class="label">TTFT</span
+        <span class="label">TTFT <span class="scope">{{ rangeLabel }}</span></span
         ><span class="instrument-value">{{ number(ttft?.p50, 0) }}<small>ms</small></span>
       </div>
-      <div class="histogram" aria-label="TTFT histogram bucket counts">
-        <span
-          v-for="(count, index) in ttft?.bins ?? []"
-          :key="index"
-          :title="binLabel(index)"
-          :style="{ height: `${(count / maximumBin) * 100}%` }"
-        />
-        <span v-if="!ttft?.count" class="histogram-empty mono">No first-token samples</span>
-      </div>
+      <TtftDistribution :ttft="ttft" />
       <div class="instrument-note mono">
         ≈ p50 {{ ms(ttft?.p50) }} · p90 {{ ms(ttft?.p90) }} · p99 {{ ms(ttft?.p99) }}
       </div>
       <div class="instrument-note mono muted">
-        {{ number(ttft?.count ?? 0, 0) }} samples · bucket counts
+        {{ number(ttft?.count ?? 0, 0) }} samples
       </div>
     </section>
 
-    <section class="instrument">
+    <section class="instrument instrument--load">
       <div class="instrument-heading">
-        <span class="label">Load</span
+        <span class="label">Load <span class="scope">{{ nowScope }}</span></span
         ><span class="instrument-value"
           >{{ number(gauges.running_requests, 0) }}<small>running</small></span
         >
@@ -158,7 +153,8 @@ function binLabel(index: number) {
           ><strong>{{ number(gauges['service.preparing'], 0) }}</strong>
         </div>
         <div>
-          <span class="label">Queue p50</span><strong>{{ ms(summary?.queue.p50) }}</strong>
+          <span class="label">Queue p50 <span class="scope">{{ rangeLabel }}</span></span
+          ><strong>{{ ms(summary?.queue.p50) }}</strong>
         </div>
       </div>
       <p class="instrument-note mono">
@@ -168,9 +164,9 @@ function binLabel(index: number) {
       </p>
     </section>
 
-    <section class="instrument">
+    <section class="instrument instrument--spec">
       <div class="instrument-heading">
-        <span class="label">Speculation</span
+        <span class="label">Speculation <span class="scope">{{ rangeLabel }}</span></span
         ><span class="instrument-value">{{ number(summary?.specPercent) }}<small>%</small></span>
       </div>
       <p class="instrument-note mono">
@@ -182,9 +178,9 @@ function binLabel(index: number) {
       </p>
     </section>
 
-    <section class="instrument">
+    <section class="instrument instrument--prefix">
       <div class="instrument-heading">
-        <span class="label">Prefix cache</span
+        <span class="label">Prefix cache <span class="scope">{{ rangeLabel }}</span></span
         ><span class="instrument-value">{{ number(summary?.prefixPercent) }}<small>%</small></span>
       </div>
       <p class="instrument-note mono">
@@ -195,9 +191,9 @@ function binLabel(index: number) {
       </div>
     </section>
 
-    <section class="instrument">
+    <section class="instrument instrument--ranks">
       <div class="instrument-heading">
-        <button class="label" @click="emit('details')">Ranks ↗</button
+        <button class="label" @click="emit('details')">Ranks ↗ <span class="scope">{{ nowScope }}</span></button
         ><span class="instrument-value"
           >{{ instance?.info.ranks.length ?? '—' }}<small>ranks</small></span
         >
@@ -218,9 +214,9 @@ function binLabel(index: number) {
       </p>
     </section>
 
-    <section class="instrument recent-instrument">
+    <section class="instrument instrument--recent">
       <div class="instrument-heading">
-        <button class="label" @click="emit('events')">Recent events ↗</button>
+        <button class="label" @click="emit('events')">Recent events ↗ <span class="scope">{{ eventScope }}</span></button>
       </div>
       <div
         v-for="event in events.slice(0, 3)"

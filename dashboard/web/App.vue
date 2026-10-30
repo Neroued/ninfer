@@ -68,6 +68,11 @@ const status = computed(() =>
           : 'live'
         : 'disconnected',
 );
+const rangeLabel = computed(() => {
+  const preset = ranges.find(([value]) => value === rangeMs.value);
+  return preset?.[1] ?? 'custom';
+});
+const ttft = computed(() => summary.value?.ttft ?? null);
 const model = computed(() => instance.value?.info.model);
 const topology = computed(() => {
   const rank = instance.value?.info.ranks[0];
@@ -161,7 +166,8 @@ async function applyDates() {
             ><strong>{{ number(hero?.prefillTps, 0) }}<small>tok/s</small></strong>
           </div>
           <div>
-            <span class="label">Decode step</span><strong>{{ ms(hero?.stepMs) }}</strong>
+            <span class="label">TTFT p50 <span class="scope">{{ rangeLabel }}</span></span
+            ><strong>{{ ms(ttft?.p50) }}</strong>
           </div>
           <div>
             <span class="label">Running</span
@@ -222,6 +228,8 @@ async function applyDates() {
         :points="points"
         :events="events"
         :now="now"
+        :range-label="rangeLabel"
+        :mode="mode"
         @details="drawer = 'deployment'"
         @events="openEvents"
     /></template>

@@ -225,6 +225,32 @@ std::size_t SessionImpl::host_released(std::span<const CheckpointHandle> records
         footprint(records, true).replicas(context::ContextMemory::Host));
 }
 
+runtime::CheckpointEvictableResources
+SessionImpl::checkpoint_evictable_resources(CheckpointHandle handle) const {
+    runtime::CheckpointEvictableResources out;
+    if (!checkpoints.erasable(handle)) return out;
+    const std::array handles{handle};
+    const auto released = footprint(handles, true);
+    out.state_slots = static_cast<std::uint32_t>(released.states.size());
+    for (const auto page : released.pages) {
+        if (page.pool_id < out.kv_page_groups.size()) ++out.kv_page_groups[page.pool_id];
+    }
+    out.host_bytes = host_released(handles);
+    return out;
+}
+
+std::size_t SessionImpl::state_image_bytes() const noexcept {
+    return directory.states().image_bytes();
+}
+
+std::size_t SessionImpl::kv_page_bytes(std::uint32_t pool) const noexcept {
+    return directory.pool(pool).pages().layout().parts.front().record.bytes;
+}
+
+std::uint32_t SessionImpl::state_slots_capacity() const noexcept {
+    return directory.states().capacity();
+}
+
 std::shared_ptr<Demotion> SessionImpl::demotion(std::span<const CheckpointHandle> records) const {
     if (!has_host(*this)) return {};
     auto plan   = std::make_shared<Demotion>();
@@ -529,6 +555,21 @@ runtime::ContextStart Session::start_maintenance(const ContextAssessment& assess
 
 std::size_t Session::host_bytes_released(std::span<const CheckpointHandle> records) const {
     return impl_->host_released(records);
+}
+
+runtime::CheckpointEvictableResources
+Session::checkpoint_evictable_resources(CheckpointHandle checkpoint) const {
+    return impl_->checkpoint_evictable_resources(checkpoint);
+}
+
+std::size_t Session::state_image_bytes() const noexcept { return impl_->state_image_bytes(); }
+
+std::size_t Session::kv_page_bytes(std::uint32_t pool) const noexcept {
+    return impl_->kv_page_bytes(pool);
+}
+
+std::uint32_t Session::state_slots_capacity() const noexcept {
+    return impl_->state_slots_capacity();
 }
 
 context::RecoveryEvaluation<>

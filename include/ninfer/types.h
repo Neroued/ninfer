@@ -3,6 +3,7 @@
 #include "ninfer/deployment.h"
 #include "ninfer/observability/snapshot.h"
 
+#include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -788,6 +789,65 @@ struct GenerationResult {
     FinishReason finish_reason     = FinishReason::None;
     std::optional<std::string> matched_stop_string;
     RequestStats stats;
+};
+
+// Stable identity of a resident prefix: content digests, token frontier, and identity tag.
+// Mirrors the engine-internal prefix shortlist key; it is the cache's own grouping key.
+struct PrefixCacheKey {
+    std::uint64_t digest0      = 0;
+    std::uint64_t digest1      = 0;
+    std::uint32_t frontier     = 0;
+    std::uint32_t identity_tag = 0;
+
+    friend bool operator==(const PrefixCacheKey&, const PrefixCacheKey&) noexcept = default;
+};
+
+// Stable bound on the KV pools a resident prefix can occupy; extra pools are not reported.
+inline constexpr std::size_t kMaximumKvPools = 4;
+
+// One resident prefix: every live checkpoint sharing a PrefixCacheKey.
+struct PrefixCacheEntry {
+    PrefixCacheKey key;
+    std::uint32_t tokens = 0; // Prefix token frontier.
+    std::array<std::uint32_t, kMaximumKvPools> kv_page_groups{}; // Evictable device page groups.
+    std::size_t host_bytes  = 0; // Evictable host bytes.
+    std::uint32_t state_slots = 0; // Evictable device state slots.
+    // Evictable bytes: device KV (page groups x device_page_bytes per pool) + host bytes +
+    // state images (state_slots x state image stride). A fully shared prefix that holds no
+    // state slot and no KV can legitimately total zero.
+    std::uint64_t evictable_bytes = 0;
+    bool leased = false; // Pinned by in-flight work; must not be released.
+    std::size_t checkpoints = 0; // Resident checkpoints sharing this prefix.
+    bool reused = false; // Any checkpoint of this prefix has had repeat demand.
+    std::uint64_t last_demand = 0; // Latest logical demand tick across its checkpoints.
+};
+
+// On-demand snapshot of the resident prefix cache, built under the execution lock.
+struct PrefixCacheTable {
+    std::vector<PrefixCacheEntry> prefixes;
+};
+
+// One requested prefix that was released.
+struct PrefixCacheEviction {
+    PrefixCacheKey key;
+    std::uint64_t freed_bytes = 0;
+};
+
+// One requested prefix that was not released.
+struct PrefixCacheSkip {
+    enum class Reason : std::uint8_t { Leased, NotFound, NotEvictable };
+    PrefixCacheKey key;
+    Reason reason = Reason::NotFound;
+};
+
+// Outcome of an on-demand prefix release. busy is true when the engine was not idle; then
+// nothing was released and the other fields are empty. A prefix that is already gone is
+// reported as skipped (NotFound), never as an error.
+struct PrefixCacheEvictResult {
+    bool busy = false;
+    std::uint64_t total_freed_bytes = 0;
+    std::vector<PrefixCacheEviction> evicted;
+    std::vector<PrefixCacheSkip> skipped;
 };
 
 } // namespace ninfer

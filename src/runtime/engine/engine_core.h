@@ -5,6 +5,7 @@
 #include "runtime/contract/execution.h"
 #include "runtime/contract/resources.h"
 #include "runtime/engine/request_record.h"
+#include "runtime/engine/context_cache/prefix_table.h"
 #include "runtime/engine/context_cache/resource_manager.h"
 #include "runtime/engine/context_cache/placement_policy.h"
 #include "runtime/engine/scheduler.h"
@@ -269,6 +270,42 @@ public:
         return published_snapshot_;
     }
 
+    // On-demand prefix-cache inspection. The worker builds the table while no execution is in
+    // flight; no request state changes.
+    [[nodiscard]] PrefixCacheTable build_prefix_table() {
+        auto request = std::make_unique<AdminCacheRequest>();
+        auto result  = request->completion.get_future();
+        {
+            std::lock_guard lock(queue_mutex_);
+            if (stopping_ || failed_) throw std::logic_error("inference engine is unavailable");
+            if (admin_) throw std::logic_error("an admin cache request is already pending");
+            request->command = AdminCacheRequest::Command::BuildTable;
+            admin_           = std::move(request);
+        }
+        queue_cv_.notify_all();
+        return std::get<PrefixCacheTable>(result.get());
+    }
+
+    // On-demand prefix release. The worker enforces the idle gate and the leased/erasable checks
+    // while no execution is in flight; a non-idle engine answers busy without releasing anything.
+    // max_bytes bounds the release (0 means unbounded).
+    [[nodiscard]] PrefixCacheEvictResult evict_prefixes(std::span<const PrefixCacheKey> selection,
+                                                        std::uint64_t max_bytes) {
+        auto request = std::make_unique<AdminCacheRequest>();
+        auto result  = request->completion.get_future();
+        {
+            std::lock_guard lock(queue_mutex_);
+            if (stopping_ || failed_) throw std::logic_error("inference engine is unavailable");
+            if (admin_) throw std::logic_error("an admin cache request is already pending");
+            request->command   = AdminCacheRequest::Command::Evict;
+            request->selection.assign(selection.begin(), selection.end());
+            request->max_bytes = max_bytes;
+            admin_             = std::move(request);
+        }
+        queue_cv_.notify_all();
+        return std::get<PrefixCacheEvictResult>(result.get());
+    }
+
     [[nodiscard]] bool is_available() const {
         std::lock_guard lock(queue_mutex_);
         return !stopping_ && !failed_;
@@ -294,7 +331,36 @@ private:
         std::promise<EngineSnapshot> completion;
     };
 
+    // Flag-gated admin prefix-cache work, executed by the worker while no execution is in
+    // flight (eviction additionally requires the full idle gate).
+    struct AdminCacheRequest {
+        enum class Command : std::uint8_t { BuildTable, Evict };
+        Command command = Command::BuildTable;
+        std::vector<PrefixCacheKey> selection;
+        std::uint64_t max_bytes = 0;
+        std::promise<std::variant<PrefixCacheTable, PrefixCacheEvictResult>> completion;
+    };
+
     bool process_measurement();
+
+    bool process_admin();
+
+    struct LivePrefixCheckpoints {
+        std::vector<PrefixCheckpointRecord> records;
+        std::vector<Checkpoint> handles;
+        std::vector<std::size_t> device_page_bytes;
+        std::size_t state_image_bytes = 0;
+    };
+
+    // While no execution is in flight: walks the live checkpoints in reclaim order and
+    // normalizes each checkpoint summary for the prefix table and on-demand releases.
+    [[nodiscard]] LivePrefixCheckpoints live_prefix_checkpoints();
+
+    // The idle gate for on-demand prefix releases, mirroring the worker loop's idle predicate.
+    // On-demand releases never compete with in-flight requests, including requests still queued
+    // for admission. The pending-queue check takes queue_mutex_ in the established
+    // execution -> queue order.
+    [[nodiscard]] bool execution_idle_for_prefix_eviction() const;
 
     enum class HostWorkClass : std::uint8_t {
         Decode,
@@ -633,6 +699,7 @@ private:
     std::condition_variable queue_cv_;
     std::deque<std::shared_ptr<Request>> pending_;
     std::unique_ptr<MeasurementRequest> measurement_;
+    std::unique_ptr<AdminCacheRequest> admin_;
     std::size_t preparing_requests_       = 0;
     std::size_t outstanding_              = 0;
     std::uint64_t next_request_id_        = 1;

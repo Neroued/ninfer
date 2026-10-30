@@ -74,6 +74,40 @@ std::size_t SessionImpl::host_bytes_released(std::span<const CheckpointHandle> h
     return directory.released_bytes(*releases);
 }
 
+runtime::CheckpointEvictableResources
+SessionImpl::checkpoint_evictable_resources(CheckpointHandle handle) const {
+    runtime::CheckpointEvictableResources out;
+    if (!can_release_checkpoint(handle)) return out;
+    const auto& record = checkpoint(handle);
+    const std::array handles{handle};
+    const auto released = checkpoint_release_set(handles);
+    if (!released) return out;
+    out.state_slots = static_cast<std::uint32_t>(released->states.size());
+    const std::array<const context::HistoryPrefix*, 1> text_prefixes{&record.text_prefix()};
+    out.kv_page_groups[kTextKvPool.index] = static_cast<std::uint32_t>(
+        text_kv_histories->released_pages(text_prefixes).size());
+    if (record.backend_prefix()) {
+        const std::array<const context::HistoryPrefix*, 1> backend_prefixes{
+            record.backend_prefix()};
+        out.kv_page_groups[kBackendKvPool.index] = static_cast<std::uint32_t>(
+            backend_kv_histories->released_pages(backend_prefixes).size());
+    }
+    out.host_bytes = host_bytes_released(handles);
+    return out;
+}
+
+std::size_t SessionImpl::state_image_bytes() const noexcept {
+    return state_store->image_bytes();
+}
+
+std::size_t SessionImpl::kv_page_bytes(std::uint32_t pool) const noexcept {
+    return directory.pool(pool).pages().layout().parts.front().record.bytes;
+}
+
+std::uint32_t SessionImpl::state_slots_capacity() const noexcept {
+    return state_store->capacity();
+}
+
 std::optional<context::HostWriteRequirements>
 SessionImpl::pause_host_requirements(SequenceHandle handle) const {
     if (context_operation_ || execution || !valid_sequence(handle) || !host_context_enabled) {

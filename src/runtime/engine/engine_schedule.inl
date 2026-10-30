@@ -1163,6 +1163,138 @@ bool EngineCore<Instance>::process_measurement() {
 }
 
 template <class Instance>
+bool EngineCore<Instance>::process_admin() {
+    // Runs at the top of every worker iteration: a worker-thread quiescent point where host
+    // state is consistent even while GPU work is outstanding. Eviction is additionally gated by
+    // the full idle predicate, so it never mutates state beside in-flight work; table builds are
+    // read-only.
+    typename AdminCacheRequest::Command command = AdminCacheRequest::Command::BuildTable;
+    std::vector<PrefixCacheKey> selection;
+    std::uint64_t max_bytes = 0;
+    {
+        std::lock_guard lock(queue_mutex_);
+        if (!admin_) return false;
+        command   = admin_->command;
+        selection = std::move(admin_->selection);
+        max_bytes = admin_->max_bytes;
+    }
+    std::variant<PrefixCacheTable, PrefixCacheEvictResult> outcome;
+    try {
+        if (command == AdminCacheRequest::Command::BuildTable) {
+            const auto live = live_prefix_checkpoints();
+            outcome = build_prefix_entries(live.records, live.device_page_bytes,
+                                           live.state_image_bytes);
+        } else if (!execution_idle_for_prefix_eviction()) {
+            outcome = PrefixCacheEvictResult{.busy = true};
+        } else {
+            const auto live = live_prefix_checkpoints();
+            const auto plan =
+                plan_prefix_evictions(live.records, selection, max_bytes, live.device_page_bytes,
+                                      live.state_image_bytes);
+            PrefixCacheEvictResult result;
+            for (const auto& key_plan : plan.keys) {
+                using Action = PrefixEvictionPlan::KeyPlan::Action;
+                if (key_plan.action == Action::Leased) {
+                    result.skipped.push_back(
+                        {.key = key_plan.key, .reason = PrefixCacheSkip::Reason::Leased});
+                    continue;
+                }
+                if (key_plan.action == Action::NotFound) {
+                    result.skipped.push_back(
+                        {.key = key_plan.key, .reason = PrefixCacheSkip::Reason::NotFound});
+                    continue;
+                }
+                std::uint64_t freed = 0;
+                bool released       = false, blocked = false;
+                for (const std::size_t record : key_plan.records) {
+                    const auto bytes = record_evictable_bytes(live.records[record],
+                                                              live.device_page_bytes,
+                                                              live.state_image_bytes);
+                    if (!resources_.erase(*instance_.session, live.handles[record])) {
+                        blocked = true;
+                        break;
+                    }
+                    released                 = true;
+                    freed                    = saturating_add(freed, bytes);
+                    result.total_freed_bytes = saturating_add(result.total_freed_bytes, bytes);
+                }
+                if (released) {
+                    result.evicted.push_back({.key = key_plan.key, .freed_bytes = freed});
+                }
+                if (blocked) {
+                    result.skipped.push_back(
+                        {.key = key_plan.key, .reason = PrefixCacheSkip::Reason::NotEvictable});
+                }
+            }
+            // /metrics and the admin capacity block read the PUBLISHED snapshot. Refresh it so
+            // the release is visible on the next poll instead of acting on stale occupancy.
+            if (!result.evicted.empty()) { publish_runtime_stats(); }
+            outcome = std::move(result);
+        }
+    } catch (...) {
+        std::exception_ptr error = std::current_exception();
+        std::lock_guard lock(queue_mutex_);
+        admin_->completion.set_exception(error);
+        admin_.reset();
+        queue_cv_.notify_all();
+        return true;
+    }
+    std::lock_guard lock(queue_mutex_);
+    admin_->completion.set_value(std::move(outcome));
+    admin_.reset();
+    queue_cv_.notify_all();
+    return true;
+}
+
+template <class Instance>
+EngineCore<Instance>::LivePrefixCheckpoints EngineCore<Instance>::live_prefix_checkpoints() {
+    const auto cursor = resources_.begin_reclaim(*instance_.session);
+    LivePrefixCheckpoints live;
+    const auto pools = instance_.session->kv_pools();
+    live.state_image_bytes = instance_.session->state_image_bytes();
+    live.device_page_bytes.reserve(pools.size());
+    for (const auto& pool : pools) {
+        live.device_page_bytes.push_back(instance_.session->kv_page_bytes(pool.id.index));
+    }
+    live.records.reserve(cursor.victims.size());
+    live.handles.reserve(cursor.victims.size());
+    for (const auto& victim : cursor.victims) {
+        if (!instance_.session->valid_checkpoint(victim.handle)) { continue; }
+        const auto summary   = instance_.session->checkpoint_summary(victim.handle);
+        const auto resources = instance_.session->checkpoint_evictable_resources(victim.handle);
+        PrefixCheckpointRecord record;
+        record.key = {summary.key.digests[0], summary.key.digests[1], summary.key.frontier,
+                      summary.key.identity_tag};
+        record.leased      = summary.leased;
+        record.state_slots = resources.state_slots;
+        for (std::size_t pool = 0;
+             pool < std::min(record.kv_page_groups.size(), resources.kv_page_groups.size());
+             ++pool) {
+            record.kv_page_groups[pool] = resources.kv_page_groups[pool];
+        }
+        record.host_bytes  = resources.host_bytes;
+        // The reclaim cursor already carries priority_for(handle) for every victim
+        // (reclaim_order, resource_manager.h); reuse it instead of re-scanning owners.
+        record.reused      = victim.priority.reused;
+        record.last_demand = victim.priority.last_demand;
+        live.records.push_back(record);
+        live.handles.push_back(victim.handle);
+    }
+    return live;
+}
+
+template <class Instance>
+bool EngineCore<Instance>::execution_idle_for_prefix_eviction() const {
+    bool pending = false;
+    {
+        std::lock_guard lock(queue_mutex_);
+        pending = !pending_.empty() || preparing_requests_;
+    }
+    return prefix_cache_idle(pending, resident_empty(), !paused_.empty(),
+                             instance_.session->has_context_operation());
+}
+
+template <class Instance>
 void EngineCore<Instance>::worker_loop() noexcept {
     std::uint64_t scheduled_revision = 0;
     for (;;) {
@@ -1171,7 +1303,8 @@ void EngineCore<Instance>::worker_loop() noexcept {
             if (!stopping_ && pending_.empty() && resident_empty() && paused_.empty() &&
                 !execution_outstanding()) {
                 queue_cv_.wait(lock,
-                               [&] { return stopping_ || !pending_.empty() || measurement_; });
+                               [&] { return stopping_ || !pending_.empty() || measurement_ ||
+                                                        admin_; });
             }
             if (stopping_) {
                 lock.unlock();
@@ -1180,6 +1313,9 @@ void EngineCore<Instance>::worker_loop() noexcept {
                 return;
             }
         }
+        // Admin prefix-cache work runs at this worker quiescent point, before this iteration
+        // touches execution state, so the idle gate observes in-flight work in real time.
+        (void)process_admin();
         bool progressed  = false;
         bool outstanding = false;
         try {

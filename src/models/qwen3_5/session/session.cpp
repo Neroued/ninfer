@@ -197,6 +197,21 @@ std::size_t Session::host_bytes_released(std::span<const CheckpointHandle> check
     return impl_->host_bytes_released(checkpoints);
 }
 
+runtime::CheckpointEvictableResources
+Session::checkpoint_evictable_resources(CheckpointHandle checkpoint) const {
+    return impl_->checkpoint_evictable_resources(checkpoint);
+}
+
+std::size_t Session::state_image_bytes() const noexcept { return impl_->state_image_bytes(); }
+
+std::size_t Session::kv_page_bytes(std::uint32_t pool) const noexcept {
+    return impl_->kv_page_bytes(pool);
+}
+
+std::uint32_t Session::state_slots_capacity() const noexcept {
+    return impl_->state_slots_capacity();
+}
+
 std::size_t Session::release_redundant_host(std::span<const CheckpointHandle> excluded,
                                             std::optional<SequenceHandle> pending_backup) {
     return impl_->release_redundant_host(excluded, pending_backup);

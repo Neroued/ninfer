@@ -99,6 +99,32 @@ ContextReleaseSet SessionImpl::footprint(std::span<const CheckpointHandle> input
     return result;
 }
 
+runtime::CheckpointEvictableResources
+SessionImpl::checkpoint_evictable_resources(CheckpointHandle handle) const {
+    runtime::CheckpointEvictableResources out;
+    if (!checkpoints.erasable(handle)) return out;
+    const std::array handles{handle};
+    const auto released = footprint(handles, true);
+    out.state_slots = static_cast<std::uint32_t>(released.states.size());
+    for (const auto page : released.pages) {
+        if (page.pool_id < out.kv_page_groups.size()) ++out.kv_page_groups[page.pool_id];
+    }
+    // glm5next has no Host context; host_bytes stays zero.
+    return out;
+}
+
+std::size_t SessionImpl::state_image_bytes() const noexcept {
+    return directory.states().image_bytes();
+}
+
+std::size_t SessionImpl::kv_page_bytes(std::uint32_t pool) const noexcept {
+    return directory.pool(pool).pages().layout().parts.front().record.bytes;
+}
+
+std::uint32_t SessionImpl::state_slots_capacity() const noexcept {
+    return directory.states().capacity();
+}
+
 context::ReleasePlan<ContextRelease, ContextReleaseSet>
 SessionImpl::plan_releases(std::span<const CheckpointHandle> allowed,
                            std::span<const CheckpointHandle> excluded, const ContextDemand&) const {
@@ -189,6 +215,21 @@ runtime::ContextStart Session::start_maintenance(const ContextAssessment& assess
 
 std::size_t Session::host_bytes_released(std::span<const CheckpointHandle> records) const {
     return 0;
+}
+
+runtime::CheckpointEvictableResources
+Session::checkpoint_evictable_resources(CheckpointHandle checkpoint) const {
+    return impl_->checkpoint_evictable_resources(checkpoint);
+}
+
+std::size_t Session::state_image_bytes() const noexcept { return impl_->state_image_bytes(); }
+
+std::size_t Session::kv_page_bytes(std::uint32_t pool) const noexcept {
+    return impl_->kv_page_bytes(pool);
+}
+
+std::uint32_t Session::state_slots_capacity() const noexcept {
+    return impl_->state_slots_capacity();
 }
 
 context::RecoveryEvaluation<>

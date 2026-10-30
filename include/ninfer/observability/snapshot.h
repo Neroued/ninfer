@@ -149,6 +149,8 @@ struct EngineDescription {
     std::uint32_t max_context = 0, max_concurrency = 0, prefill_chunk = 0;
     std::vector<ContextPoolCapacity> context_pools;
     std::uint64_t context_token_capacity_estimate = 0;
+    // Logical StateImage slot capacity of the resident state directory.
+    std::uint32_t state_slots_capacity = 0;
     KvCacheStorage kv_cache                       = KvCacheStorage::BFloat16;
     std::vector<ContextKvPoolUsage> kv_pools;
 };

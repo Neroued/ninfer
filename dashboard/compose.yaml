@@ -1,0 +1,27 @@
+name: ninfer-dashboard
+
+services:
+  dashboard:
+    image: ${NINFER_DASHBOARD_IMAGE:-ninfer-dashboard:local}
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 30s
+    ports:
+      - '${NINFER_DASHBOARD_PORT:-8899}:8899'
+    volumes:
+      - type: bind
+        source: ./config.local.json
+        target: /app/config.local.json
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./data
+        target: /app/data
+        bind:
+          create_host_path: false
+    logging:
+      driver: local
+      options:
+        max-size: '10m'
+        max-file: '3'

@@ -3,7 +3,49 @@
 A standalone dashboard for NInfer's monitoring API. The collector runs continuously,
 including when no browser is open. Browsers share the same history.
 
-## Run
+## Docker
+
+Requires Docker with the Compose plugin. From `dashboard/`:
+
+```bash
+cp config.example.json config.local.json
+mkdir -p data
+# Set engine_url in config.local.json to the engine host's reachable address.
+docker build -t ninfer-dashboard:local .
+docker compose up -d
+```
+
+Open `http://localhost:8899`, or use the dashboard host's address. The image includes
+the production web application, API and collector. It runs without a GPU or host Node.js.
+Builds use the dashboard directory as their context and install dependencies from the lockfile.
+
+Keep `host`, `port` and `database` at their example values for the supplied Compose file.
+It mounts `config.local.json` read-only at `/app/config.local.json` and `data/` at `/app/data`.
+The container runs as UID/GID 1000; `data/` must be writable by that user.
+Use an engine address reachable from the container, such as the engine host's LAN address.
+
+Compose accepts two optional settings through the shell or a local `.env` file:
+
+| Setting                  | Default                  | Meaning                                            |
+| ------------------------ | ------------------------ | -------------------------------------------------- |
+| `NINFER_DASHBOARD_IMAGE` | `ninfer-dashboard:local` | Image to run; may use a release or commit tag      |
+| `NINFER_DASHBOARD_PORT`  | `8899`                   | Published host port; the container listens on 8899 |
+
+After updating the source, rebuild and replace the container:
+
+```bash
+docker build --pull -t ninfer-dashboard:local .
+docker compose up -d
+docker compose logs --tail=100 -f
+```
+
+The host data directory survives container replacement and `docker compose down`.
+After changing `config.local.json`, use `docker compose restart dashboard` to reload it.
+The container uses `unless-stopped` restart policy, a 30-second shutdown grace period and
+rotated logs. Its health check probes the dashboard API; engine availability is reported
+inside the dashboard and does not determine container health.
+
+## Run without Docker
 
 Requires Node.js 22.12 or newer. From this directory:
 
@@ -34,7 +76,7 @@ Configuration paths are relative to the configuration file. Defaults in the exam
 | `history_days`         | Retention of minute aggregates, 30 days                       |
 | `default_theme`        | Initial theme, `paper`; a browser preference takes precedence |
 
-`config.local.json`, `data/`, `dist/`, and `node_modules/` are ignored by Git. Keep the
+`config.local.json`, `.env`, `data/`, `dist/`, and `node_modules/` are ignored by Git. Keep the
 database and its SQLite sidecar files together on the collector's local filesystem.
 Metric payloads use lossless compression; time and instance keys remain indexed in SQLite.
 Hour summaries accelerate wide queries while minute observations remain available for zooming.

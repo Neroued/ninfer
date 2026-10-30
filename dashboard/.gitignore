@@ -2,3 +2,4 @@
 /dist/
 /data/
 /config.local.json
+/.env

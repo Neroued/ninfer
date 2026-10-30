@@ -18,9 +18,7 @@
     "@fastify/static": "^9.0.0",
     "better-sqlite3": "^13.0.3",
     "eventsource-parser": "^4.1.3",
-    "fastify": "^5.12.7",
-    "uplot": "^1.6.32",
-    "vue": "^3.5.44"
+    "fastify": "^5.12.7"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.13",
@@ -29,7 +27,9 @@
     "prettier": "^3.0.0",
     "tsx": "^4.0.0",
     "typescript": "~5.9.3",
+    "uplot": "^1.6.32",
     "vite": "^8.3.5",
+    "vue": "^3.5.44",
     "vue-tsc": "^3.3.14"
   }
 }

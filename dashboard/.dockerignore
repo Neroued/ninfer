@@ -1,0 +1,15 @@
+**
+!package.json
+!package-lock.json
+!tsconfig.json
+!tsconfig.server.json
+!vite.config.ts
+!index.html
+!server/
+!server/**
+!shared/
+!shared/**
+!web/
+!web/**
+!public/
+!public/**

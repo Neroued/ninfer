@@ -33,6 +33,14 @@
   --text-body: 12.5px;
   --text-drawer: 13px;
   --label-size: var(--text-label);
+  --chart-axis-font: 11px 'IBM Plex Mono', monospace;
+  --chart-time-axis-size: 28px;
+  --chart-value-axis-size: 48px;
+  --chart-tick-space: 100px;
+  --chart-padding-top: 10px;
+  --chart-padding-right: 28px;
+  --chart-padding-bottom: 2px;
+  --chart-padding-left: 0px;
   font-family: var(--sans);
   font-synthesis: none;
   text-rendering: optimizeLegibility;

@@ -35,7 +35,9 @@ function trace(row: RequestRow): string {
     <div class="request-scroll">
       <div class="request-grid request-head label">
         <span>Phase</span><span>ID</span><span>Age</span><span>Context</span><span>Speed</span
-        ><span>TTFT</span><span class="request-gen">Gen</span><span class="trace-column">Trace</span>
+        ><span>TTFT</span
+        ><span class="request-gen" data-priority="optional">Gen</span
+        ><span class="trace-column" data-priority="optional">Trace</span>
       </div>
       <template v-for="(group, index) in [rows, completed]" :key="index">
         <div v-if="index && group.length" class="request-divider label">Recently completed</div>
@@ -70,8 +72,8 @@ function trace(row: RequestRow): string {
             >{{ number(row.speed) }}<small v-if="row.speed !== null"> tok/s</small></span
           >
           <span class="request-ttft mono">{{ ms(row.ttftMs) }}</span>
-          <span class="request-gen mono">{{ tokens(row.generatedTokens) }}</span>
-          <svg class="trace-column request-trace" viewBox="0 0 100 24" aria-hidden="true">
+          <span class="request-gen mono" data-priority="optional">{{ tokens(row.generatedTokens) }}</span>
+          <svg class="trace-column request-trace" viewBox="0 0 100 24" data-priority="optional" aria-hidden="true">
             <path :d="trace(row)" />
           </svg>
         </button>

@@ -253,6 +253,7 @@
   flex-direction: column;
   min-height: 0;
   flex: 1;
+  container-type: inline-size;
 }
 .requests-panel > .section-heading {
   padding: 7px 0 10px;
@@ -622,11 +623,39 @@
   }
 }
 
+.app-frame {
+  container: app / inline-size;
+}
 .timeline-block {
   min-width: 0;
 }
+.rail-shell {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  container: rail / inline-size;
+}
 
-@media (min-width: 960px) and (max-width: 1279px) {
+@media (min-width: 768px) {
+  @container rail (max-width: 400px) {
+    .telemetry-rail {
+      grid-template-columns: minmax(0, 1fr);
+    }
+  }
+  @container rail (min-width: 401px) and (max-width: 699px) {
+    .telemetry-rail {
+      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    }
+  }
+  @container rail (min-width: 700px) {
+    .telemetry-rail {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+  }
+}
+
+@container app (min-width: 960px) and (max-width: 1279px) {
   .stage {
     height: auto;
     min-height: 0;
@@ -656,22 +685,28 @@
     flex: initial;
     max-height: none;
   }
-  .telemetry-rail {
+  .rail-shell {
     grid-column: 2;
     grid-row: 3;
-    grid-template-columns: minmax(0, 1fr);
+    min-height: 0;
+  }
+  .telemetry-rail {
     min-height: 0;
     overflow: visible;
     border-top: 0;
     border-left: 1px solid var(--rule);
     padding-left: var(--gap);
   }
-  .request-grid {
-    grid-template-columns: 80px 48px 62px minmax(100px, 1fr) 89px 76px;
-  }
-  .request-gen,
-  .trace-column {
-    display: none;
+}
+
+@media (min-width: 768px) {
+  @container (max-width: 640px) {
+    .request-grid {
+      grid-template-columns: 80px 48px 62px minmax(100px, 1fr) 89px 76px;
+    }
+    .request-grid [data-priority='optional'] {
+      display: none;
+    }
   }
 }
 

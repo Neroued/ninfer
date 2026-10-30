@@ -11,6 +11,35 @@ export interface Line {
   range?: [min: keyof ChartPoint, max: keyof ChartPoint];
 }
 
+interface ChartConfig {
+  font: string;
+  timeAxisSize: number;
+  valueAxisSize: number;
+  tickSpace: number;
+  padding: [number, number, number, number];
+}
+
+function chartConfig(): ChartConfig {
+  const style = getComputedStyle(document.documentElement);
+  const px = (name: string, fallback: number) => {
+    const value = Number.parseFloat(style.getPropertyValue(name));
+    return Number.isFinite(value) ? value : fallback;
+  };
+  return {
+    font:
+      style.getPropertyValue('--chart-axis-font').trim() || '11px "IBM Plex Mono", monospace',
+    timeAxisSize: px('--chart-time-axis-size', 28),
+    valueAxisSize: px('--chart-value-axis-size', 48),
+    tickSpace: px('--chart-tick-space', 100),
+    padding: [
+      px('--chart-padding-top', 10),
+      px('--chart-padding-right', 28),
+      px('--chart-padding-bottom', 2),
+      px('--chart-padding-left', 0),
+    ],
+  };
+}
+
 export class TimeSeries {
   private readonly plot: uPlot;
   private readonly resize: ResizeObserver;
@@ -57,11 +86,14 @@ export class TimeSeries {
         points: { show: false },
       });
     }
+    const width = Math.max(200, element.clientWidth);
+    const config = chartConfig();
+    const tickSpace = width >= 600 ? Math.min(config.tickSpace, Math.round(width / 5)) : undefined;
     this.plot = new uPlot(
       {
-        width: Math.max(200, element.clientWidth),
+        width,
         height,
-        padding: [10, 28, 2, 0],
+        padding: config.padding,
         legend: { show: false },
         cursor: {
           drag: { x: true, y: false, setScale: false },
@@ -76,11 +108,11 @@ export class TimeSeries {
           {
             show: showTime,
             stroke: color('muted'),
-            size: 28,
-            space: 100,
+            size: config.timeAxisSize,
+            ...(tickSpace === undefined ? {} : { space: tickSpace }),
             grid: { show: false },
             ticks: { show: false },
-            font: '11px "IBM Plex Mono", monospace',
+            font: config.font,
             gap: 6,
             values: (plot, values) => {
               const span = (plot.scales.x.max ?? 0) - (plot.scales.x.min ?? 0);
@@ -100,8 +132,8 @@ export class TimeSeries {
           },
           {
             stroke: color('muted'),
-            size: 48,
-            font: '11px "IBM Plex Mono", monospace',
+            size: config.valueAxisSize,
+            font: config.font,
             grid: { stroke: color('grid'), width: 1 },
             ticks: { show: false },
             values: (_u, values) =>

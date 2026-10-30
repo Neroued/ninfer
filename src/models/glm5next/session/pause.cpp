@@ -206,6 +206,7 @@ void SessionImpl::prepare_pause_resources(context::ContextReservation& targets) 
             detach(sequence, runtime::CheckpointRole::Continuation, std::move(pause.checkpoint));
         if (!pause.paused->snapshot)
             throw std::logic_error("prepared pause lost its checkpoint reservation");
+        checkpoints.at(*pause.paused->snapshot).snapshot.set_use(context::ContextUse::Request);
     }
     pause.paused->sequence = std::move(sequences[pause.lane]);
     if (pause.action.kind == runtime::PauseKind::Relocate) {

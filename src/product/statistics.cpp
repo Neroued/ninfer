@@ -78,6 +78,8 @@ Json context_usage_json(const RuntimeStats& stats) {
                          {"capacity_bytes", pool.capacity_bytes},
                          {"block_bytes", pool.block_bytes},
                          {"live_bytes", pool.live_bytes},
+                         {"in_use_bytes", pool.in_use_bytes},
+                         {"cached_bytes", pool.cached_bytes},
                          {"reserved_bytes", pool.reserved_bytes},
                          {"pending_retirement_bytes", pool.pending_retirement_bytes},
                          {"relocation_bytes", pool.relocation_bytes},

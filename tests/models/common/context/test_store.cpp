@@ -308,16 +308,24 @@ void test_physical_resource_accounting() {
                                                                   .parts         = {{0, {256, 256}}}}},
                                        .metadata_budget_bytes = 1024 * 1024});
     const auto usage = [&](ninfer::ContextMemoryDomain memory, bool kv) {
-        for (const auto& value : directory.usage().resources)
+        const auto snapshot = directory.usage();
+        for (const auto& pool : snapshot.pools)
+            expect(pool.live_bytes == pool.in_use_bytes + pool.cached_bytes,
+                   "Context live purposes must conserve physical occupancy");
+        for (const auto& value : snapshot.resources)
             if (value.domain == memory && value.history_pool.has_value() == kv) return value;
         throw std::logic_error("missing Context resource observation");
     };
     auto& states     = directory.states();
     const auto state = states.reserve_destination().value();
+    expect(usage(ninfer::ContextMemoryDomain::Device, false).in_use_bytes == 256,
+           "materialized State destination is request storage");
     states.complete_initialization(state);
     states.freeze(state);
     states.retain_checkpoint_reference(state);
     states.retain_checkpoint_reference(state);
+    expect(usage(ninfer::ContextMemoryDomain::Device, false).cached_bytes == 256,
+           "immutable cache aliases count their physical storage once");
     {
         store::ContextDemand demand;
         const auto id = demand.add_history(0, 1);
@@ -334,14 +342,30 @@ void test_physical_resource_accounting() {
                "identical allocator geometry must distinguish State from KV without counting "
                "references");
         auto backup = states.reserve_device_to_host(state).value();
-        expect(usage(ninfer::ContextMemoryDomain::Host, false).live_bytes == 256,
-               "in-flight State copy owns a separate Host replica");
+        expect(usage(ninfer::ContextMemoryDomain::Host, false).cached_bytes == 256 &&
+                   usage(ninfer::ContextMemoryDomain::Device, false).cached_bytes == 256,
+               "cache backup must keep both replicas classified as cache");
         backup.publish(true);
         expect(pages.release_reference(page[0]) && pages.release_reference(page[0]),
                "shared page release");
     }
     expect(usage(ninfer::ContextMemoryDomain::Device, true).live_records == 0,
            "abandoned history binding leaked its resource count");
+    {
+        auto maintenance = states.pin_binding(state);
+        expect(usage(ninfer::ContextMemoryDomain::Device, false).in_use_bytes == 0,
+               "allocator maintenance does not own a request");
+        auto read = states.read(state);
+        expect(usage(ninfer::ContextMemoryDomain::Device, false).in_use_bytes == 256 &&
+                   usage(ninfer::ContextMemoryDomain::Host, false).cached_bytes == 256,
+               "Device request reader must not classify the idle Host replica as in use");
+        auto host_read = states.read(state, store::ContextMemory::Host);
+        expect(usage(ninfer::ContextMemoryDomain::Host, false).in_use_bytes == 256,
+               "Host restore reader holds request storage until retirement");
+    }
+    expect(usage(ninfer::ContextMemoryDomain::Device, false).cached_bytes == 256 &&
+               usage(ninfer::ContextMemoryDomain::Host, false).cached_bytes == 256,
+           "last request reader returns the remaining replicas to cache");
     expect(states.release_checkpoint_owner(state), "first shared checkpoint owner release");
     expect(usage(ninfer::ContextMemoryDomain::Device, false).live_records == 1,
            "releasing one shared owner freed its remaining replica");
@@ -350,6 +374,13 @@ void test_physical_resource_accounting() {
     const auto pending = usage(ninfer::ContextMemoryDomain::Device, false);
     expect(pending.live_records == 0 && pending.pending_retirement_records == 1,
            "last-owner release must retain the borrowed physical record until retirement");
+    expect(pending.in_use_bytes == 0 && pending.cached_bytes == 0,
+           "retiring storage must not also count as live request or cache storage");
+    states.retain_checkpoint_reference(state);
+    expect(usage(ninfer::ContextMemoryDomain::Device, false).in_use_bytes == 256 &&
+               usage(ninfer::ContextMemoryDomain::Host, false).cached_bytes == 256,
+           "cancelled retirement must restore each replica's actual use");
+    expect(states.release_checkpoint_owner(state), "revived checkpoint release");
     reader.reset();
     for (const auto& resource : directory.usage().resources)
         expect(resource.live_records == 0 && resource.pending_retirement_records == 0,

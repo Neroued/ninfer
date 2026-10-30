@@ -127,6 +127,7 @@ ContextProgress detail::SessionImpl::complete_context() {
                 }
                 checkpoint.snapshot = detail::Snapshot(states, continuation, std::move(prefixes),
                                                        checkpoint.snapshot.identity_owner());
+                checkpoint.snapshot.set_use(context::ContextUse::Request);
                 (void)destination.release();
                 tx->paused->sequence->continuation.metadata.placement = tx->action.placement;
             }

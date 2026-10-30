@@ -145,6 +145,10 @@ void state_conversion() {
     auto transaction = fixture.directory.begin_transaction();
     transaction.convert_state(source, 1, fixture.reserve_state(1), fields);
     const auto destination = transaction.state_destination().image();
+    for (const auto& pool : fixture.directory.usage().pools)
+        if (pool.domain == ninfer::ContextMemoryDomain::Device)
+            require(pool.in_use_bytes == 96 && pool.cached_bytes == 0,
+                    "ADP conversion must hold source and destination as request storage");
     rejects([&] { (void)states.begin_write(source, destination); },
             "ordinary fork accepted a layout conversion");
     require(states.role(destination) == context::StateRole::ReservedDestination &&
@@ -159,6 +163,11 @@ void state_conversion() {
     require(states.variant(destination) == 1 && states.content_epoch(destination) == epoch &&
                 states.source_pins(source) == 0,
             "layout conversion changed the mathematical content epoch");
+    for (const auto& pool : fixture.directory.usage().pools)
+        if (pool.domain == ninfer::ContextMemoryDomain::Device)
+            require(pool.in_use_bytes == (pool.rank == 0 ? 32U : 64U) &&
+                        pool.cached_bytes == (pool.rank == 0 ? 64U : 32U),
+                    "ADP conversion retirement must return its old rank shards to cache");
     const auto to_zero = states.device_binding(destination, 0);
     const auto to_one  = states.device_binding(destination, 1);
     require(std::memcmp(fixture.bytes(to_zero), fixture.bytes(from_zero), 32) == 0 &&

@@ -102,6 +102,7 @@ public:
 
     [[nodiscard]] std::uint32_t frontier() const noexcept { return frontier_; }
 
+    void set_use(ContextUse, ContextMemory = ContextMemory::Device);
     void reset() noexcept;
 
 private:
@@ -111,6 +112,8 @@ private:
     HistoryDirectory* store_ = nullptr;
     HistoryId history_;
     std::uint32_t frontier_ = 0;
+    ContextUse use_         = ContextUse::Cache;
+    ContextMemory memory_   = ContextMemory::Device;
     friend class HistoryDirectory;
 };
 
@@ -356,11 +359,17 @@ private:
         bool reserved            = false;
     };
 
+    struct PrefixReferences {
+        std::uint32_t frontier = 0;
+        std::uint32_t count    = 0;
+        std::array<std::uint32_t, 2> requests{};
+    };
+
     struct History {
         std::vector<ChunkRef> directory;
         std::vector<Chunk*> spare_chunks;
         MetadataReservation branch_descriptor;
-        std::vector<std::pair<std::uint32_t, std::uint32_t>> prefixes;
+        std::vector<PrefixReferences> prefixes;
         RecordReservation reservation;
         std::vector<std::uint32_t> placement;
         std::optional<RowLease> row;
@@ -369,9 +378,10 @@ private:
         std::uint32_t frontier     = 0;
         std::uint32_t retained     = 0;
         std::uint32_t prefix_count = 0;
-        bool occupied              = false;
-        bool reserved              = false;
-        bool owned                 = false;
+        std::array<std::uint32_t, 2> request_frontiers{};
+        bool occupied = false;
+        bool reserved = false;
+        bool owned    = false;
     };
 
     [[nodiscard]] History& require(HistoryId history);
@@ -386,6 +396,7 @@ private:
     [[nodiscard]] std::uint64_t writer(HistoryId history) const noexcept;
     void add_prefix(HistoryId history, std::uint32_t frontier);
     void remove_prefix(HistoryId history, std::uint32_t frontier) noexcept;
+    void update_request_prefix(HistoryId, std::uint32_t frontier, ContextMemory, bool add);
     void release_owner(HistoryId history) noexcept;
     void deactivate_retired(HistoryId history);
     void collect(HistoryId history);

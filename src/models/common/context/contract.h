@@ -11,6 +11,7 @@
 namespace ninfer::models::context {
 
 enum class ContextMemory : std::uint8_t { Device, Host };
+enum class ContextUse : std::uint8_t { Request, Cache };
 
 struct ContextRange {
     ContextMemory memory = ContextMemory::Device;

@@ -109,15 +109,16 @@ bool PageDirectory::Page::pending() const noexcept {
 }
 
 PageDirectory::ReadLease::ReadLease(PageDirectory& store, PageId page, std::uint32_t rank,
-                                    ContextMemory memory, std::uint32_t coverage) noexcept
+                                    ContextMemory memory, std::uint32_t coverage,
+                                    ContextUse use) noexcept
     : store_(&store), page_(page), epoch_(store.content_epoch(page)), rank_(rank),
-      coverage_(coverage), memory_(memory) {}
+      coverage_(coverage), memory_(memory), use_(use) {}
 
 PageDirectory::ReadLease::~ReadLease() { reset(); }
 
 PageDirectory::ReadLease::ReadLease(ReadLease&& other) noexcept
     : store_(std::exchange(other.store_, nullptr)), page_(other.page_), epoch_(other.epoch_),
-      rank_(other.rank_), coverage_(other.coverage_), memory_(other.memory_) {}
+      rank_(other.rank_), coverage_(other.coverage_), memory_(other.memory_), use_(other.use_) {}
 
 PageDirectory::ReadLease& PageDirectory::ReadLease::operator=(ReadLease&& other) noexcept {
     if (this != &other) {
@@ -128,6 +129,7 @@ PageDirectory::ReadLease& PageDirectory::ReadLease::operator=(ReadLease&& other)
         rank_     = other.rank_;
         coverage_ = other.coverage_;
         memory_   = other.memory_;
+        use_      = other.use_;
     }
     return *this;
 }
@@ -146,11 +148,15 @@ void PageDirectory::ReadLease::reset() noexcept {
     auto& page = store->require(page_);
     for (auto& local : page.parts) {
         if (rank_ != UINT32_MAX && local.rank != rank_) continue;
-        auto& readers =
-            memory_ == ContextMemory::Device ? local.device->readers : local.host->readers;
-        if (!readers) std::terminate();
-        --readers;
+        auto& replica = *(memory_ == ContextMemory::Device ? local.device : local.host);
+        if (!replica.readers) std::terminate();
+        --replica.readers;
+        if (use_ == ContextUse::Request) {
+            if (!replica.request_readers) std::terminate();
+            --replica.request_readers;
+        }
     }
+    refresh_usage(page);
     store->retire_unowned(page_);
 }
 
@@ -167,7 +173,7 @@ PageDirectory::ReadLease PageDirectory::pin_binding(PageId handle, std::uint32_t
     else
         ++local.host->readers;
     return ReadLease(*this, handle, rank, memory,
-                     device ? local.device->columns : local.host->columns);
+                     device ? local.device->columns : local.host->columns, ContextUse::Cache);
 }
 
 PageDirectory::ReadLease PageDirectory::read_device(PageId handle, std::uint32_t coverage) {
@@ -177,14 +183,16 @@ PageDirectory::ReadLease PageDirectory::read_device(PageId handle, std::uint32_t
 }
 
 PageDirectory::ReadLease PageDirectory::read_device(PageId handle, std::uint32_t rank,
-                                                    std::uint32_t coverage) {
+                                                    std::uint32_t coverage, ContextUse use) {
     auto& page  = require(handle);
     auto& local = part(page, rank);
     if (!device_covers(handle, rank, coverage) || page.writer_identity || local.restoring ||
         page.destination_pinned || page.readers() == UINT32_MAX)
         throw std::logic_error("KV Device reader lacks an available replica");
     ++local.device->readers;
-    return ReadLease(*this, handle, rank, ContextMemory::Device, coverage);
+    if (use == ContextUse::Request) ++local.device->request_readers;
+    refresh_usage(page);
+    return ReadLease(*this, handle, rank, ContextMemory::Device, coverage, use);
 }
 
 PageDirectory::ReadLease PageDirectory::read_host(PageId handle, std::uint32_t rank,
@@ -194,6 +202,8 @@ PageDirectory::ReadLease PageDirectory::read_host(PageId handle, std::uint32_t r
     if (!host_covers(handle, rank, coverage) || local.backing_up || page.readers() == UINT32_MAX)
         throw std::logic_error("KV Host reader lacks an available replica");
     ++local.host->readers;
+    ++local.host->request_readers;
+    refresh_usage(page);
     return ReadLease(*this, handle, rank, ContextMemory::Host, coverage);
 }
 
@@ -205,6 +215,8 @@ PageDirectory::ReadLease PageDirectory::read_device_prefix(PageId handle, std::u
         local.restoring || page.destination_pinned || page.readers() == UINT32_MAX)
         throw std::logic_error("KV prefix reader lacks protected Device coverage");
     ++local.device->readers;
+    ++local.device->request_readers;
+    refresh_usage(page);
     return ReadLease(*this, handle, rank, ContextMemory::Device, coverage);
 }
 
@@ -232,6 +244,7 @@ void PageDirectory::Restore::publish() {
         !store_->host_covers(this->page(), rank(), source_.coverage()))
         throw std::logic_error("KV source changed before restore publication");
     local.device = std::exchange(local.restoring, nullptr);
+    refresh_usage(page);
     destination_ = nullptr;
     store_       = nullptr;
     source_.reset();
@@ -261,7 +274,8 @@ void PageDirectory::Backup::publish() {
         !store_->device_covers(this->page(), rank(), source_.coverage()))
         throw std::logic_error("KV source changed before backup publication");
     if (local.host) store_->allocation_pages_->erase(local.host->record.allocation());
-    local.host   = std::exchange(local.backing_up, nullptr);
+    local.host = std::exchange(local.backing_up, nullptr);
+    refresh_usage(page);
     destination_ = nullptr;
     store_       = nullptr;
     source_.reset();
@@ -614,6 +628,7 @@ void PageDirectory::publish_transfer_destination(PageId handle) noexcept {
         std::terminate();
     page.references         = 1;
     page.destination_pinned = false;
+    refresh_usage(page);
 }
 
 void PageDirectory::abort_transfer_destination(PageId handle,
@@ -803,11 +818,15 @@ void PageDirectory::prepare_write(PageId handle, std::uint64_t writer, std::uint
         if (local.host) local.host->columns = std::min(local.host->columns, begin);
     }
     page.writer_identity = writer;
+    refresh_usage(page);
 }
 
 void PageDirectory::release_writer(PageId handle, std::uint64_t writer) {
     auto& page = require(handle);
-    if (page.writer_identity == writer) page.writer_identity = 0;
+    if (page.writer_identity == writer) {
+        page.writer_identity = 0;
+        refresh_usage(page);
+    }
 }
 
 void PageDirectory::commit_coverage(PageId handle, std::uint32_t columns) {
@@ -850,8 +869,10 @@ PageDirectory::Backup PageDirectory::prepare_host_replica(PageId handle, std::ui
         destination.binding().bytes != physical(handle, rank).bytes || local.backing_up ||
         (local.host && local.host->readers) || host_covers(handle, rank, page.required_columns))
         throw std::logic_error("KV Host backup is not reservable");
-    auto source = read_device(handle, rank, page.required_columns);
+    const auto use = page.request_references[1] ? ContextUse::Request : ContextUse::Cache;
+    auto source    = read_device(handle, rank, page.required_columns, use);
     domains_->classify(destination, layout_id_);
+    destination.set_use(use);
     local.backing_up = allocation_pages_->emplace(destination, handle, source.coverage());
     return Backup(*this, std::move(source), local.backing_up);
 }
@@ -948,7 +969,12 @@ void PageDirectory::pin_source(PageId handle) {
     for (const auto& local : page.parts)
         if (!local.device && !local.restoring)
             throw std::logic_error("KV source has no prepared Device replica");
-    for (auto& local : page.parts) ++(local.device ? local.device : local.restoring)->readers;
+    for (auto& local : page.parts) {
+        auto& replica = *(local.device ? local.device : local.restoring);
+        ++replica.readers;
+        ++replica.request_readers;
+    }
+    refresh_usage(page);
 }
 
 void PageDirectory::unpin_source(PageId handle) {
@@ -957,21 +983,55 @@ void PageDirectory::unpin_source(PageId handle) {
         if (!(local.device ? local.device : local.restoring) ||
             !(local.device ? local.device : local.restoring)->readers)
             throw std::logic_error("KV Device source is not pinned");
-    for (auto& local : page.parts) --(local.device ? local.device : local.restoring)->readers;
+    for (auto& local : page.parts) {
+        auto& replica = *(local.device ? local.device : local.restoring);
+        --replica.readers;
+        if (!replica.request_readers) std::terminate();
+        --replica.request_readers;
+    }
+    refresh_usage(page);
     retire_unowned(handle);
+}
+
+void PageDirectory::refresh_usage(Page& page) noexcept {
+    const bool device = page.active_references || page.request_references[0] ||
+                        page.writer_identity || page.destination_pinned;
+    for (auto& local : page.parts) {
+        if (local.device)
+            local.device->record.set_use(
+                device || local.device->request_readers ? ContextUse::Request : ContextUse::Cache);
+        if (local.host)
+            local.host->record.set_use(page.request_references[1] || local.host->request_readers
+                                           ? ContextUse::Request
+                                           : ContextUse::Cache);
+    }
+}
+
+void PageDirectory::retain_request_reference(PageId handle, ContextMemory memory) {
+    auto& page  = require(handle);
+    auto& count = page.request_references[static_cast<std::size_t>(memory)];
+    if (count == UINT32_MAX) throw std::overflow_error("KV request reference overflow");
+    if (++count == 1) refresh_usage(page);
+}
+
+void PageDirectory::release_request_reference(PageId handle, ContextMemory memory) {
+    auto& page  = require(handle);
+    auto& count = page.request_references[static_cast<std::size_t>(memory)];
+    if (!count) throw std::logic_error("KV page has no request reference");
+    if (--count == 0) refresh_usage(page);
 }
 
 void PageDirectory::retain_active_reference(PageId handle) {
     auto& page = require(handle);
     if (page.active_references >= page.references)
         throw std::logic_error("KV active reference is not retainable");
-    ++page.active_references;
+    if (++page.active_references == 1) refresh_usage(page);
 }
 
 void PageDirectory::release_active_reference(PageId handle) {
     auto& page = require(handle);
     if (!page.active_references) throw std::logic_error("KV page has no active reference");
-    --page.active_references;
+    if (--page.active_references == 0) refresh_usage(page);
 }
 
 void PageDirectory::retain_reference(PageId handle) {

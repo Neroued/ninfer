@@ -438,7 +438,17 @@
   overflow: hidden;
   min-width: 30px;
 }
-.pool-live {
+.pool-in-use {
+  background: var(--decode);
+}
+.pool-use-key {
+  color: var(--decode);
+}
+.pool-cache-key {
+  color: var(--ink);
+}
+.pool-cached,
+.pool-unclassified {
   background: var(--ink);
   opacity: 0.55;
 }

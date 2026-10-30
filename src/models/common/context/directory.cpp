@@ -826,6 +826,13 @@ ContextUsage ContextDirectory::usage() const {
                 const auto& records = records_.usage({rank.rank, memory}, layout);
                 into.live_records += records.live_records;
                 into.live_bytes += records.live_records * records.stride_bytes;
+                const auto cached = records.cached_records * records.stride_bytes;
+                const auto in_use =
+                    (records.live_records - records.cached_records) * records.stride_bytes;
+                into.cached_bytes += cached;
+                into.in_use_bytes += in_use;
+                result.pools.back().cached_bytes += cached;
+                result.pools.back().in_use_bytes += in_use;
                 into.pending_retirement_records += records.pending_retirement_records;
                 into.pending_retirement_bytes +=
                     records.pending_retirement_records * records.stride_bytes;

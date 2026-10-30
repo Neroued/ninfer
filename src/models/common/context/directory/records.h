@@ -48,6 +48,7 @@ struct ContextRecordBinding {
 struct RecordUsage {
     std::uint64_t stride_bytes = 0;
     std::uint64_t live_records = 0, pending_retirement_records = 0;
+    std::uint64_t cached_records = 0;
 };
 
 // Record-relative fields supplied by the layout owner. Copies preserve represented content.
@@ -78,6 +79,7 @@ public:
     [[nodiscard]] AllocationId allocation() const noexcept { return allocation_; }
 
     [[nodiscard]] ContextRecordBinding binding() const;
+    void set_use(ContextUse use) noexcept;
     void defer_retirement();
     void cancel_retirement();
     void reset() noexcept;
@@ -88,7 +90,10 @@ private:
     ContextDomainId domain_;
     AllocationId allocation_;
     bool retiring_      = false;
+    ContextUse use_     = ContextUse::Request;
     RecordUsage* usage_ = nullptr;
+    void account(bool add) noexcept;
+    void set_retiring(bool retiring) noexcept;
     void forget() noexcept;
     friend class RecordReservation;
     friend class RecordDomains;

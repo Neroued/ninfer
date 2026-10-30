@@ -58,6 +58,7 @@ bool same_ownership(const q35::PhysicalUsageSnapshot& a, const q35::PhysicalUsag
         const auto& x = a.pools[i];
         const auto& y = b.pools[i];
         if (x.rank != y.rank || x.domain != y.domain || x.live_bytes != y.live_bytes ||
+            x.in_use_bytes != y.in_use_bytes || x.cached_bytes != y.cached_bytes ||
             x.reserved_bytes != y.reserved_bytes ||
             x.pending_retirement_bytes != y.pending_retirement_bytes ||
             x.future_reserved_bytes != y.future_reserved_bytes ||

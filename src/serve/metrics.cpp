@@ -147,6 +147,8 @@ std::string Metrics::render(const EngineSnapshot& snapshot, const ServiceSnapsho
     header("context_pool_reserved_detail_bytes", "gauge",
            "Relocation is part of reserved occupancy; future reservations have no physical target "
            "yet.");
+    header("context_pool_live_bytes", "gauge",
+           "Live Context storage by purpose; request use and cache are disjoint.");
     header("context_pool_peak_bytes", "gauge",
            "Lifetime peak physical Context occupancy by rank and domain.");
     for (const auto& pool : stats.context_pools) {
@@ -157,6 +159,8 @@ std::string Metrics::render(const EngineSnapshot& snapshot, const ServiceSnapsho
         };
         emit("context_pool_bytes", "capacity", pool.capacity_bytes);
         emit("context_pool_bytes", "live", pool.live_bytes);
+        emit("context_pool_live_bytes", "in_use", pool.in_use_bytes);
+        emit("context_pool_live_bytes", "cached", pool.cached_bytes);
         emit("context_pool_bytes", "reserved", pool.reserved_bytes);
         emit("context_pool_bytes", "pending_retirement", pool.pending_retirement_bytes);
         emit("context_pool_bytes", "padding", pool.padding_bytes);
@@ -450,6 +454,8 @@ std::string Metrics::render(const EngineSnapshot& snapshot, const ServiceSnapsho
     }
     header("context_resource_bytes", "gauge",
            "Physical KV/State replicas, independent of shared references.");
+    header("context_resource_live_bytes", "gauge",
+           "Live KV/State storage by purpose; request use and cache are disjoint.");
     for (const auto& value : stats.context_resources) {
         const auto labels =
             "rank=\"" + std::to_string(value.rank) + "\",domain=\"" +
@@ -460,6 +466,10 @@ std::string Metrics::render(const EngineSnapshot& snapshot, const ServiceSnapsho
             << '\n';
         out << "ninfer_context_resource_bytes{" << labels << ",kind=\"pending_retirement\"} "
             << value.pending_retirement_bytes << '\n';
+        out << "ninfer_context_resource_live_bytes{" << labels << ",kind=\"in_use\"} "
+            << value.in_use_bytes << '\n';
+        out << "ninfer_context_resource_live_bytes{" << labels << ",kind=\"cached\"} "
+            << value.cached_bytes << '\n';
     }
     header("placement_requests", "gauge", "Current scheduling state by attention placement.");
     header("placement_context_tokens", "gauge",

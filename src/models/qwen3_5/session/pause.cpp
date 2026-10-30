@@ -326,6 +326,11 @@ bool SessionImpl::begin_pause(SequenceHandle handle, runtime::PauseAction action
     if (save_snapshot) {
         saved->snapshot = detach_checkpoint(state, std::move(pause_reservation_->checkpoint));
         if (!saved->snapshot) throw std::logic_error("prepared pause lost its complete checkpoint");
+        checkpoint(*saved->snapshot)
+            .snapshot.set_use(context::ContextUse::Request,
+                              action.kind == runtime::PauseKind::HostSnapshot
+                                  ? context::ContextMemory::Host
+                                  : context::ContextMemory::Device);
     }
     if (!saved->snapshot) {
         release_sequence_kv(state);

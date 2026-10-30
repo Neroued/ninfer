@@ -87,7 +87,10 @@ HistoryPrefix::~HistoryPrefix() { reset(); }
 
 HistoryPrefix::HistoryPrefix(const HistoryPrefix& other)
     : store_(other.store_), history_(other.history_), frontier_(other.frontier_) {
-    if (valid()) store_->add_prefix(history_, frontier_);
+    if (valid()) {
+        store_->add_prefix(history_, frontier_);
+        set_use(other.use_, other.memory_);
+    }
 }
 
 HistoryPrefix& HistoryPrefix::operator=(const HistoryPrefix& other) {
@@ -100,7 +103,7 @@ HistoryPrefix& HistoryPrefix::operator=(const HistoryPrefix& other) {
 
 HistoryPrefix::HistoryPrefix(HistoryPrefix&& other) noexcept
     : store_(std::exchange(other.store_, nullptr)), history_(std::exchange(other.history_, {})),
-      frontier_(std::exchange(other.frontier_, 0)) {}
+      frontier_(std::exchange(other.frontier_, 0)), use_(other.use_), memory_(other.memory_) {}
 
 HistoryPrefix& HistoryPrefix::operator=(HistoryPrefix&& other) noexcept {
     if (this != &other) {
@@ -108,12 +111,27 @@ HistoryPrefix& HistoryPrefix::operator=(HistoryPrefix&& other) noexcept {
         store_    = std::exchange(other.store_, nullptr);
         history_  = std::exchange(other.history_, {});
         frontier_ = std::exchange(other.frontier_, 0);
+        use_      = other.use_;
+        memory_   = other.memory_;
     }
     return *this;
 }
 
+void HistoryPrefix::set_use(ContextUse use, ContextMemory memory) {
+    if (use_ == use && memory_ == memory) return;
+    if (!valid()) throw std::logic_error("KV prefix has no owner");
+    if (use == ContextUse::Request)
+        store_->update_request_prefix(history_, frontier_, memory, true);
+    if (use_ == ContextUse::Request)
+        store_->update_request_prefix(history_, frontier_, memory_, false);
+    use_    = use;
+    memory_ = memory;
+}
+
 void HistoryPrefix::reset() noexcept {
     if (valid()) {
+        if (use_ == ContextUse::Request)
+            store_->update_request_prefix(history_, frontier_, memory_, false);
         store_->remove_prefix(history_, frontier_);
         store_    = nullptr;
         history_  = {};
@@ -346,11 +364,10 @@ std::size_t HistoryDirectory::reclaimable_metadata(std::span<const HistoryId> re
                 segment = 0;
                 break;
             }
-            segment +=
-                sizeof(History) + history.placement.capacity() * sizeof(std::uint32_t) +
-                history.spare_chunks.capacity() * sizeof(Chunk*) +
-                history.directory.capacity() * sizeof(ChunkRef) +
-                history.prefixes.capacity() * sizeof(std::pair<std::uint32_t, std::uint32_t>);
+            segment += sizeof(History) + history.placement.capacity() * sizeof(std::uint32_t) +
+                       history.spare_chunks.capacity() * sizeof(Chunk*) +
+                       history.directory.capacity() * sizeof(ChunkRef) +
+                       history.prefixes.capacity() * sizeof(PrefixReferences);
         }
         bytes += segment;
     }
@@ -380,8 +397,7 @@ void HistoryDirectory::reclaim_metadata() noexcept {
             metadata_.release(history.placement.capacity() * sizeof(std::uint32_t) +
                               history.spare_chunks.capacity() * sizeof(Chunk*) +
                               history.directory.capacity() * sizeof(ChunkRef) +
-                              history.prefixes.capacity() *
-                                  sizeof(std::pair<std::uint32_t, std::uint32_t>));
+                              history.prefixes.capacity() * sizeof(PrefixReferences));
         }
         histories_.release_segment(first);
     }
@@ -454,7 +470,7 @@ HistoryDirectory::metadata_requirement(std::span<const HistoryMetadataDemand> de
         bytes +=
             vector_bytes(history ? history->spare_chunks.capacity() : 0, chunks, sizeof(Chunk*));
         bytes += vector_bytes(history ? history->prefixes.capacity() : 0, prefixes,
-                              sizeof(std::pair<std::uint32_t, std::uint32_t>));
+                              sizeof(PrefixReferences));
     };
     std::vector<HistoryId> writers;
     for (const auto& demand : demands) {
@@ -749,19 +765,56 @@ HistoryPrefix HistoryDirectory::retain_prefix(HistoryId h, std::uint32_t frontie
     return HistoryPrefix(*this, h, frontier);
 }
 
+void HistoryDirectory::update_request_prefix(HistoryId h, std::uint32_t frontier,
+                                             ContextMemory memory, bool add) {
+    auto& history     = require(h);
+    const auto domain = static_cast<std::size_t>(memory);
+    auto entry        = std::lower_bound(history.prefixes.begin(), history.prefixes.end(), frontier,
+                                         [](const auto& value, auto key) { return value.frontier < key; });
+    if (entry == history.prefixes.end() || entry->frontier != frontier)
+        throw std::logic_error("KV request prefix is not retained");
+    auto& count       = entry->requests[domain];
+    const auto before = history.request_frontiers[domain];
+    auto after        = before;
+    if (add) {
+        if (count == UINT32_MAX) throw std::overflow_error("KV request prefix count overflow");
+        ++count;
+        after = std::max(before, frontier);
+    } else {
+        if (!count) throw std::logic_error("KV request prefix is not held");
+        if (--count == 0 && before == frontier) {
+            after = 0;
+            for (auto it = history.prefixes.rbegin(); it != history.prefixes.rend(); ++it)
+                if (it->requests[domain]) {
+                    after = it->frontier;
+                    break;
+                }
+        }
+    }
+    const auto old_pages = page_count(before), new_pages = page_count(after);
+    for (auto i = std::min(old_pages, new_pages); i < std::max(old_pages, new_pages); ++i) {
+        const auto page = membership(history, i);
+        if (after > before)
+            pages_->retain_request_reference(page, memory);
+        else
+            pages_->release_request_reference(page, memory);
+    }
+    history.request_frontiers[domain] = after;
+}
+
 void HistoryDirectory::add_prefix(HistoryId h, std::uint32_t frontier) {
     auto& history = require(h);
     if (frontier > history.frontier)
         throw std::invalid_argument("KV retained prefix is outside committed history");
     const auto old = history.retained;
     auto entry     = std::lower_bound(history.prefixes.begin(), history.prefixes.end(), frontier,
-                                      [](const auto& value, auto key) { return value.first < key; });
-    if (entry == history.prefixes.end() || entry->first != frontier) {
+                                      [](const auto& value, auto key) { return value.frontier < key; });
+    if (entry == history.prefixes.end() || entry->frontier != frontier) {
         const auto index = entry - history.prefixes.begin();
         metadata_.reserve(history.prefixes, history.prefixes.size() + 1);
         entry = history.prefixes.insert(history.prefixes.begin() + index, {frontier, 0});
     }
-    ++entry->second;
+    ++entry->count;
     ++history.prefix_count;
     history.retained = std::max(old, frontier);
     update_ranges(history, std::max(history.owned ? history.frontier : 0, old),
@@ -772,13 +825,15 @@ void HistoryDirectory::add_prefix(HistoryId h, std::uint32_t frontier) {
 void HistoryDirectory::remove_prefix(HistoryId h, std::uint32_t frontier) noexcept {
     try {
         auto& history = require(h);
-        auto it       = std::lower_bound(history.prefixes.begin(), history.prefixes.end(), frontier,
-                                         [](const auto& value, auto key) { return value.first < key; });
-        if (it == history.prefixes.end() || it->first != frontier || !it->second) std::terminate();
+        auto it =
+            std::lower_bound(history.prefixes.begin(), history.prefixes.end(), frontier,
+                             [](const auto& value, auto key) { return value.frontier < key; });
+        if (it == history.prefixes.end() || it->frontier != frontier || !it->count)
+            std::terminate();
         const auto old = history.retained;
-        if (--it->second == 0) history.prefixes.erase(it);
+        if (--it->count == 0) history.prefixes.erase(it);
         --history.prefix_count;
-        history.retained = history.prefixes.empty() ? 0 : history.prefixes.rbegin()->first;
+        history.retained = history.prefixes.empty() ? 0 : history.prefixes.rbegin()->frontier;
         update_ranges(history, std::max(history.owned ? history.frontier : 0, old),
                       std::max(history.owned ? history.frontier : 0, history.retained), old,
                       history.retained);
@@ -791,11 +846,10 @@ HistoryDirectory::retained_after(HistoryId h, std::span<const HistoryPrefix* con
     const auto& history = require(h);
     for (auto it = history.prefixes.rbegin(); it != history.prefixes.rend(); ++it) {
         const auto erased = std::count_if(removed.begin(), removed.end(), [&](auto* prefix) {
-            return prefix && prefix->history() == h && prefix->frontier() == it->first;
+            return prefix && prefix->history() == h && prefix->frontier() == it->frontier;
         });
-        if (erased > it->second)
-            throw std::logic_error("KV release counts a prefix more than once");
-        if (erased < it->second) return it->first;
+        if (erased > it->count) throw std::logic_error("KV release counts a prefix more than once");
+        if (erased < it->count) return it->frontier;
     }
     return 0;
 }

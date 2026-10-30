@@ -60,6 +60,8 @@ int main() {
                                          .capacity_bytes = 1048576,
                                          .block_bytes    = 4096,
                                          .live_bytes     = 3072,
+                                         .in_use_bytes   = 1024,
+                                         .cached_bytes   = 2048,
                                          .reserved_bytes = 1024}};
     running.runtime.kv_pools         = {{0, "text", 2}, {1, "draft", 1}, {2, "index", 3}};
     running.runtime.context_transfers.kv.resize(3);
@@ -110,6 +112,13 @@ int main() {
                 "ninfer_context_pool_bytes{rank=\"0\",domain=\"host\",kind=\"reserved\"} 1024\n") !=
                 std::string::npos,
         "reserved bytes must not be added to occupancy twice");
+    check(
+        live.find(
+            "ninfer_context_pool_live_bytes{rank=\"0\",domain=\"host\",kind=\"in_use\"} 1024\n") !=
+                std::string::npos &&
+            live.find("ninfer_context_pool_live_bytes{rank=\"0\",domain=\"host\",kind=\"cached\"} "
+                      "2048\n") != std::string::npos,
+        "request and cache occupancy must remain distinct from physical lifecycle totals");
 
     check(live.find("ninfer_context_kv_page_groups{pool_id=\"2\"} 3\n") != std::string::npos &&
               live.find("ninfer_context_transfer_bytes_total{resource=\"kv\",pool_id=\"2\","

@@ -300,6 +300,8 @@ Json observation_json(const EngineSnapshot& snapshot, std::uint64_t now) {
              {"history_pool", optional(resource.history_pool)},
              {"live_records", resource.live_records},
              {"live_bytes", resource.live_bytes},
+             {"in_use_bytes", resource.in_use_bytes},
+             {"cached_bytes", resource.cached_bytes},
              {"pending_retirement_records", resource.pending_retirement_records},
              {"pending_retirement_bytes", resource.pending_retirement_bytes}});
     out["placements"] = Json::array();

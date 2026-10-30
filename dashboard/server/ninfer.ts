@@ -71,9 +71,11 @@ interface ContextPool {
   rank: number;
   domain: string;
   capacity_bytes: number;
+  in_use_bytes?: number;
+  cached_bytes?: number;
   assigned_free_bytes: number;
   unassigned_free_bytes: number;
-  [key: string]: number | string;
+  [key: string]: number | string | undefined;
 }
 
 interface ContextResource {
@@ -81,6 +83,8 @@ interface ContextResource {
   domain: string;
   history_pool: number | null;
   live_bytes: number;
+  in_use_bytes?: number;
+  cached_bytes?: number;
   pending_retirement_bytes: number;
 }
 
@@ -216,11 +220,24 @@ export function frameOf(snapshot: NinferSnapshot, at: number, monotonicMs: numbe
   }
   if (gauges.context_capacity_bytes > 0) {
     gauges.context_percent = (100 * gauges.context_occupied_bytes) / gauges.context_capacity_bytes;
+    const pools = engine.context.pools.filter((pool) => pool.domain === 'device');
+    if (pools.every((pool) => pool.in_use_bytes !== undefined && pool.cached_bytes !== undefined)) {
+      gauges.context_in_use_bytes = pools.reduce((sum, pool) => sum + pool.in_use_bytes!, 0);
+      gauges.context_cached_bytes = pools.reduce((sum, pool) => sum + pool.cached_bytes!, 0);
+      gauges.context_in_use_percent =
+        (100 * gauges.context_in_use_bytes) / gauges.context_capacity_bytes;
+    }
   }
   for (const resource of engine.context.resources) {
     const prefix = `pool.${resource.domain}.${resource.rank}.${resource.history_pool === null ? 'state' : 'kv'}`;
-    for (const field of ['live_bytes', 'pending_retirement_bytes'] as const) {
-      gauges[`${prefix}_${field}`] = (gauges[`${prefix}_${field}`] ?? 0) + resource[field];
+    for (const field of [
+      'live_bytes',
+      'in_use_bytes',
+      'cached_bytes',
+      'pending_retirement_bytes',
+    ] as const) {
+      if (resource[field] !== undefined)
+        gauges[`${prefix}_${field}`] = (gauges[`${prefix}_${field}`] ?? 0) + resource[field];
     }
   }
   numbers(gauges, 'metadata.', engine.context.metadata);

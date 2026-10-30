@@ -11,7 +11,7 @@ StateDirectory::ReadLease::~ReadLease() { reset(); }
 
 StateDirectory::ReadLease::ReadLease(ReadLease&& other) noexcept
     : directory_(std::exchange(other.directory_, nullptr)), image_(other.image_),
-      epoch_(other.epoch_) {}
+      epoch_(other.epoch_), memory_(other.memory_), use_(other.use_) {}
 
 StateDirectory::ReadLease& StateDirectory::ReadLease::operator=(ReadLease&& other) noexcept {
     if (this != &other) {
@@ -19,6 +19,8 @@ StateDirectory::ReadLease& StateDirectory::ReadLease::operator=(ReadLease&& othe
         directory_ = std::exchange(other.directory_, nullptr);
         image_     = other.image_;
         epoch_     = other.epoch_;
+        memory_    = other.memory_;
+        use_       = other.use_;
     }
     return *this;
 }
@@ -29,6 +31,7 @@ void StateDirectory::ReadLease::reset() noexcept {
     auto& image = store->require(image_);
     if (!image.source_pins || image.content_epoch != epoch_) std::terminate();
     --image.source_pins;
+    if (use_ == ContextUse::Request) store->release_request_reference(image_, memory_);
     store->retire_released_owner(image_);
 }
 
@@ -44,13 +47,15 @@ ContextRecordBinding StateDirectory::ReadLease::host_binding(std::uint32_t rank)
     return directory_->host_binding(image_, rank);
 }
 
-StateDirectory::ReadLease StateDirectory::read(StateId handle) {
+StateDirectory::ReadLease StateDirectory::read(StateId handle, ContextMemory memory,
+                                               ContextUse use) {
     auto& object = require(handle);
     if (object.role != StateRole::CheckpointImmutable ||
         object.source_pins == std::numeric_limits<std::uint32_t>::max())
         throw std::logic_error("StateImage is not readable as an immutable replica");
     ++object.source_pins;
-    return ReadLease(*this, handle, object.content_epoch);
+    if (use == ContextUse::Request) retain_request_reference(handle, memory);
+    return ReadLease(*this, handle, object.content_epoch, memory, use);
 }
 
 StateDirectory::Destination::Destination(StateDirectory& store, StateId image)
@@ -436,6 +441,7 @@ void StateDirectory::complete_initialization(StateId handle) {
     }
     if (object.content_epoch == 0) { object.content_epoch = next_epoch(); }
     object.role = StateRole::ActiveMutable;
+    refresh_usage(object);
 }
 
 void StateDirectory::complete_conversion(const ReadLease& source, StateId destination) {
@@ -496,6 +502,34 @@ std::uint32_t StateDirectory::source_pins(StateId handle) const {
 
 std::uint32_t StateDirectory::checkpoint_references(StateId handle) const {
     return require(handle).checkpoint_references;
+}
+
+void StateDirectory::refresh_usage(Object& object) noexcept {
+    const bool active = object.role == StateRole::ActiveMutable ||
+                        object.role == StateRole::ReservedDestination ||
+                        object.role == StateRole::Writing;
+    for (auto& local : object.parts) {
+        if (local.device)
+            local.device->set_use(active || object.request_references[0] ? ContextUse::Request
+                                                                         : ContextUse::Cache);
+        if (local.host)
+            local.host->set_use(object.request_references[1] ? ContextUse::Request
+                                                             : ContextUse::Cache);
+    }
+}
+
+void StateDirectory::retain_request_reference(StateId handle, ContextMemory memory) {
+    auto& object = require(handle);
+    auto& count  = object.request_references[static_cast<std::size_t>(memory)];
+    if (count == UINT32_MAX) throw std::overflow_error("StateImage request reference overflow");
+    if (++count == 1) refresh_usage(object);
+}
+
+void StateDirectory::release_request_reference(StateId handle, ContextMemory memory) noexcept {
+    auto& object = require(handle);
+    auto& count  = object.request_references[static_cast<std::size_t>(memory)];
+    if (!count) std::terminate();
+    if (--count == 0) refresh_usage(object);
 }
 
 void StateDirectory::retain_checkpoint_reference(StateId handle) {
@@ -584,6 +618,7 @@ void StateDirectory::make_mutable(StateId handle) {
     if (host_resident(handle)) --host_images_;
     for (auto& part : object.parts) part.host.reset();
     object.role = StateRole::ActiveMutable;
+    refresh_usage(object);
 }
 
 void StateDirectory::consume_checkpoint(StateId handle) {
@@ -598,6 +633,7 @@ void StateDirectory::consume_checkpoint(StateId handle) {
     if (host_resident(handle)) --host_images_;
     for (auto& part : object.parts) part.host.reset();
     object.role = StateRole::ActiveMutable;
+    refresh_usage(object);
 }
 
 bool StateDirectory::drop_device_replica(StateId handle) noexcept {
@@ -640,6 +676,7 @@ void StateDirectory::split_device_replica_identity(StateId source, StateId desti
         source_part.device.reset();
     }
     to.content_epoch = from.content_epoch;
+    refresh_usage(to);
 }
 
 void StateDirectory::freeze(StateId handle) {
@@ -649,6 +686,7 @@ void StateDirectory::freeze(StateId handle) {
         throw std::logic_error("StateImage active image is not freezable");
     }
     object.role = StateRole::CheckpointImmutable;
+    refresh_usage(object);
 }
 
 StateSelectors StateDirectory::begin_write(StateId source, StateId destination,
@@ -665,6 +703,7 @@ StateSelectors StateDirectory::begin_write(StateId source, StateId destination,
     }
     const StateSelectors result{physical_offset(source, rank), physical_offset(destination, rank)};
     ++source_object.source_pins;
+    retain_request_reference(source, ContextMemory::Device);
     destination_object.destination_pinned = true;
     destination_object.role               = StateRole::Writing;
     destination_object.write_source       = source;
@@ -686,6 +725,7 @@ void StateDirectory::complete_write(StateId source, StateId destination) {
         throw std::logic_error("StateImage fork commit is invalid");
     }
     --source_object.source_pins;
+    release_request_reference(source, ContextMemory::Device);
     destination_object.destination_pinned = false;
     destination_object.write_source       = {};
     destination_object.role               = StateRole::ActiveMutable;
@@ -700,6 +740,7 @@ void StateDirectory::abort_write(StateId source, StateId destination) {
     Object& source_object      = require(source);
     Object& destination_object = require(destination);
     --source_object.source_pins;
+    release_request_reference(source, ContextMemory::Device);
     destination_object.destination_pinned = false;
     destination_object.write_source       = {};
     destination_object.role               = StateRole::ReservedDestination;
@@ -751,8 +792,11 @@ StateDirectory::reserve_device_to_host(StateId source, RecordReservation reserve
     auto targets = reserved.materialize();
     validate_records(targets, ContextMemory::Host, object.variant);
     for (auto& record : targets) records_->classify(record, state_record_layout(object.variant));
-    const auto id = next_transfer();
-    Transfer transfer(*this, id, StateCopyDirection::DeviceToHost, read(source), source);
+    const auto id  = next_transfer();
+    const auto use = object.request_references[1] ? ContextUse::Request : ContextUse::Cache;
+    for (auto& record : targets) record.set_use(use);
+    Transfer transfer(*this, id, StateCopyDirection::DeviceToHost,
+                      read(source, ContextMemory::Device, use), source);
     transfer.records_ = std::move(targets);
     ++host_images_;
     object.transfer_id        = id;
@@ -787,7 +831,8 @@ StateDirectory::reserve_host_to_device(StateId source, StateId destination,
     validate_records(targets, ContextMemory::Device, from.variant);
     for (auto& record : targets) records_->classify(record, state_record_layout(from.variant));
     const auto id = next_transfer();
-    Transfer transfer(*this, id, StateCopyDirection::HostToDevice, read(source), destination);
+    Transfer transfer(*this, id, StateCopyDirection::HostToDevice,
+                      read(source, ContextMemory::Host), destination);
     transfer.records_ = std::move(targets);
     ++device_images_;
     to.transfer_id        = id;
@@ -824,6 +869,7 @@ void StateDirectory::publish_transfer(Transfer& transfer, bool keep_source_repli
         --host_images_;
     destination.destination_pinned = false;
     destination.transfer_id        = 0;
+    refresh_usage(destination);
     consume(transfer);
     transfer.source_.reset();
 }
@@ -839,6 +885,7 @@ void StateDirectory::abort_transfer(Transfer& transfer) noexcept {
     destination.destination_pinned = false;
     destination.transfer_id        = 0;
     if (transfer.source_.image() != transfer.destination_) destination.content_epoch = 0;
+    refresh_usage(destination);
     consume(transfer);
     transfer.source_.reset();
 }
@@ -951,7 +998,7 @@ StateDirectory::ReadLease StateDirectory::pin_binding(StateId image) {
         throw std::overflow_error("State binding pin count exhausted");
     }
     ++object.source_pins;
-    return ReadLease(*this, image, object.content_epoch);
+    return ReadLease(*this, image, object.content_epoch, ContextMemory::Device, ContextUse::Cache);
 }
 
 std::uint64_t StateDirectory::next_epoch() noexcept {

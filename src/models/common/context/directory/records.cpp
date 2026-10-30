@@ -15,7 +15,7 @@ RecordLease::~RecordLease() { reset(); }
 
 RecordLease::RecordLease(RecordLease&& other) noexcept
     : pool_(std::exchange(other.pool_, nullptr)), domain_(other.domain_),
-      allocation_(other.allocation_), retiring_(other.retiring_),
+      allocation_(other.allocation_), retiring_(other.retiring_), use_(other.use_),
       usage_(std::exchange(other.usage_, nullptr)) {}
 
 RecordLease& RecordLease::operator=(RecordLease&& other) noexcept {
@@ -25,6 +25,7 @@ RecordLease& RecordLease::operator=(RecordLease&& other) noexcept {
         domain_     = other.domain_;
         allocation_ = other.allocation_;
         retiring_   = other.retiring_;
+        use_        = other.use_;
         usage_      = std::exchange(other.usage_, nullptr);
     }
     return *this;
@@ -42,21 +43,38 @@ ContextRecordBinding RecordLease::binding() const {
 void RecordLease::defer_retirement() {
     if (!pool_ || retiring_) return;
     pool_->defer_release(allocation_);
-    if (usage_) {
-        --usage_->live_records;
-        ++usage_->pending_retirement_records;
-    }
-    retiring_ = true;
+    set_retiring(true);
 }
 
 void RecordLease::cancel_retirement() {
     if (!pool_ || !retiring_) return;
     pool_->cancel_deferred_release(allocation_);
-    if (usage_) {
-        --usage_->pending_retirement_records;
-        ++usage_->live_records;
-    }
-    retiring_ = false;
+    set_retiring(false);
+}
+
+void RecordLease::account(bool add) noexcept {
+    if (!usage_) return;
+    auto update = [add](std::uint64_t& count) {
+        if (add)
+            ++count;
+        else
+            --count;
+    };
+    update(retiring_ ? usage_->pending_retirement_records : usage_->live_records);
+    if (!retiring_ && use_ == ContextUse::Cache) update(usage_->cached_records);
+}
+
+void RecordLease::set_use(ContextUse use) noexcept {
+    if (use_ == use) return;
+    account(false);
+    use_ = use;
+    account(true);
+}
+
+void RecordLease::set_retiring(bool retiring) noexcept {
+    account(false);
+    retiring_ = retiring;
+    account(true);
 }
 
 void RecordLease::reset() noexcept {
@@ -69,12 +87,7 @@ void RecordLease::reset() noexcept {
 }
 
 void RecordLease::forget() noexcept {
-    if (usage_) {
-        if (retiring_)
-            --usage_->pending_retirement_records;
-        else
-            --usage_->live_records;
-    }
+    account(false);
     usage_ = nullptr;
     pool_  = nullptr;
 }
@@ -185,11 +198,7 @@ void RecordReservation::defer_return(RecordLease& record) {
             continue;
         claim.pool->defer_to_reservation(record.allocation_, *claim.reservation);
         ++claim.count;
-        if (record.usage_) {
-            --record.usage_->live_records;
-            ++record.usage_->pending_retirement_records;
-        }
-        record.retiring_ = true;
+        record.set_retiring(true);
         return;
     }
     throw std::logic_error("retiring record has no prepared return reservation");
@@ -418,17 +427,9 @@ void RecordDomains::classify(RecordLease& record, std::uint32_t layout) {
         throw std::invalid_argument("context record classification has a different geometry");
     auto* target = &const_cast<RecordUsage&>(usage(record.domain(), layout));
     if (record.usage_ == target) return;
-    if (record.usage_) {
-        if (record.retiring_)
-            --record.usage_->pending_retirement_records;
-        else
-            --record.usage_->live_records;
-    }
+    record.account(false);
     record.usage_ = target;
-    if (record.retiring_)
-        ++target->pending_retirement_records;
-    else
-        ++target->live_records;
+    record.account(true);
 }
 
 const ContextRecordLayout& RecordDomains::layout(std::uint32_t id) const {

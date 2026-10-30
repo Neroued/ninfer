@@ -93,6 +93,7 @@ struct ServeOptions {
     std::optional<std::string> model_id_override;
     bool enable_cors                       = false;
     std::size_t max_request_bytes          = kDefaultMaxRequestBytes;
+    bool enable_admin_cache                = false; // register the /admin/cache/prefixes routes
     std::size_t response_store_max_records = kDefaultResponseStoreRecords;
     std::size_t response_store_max_bytes   = kDefaultResponseStoreBytes;
 };

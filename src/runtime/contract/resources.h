@@ -26,6 +26,16 @@ struct KvPoolId {
     friend constexpr bool operator==(KvPoolId, KvPoolId) noexcept = default;
 };
 
+// Normalized per-checkpoint evictable resources. The session computes these under its own
+// accounting rules; the engine's prefix-cache policy consumes them without interpreting
+// model-specific storage.
+struct CheckpointEvictableResources {
+    std::uint32_t state_slots = 0; // State images freed by releasing the checkpoint.
+    // Device KV page groups freed per pool, indexed by KvPoolId.index.
+    std::array<std::uint32_t, ninfer::kMaximumKvPools> kv_page_groups{};
+    std::size_t host_bytes = 0; // Exact Host bytes freed, physical sharing counted once.
+};
+
 // IDs describe logical history kinds, not physical memory partitions.
 struct KvPoolDescriptor {
     KvPoolId id;

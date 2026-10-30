@@ -318,6 +318,11 @@ public:
     // Exact Host bytes freed by deleting this fixed set, with physical sharing counted once.
     [[nodiscard]] std::size_t
     host_bytes_released(std::span<const CheckpointHandle> checkpoints) const;
+    [[nodiscard]] runtime::CheckpointEvictableResources
+    checkpoint_evictable_resources(CheckpointHandle checkpoint) const;
+    [[nodiscard]] std::size_t state_image_bytes() const noexcept;
+    [[nodiscard]] std::size_t kv_page_bytes(std::uint32_t pool) const noexcept;
+    [[nodiscard]] std::uint32_t state_slots_capacity() const noexcept;
     [[nodiscard]] std::optional<context::HostWriteRequirements>
         pause_host_requirements(SequenceHandle) const;
     [[nodiscard]] std::vector<PauseOption> pause_options(SequenceHandle) const;

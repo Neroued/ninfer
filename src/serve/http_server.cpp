@@ -1,5 +1,6 @@
 #include "serve/http_server.h"
 
+#include "serve/admin_cache.h"
 #include "serve/anthropic_messages.h"
 #include "serve/http_transport.h"
 #include "serve/openai_common.h"
@@ -481,6 +482,29 @@ void HttpServer::register_routes() {
     server_.Post("/v1/messages", [this](const httplib::Request& req, httplib::Response& res) {
         handle_messages(req, res);
     });
+    // Admin prefix-cache routes are opt-in: without --enable-admin-cache the paths are not
+    // registered and answer 404. Bearer authentication is applied by the pre-routing handler.
+    if (admin_cache_routes_enabled(options_)) {
+        server_.Get("/admin/cache/prefixes",
+                    [this](const httplib::Request&, httplib::Response& res) {
+                        const ninfer::PrefixCacheTable table = service_->prefix_cache_table();
+                        res.set_header("Cache-Control", "no-store");
+                        res.set_content(
+                            render_prefix_cache_table(table, service_->snapshot(),
+                                                      service_->description())
+                                .dump(),
+                            "application/json");
+                    });
+        server_.Post("/admin/cache/prefixes/evict",
+                     [this](const httplib::Request& req, httplib::Response& res) {
+                         const PrefixEvictSelection selection =
+                             parse_prefix_evict_body(req.body);
+                         const ninfer::PrefixCacheEvictResult result =
+                             service_->evict_prefixes(selection.prefixes, selection.max_bytes);
+                         res.set_content(render_prefix_evict_result(result).dump(),
+                                         "application/json");
+                     });
+    }
 }
 
 void HttpServer::handle_models(const httplib::Request&, httplib::Response& res) const {

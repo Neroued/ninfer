@@ -255,6 +255,7 @@ private:
                 startup.ranks = instance->rank_budgets;
                 for (const auto& pool : instance->session->kv_pools())
                     description.kv_pools.push_back({pool.id.index, std::string(pool.label), 0});
+                description.state_slots_capacity = instance->session->state_slots_capacity();
                 for (const auto& rank : instance->executor->observations()) {
                     int device = options.device;
                     if (options.deployment)
@@ -497,6 +498,41 @@ EngineSnapshot Engine::snapshot() const {
         std::visit([](const auto& instance) { return instance->frontend.media_cache_summary(); },
                    impl_->active);
     return result;
+}
+
+PrefixCacheTable Engine::build_prefix_table() {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    return std::visit(
+        [](auto& core) -> PrefixCacheTable {
+            using CoreState = std::remove_cvref_t<decltype(core)>;
+            if constexpr (std::is_same_v<CoreState, std::monostate>) {
+                throw std::logic_error("Engine core is unavailable");
+            } else if constexpr (CoreState::element_type::purpose ==
+                                 EnginePurpose::CausalScoring) {
+                throw std::logic_error("build_prefix_table requires a Generation Engine");
+            } else {
+                return core->build_prefix_table();
+            }
+        },
+        impl_->core);
+}
+
+PrefixCacheEvictResult Engine::evict_prefixes(std::span<const PrefixCacheKey> selection,
+                                              std::uint64_t max_bytes) {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    return std::visit(
+        [&](auto& core) -> PrefixCacheEvictResult {
+            using CoreState = std::remove_cvref_t<decltype(core)>;
+            if constexpr (std::is_same_v<CoreState, std::monostate>) {
+                throw std::logic_error("Engine core is unavailable");
+            } else if constexpr (CoreState::element_type::purpose ==
+                                 EnginePurpose::CausalScoring) {
+                throw std::logic_error("evict_prefixes requires a Generation Engine");
+            } else {
+                return core->evict_prefixes(selection, max_bytes);
+            }
+        },
+        impl_->core);
 }
 
 bool Engine::is_available() const {

@@ -31,6 +31,10 @@ ninfer_add_test(ninfer_qwen3_5_prefix_real_test
   LIBRARIES ninfer_model_execution ninfer_engine)
 ninfer_test_interpose(ninfer_qwen3_5_prefix_real_test cudaEventQuery)
 
+ninfer_add_test(ninfer_qwen3_5_prefix_admin_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_prefix_admin_real.cpp"
+  LIBRARIES ninfer_model_execution ninfer_engine)
+
 add_test(NAME ninfer_qwen3_5_terminal_publication_real_test
   COMMAND ninfer_qwen3_5_prefix_real_test)
 set_tests_properties(ninfer_qwen3_5_terminal_publication_real_test PROPERTIES
@@ -88,6 +92,7 @@ set(ninfer_qwen3_5_real_tests
   ninfer_qwen3_5_native_transactions_test
   ninfer_qwen3_5_mtp_history_real_test
   ninfer_qwen3_5_prefix_real_test
+  ninfer_qwen3_5_prefix_admin_real_test
   ninfer_qwen3_5_terminal_publication_real_test
   ninfer_qwen3_5_agent_continuation_real_test
   ninfer_qwen3_5_preemption_real_test

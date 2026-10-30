@@ -274,6 +274,11 @@ public:
     [[nodiscard]] std::vector<Image> checkpoint_images(std::span<const CheckpointHandle>) const;
     [[nodiscard]] ContextReleaseSet footprint(std::span<const CheckpointHandle>,
                                               bool released) const;
+    [[nodiscard]] runtime::CheckpointEvictableResources
+    checkpoint_evictable_resources(CheckpointHandle checkpoint) const;
+    [[nodiscard]] std::size_t state_image_bytes() const noexcept;
+    [[nodiscard]] std::size_t kv_page_bytes(std::uint32_t pool) const noexcept;
+    [[nodiscard]] std::uint32_t state_slots_capacity() const noexcept;
     [[nodiscard]] ContextReclaimPlan plan_reclaim(std::span<const CheckpointHandle>,
                                                   std::span<const CheckpointHandle>,
                                                   const ContextDemand&) const;

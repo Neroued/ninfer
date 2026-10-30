@@ -306,6 +306,11 @@ public:
     [[nodiscard]] ContextReleaseSet footprint(std::span<const CheckpointHandle>,
                                               bool released) const;
     [[nodiscard]] std::size_t host_released(std::span<const CheckpointHandle>) const;
+    [[nodiscard]] runtime::CheckpointEvictableResources
+    checkpoint_evictable_resources(CheckpointHandle checkpoint) const;
+    [[nodiscard]] std::size_t state_image_bytes() const noexcept;
+    [[nodiscard]] std::size_t kv_page_bytes(std::uint32_t pool) const noexcept;
+    [[nodiscard]] std::uint32_t state_slots_capacity() const noexcept;
     [[nodiscard]] std::shared_ptr<Demotion> demotion(std::span<const CheckpointHandle>) const;
     [[nodiscard]] ContextDemotion describe_demotion(std::shared_ptr<const Demotion>) const;
     [[nodiscard]] ContextDemotion combine_demotions(std::span<const ContextDemotion>) const;

@@ -106,6 +106,17 @@ public:
 
     [[nodiscard]] EngineSnapshot snapshot() const { return engine_->snapshot(); }
 
+    // Admin prefix-cache inspection and release. The Engine builds the table on demand and
+    // enforces the idle/leased/erasable gates while no execution is in flight.
+    [[nodiscard]] ninfer::PrefixCacheTable prefix_cache_table() {
+        return engine_->build_prefix_table();
+    }
+
+    [[nodiscard]] ninfer::PrefixCacheEvictResult
+    evict_prefixes(std::span<const ninfer::PrefixCacheKey> selection, std::uint64_t max_bytes = 0) {
+        return engine_->evict_prefixes(selection, max_bytes);
+    }
+
     [[nodiscard]] bool is_available() const { return engine_->is_available(); }
 
     [[nodiscard]] ninfer::ModelSamplingDefaults sampling_defaults() const {

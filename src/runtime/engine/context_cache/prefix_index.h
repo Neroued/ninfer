@@ -30,6 +30,12 @@ public:
 
     [[nodiscard]] const PrefixCacheStatistics& statistics() const noexcept { return statistics_; }
 
+    void record_adoption(CheckpointRole role, std::uint64_t tokens) noexcept {
+        auto& value = counters(role);
+        ++value.adopted;
+        value.reused_tokens += tokens;
+    }
+
     [[nodiscard]] std::vector<Handle> matches(const Session& session, const Base& base) const {
         std::vector<Handle> result;
         const Node* current = &root_;

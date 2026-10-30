@@ -5,7 +5,7 @@
 
 namespace ninfer::models::qwen4_exp {
 
-std::size_t Session::checkpoint_capacity() const noexcept { return impl_->checkpoints.size(); }
+std::size_t Session::checkpoint_extent() const noexcept { return impl_->checkpoints.size(); }
 
 std::vector<runtime::ContextTransferRequirement>
 Session::checkpoint_restore_requirements(CheckpointHandle h) const {
@@ -23,7 +23,11 @@ bool Session::release_checkpoint(CheckpointHandle h) noexcept {
 CheckpointMetadata Session::checkpoint_metadata(CheckpointHandle h) const {
     const auto& p = *impl_;
     const auto& c = p.checkpoints.at(h);
-    return {c.frontier(), c.role, p.checkpoints[h.index].pins != 0, c.origin};
+    return {.frontier = c.frontier(),
+            .role     = c.role,
+            .leased   = p.checkpoints[h.index].pins != 0,
+            .origin   = c.origin,
+            .evidence = c.evidence};
 }
 
 PrefixShortlistKey Session::checkpoint_key(CheckpointHandle h, std::uint32_t f) const {
@@ -418,7 +422,8 @@ ContextProgress detail::SessionImpl::complete_context() {
             result.captured_checkpoints.reserve(tx->reservation->records.size());
             for (const auto& [record, role] : tx->reservation->records) {
                 p.checkpoints.publish(record,
-                                      {*tx->snapshot, role, s.captures[s.next_capture].origin});
+                                      {*tx->snapshot, role, s.captures[s.next_capture].origin,
+                                       s.captures[s.next_capture].evidence});
                 result.captured_checkpoints.push_back(record);
             }
             const auto writer    = context::adopt_capture_writer(states, s.continuation.image,

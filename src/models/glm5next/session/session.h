@@ -11,6 +11,8 @@
 #include "runtime/contract/placement.h"
 #include "runtime/executor/executor.h"
 
+#include <compare>
+
 namespace ninfer::models::glm5next {
 class Session;
 class ModelDefinition;
@@ -40,7 +42,7 @@ using CheckpointHandle = context::CheckpointHandle;
 struct PrefixShortlistKey {
     std::array<std::uint64_t, 2> digests{};
     std::uint32_t frontier = 0, identity_tag = 0;
-    friend bool operator==(PrefixShortlistKey, PrefixShortlistKey) noexcept = default;
+    friend auto operator<=>(PrefixShortlistKey, PrefixShortlistKey) noexcept = default;
 };
 
 class RequestBasePlan {
@@ -63,6 +65,7 @@ struct CheckpointMetadata {
     runtime::CheckpointRole role     = runtime::CheckpointRole::Continuation;
     bool leased                      = false;
     runtime::CheckpointOrigin origin = runtime::CheckpointOrigin::Semantic;
+    SharedCandidateEvidence evidence = SharedCandidateEvidence::None;
     runtime::PlacementId placement;
 };
 
@@ -221,6 +224,7 @@ struct CapturePreparation {
     ContextAssessment assessment;
     context::HostWriteRequirements host;
     runtime::CheckpointOrigin origin = runtime::CheckpointOrigin::Semantic;
+    SharedCandidateEvidence evidence = SharedCandidateEvidence::None;
     std::vector<CheckpointHandle> retired_points;
 };
 enum class ContextOperationKind : std::uint8_t { Bind, Capture, Demote, Pause, Maintenance };
@@ -294,6 +298,9 @@ public:
                                                const ContextAssessment&) const;
     [[nodiscard]] std::uint64_t useful_release_bytes(const ContextReleaseSet&,
                                                      const ContextAssessment&) const;
+    [[nodiscard]] std::vector<std::uint64_t> release_limits(const ContextAssessment&) const;
+    [[nodiscard]] runtime::ContextReleaseMeasure release_measure(const ContextReleaseSet&,
+                                                                 const ContextAssessment&) const;
     [[nodiscard]] runtime::ContextStart start_maintenance(const ContextAssessment&);
 
     Session(PreparedSession&&, runtime::Executor<ExecutionTypes>&);
@@ -321,7 +328,7 @@ public:
     checkpoint_recovery_frontier(CheckpointHandle, const RequestBasePlan&, std::uint32_t) const;
     [[nodiscard]] context::RecoveryEvaluation<>
         evaluate_recovery(std::span<const CheckpointHandle>) const;
-    [[nodiscard]] std::size_t checkpoint_capacity() const noexcept;
+    [[nodiscard]] std::size_t checkpoint_extent() const noexcept;
     [[nodiscard]] std::vector<runtime::ContextTransferRequirement>
         checkpoint_restore_requirements(CheckpointHandle) const;
     [[nodiscard]] bool valid_checkpoint(CheckpointHandle) const noexcept;

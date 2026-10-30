@@ -32,6 +32,7 @@ struct CaptureGroup {
     std::uint32_t frontier = 0;
     std::vector<runtime::CheckpointRole> roles;
     runtime::CheckpointOrigin origin = runtime::CheckpointOrigin::Semantic;
+    SharedCandidateEvidence evidence = SharedCandidateEvidence::None;
 };
 
 struct RequestBasePlanImpl {
@@ -151,6 +152,7 @@ struct CheckpointState {
     runtime::CheckpointRole role = runtime::CheckpointRole::Continuation;
     PrefixShortlistKey key;
     runtime::CheckpointOrigin origin = runtime::CheckpointOrigin::Semantic;
+    SharedCandidateEvidence evidence = SharedCandidateEvidence::None;
 
     [[nodiscard]] const Continuation& continuation() const noexcept {
         return snapshot.continuation();
@@ -538,7 +540,8 @@ public:
                                                                     PreparedCheckpoint = {});
     void initialize_prefill(RequestControl&, std::uint32_t base);
     void initialize_captures(RequestControl&, std::uint32_t from, std::uint32_t through);
-    [[nodiscard]] bool
+    enum class CaptureReservationStatus { Ready, NeedsContext, Unavailable };
+    [[nodiscard]] CaptureReservationStatus
     reserve_capture_destination(std::uint32_t, std::uint32_t,
                                 std::span<const CheckpointHandle> host_victims = {});
     void prepare_capture_boundary(std::uint32_t);

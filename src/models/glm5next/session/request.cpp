@@ -80,24 +80,30 @@ RequestBasePlan Session::plan_request(PreparedPrompt&& prompt,
     plan->identity =
         std::make_shared<detail::Identity>(input, static_cast<std::uint32_t>(p.shape.kv_storage));
     if (plan->reuse) {
-        const auto add = [&](std::uint32_t f, runtime::CheckpointRole role) {
+        const auto add = [&](std::uint32_t f, runtime::CheckpointRole role,
+                             SharedCandidateEvidence evidence = SharedCandidateEvidence::None) {
             if (!f || f > count) throw std::invalid_argument("invalid capture frontier");
             if (!plan->can_checkpoint(f)) return;
             auto found = std::find_if(plan->captures.begin(), plan->captures.end(),
                                       [&](const auto& c) { return c.frontier == f; });
             if (found == plan->captures.end()) {
-                plan->captures.push_back({f, {role}});
-            } else if (std::find(found->roles.begin(), found->roles.end(), role) ==
-                       found->roles.end())
-                found->roles.push_back(role);
+                plan->captures.push_back(
+                    {f, {role}, runtime::CheckpointOrigin::Semantic, evidence});
+            } else {
+                found->evidence |= evidence;
+                if (std::find(found->roles.begin(), found->roles.end(), role) == found->roles.end())
+                    found->roles.push_back(role);
+            }
         };
         add(input.identity.rewrite_checkpoint ? input.identity.rewrite_checkpoint->recovery_frontier
                                               : count,
             runtime::CheckpointRole::InputReplay);
         for (const auto& o : input.context_cache.opportunities)
-            add(o.frontier, o.kind == PromptCacheMarkerKind::PrivateLongAnchor
-                                ? runtime::CheckpointRole::LongAnchor
-                                : runtime::CheckpointRole::SharedPrefix);
+            add(o.frontier,
+                o.kind == PromptCacheMarkerKind::PrivateLongAnchor
+                    ? runtime::CheckpointRole::LongAnchor
+                    : runtime::CheckpointRole::SharedPrefix,
+                o.evidence);
         std::sort(plan->captures.begin(), plan->captures.end(),
                   [](const auto& a, const auto& b) { return a.frontier < b.frontier; });
     }

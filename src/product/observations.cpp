@@ -194,6 +194,8 @@ EngineSnapshot observation_delta(EngineSnapshot current, const EngineSnapshot& b
         counter.published -= prior.published;
         counter.released -= prior.released;
         counter.reclaimed -= prior.reclaimed;
+        counter.adopted -= prior.adopted;
+        counter.reused_tokens -= prior.reused_tokens;
     }
     for (std::size_t i = 0; i < current.executions.size(); ++i)
         subtract_execution(current.executions[i], baseline.executions[i]);
@@ -268,10 +270,10 @@ Json observation_json(const EngineSnapshot& snapshot, std::uint64_t now) {
     runtime["speculative_accepted_per_position"]  = r.speculative_accepted_per_position;
     for (const auto& [name, field] : kPrefixKinds) {
         const auto& c                 = r.prefix_cache.*field;
-        runtime["prefix_cache"][name] = {{"retained", c.retained},
-                                         {"published", c.published},
-                                         {"released", c.released},
-                                         {"reclaimed", c.reclaimed}};
+        runtime["prefix_cache"][name] = {
+            {"retained", c.retained}, {"published", c.published},
+            {"released", c.released}, {"reclaimed", c.reclaimed},
+            {"adopted", c.adopted},   {"reused_tokens", c.reused_tokens}};
     }
     runtime["context_transfers"]["state"] = transfer(r.context_transfers.state);
     runtime["context_transfers"]["kv"]    = Json::array();

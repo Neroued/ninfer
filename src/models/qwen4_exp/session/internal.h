@@ -17,6 +17,7 @@ struct CapturePoint {
     std::uint32_t frontier;
     std::vector<runtime::CheckpointRole> roles;
     runtime::CheckpointOrigin origin = runtime::CheckpointOrigin::Semantic;
+    SharedCandidateEvidence evidence = SharedCandidateEvidence::None;
 };
 
 struct Identity {
@@ -44,6 +45,7 @@ struct Checkpoint {
     Snapshot snapshot;
     runtime::CheckpointRole role;
     runtime::CheckpointOrigin origin = runtime::CheckpointOrigin::Semantic;
+    SharedCandidateEvidence evidence = SharedCandidateEvidence::None;
 
     [[nodiscard]] std::uint32_t frontier() const {
         return snapshot.continuation().metadata.main_frontier;

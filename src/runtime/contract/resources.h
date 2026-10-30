@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <limits>
 #include <optional>
+#include <span>
 #include <string_view>
 #include <string>
 #include <vector>
@@ -20,6 +21,35 @@ enum class CheckpointRole : std::uint8_t { InputReplay, LongAnchor, SharedPrefix
 enum class CheckpointOrigin : std::uint8_t { Semantic, Intermediate };
 enum class CaptureSkip : std::uint8_t { Unavailable, Retained };
 enum class ContextStart : std::uint8_t { Started, Deferred, Stale };
+
+// Additive contributions in the shortfall domains of one resource assessment.
+struct ContextReleaseMeasure {
+    std::vector<std::uint64_t> bytes;
+    std::size_t metadata_objects = 0;
+
+    void merge(const ContextReleaseMeasure& other) {
+        if (bytes.size() < other.bytes.size()) bytes.resize(other.bytes.size());
+        for (std::size_t i = 0; i < other.bytes.size(); ++i) bytes[i] += other.bytes[i];
+        metadata_objects += other.metadata_objects;
+    }
+
+    void subtract(const ContextReleaseMeasure& other) {
+        for (std::size_t i = 0; i < other.bytes.size(); ++i) bytes[i] -= other.bytes[i];
+        metadata_objects -= other.metadata_objects;
+    }
+
+    [[nodiscard]] std::uint64_t total_bytes() const noexcept {
+        std::uint64_t total = 0;
+        for (const auto value : bytes) total += value;
+        return total;
+    }
+
+    [[nodiscard]] std::uint64_t useful_bytes(std::span<const std::uint64_t> limits) const {
+        std::uint64_t total = 0;
+        for (std::size_t i = 0; i < bytes.size(); ++i) total += std::min(bytes[i], limits[i]);
+        return total;
+    }
+};
 
 struct KvPoolId {
     std::uint16_t index                                           = 0;

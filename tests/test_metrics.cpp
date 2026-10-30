@@ -26,8 +26,10 @@ int main() {
     startup.ranks[0].headroom_bytes         = 512;
     startup.ranks[0].host_reservation_bytes = 1024;
     EngineSnapshot baseline;
-    baseline.runtime.generated_tokens         = 4;
-    baseline.runtime.speculative_draft_tokens = 3;
+    baseline.runtime.generated_tokens                         = 4;
+    baseline.runtime.speculative_draft_tokens                 = 3;
+    baseline.runtime.prefix_cache.shared_prefix.adopted       = 2;
+    baseline.runtime.prefix_cache.shared_prefix.reused_tokens = 256;
     baseline.ranks.resize(1);
     baseline.ranks[0].gpu_intervals[0] = {1, 1000, 1000};
     baseline.executions[1].units       = 3;
@@ -50,14 +52,16 @@ int main() {
     running.runtime.generated_tokens += 5;
     running.runtime.speculative_draft_tokens += 6;
     running.runtime.speculative_accepted_tokens = 3;
-    running.runtime.running_requests            = 1;
-    running.runtime.context_pools               = {{.rank           = 0,
-                                                    .domain         = ContextMemoryDomain::Host,
-                                                    .capacity_bytes = 1048576,
-                                                    .block_bytes    = 4096,
-                                                    .live_bytes     = 3072,
-                                                    .reserved_bytes = 1024}};
-    running.runtime.kv_pools = {{0, "text", 2}, {1, "draft", 1}, {2, "index", 3}};
+    running.runtime.prefix_cache.shared_prefix.adopted += 3;
+    running.runtime.prefix_cache.shared_prefix.reused_tokens += 512;
+    running.runtime.running_requests = 1;
+    running.runtime.context_pools    = {{.rank           = 0,
+                                         .domain         = ContextMemoryDomain::Host,
+                                         .capacity_bytes = 1048576,
+                                         .block_bytes    = 4096,
+                                         .live_bytes     = 3072,
+                                         .reserved_bytes = 1024}};
+    running.runtime.kv_pools         = {{0, "text", 2}, {1, "draft", 1}, {2, "index", 3}};
     running.runtime.context_transfers.kv.resize(3);
     running.runtime.context_transfers.kv[2][1].bytes = 8192;
     running.runtime.context_transfers.state[4].bytes = 1024;
@@ -78,6 +82,11 @@ int main() {
           "metrics must distinguish batch/row deltas and measured/unmeasured GPU intervals");
     check(live.find("ninfer_generation_tokens_total 5\n") != std::string::npos,
           "live generated count must exclude startup warmup");
+    check(live.find("ninfer_prefix_adoptions_total{role=\"shared_prefix\"} 3\n") !=
+                  std::string::npos &&
+              live.find("ninfer_prefix_reused_tokens_total{role=\"shared_prefix\"} 512\n") !=
+                  std::string::npos,
+          "prefix adoption metrics must retain role and subtract startup counters");
     check(live.find("ninfer_decode_step_seconds_count{batch=\"2\"} 2\n") != std::string::npos &&
               live.find("ninfer_execution_unit_seconds_count{kind=\"prefill\"} 0\n") !=
                   std::string::npos,
@@ -163,6 +172,9 @@ int main() {
     check(json["runtime"]["generated_tokens"] == 5 &&
               json["context"]["pools"][0]["live_bytes"] == 3072,
           "JSON and metrics must use the same counter baseline while preserving current gauges");
+    check(json["runtime"]["prefix_cache"]["shared_prefix"]["adopted"] == 3 &&
+              json["runtime"]["prefix_cache"]["shared_prefix"]["reused_tokens"] == 512,
+          "prefix JSON lost normalized adoption counters");
     RankSnapshot sampled;
     sampled.received_ns      = 700;
     sampled.stamp.sampled_ns = 400;

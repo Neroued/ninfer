@@ -181,6 +181,7 @@ struct ContextResourceUsage {
 
 struct PrefixCacheCounters {
     std::uint64_t retained = 0, published = 0, released = 0, reclaimed = 0;
+    std::uint64_t adopted = 0, reused_tokens = 0;
 };
 
 // Advertised checkpoint identities, independently of their physical replica/reference count.

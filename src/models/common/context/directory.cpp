@@ -722,6 +722,34 @@ std::size_t ContextDirectory::useful_release_bytes(const ContextReleaseSet& rele
     return useful;
 }
 
+std::vector<std::uint64_t>
+ContextDirectory::release_limits(const ContextAssessment& assessment) const {
+    std::vector<std::uint64_t> result;
+    for (const auto& domain : assessment.placement.domains)
+        if (domain.placement.status != PoolAvailability::Ready)
+            result.push_back(domain.placement.reclaim_bytes);
+    return result;
+}
+
+runtime::ContextReleaseMeasure
+ContextDirectory::release_measure(const ContextReleaseSet& release,
+                                  const ContextAssessment& assessment) const {
+    runtime::ContextReleaseMeasure result;
+    const auto records = normalized_releases(release.records);
+    for (const auto& domain : assessment.placement.domains) {
+        if (domain.placement.status == PoolAvailability::Ready) continue;
+        std::uint64_t bytes = 0;
+        for (const auto& record : records)
+            if (record.domain == domain.domain)
+                bytes += records_.pool(record.domain).resolve(record.allocation).bytes;
+        result.bytes.push_back(bytes);
+    }
+    if (assessment.metadata_shortage)
+        result.metadata_objects = release.states.size() + release.pages.size() +
+                                  release.histories.size() + release.catalog.size();
+    return result;
+}
+
 ContextReleaseSet ContextDirectory::state_release(StateId image) const {
     return {.records = states_.allocations(image), .states = {image}};
 }

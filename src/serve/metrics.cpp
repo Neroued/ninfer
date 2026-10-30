@@ -429,6 +429,9 @@ std::string Metrics::render(const EngineSnapshot& snapshot, const ServiceSnapsho
     header("prefix_checkpoints", "gauge", "Advertised checkpoints by retention role.");
     header("prefix_checkpoints_total", "counter",
            "Published/released checkpoints; reclaimed is a subset of released.");
+    header("prefix_adoptions_total", "counter", "Checkpoint sources adopted by new requests.");
+    header("prefix_reused_tokens_total", "counter",
+           "Prompt tokens reused by adopted checkpoint role.");
     for (const auto& [name, field] :
          std::array{std::pair{"input_replay", &PrefixCacheStatistics::input_replay},
                     std::pair{"long_anchor", &PrefixCacheStatistics::long_anchor},
@@ -436,6 +439,9 @@ std::string Metrics::render(const EngineSnapshot& snapshot, const ServiceSnapsho
                     std::pair{"continuation", &PrefixCacheStatistics::continuation}}) {
         const auto& value = stats.prefix_cache.*field;
         out << "ninfer_prefix_checkpoints{role=\"" << name << "\"} " << value.retained << '\n';
+        out << "ninfer_prefix_adoptions_total{role=\"" << name << "\"} " << value.adopted << '\n';
+        out << "ninfer_prefix_reused_tokens_total{role=\"" << name << "\"} " << value.reused_tokens
+            << '\n';
         for (const auto& [action, count] : std::array{std::pair{"published", value.published},
                                                       std::pair{"released", value.released},
                                                       std::pair{"reclaimed", value.reclaimed}})

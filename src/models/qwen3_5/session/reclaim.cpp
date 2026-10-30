@@ -200,7 +200,7 @@ void append_demotions(const SessionImpl& session, const PhysicalFacts::Group& gr
 std::optional<ContextRelease>
 quote_release(const std::shared_ptr<ReclaimPlan>& evaluation,
               std::span<const CheckpointHandle> sources,
-              context::ReleaseInventory<ContextReleaseSet>::Selection& selection) {
+              context::ReleaseInventory<ContextReleaseSet>::Selection<>& selection) {
     auto probe = selection.probe(sources);
     if (selection.released().empty()) return {};
     auto plan        = std::make_shared<ReleasePlan>();

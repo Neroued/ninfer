@@ -175,6 +175,15 @@ std::uint64_t Session::useful_release_bytes(const ContextReleaseSet& released,
     return impl_->directory.useful_release_bytes(released, assessment);
 }
 
+std::vector<std::uint64_t> Session::release_limits(const ContextAssessment& assessment) const {
+    return impl_->directory.release_limits(assessment);
+}
+
+runtime::ContextReleaseMeasure Session::release_measure(const ContextReleaseSet& released,
+                                                        const ContextAssessment& assessment) const {
+    return impl_->directory.release_measure(released, assessment);
+}
+
 runtime::ContextStart Session::start_maintenance(const ContextAssessment& assessment) {
     auto& session = *impl_;
     if (session.operation) return runtime::ContextStart::Deferred;

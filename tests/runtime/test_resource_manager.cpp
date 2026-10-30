@@ -142,6 +142,7 @@ struct Program {
         std::optional<std::size_t> demotion_bytes;
         Role role                                = Role::SharedPrefix;
         ninfer::runtime::CheckpointOrigin origin = ninfer::runtime::CheckpointOrigin::Semantic;
+        ninfer::SharedCandidateEvidence evidence = ninfer::SharedCandidateEvidence::None;
         PlacementId placement;
     };
 
@@ -155,6 +156,7 @@ struct Program {
         Role role;
         bool leased;
         ninfer::runtime::CheckpointOrigin origin = ninfer::runtime::CheckpointOrigin::Semantic;
+        ninfer::SharedCandidateEvidence evidence = ninfer::SharedCandidateEvidence::None;
         PlacementId placement;
     };
 
@@ -291,11 +293,28 @@ struct Program {
                                                       host_capacity - usage.occupied.host_bytes));
     }
 
+    std::vector<std::uint64_t> release_limits(const Assessment& assessment) const {
+        const auto usage = physical_usage();
+        return {assessment.demand.device_bytes > device_capacity - usage.occupied.device_bytes
+                    ? assessment.demand.device_bytes -
+                          (device_capacity - usage.occupied.device_bytes)
+                    : 0,
+                assessment.demand.host_bytes > host_capacity - usage.occupied.host_bytes
+                    ? assessment.demand.host_bytes - (host_capacity - usage.occupied.host_bytes)
+                    : 0};
+    }
+
+    ninfer::runtime::ContextReleaseMeasure release_measure(const Usage& released,
+                                                           const Assessment& assessment) const {
+        return {{assessment.demand.device_bytes ? released.device_bytes : 0,
+                 assessment.demand.host_bytes ? released.host_bytes : 0}};
+    }
+
     ninfer::runtime::ContextStart start_maintenance(const Assessment&) {
         throw std::logic_error("the policy fixture does not require relocation");
     }
 
-    std::size_t checkpoint_capacity() const { return contents.size(); }
+    std::size_t checkpoint_extent() const { return contents.size(); }
 
     std::vector<ninfer::runtime::ContextTransferRequirement>
     checkpoint_restore_requirements(Handle h) const {
@@ -305,8 +324,12 @@ struct Program {
     [[nodiscard]] Metadata checkpoint_metadata(Handle handle) const {
         const auto& content = contents.at(handle.index);
         require(content.alive, "cache queried a released checkpoint");
-        return {static_cast<std::uint32_t>(content.tokens.size()), content.role, content.leased,
-                content.origin, content.placement};
+        return {static_cast<std::uint32_t>(content.tokens.size()),
+                content.role,
+                content.leased,
+                content.origin,
+                content.evidence,
+                content.placement};
     }
 
     [[nodiscard]] Summary checkpoint_summary(Handle handle) const {
@@ -692,7 +715,8 @@ struct Fixture {
 
     Token begin(const Base& base, std::optional<Handle> desired = {},
                 std::span<const Handle> carried = {}, std::optional<Token> resume = {}) {
-        return cache.adopt(program, source(base, desired, resume), base, ++next_order, carried);
+        return cache.adopt(program, source(base, desired, resume), base, ++next_order,
+                           resume.has_value(), carried);
     }
 
     Token publish(Handle handle, std::optional<std::uint64_t> session = {}) {
@@ -784,9 +808,8 @@ void test_shared_publication_deduplicates_complete_snapshots() {
     require(f.program.valid_checkpoint(first) && !f.program.valid_checkpoint(second),
             "concurrent publication retained two identical public recovery points");
     const Base request{.tokens = {1, 2, 3, 4}};
-    const auto semantic = ninfer::runtime::CheckpointOrigin::Semantic;
-    require(f.cache.retain_shared_checkpoint(f.program, request, 3, semantic) &&
-                !f.cache.retain_shared_checkpoint(f.program, request, 2, semantic),
+    require(f.cache.retain_shared_checkpoint(f.program, request, 3) &&
+                !f.cache.retain_shared_checkpoint(f.program, request, 2),
             "shared capture lookup accepted a position without a complete state");
     require(f.cache.candidates(f.program, request).size() == 2,
             "duplicate shared publication left an extra source");
@@ -806,9 +829,8 @@ void test_shared_publication_preserves_distinct_placements() {
     const auto first               = f.program.add({1, 2, 3}, {}, Role::SharedPrefix, {0});
     f.publish(first);
     const Base request{.tokens = {1, 2, 3, 4}};
-    const auto origin = ninfer::runtime::CheckpointOrigin::Semantic;
-    require(f.cache.retain_shared_checkpoint(f.program, request, 3, origin, {0}) &&
-                !f.cache.retain_shared_checkpoint(f.program, request, 3, origin, {1}),
+    require(f.cache.retain_shared_checkpoint(f.program, request, 3, {0}) &&
+                !f.cache.retain_shared_checkpoint(f.program, request, 3, {1}),
             "a remote checkpoint suppressed a local shared capture");
 
     const auto second = f.program.add({1, 2, 3}, {}, Role::SharedPrefix, {1});
@@ -818,12 +840,12 @@ void test_shared_publication_preserves_distinct_placements() {
     require(f.program.valid_checkpoint(first) && f.program.valid_checkpoint(second) &&
                 !f.program.valid_checkpoint(duplicate),
             "shared publication did not distinguish placement from same-side duplication");
-    require(f.cache.retain_shared_checkpoint(f.program, request, 3, origin, {0}) &&
-                f.cache.retain_shared_checkpoint(f.program, request, 3, origin, {1}),
+    require(f.cache.retain_shared_checkpoint(f.program, request, 3, {0}) &&
+                f.cache.retain_shared_checkpoint(f.program, request, 3, {1}),
             "shared capture lookup lost one placement's complete snapshot");
     require(f.cache.erase(f.program, first) &&
-                !f.cache.retain_shared_checkpoint(f.program, request, 3, origin, {0}) &&
-                f.cache.retain_shared_checkpoint(f.program, request, 3, origin, {1}),
+                !f.cache.retain_shared_checkpoint(f.program, request, 3, {0}) &&
+                f.cache.retain_shared_checkpoint(f.program, request, 3, {1}),
             "retiring one placement removed another placement's recovery point");
 }
 
@@ -951,28 +973,20 @@ void test_resume_waiting_retains_private_points_but_borrows_snapshot() {
     }
 }
 
-void test_intermediate_capture_preserves_semantic_history() {
-    using Origin = ninfer::runtime::CheckpointOrigin;
-    for (const auto origin : {Origin::Semantic, Origin::Intermediate}) {
+void test_capture_origin_does_not_override_recovery_value() {
+    for (const auto origin : {ninfer::runtime::CheckpointOrigin::Semantic,
+                              ninfer::runtime::CheckpointOrigin::Intermediate}) {
         Fixture f(0);
-        const auto semantic                       = f.program.add({1, 2, 3});
-        f.program.contents[semantic.index].origin = origin;
-        f.publish(semantic);
-        if (origin == Origin::Intermediate)
-            require(f.cache.retain_shared_checkpoint(f.program, Base{.tokens = {1, 2, 3, 4}}, 3,
-                                                     Origin::Semantic),
-                    "semantic capture could not retain an existing intermediate snapshot");
+        const auto prior                       = f.program.add({1, 2, 3});
+        f.program.contents[prior.index].origin = origin;
+        f.publish(prior);
         const Base request{.tokens = {100, 101, 102, 103}};
-        const auto admission =
-            f.cache.capture_admission(f.program, 0, request, 4, false, Origin::Intermediate);
-        auto cursor = f.cache.begin_reclaim(f.program, admission);
+        const auto admission = f.cache.capture_admission(f.program, 0, request, 4, false);
+        auto cursor          = f.cache.begin_reclaim(f.program, admission);
         require(f.cache.reclaim(f.program, f.program.pressure(1), {}, cursor) ==
-                        ninfer::runtime::ReclaimProgress::Blocked &&
-                    f.program.valid_checkpoint(semantic),
-                "cold intermediate capture displaced a semantic shared prefix");
-        require(f.cache.reclaim(f.program, f.program.pressure(1)) ==
-                    ninfer::runtime::ReclaimProgress::Changed,
-                "semantic retention prevented required execution");
+                        ninfer::runtime::ReclaimProgress::Changed &&
+                    !f.program.valid_checkpoint(prior),
+                "capture origin overrode a better recovery gain");
     }
 }
 
@@ -988,8 +1002,8 @@ void test_private_continuation_advances_with_adoption_heat() {
     require(choice.take_over && choice.owner == old_owner && choice.source.consume_source,
             "anonymous private continuation cannot transfer its writer");
     require(f.program.release_checkpoint(old), "fixture consume failed");
-    const auto owner = f.cache.adopt(f.program, choice, next, 20, {}, {&old, 1});
-    require(owner == old_owner && f.cache.retention(owner).reused,
+    const auto owner = f.cache.adopt(f.program, choice, next, 20, false, {}, {&old, 1});
+    require(owner == old_owner && f.cache.retention(owner).reused(),
             "consumed handle retirement lost the adopted continuation relationship");
     const auto advanced =
         f.program.add({1, 2, 3, 4}, {f.program.host_block(16)}, Role::Continuation);
@@ -999,7 +1013,7 @@ void test_private_continuation_advances_with_adoption_heat() {
             "new endpoint lost actual private continuation reuse protection");
     const auto replay = f.program.add({1, 2, 3}, {f.program.host_block(16)}, Role::InputReplay);
     f.cache.publish(f.program, owner, replay);
-    require(f.cache.retention(owner).reused && !f.cache.host_victims(f.program, 32, entrant),
+    require(f.cache.retention(owner).reused() && !f.cache.host_victims(f.program, 32, entrant),
             "input replay and endpoint did not share their owner's retention priority");
 }
 
@@ -1012,9 +1026,9 @@ void test_branch_adoption_time_is_independent_of_finish_order() {
     const auto first_choice = f.source(branch, parent);
     require(!first_choice.take_over && !first_choice.source.consume_source,
             "branch disabling session publication consumed its named predecessor");
-    const auto first       = f.cache.adopt(f.program, first_choice, branch, 10);
+    const auto first       = f.cache.adopt(f.program, first_choice, branch, 10, false);
     const auto first_used  = f.cache.retention(first).last_demand;
-    const auto second      = f.cache.adopt(f.program, f.source(branch, parent), branch, 11);
+    const auto second      = f.cache.adopt(f.program, f.source(branch, parent), branch, 11, false);
     const auto second_used = f.cache.retention(second).last_demand;
     require(first != original && second != original && first != second && first_used < second_used,
             "independent branches did not acquire distinct real adoption times");
@@ -1041,7 +1055,8 @@ void test_shared_source_does_not_inherit_private_heat() {
     f.publish(shared);
     const Base base{.tokens = {1, 2, 3}, .advice = {.session_key = 42}};
     const auto owner = f.begin(base, shared);
-    require(!f.cache.retention(owner).reused, "shared-prefix adoption heated a new private suffix");
+    require(!f.cache.retention(owner).reused(),
+            "shared-prefix adoption heated a new private suffix");
     const auto endpoint = f.program.add({1, 2, 3}, {f.program.host_block(16)}, Role::Continuation);
     f.cache.publish(f.program, owner, endpoint);
     f.cache.finish(f.program, owner, base, 20);
@@ -1075,13 +1090,13 @@ void test_resume_preserves_owner_and_does_not_create_a_hit() {
     const auto replay = f.program.add({1, 2}, {f.program.host_block(16)}, Role::InputReplay);
     f.cache.publish(f.program, owner, replay);
     const auto choice  = f.source(base, replay, owner);
-    const auto resumed = f.cache.adopt(f.program, choice, base, 1, {&replay, 1});
-    require(resumed == owner && !f.cache.retention(owner).reused &&
+    const auto resumed = f.cache.adopt(f.program, choice, base, 1, true, {&replay, 1});
+    require(resumed == owner && !f.cache.retention(owner).reused() &&
                 f.cache.points(owner) == std::vector<Handle>{replay},
             "own pause/replay changed continuation identity or counted as cross-request reuse");
     require(f.cache.erase(f.program, replay), "active relation pinned all optional input history");
     const auto root = f.source(base, {}, owner);
-    require(f.cache.adopt(f.program, root, base, 1) == owner,
+    require(f.cache.adopt(f.program, root, base, 1, true) == owner,
             "evicting all optional checkpoints destroyed an active continuation token");
     const auto shared = f.program.add({8});
     f.cache.publish(f.program, owner, shared);
@@ -1114,7 +1129,7 @@ void test_rewind_evaluation_preserves_sources_until_binding() {
                 choice.source.retired_points == std::vector<Handle>({endpoint, deeper}) &&
                 f.program.valid_checkpoint(replay) && f.program.valid_checkpoint(anchor) &&
                 f.program.valid_checkpoint(leased) && f.program.valid_checkpoint(shared) &&
-                !f.cache.retention(owner).reused,
+                !f.cache.retention(owner).reused(),
             "read-only rewind evaluation retired history or granted retirement of a reader");
     require(choice.source.private_points == std::vector<Handle>({replay, anchor}),
             "rewind preparation bypassed Native inspection of the remaining compatible points");
@@ -1252,14 +1267,14 @@ void test_waiting_owner_cannot_take_over_an_advanced_session() {
     const auto owner = f.publish(point, 42);
     auto choice      = f.source(base, point);
     f.cache.retain_source(f.program, 10, choice);
-    const auto child = f.cache.adopt(f.program, choice, base, 20);
+    const auto child = f.cache.adopt(f.program, choice, base, 20, false);
     const auto next  = f.program.add({1, 2, 3, 4}, {}, Role::Continuation);
     f.cache.publish(f.program, child, next);
     f.cache.finish(f.program, child, base, 20);
     require(f.cache.prepare_source(f.program, base, choice, 10) && !choice.take_over &&
                 choice.source.consume_source && f.program.valid_checkpoint(point),
             "waiting source overwrote the newer session or lost its own independent contents");
-    const auto branch = f.cache.adopt(f.program, choice, base, 10);
+    const auto branch = f.cache.adopt(f.program, choice, base, 10, false);
     require(branch != owner && f.program.valid_checkpoint(next),
             "a stale continuation alias replaced the advanced owner's recovery points");
     f.cache.release_source(f.program, 10);
@@ -1273,7 +1288,7 @@ void test_older_waiter_does_not_take_over_a_newer_catalog_version() {
     auto old         = f.source(base, input);
     f.cache.retain_source(f.program, 10, old);
     const std::array carried{input};
-    require(f.cache.adopt(f.program, old, base, 20, carried) == owner,
+    require(f.cache.adopt(f.program, old, base, 20, false, carried) == owner,
             "newer session could not preserve its existing input point");
     const auto endpoint = f.program.add({1, 2, 3, 4}, {}, Role::Continuation);
     f.cache.publish(f.program, owner, endpoint);
@@ -1284,7 +1299,7 @@ void test_older_waiter_does_not_take_over_a_newer_catalog_version() {
     require(found != choices.end() && !found->take_over && !found->source.consume_source &&
                 found->source.retired_points.empty(),
             "re-querying a newer catalog bypassed the waiting request's publication order");
-    const auto branch = f.cache.adopt(f.program, *found, base, 10);
+    const auto branch = f.cache.adopt(f.program, *found, base, 10, false);
     f.cache.finish(f.program, branch, base, 10);
     require(branch != owner && f.program.valid_checkpoint(endpoint),
             "older completion overwrote a newer session's recovery point");
@@ -1306,7 +1321,7 @@ void test_session_submission_order_controls_only_the_named_hint() {
     require(candidates.front().source.checkpoint == newer && candidates.front().session_hint &&
                 f.program.valid_checkpoint(old),
             "an older late finish replaced the named hint or deleted anonymous history");
-    require(!f.cache.retention(old_owner).reused && !f.cache.retention(new_owner).reused,
+    require(!f.cache.retention(old_owner).reused() && !f.cache.retention(new_owner).reused(),
             "session publication manufactured a cache hit");
 }
 
@@ -1429,7 +1444,7 @@ void test_one_off_fanout_competes_with_repeated_continuation() {
                 f.program.physical_usage().occupied.host_bytes == 64,
             "fanout counted its shared prefix once per logical branch");
     require(slow_used < recent_used && f.cache.retention(slow_owner).last_demand == slow_used &&
-                f.cache.retention(dialogue_owner).reused,
+                f.cache.retention(dialogue_owner).reused(),
             "late fanout completion displaced the recently adopted dialogue's soft protection");
     auto cursor                = f.cache.begin_reclaim(f.program);
     const auto released_before = f.program.released.size();
@@ -1725,21 +1740,23 @@ void test_committed_repeated_demand_admits_a_new_short_working_set() {
     const auto permission = [&] {
         return f.cache.capture_admission(f.program, 0, incoming, 2, false);
     };
+    (void)f.begin(incoming);
     f.cache.observe_committed(incoming, 7, 0, 1, incoming.captures);
-    require(!permission().priority.reused, "work before a finite candidate created demand");
+    require(!permission().priority.reused(), "work before a finite candidate created demand");
     f.cache.observe_committed(incoming, 7, 1, 3, incoming.captures);
     f.cache.observe_committed(incoming, 7, 0, 3, incoming.captures);
-    require(!permission().priority.reused, "same-request repeated observation created reuse");
+    require(!permission().priority.reused(), "same-request repeated observation created reuse");
+    (void)f.begin(incoming);
     f.cache.observe_committed(incoming, 8, 0, 3, incoming.captures);
     const auto admission = permission();
-    require(admission.priority.reused, "two completed requests failed to qualify new demand");
+    require(admission.priority.reused(), "two completed requests failed to qualify new demand");
     auto cursor = f.cache.begin_reclaim(f.program, admission);
     require(f.cache.reclaim(f.program, f.program.pressure(1), {}, cursor) ==
                     ninfer::runtime::ReclaimProgress::Changed &&
                 !f.program.valid_checkpoint(old),
             "old long history permanently excluded the repeated short working set");
     const Base old_input{.tokens = tokens(100)};
-    require(f.cache.capture_admission(f.program, 0, old_input, 100, false).priority.reused,
+    require(f.cache.capture_admission(f.program, 0, old_input, 100, false).priority.reused(),
             "retiring physical history discarded the bounded record of its actual adoption");
     const auto new_point = f.program.add(tokens(2, 1000));
     f.publish(new_point);
@@ -1816,7 +1833,7 @@ void test_inherited_owner_heat_cannot_spend_a_full_other_continuation() {
     f.publish(other);
     const Base next{.tokens = tokens(2091)};
     const auto continuing = f.begin(next, old_input);
-    require(continuing == owner && f.cache.retention(owner).reused,
+    require(continuing == owner && f.cache.retention(owner).reused(),
             "fixture did not inherit actual private adoption evidence");
     const auto admission = f.cache.capture_admission(f.program, owner, next, 2091);
     auto decision        = f.cache.begin_reclaim(f.program, admission);
@@ -1833,7 +1850,9 @@ void test_exact_repeated_candidate_can_replace_a_long_hotspot_with_common_fallba
     f.publish(old);
     f.use_shared(old);
     const Base incoming{.tokens = tokens(1000), .captures = {1000}};
+    (void)f.begin(incoming);
     f.cache.observe_committed(incoming, 100, 32, 1000, incoming.captures);
+    (void)f.begin(incoming);
     f.cache.observe_committed(incoming, 101, 32, 1000, incoming.captures);
     const auto admission = f.cache.capture_admission(f.program, 0, incoming, 1000, false);
     auto decision        = f.cache.begin_reclaim(f.program, admission);
@@ -2100,6 +2119,125 @@ std::uint64_t recovery_oracle(const Program& program, std::span<const Handle> re
     return total;
 }
 
+void test_device_selection_rescores_combined_recovery() {
+    {
+        Fixture f(0);
+        const auto parent  = f.program.add(tokens(1000));
+        const auto left    = f.program.add(tokens(1100));
+        auto right_tokens  = tokens(1200);
+        right_tokens[1000] = 999999;
+        const auto right   = f.program.add(std::move(right_tokens));
+        const auto other   = f.program.add(tokens(1200, 20000));
+        for (const auto h : {parent, left, right, other}) {
+            f.program.contents[h.index].main_pages = 0;
+            f.publish(h);
+        }
+        require(f.cache.reclaim(f.program, f.program.pressure(3)) ==
+                        ninfer::runtime::ReclaimProgress::Changed &&
+                    f.program.valid_checkpoint(parent) && !f.program.valid_checkpoint(left) &&
+                    !f.program.valid_checkpoint(right) && !f.program.valid_checkpoint(other),
+                "Device selection kept stale individual scores after removing a branch");
+    }
+    {
+        Fixture f(0);
+        const auto first = f.program.add(tokens(1000));
+        const auto alias = f.program.add(tokens(1000), {}, Role::InputReplay);
+        const auto other = f.program.add(tokens(10, 20000));
+        for (const auto h : {first, alias, other}) {
+            f.program.contents[h.index].main_pages = 0;
+            f.publish(h);
+        }
+        require(f.cache.reclaim(f.program, f.program.pressure(2)) ==
+                        ninfer::runtime::ReclaimProgress::Changed &&
+                    f.program.valid_checkpoint(alias) && !f.program.valid_checkpoint(first) &&
+                    !f.program.valid_checkpoint(other),
+                "Device selection removed both independently stored semantic aliases");
+    }
+}
+
+void test_reuse_protection_ages_by_bound_requests() {
+    for (const auto age : {127U, 128U}) {
+        Fixture f(0);
+        const auto hot      = f.program.add({1});
+        const auto valuable = f.program.add(tokens(1000, 100));
+        f.publish(hot);
+        f.publish(valuable);
+        f.use_shared(hot);
+        for (unsigned i = 0; i < age; ++i) {
+            const auto owner = f.begin(Base{.tokens = {50000 + i}});
+            f.cache.abandon(f.program, owner);
+        }
+        require(f.cache.reclaim(f.program, f.program.pressure(1)) ==
+                        ninfer::runtime::ReclaimProgress::Changed &&
+                    f.program.valid_checkpoint(hot) == (age == 127) &&
+                    f.program.valid_checkpoint(valuable) == (age == 128),
+                "reuse protection did not expire after the bound-request window");
+    }
+}
+
+void test_queries_publication_and_resume_do_not_age_reuse() {
+    Fixture f(0);
+    const auto hot       = f.program.add({1});
+    const auto valuable  = f.program.add(tokens(1000, 100));
+    const auto publisher = f.publish(hot);
+    f.publish(valuable);
+    f.use_shared(hot);
+    const Base base{.tokens = {1, 2}};
+    const auto owner  = f.begin(base);
+    const auto resume = f.source(base, {}, owner);
+    for (unsigned i = 0; i < 256; ++i) {
+        (void)f.cache.candidates(f.program, base);
+        (void)f.cache.capture_admission(f.program, owner, base, 2);
+        require(f.cache.retain_shared_checkpoint(f.program, base, 1), "duplicate source missing");
+        f.cache.publish(f.program, publisher, hot);
+        require(f.cache.adopt(f.program, resume, base, i, true) == owner, "resume changed owner");
+    }
+    require(f.cache.reclaim(f.program, f.program.pressure(1)) ==
+                    ninfer::runtime::ReclaimProgress::Changed &&
+                f.program.valid_checkpoint(hot) && !f.program.valid_checkpoint(valuable),
+            "non-demand work aged a reused recovery point");
+}
+
+void test_explicit_capture_evidence_is_a_tie_preference() {
+    for (const bool equal_value : {true, false}) {
+        Fixture f(0);
+        const auto explicit_point = f.program.add({1});
+        const auto automatic      = f.program.add(equal_value ? Key{2} : tokens(1000, 100));
+        f.publish(explicit_point);
+        f.publish(automatic);
+        require(f.cache.retain_shared_checkpoint(f.program, Base{.tokens = {1, 3}}, 1, {},
+                                                 ninfer::SharedCandidateEvidence::ExplicitBoundary),
+                "explicit point was not retained");
+        const auto before = f.cache.statistics().shared_prefix;
+        require(f.cache.reclaim(f.program, f.program.pressure(1)) ==
+                        ninfer::runtime::ReclaimProgress::Changed &&
+                    f.program.valid_checkpoint(explicit_point) == equal_value &&
+                    f.program.valid_checkpoint(automatic) != equal_value,
+                "explicit evidence either lost a tie or overrode recovery value");
+        require(f.cache.statistics().shared_prefix.published == before.published &&
+                    f.cache.statistics().shared_prefix.adopted == 0,
+                "retaining a marked boundary fabricated a publication or adoption");
+    }
+}
+
+void test_adoption_counters_survive_consumption_and_exclude_resume() {
+    Fixture f(0);
+    const auto point = f.program.add({1, 2, 3}, {}, Role::InputReplay);
+    f.publish(point);
+    const Base next{.tokens = {1, 2, 3, 4}};
+    const auto choice = f.source(next, point);
+    require(f.program.release_checkpoint(point), "native consumption failed");
+    const auto owner  = f.cache.adopt(f.program, choice, next, 2, false, {}, {&point, 1});
+    const auto& value = f.cache.statistics().input_replay;
+    require(value.adopted == 1 && value.reused_tokens == 3,
+            "adoption counters depended on a consumed checkpoint handle");
+    auto resume         = choice;
+    resume.resume_owner = owner;
+    (void)f.cache.adopt(f.program, resume, next, 2, true);
+    require(value.adopted == 1 && value.reused_tokens == 3,
+            "same-request recovery counted as cross-request reuse");
+}
+
 void test_host_selection_against_full_rescoring() {
     std::mt19937 random(402);
     for (unsigned trial = 0; trial < 100; ++trial) {
@@ -2280,7 +2418,12 @@ int main() {
         test_resume_waiting_retains_private_points_but_borrows_snapshot();
         test_execution_dependency_does_not_become_empty_payload_reclaim();
         test_preservation_batches_only_until_complete_admission();
-        test_intermediate_capture_preserves_semantic_history();
+        test_capture_origin_does_not_override_recovery_value();
+        test_device_selection_rescores_combined_recovery();
+        test_reuse_protection_ages_by_bound_requests();
+        test_queries_publication_and_resume_do_not_age_reuse();
+        test_explicit_capture_evidence_is_a_tie_preference();
+        test_adoption_counters_survive_consumption_and_exclude_resume();
         test_host_selection_against_full_rescoring();
         test_reclaim_assesses_combined_device_and_host_demand();
         test_host_placement_overrides_aggregate_free_bytes();

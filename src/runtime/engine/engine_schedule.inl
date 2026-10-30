@@ -30,9 +30,9 @@ bool EngineCore<Instance>::prepare_semantic_capture(const std::shared_ptr<Reques
     }
     while (const auto capture = instance_.session->prepare_capture(*request->sequence)) {
         if (instance_.session->capture_is_shared(*request->sequence) &&
-            resources_.retain_shared_checkpoint(*instance_.session, *request->base_plan,
-                                                capture->frontier, capture->origin,
-                                                instance_.session->placement(*request->sequence))) {
+            resources_.retain_shared_checkpoint(
+                *instance_.session, *request->base_plan, capture->frontier,
+                instance_.session->placement(*request->sequence), capture->evidence)) {
             instance_.session->skip_capture(*request->sequence, CaptureSkip::Retained);
             decision.reset();
             continue;
@@ -44,7 +44,7 @@ bool EngineCore<Instance>::prepare_semantic_capture(const std::shared_ptr<Reques
         if (instance_.session->has_context_operation()) { return false; }
         const auto admission = resources_.capture_admission(
             *instance_.session, request->continuation_owner, *request->base_plan, capture->frontier,
-            instance_.session->capture_is_input(*request->sequence), capture->origin);
+            instance_.session->capture_is_input(*request->sequence));
         if (!decision || decision->frontier != capture->frontier) {
             decision.emplace(
                 CaptureDecision{*request->sequence, capture->frontier,
@@ -153,9 +153,9 @@ void EngineCore<Instance>::resolve_context_progress(
                 }
             }
         }
-        request->continuation_owner =
-            resources_.adopt(*instance_.session, control.source, *request->base_plan,
-                             request->publication_order, carried, progress.retired_checkpoints);
+        request->continuation_owner = resources_.adopt(
+            *instance_.session, control.source, *request->base_plan, request->publication_order,
+            control.resumed, carried, progress.retired_checkpoints);
         resources_.release_source(*instance_.session, request->id);
         request->lane      = control.destination;
         request->sequence  = progress.sequence;

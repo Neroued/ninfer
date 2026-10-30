@@ -170,8 +170,9 @@ export function frameOf(snapshot: NinferSnapshot, at: number, monotonicMs: numbe
   });
   for (const [kind, values] of Object.entries(runtime.prefix_cache)) {
     gauges[`prefix.${kind}.retained`] = values.retained;
-    for (const key of ['published', 'released', 'reclaimed']) {
-      counters[`prefix.${kind}.${key}`] = values[key];
+    for (const key of ['published', 'released', 'reclaimed', 'adopted', 'reused_tokens']) {
+      const value = values[key];
+      if (typeof value === 'number') counters[`prefix.${kind}.${key}`] = value;
     }
   }
 

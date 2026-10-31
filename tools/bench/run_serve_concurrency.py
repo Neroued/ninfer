@@ -20,16 +20,15 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
-
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from tools.bench import run_serve_corpus as corpus  # noqa: E402
 from tools.bench.serve_log import startup_resource_observation  # noqa: E402
+from tools.bench import serve_measurement as observation  # noqa: E402
 
-
-SUITES = ("decode-saturation", "corpus-makespan")
+SUITES = ("context-profile", "decode-saturation", "corpus-makespan")
 STATS_INTERVAL_MS = 1000
 PENDING_TIMEOUT_MS = 24 * 60 * 60 * 1000
 SATURATION_FIXTURE = "long_decode_aime26_15"
@@ -132,7 +131,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         action="append",
         required=True,
         choices=SUITES,
-        help="measurement suite; repeat to run both",
+        help="repeat to combine suites; context-profile always measures C=1",
     )
     parser.add_argument(
         "--concurrency",
@@ -140,7 +139,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         required=True,
         type=int,
         metavar="N",
-        help="startup max concurrency and client worker count; repeat to sweep",
+        help="HTTP request concurrency; repeat to sweep. Engine capacity can be fixed by TOML or --engine-concurrency",
     )
     parser.add_argument(
         "--decode-tokens",
@@ -148,22 +147,17 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=8192,
         help="per-request output budget for decode-saturation (default: 8192)",
     )
-    parser.add_argument("--max-context", type=int, default=262144)
+    corpus.add_launch_arguments(parser)
     parser.add_argument(
-        "--context-capacity",
-        default="auto",
-        metavar="SIZE|auto",
-        help="per-rank shared KV/State capacity passed to ninfer-serve (default: auto)",
+        "--output", type=Path, required=True, help="benchmark output directory"
     )
-    parser.add_argument("--prefill-chunk", type=int, default=1024)
-    parser.add_argument("--kv-dtype", choices=tuple(corpus.KV_CACHE_NAMES), default="int8")
-    parser.add_argument("--output", type=Path, required=True, help="benchmark output directory")
     parser.add_argument("--port", type=int, default=8080, help="loopback serving port")
-    parser.add_argument("--device", type=int, default=0, help="CUDA device index")
     parser.add_argument(
-        "--dry-run", action="store_true", help="print point commands and request counts only"
+        "--dry-run",
+        action="store_true",
+        help="print point commands and request counts only",
     )
-    return parser.parse_args(argv)
+    return corpus.resolve_launch_arguments(parser.parse_args(argv))
 
 
 def validate_args(args: argparse.Namespace) -> None:
@@ -198,7 +192,9 @@ def build_points(
         for mode_name in mode_names:
             backend, draft_tokens = corpus.SPECULATIVE_MODES[mode_name]
             for suite in args.suite:
-                for concurrency in args.concurrency:
+                for concurrency in (
+                    [1] if suite == "context-profile" else args.concurrency
+                ):
                     points.append(
                         Point(
                             target=target,
@@ -207,7 +203,9 @@ def build_points(
                             speculative_mode=mode_name,
                             speculative_backend=backend,
                             draft_tokens=draft_tokens,
-                            proposal_head=args.proposal_head if draft_tokens else "full",
+                            proposal_head=(
+                                args.proposal_head if draft_tokens else "full"
+                            ),
                             sampling_mode=args.sampling,
                             kv_dtype=args.kv_dtype,
                             suite=suite,
@@ -220,8 +218,17 @@ def build_points(
 def build_jobs(
     point: Point, fixtures: dict[str, corpus.Fixture], decode_tokens: int
 ) -> list[Job]:
+    if point.suite == "context-profile":
+        return [
+            Job(index, index, fixtures[name], seed, fixtures[name].max_new)
+            for index, (name, seed) in enumerate(
+                (name, seed) for name in corpus.NIAH_FIXTURES for seed in corpus.SEEDS
+            )
+        ]
     if point.suite == "decode-saturation":
-        fixture = fixtures[SATURATION_FIXTURE]
+        fixture = dataclasses.replace(
+            fixtures[SATURATION_FIXTURE], max_new=decode_tokens
+        )
         return [
             Job(
                 index=index,
@@ -253,6 +260,8 @@ def build_jobs(
 
 
 def workload_order(point: Point) -> dict[str, Any]:
+    if point.suite == "context-profile":
+        return {"kind": "fixture_order", "dispatch": "serial_http_send"}
     if point.suite == "corpus-makespan":
         return {
             "kind": "fixed_shuffle",
@@ -287,68 +296,30 @@ def server_command(
     command = [
         str(serve),
         str(point.artifact),
-        "--host",
-        "127.0.0.1",
-        "--port",
-        str(args.port),
+        *corpus.launch_arguments(args, point.concurrency, STATS_INTERVAL_MS),
         "--model-id",
         point.model_id,
-        "--max-context",
-        str(args.max_context),
-        "--context-capacity",
-        args.context_capacity,
-        "--max-concurrency",
-        str(point.concurrency),
+        "--request-log-jsonl",
+        str(server_log),
         "--max-pending-requests",
         "1",
         "--pending-timeout",
         str(PENDING_TIMEOUT_MS),
-        "--prefill-chunk",
-        str(args.prefill_chunk),
-        "--stats-interval",
-        str(STATS_INTERVAL_MS),
-        "--device",
-        str(args.device),
-        "--request-log-jsonl",
-        str(server_log),
         "--kv-dtype",
         point.kv_dtype,
-        "--no-prefix-reuse",
-        "--host-cache-capacity",
-        "0",
+        "--spec",
+        point.speculative_backend,
     ]
-    if point.speculative_backend != "none":
+    if point.draft_tokens:
         command.extend(
             [
-                "--spec",
-                point.speculative_backend,
                 "--draft-tokens",
                 str(point.draft_tokens),
+                "--proposal-head",
+                point.proposal_head,
             ]
         )
-        if point.proposal_head == "optimized":
-            command.extend(["--proposal-head", "optimized"])
-    if point.sampling_mode == "greedy":
-        command.extend(["--temperature", "0"])
-    else:
-        # Preserve the sampling profile attached to the published benchmark methodology.
-        command.extend(
-            [
-                "--temperature",
-                "0.6",
-                "--top-p",
-                "0.95",
-                "--top-k",
-                "20",
-                "--min-p",
-                "0",
-                "--presence-penalty",
-                "1.0",
-                "--frequency-penalty",
-                "0",
-            ]
-        )
-    return command
+    return command + corpus.sampling_arguments(point.sampling_mode)
 
 
 def validate_server_start(
@@ -359,14 +330,20 @@ def validate_server_start(
     expected = {
         "device": args.device,
         "max_context": args.max_context,
-        "context_capacity_mode": "auto" if args.context_capacity == "auto" else "explicit",
-        "max_concurrency": point.concurrency,
+        "context_capacity_mode": (
+            "auto" if args.context_capacity == "auto" else "explicit"
+        ),
+        "max_concurrency": (
+            point.concurrency
+            if args.engine_concurrency is None
+            else args.engine_concurrency
+        ),
         "max_pending_requests": 1,
         "pending_timeout_ms": PENDING_TIMEOUT_MS,
         "prefill_chunk": args.prefill_chunk,
         "log_stats_interval_ms": STATS_INTERVAL_MS,
         "kv_cache": point.kv_dtype,
-        "cuda_graph": True,
+        "cuda_graph": args.cuda_graph,
         "prefix_reuse": False,
         "speculative_backend": point.speculative_backend,
         "speculative_draft_window": point.draft_tokens,
@@ -374,15 +351,27 @@ def validate_server_start(
     }
     actual = {name: engine.get(name) for name in expected}
     if actual != expected:
-        raise corpus.CampaignError(f"server_start Engine configuration mismatch: {actual!r}")
+        raise corpus.CampaignError(
+            f"server_start Engine configuration mismatch: {actual!r}"
+        )
     context_cache = engine.get("context_cache", {})
     if context_cache.get("host_capacity_bytes") != 0:
-        raise corpus.CampaignError("server_start context cache capacity differs from the point")
-    if (event.get("sampling_defaults", {}).get("server_overrides", {}).get("temperature") == 0) != (
-        point.sampling_mode == "greedy"
+        raise corpus.CampaignError(
+            "server_start context cache capacity differs from the point"
+        )
+    if (
+        event.get("sampling_defaults", {})
+        .get("server_overrides", {})
+        .get("temperature")
+        == 0
+    ) != (point.sampling_mode == "greedy"):
+        raise corpus.CampaignError(
+            "server_start sampling mode does not match the point"
+        )
+    if (
+        Path(event.get("artifact", {}).get("path", "")).resolve()
+        != point.artifact.resolve()
     ):
-        raise corpus.CampaignError("server_start sampling mode does not match the point")
-    if Path(event.get("artifact", {}).get("path", "")).resolve() != point.artifact.resolve():
         raise corpus.CampaignError("loaded artifact path does not match the point")
     if event.get("server", {}).get("public_model_id") != point.model_id:
         raise corpus.CampaignError("server public model id does not match the point")
@@ -467,13 +456,14 @@ def run_clients(
                     payload = request_payload(point, job)
                     if point.concurrency == 1:
                         print(
-                            f"request {job.index + 1}/{len(jobs)} {job.fixture.name} seed={job.seed}",
+                            f"request {job.fixture.name} seed={job.seed}",
                             flush=True,
                         )
                     if ordered_dispatch:
                         with dispatch_condition:
                             dispatch_condition.wait_for(
-                                lambda: failed.is_set() or job.index == next_dispatch_index
+                                lambda: failed.is_set()
+                                or job.index == next_dispatch_index
                             )
                             if failed.is_set():
                                 return
@@ -486,7 +476,9 @@ def run_clients(
                         started_at = time.monotonic()
                         response = corpus.post_json(connection, payload)
                     finished_at = time.monotonic()
-                    result = parse_client_response(job, response, started_at, finished_at)
+                    result = parse_client_response(
+                        job, response, started_at, finished_at
+                    )
                     if on_result is not None:
                         on_result(result, response)
                 except Exception as exc:
@@ -504,13 +496,17 @@ def run_clients(
     for thread in threads:
         thread.start()
 
-    readiness_errors = [error for error in (ready.get() for _ in threads) if error is not None]
+    readiness_errors = [
+        error for error in (ready.get() for _ in threads) if error is not None
+    ]
     if readiness_errors:
         failed.set()
         start_event.set()
         for thread in threads:
             thread.join()
-        raise corpus.CampaignError(f"failed to connect benchmark clients: {readiness_errors[0]}")
+        raise corpus.CampaignError(
+            f"failed to connect benchmark clients: {readiness_errors[0]}"
+        )
 
     campaign_start = time.monotonic()
     start_event.set()
@@ -527,7 +523,11 @@ def run_clients(
             f"completed {len(results)} client request(s), expected {len(jobs)}"
         )
     campaign_end = max(result.finished_at for result in results)
-    return sorted(results, key=lambda result: result.job.index), campaign_start, campaign_end
+    return (
+        sorted(results, key=lambda result: result.job.index),
+        campaign_start,
+        campaign_end,
+    )
 
 
 def load_server_events(path: Path, server_instance_id: str) -> list[dict[str, Any]]:
@@ -542,11 +542,15 @@ def load_server_events(path: Path, server_instance_id: str) -> list[dict[str, An
                     continue
                 event_name = event.get("event")
                 if not isinstance(event_name, str):
-                    raise corpus.CampaignError(f"{path}:{line_number}: event name is missing")
+                    raise corpus.CampaignError(
+                        f"{path}:{line_number}: event name is missing"
+                    )
                 corpus.require_server_log_identity(event, event_name)
                 events.append(event)
     except (OSError, json.JSONDecodeError) as exc:
-        raise corpus.CampaignError(f"failed to read serving events from {path}: {exc}") from exc
+        raise corpus.CampaignError(
+            f"failed to read serving events from {path}: {exc}"
+        ) from exc
     return events
 
 
@@ -573,7 +577,9 @@ def sum_request_done(events: Sequence[dict[str, Any]]) -> dict[str, int | float 
             accepted_tokens += int(speculative["accepted_tokens"])
             fallback_steps += int(speculative["fallback_steps"])
         except (KeyError, TypeError, ValueError) as exc:
-            raise corpus.CampaignError(f"request_done event is missing metrics: {exc}") from exc
+            raise corpus.CampaignError(
+                f"request_done event is missing metrics: {exc}"
+            ) from exc
     return {
         "prompt_tokens": prompt_tokens,
         "completion_tokens": completion_tokens,
@@ -601,7 +607,9 @@ def sum_throughput(events: Sequence[dict[str, Any]]) -> dict[str, int | float | 
             decode_rounds += int(event["decode_batch"]["rounds"])
             decode_row_rounds += int(event["decode_batch"]["row_rounds"])
         except (KeyError, TypeError, ValueError) as exc:
-            raise corpus.CampaignError(f"throughput event is missing counters: {exc}") from exc
+            raise corpus.CampaignError(
+                f"throughput event is missing counters: {exc}"
+            ) from exc
     return {
         "computed_prefill_tokens": computed_prefill_tokens,
         "committed_decode_tokens": committed_decode_tokens,
@@ -642,19 +650,26 @@ def is_steady_interval(event: dict[str, Any], concurrency: int) -> bool:
 
 def steady_metrics(
     events: Sequence[dict[str, Any]], concurrency: int
-) -> dict[str, int | float]:
+) -> dict[str, int | float | None]:
     selected = [event for event in events if is_steady_interval(event, concurrency)]
     if not selected:
-        raise corpus.CampaignError(
-            f"concurrency {concurrency} produced no recovery-free full-batch decode interval; "
-            "increase --decode-tokens or --context-capacity, or reduce concurrency"
-        )
+        return {
+            "intervals": 0,
+            "seconds": 0.0,
+            "committed_decode_tokens": 0,
+            "decode_rounds": 0,
+            "decode_row_rounds": 0,
+            "average_decode_batch": None,
+            "decode_tokens_per_second": None,
+        }
     duration = sum(float(event["interval_seconds"]) for event in selected)
     tokens = sum(int(event["tokens"]["committed_decode"]) for event in selected)
     rounds = sum(int(event["decode_batch"]["rounds"]) for event in selected)
     row_rounds = sum(int(event["decode_batch"]["row_rounds"]) for event in selected)
     if duration <= 0.0 or rounds <= 0:
-        raise corpus.CampaignError("steady decode interval has no measurable duration or rounds")
+        raise corpus.CampaignError(
+            "steady decode interval has no measurable duration or rounds"
+        )
     return {
         "intervals": len(selected),
         "seconds": duration,
@@ -697,6 +712,7 @@ def analyze_point(
     results: Sequence[ClientResult],
     campaign_start: float,
     campaign_end: float,
+    measured: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     errors = [event for event in events if event.get("event") == "request_error"]
     if errors:
@@ -711,29 +727,38 @@ def analyze_point(
 
     done_totals = sum_request_done(request_done)
     runtime_totals = sum_throughput(throughput)
+    if measured is not None:
+        runtime = measured["runtime"]
+        runtime_totals.update(
+            computed_prefill_tokens=runtime["computed_prefill_tokens"],
+            committed_decode_tokens=runtime["committed_decode_tokens"],
+            decode_rounds=runtime["decode_rounds"],
+            decode_row_rounds=runtime["decode_row_rounds"],
+        )
     client_prompt = sum(result.prompt_tokens for result in results)
     client_completion = sum(result.completion_tokens for result in results)
-    if client_prompt != done_totals["prompt_tokens"] or client_completion != done_totals[
-        "completion_tokens"
-    ]:
+    if (
+        client_prompt != done_totals["prompt_tokens"]
+        or client_completion != done_totals["completion_tokens"]
+    ):
         raise corpus.CampaignError("client usage and request_done token totals differ")
-    if runtime_totals["computed_prefill_tokens"] != done_totals["computed_prefill_tokens"]:
-        raise corpus.CampaignError("throughput and request_done prefill token totals differ")
+    if (
+        runtime_totals["computed_prefill_tokens"]
+        != done_totals["computed_prefill_tokens"]
+    ):
+        raise corpus.CampaignError(
+            "throughput and request_done prefill token totals differ"
+        )
     if runtime_totals["committed_decode_tokens"] != done_totals["decode_tokens"]:
-        raise corpus.CampaignError("throughput and request_done decode token totals differ")
+        raise corpus.CampaignError(
+            "throughput and request_done decode token totals differ"
+        )
 
     makespan = campaign_end - campaign_start
     if makespan <= 0.0:
         raise corpus.CampaignError("campaign makespan is not positive")
     metrics: dict[str, Any]
     if point.suite == "decode-saturation":
-        if any(
-            event.get("result", {}).get("finish_reason") != "output_limit"
-            for event in request_done
-        ):
-            raise corpus.CampaignError(
-                "decode-saturation request stopped before its output limit"
-            )
         metrics = {
             "wave_makespan_seconds": makespan,
             "steady": steady_metrics(throughput, point.concurrency),
@@ -768,17 +793,27 @@ def analyze_point(
         "command": list(command),
         "server_log": str(server_log),
         "engine": server_start.get("engine", {}),
+        "configuration": server_start.get("configuration", {}),
         "resources": startup_resource_observation(server_start),
         "environment": server_start.get("environment", {}),
         "totals": done_totals,
         "decode_batch": {
             "rounds": runtime_totals["decode_rounds"],
             "row_rounds": runtime_totals["decode_row_rounds"],
-            "average_size": runtime_totals["average_decode_batch"],
         },
+        "measurement": measured,
         "metrics": metrics,
         "requests": client_records(results, campaign_start),
     }
+
+
+def write_json(path: Path, value: Any) -> None:
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(
+        json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False) + "\n",
+        encoding="utf-8",
+    )
+    temporary.replace(path)
 
 
 def run_point(
@@ -791,73 +826,160 @@ def run_point(
     jobs = build_jobs(point, fixtures, args.decode_tokens)
     server_log = output_dir / "server" / f"{point.key}.jsonl"
     command = server_command(serve, point, server_log, args)
-    print(
-        f"start {point.target}/{point.speculative_mode}/{point.suite} "
-        f"C={point.concurrency} requests={len(jobs)} order={workload_order_label(point)}",
-        flush=True,
+    detail_dir = output_dir / "requests" / point.key
+    detail_dir.mkdir(parents=True, exist_ok=True)
+    write_json(
+        detail_dir / "jobs.json",
+        [
+            {
+                "index": j.index,
+                "fixture": j.fixture.name,
+                "seed": j.seed,
+                "max_tokens": j.max_tokens,
+                "thinking": j.fixture.thinking,
+            }
+            for j in jobs
+        ],
     )
-
+    records = {}
+    print(f"start {point.key}: {len(jobs)} requests", flush=True)
+    write_json(
+        output_dir / "progress.json",
+        {"state": "starting", "point": point.key, "completed": 0, "total": len(jobs)},
+    )
     with corpus.RunningServer(command, "127.0.0.1", args.port, server_log) as server:
         server_start = server.wait_until_ready()
-        server_instance_id, prefill_signature = validate_server_start(server_start, point, args)
-        if point.suite == "corpus-makespan" and point.concurrency == 1:
-            # Persist full responses and the existing per-request metrics off the HTTP send path.
-            # C=1 gives one unambiguous request_done sequence; the measured end is still the final
-            # HTTP response, before this collector is joined.
-            detail_dir = output_dir / "corpus" / point.key
-            detail_dir.mkdir(parents=True, exist_ok=True)
-            records: dict[tuple[str, str, str, str, int], dict[str, Any]] = {}
-            with (
-                (detail_dir / "results.jsonl").open("w", encoding="utf-8") as handle,
-                ThreadPoolExecutor(max_workers=1) as collector,
-            ):
-                def save(result: ClientResult, response: dict[str, Any]) -> None:
-                    job = result.job
-                    event = server.wait_for_request_done(server_instance_id)
-                    spec = corpus.RunSpec(
-                        target=point.target,
-                        model_id=point.model_id,
-                        artifact=point.artifact,
-                        speculative_mode=point.speculative_mode,
-                        speculative_backend=point.speculative_backend,
-                        draft_tokens=point.draft_tokens,
-                        sampling_mode=point.sampling_mode,
-                        kv_dtype=point.kv_dtype,
-                        fixture=job.fixture,
-                        seed=job.seed,
-                    )
-                    record = corpus.build_result_record(
-                        spec, prefill_signature, request_payload(point, job), response, event
-                    )
-                    corpus.append_record(handle, record)
-                    records[corpus.record_key(record)] = record
-                    metrics = record["metrics"]
-                    rate = metrics["decode_tok_s"]
-                    rate_text = f"{rate:.2f}" if rate is not None else "n/a"
-                    print(
-                        f"done {job.index + 1}/{len(jobs)} {job.fixture.name} "
-                        f"tokens={result.completion_tokens} decode={rate_text}tok/s",
-                        flush=True,
-                    )
-
-                pending_records = []
-
-                def enqueue(result: ClientResult, response: dict[str, Any]) -> None:
-                    if pending_records and pending_records[-1].done():
-                        pending_records[-1].result()
-                    pending_records.append(collector.submit(save, result, response))
-
-                results, campaign_start, campaign_end = run_clients(point, jobs, args.port, enqueue)
-                for future in pending_records:
-                    future.result()
-            rows = corpus.build_summary_rows(
-                records, (point.target,), (point.speculative_mode,), point.sampling_mode
+        server_instance_id, prefill_signature = validate_server_start(
+            server_start, point, args
+        )
+        connection = http.client.HTTPConnection(
+            "127.0.0.1", args.port, timeout=corpus.REQUEST_TIMEOUT_SECONDS
+        )
+        try:
+            warmup = corpus.post_json(
+                connection,
+                corpus.request_payload(
+                    point.model_id, fixtures[corpus.WARMUP_FIXTURE], corpus.SEEDS[0]
+                ),
             )
-            corpus.write_summaries(rows, detail_dir)
-        else:
-            results, campaign_start, campaign_end = run_clients(point, jobs, args.port)
+            server.wait_for_request_done(server_instance_id, warmup["id"])
+        finally:
+            connection.close()
+        before = observation.wait_idle(args.port, 1)
+        write_json(detail_dir / "before.json", before)
+        completed_before = before["engine"]["runtime"]["requests"]["completed"]
+        with (detail_dir / "results.jsonl").open("w", encoding="utf-8") as handle:
 
-    events = load_server_events(server_log, server_instance_id)
+            def save(
+                result: ClientResult, response: dict, measured: dict | None = None
+            ) -> None:
+                job = result.job
+                event = server.wait_for_request_done(server_instance_id, response["id"])
+                spec = corpus.RunSpec(
+                    point.target,
+                    point.model_id,
+                    point.artifact,
+                    point.speculative_mode,
+                    point.speculative_backend,
+                    point.draft_tokens,
+                    point.sampling_mode,
+                    point.kv_dtype,
+                    job.fixture,
+                    job.seed,
+                )
+                record = corpus.build_result_record(
+                    spec,
+                    prefill_signature,
+                    request_payload(point, job),
+                    response,
+                    event,
+                )
+                record["job_index"] = job.index
+                record["http_elapsed_seconds"] = result.elapsed_seconds
+                if measured is not None:
+                    record["measurement"] = measured
+                    record["metrics"]["prefill_chunk_ms"] = measured["executions"][
+                        "prefill"
+                    ]["mean_ms"]
+                    record["metrics"]["decode_step_ms"] = measured["decode_by_batch"][
+                        0
+                    ]["mean_ms"]
+                corpus.append_record(handle, record)
+                records[corpus.record_key(record)] = record
+                write_json(
+                    output_dir / "progress.json",
+                    {
+                        "state": "running",
+                        "point": point.key,
+                        "completed": len(records),
+                        "total": len(jobs),
+                        "last_fixture": job.fixture.name,
+                        "last_completion_tokens": result.completion_tokens,
+                    },
+                )
+                print(
+                    f"done {point.key} {len(records)}/{len(jobs)} {job.fixture.name} "
+                    f"tokens={result.completion_tokens} finish={result.finish_reason}",
+                    flush=True,
+                )
+
+            wall_anchor, mono_anchor = time.time() * 1000, time.monotonic()
+            if point.suite == "context-profile":
+                results = []
+                previous = before
+                for index, job in enumerate(jobs):
+                    responses = []
+                    batch, start, end = run_clients(
+                        point,
+                        [job],
+                        args.port,
+                        lambda result, response: responses.append(response),
+                    )
+                    if index == 0:
+                        campaign_start = start
+                    campaign_end = end
+                    current = observation.wait_idle(
+                        args.port, completed_before + index + 1
+                    )
+                    save(
+                        batch[0],
+                        responses[0],
+                        observation.measurement(previous, current),
+                    )
+                    previous = current
+                    results.extend(batch)
+                after = previous
+            else:
+                with ThreadPoolExecutor(max_workers=1) as collector:
+                    pending = []
+
+                    def enqueue(result: ClientResult, response: dict) -> None:
+                        if pending and pending[-1].done():
+                            pending[-1].result()
+                        pending.append(collector.submit(save, result, response))
+
+                    results, campaign_start, campaign_end = run_clients(
+                        point, jobs, args.port, enqueue
+                    )
+                    for future in pending:
+                        future.result()
+                after = observation.wait_idle(args.port, completed_before + len(jobs))
+        write_json(detail_dir / "after.json", after)
+        measured = observation.measurement(before, after)
+    start_ms = wall_anchor + (campaign_start - mono_anchor) * 1000
+    end_ms = wall_anchor + (campaign_end - mono_anchor) * 1000
+    response_ids = {record["response"]["id"] for record in records.values()}
+    events = []
+    for event in load_server_events(server_log, server_instance_id):
+        if event["event"] == "request_done":
+            if event["request"]["response_id"] in response_ids:
+                events.append(event)
+        elif event["event"] == "throughput":
+            end = event["timestamp_unix_ms"]
+            if end <= end_ms and end - event["interval_seconds"] * 1000 >= start_ms:
+                events.append(event)
+        elif event["event"] == "request_error":
+            events.append(event)
     report = analyze_point(
         point,
         command,
@@ -868,23 +990,29 @@ def run_point(
         results,
         campaign_start,
         campaign_end,
+        measured,
     )
-    point_path = output_dir / "points" / f"{point.key}.json"
-    point_path.write_text(
-        json.dumps(report, ensure_ascii=False, indent=2, allow_nan=False) + "\n",
-        encoding="utf-8",
+    report["phase_summary"] = []
+    if point.suite != "decode-saturation":
+        report["phase_summary"] = corpus.build_summary_rows(
+            records, (point.target,), (point.speculative_mode,), point.sampling_mode
+        )
+        corpus.write_summaries(report["phase_summary"], detail_dir)
+    report["outcomes"] = {
+        reason: sum(r["metrics"]["finish_reason"] == reason for r in records.values())
+        for reason in sorted({r["metrics"]["finish_reason"] for r in records.values()})
+    }
+    report["reasoning_tokens"] = sum(
+        r["metrics"]["reasoning_tokens"] or 0 for r in records.values()
     )
-    if point.suite == "decode-saturation":
-        result_text = (
-            f"steady={report['metrics']['steady']['decode_tokens_per_second']:.1f}tok/s "
-            f"batch={report['metrics']['steady']['average_decode_batch']:.2f}"
-        )
-    else:
-        result_text = (
-            f"makespan={report['metrics']['makespan_seconds']:.2f}s "
-            f"batch={report['decode_batch']['average_size']:.2f}"
-        )
-    print(f"done {point.key}: {result_text} ({point_path})", flush=True)
+    report["repetitive_suffix_requests"] = [
+        {"fixture": r["fixture"], "seed": r["seed"], **r["output_checks"]}
+        for r in records.values()
+        if r["output_checks"]["repeated_suffix_characters"] is not None
+    ]
+    report["request_results"] = str(detail_dir / "results.jsonl")
+    write_json(output_dir / "points" / f"{point.key}.json", report)
+    print(f"complete {point.key}: {campaign_end - campaign_start:.2f}s", flush=True)
     return report
 
 
@@ -915,9 +1043,10 @@ def add_speedups(reports: Sequence[dict[str, Any]]) -> None:
         if baseline is None:
             continue
         if report["suite"] == "decode-saturation":
-            current = float(report["metrics"]["steady"]["decode_tokens_per_second"])
-            reference = float(baseline["metrics"]["steady"]["decode_tokens_per_second"])
-            report["speedup_vs_c1"] = current / reference
+            current = report["metrics"]["steady"]["decode_tokens_per_second"]
+            reference = baseline["metrics"]["steady"]["decode_tokens_per_second"]
+            if current is not None and reference:
+                report["speedup_vs_c1"] = current / reference
         else:
             current = float(report["metrics"]["makespan_seconds"])
             reference = float(baseline["metrics"]["makespan_seconds"])
@@ -937,7 +1066,9 @@ SUMMARY_FIELDS = (
     "prompt_tokens",
     "computed_prefill_tokens",
     "decode_tokens",
-    "average_decode_batch",
+    "full_batch_steps",
+    "full_batch_step_ms",
+    "speculative_acceptance",
     "steady_seconds",
     "steady_decode_tokens_per_second",
     "makespan_seconds",
@@ -962,7 +1093,9 @@ def summary_row(report: dict[str, Any]) -> dict[str, Any]:
         "prompt_tokens": report["totals"]["prompt_tokens"],
         "computed_prefill_tokens": report["totals"]["computed_prefill_tokens"],
         "decode_tokens": report["totals"]["decode_tokens"],
-        "average_decode_batch": report["decode_batch"]["average_size"],
+        "full_batch_steps": 0,
+        "full_batch_step_ms": None,
+        "speculative_acceptance": report["totals"]["speculative_acceptance"],
         "steady_seconds": None,
         "steady_decode_tokens_per_second": None,
         "makespan_seconds": None,
@@ -971,8 +1104,11 @@ def summary_row(report: dict[str, Any]) -> dict[str, Any]:
         "workload_decode_tokens_per_second": None,
         "speedup_vs_c1": report.get("speedup_vs_c1"),
     }
+    for batch in (report.get("measurement") or {}).get("decode_by_batch", []):
+        if batch["batch"] == report["concurrency"]:
+            row["full_batch_steps"] = batch["units"]
+            row["full_batch_step_ms"] = batch["mean_ms"]
     if report["suite"] == "decode-saturation":
-        row["average_decode_batch"] = report["metrics"]["steady"]["average_decode_batch"]
         row["steady_seconds"] = report["metrics"]["steady"]["seconds"]
         row["steady_decode_tokens_per_second"] = report["metrics"]["steady"][
             "decode_tokens_per_second"
@@ -1026,7 +1162,8 @@ def write_summaries(reports: Sequence[dict[str, Any]], output_dir: Path) -> None
         writer = csv.DictWriter(handle, fieldnames=SUMMARY_FIELDS)
         writer.writeheader()
         writer.writerows(
-            {field: csv_value(row.get(field)) for field in SUMMARY_FIELDS} for row in rows
+            {field: csv_value(row.get(field)) for field in SUMMARY_FIELDS}
+            for row in rows
         )
 
     groups: dict[tuple[str, str, str, str, str], list[dict[str, Any]]] = {}
@@ -1044,17 +1181,67 @@ def write_summaries(reports: Sequence[dict[str, Any]], output_dir: Path) -> None
     for (target, prefill_signature, kv_dtype, mode, suite), group in groups.items():
         group.sort(key=lambda row: int(row["concurrency"]))
         title = f"## {target} / {prefill_signature} / {kv_dtype} / {mode} / {suite}"
-        if suite == "decode-saturation":
+        if suite == "context-profile":
+            phases = [
+                phase
+                for report in reports
+                if report["suite"] == suite
+                and report["target"] == target
+                and report["speculative_mode"] == mode
+                for phase in report["phase_summary"]
+            ]
             table = markdown_table(
-                ("C", "Requests", "Steady s", "Avg batch", "Decode tok/s", "Speedup"),
+                (
+                    "Fixture",
+                    "Samples",
+                    "Prompt tokens",
+                    "Prefill tok/s",
+                    "TTFT ms",
+                    "Chunk ms",
+                    "Decode step ms",
+                    "Decode tok/s",
+                ),
+                [
+                    (
+                        phase["fixture"],
+                        str(phase["samples"]),
+                        *(
+                            corpus.format_mean_stddev(phase, key)
+                            for key in (
+                                "prompt_tokens",
+                                "prefill_tok_s",
+                                "server_ttft_ms",
+                                "prefill_chunk_ms",
+                                "decode_step_ms",
+                                "decode_tok_s",
+                            )
+                        ),
+                    )
+                    for phase in phases
+                ],
+            )
+        elif suite == "decode-saturation":
+            table = markdown_table(
+                (
+                    "C",
+                    "Requests",
+                    "Full-batch steps",
+                    "Step ms",
+                    "Steady s",
+                    "Decode tok/s",
+                    "Acceptance",
+                    "Decode tokens",
+                ),
                 [
                     (
                         str(row["concurrency"]),
                         str(row["request_count"]),
+                        str(row["full_batch_steps"]),
+                        format_number(row["full_batch_step_ms"]),
                         format_number(row["steady_seconds"]),
-                        format_number(row["average_decode_batch"]),
                         format_number(row["steady_decode_tokens_per_second"], 1),
-                        format_number(row["speedup_vs_c1"]),
+                        format_number(row["speculative_acceptance"], 3),
+                        str(row["decode_tokens"]),
                     )
                     for row in group
                 ],
@@ -1066,10 +1253,11 @@ def write_summaries(reports: Sequence[dict[str, Any]], output_dir: Path) -> None
                     "Requests",
                     "Makespan s",
                     "Requests/s",
-                    "Prefill tok/s",
-                    "Decode tok/s",
-                    "Avg batch",
-                    "Speedup",
+                    "Decode tokens",
+                    "Corpus decode tok/s",
+                    "Full-batch steps",
+                    "Step ms",
+                    "Acceptance",
                 ),
                 [
                     (
@@ -1077,10 +1265,11 @@ def write_summaries(reports: Sequence[dict[str, Any]], output_dir: Path) -> None
                         str(row["request_count"]),
                         format_number(row["makespan_seconds"]),
                         format_number(row["requests_per_second"], 4),
-                        format_number(row["workload_prefill_tokens_per_second"], 1),
+                        str(row["decode_tokens"]),
                         format_number(row["workload_decode_tokens_per_second"], 1),
-                        format_number(row["average_decode_batch"]),
-                        format_number(row["speedup_vs_c1"]),
+                        str(row["full_batch_steps"]),
+                        format_number(row["full_batch_step_ms"]),
+                        format_number(row["speculative_acceptance"], 3),
                     )
                     for row in group
                 ],
@@ -1089,9 +1278,7 @@ def write_summaries(reports: Sequence[dict[str, Any]], output_dir: Path) -> None
 
     corpus_order_note = ""
     if any(report["suite"] == "corpus-makespan" for report in reports):
-        corpus_order_note = (
-            f" Corpus-makespan uses fixed shuffle seed {CORPUS_ORDER_SEED} and ordered HTTP sends."
-        )
+        corpus_order_note = f" Corpus-makespan uses fixed shuffle seed {CORPUS_ORDER_SEED} and ordered HTTP sends."
     markdown = (
         "# Concurrent serving benchmark\n\n"
         "Saturated decode rates use only complete intervals whose decode batch equals the "
@@ -1107,7 +1294,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     validate_args(args)
     artifacts = corpus.parse_artifacts(args.artifact)
-    fixtures = corpus.load_fixtures()
+    fixtures = corpus.load_fixtures(args.thinking)
     points = build_points(artifacts, args)
     output_dir = args.output.expanduser().resolve()
 
@@ -1133,10 +1320,32 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     reports: list[dict[str, Any]] = []
     for point in points:
-        reports.append(run_point(serve, point, fixtures, output_dir, args))
+        try:
+            reports.append(run_point(serve, point, fixtures, output_dir, args))
+        except BaseException as error:
+            write_json(
+                output_dir / "progress.json",
+                {
+                    "state": "failed",
+                    "point": point.key,
+                    "error": str(error),
+                    "completed_points": len(reports),
+                },
+            )
+            raise
+        add_speedups(reports)
+        write_summaries(reports, output_dir)
 
     add_speedups(reports)
     write_summaries(reports, output_dir)
+    write_json(
+        output_dir / "progress.json",
+        {
+            "state": "complete",
+            "points": len(reports),
+            "requests": sum(report["request_count"] for report in reports),
+        },
+    )
     print(f"summary: {output_dir / 'summary.md'}", flush=True)
     return 0
 

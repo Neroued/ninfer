@@ -15,7 +15,173 @@ from tools.bench.run_serve_corpus import (
 from tools.bench.run_serve_concurrency import build_points
 from tools.bench import run_serve_corpus as corpus
 from tools.bench import run_serve_concurrency as concurrency
+from tools.bench import serve_measurement as observation
 from tools.bench.ttft.diagnostics import attach_generation_diagnostics
+
+
+def test_configured_deployment_and_glm_workloads(tmp_path):
+    config = tmp_path / "serve.toml"
+    config.write_text("""
+[engine]
+max_context = 1048576
+max_concurrency = 8
+prefill_chunk = 4096
+kv_dtype = "fp8"
+[distributed.parallel]
+tp = 2
+adp = 2
+[speculative]
+backend = "mtp"
+draft_tokens = 3
+""")
+    args = concurrency.parse_args(
+        [
+            "--serve",
+            "serve",
+            "--artifact",
+            "glm=/model.ninfer",
+            "--config",
+            str(config),
+            "--mode",
+            "mtp3",
+            "--thinking",
+            "on",
+            "--output",
+            str(tmp_path),
+            "--suite",
+            "context-profile",
+            "--suite",
+            "decode-saturation",
+            "--suite",
+            "corpus-makespan",
+            "--concurrency",
+            "8",
+            "--concurrency",
+            "4",
+            "--concurrency",
+            "2",
+            "--concurrency",
+            "1",
+        ]
+    )
+    points = build_points([("glm", Path("/model.ninfer"))], args)
+    fixtures = corpus.load_fixtures(args.thinking)
+    jobs = [
+        concurrency.build_jobs(point, fixtures, args.decode_tokens) for point in points
+    ]
+    assert len(points) == 9 and sum(map(len, jobs)) == 335
+    assert all(job.fixture.thinking for batch in jobs for job in batch)
+    assert len(jobs[0]) == 20 and points[0].concurrency == 1
+    assert all(
+        job.max_tokens == 8192 and job.fixture.max_new == 8192 for job in jobs[1]
+    )
+    command = concurrency.server_command(
+        Path("serve"), points[-1], tmp_path / "log", args
+    )
+    for flag, value in (
+        ("--config", str(config)),
+        ("--max-context", "1048576"),
+        ("--max-concurrency", "8"),
+        ("--prefill-chunk", "4096"),
+        ("--kv-dtype", "fp8"),
+    ):
+        assert command[command.index(flag) + 1] == value
+    override = corpus.parse_args(
+        [
+            "--serve",
+            "serve",
+            "--artifact",
+            "glm=/model.ninfer",
+            "--config",
+            str(config),
+            "--prefill-chunk",
+            "2048",
+            "--mode",
+            "mtp0",
+            "--output",
+            str(tmp_path),
+        ]
+    )
+    spec = RunSpec(
+        "glm",
+        "glm",
+        Path("/model.ninfer"),
+        "mtp0",
+        "none",
+        0,
+        "greedy",
+        "fp8",
+        fixtures[corpus.WARMUP_FIXTURE],
+        7,
+    )
+    command = corpus.server_command(Path("serve"), spec, tmp_path / "log", override)
+    assert command[command.index("--prefill-chunk") + 1] == "2048"
+    assert command[command.index("--spec") + 1] == "none"
+
+
+def test_observation_measures_actual_batch_counters():
+    def execution(count, ns):
+        return dict(
+            units=count,
+            rows=count * 4,
+            input_tokens=count * 4,
+            scheduled_positions=count * 16,
+            latency_bins=[count],
+            total=dict(count=count, total_ns=ns),
+            result=dict(count=count, total_ns=ns - count * 1000),
+            resolution=dict(count=count, total_ns=0),
+            retirement=dict(count=count, total_ns=count * 1000),
+        )
+
+    def snapshot(count, ns):
+        counters = {
+            key: count
+            for key in (
+                "computed_prefill_tokens",
+                "committed_decode_tokens",
+                "decode_rounds",
+                "decode_row_rounds",
+                "reused_prompt_tokens",
+                "preemptions",
+                "snapshot_restores",
+                "replay_restores",
+            )
+        }
+        return {
+            "server_instance_id": "same",
+            "engine": {
+                "runtime": counters,
+                "execution_latency_bounds_ns": [10000000],
+                "executions": {"decode": execution(count, ns)},
+                "decode_by_batch": [
+                    {"batch": 1, **execution(0, 0)},
+                    {"batch": 4, **execution(count, ns)},
+                ],
+                "ranks": [
+                    {
+                        "rank": rank,
+                        "gpu_intervals": {"target": {"count": count, "total_ns": ns}},
+                        "attention_work": {"decode": {"rows": count * (rank + 1)}},
+                        "communication_eager": {},
+                        "communication_graph": {},
+                    }
+                    for rank in (1, 0)
+                ],
+            },
+        }
+
+    before, after = snapshot(3, 21000000), snapshot(5, 37000000)
+    measured = observation.measurement(before, after)
+    assert measured["decode_by_batch"][0]["mean_ms"] is None
+    actual = measured["decode_by_batch"][1]
+    assert actual["units"] == 2 and actual["mean_ms"] == 8.0
+    assert sum(actual["stage_mean_ms"].values()) == pytest.approx(8.0)
+    assert [
+        (r["rank"], r["attention_work"]["decode"]["rows"]) for r in measured["ranks"]
+    ] == [(1, 4), (0, 2)]
+    after["server_instance_id"] = "restarted"
+    with pytest.raises(ValueError, match="instance changed"):
+        observation.measurement(before, after)
 
 
 @pytest.mark.parametrize(
@@ -68,8 +234,9 @@ def test_steady_throughput_excludes_recovery(section: str, field: str) -> None:
         "average_decode_batch": 8.0,
         "decode_tokens_per_second": 600.0,
     }
-    with pytest.raises(corpus.CampaignError, match="no recovery-free full-batch"):
-        concurrency.steady_metrics([recovery], 8)
+    missing = concurrency.steady_metrics([recovery], 8)
+    assert missing["decode_rounds"] == 0
+    assert missing["decode_tokens_per_second"] is None
 
 
 @pytest.mark.parametrize(
@@ -77,7 +244,9 @@ def test_steady_throughput_excludes_recovery(section: str, field: str) -> None:
     [(0, 0.0, None), (1, 0.0, 0.0), (2, 0.125, 0.125)],
 )
 def test_result_record_parses_production_timings(
-    vision_samples: int, vision_seconds: float, expected_vision: float | None,
+    vision_samples: int,
+    vision_seconds: float,
+    expected_vision: float | None,
 ) -> None:
     fixture = Fixture(
         name="fixture",
@@ -171,7 +340,8 @@ def test_result_record_parses_production_timings(
 
 @pytest.mark.parametrize("resource_case", ["single", "pair", "missing", "partial"])
 def test_startup_resources_reach_concurrency_and_ttft_reports(
-    tmp_path: Path, resource_case: str,
+    tmp_path: Path,
+    resource_case: str,
 ) -> None:
     ranks = [
         {
@@ -206,16 +376,30 @@ def test_startup_resources_reach_concurrency_and_ttft_reports(
 
     fixture = Fixture("fixture", [], False, 2, "test")
     point = concurrency.Point(
-        "model", "model", tmp_path / "model.ninfer", "mtp0", "none", 0,
-        "full", "greedy", "fp8", "corpus-makespan", 1,
+        "model",
+        "model",
+        tmp_path / "model.ninfer",
+        "mtp0",
+        "none",
+        0,
+        "full",
+        "greedy",
+        "fp8",
+        "corpus-makespan",
+        1,
     )
     done = {
         "event": "request_done",
         "result": {
-            "prompt_tokens": 10, "completion_tokens": 2, "computed_prefill_tokens": 10,
+            "prompt_tokens": 10,
+            "completion_tokens": 2,
+            "computed_prefill_tokens": 10,
         },
         "speculative": {
-            "rounds": 0, "drafted_tokens": 0, "accepted_tokens": 0, "fallback_steps": 0,
+            "rounds": 0,
+            "drafted_tokens": 0,
+            "accepted_tokens": 0,
+            "fallback_steps": 0,
         },
     }
     interval = {
@@ -224,11 +408,24 @@ def test_startup_resources_reach_concurrency_and_ttft_reports(
         "decode_batch": {"rounds": 1, "row_rounds": 1},
     }
     result = concurrency.ClientResult(
-        concurrency.Job(0, 0, fixture, 1, 2), 0.0, 1.0, 10, 2, "output_limit",
+        concurrency.Job(0, 0, fixture, 1, 2),
+        0.0,
+        1.0,
+        10,
+        2,
+        "output_limit",
     )
     log = tmp_path / "server.jsonl"
     point_report = concurrency.analyze_point(
-        point, [], log, start, "bindings", [done, interval], [result], 0.0, 1.0,
+        point,
+        [],
+        log,
+        start,
+        "bindings",
+        [done, interval],
+        [result],
+        0.0,
+        1.0,
     )
     # Startup resources remain usable even when runtime intervals have not been logged yet.
     log.write_text(json.dumps(start) + "\n")
@@ -240,7 +437,8 @@ def test_startup_resources_reach_concurrency_and_ttft_reports(
         expected = {"status": "available", **resources}
     else:
         reason = (
-            "startup_resources_missing" if resource_case == "missing"
+            "startup_resources_missing"
+            if resource_case == "missing"
             else "startup_resources_invalid"
         )
         expected = {"status": "unavailable", "reason": reason}
@@ -332,8 +530,15 @@ def test_selected_kv_reaches_server_and_is_verified(
     }
     if concurrent:
         args = concurrency.parse_args(
-            common + ["--suite", "decode-saturation", "--concurrency", "1",
-                      "--proposal-head", head]
+            common
+            + [
+                "--suite",
+                "decode-saturation",
+                "--concurrency",
+                "1",
+                "--proposal-head",
+                head,
+            ]
         )
         point = build_points([("model", artifact)], args)[0]
         command = concurrency.server_command(
@@ -361,18 +566,19 @@ def test_selected_kv_reaches_server_and_is_verified(
             Fixture("fixture", [], False, 8, "test"),
             7,
         )
-        command = corpus.server_command(
-            Path("serve"), spec, tmp_path / "log", args.port, args.device
-        )
-        validate = lambda: corpus.validate_server_start(event, spec, args.device)
+        command = corpus.server_command(Path("serve"), spec, tmp_path / "log", args)
+        validate = lambda: corpus.validate_server_start(event, spec, args)
     assert command[command.index("--kv-dtype") + 1] == kv_dtype
     assert command[command.index("--context-capacity") + 1] == "auto"
     assert command[command.index("--host-cache-capacity") + 1] == "0"
-    assert ("--proposal-head" in command) == (head == "optimized")
+    if "--proposal-head" in command:
+        assert command[command.index("--proposal-head") + 1] == head
     assert validate() == ("instance", "bindings")
     for field in ("host_capacity_bytes",):
         engine["context_cache"][field] = 1
-        with pytest.raises(corpus.CampaignError, match="context cache capacity differs"):
+        with pytest.raises(
+            corpus.CampaignError, match="context cache capacity differs"
+        ):
             validate()
         engine["context_cache"][field] = 0
     engine["kv_cache"] = "bf16"

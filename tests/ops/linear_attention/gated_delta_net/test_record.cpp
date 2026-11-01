@@ -1,10 +1,10 @@
+#include "ops/suite.h"
 #include "ops/state_fixture.h"
 #include "ninfer/ops/gated_delta_net.h"
 #include "cuda_fixture.h"
 #include "core/buffer.h"
 
 #include "core/device.h"
-#include "ops/linear_attention/gated_delta_net/recurrence/launch.h"
 
 #include "ops/op_tester.h"
 
@@ -47,8 +47,8 @@ int verify_equal(const std::string& label, const std::vector<std::uint16_t>& lhs
 
 int run_case(std::int32_t value_heads, std::int32_t width, std::int32_t batch,
              std::vector<std::int32_t> valid_columns, std::uint32_t seed) {
-    constexpr std::int32_t kQkHeads = 16;
-    const bool dense                = valid_columns.empty();
+    const std::int32_t kQkHeads = value_heads == 24 ? 8 : 16;
+    const bool dense            = valid_columns.empty();
     if (dense) { valid_columns.assign(static_cast<std::size_t>(batch), width); }
     const std::int32_t columns       = width * batch;
     const std::int32_t slots         = 8;
@@ -89,8 +89,7 @@ int run_case(std::int32_t value_heads, std::int32_t width, std::int32_t batch,
     DeviceBuffer reference_final(ninfer::test::cuda_environment().context.device(),
                                  static_cast<std::size_t>(kStateDim) * kStateDim * value_heads *
                                      batch * sizeof(float));
-    DeviceBuffer record_state   = to_device(state);
-    DeviceBuffer device_initial = to_device(initial_slots);
+    DeviceBuffer record_state = to_device(state);
     DeviceBuffer device_valid;
     if (!dense) { device_valid = to_device(valid_columns); }
 
@@ -119,13 +118,16 @@ int run_case(std::int32_t value_heads, std::int32_t width, std::int32_t batch,
                             {kStateDim, kStateDim, value_heads, slots});
     Tensor record_states(record_state.span(), DType::FP32,
                          {kStateDim, kStateDim, value_heads, slots});
-    SlottedStateFixture history(record_states, 3);
-    record_states = history.tensor;
+    RecordStateFixture history(record_states, 3);
     Tensor reference_final_states(reference_final.span(), DType::FP32,
                                   {kStateDim, kStateDim, value_heads, batch});
+    DeviceBuffer reference_slot = to_device(std::vector<std::int64_t>{0});
+    Tensor selected_reference_slot(reference_slot.span(), DType::I64, {1});
     Tensor valid;
     if (!dense) { valid = Tensor(device_valid.span(), DType::I32, {batch}); }
-    Tensor initial(device_initial.span(), DType::I32, {batch});
+    auto initial_offsets        = history.record_offsets(initial_slots);
+    DeviceBuffer device_initial = to_device(initial_offsets);
+    Tensor initial(device_initial.span(), DType::I64, {batch});
     Tensor reference_output(reference_out.span(), DType::BF16,
                             {kStateDim, value_heads, width, batch});
     Tensor record_output(record_out.span(), DType::BF16, {kStateDim, value_heads, width, batch});
@@ -139,7 +141,7 @@ int run_case(std::int32_t value_heads, std::int32_t width, std::int32_t batch,
     CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
     const auto stream_execution = ninfer::test::cuda_environment().context.execution_view(stream);
     cuda_synchronize();
-    // Replay is bitwise equivalent to recurrence, independently of the prefill dispatcher.
+    // The contract names public one-token state-pool execution as the exact reference.
     const auto launch_reference = [&] {
         CUDA_CHECK(cudaMemsetAsync(reference_out.data(), 0, reference_out.size(), stream));
         for (std::int32_t row = 0; row < batch; ++row) {
@@ -167,14 +169,26 @@ int run_case(std::int32_t value_heads, std::int32_t width, std::int32_t batch,
                                  .view({kStateDim, value_heads, valid_extent});
             Tensor final_row =
                 reference_final_states.slice(3, row, 1).view({kStateDim, kStateDim, value_heads});
-            ops::detail::gated_delta_net::launch_recurrent_inout(q_row, k_row, v_row, g_row,
-                                                                 beta_row, kScale, true, state_row,
-                                                                 final_row, out_row, stream);
+            CUDA_CHECK(cudaMemcpyAsync(final_row.data, state_row.data, state_row.bytes(),
+                                       cudaMemcpyDeviceToDevice, stream));
+            for (int token = 0; token < valid_extent; ++token) {
+                auto qt = q_row.slice(2, token, 1);
+                auto kt = k_row.slice(2, token, 1);
+                auto vt = v_row.slice(2, token, 1);
+                auto gt = g_row.slice(1, token, 1);
+                auto bt = beta_row.slice(1, token, 1);
+                auto ot = out_row.slice(2, token, 1);
+                ops::gated_delta_net_batch_update(
+                    qt, kt, vt, gt, bt, kScale, true,
+                    dense_record_field(final_row, 3, selected_reference_slot),
+                    dense_record_field(final_row, 3, selected_reference_slot), ot,
+                    stream_execution);
+            }
         }
     };
     const auto launch_record = [&] {
         ops::gated_delta_net_replay_record(
-            q, k, v, g_tensor, beta_tensor, kScale, record_states, valid, initial,
+            q, k, v, g_tensor, beta_tensor, kScale, history.view(initial), valid,
             {key_record_tensor, value_record_tensor, gate_record_tensor}, record_output,
             stream_execution);
     };
@@ -193,6 +207,10 @@ int run_case(std::int32_t value_heads, std::int32_t width, std::int32_t batch,
         for (auto& bits : q_bits) bits ^= 0x8000U;
         CUDA_CHECK(cudaMemcpyAsync(device_q.data(), q_bits.data(), device_q.size(),
                                    cudaMemcpyHostToDevice, stream));
+        for (auto& slot : initial_slots) slot = (slot + 3) % slots;
+        initial_offsets = history.record_offsets(initial_slots);
+        CUDA_CHECK(cudaMemcpyAsync(device_initial.data(), initial_offsets.data(),
+                                   device_initial.size(), cudaMemcpyHostToDevice, stream));
         if (!dense) {
             for (auto& count : valid_columns) count = 1 + count % width;
             CUDA_CHECK(cudaMemcpyAsync(device_valid.data(), valid_columns.data(),
@@ -296,23 +314,32 @@ int run_case(std::int32_t value_heads, std::int32_t width, std::int32_t batch,
 
 } // namespace
 
-int main() {
-    if (cuda_unavailable()) {
-        std::cout << "SKIP: no usable CUDA device\n";
-        return 77;
-    }
-
-    int failures = 0;
-    failures += run_case(32, 2, 1, {}, 1701U);
-    failures += run_case(32, 16, 1, {7}, 1711U);
-    failures += run_case(32, 6, 8, {6, 5, 4, 3, 2, 1, 6, 2}, 1721U);
+int main(int argc, char** argv) {
+    OpSuite suite;
+    const auto add = [&](int heads, int width, int batch, std::vector<int> valid, unsigned seed) {
+        suite.add(std::string(heads == 24 ? "gdn_record_local/h" : "gdn_record/h") +
+                      std::to_string(heads) + "/w" + std::to_string(width) + "/b" +
+                      std::to_string(batch) + (valid.empty() ? "/dense" : "/ragged"),
+                  [=] { return run_case(heads, width, batch, valid, seed); },
+                  {{"execution", width == 2 || width == 9 || width == 16 ? "graph" : "eager"}});
+    };
+    add(32, 2, 1, {}, 1701U);
+    add(32, 16, 1, {7}, 1711U);
+    add(32, 6, 8, {6, 5, 4, 3, 2, 1, 6, 2}, 1721U);
     for (int width = 2; width <= 16; ++width) {
-        failures += run_case(48, width, 1, {}, 1730U + width);
+        add(48, width, 1, {}, 1730U + width);
         std::vector<std::int32_t> valid(8);
         for (int b = 0; b < 8; ++b) valid[b] = b == 0 ? width : 1 + (3 * b) % width;
-        failures += run_case(48, width, 8, valid, 1760U + width);
+        add(48, width, 8, valid, 1760U + width);
     }
-    failures += run_case(48, 5, 3, {5, 3, 1}, 1791U);
-    std::cout << (failures == 0 ? "OK" : "FAIL") << " gated_delta_net_replay_record\n";
-    return failures == 0 ? 0 : 1;
+    add(48, 5, 3, {5, 3, 1}, 1791U);
+
+    for (int b = 1; b <= 8; ++b)
+        for (int t = 2; t <= 16; ++t) {
+            add(24, t, b, {}, 2000U + 100 * b + t);
+            std::vector<int> valid(b);
+            for (int row = 0; row < b; ++row) valid[row] = 1 + (3 * row + t - 1) % t;
+            add(24, t, b, valid, 3000U + 100 * b + t);
+        }
+    return suite.main(argc, argv);
 }

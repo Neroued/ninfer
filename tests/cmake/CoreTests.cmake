@@ -4,12 +4,24 @@ add_executable(ninfer_public_api_test "${CMAKE_CURRENT_LIST_DIR}/../test_public_
 target_include_directories(ninfer_public_api_test PRIVATE ${PROJECT_SOURCE_DIR}/include)
 add_test(NAME ninfer_public_api_test COMMAND ninfer_public_api_test)
 
-foreach(part IN ITEMS system task_pool executor)
+foreach(part IN ITEMS system task_pool)
   ninfer_add_test(ninfer_cpu_${part}_test
     SOURCES "${CMAKE_CURRENT_LIST_DIR}/../cpu/test_${part}.cpp"
     LIBRARIES ninfer_cpu)
   set_tests_properties(ninfer_cpu_${part}_test PROPERTIES TIMEOUT 30)
 endforeach()
+
+if(NINFER_TARGET STREQUAL "rtx5090")
+  foreach(part IN ITEMS x86 executor)
+    ninfer_add_test(ninfer_cpu_${part}_test
+      SOURCES "${CMAKE_CURRENT_LIST_DIR}/../cpu/test_${part}.cpp"
+      LIBRARIES ninfer_cpu_executor)
+    set_tests_properties(ninfer_cpu_${part}_test PROPERTIES TIMEOUT 30)
+  endforeach()
+  ninfer_add_test(ninfer_cpu_tensor_test
+    SOURCES "${CMAKE_CURRENT_LIST_DIR}/../cpu/test_tensor.cpp"
+    LIBRARIES ninfer_core ninfer_cpu_executor)
+endif()
 
 ninfer_add_test(ninfer_device_test       SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_device.cpp"
   LIBRARIES ninfer_core)
@@ -48,18 +60,13 @@ add_test(NAME ninfer_nf4_exact_test
 
 ninfer_add_test(ninfer_read_queue_test SOURCES "${CMAKE_CURRENT_LIST_DIR}/../io/test_read_queue.cpp"
   LIBRARIES ninfer_core PkgConfig::URING)
-target_link_options(ninfer_read_queue_test PRIVATE "LINKER:--wrap=io_uring_submit")
+ninfer_test_interpose(ninfer_read_queue_test io_uring_submit)
 set_tests_properties(ninfer_read_queue_test PROPERTIES TIMEOUT 30)
 
 ninfer_add_test(ninfer_arena_test        SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_arena.cpp"
   LIBRARIES ninfer_core)
 
-ninfer_add_test(ninfer_kv_cache_test
-  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_kv_cache.cpp"
-  LIBRARIES ninfer_core)
-
-ninfer_add_test(ninfer_host_context_arena_test
-  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_host_context_arena.cpp"
+ninfer_add_test(ninfer_context_pool_test SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_context_pool.cpp"
   LIBRARIES ninfer_core)
 
 ninfer_add_test(ninfer_state_store_test
@@ -74,22 +81,12 @@ set_tests_properties(
   ninfer_device_test
   ninfer_decode_graph_test
   ninfer_arena_test
-  ninfer_kv_cache_test
-  ninfer_host_context_arena_test
   ninfer_state_store_test
   PROPERTIES SKIP_RETURN_CODE 77)
 
 ninfer_add_test(ninfer_host_timing_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_host_timing.cpp"
-  LIBRARIES ninfer_core)
-
-ninfer_add_test(ninfer_jinja_test
-  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../text/test_jinja.cpp"
-  LIBRARIES ninfer_jinja ninfer::json)
-
-add_test(NAME ninfer_chat_templates_test
-  COMMAND ${Python3_EXECUTABLE} -B ${PROJECT_SOURCE_DIR}/tests/text/test_chat_templates.py
-          $<TARGET_FILE:ninfer_jinja_test>)
+  LIBRARIES ninfer_runtime_support)
 
 ninfer_add_test(ninfer_weight_bank_test SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_weight_bank.cpp"
   LIBRARIES ninfer_core)
@@ -100,8 +97,6 @@ ninfer_add_test(ninfer_expert_cache_test
   LIBRARIES ninfer_core)
 set_tests_properties(ninfer_expert_cache_test PROPERTIES TIMEOUT 60)
 
-foreach(symbol IN ITEMS
-    cudaEventRecord cudaMemcpyAsync cudaMemcpyBatchAsync cudaStreamSynchronize cudaStreamWaitEvent
-    cudaFree cudaFreeHost)
-  target_link_options(ninfer_expert_cache_test PRIVATE "LINKER:--wrap=${symbol}")
-endforeach()
+ninfer_test_interpose(ninfer_expert_cache_test
+  cudaEventRecord cudaMemcpyAsync cudaMemcpyBatchAsync cudaStreamSynchronize cudaStreamWaitEvent
+  cudaFree cudaFreeHost)

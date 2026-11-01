@@ -1,0 +1,30 @@
+# rtx5090-qwen3_8-27b-nvfp4: CLI/Serve deployment example.
+# Set model.path to your artifact entry file before use.
+# Requires an artifact containing Text, Vision, MTP and the optimized proposal head.
+
+[model]
+path = "/srv/models/qwen3_8_27b_nvfp4.ninfer"
+vision = true
+
+[engine]
+max_context = 240000 # Per-request limit; shared physical capacity is planned separately.
+max_concurrency = 2
+kv_dtype = "fp8"
+context_capacity = "auto"
+memory_headroom = "256MiB"
+prefill_chunk = 1024
+cuda_graph = true
+
+[speculative]
+backend = "mtp"
+draft_tokens = 3
+proposal_head = "optimized"
+
+[vision]
+memory_budget = "1GiB"
+
+[server]
+host = "127.0.0.1" # Use 0.0.0.0 for LAN access.
+port = 8080
+model_id = "qwen3.8-27b"
+# api_key = "replace-with-your-key"

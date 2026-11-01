@@ -33,8 +33,8 @@ void expect_throw(Function&& function, const char* message) {
     expect(false, message);
 }
 
-std::array<ninfer::runtime::ContextTransferCost, 3> transfer(std::uint64_t batch_ns = 10) {
-    std::array<ninfer::runtime::ContextTransferCost, 3> result;
+std::array<ninfer::runtime::ContextTransferCost, 4> transfer(std::uint64_t batch_ns = 10) {
+    std::array<ninfer::runtime::ContextTransferCost, 4> result;
     for (auto& direction : result) {
         direction = {.batch_ns        = batch_ns,
                      .operation_ns    = 3,
@@ -59,10 +59,11 @@ Json direction_json(const ninfer::runtime::ContextTransferCost& value) {
                 {"ns_per_byte_q32", value.ns_per_byte_q32}};
 }
 
-Json transfer_json(const std::array<ninfer::runtime::ContextTransferCost, 3>& value) {
+Json transfer_json(const std::array<ninfer::runtime::ContextTransferCost, 4>& value) {
     return Json{{"d2h", direction_json(value[0])},
                 {"h2d", direction_json(value[1])},
-                {"d2d", direction_json(value[2])}};
+                {"d2d", direction_json(value[2])},
+                {"h2h", direction_json(value[3])}};
 }
 
 Json prefill_json(const ninfer::runtime::ContextPrefillCost& value) {
@@ -136,10 +137,51 @@ void test_exact_evaluation() {
     requirements[1].direction = ninfer::runtime::ContextTransferDirection::HostToDevice;
     expect(ninfer::runtime::price_context_transfer_requirements(model, requirements) == 26,
            "independent transfer directions were incorrectly coalesced");
+    requirements[1].rank = 1;
+    expect(ninfer::runtime::price_context_transfer_requirements(model, requirements) == 13,
+           "parallel rank transfer costs were added as serial latency");
 
     model.prefill.chunk_ns = std::numeric_limits<std::uint64_t>::max();
     expect(model.prefill_ns({.chunks = 2}) == std::numeric_limits<std::uint64_t>::max(),
            "prefill cost did not saturate");
+}
+
+void test_peer_transfer_cost() {
+    using namespace ninfer::runtime;
+    ContextMachineCostModel model{.transfer = transfer(), .prefill = prefill()};
+    std::vector<ContextTransferRequirement> requirements{
+        {.direction = ContextTransferDirection::PeerDeviceToDevice,
+         .work      = {12, 1},
+         .rank      = 0,
+         .peer      = ContextPeerTransfer{0, 1}},
+        {.direction = ContextTransferDirection::PeerDeviceToDevice,
+         .work      = {12, 1},
+         .rank      = 1,
+         .peer      = ContextPeerTransfer{0, 1}},
+    };
+    expect(!try_price_context_transfer_requirements(model, requirements) &&
+               price_context_transfer_requirements(model, requirements) == UINT64_MAX,
+           "unmeasured peer links inherited local-device costs");
+    model.peer_transfer.push_back({{0, 1}, {20, 2, kContextCostQ32One}});
+    expect(try_price_context_transfer_requirements(model, requirements) == 22,
+           "peer endpoint costs were added as serial latency");
+    requirements.push_back({.resource  = {.pool = KvPoolId{0}},
+                            .direction = ContextTransferDirection::PeerDeviceToDevice,
+                            .work      = {10, 1},
+                            .rank      = 0,
+                            .peer      = ContextPeerTransfer{0, 1}});
+    expect(try_price_context_transfer_requirements(model, requirements) == 24,
+           "peer resource transfers on one link were not coalesced");
+    requirements.push_back(
+        {.direction = ContextTransferDirection::DeviceToDevice, .work = {10, 1}, .rank = 0});
+    expect(try_price_context_transfer_requirements(model, requirements) == 37,
+           "local copies were merged with peer transfer costs");
+    requirements[0].peer = ContextPeerTransfer{1, 0};
+    expect(!try_price_context_transfer_requirements(model, requirements),
+           "peer measurements were reused for an unmeasured directed link");
+    const auto generic = generic_context_machine_cost_model();
+    expect(!generic.prefill_measured && generic.peer_transfer.empty(),
+           "generic local fallback claimed measured model or peer costs");
 }
 
 void test_schema_validation() {
@@ -210,7 +252,8 @@ void test_resolution_and_atomic_upserts() {
             .hardware_class    = compiled_identity.hardware_class,
             .prefill_signature = "e6eae48276e11c15c932cb90d258b51b81e144dc13fb461e7ffa202d2caa440a",
         });
-        expect(measured.summary.prefill_source ==
+        expect(measured.model.prefill_measured && measured.model.peer_transfer.empty() &&
+                   measured.summary.prefill_source ==
                        ninfer::ContextCostPresetSource::CompiledDefault &&
                    measured.model.prefill.token_ns_q32 == 375'800'765'711'778,
                "measured bindings did not select their compiled prefill cost");
@@ -281,6 +324,7 @@ void test_resolution_and_atomic_upserts() {
 
 int main() {
     test_exact_evaluation();
+    test_peer_transfer_cost();
     test_schema_validation();
     test_resolution_and_atomic_upserts();
     if (failures == 0) { std::cout << "ok\n"; }

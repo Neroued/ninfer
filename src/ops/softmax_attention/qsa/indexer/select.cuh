@@ -1,131 +1,21 @@
 #pragma once
 
-#include "ops/softmax_attention/qsa/indexer/arguments.h"
-#include "ops/common/cuda/reduce.cuh"
-
-#include <cub/block/block_reduce.cuh>
-#include <cub/block/block_scan.cuh>
+#include "ops/softmax_attention/qsa/indexer/work_map.cuh"
+#include "ops/softmax_attention/kernels/topk_512.cuh"
 
 namespace ninfer::ops::detail::qsa {
 
-using IndexerScan   = cub::BlockScan<int, 256>;
-using IndexerReduce = cub::BlockReduce<std::uint64_t, 256>;
-
-struct IndexerRadixStorage {
-    union {
-        int histogram[8][256];
-        IndexerScan::TempStorage scan;
-        IndexerReduce::TempStorage reduce;
-    } temp;
-
-    std::uint64_t prefix, low, mask;
-    int shift, remaining, selected_count;
-};
-
-struct IndexerKeyMin {
-    __device__ std::uint64_t operator()(std::uint64_t a, std::uint64_t b) const {
-        return min(a, b);
-    }
-};
-
-struct IndexerKeyMax {
-    __device__ std::uint64_t operator()(std::uint64_t a, std::uint64_t b) const {
-        return max(a, b);
-    }
-};
-
-struct IndexerStoreKeys {
-    std::uint64_t* out;
-
-    __device__ void operator()(int rank, std::uint64_t key) const { out[rank] = key; }
-};
-
-struct IndexerStoreIds {
-    std::int32_t* out;
-
-    __device__ void operator()(int rank, std::uint64_t key) const {
-        out[rank] = common::id_from_order_key(key);
-    }
-};
-
-// Full radix selection over a unique score/id total order. Prefix refinement stops only
-// when exactly 512 keys are >= the prefix. No approximate local candidate truncation.
-template <int Items, class Store>
-__device__ void indexer_select_512(std::uint64_t (&keys)[Items], int count, IndexerRadixStorage& s,
-                                   Store store) {
-    const int tid = threadIdx.x;
-    if (count <= kIndexerSelected) {
-#pragma unroll
-        for (int j = 0; j < Items; ++j)
-            if (j * 256 + tid < count) store(j * 256 + tid, keys[j]);
-        return;
-    }
-    std::uint64_t lo = ~std::uint64_t(0), hi = 0;
-#pragma unroll
-    for (int j = 0; j < Items; ++j) {
-        if (keys[j]) lo = min(lo, keys[j]);
-        hi = max(hi, keys[j]);
-    }
-    lo = IndexerReduce(s.temp.reduce).Reduce(lo, IndexerKeyMin{});
-    if (tid == 0) s.low = lo;
-    __syncthreads();
-    hi = IndexerReduce(s.temp.reduce).Reduce(hi, IndexerKeyMax{});
-    if (tid == 0) {
-        s.shift     = ((63 - __clzll(s.low ^ hi)) / 8) * 8;
-        s.mask      = s.shift == 56 ? 0 : (~std::uint64_t(0) << (s.shift + 8));
-        s.prefix    = hi & s.mask;
-        s.remaining = kIndexerSelected;
-    }
-    __syncthreads();
-    for (int shift = s.shift; shift >= 0; shift -= 8) {
-        for (int i = tid; i < 8 * 256; i += 256) (&s.temp.histogram[0][0])[i] = 0;
-        __syncthreads();
-#pragma unroll
-        for (int j = 0; j < Items; ++j) {
-            const auto key = keys[j];
-            const int bin  = key && (key & s.mask) == s.prefix ? int((key >> shift) & 255) : 256;
-            const unsigned peers = __match_any_sync(0xffffffffu, bin);
-            if (bin < 256 && (tid % 32) == __ffs(peers) - 1)
-                atomicAdd(&s.temp.histogram[tid / 32][bin], __popc(peers));
-        }
-        __syncthreads();
-        int histogram = 0;
-#pragma unroll
-        for (int warp = 0; warp < 8; ++warp) histogram += s.temp.histogram[warp][tid];
-        __syncthreads();
-        int below, total;
-        IndexerScan(s.temp.scan).ExclusiveSum(histogram, below, total);
-        const int above     = total - below - histogram;
-        const int remaining = s.remaining;
-        __syncthreads();
-        if (above < remaining && above + histogram >= remaining) {
-            s.prefix |= std::uint64_t(tid) << shift;
-            s.remaining      = remaining - above;
-            s.selected_count = histogram;
-        }
-        __syncthreads();
-        if (s.selected_count == s.remaining) break;
-        if (tid == 0) s.mask |= std::uint64_t(255) << shift;
-        __syncthreads();
-    }
-    const auto threshold = s.prefix;
-    int kept             = 0;
-#pragma unroll
-    for (int j = 0; j < Items; ++j) kept += keys[j] >= threshold;
-    int rank;
-    IndexerScan(s.temp.scan).ExclusiveSum(kept, rank);
-#pragma unroll
-    for (int j = 0; j < Items; ++j)
-        if (keys[j] >= threshold) store(rank++, keys[j]);
-}
-
-template <int Partition>
-__global__
-__launch_bounds__(256) void indexer_partition_kernel(const __grid_constant__ IndexerArguments a) {
-    __shared__ IndexerJobs jobs;
-    __shared__ IndexerRadixStorage radix;
-    if (!jobs.build<1, Partition>(a)) return;
-    for (int job = blockIdx.x; job < jobs.prefix[jobs.groups]; job += gridDim.x) {
+template <int Partition, int Bits = 8, int Copies = 8, int MinBlocks = 1, int MaxQueries = 64,
+          bool Reverse = false>
+__global__ __launch_bounds__(256, MinBlocks) void indexer_partition_kernel(
+    const __grid_constant__ IndexerArguments a) {
+    if (a.columns <= kIndexerSelected) return;
+    __shared__ IndexerJobs<MaxQueries> jobs;
+    __shared__ Top512Storage<Bits, Copies> radix;
+    if (!jobs.template build<1, Partition>(a)) return;
+    const int total = jobs.prefix[jobs.groups];
+    for (int step = blockIdx.x; step < total; step += gridDim.x) {
+        const int job  = Reverse ? total - 1 - step : step;
         const int slot = jobs.group_for(job), part = job - jobs.prefix[slot];
         const int first = part * Partition;
         const int count = min(Partition, jobs.visible[slot] - first);
@@ -141,15 +31,16 @@ __launch_bounds__(256) void indexer_partition_kernel(const __grid_constant__ Ind
         // A discarded key already has 512 better keys in its own partition, so it cannot
         // belong to the global Top512. Only the final partition can emit fewer than 512.
         auto* out = a.candidates + (std::int64_t(slot) * a.partitions + part) * kIndexerSelected;
-        indexer_select_512(keys, count, radix, IndexerStoreKeys{out});
+        select_top512(keys, count, radix, Top512StoreKeys{out});
         __syncthreads();
     }
 }
 
-template <int Partition>
+template <int Partition, int Bits = 8, int Copies = 8,
+          int MaxPartitions = kIndexerMaxBlocks / Partition>
 __global__
 __launch_bounds__(256) void indexer_finish_kernel(const __grid_constant__ IndexerArguments a) {
-    __shared__ IndexerRadixStorage radix;
+    __shared__ Top512Storage<Bits, Copies> radix;
     const int slot = blockIdx.x, tid = threadIdx.x, visible = a.visible(slot);
     const auto column = a.column(slot);
     auto* out         = a.ids + column * kIndexerSelected;
@@ -162,13 +53,13 @@ __launch_bounds__(256) void indexer_finish_kernel(const __grid_constant__ Indexe
     const int count =
         (parts - 1) * kIndexerSelected + min(kIndexerSelected, visible - (parts - 1) * Partition);
     const auto* input   = a.candidates + std::int64_t(slot) * a.partitions * kIndexerSelected;
-    constexpr int Items = (kIndexerMaxBlocks / Partition) * kIndexerSelected / 256;
+    constexpr int Items = MaxPartitions * kIndexerSelected / 256;
     std::uint64_t keys[Items];
 #pragma unroll
     for (int j = 0; j < Items; ++j) {
         const int i = j * 256 + tid;
         keys[j]     = i < count ? input[i] : 0;
     }
-    indexer_select_512(keys, count, radix, IndexerStoreIds{out});
+    select_top512(keys, count, radix, Top512StoreIds{out});
 }
 } // namespace ninfer::ops::detail::qsa

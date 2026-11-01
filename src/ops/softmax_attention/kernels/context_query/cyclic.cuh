@@ -21,7 +21,7 @@ struct SlidingWindowAttentionPolicy {
         return key >= query - (window_mask);
     }
 
-    __device__ __forceinline__ std::int64_t context_tile(int kv_head, int, int) const {
+    __device__ __forceinline__ std::int64_t context_tile(int kv_head, int, std::int64_t) const {
         return static_cast<std::int64_t>(kContextQueryHeadDim) * padded_context * kv_head;
     }
 
@@ -41,14 +41,17 @@ __launch_bounds__(WarpsPerCta * 32, 2) __global__
         const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ query_k,
         const __nv_bfloat16* __restrict__ query_v, const std::int32_t* __restrict__ positions,
         const std::int32_t* __restrict__ valid_columns,
-        const std::int32_t* __restrict__ state_slots, const __nv_bfloat16* __restrict__ context_k,
-        const __half* __restrict__ context_v, int padded_context, std::int64_t key_slot_stride,
-        std::int64_t value_slot_stride, int window_mask, int max_context, int split_capacity,
-        float scale, float* __restrict__ partial_acc, float* __restrict__ partial_m,
-        float* __restrict__ partial_l, __nv_bfloat16* __restrict__ out) {
+        const std::int64_t* __restrict__ key_offsets,
+        const std::int64_t* __restrict__ value_offsets, const __nv_bfloat16* __restrict__ context_k,
+        const __half* __restrict__ context_v, int padded_context, int window_mask, int max_context,
+        int split_capacity, float scale, float* __restrict__ partial_acc,
+        float* __restrict__ partial_m, float* __restrict__ partial_l,
+        __nv_bfloat16* __restrict__ out) {
     const int batch = static_cast<int>(blockIdx.z);
-    context_k += key_slot_stride * state_slots[batch];
-    context_v += value_slot_stride * state_slots[batch];
+    if (valid_columns[batch] > 0) {
+        context_k += key_offsets[batch] / 2;
+        context_v += value_offsets[batch] / 2;
+    }
     const std::int32_t* batch_positions = positions + static_cast<std::int64_t>(Tokens) * batch;
     SlidingWindowAttentionPolicy policy{
         .positions      = batch_positions,

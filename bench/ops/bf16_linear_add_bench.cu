@@ -1,5 +1,6 @@
 // Cold-cache public-Op benchmark for BF16 LinearAdd [5120,6144].
 
+#include "common/roofline.h"
 #include "core/weight.h"
 #include "core/buffer.h"
 #include "ninfer/ops/linear_add.h"
@@ -30,9 +31,6 @@ namespace {
 
 constexpr std::int32_t kRows               = 5120;
 constexpr std::int32_t kHidden             = 6144;
-constexpr double kRtx5090DramGBs           = 1792.0;
-constexpr double kRtx5090SustainedReadGBs  = 1674.5;
-constexpr double kRtx5090DenseBf16Tflops   = 209.5;
 constexpr std::uint64_t kDefaultFlushBytes = 256ULL << 20;
 constexpr int kDefaultWarmup               = 3;
 constexpr int kDefaultRepeat               = 20;
@@ -122,9 +120,14 @@ Result make_result(std::int32_t tokens, const bench::ColdTiming& timing,
         2.0 * static_cast<double>(kRows) * static_cast<double>(kHidden) * tokens;
     const double seconds = timing.median_us * 1.0e-6;
     const double memory_floor_us =
-        static_cast<double>(logical_bytes) / (kRtx5090DramGBs * 1.0e9) * 1.0e6;
-    const double compute_floor_us  = useful_flops / (kRtx5090DenseBf16Tflops * 1.0e12) * 1.0e6;
-    const double roofline_floor_us = std::max(memory_floor_us, compute_floor_us);
+        static_cast<double>(logical_bytes) / (bench::kRoofline.memory_gbs * 1.0e9) * 1.0e6;
+    // T=1..4 use SIMT; only the larger-T routes execute BF16 MMA.
+    const double tensor_peak =
+        tokens >= 5 ? bench::kRoofline.bf16_f32_tflops : std::numeric_limits<double>::quiet_NaN();
+    const double compute_floor_us  = useful_flops / (tensor_peak * 1.0e6);
+    const double roofline_floor_us = std::isfinite(compute_floor_us)
+                                         ? std::max(memory_floor_us, compute_floor_us)
+                                         : std::numeric_limits<double>::quiet_NaN();
 
     return {
         tokens,
@@ -132,9 +135,10 @@ Result make_result(std::int32_t tokens, const bench::ColdTiming& timing,
         logical_bytes,
         useful_flops,
         static_cast<double>(logical_bytes) / seconds / 1.0e9,
-        (static_cast<double>(logical_bytes) / seconds / 1.0e9) / kRtx5090SustainedReadGBs * 100.0,
+        (static_cast<double>(logical_bytes) / seconds / 1.0e9) /
+            bench::kRoofline.sustained_read_gbs * 100.0,
         useful_flops / seconds / 1.0e12,
-        (useful_flops / seconds / 1.0e12) / kRtx5090DenseBf16Tflops * 100.0,
+        (useful_flops / seconds / 1.0e12) / tensor_peak * 100.0,
         memory_floor_us,
         compute_floor_us,
         roofline_floor_us / timing.median_us * 100.0,
@@ -142,11 +146,16 @@ Result make_result(std::int32_t tokens, const bench::ColdTiming& timing,
 }
 
 void print_result(const Result& result) {
-    const char* bound = result.memory_floor_us >= result.compute_floor_us ? "memory" : "compute";
-    std::printf("T=%-4d median=%8.3f us  %7.1f GB/s READ=%6.2f%%  "
-                "%7.2f TFLOP/s TC=%6.2f%%  %-7s roofline=%6.2f%%\n",
-                result.tokens, result.timing.median_us, result.effective_gbs, result.read_pct,
-                result.useful_tflops, result.tc_pct, bound, result.roofline_pct);
+    const char* bound =
+        !std::isfinite(result.compute_floor_us)
+            ? "-"
+            : (result.memory_floor_us >= result.compute_floor_us ? "memory" : "compute");
+    std::printf("T=%-4d median=%8.3f us  %7.1f GB/s READ=%6s%%  "
+                "%7.2f TFLOP/s TC=%6s%%  mem_floor=%7.3f us %-7s roofline=%6s%%\n",
+                result.tokens, result.timing.median_us, result.effective_gbs,
+                bench::format_metric(result.read_pct).c_str(), result.useful_tflops,
+                bench::format_metric(result.tc_pct).c_str(), result.memory_floor_us, bound,
+                bench::format_metric(result.roofline_pct).c_str());
 }
 
 void write_csv(const Options& options, const std::vector<Result>& results) {
@@ -160,9 +169,11 @@ void write_csv(const Options& options, const std::vector<Result>& results) {
     for (const Result& result : results) {
         out << result.tokens << ',' << result.timing.median_us << ',' << result.timing.min_us << ','
             << result.timing.p95_us << ',' << result.logical_bytes << ',' << result.useful_flops
-            << ',' << result.effective_gbs << ',' << result.read_pct << ',' << result.useful_tflops
-            << ',' << result.tc_pct << ',' << result.memory_floor_us << ','
-            << result.compute_floor_us << ',' << result.roofline_pct << ',' << options.warmup << ','
+            << ',' << result.effective_gbs << ',' << bench::format_metric(result.read_pct, 6, "")
+            << ',' << result.useful_tflops << ',' << bench::format_metric(result.tc_pct, 6, "")
+            << ',' << result.memory_floor_us << ','
+            << bench::format_metric(result.compute_floor_us, 6, "") << ','
+            << bench::format_metric(result.roofline_pct, 6, "") << ',' << options.warmup << ','
             << options.repeat << ',' << options.flush_bytes << '\n';
     }
 }

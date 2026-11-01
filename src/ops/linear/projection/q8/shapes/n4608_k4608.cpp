@@ -1,4 +1,4 @@
-#include "ops/linear/projection/q8/q8_shapes.h"
+#include "ops/linear/projection/q8/shapes.h"
 
 #include <stdexcept>
 

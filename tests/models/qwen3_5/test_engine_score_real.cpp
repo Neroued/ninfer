@@ -1,6 +1,5 @@
 #include "ninfer/engine.h"
 
-#include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <iostream>
@@ -18,16 +17,22 @@ int main() {
     options.artifact_path = artifact;
     options.purpose       = ninfer::EnginePurpose::CausalScoring;
     options.max_context   = 2048;
-    options.kv_cache      = ninfer::KvCacheStorage::Fp8E4M3Row256;
+    options.kv_cache      = ninfer::KvCacheStorage::Fp8E4m3fnGroup128Ue8m0;
     ninfer::Engine engine(options);
     const auto& effective = engine.options();
     if (effective.max_concurrency != 1 || effective.prefill_chunk == 0 ||
-        effective.kv_capacity.mode != ninfer::KvCapacityMode::Explicit ||
-        effective.kv_capacity.explicit_tokens != effective.max_context ||
         effective.context_cache.enabled ||
         effective.speculative.backend != ninfer::SpeculativeBackend::None ||
-        effective.kv_cache != ninfer::KvCacheStorage::Fp8E4M3Row256) {
+        effective.kv_cache != ninfer::KvCacheStorage::Fp8E4m3fnGroup128Ue8m0) {
         std::cerr << "causal scoring options were not normalized correctly\n";
+        return 1;
+    }
+    const auto& budget = engine.startup_report().ranks.at(0);
+    if (budget.minimum_context_capacity_bytes == 0 ||
+        budget.context_capacity_bytes < budget.minimum_context_capacity_bytes ||
+        engine.snapshot().ranks.at(0).memory.allocations.context_device_bytes !=
+            budget.context_capacity_bytes) {
+        std::cerr << "causal scoring did not materialize its required Context working set\n";
         return 1;
     }
 
@@ -49,21 +54,23 @@ int main() {
         std::cerr << "causal scoring returned an invalid result shape\n";
         return 1;
     }
-    for (const float value : all) {
-        if (!std::isfinite(value) || value > 0.0F) {
-            std::cerr << "causal scoring returned an invalid log probability\n";
-            return 1;
+    for (const auto* window : {&all, &suffix, &repeated}) {
+        for (const float value : *window) {
+            if (!std::isfinite(value) || value > 0.0F) {
+                std::cerr << "causal scoring returned an invalid log probability\n";
+                return 1;
+            }
         }
     }
-    for (std::size_t i = 0; i < suffix.size(); ++i) {
-        if (!std::isfinite(suffix[i]) || suffix[i] > 0.0F) {
-            std::cerr << "causal scoring returned a non-finite logprob\n";
-            return 1;
-        }
-        if (suffix[i] != repeated[i]) {
-            std::cerr << "a repeated score window inherited prior State/KV\n";
-            return 1;
-        }
+    const auto snapshot = engine.snapshot();
+    if (snapshot.scoring.completed_jobs != 3 || snapshot.scoring.scored_tokens != 3584 ||
+        snapshot.scoring.active_jobs != 0 || snapshot.runtime.generated_tokens != 0 ||
+        snapshot.executions[static_cast<std::size_t>(ninfer::ExecutionKind::Score)].units < 3 ||
+        snapshot.executions[static_cast<std::size_t>(ninfer::ExecutionKind::Score)].input_tokens !=
+            4608) {
+        std::cerr
+            << "scoring observations mixed target scoring with generation or missed retirement\n";
+        return 1;
     }
     std::cout << "OK causal_score_real\n";
     return 0;

@@ -52,5 +52,6 @@ bool is_letter(std::int32_t codepoint) noexcept;
 bool is_mark(std::int32_t codepoint) noexcept;
 bool is_number(std::int32_t codepoint) noexcept;
 bool is_whitespace(std::int32_t codepoint) noexcept;
+bool is_python_whitespace(std::int32_t codepoint) noexcept;
 
 } // namespace ninfer::text::unicode_internal

@@ -12,13 +12,21 @@ enum class Down {
     TmaSplit4,
     Tma80,
     Tma96Split4,
-    Tma96Split8
+    Tma96Split8,
+    Simt4,
+    Direct64S6,
+    Direct64S3,
+    Direct128S4,
+    Direct128S2
 };
 enum class Up {
+    Gemv,
     Folded16x16,
     Folded32x32,
     TmaFolded16x64,
     TmaFolded32x64,
+    TmaFolded32Warp64,
+    TmaPrefetched32Warp64,
 };
 
 struct Plan {
@@ -43,5 +51,4 @@ constexpr int split_factor(Down down) {
 }
 
 Plan select_plan(Kind kind, std::int32_t columns);
-std::size_t capacity(Weights weights, std::int32_t first, std::int32_t last);
 } // namespace ninfer::ops::detail::hc::mix

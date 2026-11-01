@@ -9,13 +9,24 @@
 
 namespace ninfer::ops {
 
-// Non-owning views of one layer. Dimension zero is contiguous; outer strides may retain
-// pool/layer gaps or interleaving. BF16/I32 bases and used strides are naturally aligned,
-// positive, and non-overlapping. All tensors reside on Device; metadata is contiguous I32 [B].
+// Canonical tail fields selected by I64 [B] record offsets. Each field addresses the same logical
+// rows.
 struct QsaTailStateView {
-    Tensor raw_keys;   // BF16 [128,3,S].
-    Tensor first_rope; // I32 [3,S].
-    Tensor slots;      // I32 [B], independently selects this pool's state slots.
+    StateFieldView raw_keys;   // BF16 [128,3].
+    StateFieldView first_rope; // I32 [3].
+};
+
+struct ConstQsaTailStateView {
+    ConstStateFieldView raw_keys;
+    ConstStateFieldView first_rope;
+
+    ConstQsaTailStateView() = default;
+
+    ConstQsaTailStateView(ConstStateFieldView raw_keys, ConstStateFieldView first_rope)
+        : raw_keys(raw_keys), first_rope(first_rope) {}
+
+    ConstQsaTailStateView(const QsaTailStateView& view)
+        : raw_keys(view.raw_keys), first_rope(view.first_rope) {}
 };
 
 struct QsaRawRecordReadView {
@@ -32,18 +43,22 @@ struct QsaBatchView {
 };
 
 struct QsaProjectionView {
-    Tensor query;       // BF16 [256,24,T,B].
-    Tensor key;         // BF16 [256,2,T,B].
-    Tensor value;       // BF16 [256,2,T,B].
+    Tensor query;       // BF16 [256,Hq,T,B].
+    Tensor key;         // BF16 [256,Hkv,T,B].
+    Tensor value;       // BF16 [256,Hkv,T,B].
     Tensor index_query; // BF16 [128,4,T,B].
     Tensor index_key;   // BF16 [128,T,B], raw projection.
 };
 
-struct QsaPrepareParameters {
-    Tensor query_norm;       // BF16 [256], offset weights: gain = 1 + FP32(weight).
-    Tensor key_norm;         // BF16 [256].
-    Tensor index_query_norm; // BF16 [128].
-    Tensor index_key_norm;   // BF16 [128].
+struct QsaKvProjectionView {
+    Tensor key;       // BF16 [256,Hkv,T,B].
+    Tensor value;     // BF16 [256,Hkv,T,B].
+    Tensor index_key; // BF16 [128,T,B], raw projection.
+};
+
+struct QsaKvPrepareParameters {
+    Tensor key_norm;       // BF16 [256], offset weights: gain = 1 + FP32(weight).
+    Tensor index_key_norm; // BF16 [128].
     float rms_epsilon        = 1e-6F;
     float rope_theta         = 1e7F;
     std::uint32_t rotary_dim = 64;
@@ -51,9 +66,22 @@ struct QsaPrepareParameters {
     bool rope_interleaved = true;
 };
 
+struct QsaPrepareParameters {
+    QsaKvPrepareParameters kv;
+    Tensor query_norm;       // BF16 [256], offset weights.
+    Tensor index_query_norm; // BF16 [128].
+};
+
 struct QsaIndexCacheView {
-    Tensor keys;         // BF16 [128,16,1,G], page-major.
-    Tensor block_tables; // I32 [logical_pages,table_rows], identical to main.block_tables.
+    PagedPlaneView keys; // BF16 [128,16,1] per record; shares main's I64 page offsets.
+};
+
+struct ConstQsaIndexCacheView {
+    ConstPagedPlaneView keys;
+
+    ConstQsaIndexCacheView() = default;
+
+    ConstQsaIndexCacheView(const QsaIndexCacheView& view) : keys(view.keys) {}
 };
 
 struct QsaCacheView {
@@ -91,19 +119,20 @@ qsa_indexer_workspace_capacity_bytes(std::int32_t min_tokens, std::int32_t max_t
  *   score[g] = sum_{h=0..3} max(0, sum_{d=0..127} index_query[d,h,t,b]*index.K[d,g]).
  * The common positive 1/sqrt(128) factor is omitted because only ranking is observable.
  * Select min(512,C) highest computed scores; exact numeric ties prefer smaller logical g.
- * Index g addresses block_tables[g/16,table_rows[b]], row g%16 of the index plane.
+ * Index g addresses keys.records.page_offsets[g/16,table_rows[b]], row g%16 of its record.
  * Four heads produce one shared selection. The incomplete token tail is not included here.
  * C<=512 selects every g without reading Q, keys or page-table contents.
  *
  * Domain / numeric:
  * T>0, B=1..8. index_query is contiguous, 16-byte-aligned BF16 [128,4,T,B]. Cache keys
- * are naturally aligned BF16 [128,16,1,G], feature-contiguous with positive, non-overlapping
- * page-major outer strides. Tables have contiguous I32 entries and non-overlapping row strides.
+ * are naturally aligned, dense BF16 [128,16,1] per 64-token record. Tables are contiguous
+ * I64 byte offsets from their record arena.
  * Positions are contiguous I32 [T,B]; valid_columns and table_rows are Device I32 [B].
  * Each row has 0<=n<=T; live positions are consecutive nonnegative original-token ordinals.
  * Every live p+1 is <= envelope.max_visible_tokens <=262144, within the table capacity.
- * Envelope zero permits only inert queries. Live scoring operands and their FP32 scores are
- * finite. BF16 values enter FP32 accumulation directly; scores have no BF16 rounding boundary.
+ * Envelope zero permits only inert queries. Live scoring operands and scores are
+ * finite. Ranking approximates the formula from represented inputs; there is no semantic
+ * intermediate score-storage rounding boundary.
  * Device counts, positions, selectors and readable live pages are caller guarantees.
  *
  * Effects / output:
@@ -111,7 +140,8 @@ qsa_indexer_workspace_capacity_bytes(std::int32_t min_tokens, std::int32_t max_t
  * min(512,C); its first count ids are distinct and in [0,C), in unspecified order. Inert counts
  * are zero and do not read positions, Q, keys or table selectors. Ids beyond count are undefined.
  * Inputs and caches are preserved. Outputs, inputs and used workspace must not write/read
- * overlap; read-only views may share storage. There is no persistent state or publication.
+ * overlap; read-only views may share storage. Selected-record alias relationships are caller
+ * guarantees. There is no persistent state or publication.
  *
  * Workspace / execution:
  * Scratch comes from the caller's arena and is reused across bounded query windows, without
@@ -121,7 +151,7 @@ qsa_indexer_workspace_capacity_bytes(std::int32_t min_tokens, std::int32_t max_t
  * the same kernels, including Graph replay. Metadata is not read back by the Host. Downstream
  * consumers read only count ids; same-stream ordering supplies the dependency.
  */
-void qsa_indexer(const Tensor& index_query, const QsaIndexCacheView& cache,
+void qsa_indexer(const Tensor& index_query, const ConstQsaIndexCacheView& cache,
                  const QsaBatchView& batch, QsaIndexerExecutionEnvelope envelope,
                  MemoryArena& workspace, QsaBlockSelection& out, CudaExecutionView execution);
 
@@ -131,15 +161,14 @@ struct QsaSparseGqaExecutionEnvelope {
     std::uint32_t max_visible_tokens = 262144;
 };
 
-/** Capacity over every positive T in [min_tokens,max_tokens], with fixed storage, B and envelope.
- * Includes only Op-local scratch, measured from a 256-byte-aligned workspace cursor.
+/** Capacity over every positive T in [min_tokens,max_tokens], with fixed storage, query/KV heads, B
+ * and envelope. Includes only Op-local scratch, measured from a 256-byte-aligned workspace cursor.
  * multiprocessor_count is the positive physical SM count used by execution.
  */
-[[nodiscard]] std::size_t
-qsa_sparse_gqa_workspace_capacity_bytes(KvCacheStorage storage, std::int32_t min_tokens,
-                                        std::int32_t max_tokens, std::int32_t batch_size,
-                                        QsaSparseGqaExecutionEnvelope envelope,
-                                        std::int32_t multiprocessor_count);
+[[nodiscard]] std::size_t qsa_sparse_gqa_workspace_capacity_bytes(
+    KvCacheStorage storage, std::int32_t query_heads, std::int32_t kv_heads,
+    std::int32_t min_tokens, std::int32_t max_tokens, std::int32_t batch_size,
+    QsaSparseGqaExecutionEnvelope envelope, std::int32_t multiprocessor_count);
 
 /**
  * Op: qsa_sparse_gqa
@@ -157,28 +186,28 @@ qsa_sparse_gqa_workspace_capacity_bytes(KvCacheStorage storage, std::int32_t min
  * K8V4 values represent R*V, so apply R^T to the fully reduced attention before the gate.
  *
  * Domain / numeric:
- * T>0, B=1..8. Query, gate and out are contiguous, 16-byte-aligned BF16 [256,24,T,B].
- * Cache supports BFloat16 (BF16 K / FP16 V), Fp8E4M3Row256, Int8Group64, Nvfp4Group16 and
- * Fp8KeyNvfp4Value. Data/scale planes follow paged_kv_storage_layout(storage,256), with
- * [leading_extent,64,2,G] geometry. Features are contiguous; naturally aligned positive,
- * non-overlapping page-major outer strides are used. Q and softmax probabilities are not
- * quantized to low-bit operands: MMA uses BF16/FP16 operands with FP32 accumulation, softmax
- * and basis transforms. Decoded KV tiles stay on chip; there is no expanded global cache.
- * Tables have contiguous I32 entries and a non-overlapping row stride. Positions are contiguous
- * I32 [T,B]; valid_columns/table_rows are contiguous Device I32 [B]. Each row has 0<=n<=T,
- * with consecutive nonnegative live positions satisfying p+1<=envelope.max_visible_tokens<=262144,
- * covered by its table. Selection is contiguous I32 [512,T,B] and [T,B]; each live c lies in
- * [0,min(512,C)], with distinct ids in [0,C). Id order is unspecified; the set need not be an
- * Indexer's actual TopK. Device metadata and readable selected pages are caller guarantees. Live
- * mathematical operands/results are finite. Cache storage quantization and the A16 computation
- * have separate rounding boundaries; decoded KV, transformed Q and probabilities are internal
- * operands rather than additional public tensors.
+ * T>0, B=1..8. Query, gate and out are contiguous, 16-byte-aligned BF16 [256,Hq,T,B], (Hq,Hkv) in
+ * {(24,2),(12,1)}. Cache supports BFloat16 (BF16 K / FP16 V), Fp8E4m3fnGroup128Ue8m0, Int8Group64,
+ * Nvfp4Group16 and Fp8KeyNvfp4Value. Data/scale planes follow paged_kv_storage_layout(storage,256),
+ * with dense, naturally aligned [leading_extent,64,Hkv] geometry per 64-token record. Q and softmax
+ * probabilities are not quantized to low-bit operands. The A16 numerical policy applies to the
+ * complete attention and gate; intermediate arithmetic remains private. Decoded KV tiles stay on
+ * chip; there is no expanded global cache. Tables contain contiguous I64 arena-relative record
+ * offsets. Positions are contiguous I32 [T,B]; valid_columns/table_rows are contiguous Device I32
+ * [B]. Each row has 0<=n<=T, with consecutive nonnegative live positions satisfying
+ * p+1<=envelope.max_visible_tokens<=262144, covered by its table. Selection is contiguous I32
+ * [512,T,B] and [T,B]; each live c lies in [0,min(512,C)], with distinct ids in [0,C). Id order is
+ * unspecified; the set need not be an Indexer's actual TopK. Device metadata and readable selected
+ * pages are caller guarantees. Live mathematical operands/results are finite. Cache storage
+ * quantization and the A16 computation have separate rounding boundaries; decoded KV, transformed Q
+ * and probabilities are internal operands rather than additional public tensors.
  *
  * Effects / execution:
  * All inputs and cache are preserved. There is no append, persistent state or publication.
  * Inert queries do not inspect positions, selections or table selectors. Ids beyond c and
  * unselected cache values are not read. Output and used workspace do not overlap inputs or
- * each other; read-only views may share storage. Scratch is caller-owned, without hidden Device
+ * each other; read-only views may share storage. Selected-record alias relationships are caller
+ * guarantees. Scratch is caller-owned, without hidden Device
  * allocation. Fixed T/B, storage, views and device facts keep node count/order compatible across
  * envelope updates. The Host bound selects launch/workspace configuration without reading Device
  * metadata. Within a captured bound, per-query lengths, selections and mixed/all-select/inert
@@ -187,7 +216,7 @@ qsa_sparse_gqa_workspace_capacity_bytes(KvCacheStorage storage, std::int32_t min
  * caller.
  */
 void qsa_sparse_gqa(const Tensor& query, const Tensor& output_gate,
-                    const PagedKVBatchLayerView& cache, const QsaBatchView& batch,
+                    const ConstPagedKVBatchLayerView& cache, const QsaBatchView& batch,
                     const QsaBlockSelection& selected, QsaSparseGqaExecutionEnvelope envelope,
                     MemoryArena& workspace, Tensor& out, CudaExecutionView execution);
 
@@ -226,24 +255,27 @@ void qsa_sparse_gqa(const Tensor& query, const Tensor& output_gate,
  *
  * Logical shapes / supported domain:
  * The current rotary implementation accepts rotary_dim=64, interleaved sections [11,11,10].
- * T>0, B in [1,8], A=1 or 3. Projections and both outputs have the shapes above, are contiguous
- * and 16-byte aligned. Norm weights are contiguous, naturally aligned BF16 vectors. Positions
- * are contiguous I32 [T,B]; rho is contiguous I32 [T,A,B]. Metadata is contiguous Device I32 [B].
- * Tail/records follow QsaTailStateView's feature-contiguous, naturally aligned stride rules.
- * Main-cache data and scale planes:
- *   BFloat16: BF16 K / FP16 V [256,64,2,G]; no scales.
- *   Int8Group64: I8 K/V [256,64,2,G]; FP16 scales [4,64,2,G].
- *   Fp8E4M3Row256: FP8_E4M3FN K/V [256,64,2,G]; FP16 scales [1,64,2,G].
- *   Nvfp4Group16: packed U8 K/V [128,64,2,G]; U8 E4M3 scales [16,64,2,G].
- *   Fp8KeyNvfp4Value: the FP8 key planes and NVFP4 value planes above.
- * Cache planes are page-major with contiguous features and non-overlapping positive outer
- * strides; tables have contiguous I32 page entries and a non-overlapping row stride.
- * Both caches share G and the identical block_tables view. R and the state pool size are positive.
- * Every row has 0<=n<=T and 0<=offset<=offset+n<=R; R may be smaller than T.
- * Live positions are consecutive, nonnegative ordinals below 262144. before corresponds to F.
- * RoPE coordinates are independent nonnegative I32 values. Epsilon/theta are positive finite
- * floats; live projection/norm values are finite. The caller provides valid live slots/page
- * mappings and disjoint writes across rows. Host validation does not read Device metadata.
+ * Hkv=1 or 2, Hq=12*Hkv; index queries always have four heads. Cache and projections agree on
+ * Hkv. T>0, B in [1,8], A=1 or 3. Projections and both outputs have the shapes above, are
+ * contiguous and 16-byte aligned. Norm weights are contiguous, naturally aligned BF16 vectors.
+ * Positions are contiguous I32 [T,B]; rho is contiguous I32 [T,A,B]. Metadata is contiguous Device
+ * I32 [B]. Tail/records follow QsaTailStateView's feature-contiguous, naturally aligned stride
+ * rules. Main-cache data and scale planes:
+ *
+ * - BFloat16: BF16 K / FP16 V [256,64,Hkv] per record; no scales.
+ * - Int8Group64: I8 K/V [256,64,Hkv] per record; FP16 scales [4,64,Hkv] per record.
+ * - Fp8E4m3fnGroup128Ue8m0: FP8_E4M3FN K/V [256,64,Hkv] per record; UE8M0 U8 scales [2,64,Hkv] per
+ * record.
+ * - Nvfp4Group16: packed U8 K/V [128,64,Hkv] per record; U8 E4M3 scales [16,64,Hkv] per record.
+ * - Fp8KeyNvfp4Value: the FP8 key planes and NVFP4 value planes above.
+ *
+ * Cache planes are dense within each record; tables have contiguous I64 record offsets and a
+ * non-overlapping row stride. Both caches share the record arena and page-offset table. R is
+ * positive. Every row has 0<=n<=T and 0<=offset<=offset+n<=R; R may be smaller than T. Live
+ * positions are consecutive, nonnegative ordinals below 262144. before corresponds to F. RoPE
+ * coordinates are independent nonnegative I32 values. Epsilon/theta are positive finite floats;
+ * live projection/norm values are finite. The caller provides valid live record/page mappings and
+ * disjoint writes across rows. Host validation does not read Device metadata.
  *
  * Numeric / effects:
  * Norm and rotation have no intermediate represented tensor. The pooled mean's BF16 rounding
@@ -265,32 +297,54 @@ void qsa_sparse_gqa(const Tensor& query, const Tensor& output_gate,
  */
 void qsa_prepare(const QsaProjectionView& projected, const QsaPrepareParameters& parameters,
                  const QsaBatchView& batch, const Tensor& rope_positions,
-                 const QsaTailStateView& before, QsaCacheView cache, QsaRawRecordWriteView records,
-                 Tensor& query, Tensor& index_query, CudaExecutionView execution);
+                 const ConstQsaTailStateView& before, QsaCacheView cache,
+                 QsaRawRecordWriteView records, Tensor& query, Tensor& index_query,
+                 CudaExecutionView execution);
+
+/**
+ * The K/V, compressed index-key and raw-record effects of qsa_prepare, with no query
+ * inputs or outputs. K normalization/RoPE, V encoding, four-token index-key pooling,
+ * its BF16 mean boundary, and cross-call tail/coordinate selection follow that contract.
+ *
+ * T/B/Hkv come from projected.key; projections follow QsaKvProjectionView. Parameters,
+ * metadata, all five cache encodings, tail and records have the same domain and alias
+ * requirements as qsa_prepare. Only live columns and newly completed index blocks are
+ * written; inert columns read no projections, positions, state or table selectors.
+ * Inputs and untouched storage are preserved. No frontier or tail state is published.
+ * Zero global scratch and no hidden allocation; Graph replay consumes current Device
+ * metadata. The caller owns allocation, readiness, tail extraction and acceptance.
+ */
+void qsa_prepare_kv(const QsaKvProjectionView& projected, const QsaKvPrepareParameters& parameters,
+                    const QsaBatchView& batch, const Tensor& rope_positions,
+                    const ConstQsaTailStateView& before, QsaCacheView cache,
+                    QsaRawRecordWriteView records, CudaExecutionView execution);
 
 /**
  * Op: qsa_tail_extract
  *
  * Math / indexing:
  * For row b, let F0=records.base_positions[b], a=accepted_columns[b], F1=F0+a,
- * r=F1%4, s=F1-r, src=before.slots[b], dst=after.slots[b]. For every feature c and j in [0,3):
- *   after.raw_keys[c,j,dst] = BF16 +0                              if j>=r,
- *                            before.raw_keys[c,s+j-(F0-F0%4),src] if s+j<F0,
+ * r=F1%4, s=F1-r. The notation below selects each field's record for row b.
+ * For every feature c and j in [0,3):
+ *   after.raw_keys[c,j,b] = BF16 +0                              if j>=r,
+ *                            before.raw_keys[c,s+j-(F0-F0%4),b] if s+j<F0,
  *                            records.raw_keys[c,s+j-F0,b]         otherwise.
- *   after.first_rope[:,dst] = [0,0,0]                         if r==0,
- *                            before.first_rope[:,src]        if s<F0,
+ *   after.first_rope[:,b] = [0,0,0]                         if r==0,
+ *                            before.first_rope[:,b]        if s<F0,
  *                            records.rope_positions[:,s-F0,b] otherwise.
  * before is the canonical state at F0: its first F0%4 raw columns contain the unfinished
  * four-token block in chronological order, the other columns are BF16 +0; first_rope holds
  * that block's first token coordinates, or three I32 zeros when F0%4==0.
  *
  * Logical shapes / supported domain:
- * View rules above apply. B is in [1,8]; R and both pools' S are positive. Each state's two
- * planes agree on S, both record planes agree on R/B, and before/after may have different S.
+ * B is in [1,8]; R and L are positive. Each state's two fields agree on B/L.
+ * Record raw keys are BF16 [128,R,B,L], coordinates I32 [3,R,B,L], with contiguous features
+ * and explicit disjoint outer strides. Each layer independently applies the equations above;
+ * base_positions, valid_columns and accepted_columns are shared across layers.
  * accepted_columns is contiguous Device I32 [B]. Each row has 0<=a<=u<=R, F0>=0, and F0+u
  * representable as nonnegative I32. The caller supplies the input-prefix length, not an emitted
- * token count, and ensures that before corresponds to F0. Source/destination slots are valid
- * even for a=0. Host-visible layouts are checked without reading Device metadata to Host;
+ * token count, and ensures that before corresponds to F0. Source/destination record offsets are
+ * valid even for a=0. Host-visible layouts are checked without reading Device metadata to Host;
  * count/index values and selected-region alias relationships are caller guarantees.
  *
  * Numeric / effects:
@@ -304,15 +358,15 @@ void qsa_prepare(const QsaProjectionView& projected, const QsaPrepareParameters&
  * records/metadata. Read-only sources may be shared. A destination plane may exactly alias its
  * corresponding source plane with identical addressed layout; other write/read overlap is
  * forbidden, including between raw and coordinate planes. Aliasing is defined by selected
- * addresses, not pool descriptor identity or slot numbers. In-place results use original source
- * words. No cache, count, frontier or state-publication effect occurs.
+ * addresses, not pool descriptor identity or physical record offsets. In-place results use original
+ * source words. No cache, count, frontier or state-publication effect occurs.
  *
  * Workspace / execution:
  * No caller-owned global scratch, sizing query, or hidden Device allocation. Work is submitted
  * to execution.stream(). CUDA Graph replay reads
  * the current Device metadata. The caller owns operand readiness and storage lifetime.
  */
-void qsa_tail_extract(const QsaTailStateView& before, const QsaRawRecordReadView& records,
+void qsa_tail_extract(const ConstQsaTailStateView& before, const QsaRawRecordReadView& records,
                       const Tensor& accepted_columns, QsaTailStateView after,
                       CudaExecutionView execution);
 

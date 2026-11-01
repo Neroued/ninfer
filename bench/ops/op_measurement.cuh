@@ -3,6 +3,8 @@
 #include "core/buffer.h"
 #include "ninfer_bench_common.h"
 
+#include <cuda_profiler_api.h>
+
 #include <charconv>
 #include <chrono>
 #include <filesystem>
@@ -18,6 +20,7 @@ struct Options {
     int warmup = 10, repeat = 100;
     std::size_t flush_bytes = 256ULL << 20;
     std::string execution = "graph", cache = "both", csv_out;
+    bool profile = false;
 };
 
 template <class Integer = int>
@@ -87,6 +90,8 @@ inline bool parse(Options& o, std::string_view flag, std::string_view value) {
         o.cache = value;
     } else if (flag == "--csv-out")
         o.csv_out = value;
+    else if (flag == "--profile")
+        o.profile = integer(value, 0, 1);
     else
         return false;
     return true;
@@ -95,10 +100,10 @@ inline bool parse(Options& o, std::string_view flag, std::string_view value) {
 inline void help() {
     std::cout
         << "  --execution graph|eager|both  --cache cold|warm|both\n"
-           "  --warmup N --repeat N --flush-mib N --csv-out PATH\n"
+           "  --warmup N --repeat N --flush-mib N --csv-out PATH --profile 0|1\n"
            "Graph GPU timing brackets the captured Op body. Eager timing includes launch gaps.\n"
            "State restore and cold-cache eviction precede the timer. Host submission is "
-           "separate.\n";
+           "separate. --profile 1 brackets one prepared post-warmup call.\n";
 }
 
 inline std::vector<std::string> selections(const std::string& value, const char* a, const char* b) {
@@ -124,7 +129,7 @@ public:
     BodyTimedGraph& operator=(const BodyTimedGraph&) = delete;
 
     template <class Launch>
-    void capture(CudaExecutionView cuda, Launch&& launch) {
+    void capture(CudaExecutionView cuda, Launch&& launch, bool allow_empty = false) {
         const auto stream = cuda.stream();
         CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
         try {
@@ -141,6 +146,7 @@ public:
         CUDA_CHECK(cudaGraphInstantiate(&exec_, graph_, 0));
         std::size_t n = 0;
         CUDA_CHECK(cudaGraphGetNodes(graph_, nullptr, &n));
+        nodes_ = n;
         std::vector<cudaGraphNode_t> nodes(n);
         CUDA_CHECK(cudaGraphGetNodes(graph_, nodes.data(), &n));
         for (const auto node : nodes) {
@@ -148,12 +154,18 @@ public:
             CUDA_CHECK(cudaGraphNodeGetType(node, &type));
             if (type == cudaGraphNodeTypeKernel) ++kernels_;
         }
-        if (!kernels_) throw std::runtime_error("captured Op has no kernels");
+        if (!kernels_ && !allow_empty) throw std::runtime_error("captured Op has no kernels");
     }
 
     void launch(CudaExecutionView cuda) const {
         const auto stream = cuda.stream();
         CUDA_CHECK(cudaGraphLaunch(exec_, stream));
+    }
+
+    double launch_timed(CudaExecutionView cuda) const {
+        launch(cuda);
+        CUDA_CHECK(cudaStreamSynchronize(cuda.stream()));
+        return elapsed_us();
     }
 
     double elapsed_us() const {
@@ -163,21 +175,28 @@ public:
     }
 
     std::size_t kernels() const { return kernels_; }
+
+    std::size_t nodes() const { return nodes_; }
+
+    std::size_t body_nodes() const { return nodes_ - 2; }
 private:
     cudaGraph_t graph_    = nullptr;
     cudaGraphExec_t exec_ = nullptr;
     cudaEvent_t start_ = nullptr, stop_ = nullptr;
     std::size_t kernels_ = 0;
+    std::size_t nodes_   = 0;
 };
 
 struct Result {
     ColdTiming gpu, host;
     std::size_t kernels = 0;
+    std::size_t nodes   = 0;
 };
 
 template <class Launch, class Restore>
 Result measure(Launch&& launch, Restore&& restore, L2FlushBuffer& flush, CudaExecutionView cuda,
-               const Options& options, const std::string& execution, const std::string& cache) {
+               const Options& options, const std::string& execution, const std::string& cache,
+               bool allow_empty = false) {
     const auto stream = cuda.stream();
     // Complete fixture uploads and poison fills before using the capture stream.
     CUDA_CHECK(cudaDeviceSynchronize());
@@ -186,7 +205,7 @@ Result measure(Launch&& launch, Restore&& restore, L2FlushBuffer& flush, CudaExe
     CUDA_CHECK(cudaStreamSynchronize(stream));
     BodyTimedGraph graph;
     // Capture also counts the actual Op kernels for an eager row, without timing setup.
-    graph.capture(cuda, launch);
+    graph.capture(cuda, launch, allow_empty);
     const bool captured = execution == "graph";
     const auto invoke   = [&] {
         if (captured)
@@ -203,6 +222,19 @@ Result measure(Launch&& launch, Restore&& restore, L2FlushBuffer& flush, CudaExe
         invoke();
     }
     CUDA_CHECK(cudaStreamSynchronize(stream));
+    if (options.profile) {
+        prepare();
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        CUDA_CHECK(cudaProfilerStart());
+        try {
+            invoke();
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+        } catch (...) {
+            (void)cudaProfilerStop();
+            throw;
+        }
+        CUDA_CHECK(cudaProfilerStop());
+    }
     cudaEvent_t start, stop;
     CUDA_CHECK(cudaEventCreate(&start));
     CUDA_CHECK(cudaEventCreate(&stop));
@@ -228,7 +260,8 @@ Result measure(Launch&& launch, Restore&& restore, L2FlushBuffer& flush, CudaExe
     }
     cudaEventDestroy(start);
     cudaEventDestroy(stop);
-    return {summarize_timings(std::move(gpu)), summarize_timings(std::move(host)), graph.kernels()};
+    return {summarize_timings(std::move(gpu)), summarize_timings(std::move(host)), graph.kernels(),
+            graph.nodes()};
 }
 
 struct Row {
@@ -273,6 +306,34 @@ public:
 private:
     std::ofstream file_;
     std::ostream* out_ = &std::cout;
+};
+
+// One complete, stateless or restored Op with a logical-byte roofline model.
+class LogicalBenchmark {
+public:
+    explicit LogicalBenchmark(const Options& options)
+        : options_(options), flush_(options.flush_bytes),
+          csv_(options.csv_out, "logical_bytes,logical_gb_s,bandwidth_reference_us") {}
+
+    template <class Launch, class Restore>
+    void run(const Row& row, std::size_t logical_bytes, Launch&& launch, Restore&& restore) {
+        for (const auto& execution : selections(options_.execution, "graph", "eager"))
+            for (const auto& cache : selections(options_.cache, "cold", "warm")) {
+                const auto result =
+                    measure(launch, restore, flush_, device_context().execution_view(), options_,
+                            execution, cache);
+                csv_.write(row, result, execution, cache,
+                           std::to_string(logical_bytes) + ',' +
+                               format_metric(logical_bytes / (result.gpu.median_us * 1000), 3, "") +
+                               ',' +
+                               format_metric(logical_bytes / (kRoofline.memory_gbs * 1000), 3, ""));
+            }
+    }
+
+private:
+    Options options_;
+    L2FlushBuffer flush_;
+    Csv csv_;
 };
 
 inline DeviceBuffer make_i32(const std::vector<int>& values) {

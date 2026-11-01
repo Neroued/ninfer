@@ -2,6 +2,7 @@
 
 #include "core/dtype.h"
 #include "ninfer/types.h"
+#include "ops/fp8_cache_reference.h"
 
 #include <algorithm>
 #include <array>
@@ -30,7 +31,7 @@ struct CacheEncoding {
 
 inline CacheEncoding cache_encoding(KvCacheStorage storage) {
     const VectorEncoding i8{Encoding::Int8, DType::I8, DType::FP16, 256, 4, 64, true};
-    const VectorEncoding fp8{Encoding::Fp8, DType::FP8_E4M3FN, DType::FP16, 256, 1, 256, true};
+    const VectorEncoding fp8{Encoding::Fp8, DType::FP8_E4M3FN, DType::U8, 256, 2, 128, true};
     const VectorEncoding nvfp4{Encoding::Nvfp4, DType::U8, DType::U8, 128, 16, 16, true};
     switch (storage) {
     case KvCacheStorage::BFloat16:
@@ -41,7 +42,7 @@ inline CacheEncoding cache_encoding(KvCacheStorage storage) {
         value.rotate = false;
         return {i8, value};
     }
-    case KvCacheStorage::Fp8E4M3Row256: {
+    case KvCacheStorage::Fp8E4m3fnGroup128Ue8m0: {
         auto value   = fp8;
         value.rotate = false;
         return {fp8, value};
@@ -128,14 +129,17 @@ struct ReferenceScale {
 };
 
 inline ReferenceScale encode_scale(float absmax, Encoding encoding) {
+    if (encoding == Encoding::Fp8) {
+        const auto bits = fp8_cache_scale(absmax);
+        return {bits, float(fp8_cache_multiplier(bits))};
+    }
     if (absmax == 0) return {0, 0};
     if (encoding == Encoding::Nvfp4) {
         const float bounded = std::clamp(absmax / 6.0F, 0x1p-9F, 448.0F);
         const auto bits     = encode_minifloat(bounded, false);
         return {bits, float(positive_fp8(bits))};
     }
-    const float raw = encoding == Encoding::Int8 ? absmax / 127.0F
-                                                 : std::clamp(absmax / 448.0F, 0x1p-24F, 65504.0F);
+    const float raw = absmax / 127.0F;
     const auto bits = fp16_encode(raw);
     return {bits, fp16_decode(bits)};
 }
@@ -166,7 +170,7 @@ inline EncodedRow encode_row(std::array<float, 256> values, VectorEncoding forma
             absmax = std::max(absmax, std::abs(values[d]));
         const auto scale = encode_scale(absmax, format.encoding);
         const int group  = begin / format.group;
-        if (format.encoding == Encoding::Nvfp4)
+        if (format.scale_dtype == DType::U8)
             out.scales[group] = std::uint8_t(scale.bits);
         else
             write_u16(out.scales, 2 * group, scale.bits);
@@ -199,10 +203,14 @@ inline bool compatible_key_encoding(std::array<double, 256> ideal, VectorEncodin
         const auto low    = encode_scale(float(std::max(0.0, absmax - delta)), format.encoding);
         const auto high   = encode_scale(float(absmax + delta), format.encoding);
         const int group   = begin / format.group;
-        const float scale = format.encoding == Encoding::Nvfp4
-                                ? float(positive_fp8(actual.scales[group]))
-                                : fp16_decode(read_u16(actual.scales, 2 * group));
-        if (!std::isfinite(scale) || scale < low.value || scale > high.value) return false;
+        const float scale =
+            format.encoding == Encoding::Nvfp4 ? float(positive_fp8(actual.scales[group]))
+            : format.encoding == Encoding::Fp8 ? float(fp8_cache_multiplier(actual.scales[group]))
+                                               : fp16_decode(read_u16(actual.scales, 2 * group));
+        // The zero FP8 group uses unit scale; the first nonzero group uses 2^-127.
+        if (!std::isfinite(scale) || scale < std::min(low.value, high.value) ||
+            scale > std::max(low.value, high.value))
+            return false;
         for (int d = begin; d < begin + format.group; ++d) {
             const auto code  = format.encoding == Encoding::Nvfp4
                                    ? (actual.data[d / 2] >> (4 * (d % 2))) & 15

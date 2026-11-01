@@ -37,8 +37,9 @@ inline void speculative_page_boundary(Engine& engine) {
         stopped_options.stop.token_ids.push_back(reference.generated_token_ids[1]);
         const auto stopped = engine.generate(engine.prepare_tokens(prompt), stopped_options);
         check(stopped.finish_reason == FinishReason::StopToken &&
-                  stopped.generated_token_ids.size() == 2 && stopped.speculative.rounds == 1 &&
-                  stopped.speculative.drafted_tokens > 0 &&
+                  stopped.generated_token_ids.size() == 2 &&
+                  stopped.stats.speculative.rounds == 1 &&
+                  stopped.stats.speculative.drafted_tokens > 0 &&
                   std::equal(stopped.generated_token_ids.begin(), stopped.generated_token_ids.end(),
                              reference.generated_token_ids.begin()),
               "cross-page speculative verify did not stop at the preceding page boundary");
@@ -50,7 +51,7 @@ inline void speculative_page_boundary(Engine& engine) {
     followup.push_back(198);
     const auto reused = engine.generate(engine.prepare_tokens(followup), request(true));
     const auto fresh  = engine.generate(engine.prepare_tokens(followup), request(false));
-    check(reused.reused_prompt_tokens == 64,
+    check(reused.stats.reused_prompt_tokens == 64,
           "page-boundary terminal did not retain its exact committed frontier");
     // The resource oracle is the exact retained frontier and successful subsequent execution.
     // Reuse and full prefill have different floating-point paths, so long generated text is not

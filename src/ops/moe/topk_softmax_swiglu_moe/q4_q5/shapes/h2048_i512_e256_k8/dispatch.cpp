@@ -7,14 +7,14 @@ namespace {
 constexpr int kGroupedFirst = 47;
 constexpr std::array kAllocationBoundaries{2, kGroupedFirst, 768};
 
-Plan select_plan(int tokens) {
+Plan select_plan(int tokens, int, ExpertSubsetKind subset) {
     Plan plan;
     plan.integer.grouped        = tokens >= kGroupedFirst;
     plan.router                 = {.algorithm         = tokens == 1 ? RouterAlgorithm::Vector
                                                         : plan.integer.grouped ? RouterAlgorithm::Mma
                                                                                : RouterAlgorithm::TokenTile,
                                    .programmatic      = !plan.integer.grouped,
-                                   .count_assignments = plan.integer.grouped};
+                                   .count_assignments = plan.integer.grouped && subset == ExpertSubsetKind::All};
     plan.integer.token          = {.paths_per_block    = tokens == 1 ? 9 : 3,
                                    .output_rows        = tokens == 1    ? 1
                                                          : tokens <= 2  ? 1
@@ -37,6 +37,10 @@ Plan select_plan(int tokens) {
                               .single_token       = false,
                               .programmatic_input = false};
     }
+    plan.integer.shared = {.token   = {.paths_per_block = 1,
+                                       .output_rows     = tokens == 1 ? 1 : 4,
+                                       .single_token    = tokens == 1},
+                           .columns = tokens >= 16 ? 64 : 0};
     return plan;
 }
 } // namespace

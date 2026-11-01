@@ -54,6 +54,14 @@ struct Q8A16GemvSchedule {
     static_assert(kThreads <= 1024);
 };
 
+template <int Tokens, int BlockRows, int WarpsPerRow, int MinBlocksPerSm, int StaticK,
+          int Unroll = 4>
+struct Q8A16GemvTileSchedule
+    : Q8A16GemvSchedule<BlockRows, WarpsPerRow, MinBlocksPerSm, StaticK, Unroll> {
+    static_assert(Tokens > 1 && Tokens <= 8);
+    static constexpr int kBlockTokens = Tokens;
+};
+
 enum class Q8MmaFragmentPipeline { Serial, PingPong };
 
 // Quant codes are prefetched while MMA consumes the decoded BF16 weight tile.
@@ -64,7 +72,7 @@ template <int BlockRows, int BlockTokens, int BlockK, int WarpRows, int WarpToke
           Q8MmaFragmentPipeline FragmentPipeline = Q8MmaFragmentPipeline::PingPong,
           Cache WeightCache = Cache::cg, Cache ActivationCache = Cache::cg,
           Cache PredicatedCache = Cache::ca, bool Predicated = false, int StaticK = 0,
-          int KLoopUnroll = 4>
+          int KLoopUnroll = 4, bool FullWeightTiles = false>
 struct Q8A16MmaSchedule {
     static constexpr int kBlockRows         = BlockRows;
     static constexpr int kBlockTokens       = BlockTokens;
@@ -81,6 +89,7 @@ struct Q8A16MmaSchedule {
     static constexpr bool kPredicated       = Predicated;
     static constexpr int kStaticK           = StaticK;
     static constexpr int kKLoopUnroll       = KLoopUnroll;
+    static constexpr bool kFullWeightTiles  = FullWeightTiles;
     static constexpr int kWarpGridRows      = BlockRows / WarpRows;
     static constexpr int kWarpGridTokens    = BlockTokens / WarpTokens;
     static constexpr int kWarps             = kWarpGridRows * kWarpGridTokens;
@@ -113,24 +122,26 @@ enum class Q8ActivationStage : std::uint8_t {
 template <int BlockTokens, int KWarps, int Stages, int MinBlocksPerSm, Q8ScaleAccess ScaleAccess,
           Cache ActivationCache = Cache::ca, Cache WeightCache = Cache::cg,
           Q8ActivationStage ActivationStage = Q8ActivationStage::ActiveOnly, int StaticK = 0,
-          int TokenCapacity = BlockTokens, bool ExactTokens = false>
+          int TokenCapacity = BlockTokens, bool ExactTokens = false, int KPhaseStride = 0>
 struct Q8A16SlicedKMmaSchedule {
-    static_assert(KWarps == 2 || KWarps == 4 || KWarps == 8 || KWarps == 16);
+    static_assert(KWarps == 2 || KWarps == 4 || KWarps == 8 || KWarps == 16 || KWarps == 32);
     static_assert(BlockTokens >= 8 && BlockTokens % 8 == 0);
     static_assert(Stages == 1 || Stages == 2);
     static_assert(MinBlocksPerSm > 0);
     static_assert(TokenCapacity > 0 && TokenCapacity <= BlockTokens);
+    static_assert(KPhaseStride >= 0);
     static_assert(StaticK == 0 || (StaticK > 0 && StaticK % (KWarps * 64) == 0));
     template <int K, int Capacity, bool Exact = false>
-    using with_problem =
-        Q8A16SlicedKMmaSchedule<BlockTokens, KWarps, Stages, MinBlocksPerSm, ScaleAccess,
-                                ActivationCache, WeightCache, ActivationStage, K, Capacity, Exact>;
+    using with_problem = Q8A16SlicedKMmaSchedule<BlockTokens, KWarps, Stages, MinBlocksPerSm,
+                                                 ScaleAccess, ActivationCache, WeightCache,
+                                                 ActivationStage, K, Capacity, Exact, KPhaseStride>;
     static constexpr int kBlockRows         = 16;
     static constexpr int kBlockTokens       = BlockTokens;
     static constexpr int kTokenCapacity     = TokenCapacity;
     static constexpr int kStaticK           = StaticK;
     static constexpr bool kExactTokens      = ExactTokens;
     static constexpr int kKWarps            = KWarps;
+    static constexpr int kKPhaseStride      = KPhaseStride;
     static constexpr int kStages            = Stages;
     static constexpr int kMinBlocksPerSm    = MinBlocksPerSm;
     static constexpr auto kScaleAccess      = ScaleAccess;
@@ -140,7 +151,7 @@ struct Q8A16SlicedKMmaSchedule {
     static constexpr int kThreads           = KWarps * 32;
     static constexpr int kWarpK             = 64;
     static constexpr int kBlockK            = KWarps * kWarpK;
-    static constexpr int kRowsPerLoaderWarp = kBlockRows / KWarps;
+    static constexpr int kRowsPerLoaderWarp = KWarps > kBlockRows ? 1 : kBlockRows / KWarps;
     static constexpr int kScaleBytesPerRow  = kBlockK / 16;
     static constexpr int kStagingBytes =
         Stages * (kBlockRows * kBlockK + KWarps * BlockTokens * kWarpK * 2 +

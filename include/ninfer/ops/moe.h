@@ -11,12 +11,19 @@
 
 namespace ninfer::ops {
 
+// Workspace capacities start at a 256-byte-aligned local origin. Entries suballocate that
+// region from the caller arena and restore its cursor on return; the caller accounts for
+// any leading alignment gap when composing allocations. Zero scratch performs no allocation.
+
 // Every SwiGLU uses gate_up [2I,H] with gate rows first, then up rows; down is [H,I].
 struct SwiGLUProfile {
     std::int32_t hidden = 0, intermediate = 0;
     QType gate_up_type = QType::BF16, down_type = QType::BF16;
     QuantLayout gate_up_layout = QuantLayout::Contiguous, down_layout = QuantLayout::Contiguous;
     LinearPolicy gate_up_policy = LinearPolicy::A16Only, down_policy = LinearPolicy::A16Only;
+    // Absent: SiLU(gate)*up. Present: SiLU(min(gate,L))*clamp(up,-L,L), L finite and positive.
+    std::optional<float> clamp_limit;
+    friend bool operator==(const SwiGLUProfile&, const SwiGLUProfile&) = default;
 };
 
 struct RouteProfile {
@@ -63,6 +70,21 @@ struct CpuSwiGLUExperts {
 struct SwiGLUWeights {
     SingleProjectionWeight gate_up, down;
 };
+
+// Complete unscaled FFN y=down*(activation(gate*x,up*x)), coefficient exactly one.
+// x and destination are contiguous 16-byte-aligned BF16 [H,T], T>0. Gate/up is [2I,H],
+// down [H,I]; inputs and native weight planes are immutable and disjoint from destination
+// and live caller scratch. Profile and prepared weights must agree. No observable product
+// rounding boundary, residual, routes or coefficient tensor. Writes every destination cell.
+// Capacity covers the inclusive extent interval.
+// No hidden allocation/transfer/readback; enqueues on execution and supports Graph replay.
+// Supports registered BF16, Q8-G32/FP16 and NVFP4 profiles with an explicit finite positive clamp
+// limit.
+[[nodiscard]] std::size_t swiglu_workspace_capacity_bytes(const SwiGLUProfile& profile,
+                                                          std::int32_t min_tokens,
+                                                          std::int32_t max_tokens);
+void swiglu(const Tensor& x, const SwiGLUProfile& profile, const SwiGLUWeights& weights,
+            Tensor& destination, MemoryArena& workspace, CudaExecutionView execution);
 
 struct ScaledSwiGLUTerm {
     SwiGLUWeights weights;
@@ -123,7 +145,60 @@ void topk_softmax_route(const Tensor& x, const RouteProfile& profile, const Weig
                         ExpertRoutes& routes, Tensor& shared_coefficients, MemoryArena& workspace,
                         CudaExecutionView execution);
 
-// F_e(x)=down_e*(SiLU(gate_e*x)*(up_e*x)). Sum coefficient[j,t]*F_ids[j,t](x[:,t]) over subset.
+// Corrected sigmoid routing over all global experts; no shared logit.
+struct SigmoidRouteProfile {
+    RouteProfile route;
+    float scaling_factor;
+    float normalization_epsilon;
+};
+
+// Native BF16 control [E,H] produces logits=control*x without an intermediate BF16 cast.
+// Choice is sigmoid(logit)+correction_bias[e]; TopK is descending, ties by lower global ID.
+// Coefficients are scaling_factor*sigmoid(selected_logit)/(sum_selected_sigmoid+epsilon):
+// correction bias affects selection only. Both normalization parameters are positive finite.
+// Supports registered H/E/K geometries. Bias is contiguous FP32[E], routes I32/FP32[K,T].
+// x/output/weights follow the alignment, immutability, disjoint caller-scratch and Graph
+// contract above; there is no BF16 logit boundary, hidden allocation or host readback.
+[[nodiscard]] std::size_t topk_sigmoid_route_workspace_capacity_bytes(const SigmoidRouteProfile&,
+                                                                      std::int32_t min_tokens,
+                                                                      std::int32_t max_tokens);
+void topk_sigmoid_route(const Tensor& x, const SigmoidRouteProfile&, const Weight& control,
+                        const Tensor& correction_bias, ExpertRoutes& routes, MemoryArena&,
+                        CudaExecutionView);
+
+struct SigmoidMoeProfile {
+    SigmoidRouteProfile routing;
+    RoutedSwiGLUProfile routed;
+    SwiGLUProfile shared;
+};
+
+struct SigmoidMoeWeights {
+    Weight control;
+    Tensor correction_bias;
+    CudaSwiGLUExperts routed;
+    SwiGLUWeights shared;
+};
+
+// Complete local contribution: routed_swiglu(topk_sigmoid_route(x),subset,x)+shared(x).
+// Shared is unscaled, exactly once, including zero routed hits. Only final output is BF16.
+// Supports registered block-scaled routed and native BF16 or Q8-G32/FP16 shared profiles,
+// both with explicit finite positive clamp limits.
+// Destination is contiguous BF16[H,T], Write; no residual, rank, communication or shared gate.
+// Router, native bank/subset and shared semantics follow the profiles above; all matrices and
+// control inputs are immutable and disjoint from output/live caller scratch. Graph replay may
+// change x/bias/routes-inducing data, mask and index contents after prior consumers finish.
+// None skips router/routed inputs and computes unscaled shared; those unused views may be empty.
+// No hidden allocation/transfer/readback; workspace covers every positive T in the interval.
+[[nodiscard]] std::size_t topk_sigmoid_swiglu_moe_workspace_capacity_bytes(const SigmoidMoeProfile&,
+                                                                           ExpertSubsetKind,
+                                                                           std::int32_t min_tokens,
+                                                                           std::int32_t max_tokens);
+void topk_sigmoid_swiglu_moe(const Tensor&, const SigmoidMoeProfile&, const SigmoidMoeWeights&,
+                             ExpertSubset, Tensor& destination, MemoryArena&, CudaExecutionView);
+
+// F_e(x)=down_e*(activation(gate_e*x,up_e*x)), with the explicit profile clamp when present.
+// Sum coefficient[j,t]*F_ids[j,t](x[:,t]) over subset. Registered clamped block-scaled
+// geometries support Write to BF16 or FP32, without a scaled shared term.
 // The shared overload adds coefficients[t]*F_shared(x[:,t]) exactly once, including for None.
 // x is contiguous BF16 [H,T], destination is contiguous FP32 or BF16 [H,T], T>0. Both,
 // routes and encoded planes are 16-byte aligned; mask/shared coefficients are 4-byte aligned.
@@ -161,7 +236,7 @@ void routed_swiglu(const Tensor& x, const RoutedSwiGLUProfile& profile,
 // allocation, transfer or thread creation occurs. Shared experts and residual addition are
 // separate computations. Requires an AVX2/FMA/F16C worker team for nonempty contributions.
 // NVFP4 consumes the native swizzled scales and each expert's matrix divisor directly.
-// Capacity covers the inclusive token interval from a 256-byte-aligned local cursor; it is
+// Capacity covers the inclusive token interval; it is
 // independent of worker count and excludes destination storage. None requires no scratch.
 [[nodiscard]] std::size_t routed_swiglu_workspace_capacity_bytes(const RoutedSwiGLUProfile& profile,
                                                                  ExpertSubsetKind subset,
@@ -172,16 +247,20 @@ void routed_swiglu(const Tensor& x, const RoutedSwiGLUProfile& profile,
                    Tensor& destination, MemoryArena& workspace, CpuExecutionView execution);
 
 // Complete top-k-softmax routed SwiGLU plus sigmoid-gated shared SwiGLU, with the same routing,
-// expert and residual formulas above. Destination is BF16 [H,T]. Every routed expert is readable.
+// expert and residual formulas above. TopK is selected globally, then restricted to subset without
+// renormalizing its coefficients. The local shared term is added exactly once. Destination is
+// BF16 [H,T]. Only selected routed weights/index entries must be readable; None reads neither.
 // Only destination and caller scratch are mutated; they are mutually disjoint and overlap no
 // input. Hints affect cache warming only. CUDA Graph capture/replay is supported.
 // Capacity queries cover every positive T in their inclusive interval, from an aligned local
 // workspace cursor, with no dependence on route values. Output storage is excluded from scratch.
 [[nodiscard]] std::size_t
-topk_softmax_swiglu_moe_workspace_capacity_bytes(const MoeProfile& profile, MoeEpilogue epilogue,
-                                                 std::int32_t min_tokens, std::int32_t max_tokens);
+topk_softmax_swiglu_moe_workspace_capacity_bytes(const MoeProfile& profile, ExpertSubsetKind subset,
+                                                 MoeEpilogue epilogue, std::int32_t min_tokens,
+                                                 std::int32_t max_tokens);
 void topk_softmax_swiglu_moe(const Tensor& x, const MoeProfile& profile, const MoeWeights& weights,
-                             MoeEpilogue epilogue, Tensor& destination, MemoryArena& workspace,
-                             CudaExecutionView execution, const MoeExecutionHints& hints = {});
+                             ExpertSubset subset, MoeEpilogue epilogue, Tensor& destination,
+                             MemoryArena& workspace, CudaExecutionView execution,
+                             const MoeExecutionHints& hints = {});
 
 } // namespace ninfer::ops

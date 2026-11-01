@@ -2,6 +2,7 @@
 
 #include "core/buffer.h"
 #include "recurrence_options.h"
+#include "traffic.h"
 #include "ninfer_bench_common.h"
 #include "ops/linear_attention/gated_delta_net/operands.h"
 
@@ -9,9 +10,7 @@ namespace ninfer::bench::gdn_recurrence {
 namespace gated_delta_net_detail      = ninfer::ops::detail::gated_delta_net;
 inline constexpr float kQkNormEpsilon = 1.0e-6F;
 
-struct Problem {
-    int qk_heads, value_heads, tokens, batch = 1;
-};
+using Problem = gdn::Geometry;
 
 DeviceBuffer make_varied_bf16(std::size_t elements, std::uint32_t seed) {
     std::vector<std::uint16_t> host(elements);

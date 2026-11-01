@@ -155,7 +155,6 @@ int main() {
         },
         "record capacity above eight");
 
-    ninfer::LayoutBuilder state_backing_builder;
     ninfer::StateImageBuilder state_builder;
     const auto state_layout =
         ninfer::plan_linear_attention_state(state_builder, {.layers         = 3,
@@ -165,26 +164,24 @@ int main() {
                                                             .value_head_dim = 128,
                                                             .key_head_dim   = 128,
                                                             .conv_dtype     = ninfer::DType::BF16});
-    const auto images             = state_builder.finish(state_backing_builder, 7);
-    const std::size_t state_bytes = state_backing_builder.finish(256);
-    ninfer::HostBuffer state_backing(state_bytes);
+    const auto images = state_builder.finish();
+    ninfer::HostBuffer state_backing(2 * images.image_bytes + 512);
     ninfer::StateImageStorage storage(state_backing.span(), images);
     ninfer::LinearAttentionStateView state(storage, state_layout);
-    const auto all = state.all_layers_view();
-    failures +=
-        expect(all.conv_layer0.data == state.layer_view(0).conv.data, "conv layer-0 base differs");
-    failures += expect(all.recurrent_layer0.data == state.layer_view(0).recurrent.data,
-                       "recurrent layer-0 base differs");
-    failures += expect_size(static_cast<std::size_t>(all.conv_layer_stride_bytes),
-                            static_cast<std::byte*>(state.layer_view(1).conv.data) -
-                                static_cast<std::byte*>(state.layer_view(0).conv.data),
+    const auto all            = state.all_layers_view();
+    const std::int64_t offset = images.image_bytes + 512;
+    failures += expect(all.conv.tensor(offset).data == state.conv_tensor(0, offset).data,
+                       "conv record base differs");
+    failures += expect(all.recurrent.tensor(offset).data == state.recurrent_tensor(0, offset).data,
+                       "recurrent record base differs");
+    failures += expect_size(all.conv.field.layer_stride,
+                            static_cast<std::byte*>(state.conv_tensor(1, offset).data) -
+                                static_cast<std::byte*>(state.conv_tensor(0, offset).data),
                             "conv layer stride");
-    failures += expect_size(static_cast<std::size_t>(all.recurrent_layer_stride_bytes),
-                            static_cast<std::byte*>(state.layer_view(1).recurrent.data) -
-                                static_cast<std::byte*>(state.layer_view(0).recurrent.data),
+    failures += expect_size(all.recurrent.field.layer_stride,
+                            static_cast<std::byte*>(state.recurrent_tensor(1, offset).data) -
+                                static_cast<std::byte*>(state.recurrent_tensor(0, offset).data),
                             "recurrent layer stride");
-    failures +=
-        expect_size(static_cast<std::size_t>(all.conv_layer0.ne[2]), 7, "all-layer slot count");
     failures += expect_size(static_cast<std::size_t>(records.spec.record_capacity), 5,
                             "independent record capacity");
 

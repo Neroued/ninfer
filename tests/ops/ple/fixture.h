@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/buffer.h"
+#include "core/record_view.h"
 #include "ops/op_tester.h"
 
 #include <array>
@@ -26,8 +27,8 @@ struct Words {
         std::size_t span = 1;
         for (int d = 0; d < 4; ++d) span += (tensor.ne[d] - 1) * (tensor.nb[d] / 2);
         host.resize(leading + span, 0x7fa1);
-        device      = std::make_unique<GuardedDeviceBuffer>(host.size() * 2);
-        tensor.data = static_cast<std::uint16_t*>(device->data()) + leading;
+        device        = std::make_unique<GuardedDeviceBuffer>(host.size() * 2);
+        tensor.data   = static_cast<std::uint16_t*>(device->data()) + leading;
         tensor.device = device->device();
     }
 
@@ -66,6 +67,34 @@ inline std::array<std::int64_t, 4> column_strides(int columns, int outer, int la
     if (layout == 1) return {1, D + 3, std::int64_t(D + 3) * columns + 5, 1};
     // Slot/batch interleaving is also a legal positive-stride view.
     return {1, std::int64_t(D + 8) * outer + 16, D + 8, 1};
+}
+
+inline std::array<std::int64_t, 4> history_strides(int records, int layout) {
+    const auto stride = std::int64_t(D) * 9 + (layout ? 23 : 0);
+    return {1, D, stride, stride * records};
+}
+
+inline StateFieldView history_field(const Tensor& values, MemorySpan storage, Tensor offsets) {
+    const auto bytes = std::size_t(D) * 9 * 2;
+    const auto offset =
+        static_cast<std::byte*>(values.data) - static_cast<std::byte*>(storage.data);
+    const std::size_t alignment =
+        (reinterpret_cast<std::uintptr_t>(values.data) % 4 == 0 && values.nb[2] % 4 == 0) ? 4 : 2;
+    return {{storage, offsets},
+            {{{std::size_t(offset), bytes, alignment}, DType::BF16, {D, 9, 1, 1}}, 1, bytes}};
+}
+
+inline std::vector<std::int64_t> history_offsets(const Tensor& values,
+                                                 const std::vector<int>& indices) {
+    std::vector<std::int64_t> result;
+    for (int index : indices) result.push_back(index < 0 ? -1 : index * values.nb[2]);
+    return result;
+}
+
+inline void upload_offsets(DeviceBuffer& destination, const Tensor& values,
+                           const std::vector<int>& indices) {
+    const auto offsets = history_offsets(values, indices);
+    destination.copy_from_host(offsets.data(), offsets.size() * sizeof(std::int64_t));
 }
 
 inline double value(const Words& words, int x, int y = 0, int z = 0, int w = 0) {

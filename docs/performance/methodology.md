@@ -1,5 +1,10 @@
 # Serving performance methodology
 
+This document defines the recorded RTX 5090 campaigns linked from the [performance index](../performance.md).
+Their resource settings and commands belong to those campaigns. Current capacity controls and
+measurement commands are described in [startup configuration](../startup-configuration.md) and
+[benchmarks](../../bench/README.md).
+
 [Performance index](../performance.md) · [Runner usage](../../tools/bench/README.md#serving-corpus-benchmark)
 
 This is the measurement and publication reference for the serving results in this directory.
@@ -29,9 +34,9 @@ These are recorded experimental settings, not promises about current executable 
 | Report label | Runner mode | Server options |
 |---|---|---|
 | MTP0 (no speculation) | `mtp0` | No `--spec` |
-| MTP3 | `mtp3` | `--spec mtp --draft-tokens 3 --lm-head-draft` |
-| DFlash, block=8 | `dflash7` | `--spec dflash --draft-tokens 7 --lm-head-draft` |
-| DFlash2, block=8 | `dflash2_7` | `--spec dflash2 --draft-tokens 7 --lm-head-draft` |
+| MTP3 | `mtp3` | `--spec mtp --draft-tokens 3 --proposal-head optimized` |
+| DFlash, block=8 | `dflash7` | `--spec dflash --draft-tokens 7 --proposal-head optimized` |
+| DFlash2, block=8 | `dflash2_7` | `--spec dflash2 --draft-tokens 7 --proposal-head optimized` |
 
 `K` denotes draft tokens; block size is `K+1`. Weight format, backend, draft count, and proposal
 head are separate experimental dimensions.
@@ -88,7 +93,7 @@ not a repeated-sample mean.
 | Published metric | Definition |
 |---|---|
 | Prefill phase (tok/s) | `prompt_tokens / prefill_seconds` for each serial request |
-| Server TTFT (ms) | `1000 * (prepare_seconds + vision_seconds + prefill_seconds)` |
+| Server TTFT (ms) | `1000 * request_done.timings_seconds.ttft` |
 | Decode phase (tok/s) | `(completion_tokens - 1) / decode_seconds` for each serial request |
 | Corpus prefill (tok/s) | Total computed prefill tokens / full corpus makespan |
 | Corpus decode (tok/s) | Total decode tokens / full corpus makespan |
@@ -97,8 +102,17 @@ not a repeated-sample mean.
 | Spec acceptance | Accepted draft tokens / drafted tokens |
 | Spec tokens/round | `1 + accepted_tokens / speculative_rounds` |
 
-Server TTFT is an internal phase sum. It does not include ingress queueing or HTTP transport and
-is not the external streaming TTFT measured by the [Serve TTFT client](../../tools/bench/ttft/README.md).
+Server TTFT follows the production first-token boundary and includes service/Engine preparation
+and Engine queueing. It is separate from the [Serve TTFT client's](../../tools/bench/ttft/README.md)
+network observation, which starts before writing the HTTP request and ends at the first nonempty
+output delta. Execution phases can overlap and must not be added to reconstruct either TTFT.
+Serial result schema v8 and earlier used a phase sum; those historical values have a different
+boundary from the current server TTFT.
+
+Vision timing is the reported GPU stream interval. Serial records preserve its sample count;
+`vision_stream_seconds` is `null` when that count is zero, including when GPU timing is disabled.
+A positive sample count with a zero duration represents a measured zero. Request Host exposure
+includes all six reported phases, including `executor_flush`.
 The three decode rates have different time denominators and must not share an unlabeled column.
 Committed decode tokens exclude the first completion token produced by prefill.
 

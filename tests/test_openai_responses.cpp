@@ -5,6 +5,7 @@
 #include "serve/generation_service.h"
 #include "serve/openai_responses.h"
 #include "serve/translate.h"
+#include "serve_tool_stream_fixture.h"
 
 #include <nlohmann/json.hpp>
 
@@ -99,13 +100,13 @@ StoredOpenAIResponse stored_parent(OpenAIResponseContext context) {
 
 GenerationOutcome sample_outcome() {
     GenerationOutcome outcome;
-    outcome.text                            = "answer";
-    outcome.reasoning                       = "thought";
-    outcome.prompt_tokens                   = 11;
-    outcome.completion_tokens               = 7;
-    outcome.reasoning_tokens                = 3;
-    outcome.finish_reason                   = ninfer::FinishReason::StopToken;
-    outcome.metrics.prefix_cache_hit_tokens = 4;
+    outcome.text                       = "answer";
+    outcome.reasoning                  = "thought";
+    outcome.prompt_tokens              = 11;
+    outcome.completion_tokens          = 7;
+    outcome.reasoning_tokens           = 3;
+    outcome.finish_reason              = ninfer::FinishReason::StopToken;
+    outcome.stats.reused_prompt_tokens = 4;
     return outcome;
 }
 
@@ -281,8 +282,8 @@ int test_typed_items_and_cache_markers() {
     failures += check(resolved.generation.messages.size() == 4 &&
                           resolved.generation.messages[1].tool_call_id == "call_1",
                       "typed Items survive call-graph normalization");
-    const ninfer::PromptInput translated = to_prompt_input(
-        resolved.generation, ResolvedPromptSemantics{}, [](const ContentPart& part) {
+    const ninfer::PromptInput translated =
+        to_prompt_input(resolved.generation, PromptOptionInputs{}, [](const ContentPart& part) {
             ninfer::OwnedMedia media;
             media.kind  = part.kind == ContentKind::Image ? ninfer::MediaKind::Image
                                                           : ninfer::MediaKind::Video;
@@ -316,7 +317,7 @@ int test_prompt_cache_policy_after_history_resolution() {
                                  Json{{"type", "input_text"}, {"text", "first question"}}})}}})}};
     const auto initial = parse_openai_responses_create_request(initial_body, limits());
     const auto first   = resolve_openai_responses_prompt(initial.prompt, store, "resp_first", true);
-    const auto first_prompt = to_prompt_input(first.generation, ResolvedPromptSemantics{}, {});
+    const auto first_prompt = to_prompt_input(first.generation, PromptOptionInputs{}, {});
     int failures            = 0;
     failures +=
         check(first_prompt.context_cache.markers.size() == 2 &&
@@ -344,7 +345,7 @@ int test_prompt_cache_policy_after_history_resolution() {
     const auto followup = parse_openai_responses_create_request(followup_body, limits());
     const auto second =
         resolve_openai_responses_prompt(followup.prompt, store, "resp_second", true);
-    const auto second_prompt = to_prompt_input(second.generation, ResolvedPromptSemantics{}, {});
+    const auto second_prompt = to_prompt_input(second.generation, PromptOptionInputs{}, {});
     failures += check(
         second_prompt.context_cache.markers.size() == 2 &&
             second_prompt.context_cache.markers[0].location == Location::MessagePartBoundary &&
@@ -374,7 +375,7 @@ int test_prompt_cache_policy_after_history_resolution() {
     const auto explicit_result =
         resolve_openai_responses_prompt(explicit_request.prompt, store, "resp_explicit", true);
     const auto explicit_prompt =
-        to_prompt_input(explicit_result.generation, ResolvedPromptSemantics{}, {});
+        to_prompt_input(explicit_result.generation, PromptOptionInputs{}, {});
     failures += check(
         explicit_prompt.context_cache.markers.size() == 1 &&
             explicit_prompt.context_cache.markers[0].location == Location::MessagePartBoundary &&
@@ -630,11 +631,11 @@ int test_tools_and_effective_subset() {
     const OpenAIResponsesCreateRequest ordered_request =
         parse_openai_responses_create_request(ordered, limits());
     failures += check(ordered_request.prompt.generation.constrains_tools() &&
-                          !to_request_options(ordered_request.prompt.generation, {}, {}, true)
+                          !to_request_options(ordered_request.prompt.generation, {}, true)
                                .output.preserve_special_tokens,
                       "ordinary Responses tools did not select constrained output");
     const ninfer::PromptInput ordered_prompt =
-        to_prompt_input(ordered_request.prompt.generation, ResolvedPromptSemantics{}, {});
+        to_prompt_input(ordered_request.prompt.generation, PromptOptionInputs{}, {});
     failures += check(
         ordered_prompt.options.tool_jsons.size() == 1 &&
             ordered_prompt.options.tool_jsons.front() ==
@@ -702,11 +703,14 @@ int test_namespace_tools() {
     stream_request.stream                       = true;
     OpenAIResponsesEventStream stream("resp_namespace_stream", 1, stream_request, {});
     (void)stream.start();
+    auto tool_events                           = emit_tools(stream, outcome.tool_calls);
     const OpenAIResponsesStreamFinish streamed = stream.finish(outcome);
-    bool saw_added                             = false;
-    bool saw_done                              = false;
-    bool saw_item_done                         = false;
-    for (const std::string& wire : streamed.events_before_terminal) {
+    tool_events.insert(tool_events.end(), streamed.events_before_terminal.begin(),
+                       streamed.events_before_terminal.end());
+    bool saw_added     = false;
+    bool saw_done      = false;
+    bool saw_item_done = false;
+    for (const std::string& wire : tool_events) {
         const Json event = parse_event(wire);
         if (event.at("type") == "response.output_item.added" &&
             event.at("item").at("type") == "function_call") {
@@ -989,6 +993,7 @@ int test_response_object() {
               "truncation lost a completed call or hid the incomplete response");
     OpenAIResponsesEventStream stream("resp_partial_stream", 123, request, runtime);
     (void)stream.start();
+    (void)emit_tools(stream, tools.tool_calls);
     const auto finish   = stream.finish(tools);
     const auto terminal = parse_event(stream.terminal(finish.response));
     failures += check(terminal.at("type") == "response.incomplete" &&
@@ -1006,8 +1011,8 @@ int test_sse_sequence_and_failures() {
     wire.insert(wire.end(), next.begin(), next.end());
     next = encoder.content_delta("ans");
     wire.insert(wire.end(), next.begin(), next.end());
-    auto outcome       = sample_outcome();
-    outcome.constraint = ninfer::ConstraintObservation{
+    auto outcome             = sample_outcome();
+    outcome.stats.constraint = ninfer::ConstraintObservation{
         .branch = ninfer::ConstraintOutputBranch::Content, .complete = true, .terminated = true};
     OpenAIResponsesStreamFinish finish = encoder.finish(outcome);
     wire.insert(wire.end(), finish.events_before_terminal.begin(),
@@ -1087,7 +1092,7 @@ int test_input_tokens_uses_shared_state_path() {
     failures += check(resolved.generation.tools.size() == 1 &&
                           resolved.generation.tools[0].name == "mcp__clock__now",
                       "input token counting uses the namespace tool translation path");
-    const auto counted_prompt = to_prompt_input(resolved.generation, ResolvedPromptSemantics{}, {});
+    const auto counted_prompt = to_prompt_input(resolved.generation, PromptOptionInputs{}, {});
     failures += check(counted_prompt.context_cache.markers.empty() &&
                           !counted_prompt.context_cache.allow_engine_automatic_shared_prefixes,
                       "input token counting does not create automatic cache writes");
@@ -1111,21 +1116,20 @@ int test_constrained_decoding() {
         const auto selected =
             resolve_openai_responses_prompt(parsed.prompt, store, std::nullopt, false);
         failures +=
-            check(to_request_options(selected.generation, {}, {}, true).constraint ==
+            check(to_request_options(selected.generation, {}, true).constraint ==
                       (value.contains("choice") ? ninfer::OutputConstraint::choice({"yes", "no"})
                                                 : ninfer::OutputConstraint::regex("[a-z]+")),
                   "Responses choice/regex lost through prompt resolution");
     }
     const auto resolved =
         resolve_openai_responses_prompt(request.prompt, store, std::nullopt, false);
-    failures += check(to_request_options(resolved.generation, {}, {}, true).constraint->source ==
+    failures += check(to_request_options(resolved.generation, {}, true).constraint->source ==
                           "root ::= \"yes\"",
                       "Responses GBNF extension was lost in resolution or Engine translation");
     body["tools"] = Json::array({Json{{"type", "function"}, {"name", "lookup"}}});
-    failures += check(api_error([&] {
-                          (void)parse_openai_responses_create_request(body, limits());
-                      }).param == "structured_outputs.grammar",
-                      "grammar admitted active tools");
+    failures +=
+        check(parse_openai_responses_create_request(body, limits()).prompt.generation.uses_tools(),
+              "grammar/tools request did not reach the Frontend");
     body["tool_choice"] = "none";
     failures += check(parse_openai_responses_create_request(body, limits())
                               .prompt.generation.constraint->source == "root ::= \"yes\"",

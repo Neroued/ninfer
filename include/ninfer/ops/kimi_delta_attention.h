@@ -3,6 +3,7 @@
 #include "core/arena.h"
 #include "core/device.h"
 #include "core/tensor.h"
+#include "core/record_view.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -60,17 +61,43 @@ void kimi_delta_attention(const Tensor& q, const Tensor& k, const Tensor& v, con
                           CudaExecutionView execution);
 
 /**
- * Scratch-free one-token update for B independent state-pool slots, using the same head mapping.
+ * Scratch-free one-token update for B independent state records, using the same head mapping.
  * q/k BF16 [128,Hqk,1,B], v/g/out BF16 [128,Hv,1,B], beta BF16 [Hv,1,B],
- * A_log FP32 [Hv], dt_bias FP32 [128,Hv], states FP32 [128,128,Hv,Slots], device I32 slots [B].
- * State slots have dense [128,128,Hv] and explicit 16-byte-aligned nb[3]; other operands are
- * contiguous. B is in [1,8]. Caller-provided active slots are valid and distinct. Each row reads
- * and writes its selected state. Inputs, out, selectors and state do not overlap.
+ * A_log FP32 [Hv], dt_bias FP32 [128,Hv], and source/destination select FP32 [128,128,Hv] fields
+ * using device I64 [B] arena-relative byte offsets. Each field is 16-byte aligned and in bounds;
+ * other operands are contiguous. B is in [1,8]. Source/destination may exactly alias or be
+ * disjoint. Destinations are distinct and cannot overwrite another row's source. Read-only
+ * sources may be shared. Inputs, output and metadata do not overlap selected state fields.
  */
 void kimi_delta_attention_batch_update(const Tensor& q, const Tensor& k, const Tensor& v,
                                        const Tensor& g, const Tensor& beta, const Tensor& A_log,
                                        const Tensor& dt_bias, float lower_bound, float scale,
-                                       Tensor& states, const Tensor& slots, Tensor& out,
-                                       CudaExecutionView execution);
+                                       ConstStateFieldView source, StateFieldView destination,
+                                       Tensor& out, CudaExecutionView execution);
+
+struct KdaRecurrenceRecords {
+    Tensor key;       // BF16 [128,Hq,T,B], before normalization.
+    Tensor value;     // BF16 [128,Hv,T,B].
+    Tensor log_decay; // FP32 [128,Hv,T,B].
+    Tensor beta;      // FP32 [Hv,T,B], after sigmoid.
+};
+
+/**
+ * Evaluate n[b] KDA steps from each read-only source field, publishing BF16 readouts and
+ * transition records, without writing persistent state. Inputs are the batch-update shapes
+ * with positive T; valid_columns is empty (n=T) or Device I32 [B], 1<=n<=T, B=1..8.
+ * Records preserve represented K/V and the actual FP32 log-decay/beta words. Outputs match
+ * ordinary one-token updates of the same inputs bit for bit. Invalid output tails are +0;
+ * record tails and source fields are unchanged. K/key-record and V/value-record may exactly
+ * alias; other tensor writes are disjoint from inputs, records, metadata and selected fields.
+ * Device selectors/lengths are caller promises. Zero scratch; capture/replay reads current
+ * I64 source offsets and valid lengths at stable metadata addresses.
+ */
+void kimi_delta_attention_replay_record(const Tensor& q, const Tensor& k, const Tensor& v,
+                                        const Tensor& g, const Tensor& beta, const Tensor& A_log,
+                                        const Tensor& dt_bias, float lower_bound, float scale,
+                                        ConstStateFieldView initial_state,
+                                        const Tensor& valid_columns, KdaRecurrenceRecords records,
+                                        Tensor& out, CudaExecutionView execution);
 
 } // namespace ninfer::ops

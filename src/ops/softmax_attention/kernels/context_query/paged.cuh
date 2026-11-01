@@ -8,11 +8,10 @@ namespace ninfer::ops::detail {
 struct ContextAttentionPolicy {
     static constexpr bool PageMapped = true;
 
-    const std::int32_t* block_table;
-    int physical_pages;
+    const std::int64_t* block_table;
     int logical_pages;
-    int table_group     = -1;
-    int table_lane_page = 0;
+    int table_group                = -1;
+    std::int64_t table_lane_offset = 0;
 
     __device__ __forceinline__ int context_count(int value) const { return value; }
 
@@ -21,9 +20,9 @@ struct ContextAttentionPolicy {
     __device__ __forceinline__ bool allow_context(int, int) const { return true; }
 
     __device__ __forceinline__ std::int64_t context_tile(int kv_head, int key0,
-                                                         int physical_page) const {
-        return kv::head_major_offset<kContextQueryHeadDim>(physical_page, kv_head,
-                                                           key0 & kv::kPageMask, 0, physical_pages);
+                                                         std::int64_t page_offset) const {
+        return kv::record_offset<kContextQueryHeadDim, 2>(page_offset, kv_head,
+                                                          key0 & kv::kPageMask, 0);
     }
 
     __device__ __forceinline__ std::int64_t context_index(std::int64_t tile, int d, int,
@@ -40,7 +39,7 @@ struct ContextAttentionPolicy {
                 const int first_group        = first_logical_page & ~3;
                 const int table_index        = first_group + lane;
                 if (lane < 4 && table_index < logical_pages) {
-                    table_lane_page = __ldg(block_table + table_index);
+                    table_lane_offset = __ldg(block_table + table_index);
                 }
                 table_group = first_group;
             }
@@ -48,21 +47,21 @@ struct ContextAttentionPolicy {
     }
 
     template <int Tokens>
-    __device__ __forceinline__ int page(int key0, int lane, unsigned mask) {
+    __device__ __forceinline__ std::int64_t page(int key0, int lane, unsigned mask) {
         const int logical_page = key0 >> 6;
         if constexpr (Tokens == 4) {
             const int group = logical_page & ~3;
             if (group != table_group) {
                 const int table_index = group + lane;
                 if (lane < 4 && table_index < logical_pages) {
-                    table_lane_page = __ldg(block_table + table_index);
+                    table_lane_offset = __ldg(block_table + table_index);
                 }
                 table_group = group;
             }
-            return __shfl_sync(mask, table_lane_page, logical_page - group);
+            return __shfl_sync(mask, table_lane_offset, logical_page - group);
         } else {
-            const int physical_page = lane == 0 ? __ldg(block_table + logical_page) : 0;
-            return __shfl_sync(mask, physical_page, 0);
+            const std::int64_t record_offset = lane == 0 ? __ldg(block_table + logical_page) : 0;
+            return __shfl_sync(mask, record_offset, 0);
         }
     }
 };
@@ -73,14 +72,13 @@ __launch_bounds__(WarpsPerCta * 32, 2) __global__ void context_attention_split_p
     const __nv_bfloat16* __restrict__ query_v, const std::int32_t* __restrict__ context_length,
     const std::int32_t* __restrict__ valid_columns, const std::int32_t* __restrict__ table_rows,
     const __nv_bfloat16* __restrict__ context_k, const __half* __restrict__ context_v,
-    const std::int32_t* __restrict__ block_tables, int physical_pages, int logical_pages,
-    int max_context, int split_capacity, float scale, __nv_bfloat16* __restrict__ partial_acc,
+    const std::int64_t* __restrict__ block_tables, int logical_pages, int max_context,
+    int split_capacity, float scale, __nv_bfloat16* __restrict__ partial_acc,
     float* __restrict__ partial_m, float* __restrict__ partial_l, __nv_bfloat16* __restrict__ out) {
     const int batch = static_cast<int>(blockIdx.z);
     ContextAttentionPolicy policy{
         .block_table = block_tables + static_cast<std::int64_t>(logical_pages) * table_rows[batch],
-        .physical_pages = physical_pages,
-        .logical_pages  = logical_pages,
+        .logical_pages = logical_pages,
     };
     context_query_split_partial_body<ContextAttentionPolicy, Tokens, WarpsPerCta, KeyBlock,
                                      DirectOutput>(

@@ -1,70 +1,44 @@
 #pragma once
 
-#include "artifact/materializer.h"
-#include "models/qwen3_5/config.h"
-#include "models/common/qwen/frontend/resources.h"
-#include "models/qwen3_5/weights.h"
-#include "ninfer/ops/weight_input.h"
-
-#include <memory>
-#include <span>
-#include <string>
+#include "models/qwen3_5/definition.h"
 
 namespace ninfer::models::qwen3_5 {
 
-struct InstanceInfo {
-    std::string name;
-};
-
 class ResolvedLoadPlan;
 
-class Model {
+// Local immutable weight storage. Borrowers finish before its backing is released.
+class ModelShard {
 public:
-    ~Model();
-    Model(const Model&)            = delete;
-    Model& operator=(const Model&) = delete;
-    Model(Model&&)                 = delete;
-    Model& operator=(Model&&)      = delete;
+    ~ModelShard();
+    ModelShard(const ModelShard&)            = delete;
+    ModelShard& operator=(const ModelShard&) = delete;
 
-    [[nodiscard]] const Config& config() const noexcept { return config_; }
-
-    [[nodiscard]] const LoadOptions& options() const noexcept { return options_; }
-
-    [[nodiscard]] const ModelWeights& weights() const noexcept { return weights_; }
+    [[nodiscard]] const ModelDefinition& definition() const { return *definition_; }
 
     [[nodiscard]] const BoundWeight& weight(WeightId id) const { return bound_.at(id.index); }
 
-    [[nodiscard]] ops::WeightInput input(WeightUseId id) const;
-    [[nodiscard]] ops::WeightInput input(WeightId id) const;
+    [[nodiscard]] ops::WeightInput input(WeightId id) const { return weight_input(bound_, id); }
 
-    [[nodiscard]] std::span<const BoundWeight> weight_data() const noexcept { return bound_; }
+    [[nodiscard]] ops::WeightInput input(WeightUseId id) const { return weight_input(bound_, id); }
 
-    [[nodiscard]] std::span<const ExpertBankSource> expert_banks() const noexcept { return banks_; }
+    [[nodiscard]] std::span<const BoundWeight> weight_data() const { return bound_; }
 
-    [[nodiscard]] const qwen::FrontendResources& resources() const noexcept { return resources_; }
+    [[nodiscard]] std::span<const ExpertBankSource> expert_banks() const { return banks_; }
 
-    [[nodiscard]] const InstanceInfo& info() const noexcept { return info_; }
-
-    [[nodiscard]] const artifact::MaterializationStats& storage_stats() const noexcept {
+    [[nodiscard]] const artifact::MaterializationStats& storage_stats() const {
         return backing_.stats();
     }
 
 private:
-    friend std::unique_ptr<Model> materialize_model(ResolvedLoadPlan&&, DeviceContext&,
-                                                    const StartupObserver*);
-    Model(Config config, LoadOptions options, ModelWeights weights, std::vector<BoundWeight> bound,
-          std::vector<ExpertBankSource> banks, qwen::FrontendResources resources, InstanceInfo info,
-          artifact::MaterializedArtifact backing);
+    friend std::unique_ptr<ModelShard> materialize_model(ResolvedLoadPlan&&, DeviceContext&,
+                                                         const StartupObserver*);
+    ModelShard(std::shared_ptr<const ModelDefinition>, artifact::MaterializedArtifact,
+               std::vector<BoundWeight>, std::vector<ExpertBankSource>);
 
-    // Destroy all borrowers before backing. The caller keeps DeviceContext alive through cleanup.
+    std::shared_ptr<const ModelDefinition> definition_;
     artifact::MaterializedArtifact backing_;
-    Config config_;
-    LoadOptions options_;
-    ModelWeights weights_;
     std::vector<BoundWeight> bound_;
     std::vector<ExpertBankSource> banks_;
-    qwen::FrontendResources resources_;
-    InstanceInfo info_;
 };
 
 } // namespace ninfer::models::qwen3_5

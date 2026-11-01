@@ -42,15 +42,15 @@ void launch_active_cols(const Tensor& x, const Weight& weight, Tensor& qkv, Tens
 
 template <int ActiveCols, class Publish>
 void launch_active_cols_conv(const Tensor& x, const Weight& weight, const Tensor& conv_weight,
-                             const Tensor& conv_states, const Tensor& valid_columns,
-                             const Tensor& initial_slot, Tensor& query, Tensor& key, Tensor& value,
-                             Tensor& z, Publish publish, cudaStream_t stream) {
+                             const ConstStateFieldView& conv_states, const Tensor& valid_columns,
+                             Tensor& query, Tensor& key, Tensor& value, Tensor& z, Publish publish,
+                             cudaStream_t stream) {
     static_assert(ActiveCols >= 2 && ActiveCols <= 16);
     constexpr int TileCols = ActiveCols <= 8 ? 8 : 16;
     using Geometry         = Q8LinearGeometry<kRows, kHidden>;
     using Schedule         = Q8SlicedKDefault<TileCols, ActiveCols>;
     const auto output      = make_gdn_conv_output<GdnConvGeometry<4096>, ActiveCols>(
-        conv_weight, conv_states, valid_columns, initial_slot, query, key, value, z, publish);
+        conv_weight, conv_states, valid_columns, query, key, value, z, publish);
     launch_q8_a16_sliced_k_mma<
         typename Schedule::template with_problem<Geometry::kInputRows, ActiveCols, true>>(
         q8_linear_operands(x, weight), output, GdnConvRowEpilogue<ActiveCols>{}, stream);
@@ -58,25 +58,25 @@ void launch_active_cols_conv(const Tensor& x, const Weight& weight, const Tensor
 
 template <int ActiveCols>
 void launch_active_cols_conv_snapshot(const Tensor& x, const Weight& weight,
-                                      const Tensor& conv_weight, Tensor& conv_states,
-                                      const Tensor& valid_columns, const Tensor& initial_slot,
-                                      const Tensor& snapshot_base_slot, Tensor& query, Tensor& key,
-                                      Tensor& value, Tensor& z, cudaStream_t stream) {
-    launch_active_cols_conv<ActiveCols>(
-        x, weight, conv_weight, conv_states, valid_columns, initial_slot, query, key, value, z,
-        SnapshotHistoryPublish{static_cast<__nv_bfloat16*>(conv_states.data), conv_states.nb[2] / 2,
-                               static_cast<const std::int32_t*>(snapshot_base_slot.data), 8192},
-        stream);
+                                      const Tensor& conv_weight,
+                                      const ConstStateFieldView& conv_states,
+                                      const Tensor& valid_columns,
+                                      const gdn_input::HistoryDestination& destination,
+                                      Tensor& query, Tensor& key, Tensor& value, Tensor& z,
+                                      cudaStream_t stream) {
+    launch_active_cols_conv<ActiveCols>(x, weight, conv_weight, conv_states, valid_columns, query,
+                                        key, value, z,
+                                        make_snapshot_history_publish(destination, 8192), stream);
 }
 
 template <int ActiveCols>
 void launch_active_cols_conv_record(const Tensor& x, const Weight& weight,
-                                    const Tensor& conv_weight, const Tensor& conv_states,
-                                    const Tensor& valid_columns, const Tensor& initial_slot,
-                                    Tensor& conv_record, Tensor& query, Tensor& key, Tensor& value,
-                                    Tensor& z, cudaStream_t stream) {
+                                    const Tensor& conv_weight,
+                                    const ConstStateFieldView& conv_states,
+                                    const Tensor& valid_columns, Tensor& conv_record, Tensor& query,
+                                    Tensor& key, Tensor& value, Tensor& z, cudaStream_t stream) {
     launch_active_cols_conv<ActiveCols>(
-        x, weight, conv_weight, conv_states, valid_columns, initial_slot, query, key, value, z,
+        x, weight, conv_weight, conv_states, valid_columns, query, key, value, z,
         RecordColumnPublish{static_cast<__nv_bfloat16*>(conv_record.data), 8192, ActiveCols},
         stream);
 }
@@ -93,12 +93,13 @@ void launch_medium_cols(const Tensor& x, const Weight& weight, Tensor& qkv, Tens
 }
 
 using ProjectionLauncher = void (*)(const Tensor&, const Weight&, Tensor&, Tensor&, cudaStream_t);
-using SnapshotLauncher   = void (*)(const Tensor&, const Weight&, const Tensor&, Tensor&,
-                                  const Tensor&, const Tensor&, const Tensor&, Tensor&, Tensor&,
-                                  Tensor&, Tensor&, cudaStream_t);
-using RecordLauncher     = void (*)(const Tensor&, const Weight&, const Tensor&, const Tensor&,
-                                const Tensor&, const Tensor&, Tensor&, Tensor&, Tensor&, Tensor&,
-                                Tensor&, cudaStream_t);
+using SnapshotLauncher   = void (*)(const Tensor&, const Weight&, const Tensor&,
+                                  const ConstStateFieldView&, const Tensor&,
+                                  const gdn_input::HistoryDestination&, Tensor&, Tensor&, Tensor&,
+                                  Tensor&, cudaStream_t);
+using RecordLauncher     = void (*)(const Tensor&, const Weight&, const Tensor&,
+                                const ConstStateFieldView&, const Tensor&, Tensor&, Tensor&,
+                                Tensor&, Tensor&, Tensor&, cudaStream_t);
 
 template <std::size_t... Offsets>
 constexpr auto make_projection_launchers(std::index_sequence<Offsets...>) {
@@ -141,32 +142,34 @@ void launch_q8_gdn_input_splitk_mma(const Tensor& x, const Weight& weight, Tenso
     CUDA_CHECK(cudaGetLastError());
 }
 
-void launch_q8_gdn_input_splitk_conv_snapshot(
-    const Tensor& x, const Weight& weight, const Tensor& conv_weight, Tensor& conv_states,
-    const Tensor& valid_columns, const Tensor& initial_slot, const Tensor& snapshot_base_slot,
-    Tensor& query, Tensor& key, Tensor& value, Tensor& z, cudaStream_t stream) {
+void launch_q8_gdn_input_splitk_conv_snapshot(const Tensor& x, const Weight& weight,
+                                              const Tensor& conv_weight,
+                                              const ConstStateFieldView& conv_states,
+                                              const Tensor& valid_columns,
+                                              const gdn_input::HistoryDestination& destination,
+                                              Tensor& query, Tensor& key, Tensor& value, Tensor& z,
+                                              cudaStream_t stream) {
     const std::int32_t cols = x.ne[1];
     if (cols < kFirstExactCols || cols > kLastSnapshotExactCols) {
         throw std::invalid_argument("Q8 fused GDN input snapshot requires T=2..16");
     }
     kSnapshotLaunchers[cols - kFirstExactCols](x, weight, conv_weight, conv_states, valid_columns,
-                                               initial_slot, snapshot_base_slot, query, key, value,
-                                               z, stream);
+                                               destination, query, key, value, z, stream);
     CUDA_CHECK(cudaGetLastError());
 }
 
 void launch_q8_gdn_input_splitk_conv_record(const Tensor& x, const Weight& weight,
-                                            const Tensor& conv_weight, const Tensor& conv_states,
-                                            const Tensor& valid_columns, const Tensor& initial_slot,
-                                            Tensor& conv_record, Tensor& query, Tensor& key,
-                                            Tensor& value, Tensor& z, cudaStream_t stream) {
+                                            const Tensor& conv_weight,
+                                            const ConstStateFieldView& conv_states,
+                                            const Tensor& valid_columns, Tensor& conv_record,
+                                            Tensor& query, Tensor& key, Tensor& value, Tensor& z,
+                                            cudaStream_t stream) {
     const std::int32_t cols = x.ne[1];
     if (cols < kFirstExactCols || cols > kLastSnapshotExactCols) {
         throw std::invalid_argument("Q8 fused GDN input record requires T=2..16");
     }
     kRecordLaunchers[cols - kFirstExactCols](x, weight, conv_weight, conv_states, valid_columns,
-                                             initial_slot, conv_record, query, key, value, z,
-                                             stream);
+                                             conv_record, query, key, value, z, stream);
     CUDA_CHECK(cudaGetLastError());
 }
 

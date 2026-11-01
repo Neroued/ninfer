@@ -21,12 +21,14 @@ public:
     int input(const Tensor& x, int hidden);
     void output(const Tensor& y, int hidden, int tokens, MoeEpilogue epilogue);
     void control(const Weight& control, const RouteProfile& profile);
+    void sigmoid_control(const Weight& control, const RouteProfile& profile);
     void routes(const ExpertRoutes& routes, int top_k, int tokens, bool writing);
     void coefficient(const Tensor& value, int tokens, bool writing);
     void subset(ExpertSubset subset, int experts);
     void experts(const CudaSwiGLUExperts& weights, const RoutedSwiGLUProfile& profile);
-    void shared(const SwiGLUWeights& weights, int hidden);
-    void workspace(const MemoryArena& workspace, std::size_t bytes);
+    void shared(const SwiGLUWeights& weights, const SwiGLUProfile& profile);
+    void unscaled_shared(const SwiGLUWeights& weights, const SwiGLUProfile& profile);
+    void workspace(ConstMemorySpan scratch);
     void finish() const;
 
 private:

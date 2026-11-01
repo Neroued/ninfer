@@ -1,5 +1,6 @@
 // Cold-cache public Op benchmark for the registered Q4 LinearSwiGLU profile.
 
+#include "common/roofline.h"
 #include "core/weight.h"
 #include "core/buffer.h"
 #include "ninfer/ops/linear_swiglu.h"
@@ -116,7 +117,7 @@ void write_csv(const std::string& path, const std::vector<Result>& results) {
                      result.tokens, result.execution, result.graph_nodes, result.median_us,
                      result.min_us, result.p95_us, result.weight_bytes, result.logical_bytes,
                      result.projection_flops, result.logical_bytes / seconds / 1.0e9,
-                     result.logical_bytes / seconds / 1.0e9 / 1792.0 * 100.0,
+                     result.logical_bytes / seconds / 1.0e9 / bench::kRoofline.memory_gbs * 100.0,
                      result.projection_flops / seconds / 1.0e12, result.workspace_sweep_bytes,
                      result.workspace_exact_bytes);
     }

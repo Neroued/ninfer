@@ -34,6 +34,7 @@ class Model:
     packing_groups: list[tuple[str, ...]] = field(default_factory=list)
     token_count: int = 0
     special_token_ids: tuple[int, ...] = ()
+    proposal_domain: str = "indexed"
 
     @property
     def config(self) -> dict:

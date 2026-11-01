@@ -1,8 +1,10 @@
 add_library(ninfer_text STATIC
   unicode.cpp
+  tokenizer.cpp
   ${PROJECT_SOURCE_DIR}/third_party/utf8proc/utf8proc.c
 )
 ninfer_internal_includes(ninfer_text)
+target_link_libraries(ninfer_text PRIVATE ninfer::json)
 target_include_directories(ninfer_text PRIVATE ${PROJECT_SOURCE_DIR}/third_party)
 
 # Language evaluation reuses the engine's Unicode and JSON dependencies.
@@ -11,7 +13,7 @@ ninfer_internal_includes(ninfer_jinja)
 target_include_directories(ninfer_jinja PRIVATE ${PROJECT_SOURCE_DIR}/third_party)
 target_link_libraries(ninfer_jinja PRIVATE ninfer_text ninfer::json)
 
-add_library(ninfer_grammar STATIC grammar.cpp json_schema.cpp schema_composition.cpp json_input.cpp)
+add_library(ninfer_grammar STATIC grammar.cpp json_schema.cpp schema_composition.cpp schema_types.cpp json_input.cpp)
 ninfer_internal_includes(ninfer_grammar)
 target_include_directories(ninfer_grammar PRIVATE ${PROJECT_SOURCE_DIR}/third_party/xgrammar/cpp)
 target_include_directories(ninfer_grammar SYSTEM PRIVATE

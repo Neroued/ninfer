@@ -24,8 +24,11 @@ std::string pointer_component(std::string value) {
 }
 
 jinja::value convert(const nlohmann::ordered_json& input, const std::string& pointer,
-                     const std::unordered_map<std::string, std::uint32_t>& tags, bool literal) {
+                     const std::unordered_map<std::string, std::uint32_t>& tags, bool literal,
+                     std::uint32_t inherited_origin = 0) {
     using namespace jinja;
+    const auto found  = tags.find(pointer);
+    const auto origin = found == tags.end() ? inherited_origin : found->second;
     value result;
     if (input.is_null())
         result = mk_val<value_none>();
@@ -44,22 +47,25 @@ jinja::value convert(const nlohmann::ordered_json& input, const std::string& poi
     else if (input.is_array()) {
         auto array = mk_val<value_array>();
         for (std::size_t i = 0; i < input.size(); ++i) {
-            array->push_back(convert(input[i], pointer + "/" + std::to_string(i), tags, literal));
+            array->push_back(
+                convert(input[i], pointer + "/" + std::to_string(i), tags, literal, origin));
         }
         result = std::move(array);
     } else if (input.is_object()) {
         auto object = mk_val<value_object>();
         for (const auto& item : input.items()) {
-            object->insert(mk_val<value_string>(string(item.key(), 0, literal)),
+            auto key = string(item.key(), 0, literal);
+            if (origin) key.tag(origin, false);
+            object->insert(mk_val<value_string>(std::move(key)),
                            convert(item.value(), pointer + "/" + pointer_component(item.key()),
-                                   tags, literal));
+                                   tags, literal, origin));
         }
         result = std::move(object);
     } else
         throw std::invalid_argument("Unsupported template JSON value");
-    if (const auto it = tags.find(pointer); it != tags.end()) {
-        result->origin = it->second;
-        if (is_val<value_string>(result)) result->val_str.tag(it->second);
+    if (origin) {
+        result->origin = origin;
+        if (is_val<value_string>(result)) result->val_str.tag(origin, found != tags.end());
     }
     return result;
 }

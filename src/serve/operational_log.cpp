@@ -1,6 +1,8 @@
 #include "serve/operational_log.h"
+#include "product/statistics.h"
 
 #include "product/logging/pretty_format.h"
+#include "product/logging/configuration.h"
 #include "product/speculative_options.h"
 
 #include <spdlog/logger.h>
@@ -111,24 +113,8 @@ const char* protocol_name(std::string_view protocol) noexcept {
     return "http";
 }
 
-const char* kv_cache_name(ninfer::KvCacheStorage storage) noexcept {
-    switch (storage) {
-    case ninfer::KvCacheStorage::BFloat16:
-        return "bf16";
-    case ninfer::KvCacheStorage::Int8Group64:
-        return "int8";
-    case ninfer::KvCacheStorage::Fp8E4M3Row256:
-        return "fp8";
-    case ninfer::KvCacheStorage::Nvfp4Group16:
-        return "nvfp4";
-    case ninfer::KvCacheStorage::Fp8KeyNvfp4Value:
-        return "k8v4";
-    }
-    return "unknown";
-}
-
-const char* kv_capacity_mode_name(ninfer::KvCapacityMode mode) noexcept {
-    return mode == ninfer::KvCapacityMode::Automatic ? "auto" : "explicit";
+const char* kv_cache_name(ninfer::KvCacheStorage storage) {
+    return ninfer::kv_cache_profile_info(storage).name;
 }
 
 void append_clause(std::ostringstream& out, std::string_view clause) { out << " | " << clause; }
@@ -153,10 +139,11 @@ std::uint64_t host_active_ns(const ThroughputReport& report) noexcept {
     const ninfer::RuntimeHostWorkStats& previous = report.previous.host_work;
     const ninfer::RuntimeHostWorkStats& current  = report.current.host_work;
     return monotonic_delta(previous.engine_boundary_ns, current.engine_boundary_ns) +
-           monotonic_delta(previous.program_submit_ns, current.program_submit_ns) +
-           monotonic_delta(previous.program_post_ns, current.program_post_ns) +
+           monotonic_delta(previous.session_call_ns, current.session_call_ns) +
+           monotonic_delta(previous.executor_poll_ns, current.executor_poll_ns) +
            monotonic_delta(previous.engine_commit_output_ns, current.engine_commit_output_ns) +
-           monotonic_delta(previous.engine_maintenance_ns, current.engine_maintenance_ns);
+           monotonic_delta(previous.engine_maintenance_ns, current.engine_maintenance_ns) +
+           monotonic_delta(previous.executor_flush_ns, current.executor_flush_ns);
 }
 
 void append_failure_fields(std::ostringstream& out, const RequestFailure& failure) {
@@ -222,16 +209,17 @@ OperationalRecord render_request_rejected(const RequestRejectionLogContext& cont
 
 OperationalRecord render_request_done(const RequestLogContext& context,
                                       const GenerationOutcome& outcome) {
-    const GenerationMetrics& metrics     = outcome.metrics;
-    const double computed_prefill_tokens = static_cast<double>(metrics.computed_prefill_tokens);
-    const double decode_tokens =
-        outcome.completion_tokens > 0 ? static_cast<double>(outcome.completion_tokens - 1) : 0.0;
+    const RequestStats& metrics = outcome.stats;
+    const auto rates            = product::generation_rates(metrics, outcome.completion_tokens);
     std::ostringstream out;
     out << "req#" << context.id << " done | " << protocol_name(context.protocol) << " | ";
-    if (outcome.tool_calls.empty()) {
+    const auto complete_calls =
+        std::count_if(outcome.tool_calls.begin(), outcome.tool_calls.end(),
+                      [](const auto& call) { return call.status == ToolCallStatus::Complete; });
+    if (complete_calls == 0) {
         out << finish_reason_name(outcome.finish_reason);
     } else {
-        out << "tool calls " << product::format_pretty_count(outcome.tool_calls.size());
+        out << "tool calls " << product::format_pretty_count(complete_calls);
     }
     out << " | prompt "
         << product::format_pretty_count(
@@ -240,43 +228,45 @@ OperationalRecord render_request_done(const RequestLogContext& context,
         << product::format_pretty_count(
                static_cast<std::uint64_t>(std::max(outcome.completion_tokens, 0)));
     const double cache_ratio = outcome.prompt_tokens > 0
-                                   ? static_cast<double>(metrics.prefix_cache_hit_tokens) /
+                                   ? static_cast<double>(metrics.reused_prompt_tokens) /
                                          static_cast<double>(outcome.prompt_tokens)
                                    : 0.0;
-    out << " | cache " << product::format_pretty_count(metrics.prefix_cache_hit_tokens) << " ("
+    out << " | cache " << product::format_pretty_count(metrics.reused_prompt_tokens) << " ("
         << product::format_pretty_percent(cache_ratio);
     if (metrics.prefix_reuse_path != ninfer::PrefixReusePath::Root) {
         out << ", " << prefix_reuse_path_name(metrics.prefix_reuse_path);
     }
-    out << ") | TTFT " << product::format_pretty_duration(metrics.ttft_seconds) << " | total "
-        << product::format_pretty_duration(metrics.total_seconds);
+    out << ") | TTFT "
+        << product::format_pretty_duration(metrics.timings.first_token_seconds +
+                                           outcome.service_prepare_seconds)
+        << " | total "
+        << product::format_pretty_duration(metrics.timings.total_seconds +
+                                           outcome.service_prepare_seconds);
     if (metrics.engine_timing.queue_wait_seconds >= 0.01) {
         out << " | queue "
             << product::format_pretty_duration(metrics.engine_timing.queue_wait_seconds);
     }
-    if (metrics.prefill_seconds > 0.0) {
-        out << " | prefill "
-            << product::format_pretty_rate(computed_prefill_tokens / metrics.prefill_seconds,
-                                           "tok");
+    if (metrics.timings.prefill_seconds > 0.0) {
+        out << " | prefill " << product::format_pretty_rate(rates.prefill_tokens_per_second, "tok");
     }
-    if (metrics.decode_seconds > 0.0) {
-        out << " | decode "
-            << product::format_pretty_rate(decode_tokens / metrics.decode_seconds, "tok");
+    if (metrics.timings.decode_seconds > 0.0) {
+        out << " | decode " << product::format_pretty_rate(rates.output_tokens_per_second, "tok");
     }
-    if (metrics.speculative_draft_tokens != 0) {
-        const double acceptance = static_cast<double>(metrics.speculative_accepted_tokens) /
-                                  static_cast<double>(metrics.speculative_draft_tokens);
-        out << " | " << product::speculative_backend_name(metrics.speculative_backend)
-            << " accepted " << product::format_pretty_count(metrics.speculative_accepted_tokens)
-            << '/' << product::format_pretty_count(metrics.speculative_draft_tokens) << " ("
+    if (metrics.speculative.drafted_tokens != 0) {
+        const double acceptance = static_cast<double>(metrics.speculative.accepted_tokens) /
+                                  static_cast<double>(metrics.speculative.drafted_tokens);
+        out << " | " << product::speculative_backend_name(metrics.speculative.backend)
+            << " accepted " << product::format_pretty_count(metrics.speculative.accepted_tokens)
+            << '/' << product::format_pretty_count(metrics.speculative.drafted_tokens) << " ("
             << product::format_pretty_percent(acceptance) << ')';
     }
-    if (outcome.thinking.configured_budget) {
+    if (outcome.stats.thinking.configured_budget) {
         out << " | thinking "
-            << product::format_pretty_count(outcome.thinking.model_thinking_tokens) << '/'
-            << product::format_pretty_count(*outcome.thinking.configured_budget);
-        if (outcome.thinking.injected_tokens != 0) {
-            out << ", control " << product::format_pretty_count(outcome.thinking.injected_tokens);
+            << product::format_pretty_count(outcome.stats.thinking.model_thinking_tokens) << '/'
+            << product::format_pretty_count(*outcome.stats.thinking.configured_budget);
+        if (outcome.stats.thinking.injected_tokens != 0) {
+            out << ", control "
+                << product::format_pretty_count(outcome.stats.thinking.injected_tokens);
         }
     }
     return {.severity = OperationalSeverity::Info, .message = out.str()};
@@ -370,6 +360,21 @@ OperationalRecord render_throughput(const ThroughputReport& report) {
             << static_cast<double>(report.decode_row_rounds) /
                    static_cast<double>(report.decode_rounds);
     }
+    for (const auto kind : {ExecutionKind::Prefill, ExecutionKind::Decode}) {
+        const auto i = static_cast<std::size_t>(kind);
+        const auto value =
+            product::execution_window(report.previous_execution[i], report.current_execution[i]);
+        if (auto mean = value.mean_seconds())
+            out << (kind == ExecutionKind::Prefill ? " | chunk " : " | step ")
+                << product::format_pretty_duration(*mean);
+    }
+    const auto drafts =
+        report.current.speculative_draft_tokens - report.previous.speculative_draft_tokens;
+    const auto accepted =
+        report.current.speculative_accepted_tokens - report.previous.speculative_accepted_tokens;
+    if (drafts)
+        out << " | draft accepted " << accepted << '/' << drafts << " ("
+            << product::format_pretty_percent(double(accepted) / drafts) << ')';
     const double host_seconds = static_cast<double>(host_active_ns(report)) * 1.0e-9;
     const double host_ratio =
         report.interval_seconds > 0.0 ? host_seconds / report.interval_seconds : 0.0;
@@ -436,43 +441,40 @@ void OperationalLog::http_failure(std::string_view endpoint, const RequestFailur
 }
 
 void OperationalLog::engine_capacity(const GenerationService& service) const {
-    const ninfer::MemorySummary memory            = service.memory_summary();
-    const ninfer::EngineOptions& engine           = service.engine_options();
-    const ninfer::ContextCacheOptions& cache      = engine.context_cache;
-    const ninfer::ContextCostSummary context_cost = service.load_summary().context_cost;
+    const auto& description  = service.description();
+    const auto& startup      = service.startup_report();
+    const auto& engine       = service.engine_options();
+    const auto& cache        = engine.context_cache;
+    const auto& context_cost = startup.load.context_cost;
+    logger_->info("capacity | {} | {} ranks | {} active lanes", kv_cache_name(description.kv_cache),
+                  description.ranks.size(), engine.max_concurrency);
+    product::log_context_capacity(*logger_, description);
+    for (std::size_t i = 0; i < description.ranks.size(); ++i) {
+        const auto& rank   = description.ranks[i];
+        const auto& budget = startup.ranks.at(i);
+        logger_->info("rank {} | node {} device {} | budget {} | runtime {} | startup free {}",
+                      rank.rank, rank.node, rank.device,
+                      product::format_pretty_bytes(budget.limit_bytes),
+                      product::format_pretty_bytes(budget.runtime_reservation_bytes),
+                      product::format_pretty_bytes(budget.available_after_startup_bytes));
+        if (budget.graphs)
+            logger_->debug("rank {} | graph rebuild estimate {} | preparation peak {} | delta {} B",
+                           rank.rank,
+                           product::format_pretty_bytes(budget.graphs->rebuild_estimate_bytes),
+                           product::format_pretty_bytes(budget.graphs->preparation_peak_bytes),
+                           budget.graphs->preparation_increment_bytes);
+    }
 
-    logger_->info("capacity | KV {} tokens, {}, {} | pages {}/{} | runtime {} | free {}",
-                  product::format_pretty_count(memory.kv_capacity), kv_cache_name(memory.kv_cache),
-                  kv_capacity_mode_name(memory.kv_capacity_mode),
-                  product::format_pretty_count(memory.kv_capacity_page_groups),
-                  product::format_pretty_count(memory.kv_capacity_max_page_groups),
-                  product::format_pretty_bytes(memory.runtime_reservation_bytes),
-                  product::format_pretty_bytes(memory.available_after_startup_bytes));
+    logger_->info("context | history {} | checkpoint interval {} tokens",
+                  cache.enabled ? "on" : "off", cache.checkpoint_interval);
 
-    logger_->info("context | history {} | {} active + {} extra device states | host {}",
-                  cache.enabled ? "on" : "off", engine.max_concurrency, *cache.device_state_slots,
-                  product::format_pretty_bytes(*cache.host_capacity_bytes));
-
-    if (service.options().enable_vision) {
-        const ninfer::MediaCacheSummary media = service.media_cache_summary();
+    if (service.options().launch.engine.enable_vision) {
+        const ninfer::MediaCacheSummary media = service.snapshot().media;
         logger_->info("media | {} preprocess workers | cache {} | live {}",
                       media.preprocess_threads, product::format_pretty_bytes(media.capacity_bytes),
                       product::format_pretty_bytes(media.live_capacity_bytes));
     }
 
-    const auto graph = memory.cuda_graph.value_or(ninfer::GraphMemorySummary{});
-    logger_->debug(
-        "memory ledger | after weights {} | after startup {} | headroom {} | slack {} | "
-        "graph rebuild estimate {} | graph preparation increment {} B | "
-        "graph calibration increment {} B | graph calibration retained {} B | startup retained {} "
-        "B",
-        product::format_pretty_bytes(memory.available_after_weights_bytes),
-        product::format_pretty_bytes(memory.available_after_startup_bytes),
-        product::format_pretty_bytes(memory.kv_capacity_headroom_bytes),
-        product::format_pretty_bytes(memory.planned_slack_bytes),
-        product::format_pretty_bytes(graph.rebuild_estimate_bytes),
-        graph.preparation_increment_bytes, graph.calibration_increment_bytes,
-        graph.calibration_retained_bytes, memory.startup_retained_bytes);
     logger_->debug("context cost | transfer {} | prefill {} | hardware {} | prefill signature {}",
                    ninfer::context_cost_preset_source_name(context_cost.transfer_source),
                    ninfer::context_cost_preset_source_name(context_cost.prefill_source),

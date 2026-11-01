@@ -3,8 +3,11 @@
 #include "core/nvtx.h"
 #include "ninfer/types.h"
 #include "runtime/contract/execution.h"
+#include "runtime/contract/placement.h"
 #include "runtime/engine/generation_budget.h"
 #include "runtime/engine/context_cache/types.h"
+#include "runtime/executor/contract.h"
+#include "runtime/observability/execution.h"
 
 #include <atomic>
 #include <chrono>
@@ -28,19 +31,19 @@ enum class RequestEngineHostPhase : std::uint8_t {
 };
 
 struct RequestHostTiming {
-    std::uint64_t queue_wait_ns                    = 0;
-    std::uint64_t engine_boundary_exposed_ns       = 0;
-    std::uint64_t program_submit_exposed_ns        = 0;
-    std::uint64_t program_post_exposed_ns          = 0;
-    std::uint64_t engine_commit_output_exposed_ns  = 0;
-    std::uint64_t engine_maintenance_exposed_ns    = 0;
-    std::uint64_t device_wait_exposed_ns           = 0;
-    std::uint64_t constraint_draft_wait_exposed_ns = 0;
-    std::uint64_t decode_host_exposed_ns           = 0;
-    std::uint64_t decode_device_wait_exposed_ns    = 0;
-    std::uint64_t prefill_units                    = 0;
-    std::uint64_t decode_rounds                    = 0;
-    std::uint64_t control_units                    = 0;
+    std::uint64_t queue_wait_ns                     = 0;
+    std::uint64_t engine_boundary_exposed_ns        = 0;
+    std::uint64_t session_call_exposed_ns           = 0;
+    std::uint64_t executor_poll_exposed_ns          = 0;
+    std::uint64_t engine_commit_output_exposed_ns   = 0;
+    std::uint64_t engine_maintenance_exposed_ns     = 0;
+    std::uint64_t scheduler_yield_exposed_ns        = 0;
+    std::uint64_t executor_flush_exposed_ns         = 0;
+    std::uint64_t decode_host_exposed_ns            = 0;
+    std::uint64_t decode_scheduler_yield_exposed_ns = 0;
+    std::uint64_t prefill_units                     = 0;
+    std::uint64_t decode_rounds                     = 0;
+    std::uint64_t control_units                     = 0;
 
     void expose_engine(RequestEngineHostPhase phase, std::uint64_t elapsed_ns,
                        bool decode_member) noexcept {
@@ -58,14 +61,26 @@ struct RequestHostTiming {
         if (decode_member) { decode_host_exposed_ns += elapsed_ns; }
     }
 
-    void expose_program(ExecutionTiming timing, bool decode_member) noexcept {
-        program_submit_exposed_ns += timing.submit_host_ns;
-        program_post_exposed_ns += timing.post_host_ns;
-        device_wait_exposed_ns += timing.device_wait_ns;
-        constraint_draft_wait_exposed_ns += timing.constraint_draft_wait_ns;
+    void expose_call(CoordinatorCall call, std::uint64_t elapsed, bool decode_member) noexcept {
+        switch (call) {
+        case CoordinatorCall::Session:
+            session_call_exposed_ns += elapsed;
+            break;
+        case CoordinatorCall::Poll:
+            executor_poll_exposed_ns += elapsed;
+            break;
+        case CoordinatorCall::Flush:
+            executor_flush_exposed_ns += elapsed;
+            break;
+        case CoordinatorCall::Yield:
+            scheduler_yield_exposed_ns += elapsed;
+            break;
+        }
         if (decode_member) {
-            decode_host_exposed_ns += timing.host_ns();
-            decode_device_wait_exposed_ns += timing.device_wait_ns;
+            if (call == CoordinatorCall::Yield)
+                decode_scheduler_yield_exposed_ns += elapsed;
+            else
+                decode_host_exposed_ns += elapsed;
         }
     }
 
@@ -75,22 +90,22 @@ struct RequestHostTiming {
             .queue_wait_seconds = static_cast<double>(queue_wait_ns) * kNanosecondsToSeconds,
             .engine_boundary_exposed_seconds =
                 static_cast<double>(engine_boundary_exposed_ns) * kNanosecondsToSeconds,
-            .program_submit_exposed_seconds =
-                static_cast<double>(program_submit_exposed_ns) * kNanosecondsToSeconds,
-            .program_post_exposed_seconds =
-                static_cast<double>(program_post_exposed_ns) * kNanosecondsToSeconds,
+            .session_call_exposed_seconds =
+                static_cast<double>(session_call_exposed_ns) * kNanosecondsToSeconds,
+            .executor_poll_exposed_seconds =
+                static_cast<double>(executor_poll_exposed_ns) * kNanosecondsToSeconds,
             .engine_commit_output_exposed_seconds =
                 static_cast<double>(engine_commit_output_exposed_ns) * kNanosecondsToSeconds,
             .engine_maintenance_exposed_seconds =
                 static_cast<double>(engine_maintenance_exposed_ns) * kNanosecondsToSeconds,
-            .device_wait_exposed_seconds =
-                static_cast<double>(device_wait_exposed_ns) * kNanosecondsToSeconds,
-            .constraint_draft_wait_exposed_seconds =
-                static_cast<double>(constraint_draft_wait_exposed_ns) * kNanosecondsToSeconds,
+            .scheduler_yield_exposed_seconds =
+                static_cast<double>(scheduler_yield_exposed_ns) * kNanosecondsToSeconds,
+            .executor_flush_exposed_seconds =
+                static_cast<double>(executor_flush_exposed_ns) * kNanosecondsToSeconds,
             .decode_host_exposed_seconds =
                 static_cast<double>(decode_host_exposed_ns) * kNanosecondsToSeconds,
-            .decode_device_wait_exposed_seconds =
-                static_cast<double>(decode_device_wait_exposed_ns) * kNanosecondsToSeconds,
+            .decode_scheduler_yield_exposed_seconds =
+                static_cast<double>(decode_scheduler_yield_exposed_ns) * kNanosecondsToSeconds,
             .prefill_units = prefill_units,
             .decode_rounds = decode_rounds,
             .control_units = control_units,
@@ -119,7 +134,7 @@ struct RequestRecord {
     using SequenceHandle = typename ModelContract::SequenceHandle;
     using ResumeState    = typename ModelContract::ResumeState;
     using StreamEvent = std::variant<GenerationTimingObservation, GenerationFirstTokenObservation,
-                                     OutputDelta, std::unique_ptr<GenerationSchedulingObservation>>;
+                                     OutputEvent, std::unique_ptr<GenerationSchedulingObservation>>;
 
     RequestRecord(std::uint64_t request_identity, std::uint64_t publication_sequence,
                   PreparedPrompt input, OutputSession output_session, PromptSummary summary,
@@ -184,12 +199,17 @@ struct RequestRecord {
     std::string content;
     std::string reasoning;
     std::optional<LaneId> lane;
+    std::optional<ResidencyId> residency;
     std::optional<SequenceHandle> sequence;
+    std::optional<PlacementId> placement;
+    std::uint64_t placement_tokens = 0;
     std::atomic<bool> cancelled{false};
     EngineRequestState model_state        = EngineRequestState::Waiting;
     bool capture_pending                  = false;
     EngineRequestState post_capture_state = EngineRequestState::Prefill;
     std::optional<FinishReason> terminal_reason;
+    std::exception_ptr terminal_error;
+    bool consumed_by_commit = false;
 
     std::optional<BasePlan> base_plan;
     std::optional<ResumeState> suspended;
@@ -212,20 +232,19 @@ struct RequestRecord {
     std::uint64_t paused_ns                = 0;
     std::optional<Clock::time_point> paused_at;
     std::uint32_t computed_prompt_tokens = 0;
-    GenerationTimings generation_timings;
+    RequestExecutionStatistics executions;
+    std::vector<ExecutionExposure> decode_by_batch;
+    std::array<DurationCounter, 4> max_rank_gpu{};
+    std::optional<ExecutionSample> pending_execution;
     RequestHostTiming host_timing;
     std::uint64_t initial_binding_ns = 0;
-    GenerationWorkTiming prefill_work;
-    GenerationWorkTiming replay_work;
-    std::array<std::array<GenerationTransferTiming, 3>,
-               ModelContract::Program::ContextResources::pool_capacity + 1>
-        context_transfers{};
+    std::vector<ContextTransferSeries> context_transfers;
     std::optional<GenerationFirstOutputTiming> first_output_timing;
     SpeculativeStats speculative_stats;
 
     std::mutex mutex;
     std::condition_variable cv;
-    std::optional<GenerationStart> stream_start;
+    std::optional<GenerationStart> generation_start;
     std::optional<PromptProgress> stream_progress;
     std::vector<StreamEvent> events;
     GenerationResult result;

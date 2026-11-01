@@ -2,7 +2,7 @@
 #include "core/transfer.h"
 #include "core/decode_graph.h"
 #include "models/qwen3_5/load.h"
-#include "models/common/moe/resources.h"
+#include "models/common/moe/offload/resources.h"
 #include "ninfer/ops/sum_contributions.h"
 
 #include <cuda_profiler_api.h>
@@ -22,10 +22,11 @@
 
 namespace {
 using namespace ninfer;
-namespace model  = ninfer::models::qwen3_5;
-namespace shared = ninfer::models::moe;
-using Clock      = std::chrono::steady_clock;
-using Kind       = ops::ExpertSubsetKind;
+namespace model     = ninfer::models::qwen3_5;
+namespace model_moe = ninfer::models::moe;
+namespace offload   = model_moe::offload;
+using Clock         = std::chrono::steady_clock;
+using Kind          = ops::ExpertSubsetKind;
 
 struct Options {
     std::string artifact;
@@ -113,21 +114,21 @@ std::uint16_t bf16(float value) {
 struct Layer {
     artifact::MaterializedArtifact backing;
     ExpertBankSource source;
-    shared::Parameters parameters;
+    model_moe::Parameters parameters;
 
     Layer(const Options& options, DeviceContext& device) {
         artifact::Reader reader(options.artifact);
-        auto plan = model::plan_load(reader);
+        auto definition = model::read_definition(reader);
         const auto& layer =
-            std::get<model::MoeWeights>(plan.weights().text.layers.at(options.layer).ffn);
-        const auto& bank = plan.expert_banks()[layer.bank.index];
+            std::get<model::MoeWeights>(definition->weights().text.layers.at(options.layer).ffn);
+        const auto& bank = definition->expert_banks()[layer.bank.index];
         const std::array fixed{layer.router, layer.shared_score, layer.shared.gate, layer.shared.up,
                                layer.shared.down};
         std::vector<artifact::PlacementRequest> requests{
             {bank.gate_up.object, Device::cpu(), artifact::HostAccess::CudaTransfer},
             {bank.down.object, Device::cpu(), artifact::HostAccess::CudaTransfer}};
         for (const auto id : fixed) {
-            for (const auto& part : plan.parameter(id).binding.parts) {
+            for (const auto& part : definition->parameter(id).binding.parts) {
                 requests.push_back({part.object, device.device()});
             }
         }
@@ -139,10 +140,11 @@ struct Layer {
                    backing.host_transfer_view(bank.down.object)};
         std::array<WeightView, 5> views;
         for (std::size_t i = 0; i < fixed.size(); ++i) {
-            views[i] = artifact::bind_view(plan.parameter(fixed[i]), backing, device.device());
+            views[i] =
+                artifact::bind_view(definition->parameter(fixed[i]), backing, device.device());
         }
         const auto input = [&](std::size_t i) {
-            const auto uses = plan.uses(fixed[i]);
+            const auto uses = definition->uses(fixed[i]);
             if (uses.size() != 1) {
                 throw std::invalid_argument("benchmark requires one fixed weight Use");
             }
@@ -154,7 +156,7 @@ struct Layer {
                               ops::prepare_linear_weight(input(4))};
         auto gu_policy = ops::LinearPolicy::AllowA4, down_policy = gu_policy;
         const auto include = [&](ops::LinearPolicy& policy, ninfer::models::WeightId id) {
-            for (const auto& use : plan.uses(id)) {
+            for (const auto& use : definition->uses(id)) {
                 if (!ops::valid_linear_policy(use.policy)) {
                     throw std::invalid_argument("invalid expert Use");
                 }
@@ -173,8 +175,8 @@ struct Layer {
         parameters.profile = {
             ops::routed_swiglu_profile(
                 source.gate_up, source.down,
-                std::get<model::MoeConfig>(plan.config().text.ffn).num_experts_per_tok, gu_policy,
-                down_policy),
+                std::get<model::MoeConfig>(definition->config().text.ffn).num_experts_per_tok,
+                gu_policy, down_policy),
             ops::swiglu_profile(parameters.shared)};
         parameters.bank = {0};
     }
@@ -218,8 +220,8 @@ MemorySpan bytes(const Tensor& tensor, bool pinned = false) {
     return {tensor.data, tensor.bytes(), tensor.device, pinned};
 }
 
-void serial(const Tensor& x, const shared::Parameters& p, shared::PartitionView partition,
-            Tensor& residual, MemoryArena& work, shared::ExecutionView execution,
+void serial(const Tensor& x, const model_moe::Parameters& p, offload::PartitionView partition,
+            Tensor& residual, MemoryArena& work, offload::ExecutionView execution,
             SerialFrame& frame, const ExpertBankSource& source, const ExpertBankDeviceView& bank) {
     auto& host = *execution.host;
     ops::topk_softmax_route(
@@ -293,11 +295,11 @@ void run(const Options& options) {
     selected.resize(options.gpu_experts);
     std::vector<bool> on_gpu(e);
     for (const auto id : selected) on_gpu[id] = true;
-    shared::Partition partition({0}, e, selected, device);
+    offload::Partition partition({0}, e, selected, device);
     const auto requirements =
-        shared::describe_execution(p.profile, partition.gpu_kind(), ops::MoeEpilogue::AddResidual,
-                                   options.tokens, options.tokens);
-    shared::Bridge resources(requirements, topology, team, device);
+        offload::describe_execution(p.profile, partition.gpu_kind(), ops::MoeEpilogue::AddResidual,
+                                    options.tokens, options.tokens);
+    offload::Bridge resources(requirements, topology, team, device);
     auto execution = resources.execution_view();
     const auto route_scratch =
         ops::topk_softmax_route_workspace_capacity_bytes({h, e, k}, options.tokens, options.tokens);
@@ -396,8 +398,8 @@ void run(const Options& options) {
     auto use = cache.acquire(partition.gpu_keys(), execution.cuda);
     if (!use) throw std::logic_error("benchmark GPU assignment not published");
     const auto prepared =
-        shared::prepare_execution(p, partition.view(), layer.source, cache.view({0}),
-                                  ops::MoeEpilogue::AddResidual, options.tokens, execution);
+        offload::prepare_execution(p, partition.view(), layer.source, cache.view({0}),
+                                   ops::MoeEpilogue::AddResidual, options.tokens, execution);
     std::vector<DecodeGraphExecutable> graphs;
     if (options.execution == "graph") {
         graphs.resize(inputs.size());
@@ -405,7 +407,7 @@ void run(const Options& options) {
             Tensor x(inputs[i].span(), DType::BF16, {h, options.tokens});
             DecodeGraphDefinition definition;
             definition.capture(execution.cuda.stream(), [&] {
-                shared::enqueue_gpu(x, prepared, residual, work, shared::GpuSubmission::Capture);
+                offload::enqueue_gpu(x, prepared, residual, work, offload::GpuSubmission::Capture);
             });
             graphs[i].instantiate(definition);
             graphs[i].upload(execution.cuda.stream());
@@ -414,15 +416,17 @@ void run(const Options& options) {
     }
     const auto call = [&](int sample, bool serialized) {
         Tensor x(inputs[sample % inputs.size()].span(), DType::BF16, {h, options.tokens});
-        if (serialized)
+        if (serialized) {
             serial(x, p, partition.view(), residual, work, execution, frame, layer.source,
                    cache.view({0}));
-        else if (!graphs.empty()) {
-            graphs[sample % graphs.size()].launch(execution.cuda.stream());
-            (void)shared::complete(prepared, residual);
-        } else
-            shared::execute(x, p, partition.view(), layer.source, cache.view({0}),
-                            ops::MoeEpilogue::AddResidual, residual, work, execution);
+        } else {
+            if (!graphs.empty()) {
+                graphs[sample % graphs.size()].launch(execution.cuda.stream());
+            } else {
+                offload::enqueue_gpu(x, prepared, residual, work, offload::GpuSubmission::Eager);
+            }
+            while (!offload::try_complete(prepared, residual)) std::this_thread::yield();
+        }
         device.synchronize();
     };
     // Both schedules use the same team, input corpus, partition, transfers, kernels and output.

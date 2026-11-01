@@ -34,7 +34,7 @@ struct Fp8KvTiledMmaSchedule {
     static constexpr int kKBytes       = KeyTile * 256;
     static constexpr int kVBytes       = KeyTile * 256;
     static constexpr int kVStageBytes  = KeyTile * 256 * 2;
-    static constexpr int kScaleBytes   = 2 * KeyTile * 2;
+    static constexpr int kScaleBytes   = 2 * KeyTile * (1 + sizeof(unsigned));
     static constexpr int kSharedBytes =
         kQBytes + kQScaleBytes + kKBytes + kVBytes + kVStageBytes + kScaleBytes;
     static_assert(kSharedBytes <= 99 * 1024);

@@ -1,11 +1,13 @@
-// Public-Op benchmark for plain/uniform and packed dense Softmax Attention.
+// Public-Op benchmark for uniform and packed dense Softmax Attention.
 // Tile selection and launch decomposition remain private to packed_softmax_attention().
 
+#include "common/roofline.h"
 #include "ninfer/ops/softmax_attention.h"
 #include "core/buffer.h"
 
 #include "core/device.h"
-#include "ninfer_bench_common.h"
+#include "op_measurement.cuh"
+#include "common/gpu_activity.cuh"
 
 #include <cuda_profiler_api.h>
 #include <cuda_runtime.h>
@@ -30,20 +32,16 @@ using namespace ninfer;
 
 namespace {
 
-constexpr std::int32_t kHeadDim = 72;
-constexpr std::int32_t kHeads   = 16;
-constexpr float kScale          = 0.11785113019775792073F;
-constexpr ops::AttentionHeadGeometry kGeometry{kHeadDim, kHeads, kHeads};
-constexpr std::size_t kFlushBytes   = std::size_t{256} << 20;
-constexpr double kDenseBf16TcTflops = 209.5;
-constexpr double kRtx5090DramGBs    = 1792.0;
+constexpr std::int32_t kHeads     = 16;
+constexpr std::size_t kFlushBytes = std::size_t{256} << 20;
 
-enum class Entry : std::uint8_t { Uniform, Packed, Both };
+enum class Entry : std::uint8_t { Uniform, Packed, Plain, Both };
 enum class Execution : std::uint8_t { Eager, Graph, Both };
 enum class CacheMode : std::uint8_t { Cold, Warm, Both };
 enum class CacheState : std::uint8_t { Cold, Warm };
 
 struct Options {
+    int head_dim          = 72;
     Entry entry           = Entry::Both;
     Execution execution   = Execution::Graph;
     CacheMode cache       = CacheMode::Cold;
@@ -51,6 +49,8 @@ struct Options {
     std::int32_t length   = 256;
     std::vector<std::int32_t> segment_lengths;
     bool explicit_lengths = false;
+    bool interleaved_qkv  = true;
+    int calls             = 1;
     int warmup            = 3;
     int repeat            = 30;
     bool profile          = false;
@@ -70,14 +70,15 @@ struct Result {
 };
 
 [[noreturn]] void usage(const char* message) {
-    std::fprintf(stderr,
-                 "error: %s\n"
-                 "usage: ninfer_packed_softmax_attention_bench "
-                 "[--entry uniform|packed|both] [--segments S --length L | "
-                 "--segment-lengths L1,L2,...] "
-                 "[--execution eager|graph|both] [--cache cold|warm|both] "
-                 "[--warmup N] [--repeat N] [--profile] [--csv-out PATH]\n",
-                 message);
+    std::fprintf(
+        stderr,
+        "error: %s\n"
+        "usage: ninfer_packed_softmax_attention_bench "
+        "[--dim 64|72] [--entry plain|uniform|packed|both] [--segments S --length L | "
+        "--segment-lengths L1,L2,...] "
+        "[--layout qkv|contiguous] [--execution eager|graph|both] [--cache cold|warm|both] "
+        "[--warmup N] [--repeat N] [--calls N] [--profile] [--csv-out PATH]\n",
+        message);
     std::exit(2);
 }
 
@@ -117,7 +118,10 @@ Options parse_options(int argc, char** argv) {
             if (++index == argc) { usage(flag); }
             return argv[index];
         };
-        if (argument == "--entry") {
+        if (argument == "--dim") {
+            options.head_dim = parse_i32(next("--dim requires 64 or 72"), 64, 72, "--dim");
+            if (options.head_dim != 64 && options.head_dim != 72) usage("--dim requires 64 or 72");
+        } else if (argument == "--entry") {
             const std::string_view value(next("--entry requires a value"));
             if (value == "uniform")
                 options.entry = Entry::Uniform;
@@ -125,8 +129,10 @@ Options parse_options(int argc, char** argv) {
                 options.entry = Entry::Packed;
             else if (value == "both")
                 options.entry = Entry::Both;
+            else if (value == "plain")
+                options.entry = Entry::Plain;
             else
-                usage("--entry expects uniform, packed, or both");
+                usage("--entry expects plain, uniform, packed, or both");
         } else if (argument == "--segments") {
             options.segments = parse_i32(next("--segments requires a value"), 1,
                                          std::numeric_limits<std::int32_t>::max(), "--segments");
@@ -137,6 +143,11 @@ Options parse_options(int argc, char** argv) {
             options.segment_lengths =
                 parse_list(next("--segment-lengths requires a value"), "--segment-lengths");
             options.explicit_lengths = true;
+        } else if (argument == "--layout") {
+            const std::string_view value(next("--layout requires a value"));
+            if (value != "qkv" && value != "contiguous")
+                usage("--layout expects qkv or contiguous");
+            options.interleaved_qkv = value == "qkv";
         } else if (argument == "--execution") {
             const std::string_view value(next("--execution requires a value"));
             if (value == "eager")
@@ -157,6 +168,8 @@ Options parse_options(int argc, char** argv) {
                 options.cache = CacheMode::Both;
             else
                 usage("--cache expects cold, warm, or both");
+        } else if (argument == "--calls") {
+            options.calls = parse_i32(next("--calls requires a value"), 1, 10000, "--calls");
         } else if (argument == "--warmup") {
             options.warmup = parse_i32(next("--warmup requires a value"), 0, 10000, "--warmup");
         } else if (argument == "--repeat") {
@@ -172,6 +185,8 @@ Options parse_options(int argc, char** argv) {
         }
     }
 
+    if (options.calls > 1 && options.cache != CacheMode::Warm)
+        usage("--calls > 1 requires --cache warm");
     if (!options.explicit_lengths) {
         const std::int64_t tokens = static_cast<std::int64_t>(options.segments) * options.length;
         if (tokens > std::numeric_limits<std::int32_t>::max()) {
@@ -187,6 +202,8 @@ Options parse_options(int argc, char** argv) {
     const bool uniform =
         std::adjacent_find(options.segment_lengths.begin(), options.segment_lengths.end(),
                            std::not_equal_to<>()) == options.segment_lengths.end();
+    if (options.entry == Entry::Plain && options.segment_lengths.size() != 1)
+        usage("plain requires one segment");
     if (!uniform && options.entry != Entry::Packed) {
         usage("nonuniform segment lengths require --entry packed");
     }
@@ -199,27 +216,38 @@ Options parse_options(int argc, char** argv) {
 
 class Case {
 public:
-    explicit Case(std::vector<std::int32_t> segment_lengths)
-        : segment_lengths_(std::move(segment_lengths)),
+    Case(std::vector<std::int32_t> segment_lengths, bool interleaved_qkv, int head_dim)
+        : geometry_{head_dim, kHeads, kHeads}, scale_(1.F / std::sqrt(float(head_dim))),
+          segment_lengths_(std::move(segment_lengths)),
           tokens_(static_cast<std::int32_t>(
               std::accumulate(segment_lengths_.begin(), segment_lengths_.end(), std::int64_t{0}))),
-          q_(bench::make_bf16(static_cast<std::size_t>(kHeadDim) * kHeads * tokens_, 101U)),
-          k_(bench::make_bf16(static_cast<std::size_t>(kHeadDim) * kHeads * tokens_, 103U)),
-          v_(bench::make_bf16(static_cast<std::size_t>(kHeadDim) * kHeads * tokens_, 105U)),
+          qkv_(bench::make_bf16(static_cast<std::size_t>(3 * geometry_.head_dim) * kHeads * tokens_,
+                                101U)),
           cu_seqlens_(ninfer::bench::device_context().device(),
                       (segment_lengths_.size() + 1) * sizeof(std::int32_t)),
-          output_(bench::make_zeros(static_cast<std::size_t>(kHeadDim) * kHeads * tokens_ * 2)),
+          output_(bench::make_zeros(static_cast<std::size_t>(geometry_.head_dim) * kHeads *
+                                    tokens_ * 2)),
           workspace_bytes_(ops::packed_softmax_attention_workspace_capacity_bytes(
-              kGeometry, tokens_, tokens_, static_cast<std::int32_t>(segment_lengths_.size()),
+              geometry_, tokens_, tokens_, static_cast<std::int32_t>(segment_lengths_.size()),
               static_cast<std::int32_t>(segment_lengths_.size()))),
           workspace_storage_(bench::make_buffer(std::max<std::size_t>(workspace_bytes_, 1))),
           workspace_(workspace_storage_.span()),
-          q_tensor_(q_.span(), DType::BF16, {kHeadDim, kHeads, tokens_}),
-          k_tensor_(k_.span(), DType::BF16, {kHeadDim, kHeads, tokens_}),
-          v_tensor_(v_.span(), DType::BF16, {kHeadDim, kHeads, tokens_}),
+          q_tensor_(qkv_.span(), DType::BF16, {geometry_.head_dim, kHeads, tokens_}),
+          k_tensor_(qkv_.span(), DType::BF16, {geometry_.head_dim, kHeads, tokens_}),
+          v_tensor_(qkv_.span(), DType::BF16, {geometry_.head_dim, kHeads, tokens_}),
           cu_tensor_(cu_seqlens_.span(), DType::I32,
                      {static_cast<std::int32_t>(segment_lengths_.size() + 1)}),
-          output_tensor_(output_.span(), DType::BF16, {kHeadDim, kHeads, tokens_}) {
+          output_tensor_(output_.span(), DType::BF16, {geometry_.head_dim, kHeads, tokens_}) {
+        const std::size_t plane = geometry_.head_dim * kHeads * sizeof(std::uint16_t);
+        const auto offset       = interleaved_qkv ? plane : plane * tokens_;
+        k_tensor_.data          = static_cast<std::byte*>(qkv_.data()) + offset;
+        v_tensor_.data          = static_cast<std::byte*>(qkv_.data()) + 2 * offset;
+        if (interleaved_qkv) {
+            for (auto* tensor : {&q_tensor_, &k_tensor_, &v_tensor_}) {
+                tensor->nb[2] = 3 * plane;
+                tensor->nb[3] = 3 * plane * tokens_;
+            }
+        }
         std::vector<std::int32_t> cumulative(segment_lengths_.size() + 1, 0);
         for (std::size_t index = 0; index < segment_lengths_.size(); ++index) {
             cumulative[index + 1] = cumulative[index] + segment_lengths_[index];
@@ -230,15 +258,13 @@ public:
 
     void launch(Entry entry, CudaExecutionView cuda) {
         if (entry == Entry::Uniform) {
-            if (segment_lengths_.size() == 1) {
-                ops::softmax_attention(q_tensor_, k_tensor_, v_tensor_, kGeometry, kScale,
-                                       workspace_, output_tensor_, cuda);
-            } else {
-                ops::packed_softmax_attention(q_tensor_, k_tensor_, v_tensor_, kGeometry, kScale,
-                                              segment_lengths_.front(), output_tensor_, cuda);
-            }
+            ops::packed_softmax_attention(q_tensor_, k_tensor_, v_tensor_, geometry_, scale_,
+                                          segment_lengths_.front(), output_tensor_, cuda);
+        } else if (entry == Entry::Plain) {
+            ops::softmax_attention(q_tensor_, k_tensor_, v_tensor_, geometry_, scale_, workspace_,
+                                   output_tensor_, cuda);
         } else {
-            ops::packed_softmax_attention(q_tensor_, k_tensor_, v_tensor_, kGeometry, kScale,
+            ops::packed_softmax_attention(q_tensor_, k_tensor_, v_tensor_, geometry_, scale_,
                                           cu_tensor_, workspace_, output_tensor_, cuda);
         }
     }
@@ -256,21 +282,25 @@ public:
     [[nodiscard]] double useful_flops() const noexcept {
         double squared_lengths = 0.0;
         for (const std::int32_t length : segment_lengths_) {
-            squared_lengths += static_cast<double>(length) * length;
+            // A one-key segment is the identity on V and needs no contractions.
+            if (length > 1) squared_lengths += static_cast<double>(length) * length;
         }
-        return 4.0 * kHeadDim * kHeads * squared_lengths;
+        return 4.0 * geometry_.head_dim * kHeads * squared_lengths;
     }
 
     [[nodiscard]] double useful_bytes() const noexcept {
-        return 8.0 * static_cast<double>(kHeadDim) * kHeads * tokens_;
+        double bytes = 0;
+        for (const std::int32_t length : segment_lengths_)
+            bytes += (length == 1 ? 4.0 : 8.0) * geometry_.head_dim * kHeads * length;
+        return bytes;
     }
 
 private:
+    ops::AttentionHeadGeometry geometry_;
+    float scale_;
     std::vector<std::int32_t> segment_lengths_;
     std::int32_t tokens_;
-    DeviceBuffer q_;
-    DeviceBuffer k_;
-    DeviceBuffer v_;
+    DeviceBuffer qkv_;
     DeviceBuffer cu_seqlens_;
     DeviceBuffer output_;
     std::size_t workspace_bytes_;
@@ -283,7 +313,9 @@ private:
     Tensor output_tensor_;
 };
 
-const char* entry_name(Entry entry) { return entry == Entry::Uniform ? "uniform" : "packed"; }
+const char* entry_name(Entry entry) {
+    return entry == Entry::Uniform ? "uniform" : entry == Entry::Plain ? "plain" : "packed";
+}
 
 const char* execution_name(Execution execution) {
     return execution == Execution::Eager ? "eager" : "graph";
@@ -292,17 +324,22 @@ const char* execution_name(Execution execution) {
 const char* cache_name(CacheState cache) { return cache == CacheState::Cold ? "cold" : "warm"; }
 
 bench::ColdTiming measure(Case& data, Entry entry, Execution execution, CacheState cache,
-                          bench::TimedGraph* graph, bench::L2FlushBuffer& flush,
-                          CudaExecutionView cuda, int warmup, int repeat) {
-    if (execution == Execution::Eager) {
-        const auto launch = [&](CudaExecutionView cuda) { data.launch(entry, cuda); };
-        return cache == CacheState::Cold
-                   ? bench::measure_cold_launch(launch, flush, cuda, warmup, repeat)
-                   : bench::measure_launch(launch, cuda, warmup, repeat);
-    }
-    return cache == CacheState::Cold
-               ? bench::measure_cold_graph(*graph, flush, cuda, warmup, repeat)
-               : bench::measure_graph(*graph, cuda, warmup, repeat);
+                          bench::L2FlushBuffer& flush, CudaExecutionView cuda,
+                          const Options& options) {
+    bench::measurement::Options timing;
+    timing.warmup = options.warmup;
+    timing.repeat = options.repeat;
+    auto result   = bench::measurement::measure(
+                      [&](auto e) {
+                          for (int i = 0; i < options.calls; ++i) data.launch(entry, e);
+                      },
+                      [](auto e) { bench::condition_gpu(e, 200); }, flush, cuda, timing,
+                      execution_name(execution), cache_name(cache))
+                      .gpu;
+    result.median_us /= options.calls;
+    result.min_us /= options.calls;
+    result.p95_us /= options.calls;
+    return result;
 }
 
 void report(const Result& result) {
@@ -311,12 +348,13 @@ void report(const Result& result) {
     const double tflops  = result.useful_flops / seconds / 1.0e12;
     std::printf("entry=%-7s execution=%-5s cache=%-4s P=%6d S=%4d workspace=%8zu "
                 "median=%9.3f us min=%9.3f us p95=%9.3f us useful=%8.1f GB/s "
-                "(%5.1f%% of %.0f) math=%7.2f TFLOP/s (%5.1f%% of %.1f)\n",
+                "(%5.1f%% of %.0f) math=%7.2f TFLOP/s (%5s%% of %s)\n",
                 entry_name(result.entry), execution_name(result.execution),
                 cache_name(result.cache), result.tokens, result.segments, result.workspace_bytes,
                 result.timing.median_us, result.timing.min_us, result.timing.p95_us, gbps,
-                gbps / kRtx5090DramGBs * 100.0, kRtx5090DramGBs, tflops,
-                tflops / kDenseBf16TcTflops * 100.0, kDenseBf16TcTflops);
+                gbps / bench::kRoofline.memory_gbs * 100.0, bench::kRoofline.memory_gbs, tflops,
+                bench::format_metric(tflops / bench::kRoofline.bf16_f32_tflops * 100.0, 1).c_str(),
+                bench::format_metric(bench::kRoofline.bf16_f32_tflops, 1).c_str());
 }
 
 void write_csv(const Options& options, const std::vector<Result>& results) {
@@ -325,14 +363,18 @@ void write_csv(const Options& options, const std::vector<Result>& results) {
     if (!path.parent_path().empty()) { std::filesystem::create_directories(path.parent_path()); }
     std::ofstream output(path);
     if (!output) { throw std::runtime_error("failed to open CSV output"); }
-    output << "entry,execution,cache,tokens,segments,workspace_bytes,useful_bytes,useful_flops,"
-              "median_us,min_us,p95_us\n";
+    output
+        << "entry,execution,cache,tokens,segments,workspace_bytes,useful_bytes,useful_flops,"
+           "median_us,min_us,p95_us,layout,memory_reference_us,math_reference_us,head_dim,calls\n";
     for (const Result& result : results) {
         output << entry_name(result.entry) << ',' << execution_name(result.execution) << ','
                << cache_name(result.cache) << ',' << result.tokens << ',' << result.segments << ','
                << result.workspace_bytes << ',' << result.useful_bytes << ',' << result.useful_flops
                << ',' << result.timing.median_us << ',' << result.timing.min_us << ','
-               << result.timing.p95_us << '\n';
+               << result.timing.p95_us << ',' << (options.interleaved_qkv ? "qkv" : "contiguous")
+               << ',' << result.useful_bytes / (bench::kRoofline.memory_gbs * 1000.) << ','
+               << result.useful_flops / (bench::kRoofline.bf16_f32_tflops * 1.e6) << ','
+               << options.head_dim << ',' << options.calls << '\n';
     }
 }
 
@@ -381,7 +423,7 @@ int main(int argc, char** argv) {
         CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
         const auto cuda = ninfer::bench::device_context().execution_view(stream);
         bench::L2FlushBuffer flush(kFlushBytes);
-        Case data(options.segment_lengths);
+        Case data(options.segment_lengths, options.interleaved_qkv, options.head_dim);
 
         if (options.profile) {
             profile(data, options.entry, options, flush, cuda);
@@ -390,16 +432,10 @@ int main(int argc, char** argv) {
         }
 
         std::vector<Result> results;
-        for (const Entry entry : {Entry::Uniform, Entry::Packed}) {
-            if ((options.entry == Entry::Uniform && entry != Entry::Uniform) ||
-                (options.entry == Entry::Packed && entry != Entry::Packed)) {
+        for (const Entry entry : {Entry::Uniform, Entry::Packed, Entry::Plain}) {
+            if ((options.entry != Entry::Both && options.entry != entry) ||
+                (options.entry == Entry::Both && entry == Entry::Plain)) {
                 continue;
-            }
-            bench::TimedGraph graph;
-            if (options.execution != Execution::Eager) {
-                data.launch(entry, cuda);
-                CUDA_CHECK(cudaStreamSynchronize(stream));
-                graph.capture(cuda, [&](CudaExecutionView cuda) { data.launch(entry, cuda); });
             }
             for (const Execution execution : {Execution::Eager, Execution::Graph}) {
                 if ((options.execution == Execution::Eager && execution != Execution::Eager) ||
@@ -419,8 +455,7 @@ int main(int argc, char** argv) {
                                   data.workspace_bytes(entry),
                                   data.useful_bytes(),
                                   data.useful_flops(),
-                                  measure(data, entry, execution, cache, &graph, flush, cuda,
-                                          options.warmup, options.repeat)};
+                                  measure(data, entry, execution, cache, flush, cuda, options)};
                     report(result);
                     results.push_back(result);
                 }

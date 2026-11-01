@@ -90,4 +90,5 @@ class ModelOptNvfp4:
             encoded,
             lambda: dw,
             lambda: da,
+            encoded_format="nvfp4",
         )

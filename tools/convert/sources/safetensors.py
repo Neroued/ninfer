@@ -51,8 +51,6 @@ class SafetensorsSource:
         self._headers: dict[Path, dict[str, TensorInfo]] = {}
         self._fds: OrderedDict[Path, int] = OrderedDict()
         self.bytes_read = 0
-        # Parallel conversion workers share this source. Protect the
-        # mutable header/FD caches and keep an FD alive across pread().
         self._read_lock = threading.RLock()
         if self.path.is_file() and self.path.suffix == ".safetensors":
             file = self.path
@@ -150,17 +148,15 @@ class SafetensorsSource:
             return torch.empty(0, dtype=dtype)
         count = (end - begin) * word_bytes
         offset = info.offset + begin * word_bytes
+        raw = bytearray(count)
         with self._read_lock:
-            # _file() may evict/close the LRU descriptor. Keep the lock held
-            # until pread() and cache-discard complete so another worker cannot
-            # invalidate this descriptor underneath us.
+            # A concurrent reader must not evict the FD during preadv.
             fd = self._file(info.file)
-            raw = os.pread(fd, count, offset)
-            if len(raw) != count:
+            if os.preadv(fd, [raw], offset) != count:
                 raise ValueError(f"{name}: short source read")
             self.bytes_read += count
             discard_cached_pages(fd, offset, count)
-        return torch.frombuffer(bytearray(raw), dtype=dtype)
+        return torch.frombuffer(raw, dtype=dtype)
 
     def close(self) -> None:
         with self._read_lock:

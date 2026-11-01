@@ -7,12 +7,10 @@
 #include <functional>
 #include <map>
 #include <stdexcept>
-#include <string_view>
 #include <utility>
 
 #include "grammar_functor.h"
 #include "fsm_builder.h"
-#include <tuple>
 #include "regex_converter.h"
 #include "support/encoding.h"
 #include "support/json_parse.h"
@@ -24,7 +22,43 @@ std::string encode(const std::string& value) {
   return json.substr(1, json.size() - 2);
 }
 
+FSMWithStartEnd Minimize(FSMWithStartEnd fsm) {
+  auto result = fsm.MinimizeDFA(65536);
+  if (result.IsErr()) throw std::move(result).UnwrapErr();
+  return std::move(result).Unwrap();
+}
+
+void AddBytes(FSM& fsm, int source, int target, const std::string& bytes) {
+  for (size_t i = 0; i < bytes.size(); ++i) {
+    const int next = i + 1 == bytes.size() ? target : fsm.AddState();
+    const auto byte = static_cast<unsigned char>(bytes[i]);
+    fsm.AddEdge(source, next, byte, byte);
+    source = next;
+  }
+}
+
+FSMWithStartEnd JSONEncodedFSM(const FSMWithStartEnd& input) {
+  FSM result;
+  for (int i = 0; i < input.NumStates(); ++i) result.AddState();
+  for (int state = 0; state < input.NumStates(); ++state) {
+    for (const auto& edge : input.GetFsm().GetEdges(state)) {
+      // UTF-8 multibyte sequences are unchanged. Escape only JSON's ASCII syntax/control bytes.
+      for (const auto [lo, hi] : {std::pair{0x20, 0x21}, {0x23, 0x5b}, {0x5d, 0xff}})
+        if (std::max(lo, edge.min) <= std::min(hi, edge.max))
+          result.AddEdge(state, edge.target, std::max(lo, edge.min), std::min(hi, edge.max));
+      for (int byte = edge.min; byte <= std::min(edge.max, 0x5c); ++byte)
+        if (byte < 0x20 || byte == '"' || byte == '\\')
+          AddBytes(result, state, edge.target, encode(std::string(1, static_cast<char>(byte))));
+    }
+  }
+  return Minimize(FSMWithStartEnd(result, input.GetStart(), input.GetEnds()));
+}
+
 class JSONEncoder : public GrammarMutator {
+  int32_t VisitByteFSM(const GrammarExpr& expr) final {
+    return builder_->AddByteFSM(JSONEncodedFSM(base_grammar_->GetByteFSM(expr)));
+  }
+
   int32_t VisitByteString(const GrammarExpr& expr) final {
     std::string value;
     for (int byte : expr) value += static_cast<char>(byte);
@@ -69,178 +103,24 @@ class JSONEncoder : public GrammarMutator {
 };
 }  // namespace
 
-int32_t AddScalarStringFSM(GrammarBuilder& builder, const FSMWithStartEnd& fsm,
-                           const std::string& rule_name, bool close_json_string,
-                           bool share_continuations) {
-  // Do not emit paths that can never complete after exclusions. Otherwise a matcher
-  // could accept a forbidden alternative's prefix and reach an all-rejected mask later.
-  std::vector<std::vector<int>> predecessors(fsm.NumStates());
-  for (int state = 0; state < fsm.NumStates(); ++state) {
-    for (const auto& edge : fsm.GetFsm().GetEdges(state)) {
-      predecessors[edge.target].push_back(state);
-    }
+int32_t AddScalarStringFSM(GrammarBuilder& builder, const FSMWithStartEnd& input,
+                           const std::string& rule_name, bool close_json_string) {
+  // Preserve Unicode scalar semantics, including where byte regexes admit overlong encodings.
+  static const auto scalar = [] {
+    auto parsed = GrammarFSMBuilder::Regex(R"([^\uD800-\uDFFF]*)", false);
+    if (parsed.IsErr()) throw std::move(parsed).UnwrapErr();
+    return Minimize(std::move(parsed).Unwrap());
+  }();
+  auto intersection = FSMWithStartEnd::Intersect(input, scalar);
+  if (intersection.IsErr()) throw std::move(intersection).UnwrapErr();
+  auto fsm = Minimize(std::move(intersection).Unwrap());
+  if (close_json_string) {
+    const auto ends = fsm.GetEnds();
+    const int end = fsm.AddState();
+    for (int old : ends) fsm.GetFsm().AddEdge(old, end, '"', '"');
+    fsm = FSMWithStartEnd(fsm.GetFsm(), fsm.GetStart(), {end});
   }
-  std::vector<bool> productive(fsm.NumStates(), false);
-  std::vector<int> worklist(fsm.GetEnds().begin(), fsm.GetEnds().end());
-  for (int state : worklist) productive[state] = true;
-  for (size_t index = 0; index < worklist.size(); ++index) {
-    for (int state : predecessors[worklist[index]]) {
-      if (!productive[state]) {
-        productive[state] = true;
-        worklist.push_back(state);
-      }
-    }
-  }
-  if (!productive[fsm.GetStart()]) {
-    return builder.AddCharacterClass({{0, 0x10ffff}}, true);
-  }
-
-  // Collapse UTF-8 paths into codepoint transitions before emitting character classes.
-  // Emitting individual continuation bytes as string literals would not round-trip through
-  // EBNF, whose escaped string literals represent Unicode codepoints rather than raw bytes.
-  struct CodepointRange {
-    int min, max, target;
-  };
-  using Ranges = std::vector<CodepointRange>;
-  auto merge_ranges = [](Ranges ranges) {
-    std::sort(ranges.begin(), ranges.end(), [](const auto& a, const auto& b) {
-      return std::tie(a.target, a.min, a.max) < std::tie(b.target, b.min, b.max);
-    });
-    Ranges merged;
-    for (const auto& range : ranges) {
-      if (!merged.empty() && merged.back().target == range.target &&
-          range.min <= merged.back().max + 1) {
-        merged.back().max = std::max(merged.back().max, range.max);
-      } else {
-        merged.push_back(range);
-      }
-    }
-    return merged;
-  };
-  auto append_ranges = [](Ranges* ranges, int min, int max, int shift,
-                          const CodepointRange& suffix) {
-    if (suffix.min == 0 && suffix.max == (1 << shift) - 1) {
-      ranges->push_back({min << shift, (max << shift) | suffix.max, suffix.target});
-    } else {
-      for (int prefix = min; prefix <= max; ++prefix) {
-        ranges->push_back(
-            {(prefix << shift) | suffix.min, (prefix << shift) | suffix.max, suffix.target});
-      }
-    }
-  };
-  // Memoize suffixes so wide Unicode classes do not enumerate every codepoint.
-  std::map<std::pair<int, int>, Ranges> suffix_cache;
-  std::function<const Ranges&(int, int)> suffix_ranges = [&](int state,
-                                                             int remaining) -> const Ranges& {
-    auto [it, inserted] = suffix_cache.emplace(std::make_pair(state, remaining), Ranges{});
-    if (!inserted) return it->second;
-    Ranges ranges;
-    if (remaining == 0) {
-      ranges.push_back({0, 0, state});
-    } else {
-      for (const auto& edge : fsm.GetFsm().GetEdges(state)) {
-        if (!productive[edge.target]) continue;
-        XGRAMMAR_CHECK(edge.IsCharRange());
-        int min = std::max(edge.min, 0x80), max = std::min(edge.max, 0xbf);
-        if (min > max) continue;
-        for (const auto& suffix : suffix_ranges(edge.target, remaining - 1)) {
-          append_ranges(&ranges, min & 0x3f, max & 0x3f, 6 * (remaining - 1), suffix);
-        }
-      }
-    }
-    it->second = merge_ranges(std::move(ranges));
-    return it->second;
-  };
-
-  std::vector<int32_t> rules(fsm.NumStates(), -1);
-  std::vector<int> pending{fsm.GetStart()};
-  // Share complete fallback branches across key prefixes to reuse their token masks.
-  // The key contains the target state followed by every codepoint interval.
-  std::map<std::vector<int32_t>, int32_t> shared_key_continuations;
-  rules[fsm.GetStart()] = builder.AddEmptyRuleWithHint(rule_name + "_exclude");
-  for (size_t index = 0; index < pending.size(); ++index) {
-    int state = pending[index];
-    Ranges ranges;
-    for (const auto& edge : fsm.GetFsm().GetEdges(state)) {
-      if (!productive[edge.target]) continue;
-      XGRAMMAR_CHECK(edge.IsCharRange());
-      if (edge.min < 128) {
-        ranges.push_back({edge.min, std::min(edge.max, 127), edge.target});
-      }
-      const int leading_min[] = {0, 0xc2, 0xe0, 0xf0};
-      const int leading_max[] = {0, 0xdf, 0xef, 0xf4};
-      for (int remaining = 1; remaining <= 3; ++remaining) {
-        int min = std::max(edge.min, leading_min[remaining]);
-        int max = std::min(edge.max, leading_max[remaining]);
-        if (min > max) continue;
-        int mask = (1 << (6 - remaining)) - 1;
-        Ranges unicode_ranges;
-        for (const auto& suffix : suffix_ranges(edge.target, remaining)) {
-          append_ranges(&unicode_ranges, min & mask, max & mask, 6 * remaining, suffix);
-        }
-        // The byte FSM can contain non-canonical UTF-8 paths. Never turn an overlong
-        // encoding into a second transition for an ASCII character (bypassing exclusions).
-        const int codepoint_min[] = {0, 0x80, 0x800, 0x10000};
-        const int codepoint_max[] = {0, 0x7ff, 0xffff, 0x10ffff};
-        for (auto range : unicode_ranges) {
-          range.min = std::max(range.min, codepoint_min[remaining]);
-          range.max = std::min(range.max, codepoint_max[remaining]);
-          if (range.min <= range.max) {
-            // Raw tool strings and JSON strings contain Unicode scalar values.
-            if (range.min <= 0xd7ff)
-              ranges.push_back({range.min, std::min(range.max, 0xd7ff), range.target});
-            if (range.max >= 0xe000)
-              ranges.push_back({std::max(range.min, 0xe000), range.max, range.target});
-          }
-        }
-      }
-    }
-    std::map<int, std::vector<GrammarBuilder::CharacterClassElement>> transitions;
-    for (const auto& range : merge_ranges(std::move(ranges))) {
-      transitions[range.target].push_back({range.min, range.max});
-    }
-    std::vector<int32_t> choices;
-    // Keep the closing quote on the accepting body states. A nullable body rule
-    // would otherwise finish at every character and force token masks to speculate
-    // across its parent rules. The quote is appended AFTER the exclusion intersection:
-    // it is JSON syntax, not string content subject to excludes.
-    if (fsm.IsEndState(state)) {
-      choices.push_back(close_json_string ? builder.AddByteString("\"") : builder.AddEmptyStr());
-    }
-    for (const auto& [target, codepoints] : transitions) {
-      if (rules[target] == -1) {
-        rules[target] = builder.AddEmptyRuleWithHint(rule_name + "_exclude");
-        pending.push_back(target);
-      }
-      bool single_ascii = codepoints.size() == 1 && codepoints[0].lower == codepoints[0].upper &&
-                          codepoints[0].upper <= 0x7f;
-      // Keep self-loops local for the compiler's speculative string-mask fast path.
-      if (share_continuations && !single_ascii && target != state) {
-        std::vector<int32_t> key{target};
-        key.reserve(1 + codepoints.size() * 2);
-        for (const auto& range : codepoints) {
-          key.push_back(range.lower);
-          key.push_back(range.upper);
-        }
-        auto [it, inserted] = shared_key_continuations.emplace(std::move(key), -1);
-        if (inserted) {
-          it->second =
-              builder.AddRuleWithHint(rule_name + "_exclude_continuation",
-                                      builder.AddSequence({builder.AddCharacterClass(codepoints),
-                                                           builder.AddRuleRef(rules[target])}));
-        }
-        choices.push_back(builder.AddRuleRef(it->second));
-      } else {
-        choices.push_back(builder.AddSequence(
-            {builder.AddCharacterClass(codepoints), builder.AddRuleRef(rules[target])}));
-      }
-    }
-    if (choices.empty()) {
-      choices.push_back(builder.AddCharacterClass({{0, 0x10ffff}}, true));
-    }
-    builder.UpdateRuleBody(rules[state], builder.AddChoices(choices));
-  }
-  return builder.AddRuleRef(rules[fsm.GetStart()]);
+  return builder.AddRuleRef(builder.AddRuleWithHint(rule_name, builder.AddByteFSM(fsm)));
 }
 
 Grammar StringConstraints(const std::vector<std::string>& patterns, int minimum, int maximum,
@@ -271,10 +151,114 @@ Grammar StringConstraints(const std::vector<std::string>& patterns, int minimum,
   if (!exclusion) throw std::invalid_argument("invalid string exclusion");
   intersect(*exclusion);
   GrammarBuilder builder;
-  const auto body = AddScalarStringFSM(builder, fsm, "value", false, false);
+  const auto body = AddScalarStringFSM(builder, fsm, "value", false);
   auto grammar = builder.Get(builder.AddRuleWithHint("root", body));
   if (json_encoding) grammar = JSONEncoder().Apply(grammar);
   return GrammarNormalizer::Apply(grammar);
+}
+
+StringDispatch::StringDispatch(GrammarBuilder& builder, std::string delimiter,
+                               int32_t default_value, std::string forbidden_ascii, bool nonempty)
+    : builder_(builder), delimiter_(std::move(delimiter)), default_value_(default_value) {
+  XGRAMMAR_CHECK(!delimiter_.empty());
+  std::string allowed = "[^\\uD800-\\uDFFF";
+  for (unsigned char byte : forbidden_ascii) {
+    XGRAMMAR_CHECK(byte < 128);
+    constexpr char hex[] = "0123456789abcdef";
+    allowed += "\\x";
+    allowed += hex[byte >> 4];
+    allowed += hex[byte & 15];
+  }
+  allowed += nonempty ? "]+" : "]*";
+  auto raw = GrammarFSMBuilder::Regex(allowed, false);
+  if (raw.IsErr()) throw std::move(raw).UnwrapErr();
+  auto stop = GrammarFSMBuilder::TagDispatch({{}, false, {delimiter_}});
+  XGRAMMAR_CHECK(stop.has_value());
+  auto body = FSMWithStartEnd::Intersect(std::move(raw).Unwrap(), *stop);
+  if (body.IsErr()) throw std::move(body).UnwrapErr();
+  auto fsm = std::move(body).Unwrap();
+  const auto ends = fsm.GetEnds();
+  const int final = fsm.AddState();
+  for (int end : ends) AddBytes(fsm.GetFsm(), end, final, delimiter_);
+  lexer_ = Minimize(FSMWithStartEnd(fsm.GetFsm(), fsm.GetStart(), {final}));
+}
+
+int32_t StringDispatch::Add(const std::vector<std::pair<std::string, int32_t>>& cases) {
+  struct Node {
+    std::map<unsigned char, size_t> children;
+    int state;
+    bool terminal = false;
+  };
+  const auto advance = [&](int state, unsigned char byte) {
+    for (const auto& edge : lexer_.GetFsm().GetEdges(state))
+      if (edge.min <= byte && byte <= edge.max) return edge.target;
+    return -1;
+  };
+  std::vector<Node> nodes{{{}, lexer_.GetStart()}};
+  std::map<int32_t, std::vector<std::string>> values;
+  for (const auto& [name, value] : cases) {
+    const auto full = name + delimiter_;
+    size_t node = 0;
+    for (unsigned char byte : full) {
+      auto found = nodes[node].children.find(byte);
+      if (found != nodes[node].children.end()) {
+        node = found->second;
+      } else {
+        const int state = advance(nodes[node].state, byte);
+        XGRAMMAR_CHECK(state >= 0) << "Name is outside the delimited string language";
+        const size_t child = nodes.size();
+        nodes[node].children.emplace(byte, child);
+        nodes.push_back({{}, state});
+        node = child;
+      }
+    }
+    XGRAMMAR_CHECK(lexer_.IsEndState(nodes[node].state) && !nodes[node].terminal);
+    nodes[node].terminal = true;
+    values[value].push_back(full);
+  }
+  const auto branch = [&](const FSMWithStartEnd& fsm, int32_t value) {
+    const int name = builder_.AddRuleWithHint("parameter_name", builder_.AddByteFSM(fsm));
+    return builder_.AddSequence({builder_.AddRuleRef(name), builder_.AddRuleRef(value)});
+  };
+  std::vector<int32_t> choices;
+  for (const auto& [value, names] : values) {
+    auto trie = TrieFSMBuilder::Build(names, {});
+    XGRAMMAR_CHECK(trie.has_value());
+    choices.push_back(branch(Minimize(*trie), value));
+  }
+  // A mismatch leaves the positive trie once and joins the shared name lexer.
+  // Do not compose a regex complement or replicate the suffix at each prefix.
+  FSM fallback;
+  const int suffix = nodes.size();
+  for (int i = 0; i < suffix + lexer_.NumStates(); ++i) fallback.AddState();
+  std::vector<int32_t> ends;
+  for (int i = 0; i < suffix; ++i) {
+    const auto& node = nodes[i];
+    if (!node.terminal && lexer_.IsEndState(node.state)) ends.push_back(i);
+    int first = 0, previous = -1;
+    for (int byte = 0; byte <= 256; ++byte) {
+      int target = -1;
+      if (byte < 256) {
+        const int next = advance(node.state, static_cast<unsigned char>(byte));
+        if (next >= 0) {
+          auto child = node.children.find(byte);
+          target = child == node.children.end() ? suffix + next : int(child->second);
+        }
+      }
+      if (target != previous) {
+        if (previous >= 0) fallback.AddEdge(i, previous, first, byte - 1);
+        first = byte;
+        previous = target;
+      }
+    }
+  }
+  for (int state = 0; state < lexer_.NumStates(); ++state) {
+    if (lexer_.IsEndState(state)) ends.push_back(suffix + state);
+    for (const auto& edge : lexer_.GetFsm().GetEdges(state))
+      fallback.AddEdge(suffix + state, suffix + edge.target, edge.min, edge.max);
+  }
+  choices.push_back(branch(Minimize(FSMWithStartEnd(fallback, 0, ends)), default_value_));
+  return builder_.AddRuleWithHint("parameter_dispatch", builder_.AddChoices(choices));
 }
 
 std::string SchemaStringPattern(const std::string& pattern) {

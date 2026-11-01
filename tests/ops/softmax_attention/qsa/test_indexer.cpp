@@ -1,3 +1,5 @@
+#include "ops/suite.h"
+#include "kv_cache_storage.h"
 #include "indexer_fixture.h"
 #include "cuda_fixture.h"
 #include "core/buffer.h"
@@ -11,8 +13,8 @@ using namespace ninfer::test;
 using namespace ninfer::test::qsa::indexer;
 
 namespace {
-// BF16 products are exact in FP32 for these normal-range operands. This fixed gamma bound
-// covers 128-term accumulation, the 1-Lipschitz ReLU, and the four-head FP32 sum.
+// Fixed score-error criterion over represented inputs: 128-term dot products, ReLU and
+// the four-head sum. Every implementation uses this same ranking-error budget.
 constexpr double kU          = 0x1p-24;
 constexpr double kScoreGamma = (132 * kU) / (1 - 132 * kU);
 
@@ -100,22 +102,30 @@ int verify(Fixture& f, const std::string& label, bool preserved = true) {
     if (preserved) {
         failures += verify_exact(
             "query preserved", from_device<std::uint16_t>(f.query.data, f.q_host.size()), f.q_host);
-        failures +=
-            verify_exact("keys preserved",
-                         from_device<std::uint16_t>(f.cache.keys.data, f.k_host.size()), f.k_host);
+        failures += verify_exact(
+            "keys preserved",
+            [&] {
+                auto bytes = f.packed->download_plane(0);
+                std::vector<std::uint16_t> words(bytes.size() / 2);
+                std::memcpy(words.data(), bytes.data(), bytes.size());
+                return words;
+            }(),
+            f.k_host);
         failures +=
             verify_exact("positions preserved",
                          from_device<int>(f.batch.positions.data, f.positions.size()), f.positions);
-        failures +=
-            verify_exact("tables preserved",
-                         from_device<int>(f.cache.block_tables.data, f.tables.size()), f.tables);
+        failures += verify_exact("tables preserved",
+                                 from_device<std::int64_t>(f.cache.keys.records.page_offsets.data,
+                                                           f.table_offsets.size()),
+                                 f.table_offsets);
         failures += verify_exact("counts metadata preserved",
                                  from_device<int>(f.batch.valid_columns.data, f.B), f.valid);
         failures += verify_exact("selectors preserved",
                                  from_device<int>(f.batch.table_rows.data, f.B), f.table_rows);
     }
-    for (auto* buffer : {&f.q, &f.keys, &f.pos, &f.lengths, &f.rows, &f.table, &f.ids, &f.counts})
+    for (auto* buffer : {&f.q, &f.pos, &f.lengths, &f.rows, &f.table, &f.ids, &f.counts})
         failures += buffer->verify_guards(label);
+    failures += !f.packed->guards_intact();
     return failures;
 }
 
@@ -156,18 +166,46 @@ int run(DeviceContext& device, int t, int b, int history, int layout, Pattern pa
     return failures;
 }
 
+int graph_update(DeviceContext& device) {
+    Fixture f(65, 1, 262144, 1, Pattern::Dyadic);
+    const auto bytes = ops::qsa_indexer_workspace_capacity_bytes(65, 65, 1, {262144});
+    GuardedDeviceBuffer scratch(bytes);
+    MemoryArena workspace(scratch.span());
+    DecodeGraphExecutable graph;
+    int failures = 0;
+    for (std::uint32_t bound : {0u, 2051u, 2052u, 8192u, 32768u, 65540u, 131076u, 262144u, 2051u}) {
+        f.history                     = std::max(1u, bound);
+        f.envelope.max_visible_tokens = bound;
+        f.reset(0, bound == 0);
+        DecodeGraphDefinition definition;
+        definition.capture(device.stream(), [&] { f.launch(workspace, device.execution_view()); });
+        if (graph.ready())
+            graph.update(definition);
+        else
+            graph.instantiate(definition);
+        graph.launch(device.stream());
+        device.synchronize();
+        failures += verify(f, "indexer graph update bound=" + std::to_string(bound));
+        failures += scratch.verify_guards("indexer graph workspace");
+        if (workspace.used() != 0 || workspace.peak_used() > bytes) ++failures;
+        if (failures) return failures;
+    }
+    return failures;
+}
+
 int read_footprint(DeviceContext& device) {
     Fixture f(8, 4, 32772, 0, Pattern::Dyadic);
     f.reset(0);
     DeviceBuffer query(ninfer::test::cuda_environment().context.device(), f.q_host.size() * 2);
-    DeviceBuffer keys(ninfer::test::cuda_environment().context.device(), f.k_host.size() * 2);
+    DeviceBuffer keys(ninfer::test::cuda_environment().context.device(), f.packed->storage().bytes);
     DeviceBuffer positions(ninfer::test::cuda_environment().context.device(),
                            f.positions.size() * 4);
-    DeviceBuffer table(ninfer::test::cuda_environment().context.device(), f.tables.size() * 4);
-    f.query.data              = query.data();
-    f.cache.keys.data         = keys.data();
-    f.cache.block_tables.data = table.data();
-    f.batch.positions.data    = positions.data();
+    DeviceBuffer table(ninfer::test::cuda_environment().context.device(),
+                       f.table_offsets.size() * 8);
+    f.query.data                           = query.data();
+    f.cache.keys.records.storage           = keys.span();
+    f.cache.keys.records.page_offsets.data = table.data();
+    f.batch.positions.data                 = positions.data();
     for (int b = 0; b < f.B; ++b) {
         const int n = f.valid[b];
         if (!n) continue;
@@ -184,13 +222,15 @@ int read_footprint(DeviceContext& device) {
         const int c = (f.positions[b * f.T + n - 1] + 1) / 4;
         if (c <= 512) continue;
         const int page_count = (c + 15) / 16, row = f.table_rows[b];
-        CUDA_CHECK(cudaMemcpyAsync(static_cast<int*>(table.data()) + row * f.table_stride,
-                                   f.tables.data() + row * f.table_stride, page_count * 4,
+        CUDA_CHECK(cudaMemcpyAsync(static_cast<std::int64_t*>(table.data()) + row * f.table_stride,
+                                   f.table_offsets.data() + row * f.table_stride, page_count * 8,
                                    cudaMemcpyHostToDevice, device.stream()));
         for (int p = 0; p < page_count; ++p) {
             const auto offset =
                 std::int64_t(f.tables[row * f.table_stride + p]) * f.key_page_stride;
-            CUDA_CHECK(cudaMemcpyAsync(static_cast<std::uint16_t*>(keys.data()) + offset,
+            CUDA_CHECK(cudaMemcpyAsync(static_cast<std::byte*>(keys.data()) +
+                                           f.table_offsets[row * f.table_stride + p] +
+                                           f.cache.keys.plane.tensor.region.offset,
                                        f.k_host.data() + offset, std::min(16, c - p * 16) * 256,
                                        cudaMemcpyHostToDevice, device.stream()));
         }
@@ -245,36 +285,45 @@ int validation(DeviceContext& device) {
 }
 } // namespace
 
-int main() {
-    if (cuda_unavailable()) return 77;
-    try {
-        DeviceContext device;
-        int failures = validation(device);
-        for (int history :
-             {1, 3, 4, 5, 2047, 2048, 2049, 2050, 2051, 2052, 2053, 32764, 32768, 32772, 262144})
-            failures += run(device, 1, 1, history, 0, Pattern::Dyadic);
-        for (int capacity : {2051, 2052, 16388})
-            failures += run(device, 5, 3, capacity, 1, Pattern::Dyadic, true, capacity);
-        for (int t : {2, 3, 4, 5, 8, 9, 16, 17, 31, 32, 33, 63, 64, 65})
-            failures += run(device, t, 1, 32772, t % 2, Pattern::Dyadic, t == 4 || t == 65);
-        for (int b = 2; b <= 8; ++b)
-            failures += run(device, 64 / b + 1, b, 32772, b % 2, Pattern::Dyadic, true);
-        for (int t : {128, 1024, 2048, 4096})
-            failures += run(device, t, 1, 262144, 0, Pattern::Dyadic);
-        for (auto pattern :
-             {Pattern::Dense, Pattern::Zero, Pattern::Concentrated, Pattern::NearBoundary}) {
-            failures += run(device, 1, 1, 262144, 0, pattern);
-            failures += run(device, 8, 4, 131072, 1, pattern);
-            if (pattern == Pattern::Dense) {
-                failures += run(device, 16, 1, 32772, 0, pattern);
-                failures += run(device, 32, 1, 32772, 1, pattern);
-            }
+int main(int argc, char** argv) {
+    OpSuite suite;
+    suite.add("qsa_indexer/graph_update", [] { return graph_update(cuda_environment().context); },
+              {{"execution", "graph"}});
+    suite.add("qsa_indexer/contract", [] { return validation(cuda_environment().context); });
+    suite.add("qsa_indexer/read_footprint",
+              [] { return read_footprint(cuda_environment().context); });
+    const auto add = [&](int t, int b, int history, int layout, Pattern pattern, bool graph = false,
+                         std::uint32_t capacity = 262144) {
+        suite.add("qsa_indexer/t" + std::to_string(t) + "/b" + std::to_string(b) + "/l" +
+                      std::to_string(history) + "/layout" + std::to_string(layout) + "/pattern" +
+                      std::to_string(int(pattern)) + "/capacity" + std::to_string(capacity),
+                  [=] {
+                      return run(cuda_environment().context, t, b, history, layout, pattern, graph,
+                                 capacity);
+                  },
+                  {{"execution", graph ? "graph" : "eager"}});
+    };
+    for (int history :
+         {1, 3, 4, 5, 2047, 2048, 2049, 2050, 2051, 2052, 2053, 32764, 32768, 32772, 262144})
+        add(1, 1, history, 0, Pattern::Dyadic);
+    for (int capacity : {2051, 2052, 16388})
+        add(5, 3, capacity, 1, Pattern::Dyadic, true, capacity);
+    for (int t : {2, 3, 4, 5, 8, 9, 16, 17, 31, 32, 33, 63, 64, 65})
+        add(t, 1, 32772, t % 2, Pattern::Dyadic, t == 4 || t == 65);
+    for (int b = 2; b <= 8; ++b) add(64 / b + 1, b, 32772, b % 2, Pattern::Dyadic, true);
+    for (int t : {128, 1024, 2048, 4096}) add(t, 1, 262144, 0, Pattern::Dyadic);
+    add(129, 1, 131076, 0, Pattern::Dense, true, 131076);
+    add(65, 4, 65540, 0, Pattern::NearBoundary, true, 65540);
+    add(2, 1, 262144, 0, Pattern::Dense, true);
+    for (auto pattern :
+         {Pattern::Dense, Pattern::Zero, Pattern::Concentrated, Pattern::NearBoundary}) {
+        add(1, 1, 262144, 0, pattern);
+        add(8, 4, 131072, 1, pattern);
+        if (pattern == Pattern::Dense) {
+            add(16, 1, 32772, 0, pattern);
+            add(32, 1, 32772, 1, pattern);
         }
-        failures += read_footprint(device);
-        std::cout << "QSA Indexer: " << (failures ? "FAIL" : "PASS") << '\n';
-        return failures ? 1 : 0;
-    } catch (const std::exception& e) {
-        std::cerr << e.what() << '\n';
-        return 1;
     }
+
+    return suite.main(argc, argv);
 }

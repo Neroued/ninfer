@@ -12,8 +12,7 @@ void kv_cache_append_prefix_dispatch(const Tensor& k, const Tensor& v, const Ten
                                      KVCacheAppendPrefixExecutionEnvelope envelope,
                                      cudaStream_t stream);
 void kv_cache_append_prefix_dispatch(const Tensor& k, const Tensor& v, const Tensor& positions,
-                                     const Tensor& counts, const Tensor& state_slots,
-                                     CyclicKVCacheLayerView cache,
+                                     const Tensor& counts, CyclicKVCacheLayerView cache,
                                      KVCacheAppendPrefixExecutionEnvelope envelope,
                                      cudaStream_t stream);
 

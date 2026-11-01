@@ -26,6 +26,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from tools.bench import run_serve_corpus as corpus  # noqa: E402
+from tools.bench.serve_log import startup_resource_observation  # noqa: E402
 
 
 SUITES = ("decode-saturation", "corpus-makespan")
@@ -45,7 +46,7 @@ SATURATION_SEEDS = (
 CORPUS_ORDER_SEED = 20260811
 POINT_ARTIFACT_TYPE = "ninfer_serve_concurrency_bench_point"
 SUMMARY_ARTIFACT_TYPE = "ninfer_serve_concurrency_bench_summary"
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 
 @dataclasses.dataclass(frozen=True)
@@ -56,6 +57,7 @@ class Point:
     speculative_mode: str
     speculative_backend: str
     draft_tokens: int
+    proposal_head: str
     sampling_mode: str
     kv_dtype: str
     suite: str
@@ -64,7 +66,7 @@ class Point:
     @property
     def key(self) -> str:
         return (
-            f"{corpus.filename_label(self.target)}_{self.kv_dtype}_{self.speculative_mode}_{self.sampling_mode}_"
+            f"{corpus.filename_label(self.target)}_{self.kv_dtype}_{self.speculative_mode}_{self.proposal_head}_{self.sampling_mode}_"
             f"{self.suite.replace('-', '_')}_c{self.concurrency}"
         )
 
@@ -97,7 +99,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--serve",
         type=Path,
-        default=REPO_ROOT / "build/apps/ninfer-serve",
+        required=True,
         help="ninfer-serve executable",
     )
     parser.add_argument(
@@ -118,6 +120,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         choices=corpus.SAMPLING_MODES,
         default="stochastic",
         help="sampling profile for all requests (default: stochastic)",
+    )
+    parser.add_argument(
+        "--proposal-head",
+        choices=("full", "optimized"),
+        default="optimized",
+        help="speculative proposal head (default: optimized)",
     )
     parser.add_argument(
         "--suite",
@@ -142,10 +150,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--max-context", type=int, default=262144)
     parser.add_argument(
-        "--kv-capacity",
-        default="262144",
-        metavar="N|auto",
-        help="shared Main KV capacity passed to ninfer-serve (default: 262144)",
+        "--context-capacity",
+        default="auto",
+        metavar="SIZE|auto",
+        help="per-rank shared KV/State capacity passed to ninfer-serve (default: auto)",
     )
     parser.add_argument("--prefill-chunk", type=int, default=1024)
     parser.add_argument("--kv-dtype", choices=tuple(corpus.KV_CACHE_NAMES), default="int8")
@@ -169,11 +177,6 @@ def validate_args(args: argparse.Namespace) -> None:
         raise corpus.CampaignError("--decode-tokens must be positive")
     if args.prefill_chunk <= 0 or args.prefill_chunk % 128 != 0:
         raise corpus.CampaignError("--prefill-chunk must be a positive multiple of 128")
-    if args.kv_capacity != "auto":
-        if not args.kv_capacity.isdigit() or int(args.kv_capacity) <= 0:
-            raise corpus.CampaignError("--kv-capacity must be a positive integer or auto")
-        if int(args.kv_capacity) < args.max_context:
-            raise corpus.CampaignError("--kv-capacity must be at least --max-context")
     if len(args.concurrency) != len(set(args.concurrency)):
         raise corpus.CampaignError("duplicate --concurrency value")
     for concurrency in args.concurrency:
@@ -204,6 +207,7 @@ def build_points(
                             speculative_mode=mode_name,
                             speculative_backend=backend,
                             draft_tokens=draft_tokens,
+                            proposal_head=args.proposal_head if draft_tokens else "full",
                             sampling_mode=args.sampling,
                             kv_dtype=args.kv_dtype,
                             suite=suite,
@@ -291,17 +295,17 @@ def server_command(
         point.model_id,
         "--max-context",
         str(args.max_context),
-        "--kv-capacity",
-        args.kv_capacity,
+        "--context-capacity",
+        args.context_capacity,
         "--max-concurrency",
         str(point.concurrency),
         "--max-pending-requests",
         "1",
-        "--pending-timeout-ms",
+        "--pending-timeout",
         str(PENDING_TIMEOUT_MS),
         "--prefill-chunk",
         str(args.prefill_chunk),
-        "--log-stats-interval-ms",
+        "--stats-interval",
         str(STATS_INTERVAL_MS),
         "--device",
         str(args.device),
@@ -310,9 +314,7 @@ def server_command(
         "--kv-dtype",
         point.kv_dtype,
         "--no-prefix-reuse",
-        "--device-state-slots",
-        "0",
-        "--host-context-mib",
+        "--host-cache-capacity",
         "0",
     ]
     if point.speculative_backend != "none":
@@ -322,11 +324,12 @@ def server_command(
                 point.speculative_backend,
                 "--draft-tokens",
                 str(point.draft_tokens),
-                "--lm-head-draft",
             ]
         )
+        if point.proposal_head == "optimized":
+            command.extend(["--proposal-head", "optimized"])
     if point.sampling_mode == "greedy":
-        command.append("--greedy")
+        command.extend(["--temperature", "0"])
     else:
         # Preserve the sampling profile attached to the published benchmark methodology.
         command.extend(
@@ -356,29 +359,26 @@ def validate_server_start(
     expected = {
         "device": args.device,
         "max_context": args.max_context,
-        "kv_capacity_mode": "auto" if args.kv_capacity == "auto" else "explicit",
+        "context_capacity_mode": "auto" if args.context_capacity == "auto" else "explicit",
         "max_concurrency": point.concurrency,
         "max_pending_requests": 1,
         "pending_timeout_ms": PENDING_TIMEOUT_MS,
         "prefill_chunk": args.prefill_chunk,
         "log_stats_interval_ms": STATS_INTERVAL_MS,
-        "kv_cache": corpus.KV_CACHE_NAMES[point.kv_dtype],
+        "kv_cache": point.kv_dtype,
         "cuda_graph": True,
         "prefix_reuse": False,
         "speculative_backend": point.speculative_backend,
         "speculative_draft_window": point.draft_tokens,
-        "proposal_head": "optimized" if point.draft_tokens else "full",
+        "proposal_head": point.proposal_head,
     }
     actual = {name: engine.get(name) for name in expected}
     if actual != expected:
         raise corpus.CampaignError(f"server_start Engine configuration mismatch: {actual!r}")
     context_cache = engine.get("context_cache", {})
-    if (
-        context_cache.get("device_state_slots") != 0
-        or context_cache.get("host_capacity_bytes") != 0
-    ):
+    if context_cache.get("host_capacity_bytes") != 0:
         raise corpus.CampaignError("server_start context cache capacity differs from the point")
-    if event.get("sampling_defaults", {}).get("greedy") != (
+    if (event.get("sampling_defaults", {}).get("server_overrides", {}).get("temperature") == 0) != (
         point.sampling_mode == "greedy"
     ):
         raise corpus.CampaignError("server_start sampling mode does not match the point")
@@ -647,7 +647,7 @@ def steady_metrics(
     if not selected:
         raise corpus.CampaignError(
             f"concurrency {concurrency} produced no recovery-free full-batch decode interval; "
-            "increase --decode-tokens or --kv-capacity, or reduce concurrency"
+            "increase --decode-tokens or --context-capacity, or reduce concurrency"
         )
     duration = sum(float(event["interval_seconds"]) for event in selected)
     tokens = sum(int(event["tokens"]["committed_decode"]) for event in selected)
@@ -758,6 +758,7 @@ def analyze_point(
         "speculative_mode": point.speculative_mode,
         "speculative_backend": point.speculative_backend,
         "draft_tokens": point.draft_tokens,
+        "proposal_head": point.proposal_head,
         "sampling_mode": point.sampling_mode,
         "kv_dtype": point.kv_dtype,
         "suite": point.suite,
@@ -767,7 +768,7 @@ def analyze_point(
         "command": list(command),
         "server_log": str(server_log),
         "engine": server_start.get("engine", {}),
-        "memory": server_start.get("memory", {}),
+        "resources": startup_resource_observation(server_start),
         "environment": server_start.get("environment", {}),
         "totals": done_totals,
         "decode_batch": {

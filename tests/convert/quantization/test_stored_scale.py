@@ -108,7 +108,10 @@ def test_cuda_encoding_preserves_groups_across_chunk_boundaries():
 @pytest.mark.parametrize(
     "format,shape", [("nf4_g16_e4m3fn", (46, 16)), ("nvfp4", (256, 64))]
 )
-def test_conversion_method_uses_complete_parent_amax(tmp_path, format, shape):
+@pytest.mark.parametrize("source_cache_bytes", [0, 1024 * 1024])
+def test_conversion_method_uses_complete_parent_amax(
+    tmp_path, format, shape, source_cache_bytes
+):
     from tools.artifact.codecs.nf4 import decode_nf4_words
     from tools.artifact.codecs.nvfp4 import decode_nvfp4_words
     from tools.artifact.reader import Artifact
@@ -125,7 +128,14 @@ def test_conversion_method_uses_complete_parent_amax(tmp_path, format, shape):
     recipe = Recipe(model)
     recipe.assign("table", format=format, method="stored_scale_mse")
     path = tmp_path / "table.ninfer"
-    convert(model, recipe, path, device="cpu", rows_per_chunk=17)
+    convert(
+        model,
+        recipe,
+        path,
+        device="cpu",
+        rows_per_chunk=17,
+        source_cache_bytes=source_cache_bytes,
+    )
     with Artifact(path) as artifact:
         obj = artifact.object(artifact.directory.bindings["table"]["object"])
         decode = decode_nvfp4_words if format == "nvfp4" else decode_nf4_words

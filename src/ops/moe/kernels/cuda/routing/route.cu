@@ -26,6 +26,19 @@ __device__ __forceinline__ float dot_eight(const __nv_bfloat16* a, const __nv_bf
     return fmaf(a3.y, b3.y, sum);
 }
 
+__global__ void shared_gate(const __nv_bfloat16* x, const __nv_bfloat16* weight, float* beta,
+                            int hidden, int tokens) {
+    const int token = blockIdx.x * 4 + threadIdx.x / 32;
+    const int lane  = threadIdx.x % 32;
+    if (token >= tokens) { return; }
+    float sum = 0;
+    for (int k = lane * 8; k < hidden; k += 32 * 8) {
+        sum += dot_eight(x + std::int64_t(token) * hidden + k, weight + k);
+    }
+    sum = warp_reduce_sum(sum);
+    if (!lane) { beta[token] = 1.0F / (1.0F + __expf(-sum)); }
+}
+
 template <class Shape>
 __global__ void router_vector(const __nv_bfloat16* x, const __nv_bfloat16* weights, float* scores,
                               MoeExecutionHints hints) {
@@ -86,7 +99,7 @@ __global__ void router_token_tile(const __nv_bfloat16* x, const __nv_bfloat16* w
     }
 }
 
-template <class Shape, bool Partial>
+template <class Shape, bool Partial, bool FixedIndices = false>
 __global__ void select_routes(const float* scores, int* ids, float* alpha, float* beta,
                               bool programmatic) {
     __shared__ float reduced[Shape::control_rows], selected[Shape::top_k];
@@ -105,9 +118,9 @@ __global__ void select_routes(const float* scores, int* ids, float* alpha, float
         __syncthreads();
     }
     if (tid < 32) {
-        select_experts<Shape>(Partial ? reduced : scores + std::int64_t(token) * Shape::score_rows,
-                              ids + token * Shape::top_k, alpha + token * Shape::top_k,
-                              beta + token, selected);
+        select_experts<Shape, FixedIndices>(
+            Partial ? reduced : scores + std::int64_t(token) * Shape::score_rows,
+            ids + token * Shape::top_k, alpha + token * Shape::top_k, beta + token, selected);
     }
 }
 
@@ -175,9 +188,21 @@ void launch_route_shape(const Tensor& x, const Weight& control, const ExpertRout
             throw std::logic_error("router token tile is unsupported for this shape");
         }
     } else {
-        router_mma_kernel<S>
-            <<<dim3((S::control_rows + 15) / 16, (tokens + 63) / 64), 256, 0, stream>>>(
-                input, weights, storage.scores, tokens);
+        if (plan.mma_rows == 64) {
+            if constexpr (S::hidden == 2560) {
+                router_mma_kernel<S, 64>
+                    <<<dim3((S::control_rows + 63) / 64, (tokens + 63) / 64), 128, 0, stream>>>(
+                        input, weights, storage.scores, tokens);
+            } else {
+                throw std::logic_error("router64 is unsupported for this geometry");
+            }
+        } else if (plan.mma_rows == 16) {
+            router_mma_kernel<S>
+                <<<dim3((S::control_rows + 15) / 16, (tokens + 63) / 64), 256, 0, stream>>>(
+                    input, weights, storage.scores, tokens);
+        } else {
+            throw std::logic_error("invalid router row tile");
+        }
     }
     CUDA_CHECK(cudaGetLastError());
     auto* ids   = static_cast<int*>(routes.ids.data);
@@ -198,8 +223,13 @@ void launch_route_shape(const Tensor& x, const Weight& control, const ExpertRout
             CUDA_CHECK(cudaGetLastError());
         }
     } else {
-        select_routes<S, false>
-            <<<tokens, 32, 0, stream>>>(storage.scores, ids, alpha, beta, plan.programmatic);
+        if (plan.network_topk) {
+            select_routes<S, false, true>
+                <<<tokens, 32, 0, stream>>>(storage.scores, ids, alpha, beta, plan.programmatic);
+        } else {
+            select_routes<S, false>
+                <<<tokens, 32, 0, stream>>>(storage.scores, ids, alpha, beta, plan.programmatic);
+        }
         CUDA_CHECK(cudaGetLastError());
     }
 }
@@ -214,5 +244,14 @@ void launch_route(const Tensor& x, const Weight& control, const ExpertRoutes& ro
         launch_route_shape<SwiGLUH2048I512E256K8>(x, control, routes, shared, plan, storage, hints,
                                                   execution);
     }
+}
+
+void launch_shared_gate(const Tensor& x, const Weight& control, const Tensor& shared,
+                        CudaExecutionView execution) {
+    const auto* weights = static_cast<const __nv_bfloat16*>(control.qdata);
+    shared_gate<<<(x.ne[1] + 3) / 4, 128, 0, execution.stream()>>>(
+        static_cast<const __nv_bfloat16*>(x.data), weights + (control.n - 1) * control.k,
+        static_cast<float*>(shared.data), control.k, x.ne[1]);
+    CUDA_CHECK(cudaGetLastError());
 }
 } // namespace ninfer::ops::detail::moe_cuda::routing

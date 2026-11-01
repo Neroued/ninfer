@@ -263,7 +263,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--artifact", type=Path, required=True)
     parser.add_argument("--backend", choices=("mtp", "dflash"), required=True)
-    parser.add_argument("--server-bin", type=Path, default=Path("build/apps/ninfer-serve"))
+    parser.add_argument("--server-bin", type=Path, required=True)
     parser.add_argument(
         "--fixture",
         type=Path,
@@ -308,7 +308,7 @@ def main() -> None:
             "1",
             "--max-pending-requests",
             "4",
-            "--log-stats-interval-ms",
+            "--stats-interval",
             "0",
             "--request-log-jsonl",
             str(request_log),
@@ -316,8 +316,8 @@ def main() -> None:
             args.backend,
             "--draft-tokens",
             "3",
-            "--lm-head-draft",
-            "--greedy",
+            "--proposal-head", "optimized",
+            "--temperature", "0",
         ]
         with server_log.open("w", encoding="utf-8") as output:
             process = subprocess.Popen(

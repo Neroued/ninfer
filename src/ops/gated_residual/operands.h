@@ -23,4 +23,5 @@ struct Operands {
 Operands validate(Form form, const Tensor& input, const Tensor* block, const Tensor* injection,
                   const Tensor* weight, float epsilon, Tensor* residual, Tensor* normalized,
                   CudaExecutionView execution, const char* op);
+void launch_norm_combine(Form form, Operands operands, CudaExecutionView execution);
 } // namespace ninfer::ops::detail::hc

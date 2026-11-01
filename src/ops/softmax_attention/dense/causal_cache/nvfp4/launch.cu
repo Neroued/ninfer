@@ -51,11 +51,11 @@ void grouped_instance(const CausalAttentionOperands& p, Nvfp4KvCacheView<Writabl
     throw std::logic_error("NVFP4 grouped plan exceeds the selected token tile");
 }
 
-template <class Input>
-void execute_grouped(const Tensor& q, const Tensor& positions, float scale,
-                     PagedKVBatchLayerView cache, const Tensor* valid, const Tensor* rows,
-                     Input input, const Nvfp4KvCausalPlan& plan, MemoryArena& workspace,
-                     Tensor& out, cudaStream_t stream) {
+template <class Input, class Cache>
+void execute_grouped(const Tensor& q, const Tensor& positions, float scale, Cache cache,
+                     const Tensor* valid, const Tensor* rows, Input input,
+                     const Nvfp4KvCausalPlan& plan, MemoryArena& workspace, Tensor& out,
+                     cudaStream_t stream) {
     const auto view =
         make_quantized_causal_cache_view<Nvfp4KvCacheView<Input::writes_cache>>(cache, valid, rows);
     auto scope         = workspace.scope();
@@ -145,13 +145,13 @@ void nvfp4_kv_append_attention(const Tensor& q, const Tensor& k, const Tensor& v
 }
 
 void nvfp4_kv_cached_attention(const Tensor& q, const Tensor& positions, float scale,
-                               const PagedKVLayerView& cache,
+                               const ConstPagedKVLayerView& cache,
                                CausalAttentionExecutionEnvelope envelope, MemoryArena& workspace,
                                Tensor& out, CudaExecutionView execution) {
     const cudaStream_t stream = execution.stream();
     const auto plan           = select_nvfp4_kv_causal_plan(q.ne[1], q.ne[2], 1, envelope,
                                                             execution.multiprocessor_count());
-    const auto view = single_row_paged_kv_batch_view(cache);
+    const auto view           = single_row_paged_kv_batch_view(cache);
     if (plan.family == Nvfp4KvFamily::Tiled)
         nvfp4_kv_tiled_attention(
             make_causal_operands(q, positions, out, scale, envelope.max_visible_keys),

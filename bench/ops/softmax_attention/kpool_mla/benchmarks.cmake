@@ -1,0 +1,7 @@
+if(NINFER_TARGET STREQUAL "dgx_spark")
+  ninfer_add_op_bench(ninfer_kpool_application_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/application.cu")
+  ninfer_add_op_bench(ninfer_kpool_chain_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/chain.cu")
+  ninfer_add_op_bench(ninfer_kpool_sparse_mla_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/sparse_mla.cu")
+  ninfer_add_op_bench(ninfer_kpool_indexer_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/indexer.cu")
+  ninfer_add_op_bench(ninfer_kpool_prepare_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/prepare.cu")
+endif()

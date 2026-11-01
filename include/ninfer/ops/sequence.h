@@ -6,6 +6,38 @@
 
 namespace ninfer::ops {
 
+struct CausalPairInputs {
+    Tensor hidden, previous_hidden;
+    Tensor ids, positions;
+    Tensor rope, previous_rope;
+    Tensor prefix, skip_first;
+    Tensor rows;
+};
+
+struct CausalPairOutputs {
+    Tensor hidden, ids, positions, lengths;
+    Tensor rope;
+};
+
+// Pair adopted tokens with their preceding hidden/coordinates, selecting input row b=rows[r]
+// for output row r; absent rows means identity and C=B. For n=max(prefix[b]-skip_first[b],0),
+// j<n, i=j+skip_first[b]: output hidden[:,j,r] is hidden[:,i-1,b] if i>0, previous_hidden[:,b]
+// otherwise; IDs are ids[i,b], positions are positions[i,b]-1, and optional coordinates are
+// rope[i-1,:,b] if i>0, previous_rope[:,b] otherwise. Writes lengths[r]=n. rows[r]=-1 writes an
+// all-zero row without reading input metadata; physical tails j>=n are zero and read no inputs.
+//
+// BF16 hidden[D,W,B], previous_hidden[D,B], output hidden[D,P,C] have contiguous features;
+// bases and outer strides are 16-byte aligned, D>0 is divisible by eight. I32 IDs/positions are
+// [W,B] in, [P,C] out. Optional I32 rope [W,A,B], previous_rope [A,B], output rope [P,A,C]
+// either all exist, A=1 or 3, or are all absent. These tensors have positive, element-aligned,
+// non-overlapping strides. prefix/skip_first[B], optional rows[C], output lengths[C] are
+// contiguous I32. W,P>=1, B,C=1..8. Caller supplies rows in {-1} union [0,B), 0<=prefix<=W,
+// skip_first in {0,1}, n<=P, and positive consumed positions. Read-only inputs may alias;
+// output ranges are mutually disjoint and disjoint from all inputs. Copies bits exactly,
+// including coordinates. No workspace or persistent effects; Device controls are read on replay.
+void prepare_causal_pairs(const CausalPairInputs& input, const CausalPairOutputs& output,
+                          CudaExecutionView execution);
+
 /**
  *   For row b and 0<=j<=K:
  *     verify_ids[j,b] = anchors[b]                         when j=0
@@ -13,7 +45,8 @@ namespace ninfer::ops {
  *                       anchors[b]                        otherwise;
  *     positions[j,b]  = base_positions[b] + min(j,Pcur[b]).
  *
- *   All tensors are contiguous I32. anchors/base_positions/current_extents are [B], drafts is
+ *   All tensors are I32, contiguous except drafts, which permits positive, naturally aligned,
+ *   non-overlapping strides. anchors/base_positions/current_extents are [B], drafts is
  *   [K,B] with K>=1 and B>=1, and verify_ids/positions are [K+1,B]. Each current extent is in
  *   [0,K]. Inputs and outputs do not overlap.
  *

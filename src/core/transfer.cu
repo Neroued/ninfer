@@ -7,15 +7,15 @@
 namespace ninfer {
 namespace {
 
-cudaMemcpyKind validate_copy(MemorySpan destination, ConstMemorySpan source,
-                             CudaExecutionView execution, bool asynchronous) {
+cudaMemcpyKind validate_copy(MemorySpan destination, ConstMemorySpan source, Device device,
+                             bool asynchronous) {
     validate_memory(destination);
     validate_memory(source);
     if (destination.bytes != source.bytes) {
         throw std::invalid_argument("copy spans must have equal byte lengths");
     }
     for (const auto memory : {static_cast<ConstMemorySpan>(destination), source}) {
-        if (memory.device != Device::cpu() && memory.device != execution.device()) {
+        if (memory.device != Device::cpu() && memory.device != device) {
             throw std::invalid_argument("copy memory does not belong to the execution device");
         }
         if (asynchronous && memory.device == Device::cpu() && !memory.host_pinned) {
@@ -65,7 +65,7 @@ void check_copy(cudaError_t error) {
 } // namespace
 
 void copy_bytes_async(MemorySpan destination, ConstMemorySpan source, CudaExecutionView execution) {
-    const auto kind = validate_copy(destination, source, execution, true);
+    const auto kind = validate_copy(destination, source, execution.device(), true);
     CudaDeviceScope scope(execution.device());
     enqueue(destination, source, kind, execution);
 }
@@ -81,8 +81,8 @@ void copy_rows_async(MemorySpan destination, std::size_t destination_pitch, Cons
     };
     if (!fits(destination.bytes, destination_pitch) || !fits(source.bytes, source_pitch))
         throw std::out_of_range("pitched copy exceeds backing");
-    const auto kind =
-        validate_copy(destination.subspan(0, width), source.subspan(0, width), execution, true);
+    const auto kind = validate_copy(destination.subspan(0, width), source.subspan(0, width),
+                                    execution.device(), true);
     if (destination.device == source.device) {
         const auto dst       = reinterpret_cast<std::uintptr_t>(destination.data);
         const auto src       = reinterpret_cast<std::uintptr_t>(source.data);
@@ -97,7 +97,7 @@ void copy_rows_async(MemorySpan destination, std::size_t destination_pitch, Cons
 }
 
 void copy_bytes(MemorySpan destination, ConstMemorySpan source, CudaExecutionView execution) {
-    const auto kind = validate_copy(destination, source, execution, false);
+    const auto kind = validate_copy(destination, source, execution.device(), false);
     CudaDeviceScope scope(execution.device());
     enqueue(destination, source, kind, execution);
     const auto error = cudaStreamSynchronize(execution.stream());
@@ -122,6 +122,72 @@ void copy_host_2d_async(MemorySpan destination, std::size_t destination_pitch, C
     check_copy(cudaMemcpy2DAsync(destination.data, destination_pitch, source.host.data,
                                  source_pitch, width, rows, cudaMemcpyHostToDevice,
                                  execution.stream()));
+}
+
+CudaCopyBatch::CudaCopyBatch(Device device, std::size_t capacity)
+    : device_(device), source_spans_(capacity), destination_spans_(capacity), sources_(capacity),
+      destinations_(capacity), sizes_(capacity) {
+    if (device.type() != DeviceType::CUDA || capacity == 0) {
+        throw std::invalid_argument("CUDA copy batch requires a CUDA device and positive capacity");
+    }
+}
+
+bool CudaCopyBatch::try_append(MemorySpan destination, ConstMemorySpan source) {
+    (void)validate_copy(destination, source, device_, true);
+    if (source.bytes == 0 || source.data == destination.data) return true;
+    const auto overlaps = [](ConstMemorySpan left, ConstMemorySpan right) {
+        if (left.device != right.device) return false;
+        const auto l = reinterpret_cast<std::uintptr_t>(left.data);
+        const auto r = reinterpret_cast<std::uintptr_t>(right.data);
+        return l <= r ? r - l < left.bytes : l - r < right.bytes;
+    };
+    for (std::size_t i = 0; i < count_; ++i) {
+        if (overlaps(destination, source_spans_[i]) ||
+            overlaps(destination, destination_spans_[i]) ||
+            overlaps(source, destination_spans_[i])) {
+            return false;
+        }
+    }
+    if (count_) {
+        const auto last                  = count_ - 1;
+        const auto& previous_source      = source_spans_[last];
+        const auto& previous_destination = destination_spans_[last];
+        if (previous_source.device == source.device &&
+            previous_destination.device == destination.device &&
+            static_cast<const std::byte*>(previous_source.data) + previous_source.bytes ==
+                source.data &&
+            static_cast<const std::byte*>(previous_destination.data) + previous_destination.bytes ==
+                destination.data) {
+            source_spans_[last].bytes += source.bytes;
+            destination_spans_[last].bytes += destination.bytes;
+            sizes_[last] += source.bytes;
+            return true;
+        }
+    }
+    if (count_ == sources_.size()) return false;
+    source_spans_[count_]      = source;
+    destination_spans_[count_] = destination;
+    sources_[count_]           = source.data;
+    destinations_[count_]      = destination.data;
+    sizes_[count_++]           = source.bytes;
+    return true;
+}
+
+void CudaCopyBatch::submit(CudaExecutionView execution) const {
+    if (execution.device() != device_ || !execution.stream()) {
+        throw std::invalid_argument("CUDA copy batch requires its device and an explicit stream");
+    }
+    if (count_ == 0) return;
+    if (count_ == 1) {
+        copy_bytes_async(destination_spans_[0], source_spans_[0], execution);
+        return;
+    }
+    CudaDeviceScope scope(device_);
+    cudaMemcpyAttributes attributes{};
+    attributes.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
+    std::size_t first         = 0;
+    CUDA_CHECK(cudaMemcpyBatchAsync(destinations_.data(), sources_.data(), sizes_.data(), count_,
+                                    &attributes, &first, 1, execution.stream()));
 }
 
 CudaHostCopyBatch::CudaHostCopyBatch(Device device, std::size_t capacity)

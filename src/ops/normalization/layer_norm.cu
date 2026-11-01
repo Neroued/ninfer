@@ -1,5 +1,6 @@
 #include "ninfer/ops/layer_norm.h"
 #include "core/device.h"
+#include "core/platform.h"
 #include "ops/common/host/operands.h"
 #include "ops/common/cuda/reduce.cuh"
 #include <cuda_bf16.h>
@@ -90,6 +91,73 @@ __global__ void layer_norm_kernel(const __nv_bfloat16* x, const __nv_bfloat16* w
     }
 }
 
+template <int Block>
+__global__ void layer_norm_d1152_centered_kernel(const __nv_bfloat162* x,
+                                                 const __nv_bfloat162* weight,
+                                                 const __nv_bfloat162* bias, __nv_bfloat162* out,
+                                                 std::int64_t rows, float eps) {
+    constexpr int Pairs = 576;
+    constexpr int Items = (Pairs + Block - 1) / Block;
+    const int lane      = threadIdx.x;
+    const auto row      = std::int64_t(blockIdx.x);
+    if (row >= rows) return;
+    const auto base = row * Pairs;
+    // Center around a represented input before reducing, including large constant rows.
+    const float anchor = __low2float(x[base]);
+    float2 values[Items];
+    float sum = 0;
+#pragma unroll
+    for (int i = 0; i < Items; ++i) {
+        const int pair = lane + i * Block;
+        if (pair < Pairs) {
+            const auto v = __bfloat1622float2(x[base + pair]);
+            values[i]    = {v.x - anchor, v.y - anchor};
+            sum += values[i].x + values[i].y;
+        }
+    }
+    __shared__ float sums[Block / 32];
+    __shared__ float scalar;
+    const auto reduce = [&](float value) {
+        value = common::block_reduce_sum<Block>(value, sums);
+        if (threadIdx.x == 0) scalar = value;
+        __syncthreads();
+        return scalar;
+    };
+    const float mean = reduce(sum) / 1152.f;
+    float squares    = 0;
+#pragma unroll
+    for (int i = 0; i < Items; ++i) {
+        if (lane + i * Block < Pairs) {
+            values[i].x -= mean;
+            values[i].y -= mean;
+            squares = fmaf(values[i].x, values[i].x, squares);
+            squares = fmaf(values[i].y, values[i].y, squares);
+        }
+    }
+    const float inverse = rsqrtf(reduce(squares) / 1152.f + eps);
+#pragma unroll
+    for (int i = 0; i < Items; ++i) {
+        const int pair = lane + i * Block;
+        if (pair < Pairs) {
+            const auto w     = __bfloat1622float2(weight[pair]);
+            const auto b     = __bfloat1622float2(bias[pair]);
+            out[base + pair] = __floats2bfloat162_rn(values[i].x * inverse * w.x + b.x,
+                                                     values[i].y * inverse * w.y + b.y);
+        }
+    }
+}
+
+#if NINFER_TARGET_SPARK
+void launch_layer_norm_centered(const Tensor& x, const Tensor& weight, const Tensor& bias,
+                                float eps, Tensor& out, cudaStream_t stream) {
+    const auto rows = x.numel() / 1152;
+    layer_norm_d1152_centered_kernel<128><<<static_cast<unsigned>(rows), 128, 0, stream>>>(
+        static_cast<const __nv_bfloat162*>(x.data), static_cast<const __nv_bfloat162*>(weight.data),
+        static_cast<const __nv_bfloat162*>(bias.data), static_cast<__nv_bfloat162*>(out.data), rows,
+        eps);
+}
+#endif
+
 using LayerNormLaunch = void (*)(const Tensor&, const Tensor&, const Tensor&, float, Tensor&,
                                  cudaStream_t);
 
@@ -119,8 +187,13 @@ LayerNormLaunch select_layer_norm(const Tensor& x, const Tensor& weight, const T
                                   const Tensor& out) {
     if (x.ne[0] == 1152 && common::operand::aligned(x.data, 4) &&
         common::operand::aligned(weight.data, 4) && common::operand::aligned(bias.data, 4) &&
-        common::operand::aligned(out.data, 4))
+        common::operand::aligned(out.data, 4)) {
+#if NINFER_TARGET_SPARK
+        return launch_layer_norm_centered;
+#else
         return launch_layer_norm<true>;
+#endif
+    }
     return launch_layer_norm<false>;
 }
 

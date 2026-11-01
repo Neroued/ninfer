@@ -30,10 +30,10 @@ WriteArguments arguments(const Tensor& k, const Tensor& v, const Tensor& positio
     return {static_cast<const __nv_bfloat16*>(k.data),
             static_cast<const __nv_bfloat16*>(v.data),
             static_cast<const std::int32_t*>(positions.data),
-            cache.k_pages.data,
-            cache.v_pages.data,
-            cache.k_scale_pages.data,
-            cache.v_scale_pages.data,
+            cache.k_pages.data(),
+            cache.v_pages.data(),
+            cache.k_scale_pages.data(),
+            cache.v_scale_pages.data(),
             k.ne[2],
             k.ne[3]};
 }
@@ -48,7 +48,7 @@ void launch_quantized(const WriteArguments& a, Metadata metadata, cudaStream_t s
                 return write_i8_page_kernel<G, Metadata>;
             else
                 return write_i8_kernel<G, Metadata, Batch>;
-        } else if constexpr (Storage == KvCacheStorage::Fp8E4M3Row256) {
+        } else if constexpr (Storage == KvCacheStorage::Fp8E4m3fnGroup128Ue8m0) {
             if constexpr (Page)
                 return write_fp8_page_kernel<G, Metadata>;
             else if constexpr (Batch)
@@ -71,10 +71,8 @@ void launch_quantized(const WriteArguments& a, Metadata metadata, cudaStream_t s
     using Code =
         std::conditional_t<Storage == KvCacheStorage::Int8Group64, std::int8_t, std::uint8_t>;
     using KeyScale =
-        std::conditional_t<Storage == KvCacheStorage::Nvfp4Group16, std::uint8_t, __half>;
-    using ValueScale = std::conditional_t<Storage == KvCacheStorage::Nvfp4Group16 ||
-                                              Storage == KvCacheStorage::Fp8KeyNvfp4Value,
-                                          std::uint8_t, __half>;
+        std::conditional_t<Storage == KvCacheStorage::Int8Group64, __half, std::uint8_t>;
+    using ValueScale = KeyScale;
     const dim3 grid  = Page ? dim3(common::div_up(a.width + 7, 8), G::KVHeads)
                             : dim3(common::div_up(a.width * G::KVHeads, 8), 1, Batch ? a.batch : 1);
     kernel<<<grid, 256, 0, stream>>>(
@@ -86,6 +84,18 @@ template <KvCacheStorage Storage, class G, class Metadata>
 void launch_instance(PagedWriteInstance instance, const WriteArguments& a, Metadata metadata,
                      cudaStream_t stream) {
     if constexpr (Storage == KvCacheStorage::BFloat16) {
+        if constexpr (requires { Metadata::masked; }) {
+            if (instance == PagedWriteInstance::BatchRows256) {
+                constexpr int Threads = 128;
+                const auto units      = static_cast<std::int64_t>(a.width) * G::KVHeads * (256 / 8);
+                const dim3 grid(common::div_up(units, static_cast<std::int64_t>(Threads)), 1,
+                                a.batch);
+                write_bf16_kernel<G, Metadata, true><<<grid, Threads, 0, stream>>>(
+                    a.k, a.v, a.positions, metadata, static_cast<__nv_bfloat16*>(a.keys),
+                    static_cast<__half*>(a.values), a.width);
+                return;
+            }
+        }
         if (a.batch != 1 ||
             (instance != PagedWriteInstance::Copy96 && instance != PagedWriteInstance::Copy128))
             throw std::logic_error("KV write: invalid BF16 instance");
@@ -124,8 +134,9 @@ void storage_dispatch(KvCacheStorage storage, PagedWriteInstance instance, const
         return launch_instance<KvCacheStorage::BFloat16, G>(instance, a, metadata, stream);
     case KvCacheStorage::Int8Group64:
         return launch_instance<KvCacheStorage::Int8Group64, G>(instance, a, metadata, stream);
-    case KvCacheStorage::Fp8E4M3Row256:
-        return launch_instance<KvCacheStorage::Fp8E4M3Row256, G>(instance, a, metadata, stream);
+    case KvCacheStorage::Fp8E4m3fnGroup128Ue8m0:
+        return launch_instance<KvCacheStorage::Fp8E4m3fnGroup128Ue8m0, G>(instance, a, metadata,
+                                                                          stream);
     case KvCacheStorage::Nvfp4Group16:
         return launch_instance<KvCacheStorage::Nvfp4Group16, G>(instance, a, metadata, stream);
     case KvCacheStorage::Fp8KeyNvfp4Value:
@@ -148,9 +159,10 @@ void geometry_dispatch(int heads, KvCacheStorage storage, PagedWriteInstance ins
 
 void launch_paged_write(PagedWriteInstance instance, const Tensor& k, const Tensor& v,
                         const Tensor& positions, PagedKVLayerView cache, cudaStream_t stream) {
-    geometry_dispatch(k.ne[1], cache.storage, instance, arguments(k, v, positions, cache),
-                      DirectMetadata{static_cast<const std::int32_t*>(cache.block_table.data)},
-                      stream);
+    geometry_dispatch(
+        k.ne[1], cache.storage, instance, arguments(k, v, positions, cache),
+        DirectMetadata{static_cast<const std::int64_t*>(cache.k_pages.records.page_offsets.data)},
+        stream);
 }
 
 void launch_paged_write(PagedWriteInstance instance, const Tensor& k, const Tensor& v,
@@ -159,9 +171,10 @@ void launch_paged_write(PagedWriteInstance instance, const Tensor& k, const Tens
                         cudaStream_t stream) {
     const auto launch = [&]<bool Masked>() {
         const BatchMetadata<Masked> metadata{
-            static_cast<const std::int32_t*>(cache.block_tables.data),
+            static_cast<const std::int64_t*>(cache.k_pages.records.page_offsets.data),
             static_cast<const std::int32_t*>(valid_columns.data),
-            static_cast<const std::int32_t*>(table_rows.data), cache.block_tables.ne[0]};
+            static_cast<const std::int32_t*>(table_rows.data),
+            cache.k_pages.records.page_offsets.ne[0]};
         geometry_dispatch(k.ne[1], cache.storage, instance, arguments(k, v, positions, cache),
                           metadata, stream);
     };

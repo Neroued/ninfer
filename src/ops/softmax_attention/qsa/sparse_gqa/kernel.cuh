@@ -8,8 +8,8 @@
 namespace ninfer::ops::detail::qsa {
 
 template <KvCacheStorage Storage, int N, int Warps, bool VectorCache,
-          SparseGqaLoad Load = SparseGqaLoad::Direct>
-__device__ __forceinline__ void sparse_gqa_mma(SparseGqaArguments a,
+          SparseGqaLoad Load = SparseGqaLoad::Direct, int KvHeads>
+__device__ __forceinline__ void sparse_gqa_mma(SparseGqaKernelArguments<KvHeads> a,
                                                SparseGqaStorage<Storage, N, Warps, Load>& s,
                                                std::int64_t q, int head, int split) {
     constexpr int NK = N / Warps, QKNt = NK / 8, PVKs = NK / 16;
@@ -21,8 +21,8 @@ __device__ __forceinline__ void sparse_gqa_mma(SparseGqaArguments a,
     if (work.size == 0) {
         if (a.numerator == nullptr)
             for (int i = tid; i < 12 * 128; i += Warps * 32)
-                *reinterpret_cast<unsigned*>(a.out + (q * 24 + head * 12 + i / 128) * 256 +
-                                             (i % 128) * 2) = 0;
+                *reinterpret_cast<unsigned*>(
+                    a.out + (q * a.query_heads + head * 12 + i / 128) * 256 + (i % 128) * 2) = 0;
         return;
     }
     if (split >= work.splits) return;
@@ -46,14 +46,14 @@ __device__ __forceinline__ void sparse_gqa_mma(SparseGqaArguments a,
     constexpr float scale = common::kLog2E / 16.0f;
     const int gid = lane >> 2, lid = lane & 3;
     sparse_gqa_addresses<Storage>(a, s, work, q, head, start, end);
-    sparse_gqa_stage<Storage, N, Warps, VectorCache, true>(a, s, start, end);
+    unsigned key_scale = sparse_gqa_stage<Storage, N, Warps, VectorCache, true>(a, s, start, end);
 
     common::cp_commit();
     for (int k0 = start; k0 < end; k0 += N) {
-        common::cp_wait<0>();
-        __syncthreads();
-        sparse_gqa_expand_stage<Storage, true>(s);
-        sparse_gqa_stage<Storage, N, Warps, VectorCache, false>(a, s, k0, end);
+        const bool key_half = sparse_gqa_wait_stage<Storage, true>(s, key_scale);
+        sparse_gqa_expand_stage<Storage, true>(s, key_half, key_scale);
+        unsigned value_scale =
+            sparse_gqa_stage<Storage, N, Warps, VectorCache, false>(a, s, k0, end);
         common::cp_commit();
         float score[QKNt][4] = {};
 #pragma unroll
@@ -69,12 +69,11 @@ __device__ __forceinline__ void sparse_gqa_mma(SparseGqaArguments a,
                 sparse_gqa_qk<Storage>(score[n], qf[k], bf);
             }
         }
-        common::cp_wait<0>();
-        __syncthreads();
-        sparse_gqa_expand_stage<Storage, false>(s);
+        const bool value_half = sparse_gqa_wait_stage<Storage, false>(s, value_scale);
+        sparse_gqa_expand_stage<Storage, false>(s, value_half, value_scale);
         if (k0 + N < end) {
             sparse_gqa_addresses<Storage>(a, s, work, q, head, k0 + N, end);
-            sparse_gqa_stage<Storage, N, Warps, VectorCache, true>(a, s, k0 + N, end);
+            key_scale = sparse_gqa_stage<Storage, N, Warps, VectorCache, true>(a, s, k0 + N, end);
             common::cp_commit();
         }
         float maximum[2] = {-CUDART_INF_F, -CUDART_INF_F};
@@ -200,8 +199,9 @@ __device__ __forceinline__ void sparse_gqa_mma(SparseGqaArguments a,
     }
 }
 
-template <KvCacheStorage Storage, int N, int Warps, bool VectorCache, SparseGqaLoad Load>
-__device__ __forceinline__ void sparse_gqa_compute(SparseGqaArguments a,
+template <KvCacheStorage Storage, int N, int Warps, bool VectorCache, SparseGqaLoad Load,
+          int KvHeads>
+__device__ __forceinline__ void sparse_gqa_compute(SparseGqaKernelArguments<KvHeads> a,
                                                    SparseGqaStorage<Storage, N, Warps, Load>& s,
                                                    std::int64_t q, int head, int split) {
     sparse_gqa_mma<Storage, N, Warps, VectorCache, Load>(a, s, q, head, split);
@@ -215,35 +215,23 @@ __device__ __forceinline__ void sparse_gqa_compute(SparseGqaArguments a,
     }
 }
 
-template <int Queries>
-__device__ __forceinline__ bool sparse_gqa_all_selected(const SparseGqaArguments& a,
-                                                        std::int64_t first) {
-    const auto total = std::int64_t(a.tokens) * a.batch;
-    const auto last  = min(first + Queries, total);
-    if (first / a.tokens != (last - 1) / a.tokens) return false;
-    for (auto q = first; q < last; ++q) {
-        const auto work = a.work(q);
-        if (work.count != work.complete) return false;
-    }
-    return true;
-}
-
 template <KvCacheStorage Storage, int N, int Warps, bool VectorCache,
-          SparseGqaLoad Load = SparseGqaLoad::Direct>
-__launch_bounds__(Warps * 32) __global__ void sparse_gqa_mma_kernel(SparseGqaArguments a) {
+          SparseGqaLoad Load = SparseGqaLoad::Direct, int KvHeads>
+__launch_bounds__(Warps * 32) __global__
+    void sparse_gqa_mma_kernel(SparseGqaKernelArguments<KvHeads> a) {
     extern __shared__ __align__(16) unsigned char smem[];
     auto& s = *reinterpret_cast<SparseGqaStorage<Storage, N, Warps, Load>*>(smem);
-    sparse_gqa_compute<Storage, N, Warps, VectorCache, Load>(a, s, a.begin + blockIdx.x / 2,
-                                                             blockIdx.x % 2, blockIdx.y);
+    sparse_gqa_compute<Storage, N, Warps, VectorCache, Load>(
+        a, s, a.begin + a.group_query(blockIdx.x), a.group_head(blockIdx.x), blockIdx.y);
 }
 
-template <KvCacheStorage Storage>
-__global__ void sparse_gqa_merge_kernel(SparseGqaArguments a) {
-    const auto q = a.begin + blockIdx.x / 24;
-    const int h = blockIdx.x % 24, d = threadIdx.x * 2;
+template <KvCacheStorage Storage, int KvHeads>
+__global__ void sparse_gqa_merge_kernel(SparseGqaKernelArguments<KvHeads> a) {
+    const auto q = a.begin + a.head_query(blockIdx.x);
+    const int h = a.head_index(blockIdx.x), d = threadIdx.x * 2;
     const auto work = a.work(q);
     if (!work.size) {
-        *reinterpret_cast<unsigned*>(a.out + (q * 24 + h) * 256 + d) = 0;
+        *reinterpret_cast<unsigned*>(a.out + (q * a.query_heads + h) * 256 + d) = 0;
         return;
     }
     __shared__ float weights[64], denominator;

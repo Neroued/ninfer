@@ -13,6 +13,18 @@ using namespace common;
 
 namespace {
 
+template <class Word>
+__global__ void scatter_columns_kernel(const Word* source, const int* columns,
+                                       const std::int64_t* offsets, Word* destination, int features,
+                                       int tokens) {
+    const int row = blockIdx.y, column = columns[row];
+    if (column < 0) return;
+    const std::int64_t destination_base = offsets[row] / sizeof(Word);
+    for (int d = blockIdx.x * blockDim.x + threadIdx.x; d < features; d += blockDim.x * gridDim.x)
+        destination[destination_base + d] =
+            source[(std::int64_t(row) * tokens + column) * features + d];
+}
+
 __global__ void gather_bf16_batch_columns_kernel(const __nv_bfloat16* source,
                                                  const std::int32_t* selectors, __nv_bfloat16* out,
                                                  std::int32_t rows, std::int32_t cols) {
@@ -92,6 +104,37 @@ void remap_ids_inplace(Tensor& ids, const std::int32_t* id_map, std::int32_t n,
         throw std::invalid_argument("remap_ids_inplace: id_map must be non-null and n>0");
     }
     remap_ids_inplace_launch(ids, id_map, n, stream);
+}
+
+void scatter_batch_columns(const Tensor& source, const Tensor& columns,
+                           const StateFieldView& destination, CudaExecutionView execution) {
+    namespace operand        = common::operand;
+    constexpr const char* op = "scatter_batch_columns";
+    const int d = source.ne[0], t = source.ne[1], b = source.ne[2];
+    if (d <= 0 || t <= 0 || b < 1 || b > 8 ||
+        (source.dtype != DType::BF16 && source.dtype != DType::I32))
+        throw std::invalid_argument("scatter_batch_columns: invalid shape or type");
+    const auto bytes = dtype_size(source.dtype);
+    operand::tensor(source, source.dtype, {d, t, b}, bytes, op, "source", execution.device());
+    operand::tensor(columns, DType::I32, {b}, 4, op, "columns", execution.device());
+    operand::state_field(destination, source.dtype, {d}, bytes, op, "destination",
+                         execution.device());
+    operand::tensor(destination.records.byte_offsets, DType::I64, {b}, 8, op, "offsets",
+                    execution.device());
+    if (destination.field.layers != 1)
+        throw std::invalid_argument("scatter_batch_columns: expected a single-layer field");
+    const dim3 grid(std::min(32, div_up(d, 256)), b);
+    const auto launch = [&]<class Word>() {
+        scatter_columns_kernel<<<grid, 256, 0, execution.stream()>>>(
+            static_cast<const Word*>(source.data), static_cast<const int*>(columns.data),
+            static_cast<const std::int64_t*>(destination.records.byte_offsets.data),
+            operand::state_field_base<Word>(destination), d, t);
+    };
+    if (source.dtype == DType::BF16)
+        launch.template operator()<std::uint16_t>();
+    else
+        launch.template operator()<std::uint32_t>();
+    CUDA_CHECK(cudaGetLastError());
 }
 
 } // namespace ninfer::ops

@@ -3,10 +3,11 @@
 function(ninfer_internal_includes target)
   target_include_directories(${target} PRIVATE
     ${PROJECT_SOURCE_DIR}/include
-    ${PROJECT_SOURCE_DIR}/src)
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_BINARY_DIR}/generated)
 endfunction()
 
-function(ninfer_cuda_archive target)
+function(ninfer_cuda_library target)
   set_target_properties(${target} PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON
     CUDA_RESOLVE_DEVICE_SYMBOLS ON)
@@ -15,6 +16,7 @@ endfunction()
 
 function(ninfer_cuda_non_rdc_archive target)
   set_target_properties(${target} PROPERTIES
+    POSITION_INDEPENDENT_CODE ON
     CUDA_SEPARABLE_COMPILATION OFF
     CUDA_RESOLVE_DEVICE_SYMBOLS OFF)
   target_compile_options(${target} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)

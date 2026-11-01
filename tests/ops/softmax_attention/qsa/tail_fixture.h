@@ -18,11 +18,20 @@ struct Plane {
     std::vector<Word> host;
     std::unique_ptr<GuardedDeviceBuffer> device;
 
-    Plane(int features, int columns, int outer, int layout)
+    Plane(int features, int columns, int outer, int layout, bool state = false,
+          bool coordinates = false)
         : view(Tensor::metadata(std::is_same_v<Word, std::uint16_t> ? DType::BF16 : DType::I32,
                                 {features, columns, outer})),
           leading(layout == 1 ? 1 : 0) {
-        if (layout == 1) {
+        if (state) {
+            const int axis = coordinates ? 1 : 2;
+            if (layout == 3) {
+                leading = std::size_t(features) * (coordinates ? 1 : columns) * 5;
+                view.nb[axis] *= 12;
+            } else if (layout) {
+                view.nb[axis] += (layout == 1 ? 5 : 17) * sizeof(Word);
+            }
+        } else if (layout == 1) {
             view.nb[1] = (features + 3) * sizeof(Word);
             view.nb[2] = ((features + 3) * columns + 5) * sizeof(Word);
         } else if (layout == 2) {
@@ -37,8 +46,8 @@ struct Plane {
         std::size_t span = features + (columns - 1) * (view.nb[1] / sizeof(Word)) +
                            (outer - 1) * (view.nb[2] / sizeof(Word));
         host.resize(leading + span);
-        device    = std::make_unique<GuardedDeviceBuffer>(host.size() * sizeof(Word));
-        view.data = static_cast<Word*>(device->data()) + leading;
+        device      = std::make_unique<GuardedDeviceBuffer>(host.size() * sizeof(Word));
+        view.data   = static_cast<Word*>(device->data()) + leading;
         view.device = device->device();
     }
 
@@ -71,6 +80,29 @@ struct Plane {
         return verify_exact(label.c_str(), download(), expected) + device->verify_guards(label);
     }
 };
+
+inline StateFieldView state_field(const Tensor& values, MemorySpan storage, const Tensor& offsets,
+                                  bool coordinates = false) {
+    const int columns       = coordinates ? 1 : 3;
+    const std::size_t bytes = values.ne[0] * columns * dtype_size(values.dtype);
+    const auto offset =
+        static_cast<std::byte*>(values.data) - static_cast<std::byte*>(storage.data);
+    const int axis = coordinates ? 1 : 2;
+    const auto alignment =
+        (reinterpret_cast<std::uintptr_t>(values.data) % 4 == 0 && values.nb[axis] % 4 == 0) ? 4U
+                                                                                             : 2U;
+    return {{storage, offsets},
+            {{{std::size_t(offset), bytes, alignment}, values.dtype, {values.ne[0], columns, 1, 1}},
+             1,
+             bytes}};
+}
+
+inline std::vector<std::int64_t>
+state_offsets(const Tensor& values, const std::vector<int>& indices, bool coordinates = false) {
+    std::vector<std::int64_t> result;
+    for (int index : indices) result.push_back(index * values.nb[coordinates ? 1 : 2]);
+    return result;
+}
 
 struct Tail {
     std::array<std::array<std::uint16_t, kFeatures>, 3> raw{};

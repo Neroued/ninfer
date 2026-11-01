@@ -25,7 +25,8 @@ EXIT_CANCELLED = 6
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="ninfer-eval", description="Run repository-local model capability evaluations"
+        prog="ninfer-eval",
+        description="Run repository-local model capability evaluations",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -132,10 +133,12 @@ def _run(config, suite: str, console: Console, resume_dir: Path | None = None) -
     signal.signal(signal.SIGINT, request_cancel)
     try:
         coordinator = Coordinator(config, suite, cancel)
-        run_dir = coordinator.run(resume_dir=resume_dir)
+        run_dir = coordinator.run(
+            resume_dir=resume_dir,
+            on_started=lambda path: console.print(f"run directory: {path}"),
+        )
     finally:
         signal.signal(signal.SIGINT, old_handler)
-    console.print(f"run directory: {run_dir}")
     summary = load_summary(run_dir)
     console.print(f"status: {summary['status']}")
     return _status_exit(summary.get("status"))

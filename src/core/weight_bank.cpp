@@ -126,4 +126,31 @@ ExpertBankDeviceView device_expert_bank(const WeightBankView& gate_up, const Wei
             gate_up.parent->device};
 }
 
+ExpertMatrixEntryLayout plan_expert_matrix(LayoutBuilder& builder, const WeightBankLayout& matrix) {
+    const auto add = [&](const WeightBankPlane& plane) {
+        return plane.expert_bytes ? builder.add(plane.expert_bytes, 16, "expert plane")
+                                  : LayoutRegion{};
+    };
+    return {add(matrix.codes), add(matrix.high), add(matrix.scales)};
+}
+
+ExpertMatrixDeviceView indexed_weight_matrix(const WeightParent& parent,
+                                             const std::uint64_t* offsets, const float* divisors,
+                                             ConstMemorySpan storage) {
+    const auto& g = parent.geometry;
+    if (!parent.data || parent.device.type() != DeviceType::CUDA || !offsets ||
+        parent.device != storage.device || g.shape.size() != 2)
+        throw std::invalid_argument("indexed expert matrix requires a resident encoded matrix");
+    return {parent.data,
+            g.high_bytes ? parent.data + g.high_offset : nullptr,
+            g.scale_bytes ? parent.data + g.scale_offset : nullptr,
+            0,
+            0,
+            0,
+            offsets,
+            divisors,
+            divisors ? 1U : 0U,
+            storage};
+}
+
 } // namespace ninfer

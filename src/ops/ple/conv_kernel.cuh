@@ -12,8 +12,9 @@ namespace ninfer::ops::detail::ple {
 struct ConvArguments {
     const __nv_bfloat16 *residual, *gated, *kernel, *history, *records, *norm;
     __nv_bfloat16 *updated, *normalized;
-    const std::int32_t *valid, *slots, *offsets;
-    std::int64_t history_column, history_slot, record_column, record_batch;
+    const std::int32_t *valid, *offsets;
+    const std::int64_t* state_offsets;
+    std::int64_t history_column, record_column, record_batch;
     int tokens, batch;
     float epsilon;
 };
@@ -29,7 +30,7 @@ struct ConvWindow {
 };
 
 __device__ inline ConvWindow window(const ConvArguments& a, int token, int batch) {
-    return {token < kHistory ? a.history + a.slots[batch] * a.history_slot : nullptr,
+    return {token < kHistory ? a.history + a.state_offsets[batch] / 2 : nullptr,
             a.records + batch * a.record_batch + a.offsets[batch] * a.record_column,
             a.history_column, a.record_column};
 }

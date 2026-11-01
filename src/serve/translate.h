@@ -4,7 +4,7 @@
 
 #include "ninfer/types.h"
 #include "serve/request.h"
-#include "serve/serve_options.h"
+#include "product/config/options.h"
 
 #include <functional>
 
@@ -15,27 +15,28 @@ namespace ninfer::serve {
 // target frontend sees it.
 using MediaAcquirer = std::function<ninfer::OwnedMedia(const ContentPart&)>;
 
-struct ResolvedPromptSemantics {
+struct PromptOptionInputs {
     std::optional<bool> enable_thinking;
     std::optional<ninfer::ReasoningEffort> reasoning_effort;
     std::optional<bool> preserve_thinking;
     std::string chat_template_kwargs_json;
+    PromptDefaults defaults;
 };
 
-ResolvedPromptSemantics resolve_prompt_semantics(const GenerationRequest& req,
-                                                 const ServeOptions& server);
+PromptOptionInputs collect_prompt_options(const GenerationRequest& req,
+                                          const product::ServeOptions& server);
 
 ninfer::PromptInput to_prompt_input(const GenerationRequest& req,
-                                    const ResolvedPromptSemantics& semantics,
+                                    const PromptOptionInputs& semantics,
                                     const MediaAcquirer& acquire_media);
 
 // Build public request options (output budget, thinking, stop policy, sampler). The
 // sampler is resolved from the request's SamplingParams over the server defaults;
-// --greedy on the server forces exact argmax regardless of the request. Prefix-reuse
+// Explicit request fields override startup defaults, including temperature. Prefix-reuse
 // participation is resolved by GenerationService and supplied explicitly because
 // operational requests do not inherit the external-traffic policy.
-ninfer::RequestOptions to_request_options(const GenerationRequest& req, const ServeOptions& server,
-                                          const ResolvedPromptSemantics& semantics,
+ninfer::RequestOptions to_request_options(const GenerationRequest& req,
+                                          const product::ServeOptions& server,
                                           bool allow_prefix_reuse);
 
 } // namespace ninfer::serve

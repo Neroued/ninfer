@@ -1,4 +1,4 @@
-#include "ops/linear/projection/q8/q8_shapes.h"
+#include "ops/linear/projection/q8/shapes.h"
 #include "ops/common/cuda/memory.cuh"
 #include "ops/linear/kernels/q8/q8_gemv_launch.cuh"
 #include "ops/linear/kernels/q8/q8_mma_launch.cuh"

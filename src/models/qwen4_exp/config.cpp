@@ -165,8 +165,7 @@ std::uint64_t GdnConfig::conv_channels() const {
 }
 
 Config parse_config(const artifact::Directory& directory, const LoadOptions& options) {
-    if (options.masked_draft() || options.proposal_enabled())
-        throw ArtifactError("Qwen4Exp supports native MTP with the full shared head");
+    if (options.masked_draft()) throw ArtifactError("Qwen4Exp supports native MTP");
     Config out{text_config(directory.component("text").config), {}, options.mtp()};
     if (options.vision) out.vision = vision_config(companion(directory, "vision"), out.text.hidden);
     if (out.mtp) {

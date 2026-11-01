@@ -1,5 +1,6 @@
 #include "ninfer/ops/embedding.h"
 #include "core/device.h"
+#include "core/platform.h"
 #include "ops/common/host/operands.h"
 #include "ops/common/numeric/math.h"
 #include "ops/embedding/kernel.cuh"
@@ -178,10 +179,27 @@ int linear_grid(std::int64_t count) {
     return static_cast<int>(std::max<std::int64_t>(1, common::div_up(count, std::int64_t{kBlock})));
 }
 
-void launch_bf16(const Tensor& ids, const Weight& table, Tensor& out, cudaStream_t stream) {
+void launch_bf16_scalar(const Tensor& ids, const Weight& table, Tensor& out, cudaStream_t stream) {
     kernels::embed_gather_dense_kernel<<<linear_grid(out.numel()), kBlock, 0, stream>>>(
         static_cast<const std::int32_t*>(ids.data), static_cast<const __nv_bfloat16*>(table.qdata),
         static_cast<__nv_bfloat16*>(out.data), out.ne[0], ids.ne[0]);
+}
+
+#if NINFER_TARGET_SPARK
+void launch_bf16_d2560(const Tensor& ids, const Weight& table, Tensor& out, cudaStream_t stream) {
+    kernels::embed_gather_bf16_d2560_kernel<5, 64><<<ids.ne[0] * 5, 64, 0, stream>>>(
+        static_cast<const std::int32_t*>(ids.data), static_cast<const uint4*>(table.qdata),
+        static_cast<uint4*>(out.data));
+}
+#endif
+
+EmbeddingLaunch select_bf16(const Weight& table, const Tensor& out) {
+#if NINFER_TARGET_SPARK
+    if (out.ne[0] == 2560 && common::operand::aligned(table.qdata, 16) &&
+        common::operand::aligned(out.data, 16))
+        return launch_bf16_d2560;
+#endif
+    return launch_bf16_scalar;
 }
 
 template <bool Grouped>
@@ -297,7 +315,7 @@ void embedding(const Tensor& ids, const Weight& table, Tensor& out, CudaExecutio
         if (table.qdata == nullptr) {
             throw std::invalid_argument("embedding: dense table data must be non-null");
         }
-        launch_bf16(ids, table, out, stream);
+        select_bf16(table, out)(ids, table, out, stream);
     } break;
     case QType::Q6_G64_FP16:
         require_q6_metadata(table, out);

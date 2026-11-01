@@ -40,12 +40,12 @@ inline std::size_t direct_bf16_bytes(std::int32_t n, std::int32_t k) {
 } // namespace detail
 
 inline DirectBf16Weight make_direct_bf16_weight(std::int32_t n, std::int32_t k,
-                                                std::uint32_t seed = 0x51U) {
+                                                std::uint32_t seed = 0x51U, float extent = 0.05F) {
     const std::size_t bytes = detail::direct_bf16_bytes(n, k);
     DirectBf16Weight result{DeviceBuffer(ninfer::bench::device_context().device(), bytes), {}};
     const std::uint64_t elements = static_cast<std::uint64_t>(n) * k;
     CUDA_CHECK(fixture::fill_values(static_cast<__nv_bfloat16*>(result.storage.data()), elements,
-                                    seed, -0.05F, 0.05F));
+                                    seed, -extent, extent));
     CUDA_CHECK(cudaDeviceSynchronize());
 
     Weight& weight         = result.weight;

@@ -131,7 +131,7 @@ void validate_gate(const PleProjectionView& projected, const Tensor& residual,
 }
 
 void validate_conv(const Tensor& residual, const Tensor& gated, const Tensor& kernel,
-                   const PleBatchView& batch, const PleConvStateView& before,
+                   const PleBatchView& batch, const ConstPleConvStateView& before,
                    const PleConvRecordWindowView& current, const Tensor& updated,
                    const Tensor* norm_weight, float epsilon, const Tensor* normalized,
                    CudaExecutionView execution) {
@@ -146,10 +146,12 @@ void validate_conv(const Tensor& residual, const Tensor& gated, const Tensor& ke
             require(updated.nb[d] == residual.nb[d], "in-place residual strides");
     contiguous(kernel, DType::BF16, {kChannels, 4}, 2, "convolution kernel", execution.device());
     metadata(batch.valid_columns, rows, "valid columns", execution.device());
-    metadata(before.slots, rows, "source slots", execution.device());
+    require(before.history.field.layers == 1, "history layer");
+    common::operand::state_field(before.history, DType::BF16, {kChannels, kHistory}, 2, "PLE",
+                                 "history", execution.device());
+    common::operand::shape(before.history.records.byte_offsets, {rows, 1, 1, 1}, "PLE",
+                           "source byte offsets");
     metadata(current.offsets, rows, "record offsets", execution.device());
-    const auto history =
-        columns(before.history, kHistory, before.history.ne[2], "history", execution.device());
     const auto records =
         columns(current.values, current.values.ne[1], rows, "records", execution.device());
     if (normalized) {
@@ -162,16 +164,18 @@ void validate_conv(const Tensor& residual, const Tensor& gated, const Tensor& ke
     for (const Tensor* output : {&updated, normalized}) {
         if (!output) continue;
         const auto out = common::operand::range(output->data, output->bytes(), "PLE");
-        for (const Tensor* input : {&residual, &gated, &kernel, &batch.valid_columns, &before.slots,
-                                    &current.offsets, norm_weight}) {
+        for (const Tensor* input :
+             {&residual, &gated, &kernel, &batch.valid_columns,
+              &before.history.records.byte_offsets, &current.offsets, norm_weight}) {
             if (!input || (output == &updated && input == &residual && output->data == input->data))
                 continue;
             require(!common::operand::overlaps(
                         out, common::operand::range(input->data, input->bytes(), "PLE")),
                     "output/input overlap");
         }
-        require(!overlaps_columns(out, history) && !overlaps_columns(out, records),
-                "output/history or record overlap");
+        require(!overlaps_columns(out, records), "output/record overlap");
+        // State fields are selected by Device offsets. Addressed input/output disjointness
+        // is a caller promise; unrelated records may share the same arena.
     }
     if (normalized)
         require(!common::operand::overlaps(
@@ -180,21 +184,24 @@ void validate_conv(const Tensor& residual, const Tensor& gated, const Tensor& ke
                 "output overlap");
 }
 
-void validate_extract(const PleConvStateView& before, const PleConvRecordReadView& records,
+void validate_extract(const ConstPleConvStateView& before, const PleConvRecordReadView& records,
                       const Tensor& accepted, const PleConvStateView& after,
                       CudaExecutionView execution) {
     const int batch = accepted.ne[0];
     validate_batch_extent(batch);
     metadata(accepted, batch, "accepted columns", execution.device());
     metadata(records.valid_columns, batch, "record valid columns", execution.device());
-    metadata(before.slots, batch, "source slots", execution.device());
-    metadata(after.slots, batch, "destination slots", execution.device());
-    (void)columns(before.history, kHistory, before.history.ne[2], "source history",
-                  execution.device());
-    (void)columns(after.history, kHistory, after.history.ne[2], "destination history",
-                  execution.device());
+    const auto validate_history = [&](const ConstStateFieldView& state) {
+        require(state.field.layers == 1, "history layer");
+        common::operand::state_field(state, DType::BF16, {kChannels, kHistory}, 2, "PLE", "history",
+                                     execution.device());
+        common::operand::shape(state.records.byte_offsets, {batch, 1, 1, 1}, "PLE",
+                               "state byte offsets");
+    };
+    validate_history(before.history);
+    validate_history(after.history);
     (void)columns(records.values, records.values.ne[1], batch, "records", execution.device());
-    // Only selected slots are read/written. Their cross-row and in-place relationships
+    // Only selected records are read/written. Their cross-row and in-place relationships
     // are Device-index promises; overlapping pool descriptors alone are not an error.
 }
 

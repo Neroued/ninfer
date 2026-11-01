@@ -4,6 +4,7 @@
 #include "ops/common/numeric/math.h"
 
 #include "core/device.h"
+#include "core/platform.h"
 
 #include <cuda_bf16.h>
 
@@ -91,9 +92,10 @@ void launch_residual_add(const Tensor& y, Tensor& x, cudaStream_t stream) {
     const auto y_addr      = reinterpret_cast<std::uintptr_t>(y.data);
     const auto x_addr      = reinterpret_cast<std::uintptr_t>(x.data);
     if (((y_addr | x_addr) & (alignof(common::Bf16x8Pack) - 1)) == 0 && (n % 8) == 0) {
+        constexpr int max_grid   = NINFER_TARGET_SPARK ? 16384 : kMaxGrid;
         const std::int64_t packs = n / 8;
         const int grid           = static_cast<int>(std::min<std::int64_t>(
-            kMaxGrid,
+            max_grid,
             std::max<std::int64_t>(1, common::div_up(packs, static_cast<std::int64_t>(kBlock)))));
         residual_add_bf16x8_kernel<<<grid, kBlock, 0, stream>>>(
             static_cast<const common::Bf16x8Pack*>(y.data),

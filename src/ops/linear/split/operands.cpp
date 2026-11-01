@@ -103,12 +103,6 @@ void validate_interval(std::int32_t first, std::int32_t last) {
     require(first > 0 && last >= first, "invalid positive column interval");
 }
 
-void validate_segments(std::span<const std::int32_t> rows, const SplitShape& shape) {
-    require(rows.size() == shape.segments.size(), "invalid output segment count");
-    for (std::size_t i = 0; i < rows.size(); ++i)
-        require(rows[i] == shape.segments[i], "unsupported output segmentation");
-}
-
 void validate_operands(const Tensor& x, Weights weights, std::span<const Tensor> outputs,
                        const SplitShape& shape, CudaExecutionView execution) {
     require(x.device == execution.device() && weights.first.device == execution.device() &&

@@ -14,7 +14,8 @@ struct TailFixture {
     StatePlane<std::uint16_t> raw_before, raw_after, raw_records;
     StatePlane<std::int32_t> rope_before, rope_after, rope_records;
     std::vector<int> bases, counts, commits;
-    DeviceBuffer slots;
+    DeviceBuffer raw_offsets;
+    DeviceBuffer rope_offsets;
     DeviceBuffer base;
     DeviceBuffer valid;
     DeviceBuffer accepted;
@@ -24,11 +25,11 @@ struct TailFixture {
     Tensor count;
 
     TailFixture(const Options& o, int capacity)
-        : raw_before(128, 3, o.batch, DType::BF16, o.layout),
-          raw_after(128, 3, o.batch, DType::BF16, o.layout),
+        : raw_before(128, 3, o.batch, DType::BF16, o.layout, false, true),
+          raw_after(128, 3, o.batch, DType::BF16, o.layout, false, true),
           raw_records(128, capacity, o.batch, DType::BF16, o.layout),
-          rope_before(3, o.batch, 1, DType::I32, o.layout, true),
-          rope_after(3, o.batch, 1, DType::I32, o.layout, true),
+          rope_before(3, o.batch, 1, DType::I32, o.layout, true, true),
+          rope_after(3, o.batch, 1, DType::I32, o.layout, true, true),
           rope_records(3, capacity, o.batch, DType::I32, o.layout),
           bases(broadcast(o.bases, o.batch)) {
         counts = o.valid == "dense" ? std::vector<int>(o.batch, capacity)
@@ -57,14 +58,21 @@ struct TailFixture {
         rope_records.upload();
         std::vector<int> indices(o.batch);
         std::iota(indices.begin(), indices.end(), 0);
-        slots    = measurement::make_i32(indices);
+        const auto raw_indices  = raw_before.offsets(indices);
+        const auto rope_indices = rope_before.offsets(indices, true);
+        raw_offsets             = make_buffer(raw_indices.size() * sizeof(std::int64_t));
+        rope_offsets            = make_buffer(rope_indices.size() * sizeof(std::int64_t));
+        raw_offsets.copy_from_host(raw_indices.data(), raw_offsets.size());
+        rope_offsets.copy_from_host(rope_indices.data(), rope_offsets.size());
         base     = measurement::make_i32(bases);
         valid    = measurement::make_i32(counts);
         accepted = measurement::make_i32(commits);
-        const Tensor selected(slots.span(), DType::I32, {o.batch});
-        before = {raw_before.view, rope_before.view, selected};
-        after  = {o.inplace ? raw_before.view : raw_after.view,
-                 o.inplace ? rope_before.view : rope_after.view, selected};
+        const Tensor raw_selected(raw_offsets.span(), DType::I64, {o.batch});
+        const Tensor rope_selected(rope_offsets.span(), DType::I64, {o.batch});
+        before = {raw_before.field(raw_selected), rope_before.field(rope_selected, true)};
+        after  = {o.inplace ? raw_before.field(raw_selected) : raw_after.field(raw_selected),
+                 o.inplace ? rope_before.field(rope_selected, true)
+                            : rope_after.field(rope_selected, true)};
         records = {raw_records.view, rope_records.view, Tensor(base.span(), DType::I32, {o.batch}),
                    Tensor(valid.span(), DType::I32, {o.batch})};
         count   = Tensor(accepted.span(), DType::I32, {o.batch});

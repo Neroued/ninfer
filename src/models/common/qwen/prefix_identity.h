@@ -19,6 +19,8 @@ public:
     void clear() noexcept;
     void assign(const PreparedPromptData& prompt);
     void swap(ResidentPrefixIdentity& other) noexcept;
+    void prepare_generated(std::size_t count, std::int32_t rope_delta,
+                           std::optional<std::uint32_t> execution_split_after = std::nullopt);
     void append_generated(std::size_t count, std::int32_t rope_delta,
                           std::optional<std::uint32_t> execution_split_after = std::nullopt);
     void truncate(std::size_t tokens);
@@ -36,7 +38,7 @@ public:
 private:
     std::vector<std::uint8_t> token_types_;
     std::array<std::vector<std::int32_t>, 3> positions_;
-    std::vector<VisionItem> vision_items_;
+    std::vector<models::frontend::VisionItem> vision_items_;
     std::vector<std::uint32_t> rewrite_execution_frontiers_;
     // Exact proof for the initial text run: type zero and position[axis][i] = origin[axis] + i.
     std::size_t regular_prefix_ = 0;
@@ -52,6 +54,8 @@ public:
     void clear() noexcept;
     void assign(const PreparedPromptData& prompt);
     void swap(PrefixShortlistDigests& other) noexcept;
+    void prepare_generated(std::size_t count, std::int32_t rope_delta,
+                           std::optional<std::uint32_t> execution_split_after = std::nullopt);
     void append_generated(std::span<const TokenId> tokens, std::int32_t rope_delta,
                           std::optional<std::uint32_t> execution_split_after = std::nullopt);
     void truncate(std::size_t tokens);
@@ -65,6 +69,20 @@ public:
 private:
     std::vector<std::array<std::uint64_t, 2>> digests_;
 };
+
+// A borrowed view of one complete immutable recovery point. Backing identity is a fast proof
+// only after the frontier, domain and digest checks; it never equates physical State/KV owners.
+struct RecoveryIdentityView {
+    std::uint32_t frontier;
+    std::uint32_t domain;
+    std::span<const TokenId> tokens;
+    const ResidentPrefixIdentity& positions;
+    const PrefixShortlistDigests& digests;
+    const void* backing;
+};
+
+[[nodiscard]] bool recovery_prefix_matches(const RecoveryIdentityView& earlier,
+                                           const RecoveryIdentityView& later);
 
 [[nodiscard]] bool prefix_matches(const PreparedPromptData& prompt,
                                   std::span<const TokenId> resident_tokens,

@@ -1,6 +1,6 @@
 #include "models/qwen3_5/measurement.h"
 
-#include "models/common/qwen/frontend/digest.h"
+#include "models/common/frontend/digest.h"
 #include "models/qwen3_5/program/planning/moe.h"
 
 #include <nlohmann/json.hpp>
@@ -11,7 +11,8 @@
 
 namespace ninfer::models::qwen3_5 {
 
-std::string prefill_signature(const Model& model, const moe::Plan* moe, std::uint32_t chunk) {
+std::string prefill_signature(const ModelDefinition& model, const moe::Plan* moe,
+                              std::uint32_t chunk) {
     using Json         = nlohmann::json;
     const auto& config = model.config();
     const auto& t      = config.text;
@@ -19,7 +20,7 @@ std::string prefill_signature(const Model& model, const moe::Plan* moe, std::uin
                {"architecture", architecture_name(t.architecture)},
                {"hidden_size", t.hidden_size},
                {"vocab_size", t.vocab_size},
-               {"public_token_count", model.resources().public_token_count},
+               {"public_token_count", model.resources().text.public_token_count},
                {"num_hidden_layers", t.num_hidden_layers},
                {"rms_norm_eps", t.rms_norm_eps},
                {"layer_types", t.layer_types}};
@@ -27,13 +28,13 @@ std::string prefill_signature(const Model& model, const moe::Plan* moe, std::uin
         auto& execution = facts["moe_execution"];
         execution       = {{"implementation", "eager-fixed-windows-2"},
                            {"chunk", chunk},
-                           {"workers", moe->team.worker_cpus.size()},
-                           {"cache_bytes", moe->cache.config.capacity_bytes},
-                           {"fixed_bytes", moe->cache.config.fixed_bytes},
-                           {"window_count", moe->window_count},
+                           {"workers", moe->description().cpu_workers},
+                           {"cache_bytes", moe->description().cache_bytes},
+                           {"fixed_bytes", moe->description().fixed_bytes},
+                           {"window_count", moe->description().window_count},
                            {"layers", Json::array()}};
-        for (const auto& layer : moe->layers) {
-            execution["layers"].push_back({layer.hybrid_max_tokens, layer.spec.priority,
+        for (const auto& layer : moe->description().layers) {
+            execution["layers"].push_back({layer.hybrid_max_tokens, layer.priority,
                                            layer.fixed_experts, layer.cache_experts});
         }
     }
@@ -94,7 +95,7 @@ std::string prefill_signature(const Model& model, const moe::Plan* moe, std::uin
         }
         inventory.push_back(std::move(item));
     }
-    return qwen::frontend::sha256_hex(qwen::frontend::sha256(facts.dump()));
+    return models::frontend::sha256_hex(models::frontend::sha256(facts.dump()));
 }
 
 } // namespace ninfer::models::qwen3_5

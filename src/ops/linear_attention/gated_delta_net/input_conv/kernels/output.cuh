@@ -7,10 +7,10 @@
 
 namespace ninfer::ops::detail {
 
-template <int ValueRows>
+template <int ValueRows, int QueryRows = 2048, int KeyRows = QueryRows>
 struct GdnConvGeometry {
-    static constexpr int query_rows = 2048;
-    static constexpr int key_rows   = 2048;
+    static constexpr int query_rows = QueryRows;
+    static constexpr int key_rows   = KeyRows;
     static constexpr int value_rows = ValueRows;
     static constexpr int z_rows     = ValueRows;
     static constexpr int channels   = query_rows + key_rows + value_rows;
@@ -48,15 +48,16 @@ struct GdnConvOutput {
 
 template <class Geometry, int Tokens, class Publish>
 GdnConvOutput<Geometry, Tokens, Publish>
-make_gdn_conv_output(const Tensor& conv_weight, const Tensor& conv_states,
-                     const Tensor& valid_columns, const Tensor& initial_slot, Tensor& query,
-                     Tensor& key, Tensor& value, Tensor& z, Publish publish) {
+make_gdn_conv_output(const Tensor& conv_weight, const ConstStateFieldView& conv_states,
+                     const Tensor& valid_columns, Tensor& query, Tensor& key, Tensor& value,
+                     Tensor& z, Publish publish) {
     return {
         {
             static_cast<const __nv_bfloat16*>(conv_weight.data),
-            static_cast<const __nv_bfloat16*>(conv_states.data),
-            conv_states.nb[2] / 2,
-            static_cast<const std::int32_t*>(initial_slot.data),
+            reinterpret_cast<const __nv_bfloat16*>(
+                (static_cast<const std::byte*>(conv_states.records.storage.data) +
+                 conv_states.field.tensor.region.offset)),
+            static_cast<const std::int64_t*>(conv_states.records.byte_offsets.data),
             valid_columns.data == nullptr ? nullptr
                                           : static_cast<const std::int32_t*>(valid_columns.data),
             static_cast<__nv_bfloat16*>(query.data),

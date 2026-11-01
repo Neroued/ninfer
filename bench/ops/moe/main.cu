@@ -1,3 +1,4 @@
+#include "common/roofline.h"
 #include "core/weight.h"
 #include "core/buffer.h"
 #include "ninfer/ops/moe.h"
@@ -200,8 +201,9 @@ double unique_weight_bytes(const Result& result) {
         result.operation == Operation::Route || result.operation == Operation::Complete;
     const bool shared =
         result.operation == Operation::RoutedShared || result.operation == Operation::Complete;
+    const int router_rows = result.subset == ops::ExpertSubsetKind::None ? 1 : kRouterRows;
     const std::uint64_t fixed =
-        (router ? std::uint64_t(kRouterRows) * kHidden * 2 : 0) +
+        (router ? std::uint64_t(router_rows) * kHidden * 2 : 0) +
         (shared ? packed_weight_bytes(QType::Q8_G32_FP16, 1024, kHidden) +
                       packed_weight_bytes(QType::Q8_G32_FP16, kHidden, kIntermediate)
                 : 0);
@@ -219,17 +221,9 @@ double logical_flops(const Result& result) {
         result.operation == Operation::Route || result.operation == Operation::Complete;
     const bool shared =
         result.operation == Operation::RoutedShared || result.operation == Operation::Complete;
-    return result.tokens * ((router ? 2.0 * kRouterRows * kHidden : 0) + (shared ? ffn : 0)) +
+    const int router_rows = result.subset == ops::ExpertSubsetKind::None ? 1 : kRouterRows;
+    return result.tokens * ((router ? 2.0 * router_rows * kHidden : 0) + (shared ? ffn : 0)) +
            (result.operation == Operation::Route ? 0 : result.selected_assignments * ffn);
-}
-
-double theoretical_memory_gbps(int device) {
-    int memory_clock_khz = 0;
-    int memory_bus_bits  = 0;
-    CUDA_CHECK(cudaDeviceGetAttribute(&memory_clock_khz, cudaDevAttrMemoryClockRate, device));
-    CUDA_CHECK(cudaDeviceGetAttribute(&memory_bus_bits, cudaDevAttrGlobalMemoryBusWidth, device));
-    return 2.0 * static_cast<double>(memory_clock_khz) * 1.0e3 *
-           (static_cast<double>(memory_bus_bits) / 8.0) / 1.0e9;
 }
 
 std::uint64_t parse_u64(std::string_view text, const char* label) {
@@ -311,7 +305,7 @@ void usage(const char* argv0) {
                  "Usage: %s [options]\n\n"
                  "Public workload:\n"
                  "  --op complete|route|routed|routed-shared (default complete).\n"
-                 "  --subset all|mask-ones|mask-zeros|none (routed Ops only).\n"
+                 "  --subset all|mask-ones|mask-zeros|none (except route).\n"
                  "  Complete adds to BF16 residual; routed Ops write FP32.\n"
                  "  --codec q4-q5|q4-q6|q8-q8|all  Routed weight profile (default q4-q5).\n"
                  "  --tokens T                       Exact token extent (default 1).\n"
@@ -412,9 +406,8 @@ Options parse_options(int argc, char** argv) {
         options.codec != "all") {
         throw std::invalid_argument("--codec must be q4-q5, q4-q6, q8-q8, or all");
     }
-    if (options.subset != ops::ExpertSubsetKind::All &&
-        (options.operation == Operation::Complete || options.operation == Operation::Route)) {
-        throw std::invalid_argument("--subset requires a routed Op");
+    if (options.subset != ops::ExpertSubsetKind::All && options.operation == Operation::Route) {
+        throw std::invalid_argument("route produces global TopK and does not accept --subset");
     }
     if (options.repeat <= 0) { throw std::invalid_argument("--repeat must be positive"); }
     if (options.flush_bytes > std::numeric_limits<std::size_t>::max()) {
@@ -728,8 +721,9 @@ public:
         const auto& weights = fixture_.weights();
         switch (operation_) {
         case Operation::Complete:
-            ops::topk_softmax_swiglu_moe(x_, profile, weights, ops::MoeEpilogue::AddResidual,
-                                         destination_tensor_, workspace_, cuda);
+            ops::topk_softmax_swiglu_moe(x_, profile, weights, subset_,
+                                         ops::MoeEpilogue::AddResidual, destination_tensor_,
+                                         workspace_, cuda);
             break;
         case Operation::Route:
             ops::topk_softmax_route(x_, {kHidden, kExperts, kTopK}, weights.control, routes_,
@@ -753,7 +747,7 @@ private:
         switch (options.operation) {
         case Operation::Complete:
             return ops::topk_softmax_swiglu_moe_workspace_capacity_bytes(
-                p, ops::MoeEpilogue::AddResidual, tokens, tokens);
+                p, options.subset, ops::MoeEpilogue::AddResidual, tokens, tokens);
         case Operation::Route:
             return ops::topk_softmax_route_workspace_capacity_bytes({kHidden, kExperts, kTopK},
                                                                     tokens, tokens);
@@ -897,7 +891,7 @@ void write_csv(const std::string& path, const std::vector<Result>& results, cons
     if (!stream) { throw std::runtime_error("failed to open CSV output"); }
     int runtime = 0;
     CUDA_CHECK(cudaRuntimeGetVersion(&runtime));
-    const double peak_memory_gbps = theoretical_memory_gbps(context.device().index());
+    const double peak_memory_gbps = bench::kRoofline.memory_gbs;
     stream << "codec,tokens,distribution,seed,unique_experts,adjacent_overlap,execution,"
               "timed_scope,cache,median_us,min_us,p95_us,unique_weight_gbps,"
               "memory_lower_bound_us,logical_tflops,workspace_bytes,warmup,repeat,"
@@ -931,14 +925,15 @@ int main(int argc, char** argv) {
     try {
         const Options options         = parse_options(argc, argv);
         auto& context                 = ninfer::bench::device_context();
-        const double peak_memory_gbps = theoretical_memory_gbps(context.device().index());
+        const double peak_memory_gbps = bench::kRoofline.memory_gbs;
         std::printf("# gpu=%s compute_capability=%d execution=%s "
                     "timed_scope=public_op_device_body cold_flush_mib=%llu "
-                    "theoretical_memory=%.1f GB/s\n",
+                    "reference_target=%s theoretical_memory=%.1f GB/s\n",
                     context.properties().name, context.compute_capability(),
                     options.execution == Execution::Both ? "both"
                                                          : execution_name(options.execution),
-                    static_cast<unsigned long long>(options.flush_bytes >> 20), peak_memory_gbps);
+                    static_cast<unsigned long long>(options.flush_bytes >> 20),
+                    bench::kRoofline.target, peak_memory_gbps);
 
         std::printf(
             "# op=%s subset=%d; memory bound uses unique weights and theoretical bandwidth\n",

@@ -12,14 +12,15 @@ struct QsaRecordLayout {
 struct BatchLayout {
     TensorRegion ids, positions, rope_positions;
     std::optional<TensorRegion> visual_indices;
-    TensorRegion valid_columns, source_slots, destination_slots, main_tables;
-    TensorRegion base_positions, record_offsets, accepted_columns;
+    TensorRegion valid_columns, source_offsets, destination_offsets, main_tables;
+    TensorRegion base_positions, record_offsets, accepted_columns, count_columns;
+    TensorRegion raw_tail, raw_tail_offsets, count_slots, sampling_positions;
     std::uint32_t max_positions;
 };
 
 struct MtpBatchLayout {
     TensorRegion ids, positions, rope_positions;
-    TensorRegion valid_columns, source_slots, destination_slots, table_rows;
+    TensorRegion valid_columns, source_offsets, destination_offsets, table_rows;
     TensorRegion base_positions, record_offsets;
     std::optional<TensorRegion> visual_indices;
     LayoutRegion ingress;
@@ -28,14 +29,17 @@ struct MtpBatchLayout {
 struct MtpBufferLayout {
     MtpBatchLayout history;
     std::vector<MtpBatchLayout> draft_steps;
-    LayoutRegion ingress;
     TensorRegion base_conditioning, alignment_conditioning, hidden, sample;
-    TensorRegion tail_keys, tail_coordinates, row_indices;
-    TensorRegion drafts, extents, anchors, frontiers, target_tokens, token_counts;
+    TensorRegion tail_keys, tail_coordinates, tail_key_offsets, tail_coordinate_offsets;
+    TensorRegion drafts, extents, verify_ids, target_tokens;
+    TensorRegion last_columns, active_columns, skip_first;
 };
 
 struct BufferLayout {
-    BatchLayout batch;
+    BatchLayout batch, decode;
+    TensorRegion anchors;
+    LayoutRegion ingress, commit_ingress, host_region;
+    TensorRegion commit_destination_offsets;
     TensorRegion prefill_sample;
     std::optional<TensorRegion> prefill_conditioning;
     TensorRegion pending_sample;
@@ -45,10 +49,14 @@ struct BufferLayout {
     std::optional<GdnReplayRecordLayout> gdn_records;
     std::optional<MtpBufferLayout> mtp;
     std::optional<TensorRegion> logits;
-    std::optional<TensorRegion> sampled_ids, output_counts, accepted_drafts;
+    std::optional<TensorRegion> ple_embedding, vocabulary_local, vocabulary_gathered;
+    std::optional<TensorRegion> proposal_sampling, proposal_columns;
+    std::optional<TensorRegion> sampled_ids, output_counts;
     std::optional<TensorRegion> token_counts, sampling, grammar_masks;
 };
 
 [[nodiscard]] BufferLayout plan_buffers(LayoutBuilder&, const Config&, const EngineOptions&,
-                                        std::uint32_t chunk, std::uint32_t public_tokens);
+                                        std::uint32_t chunk, std::uint32_t public_tokens,
+                                        const GdnConfig&, std::uint32_t local_vocabulary,
+                                        std::uint32_t ranks, bool device_ple);
 } // namespace ninfer::models::qwen4_exp

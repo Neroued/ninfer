@@ -36,6 +36,16 @@ struct QsaParameters {
     LinearParameters output;
 };
 
+struct QsaHistoryParameters {
+    LinearParameters input;
+    ops::QsaKvPrepareParameters prepare;
+};
+
+struct MtpHistoryParameters {
+    ops::HcFinalMixWeights mix;
+    QsaHistoryParameters attention;
+};
+
 struct BlockParameters {
     HcParameters attention_hc, moe_hc;
     std::variant<GdnParameters, QsaParameters> mixer;
@@ -62,14 +72,15 @@ struct MtpParameters {
     Tensor embedding_norm, hidden_norm;
     BlockParameters layer;
     FinalHcParameters final_hc;
+    MtpHistoryParameters history;
 };
 
 class Parameters {
 public:
-    explicit Parameters(const Model&, std::shared_ptr<const ModelProfile> = {});
+    explicit Parameters(const ModelShard&, std::shared_ptr<const ModelProfile>);
     Parameters(const Parameters&)            = delete;
     Parameters& operator=(const Parameters&) = delete;
-    const Model& model;
+    const ModelShard& model;
     const std::shared_ptr<const ModelProfile> profile;
     TextParameters text;
     std::optional<MtpParameters> mtp;

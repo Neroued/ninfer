@@ -1,28 +1,16 @@
 #pragma once
 
 #include "ninfer/types.h"
-#include "models/common/qwen/frontend/output_session.h"
-#include "runtime/contract/request.h"
+#include "models/common/frontend/prompt.h"
+#include "models/common/frontend/output_session.h"
 
-#include <array>
-#include <cstddef>
 #include <cstdint>
 #include <memory>
-#include <span>
+#include <optional>
 #include <string_view>
 #include <vector>
 
 namespace ninfer::models::qwen {
-
-struct FrontendOptions {
-    std::filesystem::path chat_template_path;
-    std::size_t grammar_cache_bytes        = 256ULL * 1024 * 1024;
-    bool vision_enabled                    = true;
-    std::uint32_t max_context              = 2'048;
-    std::size_t media_cache_bytes          = kDefaultMediaCacheBytes;
-    std::size_t media_live_bytes           = kDefaultMediaLiveBytes;
-    std::uint32_t media_preprocess_threads = 0;
-};
 
 struct FrontendResources;
 struct PreparedPromptData;
@@ -69,12 +57,14 @@ public:
                                                 bool allow_prefix_identity = true) const;
     [[nodiscard]] std::vector<TokenId> tokenize_text(std::string_view text) const;
     [[nodiscard]] MediaCacheSummary media_cache_summary() const;
-    [[nodiscard]] OutputSession
+    [[nodiscard]] models::frontend::OutputSession
     make_output_session(const PreparedPrompt& prompt, const StopPolicy& caller_stop,
                         const OutputOptions& output                       = {},
                         const ThinkingControlOptions& thinking            = {},
                         const std::optional<OutputConstraint>& constraint = {},
                         const ToolChoice& tool_choice                     = {}) const;
+    [[nodiscard]] std::shared_ptr<const void> identity() const noexcept;
+    [[nodiscard]] SamplingPreset sampling_for(const PreparedPrompt& prompt) const;
     [[nodiscard]] const StopPolicy& default_stop_policy() const noexcept;
     [[nodiscard]] const ModelSamplingDefaults& sampling_defaults() const noexcept;
 
@@ -84,11 +74,13 @@ private:
     std::shared_ptr<const Impl> impl_;
 
     friend class FrontendTestAccess;
-    friend Frontend make_frontend(const FrontendResources& resources, FrontendOptions options,
+    friend Frontend make_frontend(const FrontendResources& resources,
+                                  models::frontend::FrontendOptions options,
                                   ModelSamplingDefaults sampling);
 };
 
-[[nodiscard]] Frontend make_frontend(const FrontendResources& resources, FrontendOptions options,
+[[nodiscard]] Frontend make_frontend(const FrontendResources& resources,
+                                     models::frontend::FrontendOptions options,
                                      ModelSamplingDefaults sampling);
 
 } // namespace ninfer::models::qwen

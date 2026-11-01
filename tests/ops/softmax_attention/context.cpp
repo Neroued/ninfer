@@ -1,6 +1,8 @@
+#include "ops/suite.h"
 #include "ninfer/ops/softmax_attention.h"
 #include "cuda_fixture.h"
 #include "core/buffer.h"
+#include "../../../tools/support/paged_kv_fixture.h"
 
 #include "core/arena.h"
 #include "ops/op_tester.h"
@@ -171,17 +173,35 @@ void context_attention_oracle(const std::vector<float>& q, const std::vector<flo
         [&](int d, int head, int token, double value) { out[q_index(d, head, token)] = value; });
 }
 
-PagedKVBatchLayerView make_context_view(DeviceBuffer& k, DeviceBuffer& v,
-                                        DeviceBuffer& block_tables, int logical_pages,
-                                        int physical_pages, int table_rows = 1) {
-    return {
-        .k_pages      = Tensor(k.span(), DType::BF16, {kD, kPage, physical_pages, kKVHeads}),
-        .v_pages      = Tensor(v.span(), DType::FP16, {kD, kPage, physical_pages, kKVHeads}),
-        .block_tables = Tensor(block_tables.span(), DType::I32, {logical_pages, table_rows}),
-        .head_dim     = kD,
-        .num_kv_heads = kKVHeads,
-        .storage      = KvCacheStorage::BFloat16,
-    };
+KVPageGeometry context_geometry() {
+    return {kPage, {{DType::BF16, kD, kKVHeads}, {DType::FP16, kD, kKVHeads}}};
+}
+
+void upload_context(tool::PackedKVFixture& packed, std::size_t plane,
+                    const std::vector<std::uint16_t>& values, int physical_pages) {
+    Tensor input({const_cast<std::uint16_t*>(values.data()), values.size() * 2, Device::cpu()},
+                 plane == 0 ? DType::BF16 : DType::FP16, {kD, kPage, physical_pages, kKVHeads});
+    packed.upload_plane(plane, input, true);
+}
+
+std::vector<std::uint16_t> download_context(const tool::PackedKVFixture& packed, std::size_t plane,
+                                            int physical_pages) {
+    std::vector<std::uint16_t> values(static_cast<std::size_t>(kD) * kPage * physical_pages *
+                                      kKVHeads);
+    Tensor output({values.data(), values.size() * 2, Device::cpu()},
+                  plane == 0 ? DType::BF16 : DType::FP16, {kD, kPage, physical_pages, kKVHeads});
+    packed.download_plane(plane, output, true);
+    return values;
+}
+
+PagedKVBatchLayerView make_context_view(tool::PackedKVFixture& packed, DeviceBuffer& offsets,
+                                        int logical_pages, int table_rows = 1) {
+    Tensor table(offsets.span(), DType::I64, {logical_pages, table_rows});
+    return {.k_pages      = packed.plane(0, table),
+            .v_pages      = packed.plane(1, table),
+            .head_dim     = kD,
+            .num_kv_heads = kKVHeads,
+            .storage      = KvCacheStorage::BFloat16};
 }
 
 enum class InputProfile {
@@ -206,9 +226,6 @@ int run_case(int tokens, int context_length, InputProfile profile = InputProfile
     const std::size_t query_kv_count = static_cast<std::size_t>(kD) * kKVHeads * tokens;
     const std::size_t logical_context_count =
         static_cast<std::size_t>(kD) * logical_stride * kKVHeads;
-    const std::size_t physical_context_count =
-        static_cast<std::size_t>(kD) * kPage * kKVHeads * physical_pages;
-
     std::vector<float> q(q_count);
     std::vector<float> query_k(query_kv_count);
     std::vector<float> query_v(query_kv_count);
@@ -245,9 +262,7 @@ int run_case(int tokens, int context_length, InputProfile profile = InputProfile
 
     std::vector<std::int32_t> mapping = page_mapping(logical_pages, mapping_pattern);
     if (sparse_envelope_storage) { std::fill(mapping.begin() + populated_pages, mapping.end(), 0); }
-    if (context_length == 0 && envelope_max == 0) {
-        mapping[0] = std::numeric_limits<std::int32_t>::max();
-    }
+    if (context_length == 0 && envelope_max == 0) { mapping[0] = -1; }
     const int scattered_rows = sparse_envelope_storage ? populated_rows : logical_capacity;
     const std::vector<float> physical_k =
         context_length == 0 && envelope_max == 0
@@ -271,12 +286,15 @@ int run_case(int tokens, int context_length, InputProfile profile = InputProfile
     const std::vector<int> valid_expected{valid_columns};
     const std::vector<int> table_row_expected{0};
 
-    DeviceBuffer d_q         = to_device(q_expected);
-    DeviceBuffer d_query_k   = to_device(query_k_expected);
-    DeviceBuffer d_query_v   = to_device(query_v_expected);
-    DeviceBuffer d_context_k = to_device(context_k_expected);
-    DeviceBuffer d_context_v = to_device(context_v_expected);
-    DeviceBuffer d_table     = to_device(mapping);
+    DeviceBuffer d_q       = to_device(q_expected);
+    DeviceBuffer d_query_k = to_device(query_k_expected);
+    DeviceBuffer d_query_v = to_device(query_v_expected);
+    tool::PackedKVFixture packed(cuda_environment().context.device(), context_geometry(),
+                                 physical_pages);
+    upload_context(packed, 0, context_k_expected, physical_pages);
+    upload_context(packed, 1, context_v_expected, physical_pages);
+    const auto offsets       = packed.table_offsets(mapping);
+    DeviceBuffer d_table     = to_device(offsets);
     DeviceBuffer d_length    = to_device_i32(length_expected);
     DeviceBuffer d_valid     = to_device_i32(valid_expected);
     DeviceBuffer d_table_row = to_device_i32(table_row_expected);
@@ -290,8 +308,7 @@ int run_case(int tokens, int context_length, InputProfile profile = InputProfile
     Tensor valid_tensor(d_valid.span(), DType::I32, {1});
     Tensor table_row_tensor(d_table_row.span(), DType::I32, {1});
     Tensor out_tensor(d_out.span(), DType::BF16, {kD, kQHeads, tokens, 1});
-    PagedKVBatchLayerView context =
-        make_context_view(d_context_k, d_context_v, d_table, logical_pages, physical_pages);
+    PagedKVBatchLayerView context = make_context_view(packed, d_table, logical_pages);
     const ops::ContextAttentionExecutionEnvelope envelope{0,
                                                           static_cast<std::uint32_t>(envelope_max)};
     const std::size_t workspace_bytes = ops::context_softmax_attention_workspace_capacity_bytes(
@@ -332,13 +349,12 @@ int run_case(int tokens, int context_length, InputProfile profile = InputProfile
         verify_exact((label + " query v unchanged").c_str(),
                      from_device<std::uint16_t>(d_query_v, query_kv_count), query_v_expected);
     failures += verify_exact((label + " context k unchanged").c_str(),
-                             from_device<std::uint16_t>(d_context_k, physical_context_count),
-                             context_k_expected);
+                             download_context(packed, 0, physical_pages), context_k_expected);
     failures += verify_exact((label + " context v unchanged").c_str(),
-                             from_device<std::uint16_t>(d_context_v, physical_context_count),
-                             context_v_expected);
+                             download_context(packed, 1, physical_pages), context_v_expected);
     failures += verify_exact((label + " block table unchanged").c_str(),
-                             from_device<std::int32_t>(d_table, mapping.size()), mapping);
+                             from_device<std::int64_t>(d_table, mapping.size()),
+                             packed.table_offsets(mapping));
     failures += verify_exact((label + " context length unchanged").c_str(),
                              from_device<int>(d_length, 1), length_expected);
     failures += verify_exact((label + " valid columns unchanged").c_str(),
@@ -400,12 +416,14 @@ int graph_mapping_replay_case() {
     context_attention_oracle(q, query_k, query_v, context_k, context_v, tokens, context_length,
                              tokens, logical_stride, reference);
 
-    DeviceBuffer d_q         = to_device(bf16_bits(q));
-    DeviceBuffer d_query_k   = to_device(bf16_bits(query_k));
-    DeviceBuffer d_query_v   = to_device(bf16_bits(query_v));
-    DeviceBuffer d_context_k = to_device(bf16_bits(physical_k));
-    DeviceBuffer d_context_v = to_device(fp16_bits(physical_v));
-    DeviceBuffer d_table     = to_device<std::int32_t>({0, 1});
+    DeviceBuffer d_q       = to_device(bf16_bits(q));
+    DeviceBuffer d_query_k = to_device(bf16_bits(query_k));
+    DeviceBuffer d_query_v = to_device(bf16_bits(query_v));
+    tool::PackedKVFixture packed(cuda_environment().context.device(), context_geometry(),
+                                 physical_pages);
+    upload_context(packed, 0, bf16_bits(physical_k), physical_pages);
+    upload_context(packed, 1, fp16_bits(physical_v), physical_pages);
+    DeviceBuffer d_table     = to_device(packed.table_offsets(replay_mappings[0]));
     DeviceBuffer d_length    = to_device_i32({context_length});
     DeviceBuffer d_valid     = to_device_i32({tokens});
     DeviceBuffer d_table_row = to_device_i32({0});
@@ -417,8 +435,7 @@ int graph_mapping_replay_case() {
     Tensor valid_tensor(d_valid.span(), DType::I32, {1});
     Tensor table_row_tensor(d_table_row.span(), DType::I32, {1});
     Tensor out_tensor(d_out.span(), DType::BF16, {kD, kQHeads, tokens, 1});
-    PagedKVBatchLayerView context =
-        make_context_view(d_context_k, d_context_v, d_table, logical_pages, physical_pages);
+    PagedKVBatchLayerView context = make_context_view(packed, d_table, logical_pages);
     constexpr ops::ContextAttentionExecutionEnvelope envelope{0, context_length};
     ninfer::DeviceBuffer workspace_storage(ninfer::test::cuda_environment().context.device(),
                                            ops::context_softmax_attention_workspace_capacity_bytes(
@@ -441,7 +458,8 @@ int graph_mapping_replay_case() {
 
     int failures = 0;
     for (const auto& replay_mapping : replay_mappings) {
-        d_table.copy_from_host(replay_mapping.data(), sizeof(replay_mapping));
+        const auto offsets = packed.table_offsets(replay_mapping);
+        d_table.copy_from_host(offsets.data(), offsets.size() * sizeof(std::int64_t));
         cuda_check(cudaGraphLaunch(executable, stream), "launch context-attention graph");
         cuda_synchronize(stream);
         const std::vector<std::int32_t> mapping(replay_mapping.begin(), replay_mapping.end());
@@ -451,7 +469,8 @@ int graph_mapping_replay_case() {
         failures += verify_reduction(label.c_str(), from_device_bf16(d_out.data(), q_count),
                                      reference, kContextQueryBf16Criterion);
         failures += verify_exact((label + " block table unchanged").c_str(),
-                                 from_device<std::int32_t>(d_table, mapping.size()), mapping);
+                                 from_device<std::int64_t>(d_table, mapping.size()),
+                                 packed.table_offsets(mapping));
     }
 
     cudaGraphExecDestroy(executable);
@@ -515,12 +534,14 @@ int batch_table_case() {
     const std::vector<std::int32_t> lengths{65, 1};
     const std::vector<std::int32_t> valid{2, 1};
     const std::vector<std::int32_t> table_rows{1, 0};
-    DeviceBuffer d_q          = to_device(bf16_bits(q));
-    DeviceBuffer d_query_k    = to_device(bf16_bits(query_k));
-    DeviceBuffer d_query_v    = to_device(bf16_bits(query_v));
-    DeviceBuffer d_context_k  = to_device(bf16_bits(physical_k));
-    DeviceBuffer d_context_v  = to_device(fp16_bits(physical_v));
-    DeviceBuffer d_tables     = to_device(block_tables);
+    DeviceBuffer d_q       = to_device(bf16_bits(q));
+    DeviceBuffer d_query_k = to_device(bf16_bits(query_k));
+    DeviceBuffer d_query_v = to_device(bf16_bits(query_v));
+    tool::PackedKVFixture packed(cuda_environment().context.device(), context_geometry(),
+                                 physical_pages);
+    upload_context(packed, 0, bf16_bits(physical_k), physical_pages);
+    upload_context(packed, 1, fp16_bits(physical_v), physical_pages);
+    DeviceBuffer d_tables     = to_device(packed.table_offsets(block_tables));
     DeviceBuffer d_lengths    = to_device(lengths);
     DeviceBuffer d_valid      = to_device(valid);
     DeviceBuffer d_table_rows = to_device(table_rows);
@@ -534,8 +555,7 @@ int batch_table_case() {
     Tensor valid_tensor(d_valid.span(), DType::I32, {batch});
     Tensor table_row_tensor(d_table_rows.span(), DType::I32, {batch});
     Tensor out_tensor(d_out.span(), DType::BF16, {kD, kQHeads, tokens, batch});
-    auto context =
-        make_context_view(d_context_k, d_context_v, d_tables, logical_pages, physical_pages, batch);
+    auto context = make_context_view(packed, d_tables, logical_pages, batch);
     constexpr ops::ContextAttentionExecutionEnvelope envelope{0, 65};
 
     std::vector<double> expected(row_q_count * batch);
@@ -582,49 +602,59 @@ int batch_table_case() {
 
 } // namespace
 
-int run_softmax_attention_context_tests() {
-    if (cuda_unavailable()) {
-        std::cout << "SKIP: CUDA device unavailable\n";
-        return 77;
-    }
-
-    int failures = 0;
-    constexpr ops::ContextAttentionExecutionEnvelope capacity_envelope{0, 196609};
-    const std::size_t interval = ops::context_softmax_attention_workspace_capacity_bytes(
-        kGeometry, capacity_envelope, 1, 16, 1);
-    const std::size_t witness = std::max(ops::context_softmax_attention_workspace_capacity_bytes(
-                                             kGeometry, capacity_envelope, 8, 8, 1),
-                                         ops::context_softmax_attention_workspace_capacity_bytes(
-                                             kGeometry, capacity_envelope, 16, 16, 1));
-    if (interval != witness) {
-        std::cerr << "context-attention interval capacity missed a token-band endpoint\n";
-        ++failures;
-    }
-    try {
-        (void)ops::context_softmax_attention_workspace_capacity_bytes(kGeometry, capacity_envelope,
-                                                                      9, 8, 1);
-        std::cerr << "context-attention accepted an invalid token interval\n";
-        ++failures;
-    } catch (const std::invalid_argument&) {}
-    failures += run_case(1, 0);
-    failures += run_case(2, 1);
-    failures += run_case(1, 63);
-    failures += run_case(2, 64, InputProfile::Random, -1, MappingPattern::Offset);
-    failures += run_case(4, 65, InputProfile::Random, -1, MappingPattern::Fragmented);
-    failures += run_case(8, 95, InputProfile::Random, 4096, MappingPattern::Fragmented);
-    failures += run_case(16, 65, InputProfile::Random, 65537, MappingPattern::Fragmented, 16, true);
-    failures += run_case(16, 257);
-    failures += run_case(1, 4096, InputProfile::Random, -1, MappingPattern::Fragmented);
-    failures += run_case(4, 0, InputProfile::QueryVisibility);
-    failures += run_case(8, 0, InputProfile::Random, 0, MappingPattern::Identity, 0);
-    failures += run_case(8, 65, InputProfile::Random, 65, MappingPattern::Fragmented, 0);
-    failures += graph_mapping_replay_case();
-    failures += batch_table_case();
-
-    if (failures != 0) {
-        std::cerr << "context_softmax_attention failures=" << failures << '\n';
-        return 1;
-    }
-    std::cout << "context_softmax_attention: PASS\n";
-    return 0;
+void add_context_attention_cases(ninfer::test::OpSuite& suite) {
+    suite.add(
+        "context_attention/capacity",
+        [] {
+            int failures = 0;
+            constexpr ops::ContextAttentionExecutionEnvelope capacity_envelope{0, 196609};
+            const std::size_t interval = ops::context_softmax_attention_workspace_capacity_bytes(
+                kGeometry, capacity_envelope, 1, 16, 1);
+            const std::size_t witness =
+                std::max(ops::context_softmax_attention_workspace_capacity_bytes(
+                             kGeometry, capacity_envelope, 8, 8, 1),
+                         ops::context_softmax_attention_workspace_capacity_bytes(
+                             kGeometry, capacity_envelope, 16, 16, 1));
+            if (interval != witness) {
+                std::cerr << "context-attention interval capacity missed a token-band endpoint\n";
+                ++failures;
+            }
+            try {
+                (void)ops::context_softmax_attention_workspace_capacity_bytes(
+                    kGeometry, capacity_envelope, 9, 8, 1);
+                std::cerr << "context-attention accepted an invalid token interval\n";
+                ++failures;
+            } catch (const std::invalid_argument&) {}
+            return failures;
+        },
+        {{"format", "bf16"}});
+    const auto add = [&](int tokens, int length, InputProfile input = InputProfile::Random,
+                         int envelope = -1, MappingPattern mapping = MappingPattern::Identity,
+                         int valid = -1, bool sparse_storage = false) {
+        const auto id = "context_attention/t" + std::to_string(tokens) + "/l" +
+                        std::to_string(length) + "/bound" + std::to_string(envelope) + "/valid" +
+                        std::to_string(valid) + "/mapping" + std::to_string(int(mapping)) +
+                        "/input" + std::to_string(int(input));
+        suite.add(id,
+                  [=] {
+                      return run_case(tokens, length, input, envelope, mapping, valid,
+                                      sparse_storage);
+                  },
+                  {{"format", "bf16"}, {"execution", "eager"}});
+    };
+    add(1, 0);
+    add(2, 1);
+    add(1, 63);
+    add(2, 64, InputProfile::Random, -1, MappingPattern::Offset);
+    add(4, 65, InputProfile::Random, -1, MappingPattern::Fragmented);
+    add(8, 95, InputProfile::Random, 4096, MappingPattern::Fragmented);
+    add(16, 65, InputProfile::Random, 65537, MappingPattern::Fragmented, 16, true);
+    add(16, 257);
+    add(1, 4096, InputProfile::Random, -1, MappingPattern::Fragmented);
+    add(4, 0, InputProfile::QueryVisibility);
+    add(8, 0, InputProfile::Random, 0, MappingPattern::Identity, 0);
+    add(8, 65, InputProfile::Random, 65, MappingPattern::Fragmented, 0);
+    suite.add("context_attention/graph_mapping", graph_mapping_replay_case,
+              {{"format", "bf16"}, {"execution", "graph"}});
+    suite.add("context_attention/batch_table", batch_table_case, {{"format", "bf16"}});
 }

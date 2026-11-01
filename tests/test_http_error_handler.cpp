@@ -1,4 +1,5 @@
 #include "serve/http_server.h"
+#include "runtime/contract/request.h"
 
 #include <nlohmann/json.hpp>
 
@@ -8,7 +9,7 @@
 namespace {
 
 using Json = nlohmann::json;
-using ninfer::serve::ServeOptions;
+using ninfer::product::ServeOptions;
 
 int check(bool condition, const char* message) {
     if (condition) { return 0; }
@@ -23,6 +24,32 @@ int main() {
     ServeOptions options;
     options.max_request_bytes = 1234;
 
+    const auto conflicting_options = ninfer::serve::request_error_to_api_error(
+        ninfer::RequestError(ninfer::RequestErrorKind::ConflictingPromptOptions,
+                             "conflicting thinking options", "reasoning_effort"));
+    failures += check(conflicting_options.status == 400 &&
+                          conflicting_options.code == "conflicting_template_option" &&
+                          conflicting_options.param == "reasoning_effort",
+                      "Frontend option conflict lost its public error classification");
+    const auto continuation = ninfer::serve::request_error_to_api_error(
+        ninfer::RequestError(ninfer::RequestErrorKind::UnsupportedPromptContinuation,
+                             "thinking cannot continue assistant content"));
+    failures += check(continuation.status == 400 &&
+                          continuation.code == "assistant_prefill_not_supported" &&
+                          continuation.param == "messages",
+                      "Frontend continuation rejection lost its public error classification");
+    const auto combination = ninfer::serve::request_error_to_api_error(
+        ninfer::RequestError(ninfer::RequestErrorKind::UnsupportedOutputCombination,
+                             "incompatible output options"),
+        "structured_outputs.regex");
+    const auto tools_stop = ninfer::serve::request_error_to_api_error(
+        ninfer::RequestError(ninfer::RequestErrorKind::UnsupportedOutputCombination,
+                             "incompatible output options", "stop"));
+    failures +=
+        check(combination.status == 400 && combination.param == "structured_outputs.regex" &&
+                  tools_stop.status == 400 && tools_stop.param == "stop",
+              "Frontend output-combination rejection lost the source request field");
+
     const ninfer::serve::ApiError media_budget = ninfer::serve::request_error_to_api_error(
         ninfer::RequestError(ninfer::RequestErrorKind::MediaBudgetExceeded,
                              "vision tokens exceed processor budget"));
@@ -35,11 +62,11 @@ int main() {
                       "invalid media did not retain its client-input classification");
     const ninfer::serve::ApiError context_limit = ninfer::serve::request_error_to_api_error(
         ninfer::RequestError(ninfer::RequestErrorKind::ContextLengthExceeded,
-                             "prepared prompt has 200 tokens, exceeding Engine max_context 128"));
+                             ninfer::runtime::context_length_error_message(200, 128)));
     failures +=
         check(context_limit.status == 400 && context_limit.code == "context_length_exceeded" &&
-                  context_limit.message.find("200 tokens") != std::string::npos &&
-                  context_limit.message.find("128") != std::string::npos,
+                  context_limit.message == "maximum context length is 128 tokens, but the "
+                                           "prepared prompt has 200 tokens",
               "context rejection lost its HTTP classification or capacity details");
     const ninfer::serve::ApiError thinking_capacity = ninfer::serve::request_error_to_api_error(
         ninfer::RequestError(ninfer::RequestErrorKind::ThinkingBudgetCapacityInsufficient,

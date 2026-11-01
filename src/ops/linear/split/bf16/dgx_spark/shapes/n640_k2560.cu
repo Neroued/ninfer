@@ -1,0 +1,51 @@
+#include "ops/linear/split/dispatch.h"
+#include "ops/linear/split/bf16/launch.cuh"
+#include "ops/linear/kernels/bf16/bf16_mma_epilogue.cuh"
+
+namespace ninfer::ops::detail::linear_split {
+namespace {
+template <class Base>
+struct SplitN640K2560 : Bf16ScheduleInstance<Base, 2560> {};
+
+using Vector = SplitN640K2560<
+    Bf16A16GemvSchedule<4, 2, 1, 8, 4, Bf16ActivationAccess::Direct, Bf16WeightCache::Default,
+                        Bf16PhaseOrder::Sequential, 1, 1, 4, 2>>;
+template <int Tokens>
+using Sliced = SplitN640K2560<Bf16A16SlicedKMmaSchedule<16, Tokens, 4, 64, 2>>;
+using Small =
+    SplitN640K2560<Bf16A16MmaSchedule<32, 32, 128, 16, 8, 3, 2, Cache::cg, Cache::cg,
+                                      Bf16MmaFragmentPipeline::PingPong, Bf16MmaRaster::TokenFast>>;
+using Medium = SplitN640K2560<Bf16A16TmaMmaSchedule<64, 32, 64, 16, 16, 3, 2>>;
+using Square = SplitN640K2560<Bf16A16TmaMmaSchedule<64, 64, 64, 32, 32, 3>>;
+using Large  = SplitN640K2560<Bf16A16TmaMmaSchedule<128, 128, 64, 64, 32, 3>>;
+using Wide   = SplitN640K2560<Bf16A16TmaMmaSchedule<128, 256, 64, 64, 64, 2>>;
+using Bulk =
+    SplitN640K2560<Bf16A16TmaMmaSchedule<128, 64, 64, 32, 32, 2, 2, Bf16MmaRaster::RowFast>>;
+
+template <class Output>
+void select_route(int tokens, const Bf16SplitRoutes<Output>& routes) {
+    if (tokens == 1) return routes.template gemv<Vector>();
+    if (tokens <= 8) return routes.template sliced<Sliced<8>>();
+    if (tokens <= 32) return routes.template sliced<Sliced<16>>();
+    if (tokens <= 64) return routes.template sliced<Sliced<32>>();
+    if (tokens <= 128) return routes.template mma<Small>();
+    if (tokens <= 256) return routes.template tma<Medium, Bf16MmaWarpStoreEpilogue>();
+    if (tokens <= 512) return routes.template tma<Square, Bf16MmaWarpStoreEpilogue>();
+    if (tokens <= 1024) return routes.template tma<Large, Bf16MmaWarpStoreEpilogue>();
+    if (tokens <= 2048) return routes.template tma<Wide, Bf16MmaWarpStoreEpilogue>();
+    return routes.template tma<Bulk, Bf16MmaWarpStoreEpilogue>();
+}
+
+void launch_split(const Tensor& x, Weights weights, std::span<const Tensor> out, MemoryArena*,
+                  cudaStream_t stream) {
+    using Output = LinearBf16SegmentedOutput<256, 256, 128>;
+    const Output output{{static_cast<__nv_bfloat16*>(out[0].data),
+                         static_cast<__nv_bfloat16*>(out[1].data),
+                         static_cast<__nv_bfloat16*>(out[2].data)}};
+    select_route(x.ne[1],
+                 Bf16SplitRoutes<Output>{bf16_a16_operands(x, weights.first), output, stream});
+}
+} // namespace
+
+const SplitShape kBf16SplitN640K2560{640, 2560, kSplitRows<256, 256, 128>, launch_split};
+} // namespace ninfer::ops::detail::linear_split

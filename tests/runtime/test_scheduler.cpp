@@ -226,6 +226,12 @@ void test_pressure_victims_and_first_unit() {
 
     require(scheduler.youngest_victim(slots, 4) == 2,
             "victim selection followed lane order instead of request age");
+    const std::array skipped{2U, 0U};
+    require(scheduler.youngest_victim(slots, 4, std::nullopt, skipped) == 3,
+            "pressure filtering changed age order or selected a noncontributing victim");
+    const std::array all_younger{2U, 0U, 3U};
+    require(!scheduler.youngest_victim(slots, 4, std::nullopt, all_younger),
+            "pressure filtering made the oldest request eligible for preemption");
     // Releasing this request may free no physical page because another request shares them.
     // There is deliberately no synthetic capacity credit: continue with the remaining members.
     slots[2].reset();

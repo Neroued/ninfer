@@ -4,10 +4,11 @@
 #include "ops/softmax_attention/qsa/sparse_gqa/kernel.cuh"
 
 namespace ninfer::ops::detail::qsa {
-template <KvCacheStorage Storage, int Warps, bool Vector>
-__launch_bounds__(Warps * 32) __global__ void sparse_gqa_simt_kernel(SparseGqaArguments a) {
-    const auto q   = a.begin + blockIdx.x / 24;
-    const int head = blockIdx.x % 24, kvh = head / 12, split = blockIdx.y;
+template <KvCacheStorage Storage, int Warps, bool Vector, int KvHeads>
+__launch_bounds__(Warps * 32) __global__
+    void sparse_gqa_simt_kernel(SparseGqaKernelArguments<KvHeads> a) {
+    const auto q   = a.begin + a.head_query(blockIdx.x);
+    const int head = a.head_index(blockIdx.x), kvh = head / 12, split = blockIdx.y;
     const int tid = threadIdx.x, lane = tid & 31, warp = tid / 32;
     const auto work = a.work(q);
     // This route always publishes FP32 partials; merge owns basis inversion and the gate.
@@ -19,25 +20,25 @@ __launch_bounds__(Warps * 32) __global__ void sparse_gqa_simt_kernel(SparseGqaAr
 #pragma unroll
     for (int i = 0; i < 8; ++i) {
         const int d = kSparseQuantized<Storage> ? lane + 32 * i : lane * 8 + i;
-        query[i]    = __bfloat162float(a.query[(q * 24 + head) * 256 + d]);
+        query[i]    = __bfloat162float(a.query[(q * a.query_heads + head) * 256 + d]);
     }
     if constexpr (kSparseQuantized<Storage>) kv::normalized_hadamard_d256_inplace(query, lane);
     const auto table = a.tables + std::int64_t(a.table_rows[q / a.tokens]) * a.table_stride;
     for (int j = start + warp; j < end; j += Warps) {
-        const int ordinal  = j / 4;
-        const int g        = ordinal < work.count
-                                 ? (work.count == work.complete ? ordinal : a.ids[q * 512 + ordinal])
-                                 : work.complete;
-        const int physical = table[g / 16], row = 4 * (g % 16) + j % 4;
-        const auto* kp = a.key.data + physical * a.key.page + kvh * a.key.head + row * a.key.row;
-        const auto* vp =
-            a.value.data + physical * a.value.page + kvh * a.value.head + row * a.value.row;
+        const int ordinal   = j / 4;
+        const int g         = ordinal < work.count
+                                  ? (work.count == work.complete ? ordinal : a.ids[q * 512 + ordinal])
+                                  : work.complete;
+        const auto physical = table[g / 16];
+        const int row       = 4 * (g % 16) + j % 4;
+        const auto* kp      = a.key.data + physical + kvh * a.key.head + row * a.key.row;
+        const auto* vp      = a.value.data + physical + kvh * a.value.head + row * a.value.row;
         float keys[8], values[8];
         if constexpr (kSparseQuantized<Storage>) {
-            const auto* ks = a.key_scale.data + physical * a.key_scale.page +
-                             kvh * a.key_scale.head + row * a.key_scale.row;
-            const auto* vs = a.value_scale.data + physical * a.value_scale.page +
-                             kvh * a.value_scale.head + row * a.value_scale.row;
+            const auto* ks =
+                a.key_scale.data + physical + kvh * a.key_scale.head + row * a.key_scale.row;
+            const auto* vs =
+                a.value_scale.data + physical + kvh * a.value_scale.head + row * a.value_scale.row;
 #pragma unroll
             for (int i = 0; i < 8; ++i) {
                 keys[i]   = sparse_gqa_decode<Storage, true>(kp, ks, lane + 32 * i);

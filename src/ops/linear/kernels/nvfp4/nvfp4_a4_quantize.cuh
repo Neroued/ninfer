@@ -27,9 +27,9 @@ __device__ __forceinline__ std::int64_t nvfp4_tiled_scale_offset(int token, int 
            (group - group_tile * kGroupsPerTile);
 }
 
-template <class Geometry, int Threads, Nvfp4ScaleLayout Layout>
+template <class Geometry, int Threads, Nvfp4ScaleLayout Layout, class Input = __nv_bfloat16>
 __global__ __launch_bounds__(Threads, 512 / Threads) void nvfp4_a4_quantize_kernel(
-    const __nv_bfloat16* __restrict__ input, std::uint8_t* __restrict__ codes,
+    const Input* __restrict__ input, std::uint8_t* __restrict__ codes,
     std::uint8_t* __restrict__ scales, std::int32_t tokens, std::int32_t written_tokens,
     float input_scale_divisor) {
     static_assert(Threads == 128 || Threads == 256 || Threads == 512);
@@ -55,8 +55,8 @@ __global__ __launch_bounds__(Threads, 512 / Threads) void nvfp4_a4_quantize_kern
         return;
     }
 
-    const int token                   = task / kGroupsPerRow;
-    const int group                   = task - token * kGroupsPerRow;
+    const int token                           = task / kGroupsPerRow;
+    const int group                           = task - token * kGroupsPerRow;
     const common::Nvfp4QuantizedK16 quantized = common::quantize_nvfp4_k16(
         input + static_cast<std::int64_t>(token) * Geometry::kInputRows + group * 16,
         input_scale_divisor);

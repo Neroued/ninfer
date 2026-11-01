@@ -100,6 +100,20 @@ int main() {
         failures += run_profile("LinearSwiGLU NVFP4_A4 half",
                                 {QType::NVFP4, 17408, 5120, 8704, 1807U, ActivationCompute::A4},
                                 kA4Cases, std::array<std::int32_t, 2>{128, 256});
+        // The gate|up of a dense FFN of width 14336 over hidden 5120 and its two-device half: the
+        // parent's routes at [28672,5120] and [14336,5120].
+        failures += run_profile("LinearSwiGLU NVFP4_A16 ffn14336",
+                                {QType::NVFP4, 28672, 5120, 14336, 1809U, ActivationCompute::A16},
+                                kA16Cases);
+        failures += run_profile("LinearSwiGLU NVFP4_A4 ffn14336",
+                                {QType::NVFP4, 28672, 5120, 14336, 1811U, ActivationCompute::A4},
+                                kA4Cases, std::array<std::int32_t, 2>{128, 256});
+        failures += run_profile("LinearSwiGLU NVFP4_A16 ffn14336 half",
+                                {QType::NVFP4, 14336, 5120, 7168, 1813U, ActivationCompute::A16},
+                                kA16Cases);
+        failures += run_profile("LinearSwiGLU NVFP4_A4 ffn14336 half",
+                                {QType::NVFP4, 14336, 5120, 7168, 1815U, ActivationCompute::A4},
+                                kA4Cases, std::array<std::int32_t, 2>{128, 256});
         std::cout << (failures == 0 ? "OK" : "FAIL") << " LinearSwiGLU NVFP4 correctness\n";
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {

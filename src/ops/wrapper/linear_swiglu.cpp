@@ -8,6 +8,7 @@
 #include "ops/linear/q3/q3_arena.h"
 #include "ops/linear/q3/q3_linear.h"
 #include "ops/linear_swiglu/fp8/fp8_linear_swiglu_plan.h"
+#include "ops/linear_swiglu/nvfp4/ffn14336/linear_swiglu_ffn14336.h"
 #include "ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_plan.h"
 #include "ops/linear_swiglu/q4/q4_linear_swiglu_plan.h"
 #include "ops/linear_swiglu/q8/q8_linear_swiglu_plan.h"
@@ -49,7 +50,33 @@ bool fused_gate_up_problem(std::int32_t gate_up_rows, std::int32_t input_rows) {
            input_rows == kGateUpInputRows;
 }
 
+// NVFP4 only: the dense FFN-14336 gate|up [28672,5120] and its two-device half [14336,5120]
+// (nvfp4/ffn14336/linear_swiglu_ffn14336.h).
+bool ffn14336_gate_up_problem(std::int32_t gate_up_rows, std::int32_t input_rows) {
+    return (gate_up_rows == detail::kLinearSwiGluFfn14336Rows ||
+            gate_up_rows == detail::kLinearSwiGluFfn14336HalfRows) &&
+           input_rows == kGateUpInputRows;
+}
+
 } // namespace
+
+bool linear_swiglu_registered(QType qtype, std::int32_t gate_up_rows, std::int32_t input_rows) {
+    const bool large = gate_up_rows == kGateUpRows && input_rows == kGateUpInputRows;
+    const bool fused = fused_gate_up_problem(gate_up_rows, input_rows);
+    switch (qtype) {
+    case QType::Q4_G64_FP16:
+        return large;
+    case QType::Q8_G32_FP16:
+        return large || (gate_up_rows == 12288 && input_rows == 2048);
+    case QType::NVFP4:
+        return fused || ffn14336_gate_up_problem(gate_up_rows, input_rows);
+    case QType::FP8_E4M3FN_ROW_BF16:
+    case QType::Q3_G128_FP16:
+        return fused;
+    default:
+        return false;
+    }
+}
 
 std::size_t linear_swiglu_workspace_capacity_bytes(QType qtype, std::int32_t gate_up_rows,
                                                    std::int32_t input_rows, LinearPolicy policy,
@@ -78,6 +105,13 @@ std::size_t linear_swiglu_workspace_capacity_bytes(QType qtype, std::int32_t gat
     }
     if (qtype == QType::NVFP4 && fused_gate_up_problem(gate_up_rows, input_rows)) {
         return detail::nvfp4_linear_swiglu_workspace_capacity_bytes(policy, min_tokens, max_tokens);
+    }
+    if (qtype == QType::NVFP4 && ffn14336_gate_up_problem(gate_up_rows, input_rows)) {
+        return gate_up_rows == detail::kLinearSwiGluFfn14336Rows
+                   ? detail::nvfp4_linear_swiglu_n28672_workspace_capacity_bytes(policy, min_tokens,
+                                                                                 max_tokens)
+                   : detail::nvfp4_linear_swiglu_n14336_workspace_capacity_bytes(policy, min_tokens,
+                                                                                 max_tokens);
     }
     if (qtype == QType::FP8_E4M3FN_ROW_BF16 && fused_gate_up_problem(gate_up_rows, input_rows)) {
         return detail::fp8_linear_swiglu_workspace_capacity_bytes(policy, min_tokens, max_tokens);
@@ -114,8 +148,13 @@ void validate_linear_swiglu(const Tensor& x, const Weight& gate_up_weight, const
     const bool shard_shape =
         matches_problem(x, gate_up_weight, out, kShardGateUpRows, kGateUpInputRows);
     const bool q8_shape = matches_problem(x, gate_up_weight, out, 12288, 2048);
+    const bool ffn14336_shape =
+        matches_problem(x, gate_up_weight, out, detail::kLinearSwiGluFfn14336Rows,
+                        kGateUpInputRows) ||
+        matches_problem(x, gate_up_weight, out, detail::kLinearSwiGluFfn14336HalfRows,
+                        kGateUpInputRows);
     if (t <= 0 || x.ne[2] != 1 || x.ne[3] != 1 || out.ne[1] != t || out.ne[2] != 1 ||
-        out.ne[3] != 1 || (!large_shape && !shard_shape && !q8_shape)) {
+        out.ne[3] != 1 || (!large_shape && !shard_shape && !q8_shape && !ffn14336_shape)) {
         throw std::invalid_argument("linear_swiglu: invalid tensor shape");
     }
     if (!x.is_contiguous() || !out.is_contiguous()) {
@@ -138,9 +177,10 @@ void validate_linear_swiglu(const Tensor& x, const Weight& gate_up_weight, const
         (q8_shape || large_shape) && gate_up_weight.qtype == QType::Q8_G32_FP16 &&
         gate_up_weight.group_size == 32 && gate_up_weight.group == 32 &&
         gate_up_weight.qhigh == nullptr && gate_up_weight.high_plane_bytes == 0 && common_row_split;
-    const bool fused_shape  = large_shape || shard_shape;
-    const bool nvfp4_weight = fused_shape && gate_up_weight.qtype == QType::NVFP4;
-    const bool fp8_weight   = fused_shape && gate_up_weight.qtype == QType::FP8_E4M3FN_ROW_BF16;
+    const bool fused_shape = large_shape || shard_shape;
+    const bool nvfp4_weight =
+        (fused_shape || ffn14336_shape) && gate_up_weight.qtype == QType::NVFP4;
+    const bool fp8_weight = fused_shape && gate_up_weight.qtype == QType::FP8_E4M3FN_ROW_BF16;
     // v0.7 27b-16gb: the GSQ-3 gate|up parent [34816,5120] (and its [17408,5120] half).
     const bool q3_weight = fused_shape && gate_up_weight.qtype == QType::Q3_G128_FP16;
     if (q3_weight) {
@@ -187,6 +227,14 @@ void dispatch_linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tenso
         if (gate_up_weight.n == kShardGateUpRows) {
             return detail::nvfp4_linear_swiglu_half_dispatch(x, gate_up_weight, out, policy, ws,
                                                              stream);
+        }
+        if (gate_up_weight.n == detail::kLinearSwiGluFfn14336Rows) {
+            return detail::nvfp4_linear_swiglu_n28672_dispatch(x, gate_up_weight, out, policy, ws,
+                                                               stream);
+        }
+        if (gate_up_weight.n == detail::kLinearSwiGluFfn14336HalfRows) {
+            return detail::nvfp4_linear_swiglu_n14336_dispatch(x, gate_up_weight, out, policy, ws,
+                                                               stream);
         }
         detail::nvfp4_linear_swiglu_dispatch(x, gate_up_weight, out, policy, ws, stream);
         return;

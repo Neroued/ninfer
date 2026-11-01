@@ -31,8 +31,6 @@ struct DenseParameters {
     LinearParameters down;
 };
 
-using FfnParameters = std::variant<DenseParameters, ops::SparseMoeWeights>;
-
 struct AttentionParameters {
     ops::ProjectionWeights projection;
     Tensor query_norm, key_norm;
@@ -46,25 +44,16 @@ struct GdnParameters {
     LinearParameters output;
 };
 
-struct BlockParameters {
-    Tensor input_norm, post_attention_norm;
-    std::variant<AttentionParameters, GdnParameters> mixer;
-    FfnParameters ffn;
-    ops::SparseMoeHints projection_prefetch;
-};
-
+// The Text embedding and output head; the blocks and the final norm are Qwen4Parameters.
 struct TextParameters {
     Weight token_embedding;
     LinearParameters output_head;
-    Tensor final_norm;
-    std::vector<BlockParameters> layers;
 };
 
 struct MtpProjectionParameters {
     LinearParameters packed;
-    // Dense MTP projects K/V and Q/gate independently in its incremental path.
-    // MoE MTP uses its existing complete-parent Attention projection.
-    std::optional<std::array<LinearParameters, 4>> rows;
+    // Q, K, gate and V alone: the incremental path projects K/V and Q/gate independently.
+    std::array<LinearParameters, 4> rows;
 };
 
 struct MtpParameters {
@@ -73,7 +62,7 @@ struct MtpParameters {
     MtpProjectionParameters projection;
     Tensor query_norm, key_norm;
     LinearParameters output;
-    FfnParameters ffn;
+    DenseParameters ffn;
     // Empty on a tensor-parallel rank that does not hold the selected head: a PrimaryOnly
     // optimized proposal head proposes on rank 0 alone. A vocabulary-split one is this rank's
     // row block on both ranks.
@@ -157,11 +146,15 @@ struct QsaParameters {
     Tensor indexer_query_norm, indexer_key_norm;
 };
 
-struct Qwen4GdnParameters {
-    LinearParameters projection; // query, key, value, z rows
-    LinearParameters control;    // a, b rows
-    Tensor a_log, dt_bias, convolution, norm;
-    LinearParameters output;
+// Shape-keyed routes of a Qwen4 block (docs/maintainer/qwen4-exp-model.md): the 27B's fused Ops
+// where the rank's projection geometry and format have a registered route, else the generic chain
+// (ops::linear + split copies + the elementwise Ops). Resolved once when the Parameters are
+// prepared (Prepare::qwen4_routes), per rank: at tp 2 they name the two-device split forms.
+struct Qwen4FusedRoutes {
+    bool gdn_input  = false; // ops::gdn_input_proj(+conv snapshot/record) | tp 2 *_split
+    bool gdn_gating = false; // ops::gdn_gating_proj | tp 2 gdn_control_split
+    bool attn_input = false; // ops::attn_input_proj | tp 2 attention_projection_split
+    bool swiglu     = false; // ops::linear_swiglu | tp 2 linear_swiglu_column_parallel
 };
 
 // The routed experts of one layer as stored: the host-mapped NVFP4 banks (device-addressable
@@ -174,17 +167,18 @@ struct Qwen4GdnParameters {
 // (e+1)*2560); no divisors, `bank` and the divisor fields stay empty.
 struct Qwen4ExpertBank {
     ops::MoeSlotPool bank; // slots = experts
-    const float* gate_up_divisors = nullptr;
-    const float* down_divisors    = nullptr;
-    float gate_up_input_divisor   = 0.0F;
-    float down_input_divisor      = 0.0F;
-    bool gguf                     = false;
-    ops::MoeGgufFormat gguf_gate_up        = ops::MoeGgufFormat::IQ3_XXS;
-    ops::MoeGgufFormat gguf_down           = ops::MoeGgufFormat::IQ4_NL;
-    const std::byte* gguf_gate_up_rows     = nullptr;
-    const std::byte* gguf_down_rows        = nullptr;
-    std::int64_t gguf_gate_up_row_bytes    = 0;
-    std::int64_t gguf_down_row_bytes       = 0;
+    const float* gate_up_divisors       = nullptr;
+    const float* down_divisors          = nullptr;
+    float gate_up_input_divisor         = 0.0F;
+    float down_input_divisor            = 0.0F;
+    bool gguf                           = false;
+    ops::MoeGgufFormat gguf_gate_up     = ops::MoeGgufFormat::IQ3_XXS;
+    ops::MoeGgufFormat gguf_down        = ops::MoeGgufFormat::IQ4_NL;
+    const std::byte* gguf_gate_up_rows  = nullptr;
+    const std::byte* gguf_down_rows     = nullptr;
+    std::int64_t gguf_gate_up_row_bytes = 0;
+    std::int64_t gguf_down_row_bytes    = 0;
+
     // Bytes of one expert (1280 gate|up rows and 2560 down rows).
     [[nodiscard]] std::int64_t gguf_expert_bytes() const noexcept {
         return 1280 * gguf_gate_up_row_bytes + 2560 * gguf_down_row_bytes;
@@ -212,21 +206,44 @@ struct PleParameters {
     Tensor key_norm, query_norm, conv_norm, convolution;
 };
 
+// The FFN of a block: the MoE (Qwen3.8-Flash-Next) or a dense SwiGLU FFN, gate|up rows in one
+// projection and down (at tp 2 this rank's intermediate rows and down columns).
+using Qwen4FfnParameters = std::variant<Qwen4MoeParameters, DenseParameters>;
+
 struct Qwen4BlockParameters {
+    // Hyper-connection mixers; empty for a model without hyper-connections (TextConfig has no
+    // hyper_connection), whose residual is one [H,T] stream normed by the two RMSNorm weights
+    // below before the mixer and the FFN (the Qwen3.5 block).
     HyperConnectionParameters attention_hc, ffn_hc;
-    std::variant<QsaParameters, Qwen4GdnParameters> mixer;
-    Qwen4MoeParameters moe;
+    Tensor input_norm, post_attention_norm;
+    // QSA (sparse attention with its indexer), GDN or dense gated full attention. GDN and dense
+    // attention are the Qwen3.5 mixers' operands: Qwen4Exp binds each projection (q|k|v|z, a|b,
+    // q|k|gate|v) as one parent; a dense Qwen3.5 model keeps its native forms.
+    std::variant<QsaParameters, GdnParameters, AttentionParameters> mixer;
+    Qwen4FfnParameters ffn;
     std::optional<PleParameters> ple;
+    Qwen4FusedRoutes fused;
+
+    // The MoE of a routed-expert block (std::bad_variant_access for a dense FFN).
+    [[nodiscard]] const Qwen4MoeParameters& moe() const {
+        return std::get<Qwen4MoeParameters>(ffn);
+    }
+
+    [[nodiscard]] Qwen4MoeParameters& moe() { return std::get<Qwen4MoeParameters>(ffn); }
 };
 
 struct Qwen4Parameters {
+    // The Text output mixer (hyper-connections), or, without hyper-connections, the final RMSNorm
+    // weight: the carried hidden is then the final-normed residual and the output head reads it
+    // directly (the Qwen3.5 convention).
     HyperConnectionParameters head;
+    Tensor final_norm;
     std::vector<Qwen4BlockParameters> layers;
 };
 
 // The MTP layer (docs/maintainer/qwen4-exp-model.md#mtp): stem over the wide residual and the
-// shifted token, one QSA block with its own 512 routed experts, and its own output mixer in front
-// of the Text output head.
+// shifted token, one QSA block with its own 512 routed experts (or, for a dense model, its own
+// dense FFN), and its own output mixer in front of the Text output head.
 //
 // Its routed experts reach the W4A4 expert Op like the Text banks, with two differences the
 // preparation resolves (T24):
@@ -250,7 +267,7 @@ struct Qwen4MtpParameters {
     LinearParameters embedding_projection;
     LinearParameters hidden_projection;
     HyperConnectionParameters head;       // no inject
-    Qwen4BlockParameters layer;           // QSA mixer, MoE over the MTP banks
+    Qwen4BlockParameters layer;           // QSA mixer, MoE over the MTP banks or dense FFN
     float uniform_gate_up_divisor = 0.0F; // > 0: the bank keeps one weight divisor per projection
     float uniform_down_divisor    = 0.0F;
     bool derived_activation_divisors = false;
@@ -280,11 +297,12 @@ public:
     std::optional<VisionParameters> vision;
     std::optional<DraftParameters> draft;
     std::optional<ProposalParameters> proposal;
-    // Qwen4Exp Text (text.layers is empty for it; text.token_embedding / output_head are used).
-    // At tp 2: this rank's shards (QSA 12 query + 1 KV heads, GDN 8 key + 24 value heads, the
-    // vocabulary half of the output head), the replicated router, indexer, PLE and
-    // hyper-connection mixers, the shared expert of its blocks, and the one host-mapped copy of
-    // the routed experts that both ranks read.
+    // The Text forward's blocks and final norm for every architecture: Qwen4Exp binds its own, a
+    // dense Qwen3.5 model its Qwen3.5 blocks without hyper-connections. Qwen4Exp at tp 2: this
+    // rank's shards (QSA 12 query
+    // + 1 KV heads, GDN 8 key + 24 value heads, the vocabulary half of the output head), the
+    // replicated router, indexer, PLE and hyper-connection mixers, the shared expert of its blocks,
+    // and the one host-mapped copy of the routed experts that both ranks read.
     std::optional<Qwen4Parameters> qwen4;
     // Qwen4Exp MTP layer, when the artifact's MTP component is loaded.
     std::optional<Qwen4MtpParameters> qwen4_mtp;

@@ -15,7 +15,6 @@ enum class Category : std::uint32_t {
     Mtp,
     DFlash,
     Attention,
-    Gdn,
     PostMixer,
     Moe,
     Control,
@@ -47,20 +46,7 @@ enum class Name : std::size_t {
     DecodeOrdinarySubmit,
     DecodeOrdinaryWait,
     PrefillMtpChunk,
-    PrefillLayerFull,
-    VerifyLayerFull,
-    PrefillAttention,
-    VerifyAttention,
-    PrefillPostMixer,
-    VerifyPostMixer,
-    PrefillLayerGdn,
-    VerifyLayerGdn,
-    PrefillGdn,
-    VerifyGdn,
     PrefillChunk,
-    SparseMoePrefill,
-    SparseMoeSmallT,
-    SparseMoeDecode,
     EngineLoad,
     FrontendPrepare,
     Score,
@@ -85,8 +71,6 @@ enum class Name : std::size_t {
     DFlashContextAppend,
     DFlashProposal,
     DFlashLayer,
-    DFlashAttention,
-    DFlashMlp,
     DecodeDFlashTarget,
     Qwen4PleGather,
     Qwen4BeginWindow,
@@ -109,8 +93,6 @@ enum class Name : std::size_t {
         return 0xffaf7aa1u;
     case Category::Attention:
         return 0xff76b7b2u;
-    case Category::Gdn:
-        return 0xffe15759u;
     case Category::PostMixer:
         return 0xffedc948u;
     case Category::Moe:
@@ -136,7 +118,6 @@ enum class Name : std::size_t {
         nvtxDomainNameCategoryA(out, static_cast<std::uint32_t>(Category::Mtp), "mtp");
         nvtxDomainNameCategoryA(out, static_cast<std::uint32_t>(Category::DFlash), "dflash");
         nvtxDomainNameCategoryA(out, static_cast<std::uint32_t>(Category::Attention), "attention");
-        nvtxDomainNameCategoryA(out, static_cast<std::uint32_t>(Category::Gdn), "gdn");
         nvtxDomainNameCategoryA(out, static_cast<std::uint32_t>(Category::PostMixer), "post-mixer");
         nvtxDomainNameCategoryA(out, static_cast<std::uint32_t>(Category::Moe), "moe");
         nvtxDomainNameCategoryA(out, static_cast<std::uint32_t>(Category::Control), "control");
@@ -172,20 +153,7 @@ enum class Name : std::size_t {
         "decode.ordinary.submit",
         "decode.ordinary.wait",
         "prefill.mtp_chunk",
-        "prefill.layer.full",
-        "verify.layer.full",
-        "prefill.attention",
-        "verify.attention",
-        "prefill.post_mixer",
-        "verify.post_mixer",
-        "prefill.layer.gdn",
-        "verify.layer.gdn",
-        "prefill.gdn",
-        "verify.gdn",
         "prefill.chunk",
-        "sparse_moe.prefill",
-        "sparse_moe.small_t",
-        "sparse_moe.decode",
         "engine.load",
         "frontend.prepare",
         "score",
@@ -210,8 +178,6 @@ enum class Name : std::size_t {
         "dflash.context_append",
         "dflash.proposal",
         "dflash.layer",
-        "dflash.attention",
-        "dflash.mlp",
         "decode.dflash.target",
         "qwen4.ple_gather",
         "qwen4.begin_window",

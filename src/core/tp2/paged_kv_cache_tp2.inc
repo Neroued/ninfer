@@ -6,6 +6,7 @@
 // mutations (attach_mirror, the page runs both pools share, the mirror's execution-row lease).
 
 #include "core/device_scope.h"
+#include "core/uva_copy.h"
 
 namespace ninfer {
 
@@ -38,9 +39,15 @@ void DeviceKVPagePool::require_no_mirror(const char* what) const {
 }
 
 void DeviceKVPagePool::zero_run(std::int32_t first, std::int32_t count, cudaStream_t stream) const {
-    for (const Tensor& plane : planes_) {
-        auto* base = static_cast<unsigned char*>(plane.data);
-        if (spec_.geometry.device_plane_order == PagedKVPlaneOrder::PageMajor) {
+    notify_write(stream);
+    for (std::size_t index = 0; index < planes_.size(); ++index) {
+        const Tensor& plane = planes_[index];
+        auto* base          = static_cast<unsigned char*>(plane.data);
+        if (spec_.geometry.planes[index].host) {
+            // Host plane (active KV in RAM, page-major): a stream-ordered kernel fill.
+            uva_fill_async(base + static_cast<std::int64_t>(first) * plane.nb[3], 0,
+                           static_cast<std::size_t>(count) * plane.nb[3], stream);
+        } else if (spec_.geometry.device_plane_order == PagedKVPlaneOrder::PageMajor) {
             CUDA_CHECK(cudaMemsetAsync(base + static_cast<std::int64_t>(first) * plane.nb[3], 0,
                                        static_cast<std::size_t>(count) * plane.nb[3], stream));
         } else {
@@ -54,9 +61,17 @@ void DeviceKVPagePool::zero_run(std::int32_t first, std::int32_t count, cudaStre
 
 void DeviceKVPagePool::copy_run(std::int32_t source_index, std::int32_t destination_index,
                                 cudaStream_t stream, std::int32_t count) const {
-    for (const Tensor& plane : planes_) {
-        auto* base = static_cast<unsigned char*>(plane.data);
-        if (spec_.geometry.device_plane_order == PagedKVPlaneOrder::PageMajor) {
+    notify_write(stream);
+    for (std::size_t index = 0; index < planes_.size(); ++index) {
+        const Tensor& plane = planes_[index];
+        auto* base          = static_cast<unsigned char*>(plane.data);
+        if (spec_.geometry.planes[index].host) {
+            // Host plane (active KV in RAM): a Host-to-Host cudaMemcpyAsync would run at once on
+            // the CPU, unordered with the stream; a kernel copy keeps the stream order.
+            uva_copy_async(base + static_cast<std::int64_t>(destination_index) * plane.nb[3],
+                           base + static_cast<std::int64_t>(source_index) * plane.nb[3],
+                           static_cast<std::size_t>(count) * plane.nb[3], stream);
+        } else if (spec_.geometry.device_plane_order == PagedKVPlaneOrder::PageMajor) {
             CUDA_CHECK(cudaMemcpyAsync(
                 base + static_cast<std::int64_t>(destination_index) * plane.nb[3],
                 base + static_cast<std::int64_t>(source_index) * plane.nb[3],

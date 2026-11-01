@@ -91,6 +91,19 @@ target_link_options(ninfer_serve_engine_failure_real_test PRIVATE
   "LINKER:--wrap=cudaStreamSynchronize")
 set_tests_properties(ninfer_serve_engine_failure_real_test PROPERTIES SKIP_RETURN_CODE 77)
 
+# Real artifact, two devices: a captured exchange that times out while serving fails only its
+# request; the transport steps down and the server keeps serving with the same tokens, and a
+# step-down that fails fails the Engine without telling the request it keeps serving. Link-time
+# wrappers around PeerMailbox::hang_reported() and Program::recover_peer_transport(), no production
+# hooks.
+ninfer_add_test(ninfer_serve_tp_transport_recovery_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_serve_tp_transport_recovery_real.cpp"
+  LIBRARIES ninfer_serve ninfer_product_logging CUDA::cudart)
+target_link_options(ninfer_serve_tp_transport_recovery_real_test PRIVATE
+  "LINKER:--wrap=_ZNK6ninfer3ops11PeerMailbox13hang_reportedEv"
+  "LINKER:--wrap=_ZN6ninfer6models7qwen3_57Program22recover_peer_transportB5cxx11Ev")
+set_tests_properties(ninfer_serve_tp_transport_recovery_real_test PROPERTIES SKIP_RETURN_CODE 77)
+
 # Documentation guard: every serve flag, NINFER_* variable, conversion recipe and Tnn tag of the
 # sources appears in the user docs (tools/check_docs.py).
 add_test(NAME ninfer_docs_guard_test

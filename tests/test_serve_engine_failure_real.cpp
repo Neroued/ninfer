@@ -2,10 +2,11 @@
 // leave HttpServer::engine_failed() set, so ninfer-serve can exit non-zero for its supervisor.
 //
 // The failure is injected with a link-time wrapper around cudaStreamSynchronize, which the Engine
-// worker calls on every decode round (ProgramImpl::synchronize_devices, the same call that reports
-// a timed-out tensor-parallel exchange). The wrapper throws, as that report does: a CUDA error
-// returned to CUDA_CHECK aborts the process by design, which a supervisor already sees. The wrapper
-// affects only this test executable; the production path has no fault hooks.
+// worker calls on every decode round (ProgramImpl::synchronize_devices). The wrapper throws: a CUDA
+// error returned to CUDA_CHECK aborts the process by design, which a supervisor already sees. No
+// exchange reported a hang, so the Engine cannot recover by stepping the transport down (issue
+// #20, ninfer_serve_tp_transport_recovery_real_test) and fails as a whole. The wrapper affects
+// only this test executable; the production path has no fault hooks.
 #include "product/logging/logging.h"
 #include "serve/generation_service.h"
 #include "serve/http_server.h"
@@ -37,7 +38,7 @@ cudaError_t CUDARTAPI __real_cudaStreamSynchronize(cudaStream_t);
 cudaError_t CUDARTAPI __wrap_cudaStreamSynchronize(cudaStream_t stream) {
     if (g_inject_failure.exchange(false)) {
         g_injected.store(true);
-        throw std::runtime_error("injected: tensor-parallel mailbox exchange timed out (test)");
+        throw std::runtime_error("injected: decode round synchronization failed (test)");
     }
     return __real_cudaStreamSynchronize(stream);
 }

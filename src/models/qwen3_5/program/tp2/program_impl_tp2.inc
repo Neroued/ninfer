@@ -70,7 +70,8 @@ ProgramImpl::PeerRuntime::PeerRuntime(DeviceContext& peer_device, const Sequence
     const PersistentLayout& own = layout(plan);
     const DeviceSpan backing    = persistent.alloc_bytes(own.bytes, 256);
     decoder                     = std::make_unique<qwen3_5::DecoderState>(
-        backing, own.decoder, elastic_arena ? elastic_arena->span() : DeviceSpan{});
+        peer_device.device, backing, own.decoder,
+        elastic_arena ? elastic_arena->span() : DeviceSpan{});
     state_images = std::make_unique<qwen3_5::StateImageDevicePool>(backing, own.state_images);
     if (own.replay_records) {
         replay_records.emplace(backing, *own.replay_records);
@@ -85,7 +86,9 @@ ProgramImpl::PeerRuntime::PeerRuntime(DeviceContext& peer_device, const Sequence
     }
     if (own.score_hidden) { score_hidden = own.score_hidden->bind(backing); }
     if (own.qwen4) {
-        qwen4_expert_table = own.qwen4->expert_table.bind(backing);
+        if (own.qwen4->expert_table) {
+            qwen4_expert_table = own.qwen4->expert_table->bind(backing);
+        }
         if (own.qwen4->expert_slots > 0) {
             qwen4_cache_pool =
                 own.qwen4->bind_pool(elastic_arena ? elastic_arena->span() : backing);
@@ -157,11 +160,6 @@ void ProgramImpl::construct_tensor_parallel(const SequencePlanImpl& plan,
                 "tensor-parallel Program requires rank 0 and rank 1 Parameters of one two-device "
                 "Model on its ExecutionContext");
         }
-        if (speculative_backend == SpeculativeBackend::DFlash) {
-            throw std::invalid_argument(
-                "tensor-parallel Program supports ordinary, MTP and DFlash2 "
-                "generation and causal scoring only");
-        }
         if (vision_enabled && (!workspace_plan.vision_receiver ||
                                !(vision_rank == 0 ? parameters : *peer_parameters_in).vision ||
                                (vision_rank == 0 ? *peer_parameters_in : parameters).vision)) {
@@ -197,10 +195,10 @@ void ProgramImpl::construct_tensor_parallel(const SequencePlanImpl& plan,
             // lent workspace is VMM memory the peer pull cannot read (T64/T68; startup.cpp keeps
             // the lending on that assumption). NINFER_TP_HOST_EXCHANGE=0 / =1 force either way.
             // enable_peer_access() only reports here: the Engine enabled it already, idempotently.
-            // v07/p2p-overlap: with peer access and no HostExchange, the 27B prefill overlap's
-            // split-phase sums take ops::PeerLanes (the direct copy on a side stream per rank)
-            // instead of falling back to one call per chunk; NINFER_TP_PEER_OVERLAP=0 keeps the
-            // one-call schedule, =force attaches the lanes without P2P too (correctness test).
+            // With peer access and no HostExchange, the 27B prefill overlap's split-phase sums take
+            // ops::PeerLanes (the direct copy on a side stream per rank) instead of falling back
+            // to one call per chunk; NINFER_TP_PEER_OVERLAP=0 keeps the one-call schedule, =force
+            // attaches the lanes without P2P too (correctness test).
             // The decision table is eager_transport.h (unit-tested on the host).
             const char* host_exchange_env = std::getenv("NINFER_TP_HOST_EXCHANGE");
             const char* peer_overlap_env  = std::getenv("NINFER_TP_PEER_OVERLAP");
@@ -219,24 +217,22 @@ void ProgramImpl::construct_tensor_parallel(const SequencePlanImpl& plan,
             tp_transport_status.eager_transport = eager.host_exchange ? "pinned host exchange"
                                                   : peer_access       ? "direct peer copies"
                                                                       : "driver-staged copies";
-            if (!parameters.model.config().text.qwen4()) {
-                const char* overlap_env = std::getenv("NINFER_TP_PREFILL_OVERLAP");
+            // The plain residual (dense Qwen3.5) overlaps each prefill chunk's exchanges
+            // (Qwen4Forward::run_plain); the hyper-connection residual does not.
+            if (!parameters.model.config().text.hyper_connection) {
+                const bool overlap_off = !execution::prefill_overlap_enabled();
                 tp_transport_status.prefill_overlap =
-                    overlap_env != nullptr && std::string_view(overlap_env) == "0"
-                        ? "off (NINFER_TP_PREFILL_OVERLAP=0)"
+                    overlap_off ? "off (NINFER_TP_PREFILL_OVERLAP=0)"
                     : eager.peer_lanes
                         ? (eager.peer_lanes_direct ? "direct peer lanes"
                                                    : "driver-staged peer lanes (test only)")
                     : eager.host_exchange ? "pinned host lanes"
                                           : "off (one call per chunk)";
-                // v07/prefill-slices: whether chunks the halves do not take run sliced.
-                const bool overlap_off =
-                    overlap_env != nullptr && std::string_view(overlap_env) == "0";
+                // Whether chunks the halves do not take run sliced.
                 if (!overlap_off && (eager.peer_lanes || eager.host_exchange)) {
-                    const char* slices_env = std::getenv("NINFER_TP_PREFILL_SLICES");
-                    const auto mode = execution::prefill_slices_mode(slices_env ? slices_env : "");
+                    const auto mode = execution::prefill_slices_mode_env();
                     tp_transport_status.prefill_overlap +=
-                        mode == execution::PrefillSlicesMode::Force ? " + slices (force)"
+                        mode == execution::PrefillSlicesMode::Force  ? " + slices (force)"
                         : mode == execution::PrefillSlicesMode::Auto ? " + slices"
                                                                      : " (slices off)";
                 }
@@ -305,9 +301,9 @@ void ProgramImpl::bind_tensor_parallel_execution() {
     // Rank 1 verifies DFlash2 proposals in its own copy of the decode frame and records its
     // GDN heads for the commit fold. With the split drafter it also holds its half of the drafter
     // and all of the drafter's state (rings of its four KV heads, prefill and pending features).
-    const bool split_drafter = is_masked_draft_backend(speculative_backend) &&
+    const bool split_drafter = speculative_backend == SpeculativeBackend::DFlash2 &&
                                execution::dflash2_drafter_split(*peer_parameters);
-    if (is_masked_draft_backend(speculative_backend) &&
+    if (speculative_backend == SpeculativeBackend::DFlash2 &&
         (!peer->io.dflash_decode || !peer->replay_records ||
          peer->dflash.has_value() != split_drafter ||
          (peer->state_images->dflash_local() != nullptr) != split_drafter ||
@@ -543,7 +539,7 @@ void ProgramImpl::synchronize_devices() const {
     }
 }
 
-bool ProgramImpl::degrade_peer_mailbox() {
+bool ProgramImpl::degrade_peer_mailbox(std::string_view when) {
     if (!peer_mailbox || !tp_execution) { return false; }
     // The executables bake in the hung mailbox's slab and words: they go first.
     ordinary_graphs                      = {};
@@ -557,12 +553,11 @@ bool ProgramImpl::degrade_peer_mailbox() {
     peer_events->attach_mailbox(nullptr);
     peer_mailbox.reset();
     const std::string previous = tp_transport_status.transport;
-    const std::string reason =
-        "an exchange timed out in the first launch of a CUDA graph (" + previous + ")";
+    const std::string reason = "an exchange timed out " + std::string(when) + " (" + previous + ")";
     tp_transport_status.fallback +=
         (tp_transport_status.fallback.empty() ? "" : "; then ") + reason;
     if ((speculative_backend == SpeculativeBackend::Mtp ||
-         is_masked_draft_backend(speculative_backend)) &&
+         speculative_backend == SpeculativeBackend::DFlash2) &&
         !tp_execution->staged_draft_collectives) {
         tp_execution->staged_draft_collectives = true;
         peer_mailbox.emplace(*execution_context, slot_bytes, 2, kernel, wide_slot_bytes);
@@ -579,6 +574,32 @@ bool ProgramImpl::degrade_peer_mailbox() {
     tp_transport_status.exchange_kernel    = {};
     tp_transport_status.slot_bytes         = 0;
     return true;
+}
+
+std::string ProgramImpl::recover_peer_transport() {
+    if (!peer_mailbox || !peer_mailbox->hang_reported()) {
+        throw std::logic_error("no tensor-parallel exchange timed out");
+    }
+    if (has_context_transaction() || pending_transaction_) {
+        throw std::logic_error("the transport cannot step down during a context transaction");
+    }
+    for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) {
+        if (active_continuations[lane] < continuation_capacity ||
+            requests[lane].lifecycle != Lifecycle::Empty) {
+            throw std::logic_error("the transport cannot step down while a request holds a lane");
+        }
+    }
+    // The timed-out poller gave up and the rest of the work retired: both devices are idle.
+    if (peer) { peer->device.synchronize(); }
+    device.synchronize();
+    if (!degrade_peer_mailbox("while serving")) {
+        throw std::logic_error("the tensor-parallel transport has nothing left to step down to");
+    }
+    // The Program holds no request and no retained context: the capture runs as at startup (its
+    // StateImages, KV rows and execution-table rows are free, and zeroing every StateImage loses
+    // nothing). A hang in a first launch steps down again inside it.
+    prepare_graphs();
+    return tp_transport_status.transport;
 }
 
 void ProgramImpl::set_peer_i32(Tensor& tensor, std::int32_t value) {

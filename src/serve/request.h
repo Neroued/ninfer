@@ -178,6 +178,9 @@ requested_reasoning_effort_name(RequestedReasoningEffort effort) noexcept {
 struct GenerationRequest {
     std::vector<ChatTurn> messages;
     std::vector<ToolDefinition> tools;
+    // Declared in the request but removed by tool_choice.allowed_tools (Chat Completions,
+    // Responses): calls naming them stay text.
+    std::vector<std::string> filtered_out_tool_names;
     std::size_t tool_name_max_length = 64;
     ToolChoice tool_choice;
     std::vector<std::string> stop_strings;

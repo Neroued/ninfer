@@ -11,7 +11,7 @@ from tools.convert.qwen3_5 import build_model, draft_config, text_config
 from tools.convert.sources.safetensors import SafetensorsSource
 
 
-def _config(*, moe=False):
+def _config():
     text = {
         "hidden_size": 16,
         "vocab_size": 8,
@@ -27,18 +27,10 @@ def _config(*, moe=False):
         "linear_num_value_heads": 2,
         "linear_value_head_dim": 4,
         "linear_conv_kernel_dim": 3,
+        "intermediate_size": 24,
     }
-    if moe:
-        text.update(
-            num_experts=3,
-            num_experts_per_tok=2,
-            moe_intermediate_size=8,
-            shared_expert_intermediate_size=4,
-        )
-    else:
-        text["intermediate_size"] = 24
     return {
-        "architectures": [("Qwen3_5MoeForConditionalGeneration" if moe else "Qwen3_5ForConditionalGeneration")],
+        "architectures": ["Qwen3_5ForConditionalGeneration"],
         "text_config": text,
         "vision_config": {
             "depth": 1,
@@ -123,34 +115,6 @@ def test_model_mapping_preserves_query_gate_gdn_mtp_and_vision_axes(tmp_path):
             assert torch.equal(selected.reshape(8, 12), patch.reshape(8, 12))
 
 
-def test_expert_bank_uses_expert_major_gate_up_and_down_ranges(tmp_path):
-    gate_up = torch.arange(3 * 16 * 16).float().reshape(3, 16, 16)
-    down = torch.arange(3 * 16 * 8).float().reshape(3, 16, 8)
-    with _checkpoint(
-        tmp_path / "moe",
-        _config(moe=True),
-        {
-            "model.language_model.layers.0.mlp.experts.gate_up_proj": gate_up,
-            "model.language_model.layers.0.mlp.experts.down_proj": down,
-        },
-    ) as source:
-        model = build_model(source)
-        for expert in range(3):
-            prefix = f"text/layers/0/moe/experts/{expert}/"
-            assert torch.equal(_values(model, prefix + "gate"), gate_up[expert, :8])
-            assert torch.equal(_values(model, prefix + "up"), gate_up[expert, 8:])
-            assert torch.equal(_values(model, prefix + "down"), down[expert])
-        other_config = _config(moe=True)
-        other_config["text_config"]["num_experts_per_tok"] = 1
-        with _checkpoint(
-            tmp_path / "expert-source",
-            other_config,
-            {"model.language_model.layers.0.mlp.experts.gate_up_proj": gate_up},
-        ) as other:
-            selected = model.source("text/layers/0/moe/experts/2/gate", other).values()
-            assert torch.equal(selected.reshape(8, 16), gate_up[2, :8])
-
-
 def test_optional_components_are_selected_before_sources_are_required(tmp_path):
     config = _config()
     config["vision_config"] = {"in_channels": 99}
@@ -167,11 +131,9 @@ def test_optional_components_are_selected_before_sources_are_required(tmp_path):
             build_model(source, components=("text", "dflash2"))
 
 
-@pytest.mark.parametrize("architecture", ["DFlashDraftModel", "DFlash2DraftModel"])
-def test_draft_query_context_and_dynamic_weights_keep_their_uses(tmp_path, architecture):
-    backend = "dflash2" if architecture == "DFlash2DraftModel" else "dflash"
+def test_draft_query_context_and_dynamic_weights_keep_their_uses(tmp_path):
     draft = {
-        "architectures": [architecture],
+        "architectures": ["DFlash2DraftModel"],
         "hidden_size": 16,
         "vocab_size": 8,
         "num_hidden_layers": 1,
@@ -204,15 +166,14 @@ def test_draft_query_context_and_dynamic_weights_keep_their_uses(tmp_path, archi
             },
         ) as companion,
     ):
-        model = build_model(base, components=("text", backend), companions={backend: companion})
-        prefix = f"{backend}/layers/0/attention/"
+        model = build_model(base, components=("text", "dflash2"), companions={"dflash2": companion})
+        prefix = "dflash2/layers/0/attention/"
         assert torch.equal(_values(model, prefix + "key"), key)
         assert torch.equal(_values(model, prefix + "context_key"), key)
-        assert model.parameters[prefix + "key"].inputs == (f"{backend}/layers/0/query_projection_input",)
-        assert model.parameters[prefix + "context_key"].inputs == (f"{backend}/context_input",)
-        assert model.components[backend]["config"]["dflash_config"]["target_layer_ids"] == [1, 0]
-        if backend == "dflash2":
-            assert torch.equal(_values(model, f"{backend}/layers/0/attention_conv/base_kernel"), kernel)
+        assert model.parameters[prefix + "key"].inputs == ("dflash2/layers/0/query_projection_input",)
+        assert model.parameters[prefix + "context_key"].inputs == ("dflash2/context_input",)
+        assert model.components["dflash2"]["config"]["dflash_config"]["target_layer_ids"] == [1, 0]
+        assert torch.equal(_values(model, "dflash2/layers/0/attention_conv/base_kernel"), kernel)
         other_config = deepcopy(draft)
         other_config["dflash_config"].update(mask_token_id=6, selector_top_k=3)
         features = torch.arange(16 * 32).float().reshape(16, 32)
@@ -226,18 +187,17 @@ def test_draft_query_context_and_dynamic_weights_keep_their_uses(tmp_path, archi
                 "candidate_selector.hidden_projection.weight": selector,
             },
         ) as other:
-            selected = model.source(f"{backend}/feature_projection", other).values()
+            selected = model.source("dflash2/feature_projection", other).values()
             assert torch.equal(selected.reshape(16, 32), features)
-            if backend == "dflash2":
-                for name, expected in (
-                    ("layers/0/attention_conv/base_kernel", kernel),
-                    ("candidate_selector/hidden_projection", selector),
-                ):
-                    selected = model.source(f"{backend}/{name}", other).values()
-                    assert torch.equal(selected.reshape(expected.shape), expected)
+            for name, expected in (
+                ("layers/0/attention_conv/base_kernel", kernel),
+                ("candidate_selector/hidden_projection", selector),
+            ):
+                selected = model.source(f"dflash2/{name}", other).values()
+                assert torch.equal(selected.reshape(expected.shape), expected)
             other.config["dflash_config"]["target_layer_ids"] = [0, 1]
             with pytest.raises(ValueError, match="target_layer_ids differs"):
-                model.source(f"{backend}/feature_projection", other)
+                model.source("dflash2/feature_projection", other)
 
 
 def test_config_normalization_keeps_dimensions_and_checks_fixed_mathematics():
@@ -325,22 +285,31 @@ def test_rope_aliases_preserve_supported_parameters_and_reject_changed_mathemati
         "num_hidden_layers": 6,
         "max_position_embeddings": 128,
         "use_sliding_window": True,
-        "max_window_layers": 5,
+        "max_window_layers": 0,
         "sliding_window": 32,
         "rope_scaling": {"type": "default", "rope_theta": 500_000},
-        "dflash_config": {"target_layer_ids": [1], "mask_token_id": 7},
+        "dflash_config": {
+            "target_layer_ids": [1],
+            "mask_token_id": 7,
+            "conv_kernel_size": 2,
+            "conv_group_size": 4,
+            "selector_rank": 4,
+            "selector_top_k": 2,
+        },
     }
     target = text_config(_config(), mtp=False)
-    result = draft_config(draft, target, "dflash")
+    result = draft_config(draft, target)
     assert result["rope_parameters"] == {"rope_theta": 500_000}
-    assert result["layer_types"] == ["full_attention"] * 5 + ["sliding_attention"]
-    del draft["max_window_layers"]
-    assert draft_config(draft, target, "dflash")["layer_types"] == ["full_attention"] * 6
+    assert result["layer_types"] == ["sliding_attention"] * 6
+    # DFlash2 drafters attend over their sliding window only: a full-attention layer is rejected.
+    draft["max_window_layers"] = 5
+    with pytest.raises(ValueError, match="sliding_attention"):
+        draft_config(draft, target)
     draft["layer_types"] = ["sliding_attention"] * 6
-    assert draft_config(draft, target, "dflash")["layer_types"] == draft["layer_types"]
+    assert draft_config(draft, target)["layer_types"] == draft["layer_types"]
     draft["rope_scaling"] = {"rope_type": "linear", "factor": 2, "rope_theta": 500_000}
     with pytest.raises(ValueError, match="rope_type"):
-        draft_config(draft, target, "dflash")
+        draft_config(draft, target)
 
 
 def test_selected_vision_processor_geometry_is_checked_before_conversion(tmp_path):

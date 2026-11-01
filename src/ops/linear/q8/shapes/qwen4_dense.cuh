@@ -85,7 +85,7 @@ Q8Launch select(std::int32_t tokens, int chosen) {
         const int v = variant() >= 0 ? variant() : chosen;
         return candidate<Geometry>(v, launch_q8_a16_simt_r8_t4);
     }
-    return select_q8_generic_hidden2560(tokens);
+    return select_q8_generic(tokens);
 }
 
 } // namespace ninfer::ops::detail::qwen4_dense

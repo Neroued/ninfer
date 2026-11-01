@@ -1,5 +1,7 @@
 #include "ninfer/engine.h"
 #include "kv_cache_storage.h"
+#include "single_device_fit.h"
+#include "models/load_options.h"
 
 #include <cstdint>
 #include <cstdlib>
@@ -2206,8 +2208,6 @@ int exercise_attention_integration(const char* artifact) {
         backend = ninfer::SpeculativeBackend::None;
     else if (backend_name == "mtp")
         backend = ninfer::SpeculativeBackend::Mtp;
-    else if (backend_name == "dflash")
-        backend = ninfer::SpeculativeBackend::DFlash;
     else if (backend_name == "dflash2")
         backend = ninfer::SpeculativeBackend::DFlash2;
     else
@@ -2229,6 +2229,11 @@ int exercise_attention_integration(const char* artifact) {
     options.speculative.backend                     = backend;
     options.speculative.draft_tokens  = backend == ninfer::SpeculativeBackend::None ? 0 : drafts;
     options.speculative.proposal_head = ninfer::ProposalHead::Full;
+    if (const auto shortfall = ninfer::test::single_device_shortfall(
+            artifact, ninfer::models::load_options(options))) {
+        std::cout << "skip: " << *shortfall << '\n';
+        return 77;
+    }
     ninfer::Engine engine(options);
     if (engine.memory_summary().kv_cache != storage)
         throw std::runtime_error("attention integration selected the wrong KV dtype");
@@ -2310,7 +2315,16 @@ int main() {
     }
     const char* selected            = std::getenv("NINFER_PREFIX_REAL_SCENARIO");
     const std::string_view scenario = selected ? selected : "all";
-    int result                      = 0;
+    // The scenarios load the text model with MTP and Vision on one device; `attention` selects its
+    // own components (an artifact may lack MTP or Vision) and checks its own fit.
+    if (scenario != "attention") {
+        if (const auto shortfall = ninfer::test::single_device_shortfall(
+                artifact, ninfer::models::load_options(engine_options(artifact)))) {
+            std::cout << "skip: " << *shortfall << '\n';
+            return 77;
+        }
+    }
+    int result = 0;
     if (scenario == "attention") {
         try {
             result = exercise_attention_integration(artifact);

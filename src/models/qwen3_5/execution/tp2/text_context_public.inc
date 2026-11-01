@@ -2,14 +2,12 @@
 // two-device (tp == 2) entry points. Not a header; our file, see docs/maintainer/upstream-merge.md.
 //
 // One Text call over the rank-0 operands, and with a non-null `tp` over both ranks of a
-// two-device Model (tp.h). A null `tp` is the single-device schedule, unchanged. With `tp`, the
-// text and multimodal prefill chunk (with its MTP prompt alignment or DFlash feature capture),
-// ordinary decode, speculative target verification (with or without DFlash feature capture), the
-// MTP decode-round forwards and proposals, the MTP bridge and their logits run split through the
-// rank-array overloads below; the single-rank MTP and verification entries are rejected with
-// std::invalid_argument. The constructor rejects the MoE FFN, paired
-// input projections, KV caches the head-local attention does not support (only BF16, INT8-G64 and
-// NVFP4-G16) and incomplete MTP bindings.
+// two-device Model (tp.h). With `tp`, the text and multimodal prefill chunk (with its MTP prompt
+// alignment or DFlash feature capture) and ordinary decode run the Qwen4 forward on both ranks
+// (qwen4_text.cpp), and speculative target verification (with or without DFlash feature capture),
+// the MTP decode-round forwards and proposals, the MTP bridge and their logits run split through
+// the rank-array overloads below; the single-rank MTP and verification entries are rejected with
+// std::invalid_argument. The constructor rejects incomplete Text forward and MTP bindings.
 
 public:
 // Rank 0's operand then rank 1's, each resident on that rank's device.
@@ -24,8 +22,8 @@ void set_peer_feature_sink(DFlashFeatureSink* sink) noexcept { peer_feature_sink
 
 // --- tp == 2 speculative forms --------------------------------------------------------------
 // Rank 1's control tensors are its own copies of rank 0's values (the Program uploads the same
-// host ingress record to both ranks and derives the rest with the same Ops). Token ids an MTP
-// call embeds are rank 0's alone: rank 0's half of the MTP input projection contracts the
+// host ingress record to both ranks and derives the rest with the same Ops). Token ids a Qwen3.5
+// MTP call embeds are rank 0's alone: rank 0's half of the MTP input projection contracts the
 // token embedding and rank 1's the target hidden. Sampling, acceptance and the winning draft
 // ids are rank 0's, and so are the logits: rank 0 alone gathers them, into its own frames.
 
@@ -38,9 +36,9 @@ void target_verify_batch(const RankTensors& ids, const RankTensors& cache_positi
                          const RankTensors& linear_state_source_slots,
                          ops::CausalAttentionExecutionEnvelope envelope, const RankTensors& hidden,
                          Tensor& logits, Tensor& target_tokens);
-// The same verification with rank 0's DFlash drafter capturing its target features: `sink`
-// reads rank 0's residual after each captured layer's all-reduce (the complete hidden state)
-// on rank 0's stream. Rank 1 captures nothing.
+// The same verification with the DFlash2 drafter capturing its target features: `sink` reads
+// rank 0's residual after each captured layer's all-reduce (the complete hidden state) on rank
+// 0's stream; rank 1 captures into the peer sink when one is set (set_peer_feature_sink).
 void target_verify_batch(const RankTensors& ids, const RankTensors& cache_positions,
                          const RankTensors& rope_positions, const RankTensors& valid_columns,
                          const RankTensors& kv_table_rows,

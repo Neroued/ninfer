@@ -16,22 +16,9 @@
 
 namespace ninfer::models::qwen3_5::execution {
 
-namespace {
-
-const DenseParameters& split_dense(const FfnParameters& parameters) {
-    const auto* dense = std::get_if<DenseParameters>(&parameters);
-    if (dense == nullptr) {
-        throw std::invalid_argument("tensor-parallel FFN: the MoE FFN has no two-device route");
-    }
-    return *dense;
-}
-
-} // namespace
-
-std::size_t ffn_split_workspace_bytes(const FfnParameters& parameters, std::int32_t first,
-                                      std::int32_t last) {
+std::size_t dense_ffn_split_workspace_bytes(const DenseParameters& p, std::int32_t first,
+                                            std::int32_t last) {
     if (first <= 0 || last < first) { throw std::invalid_argument("FFN: invalid column interval"); }
-    const auto& p    = split_dense(parameters);
     const auto& gu   = p.gate_up.weight;
     const auto& down = p.down.weight;
     WorkspaceLayoutBuilder layout;
@@ -49,13 +36,14 @@ std::size_t ffn_split_workspace_bytes(const FfnParameters& parameters, std::int3
     return layout.peak_bytes(1);
 }
 
-void ffn_split(const std::array<Tensor, 2>& hidden,
-               const std::array<const FfnParameters*, 2>& parameters,
-               const std::array<Tensor, 2>& residual, const std::array<Tensor, 2>& staging,
-               const std::array<WorkspaceArena*, 2>& workspace, const ExecutionContext& execution,
-               const ops::PeerEvents& events, int exchange_lane) {
-    const DenseParameters& p0 = split_dense(*parameters[0]);
-    const DenseParameters& p1 = split_dense(*parameters[1]);
+void dense_ffn_split(const std::array<Tensor, 2>& hidden,
+                     const std::array<const DenseParameters*, 2>& parameters,
+                     const std::array<Tensor, 2>& residual, const std::array<Tensor, 2>& staging,
+                     const std::array<WorkspaceArena*, 2>& workspace,
+                     const ExecutionContext& execution, const ops::PeerEvents& events,
+                     int exchange_lane) {
+    const DenseParameters& p0 = *parameters[0];
+    const DenseParameters& p1 = *parameters[1];
     auto scope0               = workspace[0]->scope();
     auto scope1               = workspace[1]->scope();
     const auto columns        = hidden[0].ne[1];
@@ -68,10 +56,9 @@ void ffn_split(const std::array<Tensor, 2>& hidden,
                              execution, events, exchange_lane);
 }
 
-std::size_t mtp_ffn_split_workspace_bytes(const FfnParameters& parameters, std::int32_t first,
+std::size_t mtp_ffn_split_workspace_bytes(const DenseParameters& p, std::int32_t first,
                                           std::int32_t last) {
     if (first <= 0 || last < first) { throw std::invalid_argument("FFN: invalid column interval"); }
-    const auto& p    = split_dense(parameters);
     const auto& gu   = p.gate_up.weight;
     const auto& down = p.down.weight;
     WorkspaceLayoutBuilder layout;
@@ -89,12 +76,10 @@ std::size_t mtp_ffn_split_workspace_bytes(const FfnParameters& parameters, std::
 }
 
 void mtp_ffn_split(const std::array<Tensor, 2>& hidden,
-                   const std::array<const FfnParameters*, 2>& parameters,
+                   const std::array<const DenseParameters*, 2>& p,
                    const std::array<Tensor, 2>& residual, const std::array<Tensor, 2>& staging,
                    const std::array<WorkspaceArena*, 2>& workspace,
                    const ExecutionContext& execution, const ops::PeerEvents& events) {
-    const std::array<const DenseParameters*, 2> p{&split_dense(*parameters[0]),
-                                                  &split_dense(*parameters[1])};
     auto scope0        = workspace[0]->scope();
     auto scope1        = workspace[1]->scope();
     const auto columns = hidden[0].ne[1];

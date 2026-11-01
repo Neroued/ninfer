@@ -48,25 +48,14 @@ std::vector<GraphExecutionProfile> mtp_graph_profiles(std::uint32_t capacity,
     return causal_resource_profiles(capacity, 2 * draft_window);
 }
 
-std::vector<GraphExecutionProfile> dflash_graph_profiles(SpeculativeBackend backend,
-                                                         std::uint32_t capacity,
+std::vector<GraphExecutionProfile> dflash_graph_profiles(std::uint32_t capacity,
                                                          std::uint32_t draft_window) {
     if (capacity == 0 || draft_window == 0 || draft_window > 15) {
         throw std::invalid_argument("invalid masked draft graph dimensions");
     }
-    if (backend == SpeculativeBackend::DFlash2) {
-        auto profiles = graph_profiles_through(capacity - 1, {96, 511, 2047, 8191, 32767});
-        for (std::size_t i = 0; i < profiles.size(); ++i) {
-            profiles[i].topology_class = static_cast<std::uint32_t>(i);
-        }
-        return profiles;
-    }
-    // Retain the draft's resource and topology profiles. Target causal attention contributes
-    // no context-dependent topology class.
-    auto profiles = graph_profiles_through(
-        capacity - 1, {96, 127, 511, 1023, 2047, 4095, 8191, 16383, 32767, 65536, 131072, 196608});
-    for (GraphExecutionProfile& profile : profiles) {
-        profile.topology_class = profile.max > 96U ? 1U : 0U;
+    auto profiles = graph_profiles_through(capacity - 1, {96, 511, 2047, 8191, 32767});
+    for (std::size_t i = 0; i < profiles.size(); ++i) {
+        profiles[i].topology_class = static_cast<std::uint32_t>(i);
     }
     return profiles;
 }

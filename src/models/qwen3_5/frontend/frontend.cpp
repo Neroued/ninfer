@@ -548,13 +548,13 @@ PreparedContextCache prepare_context_cache(
 
 } // namespace
 
-ModelSamplingDefaults default_sampling(Architecture architecture) {
+ModelSamplingDefaults default_sampling() {
     ModelSamplingDefaults sampling;
-    sampling.thinking     = {.temperature      = 1.0F,
-                             .top_k            = 20,
-                             .top_p            = 0.95F,
-                             .min_p            = 0.0F,
-                             .presence_penalty = architecture == Architecture::Qwen3_5Moe ? 1.5F : 0.0F,
+    sampling.thinking     = {.temperature       = 1.0F,
+                             .top_k             = 20,
+                             .top_p             = 0.95F,
+                             .min_p             = 0.0F,
+                             .presence_penalty  = 0.0F,
                              .frequency_penalty = 0.0F};
     sampling.non_thinking = {.temperature       = 0.7F,
                              .top_k             = 20,
@@ -602,7 +602,7 @@ public:
             throw std::invalid_argument(
                 "Frontend requires the parsed model tokenizer and public token domain");
         }
-        sampling = default_sampling(options.architecture);
+        sampling = default_sampling();
         for (const int token : tokenizer->default_stop_token_ids()) {
             if (!tokenizer->is_valid_token(token)) {
                 throw std::invalid_argument(
@@ -738,8 +738,8 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
     std::vector<ChatRole> message_roles;
     message_roles.reserve(input.messages.size());
     for (const ChatMessage& message : input.messages) { message_roles.push_back(message.role); }
-    const auto tool_call_output =
-        fi::build_tool_call_output_contract(options.tool_jsons, !options.tool_jsons.empty());
+    const auto tool_call_output = fi::build_tool_call_output_contract(
+        options.tool_jsons, options.filtered_out_tool_names, !options.tool_jsons.empty());
     const std::optional<std::uint32_t> leading_boundary =
         leading_instruction_boundary(message_roles);
     std::vector<PromptCacheMarker> rendered_markers = cache_hints.markers;

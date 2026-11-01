@@ -111,9 +111,13 @@ struct GdnConvEpilogue {
             }
 
             publish.publish(token, batch_row, row, s1, s2, p);
+            // The next column reads this one as its history holds it: BF16, as the convolution
+            // state and the ReplaySSM record store it. Column t of a window is then bit for bit
+            // the one-column step that reads columns < t back from that state (the token's own tap
+            // keeps the accumulator's precision in both).
             s0 = s1;
             s1 = s2;
-            s2 = p;
+            s2 = __bfloat162float(__float2bfloat16_rn(p));
         }
     }
 };

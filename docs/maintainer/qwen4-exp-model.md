@@ -2,9 +2,9 @@
 
 This reference defines the mathematics of `Qwen4ExpForCausalLM` (`qwen4_exp_text`), the
 architecture of [Qwen/Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)
-(`Qwen4ExpForConditionalGeneration`). It is **not** an instance of `Qwen3_5MoeForCausalLM`:
-hyper-connection residual streams, Qwen Sparse Attention (QSA) and the n-gram PLE embedding
-change the block and state mathematics.
+(`Qwen4ExpForConditionalGeneration`). It is not an instance of the Qwen3.5 architecture:
+hyper-connection residual streams, Qwen Sparse Attention (QSA) and the n-gram PLE embedding change
+the block and state mathematics.
 
 **Status in this tree:** the configuration is interpreted (`models/qwen3_5/config.{h,cpp}`,
 `Architecture::Qwen4Exp`), the ModelOpt NVFP4 checkpoint converts (`tools/convert/qwen4_exp.py`,
@@ -16,6 +16,11 @@ K = 1..5, full-vocabulary proposal; at tp 2 with the offload expert backend only
 [Execution](#execution). Vision, DFlash and a trimmed proposal head are refused. This reference
 and its artifact
 naming come from giveen/ninfer-ext (Apache-2.0), which executes the architecture.
+
+The same mathematics with a [dense FFN](#dense-ffn) in place of the sparse MoE, and optionally
+without PLE, serves dense checkpoints of this architecture at any hidden width. Their execution is
+validated on synthetic checkpoints against the FP64 oracle (`tools/ref_q4/synthetic.sh`, see
+[tools](../../tools/README.md)).
 
 The upstream authorities are:
 - Transformers `models/qwen4_exp` for Text;
@@ -57,6 +62,11 @@ Other fixed values:
 Embedding and output head are untied, and there is no final RMSNorm: the output mixer feeds the
 head directly.
 
+Read from the configuration rather than fixed: the hidden width H (a multiple of 8), the HC low
+rank (from the shape of the mixer weights), the FFN (the MoE fields, or `intermediate_size` alone
+for a [dense FFN](#dense-ffn)), the PLE (`ple_layer_ids` empty or absent: no n-gram embedding and
+no n-gram field is read; at most one PLE layer) and the GDN output gate (`output_gate_type`).
+
 The BF16 checkpoint holds about 180B parameters, of which about 121B are routed experts and 51.2B
 are the n-gram table.
 
@@ -67,7 +77,7 @@ are the n-gram table.
 - A **grouped** offset RMSNorm computes the RMS separately over each contiguous H-wide stream of a
   wide vector and then applies the hc·H-wide weight.
 - The GDN output norm is `w * x / rms(x) * act(z)` with a plain (not offset) weight, and
-  `act = sigmoid` here. Qwen3.5 uses SiLU in this position.
+  `act` set by `output_gate_type`: sigmoid in Flash-Next, SiLU (the Qwen3.5 choice) for `silu`.
 
 ## Hyper-connection residual
 
@@ -78,7 +88,7 @@ Each block has two HC mixers, one around the mixer and one around the MoE. Each 
 
 ```text
 n      = grouped_offset_rmsnorm(R, hc_norm)                         # [hc·H]
-m      = sigmoid(W_up · silu(W_down · n / hc))                      # [hc·H], W_down: [320, hc·H]
+m      = sigmoid(W_up · silu(W_down · n / hc))                      # [hc·H], W_down: [r, hc·H], low rank r = 320
 x      = mean_s(m_s ⊙ n_s)                                          # block input, [H]
 inject = 2 · sigmoid(W_inject · n / hc)                             # [hc]
 y      = block(x)                                                   # [H]
@@ -96,7 +106,7 @@ consumes.
 ```text
 if block has PLE:  R = R + PLE(R, tokens)
 x, inj = HC_attn(R);  R = R + inj ⊗ mixer(x)        # GDN or QSA gated attention
-x, inj = HC_mlp(R);   R = R + inj ⊗ SparseMoE(x)
+x, inj = HC_mlp(R);   R = R + inj ⊗ FFN(x)           # SparseMoE, or the dense FFN
 ```
 
 **GDN** is the Qwen3.5 formulation:
@@ -107,10 +117,28 @@ x, inj = HC_mlp(R);   R = R + inj ⊗ SparseMoE(x)
 - the delta-rule recurrence runs over `[Dk,Dv]` state per value head;
 - the output passes through the gated norm with the `z` gate, then `out_proj`.
 
-**Sparse MoE** is the [Qwen3.5 formula](qwen3_5-model.md#sparse-moe) with E = 512 and K = 10:
-- softmax over router logits, top-10, and renormalization of the selected weights;
-- SwiGLU experts whose fused `gate_up_proj` rows are gate first, then up;
-- the shared expert scaled by `sigmoid(shared_expert_gate · x)`.
+**Sparse MoE**, with E = 512 routed experts and K = 10 selected:
+
+```text
+router_probs   = softmax(W_router x)
+(values, ids)  = topk(router_probs, K)
+routing_weight = values / sum(values)
+y_e    = W_down[e](SiLU(W_gate[e] x) * (W_up[e] x))
+shared = W_shared_down(SiLU(W_shared_gate x) * (W_shared_up x))
+y      = sum(routing_weight[e] * y_e for e in ids) + sigmoid(W_shared_score x) * shared
+```
+
+The fused `gate_up_proj` rows of an expert are gate first, then up. The shared expert always runs
+and is outside the top-K; logical expert id e identifies router row e and its expert matrices.
+
+## Dense FFN
+
+A configuration with `intermediate_size` and no MoE field has a dense FFN in every Text block and
+in the MTP layer: the Qwen3.5 SwiGLU MLP ([Qwen3.5 reference](qwen3_5-model.md#text-block-mathematics);
+checkpoint `mlp.{gate,up,down}_proj`, logical `mlp/gate`, `mlp/up`, `mlp/down`). Everything else in
+this reference is unchanged. A dense model has no expert table, slot pool, offload backend or
+expert threads. Elastic KV is refused, because it trades KV pages for expert slots, so a dense
+model is served without `--profile flash-next` (which turns elastic KV on).
 
 ## Qwen Sparse Attention
 
@@ -280,27 +308,44 @@ expert and the output head as NVFP4 (`nvfp4_mse`, A16Only) and keeps hyper-conne
 indexer, the PLE projections and the MTP stem Q8. Routers, shared-expert gates, norms and vectors
 stay direct.
 
+Dense checkpoints convert with the Qwen3.5 dense MLP naming, MTP layer included. The recipes
+`qwen4_bf16`, `qwen4_bf16_hcq8` and `qwen4_nvfp4` ([weight conversion](../weight-conversion.md))
+are for correctness work on new geometries; `tools/capy_flash/gen_synthetic.py --ffn dense` writes
+such checkpoints.
+
 ## Execution
 
 `execution/qwen4_forward.h` (one template for execution and startup workspace sizing, at one
-device or over the two ranks of `--tp 2`), entry points in `execution/qwen4_text.cpp`, Program
-state in `program/` and `state/`:
+device or over the two ranks of `--tp 2`; its members by responsibility in
+`execution/qwen4_forward/`, instantiated for both uses in `execution/qwen4_forward.cpp`; the
+Program-owned inputs and taps in `execution/qwen4_runtime.h`), entry points in
+`execution/qwen4_text.cpp` (one function per call over the ranks), Program state in `program/` and
+`state/`:
 
 - **Residual**: `hyper_connection_expand` of the embedding; every mixer is
   `hyper_connection_combine_mix` (the pending block output is committed inside the next mixer); the
   output mixer (`hyper_connection_mix`, no inject) feeds the head. The carried hidden of every
   round, Prefill column, StateImage continuation and CausalScoring tile is the committed **wide
-  residual** [S*H]; the output mixer runs where logits are needed.
+  residual** [S*H]; the output mixer runs where logits are needed. Each mixer has two routes: the
+  fused **small-T** route (T <= 8 columns, two launches) for every format at H = 2560 and low rank
+  320, and for Q8 at H = 5120, where a lane's Down segment is split over H/2560 CTAs of one cluster
+  that add their square partials through DSMEM in a fixed order and Up+mix keeps its operands in
+  registers; and the **general** route for longer calls and every other H (multiple of 8) and rank,
+  BF16 or Q8 (NVFP4 mixers only at H = 2560).
 - **QSA**: `qsa_append` (K/V plus the index records and pooled block keys), `qsa_select`,
   `qsa_attention` for every call, also below the dense-equivalent extent (the selection is then all
   visible keys). The two index planes of every attention layer live in the Main KV page pool after
   the K/V planes (`DecoderStateSpec::qsa_index`), so paging, prefix reuse and host tiers move them
   with the K/V bytes.
 - **GDN**: Linear projection, `causal_conv1d_silu_split` (Prefill) or `gdn_projected_conv_snapshot`
-  (decode), `gated_delta_net[_batch_update]`, `gated_rmsnorm_sigmoid`.
+  (decode), `gated_delta_net[_batch_update]`, `gated_rmsnorm_sigmoid` (`gated_rmsnorm` for a
+  `silu` output gate).
 - **PLE**: rows gathered on the host (`PleGather`, mapped table with prefetch): per Prefill chunk
   through pinned staging, per decode round into a pinned buffer the round uploads. The convolution
   history (9 x 10240 BF16 per slot) is StateImage state (`PleStateSpec`).
+- **Dense FFN**: the gate|up parent as one SwiGLU projection (the fused `linear_swiglu` where its
+  shape is registered, otherwise Linear then `silu_mul`), then the down projection into the block
+  output (tp 2: gate|up column-parallel, down row-parallel with one all-reduce, as the mixer output).
 - **MoE**: `moe_route` (top-10 renormalized, sigmoid shared gate), the shared expert as Q8 Linear,
   the routed experts through a backend that returns the FP32 partial sum, and `moe_combine_shared`
   (one BF16 rounding). Backends (`execution/qwen4_experts.h`, `EngineOptions::routed_experts`):
@@ -387,9 +432,10 @@ state in `program/` and `state/`:
   the MTP layer (stem replicated, its QSA heads and expert partition per rank, shared expert on
   rank 0) and the proposal (replicated MTP output mixer, vocabulary-split head) over both ranks;
   rank 1 keeps its own PLE record and folds it with the same commit rows. The prefix-reuse bridge
-  (`qwen4_mtp_forward_batch_tp2`) runs the MTP column of the reuse frontier and its proposal steps
-  the same way, each rank from its own retained copy of the target hidden: rank 1 keeps its prompt
-  chunk's wide residual in its own `prefill_hidden` and writes its capture checkpoints (T66b).
+  (`qwen4_mtp_forward_batch` over both ranks) runs the MTP column of the reuse frontier and its
+  proposal steps the same way, each rank from its own retained copy of the target hidden: rank 1
+  keeps its prompt chunk's wide residual in its own `prefill_hidden` and writes its capture
+  checkpoints (T66b).
 - **MTP** (`Qwen4Forward::run_mtp`, round schedule `program/speculative/mtp.cpp`): the stem over
   the target's wide residual and the shifted token, one QSA block over the MTP KV cache (layer 0,
   its own index planes) with the MTP experts, the MTP output mixer and the Text output head. Prompt
@@ -439,3 +485,65 @@ state in `program/` and `state/`:
   nothing, so an MTP run and its no-draft control run every expert on the same side and produce
   identical tokens). Under MTP the forcing knobs rewrite only the host token; the device built the
   round's MTP column from the unforced one.
+
+## The Text forward's options
+
+`Qwen4Forward` is the one Text forward of every model: Qwen4Exp (Qwen3.8-Flash-Next, dense Qwen4)
+and the dense Qwen3.5 architecture (Qwen3.8-27B). Its options are selected by the configuration and
+the bound Parameters, never by name:
+
+| option | values | selected by |
+|---|---|---|
+| residual | hyper-connections / **plain** | `TextConfig::hyper_connection` |
+| full attention | QSA / **dense gated attention** | the block's mixer (`QsaParameters` / `AttentionParameters`) |
+| projection routes | **fused** (the 27B's Ops) / generic | `Qwen4FusedRoutes`, resolved per block and rank at preparation |
+
+**Plain residual** (`run_plain`): the Qwen3.5 block. One [H,T] residual per rank; the mixer
+normalizes it by `input_norm` and adds its output projection into it (one device: `linear_add`;
+tp 2: row-parallel with the residual folded into the all-reduce, `linear_add_row_parallel`); the FFN
+the same with `post_attention_norm`. The carried hidden is the final-normed residual, which the
+output head reads directly (`head()` returns a view). Captured tp 2 decode stages the L2 prefetch
+hints of the dense block (`tp2/exchange_prefetch.h`); a tp 2 prompt chunk overlaps its exchanges
+with compute ([Tensor parallelism §4.3](tensor-parallel.md#43-why-both-exist)).
+
+**Hyper-connection residual**: every mixer and the FFN write a block output `y` that the combine
+consumes (`close()` routes the closing projection to `y` instead of the residual).
+
+**Dense gated attention** (`dense_attention`): q|k|gate|v projection, q/k RMSNorm, RoPE (tp 2: the
+fused norm+RoPE Op), causal attention over the paged KV with the call's envelope
+(`Qwen4Columns::envelope`), sigmoid output gate, closing projection. Without QSA the KV cache has no
+index planes.
+
+**Fused routes** (`Qwen4FusedRoutes`, `Prepare::qwen4_routes`): resolved once when the Parameters
+are prepared, by asking each fused Op's capacity query for the rank's actual parent shape, format
+and policy (one device: the plain Op; tp 2: its column-parallel form). An unregistered profile
+throws in the query and keeps the generic chain; `NINFER_QWEN4_FUSED=0` forces the generic chain
+in every Qwen4Exp block (A/B). The blocks of a dense Qwen3.5 model always take the fused routes.
+
+| route | fused Ops (one device / tp 2) | registered for |
+|---|---|---|
+| `gdn_input` | `gdn_input_proj` (+ conv snapshot / record) / `*_column_parallel` | single parent [16384,5120] NVFP4, FP8, Q3; [12288,2048] Q8 (hidden 2048, an Op qualification point) |
+| `gdn_gating` | `gdn_gating_proj` / `gdn_gating_proj_column_parallel` (plain residual at one device: `gdn_norm_gating_proj`, fused with the input norm) | BF16 a\|b [96,5120]; [64,2048] (hidden 2048, an Op qualification point) |
+| `attn_input` | `attn_input_proj` / `attn_input_proj_column_parallel` (QSA input projection; the dense mixer's is `attention_projection`) | q\|k\|gate\|v [14336,5120] (24 Q / 4 KV x 256) BF16, NVFP4, FP8 |
+| `swiglu` | `linear_swiglu` / `linear_swiglu_column_parallel` | [34816,5120] (FFN 17408) NVFP4, FP8, Q4, Q8, Q3; [28672,5120] (FFN 14336) NVFP4; their tp 2 halves |
+
+Qwen3.8-Flash-Next (hidden 2560) has no registered profile and keeps the generic chain.
+
+**A dense Qwen3.5 model.** The artifact, names, binding, tp 2 sharding and stored formats are the
+Qwen3.5 ones. `Parameters` builds `qwen4` blocks as views of the Qwen3.5 blocks (no
+hyper-connections, the Qwen3.5 mixers' operands, every fused route on), so the plain residual
+issues the 27B's fused Ops. The MTP head stays the Qwen3.5 one (packed fc stem, plain block, final
+norm, optional proposal head; `TextContext::mtp_*`, `mtp_prompt_chunk(_tp2)`), and the DFlash2
+drafter is fed by a feature tap (`Qwen4FeatureTap`: the residual after the embedding and after every
+layer, then the positions; at tp 2 also rank 1's peer sink, and per half under the prefill
+overlap). The Program builds the Qwen4 runtime for every model (`Qwen4PersistentLayout`; routed
+experts and PLE only when configured); a dense model's workspace phases are the larger of the
+Qwen4 planner's (Text forward) and `build_qwen3_5_head_workspace_plan(_tp2)`'s (call roots, logits,
+sampling, MTP head, drafter) figures. The disk KV cache key carries `qwen4=1`.
+
+**Known numerical differences** (not defects of the routes): small-T projections that reduce K in
+another order than the decode projection (NVFP4 at T=3, FP8 at T=2 and 3), so those verification
+window columns differ from the decode step already in the projected value; materialized windows
+(FP8 at T >= 4, AllowA4 NVFP4 at T >= 4 with A4 activations) convolve the BF16 projection plane, so
+their own tap is BF16 where the decode step's is FP32 (`ninfer_gdn_input_proj_conv_record_test`
+lists them).

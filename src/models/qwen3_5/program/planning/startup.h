@@ -24,21 +24,18 @@ using TensorLayout                              = TensorRegion;
 inline constexpr std::uint32_t kCausalScoreTile = 1024;
 
 struct DFlashPersistentLayout {
-    std::optional<qwen3_5::PagedKVCacheLayout> full;
     TensorLayout prefill_features;
     TensorLayout prefill_positions;
     TensorLayout pending_features;
-
-    [[nodiscard]] std::size_t kv_payload_bytes() const noexcept {
-        return full ? full->payload_bytes() : 0;
-    }
 };
 
-// Qwen4Exp Program-owned device inputs of the routed-expert backend and the decode PLE rows.
+// The Text forward's Program-owned device inputs: routed-expert backend state, decode PLE rows and
+// the draft shortlist (empty for a dense FFN without PLE).
 struct Qwen4PersistentLayout {
     // I32 [512]: expert e -> e for the experts this rank reads in place from the bank (all at
-    // tp 1; at tp 2 rank r's ID parity, e % 2 == r), -1 for the others.
-    TensorLayout expert_table;
+    // tp 1; at tp 2 rank r's ID parity, e % 2 == r), -1 for the others. Routed experts only
+    // (none of the expert state below exists for a dense FFN).
+    std::optional<TensorLayout> expert_table;
     // BF16 [embed_dim, columns]: one column per lane (ordinary) or K+1 per lane (MTP rounds).
     std::optional<TensorLayout> decode_ple_rows;
     // Speculative rounds: PLE convolution inputs of the verified window, BF16 [S*H, K+1, C].
@@ -201,6 +198,7 @@ struct SequencePlanningInputs {
     RoutedExpertOptions qwen4_experts;
     // T64 elastic KV <-> expert slots (EngineOptions::elastic_kv).
     ElasticKvOptions elastic_kv;
+    bool kv_ram_active = false; // EngineOptions::kv_ram_active
     // T43 (Qwen4Exp MTP): the draft shortlist split (execution::split_draft_shortlist): the
     // output-head prefix [0, draft_prefix) and the other shortlist IDs ascending. Both empty =
     // full-vocabulary proposals.
@@ -243,8 +241,9 @@ struct SequencePlanImpl {
     bool tp_mailbox     = true;
     ContextCacheOptions context_cache;
     RoutedExpertOptions qwen4_experts;
-    ElasticKvOptions elastic_kv;   // T64
-    std::int32_t draft_prefix = 0; // T43, see SequencePlanningInputs
+    ElasticKvOptions elastic_kv;       // T64
+    bool kv_ram_active        = false; // EngineOptions::kv_ram_active
+    std::int32_t draft_prefix = 0;     // T43, see SequencePlanningInputs
     std::vector<std::int32_t> draft_extras;
     bool draft_split = false;
     // Rank 0's persistent layout, and at tp 2 rank 1's: the same layout without the masked

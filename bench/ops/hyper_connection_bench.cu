@@ -143,7 +143,8 @@ int main(int argc, char** argv) {
             Tensor tp(previous.p, DType::FP32, {kStreams, t});
             Tensor tm(mixed.p, DType::BF16, {kHidden, t});
             Tensor ti(gates.p, DType::FP32, {kStreams, t});
-            WorkspaceArena workspace(ops::hyper_connection_mix_workspace_bytes(t, t, inject));
+            WorkspaceArena workspace(
+                ops::hyper_connection_mix_workspace_bytes(t, t, inject, kHidden, kRank));
             // combine_mix commits y with a zero gate so repeated replays keep the residual fixed.
             const auto launch = [&](cudaStream_t stream) {
                 for (const auto& w : weights) {

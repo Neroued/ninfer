@@ -229,7 +229,10 @@ void validate_profile(const Profile& profile) {
     // NVFP4 and FP8 also register the two-device output-row half [17408,5120].
     const bool fused_gate_up = (profile.gate_up_rows == 34816 || profile.gate_up_rows == 17408) &&
                                profile.input_rows == 5120;
-    const bool nvfp4 = profile.qtype == QType::NVFP4 && fused_gate_up;
+    // NVFP4 also registers the dense FFN-14336 gate|up [28672,5120] and its half [14336,5120].
+    const bool ffn14336 = (profile.gate_up_rows == 28672 || profile.gate_up_rows == 14336) &&
+                          profile.input_rows == 5120;
+    const bool nvfp4 = profile.qtype == QType::NVFP4 && (fused_gate_up || ffn14336);
     const bool fp8   = profile.qtype == QType::FP8_E4M3FN_ROW_BF16 && fused_gate_up;
     if ((!q4 && !q8_companion && !q8_dflash2 && !nvfp4 && !fp8) ||
         profile.gate_up_rows != 2 * profile.output_rows) {

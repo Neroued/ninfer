@@ -52,8 +52,8 @@ void gdn_gating_proj(const Tensor& x, const Weight& a_weight, const Weight& b_we
 /**
  * Registered contiguous-parent storage forms of gdn_gating_proj:
  *
- * - Qwen3.8-27B: BF16 `ab_weight [96,5120]`, with A in rows [0,48) and B in [48,96);
- * - Qwen3.6-35B-A3B: BF16 `ab_weight [64,2048]`, with A in rows [0,32) and B in [32,64).
+ * - hidden 5120: BF16 `ab_weight [96,5120]`, with A in rows [0,48) and B in [48,96);
+ * - hidden 2048: BF16 `ab_weight [64,2048]`, with A in rows [0,32) and B in [32,64).
  *
  * The complete immutable parent is the public weight. Its halves are consumed as zero-copy views
  * and produce FP32 g/beta `[heads,T]` under the same logical formula and oracle. All other effects
@@ -64,7 +64,7 @@ void gdn_gating_proj(const Tensor& x, const Weight& ab_weight, const Tensor& A_l
                      DeviceExecutionView execution);
 
 /**
- * Applies the Qwen3.6 GDN input RMSNorm and control projection as one semantic Op:
+ * Applies the GDN input RMSNorm and control projection as one semantic Op:
  *
  *   n[k,t]    = x[k,t] * rsqrt(mean_j(x[j,t]^2) + eps) * (1 + norm_weight[k])
  *   h_ideal[k,t] = n[k,t]
@@ -88,7 +88,7 @@ void gdn_norm_gating_proj(const Tensor& x, const Tensor& norm_weight, float eps,
                           const Tensor& dt_bias, WorkspaceArena& ws, Tensor& h, Tensor& g,
                           Tensor& beta, DeviceExecutionView execution);
 
-/** The Qwen3.8-27B and Qwen3.6-35B-A3B contiguous-parent storage forms described above. */
+/** The hidden-5120 and hidden-2048 contiguous-parent storage forms described above. */
 void gdn_norm_gating_proj(const Tensor& x, const Tensor& norm_weight, float eps,
                           const Weight& ab_weight, const Tensor& A_log, const Tensor& dt_bias,
                           WorkspaceArena& ws, Tensor& h, Tensor& g, Tensor& beta,

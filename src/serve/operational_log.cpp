@@ -314,13 +314,22 @@ OperationalRecord render_prefill_miss(const RequestLogContext& context,
     return {.severity = OperationalSeverity::Warning, .message = out.str()};
 }
 
-std::optional<OperationalRecord> render_tool_call_fallback(const RequestLogContext& context,
-                                                           const GenerationOutcome& outcome) {
+std::optional<OperationalRecord> render_tool_call_parse(const RequestLogContext& context,
+                                                        const GenerationOutcome& outcome) {
     const ninfer::ToolCallParseFallbackReason reason = outcome.tool_call_parse.fallback_reason;
-    if (!outcome.tool_call_parse.marker_seen ||
+    if (!outcome.tool_call_parse.marker_seen) { return std::nullopt; }
+    if (outcome.tool_call_parse.salvaged_call_count > 0 &&
         reason == ninfer::ToolCallParseFallbackReason::None) {
-        return std::nullopt;
+        // Not a text fallback, but an unknown or renamed tool name is worth an operator's
+        // attention: the model asked for a tool under a name the request did not declare.
+        return OperationalRecord{
+            .severity = OperationalSeverity::Info,
+            .message  = "req#" + std::to_string(context.id) +
+                       " tool call name salvaged (undeclared or catalog spelling) | " +
+                       std::to_string(outcome.tool_call_parse.salvaged_call_count) + " call(s)",
+        };
     }
+    if (reason == ninfer::ToolCallParseFallbackReason::None) { return std::nullopt; }
     return OperationalRecord{
         .severity = OperationalSeverity::Warning,
         .message  = "req#" + std::to_string(context.id) + " tool markup returned as text | " +
@@ -435,8 +444,8 @@ void OperationalLog::request_done(const RequestLogContext& context,
     if (outcome.metrics.prefill_miss.has_value()) {
         write(render_prefill_miss(context, *outcome.metrics.prefill_miss));
     }
-    if (std::optional<OperationalRecord> fallback = render_tool_call_fallback(context, outcome)) {
-        write(std::move(*fallback));
+    if (std::optional<OperationalRecord> record = render_tool_call_parse(context, outcome)) {
+        write(std::move(*record));
     }
 }
 

@@ -1,33 +1,33 @@
-# DFlash and DFlash2
+# DFlash2
 
-DFlash backends propose several tokens with one masked-block forward, conditioned on committed
-target hidden features. The target verifies the proposal causally and remains the output authority.
-NInfer implements DFlash and DFlash2 as optional components of the
-[Qwen3.5 model](qwen3_5-model.md). Their private config and bindings select the stored weights;
-startup chooses one backend, draft width and proposal head.
+DFlash2 proposes several tokens with one masked-block forward, conditioned on committed target
+hidden features. The target verifies the proposal causally and remains the output authority.
+NInfer implements DFlash2 as an optional component of the [Qwen3.5 model](qwen3_5-model.md)
+(Qwen3.8-27B). Its private config and bindings select the stored weights; startup chooses the draft
+width and proposal head.
 
 This reference owns model mathematics, proposal distributions and backend state. Scheduling,
 publication and common transactions are defined by [Engine architecture](engine-architecture.md).
 
 ## Configuration and current geometries
 
-Both draft configs use `model_type=qwen3` and identify `DFlashDraftModel` or `DFlash2DraftModel`.
-They supply draft layer count, attention/FFN dimensions, norm epsilon, one-dimensional RoPE theta,
-layer attention types, sliding window, target block IDs and mask token ID. DFlash2 also supplies
-convolution tap/group dimensions and selector rank/top-k. The hidden width and embedding/output
+The draft config uses `model_type=qwen3` and identifies `DFlash2DraftModel`. It supplies draft layer
+count, attention/FFN dimensions, norm epsilon, one-dimensional RoPE theta, layer attention types
+(every layer `sliding_attention`), sliding window, target block IDs, mask token ID, convolution
+tap/group dimensions and selector rank/top-k. The hidden width and embedding/output
 semantics come from the target. Exact fields are parsed in
 [`config.cpp`](../../src/models/qwen3_5/config.cpp).
 
-| Quantity | Official 35B-A3B DFlash | Official 27B DFlash2 |
-|---|---:|---:|
-| Hidden width H | 2048 | 5120 |
-| Draft layers | 6 | 5 |
-| Intermediate width | 6144 | 17408 |
-| Q heads / KV heads / head dimension | 32 / 8 / 128 | 32 / 8 / 128 |
-| Target block IDs | `[1,6,11,16,22,27,32,37]` | `[5,19,33,47,61]` |
-| Attention pattern | Five local layers, then one full layer | Five local layers |
-| Sliding-window scalar S | 4096 | 2048 |
-| Norm epsilon / RoPE theta | `1e-6` / `1e7` | `1e-6` / `1e7` |
+| Quantity | Official 27B DFlash2 |
+|---|---:|
+| Hidden width H | 5120 |
+| Draft layers | 5 |
+| Intermediate width | 17408 |
+| Q heads / KV heads / head dimension | 32 / 8 / 128 |
+| Target block IDs | `[5,19,33,47,61]` |
+| Attention pattern | Five local layers |
+| Sliding-window scalar S | 2048 |
+| Norm epsilon / RoPE theta | `1e-6` / `1e7` |
 | Dynamic convolution | — | Two taps, group width 16 |
 | Candidate selector | Per-position argmax | Top-16 conditional path, rank 256 |
 
@@ -101,12 +101,10 @@ allowed(p_query, p_key) = abs(p_key - p_query) < S
 
 Endpoints at distance S−1 are included; distance S is excluded. Populated sequence bounds clip
 the symmetric interval. With a full left context and `p_query=F+i`, the row sees at most `S-1-i`
-context positions, plus all W query rows for the supported widths. A full layer attends all
-populated context and query rows. These masks are specified by
-[`sliding_window_attention.h`](../../include/ninfer/ops/sliding_window_attention.h) and
-[`softmax_attention.h`](../../include/ninfer/ops/softmax_attention.h).
+context positions, plus all W query rows for the supported widths. The mask is specified by
+[`sliding_window_attention.h`](../../include/ninfer/ops/sliding_window_attention.h).
 
-## DFlash backbone and proposal
+## Draft backbone
 
 Each layer uses plain RMSNorm, full-head Q/K normalization and scalar RoPE:
 
@@ -121,10 +119,8 @@ m = plain_rmsnorm(y, post_attention_norm)
 x_next = y + W_down(SiLU(W_gate m) * (W_up m))
 ```
 
-After final plain RMSNorm, the mask columns go through the selected proposal head. DFlash uses
-per-column argmax, either over public vocabulary rows of the full Text head or over the indexed
-proposal head followed by token-ID remapping. Thus its actual proposal q is a point mass, including
-when target sampling uses positive temperature.
+DFlash2 wraps both residual branches in its dynamic convolution (below). After the final plain
+RMSNorm the mask columns go through the selected proposal head and the candidate selector.
 
 Changing W can change every proposal because attention is non-causal. A shorter block is not
 required to match the prefix of a longer block.
@@ -234,19 +230,19 @@ on rejection: r_i(v) = max(p_i(v) - q_i(v), 0)
 on all accept: bonus ~ p_P
 ```
 
-DFlash q is one-hot; DFlash2 q is the retained conditional distribution. This preserves the
+DFlash2's q is the retained conditional distribution. This preserves the
 processed target distribution for the verify path. Different draft formats, shortlist heads or
 block widths can change acceptance and throughput; their logits need not match one another.
 
 ### Live widths
 
-The two backend implementations use different proposal extents near a request tail:
+Near a request tail the proposal and the target use different extents:
 
-| Extent | DFlash | DFlash2 |
-|---|---|---|
-| Proposal attention/masked input | Q=P+1 live columns | All W=K+1 columns |
-| Target attention and GDN | Q=P+1 live columns | Q=P+1 live columns |
-| Candidate prefix checked | First P proposals | First P proposals with their actual q |
+| Extent | DFlash2 |
+|---|---|
+| Proposal attention/masked input | All W=K+1 columns |
+| Target attention and GDN | Q=P+1 live columns |
+| Candidate prefix checked | First P proposals with their actual q |
 
 DFlash2 computes its configured W-column proposal even when only a prefix can be verified. Its
 proposal-valid tensor and target-valid tensor have different meanings. Columns outside the
@@ -271,9 +267,8 @@ commits no new state and releases the sequence; it does not undo earlier adopted
 
 ## Backend storage and lifecycle
 
-Local draft layers store K/V in cyclic rings; full draft layers use paged KV. A full pool exists
-only when selected draft config has full-attention layers. The official DFlash2 instance therefore
-has five local rings and no full draft pool. Its ring payload per state image is:
+Every draft layer stores its K/V in a cyclic ring; there is no paged draft pool. The official
+DFlash2 instance has five rings, whose payload per state image is:
 
 ```text
 5 layers * (2-byte K + 2-byte V) * 8 heads * 128 * 2048 = 40 MiB
@@ -298,8 +293,7 @@ target state and continuation metadata. Their coverage must agree. These rules a
 At `tp=2` DFlash2 splits the target ([Qwen3.5 model](qwen3_5-model.md#tensor-parallel-execution)),
 the drafter and the candidate ranking of the optimized proposal head; only the candidate selector
 stays on rank 0. `--lm-head-draft` is required: the text output head is split by vocabulary and
-`linear_topk` has a vocabulary-split form only for the optimized head. A drafter with
-full-attention layers is rejected (its paged KV would have no rank 1 mirror).
+`linear_topk` has a vocabulary-split form only for the optimized head.
 
 **Placement** (`load/sharding.cpp`). Every drafter layer splits like a Text layer: rank r holds
 query heads `[16 r, 16 r + 16)` of 32 and KV heads `[4 r, 4 r + 4)` of 8 of `attention/query` and

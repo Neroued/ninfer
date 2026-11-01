@@ -948,21 +948,39 @@ public:
         return ActiveCaptureReserveResult::Reserved;
     }
 
-    // Device KV lease (capy-flash, after ninfer-custom 9f108db7): gives Device KV back to an
-    // active sequence whose lease ran out of pool space, so a live answer is not cut short while
-    // retained cache holds the pool. Releases idle catalogued private continuations (no active
-    // edge, no open context transaction) in the capture reclaim's order (lowest retention weight,
-    // then GreedyDual priority, then oldest), then idle shared prefixes without client credit,
-    // oldest first, skipping owners with no Device pages of a pool that is still short, until the
-    // requested pages are covered or none remains. Returns the owners released.
+    // Device KV lease: gives Device KV back to an active sequence whose lease ran out of pool
+    // space, so a live answer is not cut short while retained cache holds the pool. Takes idle
+    // catalogued private continuations (no active edge, no open context transaction) in the
+    // capture reclaim's order (lowest retention weight, then GreedyDual priority, then oldest),
+    // then idle shared prefixes without client credit, oldest first, until the requested pages
+    // are covered or none remains. An owner qualifies for a move to the Host while it maps Device
+    // pages of a pool that is still short and that no active sequence reads, alone or with other
+    // idle owners (Program::idle_device_kv_pages): the pages a conversation's continuation shares
+    // with the shared prefix it was built on belong to neither alone. The pages covered are read
+    // from the pools, since one move frees a shared page once and one release frees it only with
+    // the last owner. Returns the owners moved or released.
     std::uint32_t reclaim_device_kv_for_lease(Program& program, std::uint32_t main_pages,
                                               std::uint32_t backend_pages,
                                               std::uint32_t minimum_main_pages,
                                               std::uint32_t minimum_backend_pages) {
         if (!std::holds_alternative<std::monostate>(transaction_)) { return 0; }
-        std::uint64_t freed_main    = 0;
-        std::uint64_t freed_backend = 0;
+        const auto start            = program.device_kv_available_pages();
+        std::uint32_t freed_main    = 0;
+        std::uint32_t freed_backend = 0;
         std::uint32_t released      = 0;
+        const auto measure          = [&] {
+            const auto now = program.device_kv_available_pages();
+            freed_main     = now.main > start.main ? now.main - start.main : 0U;
+            freed_backend  = now.backend > start.backend ? now.backend - start.backend : 0U;
+        };
+        // The owner holds Device pages of a pool that is still short.
+        const auto holds_short = [&](const auto& pages) {
+            return (freed_main < main_pages && pages.main != 0) ||
+                   (freed_backend < backend_pages && pages.backend != 0);
+        };
+        const auto need = [](std::uint32_t wanted, std::uint32_t freed) {
+            return wanted > freed ? wanted - freed : 0U;
+        };
         // With a Host tier, idle private continuations first move their Device KV to the Host
         // (same order), so the answer gets its pages and the conversations stay resumable.
         for (std::uint32_t attempts = 0; attempts < catalog_count_ &&
@@ -972,12 +990,8 @@ public:
             for (std::uint32_t slot = 0; slot < catalog_count_; ++slot) {
                 const CatalogEntry& entry = catalog_[slot];
                 if (entry.state != CatalogState::Catalogued || !entry.handle ||
-                    private_has_active_edge(slot) || lease_demote_tried(slot)) {
-                    continue;
-                }
-                const auto pages = program.retained_device_kv_pages(*entry.handle);
-                if (!((freed_main < main_pages && pages.main != 0) ||
-                      (freed_backend < backend_pages && pages.backend != 0))) {
+                    private_has_active_edge(slot) || lease_demote_tried(slot) ||
+                    !holds_short(program.idle_device_kv_pages(*entry.handle))) {
                     continue;
                 }
                 if (!victim || reclaim_key(entry) < reclaim_key(catalog_[*victim])) {
@@ -987,23 +1001,17 @@ public:
             if (!victim) { break; }
             mark_lease_demote_tried(*victim);
             CatalogEntry& entry = catalog_[*victim];
-            const auto before   = program.retained_device_kv_pages(*entry.handle);
-            const auto need     = [](std::uint64_t wanted, std::uint64_t freed) {
-                return static_cast<std::uint32_t>(wanted > freed ? wanted - freed : 0U);
-            };
-            const auto summary = program.demote_retained_kv_for_lease(
+            const auto summary  = program.demote_retained_kv_for_lease(
                 *entry.handle, {.main    = need(main_pages, freed_main),
-                                .backend = need(backend_pages, freed_backend)});
+                                 .backend = need(backend_pages, freed_backend)});
             if (!summary || !valid_continuation_summary(*summary)) { continue; }
-            const auto after = program.retained_device_kv_pages(*entry.handle);
             assign_continuation_summary(entry.summary, *summary);
             migrate_observations(entry, *summary, entry.retention);
             advance_revision(entry.revision);
             refresh_session_owner_revision(entry.id, *victim, entry.revision);
             saturating_increment(context_stats_.pressure_private_owners_degraded);
             rebuild_prefix_index();
-            freed_main += before.main > after.main ? before.main - after.main : 0U;
-            freed_backend += before.backend > after.backend ? before.backend - after.backend : 0U;
+            measure();
             ++released;
         }
         reset_lease_demote_tried();
@@ -1017,12 +1025,8 @@ public:
                 const SharedCatalogEntry& entry = shared_catalog_[slot];
                 if (entry.state != SharedCatalogState::Catalogued || !entry.handle ||
                     entry.transaction_pins != 0 || entry.explicit_credit ||
-                    shared_active_edge_count(slot) != 0 || lease_demote_tried(slot)) {
-                    continue;
-                }
-                const auto pages = program.retained_device_kv_pages(*entry.handle);
-                if (!((freed_main < main_pages && pages.main != 0) ||
-                      (freed_backend < backend_pages && pages.backend != 0))) {
+                    shared_active_edge_count(slot) != 0 || lease_demote_tried(slot) ||
+                    !holds_short(program.idle_device_kv_pages(*entry.handle))) {
                     continue;
                 }
                 if (!victim || entry.id < shared_catalog_[*victim].id) { victim = slot; }
@@ -1030,73 +1034,84 @@ public:
             if (!victim) { break; }
             mark_lease_demote_tried(*victim);
             SharedCatalogEntry& entry = shared_catalog_[*victim];
-            const auto before         = program.retained_device_kv_pages(*entry.handle);
-            const auto need           = [](std::uint64_t wanted, std::uint64_t freed) {
-                return static_cast<std::uint32_t>(wanted > freed ? wanted - freed : 0U);
-            };
-            const auto summary = program.demote_retained_shared_kv_for_lease(
+            const auto summary        = program.demote_retained_shared_kv_for_lease(
                 *entry.handle, {.main    = need(main_pages, freed_main),
-                                .backend = need(backend_pages, freed_backend)});
+                                       .backend = need(backend_pages, freed_backend)});
             if (!summary || !valid_shared_prefix_summary(*summary)) { continue; }
-            const auto after = program.retained_device_kv_pages(*entry.handle);
-            entry.summary    = *summary;
+            entry.summary = *summary;
             advance_revision(entry.revision);
             saturating_increment(context_stats_.pressure_shared_owners_degraded);
             rebuild_prefix_index();
-            freed_main += before.main > after.main ? before.main - after.main : 0U;
-            freed_backend += before.backend > after.backend ? before.backend - after.backend : 0U;
+            measure();
             ++released;
         }
         reset_lease_demote_tried();
-        // Dropping is the last resort, and only for the smallest growth step.
+        // Dropping is the last resort, and only for the smallest growth step. Owners whose release
+        // returns pages by itself go first. An owner that only shares its idle pages goes after
+        // them, and only for pages whose every holder may be released too
+        // (Program::releasable_device_kv_pages over the droppable owners): such a page comes back
+        // with the last of them, while a page an owner that must stay also maps (a shared prefix
+        // with client credit or a transaction pin, a continuation an active request was resumed
+        // from) never does, so releasing its other owners would lose them for nothing.
         main_pages    = std::min(main_pages, minimum_main_pages);
         backend_pages = std::min(backend_pages, minimum_backend_pages);
+        std::vector<std::uint32_t> droppable_private;
+        std::vector<std::uint32_t> droppable_shared;
+        std::vector<const ContinuationHandle*> droppable_private_handles;
+        std::vector<const SharedPrefixHandle*> droppable_shared_handles;
         while (freed_main < main_pages || freed_backend < backend_pages) {
-            const bool need_main    = freed_main < main_pages;
-            const bool need_backend = freed_backend < backend_pages;
-            std::optional<std::uint32_t> victim;
-            std::uint32_t victim_main    = 0;
-            std::uint32_t victim_backend = 0;
+            droppable_private.clear();
+            droppable_shared.clear();
+            droppable_private_handles.clear();
+            droppable_shared_handles.clear();
             for (std::uint32_t slot = 0; slot < catalog_count_; ++slot) {
                 const CatalogEntry& entry = catalog_[slot];
-                if (entry.state != CatalogState::Catalogued || !entry.handle ||
-                    private_has_active_edge(slot)) {
-                    continue;
-                }
-                const auto pages = program.retained_device_kv_pages(*entry.handle);
-                if (!((need_main && pages.main != 0) || (need_backend && pages.backend != 0))) {
-                    continue;
-                }
-                if (!victim || reclaim_key(entry) < reclaim_key(catalog_[*victim])) {
-                    victim         = slot;
-                    victim_main    = pages.main;
-                    victim_backend = pages.backend;
+                if (entry.state == CatalogState::Catalogued && entry.handle &&
+                    !private_has_active_edge(slot)) {
+                    droppable_private.push_back(slot);
+                    droppable_private_handles.push_back(&*entry.handle);
                 }
             }
-            if (!victim) {
-                // No idle private continuation holds pages of a short pool: the oldest idle
-                // shared prefix without client credit goes next.
-                std::optional<std::uint32_t> shared;
-                std::uint32_t shared_main    = 0;
-                std::uint32_t shared_backend = 0;
-                for (std::uint32_t slot = 0; slot < shared_catalog_count_; ++slot) {
-                    const SharedCatalogEntry& entry = shared_catalog_[slot];
-                    if (entry.state != SharedCatalogState::Catalogued || !entry.handle ||
-                        entry.transaction_pins != 0 || entry.explicit_credit ||
-                        shared_active_edge_count(slot) != 0) {
+            for (std::uint32_t slot = 0; slot < shared_catalog_count_; ++slot) {
+                const SharedCatalogEntry& entry = shared_catalog_[slot];
+                if (entry.state == SharedCatalogState::Catalogued && entry.handle &&
+                    entry.transaction_pins == 0 && !entry.explicit_credit &&
+                    shared_active_edge_count(slot) == 0) {
+                    droppable_shared.push_back(slot);
+                    droppable_shared_handles.push_back(&*entry.handle);
+                }
+            }
+            const auto jointly = program.releasable_device_kv_pages(droppable_private_handles,
+                                                                    droppable_shared_handles);
+            std::optional<std::uint32_t> victim;
+            std::optional<std::uint32_t> shared;
+            for (const bool alone : {true, false}) {
+                for (std::size_t owner = 0; owner < droppable_private.size(); ++owner) {
+                    const std::uint32_t slot  = droppable_private[owner];
+                    const CatalogEntry& entry = catalog_[slot];
+                    if (!holds_short(alone ? program.retained_device_kv_pages(*entry.handle)
+                                           : jointly[owner])) {
                         continue;
                     }
-                    const auto pages = program.retained_device_kv_pages(*entry.handle);
-                    if (!((need_main && pages.main != 0) || (need_backend && pages.backend != 0))) {
-                        continue;
-                    }
-                    if (!shared || entry.id < shared_catalog_[*shared].id) {
-                        shared         = slot;
-                        shared_main    = pages.main;
-                        shared_backend = pages.backend;
+                    if (!victim || reclaim_key(entry) < reclaim_key(catalog_[*victim])) {
+                        victim = slot;
                     }
                 }
-                if (!shared) { break; }
+                if (victim) { break; }
+                // No idle private continuation qualifies: the oldest idle shared prefix without
+                // client credit goes next.
+                for (std::size_t owner = 0; owner < droppable_shared.size(); ++owner) {
+                    const std::uint32_t slot        = droppable_shared[owner];
+                    const SharedCatalogEntry& entry = shared_catalog_[slot];
+                    if (!holds_short(alone ? program.retained_device_kv_pages(*entry.handle)
+                                           : jointly[droppable_private.size() + owner])) {
+                        continue;
+                    }
+                    if (!shared || entry.id < shared_catalog_[*shared].id) { shared = slot; }
+                }
+                if (shared) { break; }
+            }
+            if (shared) {
                 SharedCatalogEntry& entry = shared_catalog_[*shared];
                 const auto result         = program.release_shared_prefix(std::move(*entry.handle));
                 if (result.status != ConsumeStatus::Consumed) { break; }
@@ -1104,11 +1119,11 @@ public:
                 saturating_increment(context_stats_.pressure_shared_owners_evicted);
                 record_checkpoint_drops(context_stats_, 1);
                 rebuild_prefix_index();
-                freed_main += shared_main;
-                freed_backend += shared_backend;
+                measure();
                 ++released;
                 continue;
             }
+            if (!victim) { break; }
             CatalogEntry& entry         = catalog_[*victim];
             reclaim_inflation_          = std::max(reclaim_inflation_, reclaim_priority(entry));
             const std::uint32_t dropped = continuation_checkpoint_count(entry.summary);
@@ -1119,8 +1134,7 @@ public:
             saturating_increment(context_stats_.pressure_private_owners_evicted);
             record_checkpoint_drops(context_stats_, dropped);
             rebuild_prefix_index();
-            freed_main += victim_main;
-            freed_backend += victim_backend;
+            measure();
             ++released;
         }
         return released;

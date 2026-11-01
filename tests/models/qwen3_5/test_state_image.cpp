@@ -97,6 +97,9 @@ void fill_slot(q36::StateImageDevicePool& pool, std::int32_t slot, unsigned char
             set_bytes(view.v.slice(3, slot, 1), static_cast<unsigned char>(base + 0x40 + layer));
         }
     }
+    // The fills run on the default stream, which the pool's copies on the context's non-blocking
+    // streams do not wait for.
+    CUDA_CHECK(cudaDeviceSynchronize());
 }
 
 void expect_slot(q36::StateImageDevicePool& pool, std::int32_t slot, unsigned char base,

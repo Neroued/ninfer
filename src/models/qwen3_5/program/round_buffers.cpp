@@ -37,7 +37,7 @@ void validate_spec(const RoundStateSpec& spec) {
     if (spec.backend == SpeculativeBackend::Mtp && spec.draft_window > kMtpDecodeMaximumDrafts) {
         throw std::invalid_argument("RoundState MTP draft window exceeds the decode frame domain");
     }
-    if (is_masked_draft_backend(spec.backend) &&
+    if (spec.backend == SpeculativeBackend::DFlash2 &&
         (spec.draft_window == 0 || spec.draft_window > kDFlashDecodeMaximumDrafts)) {
         throw std::invalid_argument(
             "RoundState DFlash draft window exceeds the decode frame domain");
@@ -181,7 +181,7 @@ void complete_round_state_layout(LayoutBuilder& builder, RoundStateLayout& layou
         decode.ar_valid_columns  = add_tensor(builder, DType::I32, {batch, ar_steps},
                                               "MTP decode autoregressive valid columns");
     }
-    if (is_masked_draft_backend(layout.spec.backend)) {
+    if (layout.spec.backend == SpeculativeBackend::DFlash2) {
         DFlashPrefillStateLayout& prefill = layout.dflash_prefill.emplace();
         prefill.ingress =
             builder.add(sizeof(DFlashPrefillIngress), kArenaAlign, "DFlash prefill ingress");
@@ -240,7 +240,6 @@ DFlashPrefillState::DFlashPrefillState(DeviceSpan backing, const DFlashPrefillSt
     };
     append_count           = scalar(offsetof(DFlashPrefillIngress, append_count));
     state_destination_slot = scalar(offsetof(DFlashPrefillIngress, state_destination_slot));
-    full_kv_table_row      = scalar(offsetof(DFlashPrefillIngress, full_kv_table_row));
 }
 
 MtpDecodeState::MtpDecodeState(DeviceSpan backing, const MtpDecodeStateLayout& layout,
@@ -362,8 +361,6 @@ DFlashDecodeState::DFlashDecodeState(DeviceSpan backing, const DFlashDecodeState
                                            DType::I32, {width, batch});
     text_kv_table_rows =
         ingress_tensor(offsetof(DFlashDecodeIngress, text_kv_table_rows), DType::I32, {batch});
-    dflash_kv_table_rows =
-        ingress_tensor(offsetof(DFlashDecodeIngress, dflash_kv_table_rows), DType::I32, {batch});
     active_lanes = ingress_tensor(offsetof(DFlashDecodeIngress, active_lanes), DType::I32, {batch});
     state_source_slots =
         ingress_tensor(offsetof(DFlashDecodeIngress, state_source_slots), DType::I32, {batch});

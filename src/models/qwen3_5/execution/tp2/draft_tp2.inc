@@ -120,7 +120,7 @@ void propose_dflash2_batch_tp2(DFlashBatchContext& state, int batch, int k,
                 ops::sliding_window_attention_head_block(
                     query, key, value, positions[r], valid[r], slots[r],
                     {128, kSplitQueryHeads, kSplitKvHeads},
-                    dimension(config.sliding_window.value_or(0)),
+                    dimension(config.sliding_window),
                     static_cast<float>(1.0 / std::sqrt(double(config.attention.head_dim))),
                     ranks[r].dflash->local_layer(static_cast<std::uint32_t>(layer)),
                     envelopes.local, work, attention, stream);
@@ -196,7 +196,7 @@ void propose_dflash2_batch_tp2(DFlashBatchContext& state, int batch, int k,
             "DFlash2 tp2: a candidate selector on rank 1 needs the split head and rank 1's "
             "candidate and proposal buffers");
     }
-    const std::int32_t top_k = dimension(config.dflash2->selector_top_k);
+    const std::int32_t top_k = dimension(config.dflash2.selector_top_k);
     std::array<Tensor, 2> candidates;
     std::array<Tensor, 2> ids;
     std::array<Tensor, 2> scores;
@@ -234,13 +234,13 @@ void propose_dflash2_batch_tp2(DFlashBatchContext& state, int batch, int k,
         auto& work                         = core.work;
         const cudaStream_t stream          = core.device.stream;
         Tensor projected =
-            work.alloc(DType::BF16, {dimension(config.dflash2->selector_rank), mask_columns});
+            work.alloc(DType::BF16, {dimension(config.dflash2.selector_rank), mask_columns});
         project(final_hidden[selecting], selector.hidden_projection, projected, work, stream);
         Tensor drafts     = frame.draft_tokens.slice(1, 0, batch);
         Tensor proposal_q = frame.proposal_q.slice(2, 0, batch);
         ops::candidate_selector_path(
             candidates[selecting], scores[selecting].view({top_k, k, batch}),
-            projected.view({dimension(config.dflash2->selector_rank), k, batch}),
+            projected.view({dimension(config.dflash2.selector_rank), k, batch}),
             frame.anchors.slice(0, 0, batch), selector.predecessor_codebook,
             selector.successor_codebook, frame.execution_frontiers.slice(0, 0, batch),
             frame.sampling, drafts, proposal_q, work, stream);
@@ -326,8 +326,7 @@ void dflash2_share_drafts_tp2(DFlashBatchContext& state, std::int32_t batch_size
 void dflash2_draft_round_tp2(DFlashBatchContext& state, std::int32_t batch_size, std::uint32_t k,
                              DFlashEnvelopes envelopes) {
     const TpExecution* tp = state.execution.tp;
-    if (tp == nullptr || tp->dflash == nullptr || state.peer_frame == nullptr ||
-        !state.execution.parameters.model.config().draft->dflash2) {
+    if (tp == nullptr || tp->dflash == nullptr || state.peer_frame == nullptr) {
         throw std::logic_error("DFlash2 tp2 round requires the split drafter on both ranks");
     }
     const std::int32_t width = static_cast<std::int32_t>(k) + 1;
@@ -343,15 +342,13 @@ void dflash2_draft_round_tp2(DFlashBatchContext& state, std::int32_t batch_size,
         Tensor positions      = d.frame->append_positions.slice(1, 0, batch_size);
         Tensor counts         = d.frame->append_counts.slice(0, 0, batch_size);
         Tensor destinations   = d.frame->state_destination_slots.slice(0, 0, batch_size);
-        Tensor dflash_rows    = d.frame->dflash_kv_table_rows.slice(0, 0, batch_size);
         Tensor compact        = core.work.alloc(
             DType::BF16,
             {dimension(core.parameters.draft->feature_projection.weight.k), width, batch_size});
         ops::prepare_ragged_prefix(d.dflash->pending_features, active_lanes, context_starts,
                                    frontiers, compact, positions, counts, stream);
         DFlashAppendContext append{core, *d.dflash};
-        append_context_impl(append, compact, positions, counts, destinations, dflash_rows,
-                            envelopes.append);
+        append_context_impl(append, compact, positions, counts, destinations, envelopes.append);
     });
     nvtx::ScopedRange proposal_range(nvtx::Name::DFlashProposal, nvtx::Category::DFlash,
                                      static_cast<std::uint64_t>(k + 1U) * batch_size);
@@ -382,8 +379,7 @@ void dflash_append_context_peer(DFlashPeerDrafter& peer, const qwen3_5::DFlashDe
                                counts, stream);
     DFlashAppendContext append{core, peer.dflash};
     append_context_impl(append, features, positions, counts,
-                        frame.state_destination_slots.slice(0, 0, batch),
-                        frame.dflash_kv_table_rows.slice(0, 0, batch), envelope);
+                        frame.state_destination_slots.slice(0, 0, batch), envelope);
 }
 
 DFlashFeatureSink dflash_peer_batch_sink(DFlashPeerDrafter& peer, const Tensor& lanes,
@@ -421,8 +417,7 @@ DFlashFeatureSink dflash_peer_prefill_sink(DFlashPeerDrafter& peer,
                 const auto exact = static_cast<std::uint32_t>(features.ne[1]);
                 DFlashAppendContext append{core, peer.dflash};
                 append_context_impl(append, features, positions, frame.append_count,
-                                    frame.state_destination_slot, frame.full_kv_table_row,
-                                    {exact, exact});
+                                    frame.state_destination_slot, {exact, exact});
             },
     };
 }

@@ -8,6 +8,7 @@ target_sources(ninfer_model_runtime PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/execution/ple_rows.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/execution/text.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/execution/qwen4_text.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/execution/qwen4_forward.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/execution/qwen4_experts.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/execution/qwen4_draft_head.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/execution/qwen4_prefetch.cpp"

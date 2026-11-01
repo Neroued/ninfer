@@ -42,7 +42,7 @@ def _optional(model, recipe):
             else:
                 format = Q5
             _assign(recipe, name, format)
-        elif name.startswith(("mtp/", "dflash/", "dflash2/")):
+        elif name.startswith(("mtp/", "dflash2/")):
             if name.endswith(
                 (
                     "/moe/router",
@@ -54,12 +54,10 @@ def _optional(model, recipe):
             ):
                 continue
             _assign(recipe, name, Q8)
-    for backend in ("dflash", "dflash2"):
-        if backend not in model.components:
-            continue
-        layers = model.components[backend]["config"]["num_hidden_layers"]
+    if "dflash2" in model.components:
+        layers = model.components["dflash2"]["config"]["num_hidden_layers"]
         for layer in range(layers):
-            prefix = f"{backend}/layers/{layer}/attention/"
+            prefix = f"dflash2/layers/{layer}/attention/"
             for role in ("key", "value"):
                 recipe.share(prefix + "context_" + role, prefix + role)
 
@@ -129,32 +127,6 @@ def qwen3_6_27b(model, recipe, sources):
 
 def qwen3_8_27b(model, recipe, sources):
     _dense_groupwise(model, recipe, Q8)
-
-
-def qwen3_6_35b_a3b(model, recipe, sources):
-    if "num_experts" not in model.config:
-        raise ValueError("this official recipe requires Qwen3.5 MoE mathematics")
-    _optional(model, recipe)
-    _assign(recipe, "text/token_embedding", Q8)
-    _assign(recipe, "text/output_head", Q6)
-    for name, parameter in model.parameters.items():
-        if not name.startswith("text/layers/") or not parameter.projection:
-            continue
-        if name.endswith(
-            (
-                "/gdn/a_projection",
-                "/gdn/b_projection",
-                "/moe/router",
-                "/moe/shared_score",
-            )
-        ):
-            continue
-        if "/moe/experts/" in name:
-            layer = int(name.split("/")[2])
-            format = (Q6 if layer in (34, 38, 39) else Q5) if name.endswith("/down") else Q4
-        else:
-            format = Q8
-        _assign(recipe, name, format)
 
 
 def qwen3_6_27b_nvfp4(model, recipe, sources):
@@ -269,8 +241,8 @@ def _flash_next(model, recipe, *, nvfp4_dense: bool, nvfp4_groups=None, nvfp4_he
         nvfp4_head = nvfp4_dense
     nvfp4_suffixes = tuple(s for group in nvfp4_groups for s in _FLASH_NEXT_NVFP4_GROUPS[group])
     bf16_suffixes = tuple(s for group in bf16_groups for s in _FLASH_NEXT_BF16_GROUPS[group])
-    if model.config.get("model_type") != "qwen4_exp_text":
-        raise ValueError("this official recipe requires Qwen4Exp mathematics")
+    if model.config.get("model_type") != "qwen4_exp_text" or "num_experts" not in model.config:
+        raise ValueError("this official recipe requires Qwen4Exp MoE mathematics")
     # The MTP choices of _optional; the loop below restates every Text and MTP choice.
     _optional(model, recipe)
     # The Vision tower Q8 (v0.6): the 27B's mixed Q4/Q5/Q6 tower departs from the BF16 reference
@@ -371,6 +343,65 @@ qwen3_8_flash_next_nvfp4_idxhcbf16_gdnq8 = _flash_next_g_bf16("indexer", "hc", g
 qwen3_8_flash_next_nvfp4_idxbf16_gdnq8 = _flash_next_g_bf16("indexer", gdn_q8=True)
 
 
+def qwen4_bf16(model, recipe, sources):
+    """A dense Qwen4 checkpoint (Qwen4Exp mathematics, dense FFN, with or without PLE) in BF16.
+
+    Every matrix and vector keeps its BF16 values (cast_direct; the BF16 linear accepts any shape,
+    ops/linear/bf16/bf16_dispatch.cpp), the fused groups (q|k|gate|v, q|k|v|z, a|b, indexer q|k,
+    hyper-connection down|inject, PLE key|value, MLP gate|up) become one parent each. The n-gram
+    table, which the engine reads row-scaled FP8 from the file, keeps its FP8 codes when the
+    checkpoint stores them (import_encoded) and is quantized by fp8_row_maxabs otherwise. Routed
+    experts are not covered: their banks have NVFP4 routes only (qwen3_8_flash_next_* recipes).
+    Meant for correctness work on new geometries before their quantized routes exist."""
+    if model.config.get("model_type") != "qwen4_exp_text":
+        raise ValueError("this official recipe requires Qwen4Exp mathematics")
+    if "num_experts" in model.config:
+        raise ValueError("the qwen4_* recipes convert dense Qwen4 FFNs; routed experts need an NVFP4 recipe")
+    for name, parameter in model.parameters.items():
+        if name.endswith("/ple/table"):
+            if _encoded_format(parameter.source) == FP8:
+                recipe.assign(name, format=FP8, method=import_encoded, source=parameter.source)
+            else:
+                recipe.assign(name, format=FP8, method=fp8_row_maxabs)
+        elif parameter.projection:
+            _assign(recipe, name, "bf16")
+
+
+def qwen4_bf16_hcq8(model, recipe, sources):
+    """qwen4_bf16 with every hyper-connection mixer (Down|inject and Up) in Q8 by grouped max-abs,
+    the format of the production Flash-Next mixers: a synthetic checkpoint converted with it runs the
+    Q8 small-T route of the hyper-connection mixer end to end (at hidden 2560, and at 5120 where
+    only Q8 has that route), comparable with the general route on the same weights
+    (NINFER_QWEN4_HC_GENERAL=1)."""
+    qwen4_bf16(model, recipe, sources)
+    hc = _FLASH_NEXT_BF16_GROUPS["hc"]
+    for name, parameter in model.parameters.items():
+        if parameter.projection and name.endswith(hc):
+            _assign(recipe, name, Q8)
+
+
+# The dense Qwen4 projections qwen4_nvfp4 stores as NVFP4: the Qwen3.8-27B NVFP4 projection set
+# (attention q|k|gate|v and output, GDN q|k|v|z and output, MLP gate|up and down).
+_QWEN4_NVFP4_DENSE = (
+    _FLASH_NEXT_NVFP4_GROUPS["attention"] + _FLASH_NEXT_NVFP4_GROUPS["gdn"] + ("/mlp/gate", "/mlp/up", "/mlp/down")
+)
+
+
+def qwen4_nvfp4(model, recipe, sources):
+    """A dense Qwen4 checkpoint with the Qwen3.8-27B NVFP4 projection set, for the fused routes.
+
+    As qwen4_bf16, except the attention, GDN and MLP projections of the Text and MTP layers:
+    NVFP4 by nvfp4_mse, A16Only (a checkpoint without activation calibration has no A4 divisors).
+    The GDN a|b projection, hyper-connection mixers, QSA indexer, PLE projections, embedding and
+    output head stay BF16. At hidden 5120 these are the parents
+    the Text forward's fused Ops register (docs/maintainer/qwen4-exp-model.md); a synthetic checkpoint
+    converted with it exercises them against the generic chain (NINFER_QWEN4_FUSED=0)."""
+    qwen4_bf16(model, recipe, sources)
+    for name, parameter in model.parameters.items():
+        if parameter.projection and name.endswith(_QWEN4_NVFP4_DENSE):
+            recipe.assign(name, format="nvfp4", method=nvfp4_mse, activation_policy="A16Only")
+
+
 MXFP8 = "mxfp8_e4m3fn_g32_ue8m0"
 NVFP4_ROW = "nvfp4_row_e4m3_g16"
 _VERBATIM_LAYOUTS = {MXFP8: "block_scale_k32_v1", NVFP4_ROW: "row_interleaved_v1"}
@@ -441,8 +472,8 @@ def qwen3_8_flash_next_fp4_local(model, recipe, sources):
     vectors become BF16, the only rounding. Fused projection groups and expert banks are one parent
     each. Text and MTP only: Vision is not served from this checkpoint.
     """
-    if model.config.get("model_type") != "qwen4_exp_text":
-        raise ValueError("this official recipe requires Qwen4Exp mathematics")
+    if model.config.get("model_type") != "qwen4_exp_text" or "num_experts" not in model.config:
+        raise ValueError("this official recipe requires Qwen4Exp MoE mathematics")
     if "vision" in model.components:
         raise ValueError("qwen3_8_flash_next_fp4_local serves text and mtp only; use --components text,mtp")
     verbatim = set()
@@ -574,7 +605,6 @@ RECIPES = {
     "qwen3_6_27b_nvfp4": qwen3_6_27b_nvfp4,
     "qwen3_8_27b": qwen3_8_27b,
     "qwen3_8_27b_nvfp4": qwen3_8_27b_nvfp4,
-    "qwen3_6_35b_a3b": qwen3_6_35b_a3b,
     "qwen3_8_flash_next_nvfp4": qwen3_8_flash_next_nvfp4,
     "qwen3_8_flash_next_nvfp4_dense": qwen3_8_flash_next_nvfp4_dense,
     "qwen3_8_flash_next_nvfp4_mix": qwen3_8_flash_next_nvfp4_mix,
@@ -587,4 +617,7 @@ RECIPES = {
     "qwen3_8_flash_next_nvfp4_idxhcbf16_gdnq8": qwen3_8_flash_next_nvfp4_idxhcbf16_gdnq8,
     "qwen3_8_flash_next_nvfp4_idxbf16_gdnq8": qwen3_8_flash_next_nvfp4_idxbf16_gdnq8,
     "qwen3_8_flash_next_fp4_local": qwen3_8_flash_next_fp4_local,
+    "qwen4_bf16": qwen4_bf16,
+    "qwen4_bf16_hcq8": qwen4_bf16_hcq8,
+    "qwen4_nvfp4": qwen4_nvfp4,
 }

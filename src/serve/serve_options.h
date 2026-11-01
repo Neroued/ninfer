@@ -86,6 +86,8 @@ struct ServeOptions {
     // the prompt-chunk width from which the missing experts stream over PCIe (--stream-min-tokens,
     // RoutedExpertOptions::stream_min_tokens; 0 = never).
     ElasticKvOptions elastic_kv;
+    // --kv-ram-active (EngineOptions::kv_ram_active): the generating conversation's KV in RAM.
+    bool kv_ram_active = false;
     std::optional<MissSplitMode> miss_split;
     bool miss_split_calibrate = false; // --miss-split calibrate (MissSplitOptions::calibrate)
     std::optional<std::uint32_t> stream_min_tokens;

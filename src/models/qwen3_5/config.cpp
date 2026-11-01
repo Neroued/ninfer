@@ -7,6 +7,7 @@
 #include <limits>
 #include <set>
 #include <string>
+#include <string_view>
 
 namespace ninfer::models::qwen3_5 {
 namespace {
@@ -147,10 +148,14 @@ void qwen4_extensions(const Json& value, TextConfig& out) {
     }
     out.sparse_attention = qsa;
 
+    // PLE is optional: no (or an empty) ple_layer_ids means no n-gram embedding, and the n-gram
+    // fields are then not read. One layer is implemented; more would need one table per layer.
+    if (!value.contains("ple_layer_ids")) { return; }
     const auto& ids = value.at("ple_layer_ids");
-    if (!ids.is_array() || ids.size() != 1) {
-        throw ArtifactError("Qwen4Exp requires exactly one one-indexed PLE layer");
+    if (!ids.is_array() || ids.size() > 1) {
+        throw ArtifactError("Qwen4Exp implements at most one one-indexed PLE layer");
     }
+    if (ids.empty()) { return; }
     PleConfig ple;
     const auto one_indexed = integer(ids[0], "PLE layer");
     if (one_indexed > out.num_hidden_layers ||
@@ -285,10 +290,11 @@ TextConfig text(const Json& value, bool mtp) {
         }
     }
     if (qwen4) { qwen4_extensions(value, out); }
-    if (out.architecture != Architecture::Qwen3_5) {
-        if (value.contains("intermediate_size")) {
-            throw ArtifactError("MoE config carries Dense FFN width");
-        }
+    // Qwen4Exp has either FFN: the routed-expert MoE (Qwen3.8-Flash-Next) or a dense SwiGLU FFN
+    // (intermediate_size and no MoE field). Qwen3_5 is dense.
+    const bool dense =
+        out.architecture == Architecture::Qwen3_5 || (qwen4 && value.contains("intermediate_size"));
+    if (!dense) {
         MoeConfig moe{dimension(value, "num_experts"), dimension(value, "num_experts_per_tok"),
                       dimension(value, "moe_intermediate_size"),
                       dimension(value, "shared_expert_intermediate_size")};
@@ -313,7 +319,6 @@ VisionConfig vision(const Json& value) {
                      "num_position_embeddings"},
                     {}, "vision config");
     if (value.at("model_type") != "qwen3_5_vision" &&
-        value.at("model_type") != "qwen3_5_moe_vision" &&
         value.at("model_type") != "qwen4_exp_vision") {
         throw ArtifactError("unknown Vision model_type");
     }
@@ -338,15 +343,14 @@ VisionConfig vision(const Json& value) {
     return out;
 }
 
-DraftConfig draft(const Json& value, const TextConfig& target, bool dflash2) {
+DraftConfig draft(const Json& value, const TextConfig& target) {
     require_members(value,
                     {"architectures", "model_type", "intermediate_size", "num_attention_heads",
                      "num_key_value_heads", "head_dim", "num_hidden_layers",
                      "max_position_embeddings", "rms_norm_eps", "rope_parameters", "layer_types",
-                     "dflash_config"},
-                    {"sliding_window"}, "draft config");
-    if (architecture(value) != (dflash2 ? "DFlash2DraftModel" : "DFlashDraftModel") ||
-        value.at("model_type") != "qwen3") {
+                     "sliding_window", "dflash_config"},
+                    {}, "draft config");
+    if (architecture(value) != "DFlash2DraftModel" || value.at("model_type") != "qwen3") {
         throw ArtifactError("draft architecture/model_type mismatch");
     }
     DraftConfig out;
@@ -362,29 +366,19 @@ DraftConfig draft(const Json& value, const TextConfig& target, bool dflash2) {
     if (!layers.is_array() || layers.size() != out.num_hidden_layers) {
         throw ArtifactError("draft layer_types length mismatch");
     }
-    bool sliding = false;
+    // Every DFlash2 drafter layer attends over its sliding window (its context KV is the local
+    // ring the fused materialization writes).
     for (const auto& layer : layers) {
-        if (layer == "full_attention") {
-            out.layer_types.push_back(DraftAttentionKind::FullAttention);
-        } else if (layer == "sliding_attention") {
-            out.layer_types.push_back(DraftAttentionKind::SlidingAttention);
-            sliding = true;
-        } else {
-            throw ArtifactError("unknown draft layer_type");
+        if (layer != "sliding_attention") {
+            throw ArtifactError("DFlash2 draft layers must be sliding_attention");
         }
     }
-    if (sliding || value.contains("sliding_window")) {
-        out.sliding_window = dimension(value, "sliding_window");
-    }
+    out.sliding_window = dimension(value, "sliding_window");
     const auto& config = value.at("dflash_config");
-    if (dflash2) {
-        require_members(config,
-                        {"target_layer_ids", "mask_token_id", "conv_kernel_size", "conv_group_size",
-                         "selector_rank", "selector_top_k"},
-                        {}, "DFlash2 config");
-    } else {
-        require_members(config, {"target_layer_ids", "mask_token_id"}, {}, "DFlash config");
-    }
+    require_members(config,
+                    {"target_layer_ids", "mask_token_id", "conv_kernel_size", "conv_group_size",
+                     "selector_rank", "selector_top_k"},
+                    {}, "DFlash2 config");
     const auto& taps = config.at("target_layer_ids");
     if (!taps.is_array() || taps.empty()) {
         throw ArtifactError("target_layer_ids must be nonempty");
@@ -401,14 +395,11 @@ DraftConfig draft(const Json& value, const TextConfig& target, bool dflash2) {
     if (out.mask_token_id >= target.vocab_size) {
         throw ArtifactError("mask token exceeds target embedding rows");
     }
-    if (dflash2) {
-        DFlash2Config extra{
-            dimension(config, "conv_kernel_size"), dimension(config, "conv_group_size"),
-            dimension(config, "selector_rank"), dimension(config, "selector_top_k")};
-        if (target.hidden_size % extra.conv_group_size) {
-            throw ArtifactError("DFlash2 conv group does not divide hidden width");
-        }
-        out.dflash2 = extra;
+    out.dflash2 =
+        DFlash2Config{dimension(config, "conv_kernel_size"), dimension(config, "conv_group_size"),
+                      dimension(config, "selector_rank"), dimension(config, "selector_top_k")};
+    if (target.hidden_size % out.dflash2.conv_group_size) {
+        throw ArtifactError("DFlash2 conv group does not divide hidden width");
     }
     return out;
 }
@@ -455,18 +446,15 @@ Config parse_config(const artifact::Directory& directory, const LoadOptions& opt
         if (out.mtp) {
             const auto& config = companion(directory, "mtp").config;
             require_members(config, {"architectures"}, {}, "MTP config");
-            const char* expected = out.text.architecture == Architecture::Qwen4Exp ? "Qwen4ExpMTP"
-                                   : out.text.architecture == Architecture::Qwen3_5Moe
-                                       ? "Qwen3_5MoeMTP"
-                                       : "Qwen3_5MTP";
-            if (architecture(config) != expected) {
+            const std::string_view expected =
+                mtp_architecture(architecture(directory.component("text").config));
+            if (expected.empty() || architecture(config) != expected) {
                 throw ArtifactError("MTP architecture differs from target mathematics");
             }
         }
-        if (options.speculative == SpeculativeBackend::DFlash ||
-            options.speculative == SpeculativeBackend::DFlash2) {
-            out.draft = draft(companion(directory, options.speculative_component()).config,
-                              out.text, options.speculative == SpeculativeBackend::DFlash2);
+        if (options.speculative == SpeculativeBackend::DFlash2) {
+            out.draft =
+                draft(companion(directory, options.speculative_component()).config, out.text);
         }
         return out;
     } catch (const std::exception& error) {

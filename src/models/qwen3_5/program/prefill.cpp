@@ -25,7 +25,7 @@
 #include <string_view>
 
 namespace {
-// T66: NINFER_QWEN4_REWRITE_SPLITS=1 keeps the rewrite-frontier prefill splits for Qwen4Exp.
+// NINFER_QWEN4_REWRITE_SPLITS=1 keeps the rewrite-frontier prefill splits of a routed-expert model.
 bool qwen4_rewrite_splits() {
     static const bool on = [] {
         const char* v = std::getenv("NINFER_QWEN4_REWRITE_SPLITS");
@@ -50,15 +50,13 @@ DFlashFeatureSink make_dflash_prefill_sink(PrefillContext& state) {
             *state.dflash_prefill_host_ingress = {
                 .append_count           = features.ne[1],
                 .state_destination_slot = state.state_destination_slot,
-                .full_kv_table_row      = state.dflash_kv_table_row,
             };
             CUDA_CHECK(cudaMemcpyAsync(frame.ingress.data, state.dflash_prefill_host_ingress,
                                        sizeof(qwen3_5::DFlashPrefillIngress),
                                        cudaMemcpyHostToDevice, state.execution.device.stream));
             const auto exact = static_cast<std::uint32_t>(features.ne[1]);
             dflash_append_context(state, features, positions, frame.append_count,
-                                  frame.state_destination_slot, frame.full_kv_table_row,
-                                  {exact, exact});
+                                  frame.state_destination_slot, {exact, exact});
             (void)rewrite_checkpoint;
         });
 }
@@ -218,10 +216,11 @@ void sample_from_hidden(PrefillContext& state, const Tensor& hidden, std::int32_
                 state.sampling, state.execution.io.pos, purpose, state.execution.work,
                 state.execution.device.stream);
     if (reasoning_guard) {
-        guard_first_token(logits, state.execution.io.token,
-                          dimension(state.execution.parameters.model.resources().public_token_count),
-                          state.sampling, state.execution.io.pos, state.execution.work,
-                          state.execution.device.stream);
+        guard_first_token(
+            logits, state.execution.io.token,
+            dimension(state.execution.parameters.model.resources().public_token_count),
+            state.sampling, state.execution.io.pos, state.execution.work,
+            state.execution.device.stream);
     }
     state.execution.work.reset();
     if (state.execution.tp != nullptr) { state.execution.tp->work->reset(); }
@@ -346,7 +345,7 @@ void ProgramImpl::start_sequence(std::uint32_t lane, SequenceState& sequence,
                 sequence.state = ActiveStateBinding{.read = current, .write = current};
             } else {
                 const StateImageSelectors selectors = state_store->begin_fork(selected, current);
-                if (is_masked_draft_backend(speculative_backend)) {
+                if (speculative_backend == SpeculativeBackend::DFlash2) {
                     state_images->copy_dflash_local(selectors.source, selectors.destination,
                                                     device.stream);
                 }
@@ -541,7 +540,7 @@ void ProgramImpl::start_sequence(std::uint32_t lane, SequenceState& sequence,
                                                      : StateReadOwnership::ExternalOwner;
                 const StateImageSelectors selectors =
                     state_store->begin_fork(selected, destination);
-                if (is_masked_draft_backend(speculative_backend)) {
+                if (speculative_backend == SpeculativeBackend::DFlash2) {
                     state_images->copy_dflash_local(selectors.source, selectors.destination,
                                                     device.stream);
                 }
@@ -583,7 +582,7 @@ void ProgramImpl::start_sequence(std::uint32_t lane, SequenceState& sequence,
                     throw std::logic_error("retained prefix has incomplete MTP KV");
                 }
                 sequence.mtp_kv_valid = mtp_base;
-            } else if (is_masked_draft_backend(speculative_backend)) {
+            } else if (speculative_backend == SpeculativeBackend::DFlash2) {
                 const std::uint32_t source_backend = private_source != nullptr
                                                          ? private_source->dflash_context_frontier
                                                          : shared_source->frontier;
@@ -635,7 +634,7 @@ void ProgramImpl::start_sequence(std::uint32_t lane, SequenceState& sequence,
                     throw std::logic_error("resident MTP KV is shorter than the bridge frontier");
                 }
                 sequence.mtp_kv_valid = mtp_base;
-            } else if (is_masked_draft_backend(speculative_backend) &&
+            } else if (speculative_backend == SpeculativeBackend::DFlash2 &&
                        sequence.dflash_context_frontier != base) {
                 throw std::logic_error("resident DFlash context is not at the append frontier");
             }
@@ -681,9 +680,8 @@ void ProgramImpl::start_sequence(std::uint32_t lane, SequenceState& sequence,
                         "rewrite-checkpoint MTP KV is shorter than the bridge frontier");
                 }
                 sequence.mtp_kv_valid = mtp_base;
-            } else if (is_masked_draft_backend(speculative_backend)) {
-                if (!dflash || (backend_kv_cache() && !sequence.kv->backend) ||
-                    sequence.dflash_context_frontier < base) {
+            } else if (speculative_backend == SpeculativeBackend::DFlash2) {
+                if (!dflash || sequence.dflash_context_frontier < base) {
                     throw std::logic_error("planned DFlash rewrite checkpoint is unavailable");
                 }
                 sequence.dflash_context_frontier = base;
@@ -708,8 +706,7 @@ void ProgramImpl::start_sequence(std::uint32_t lane, SequenceState& sequence,
             speculative_backend == SpeculativeBackend::Mtp
                 ? std::min(capacity,
                            prompt_tokens + (initial_mtp_extent == 0 ? 0U : initial_mtp_extent - 1U))
-            : speculative_backend == SpeculativeBackend::DFlash ? prompt_tokens
-                                                                : 0U;
+                : 0U;
         // T64: before the prompt maps its KV, size the KV backing for the prompt and the first
         // decode tokens (up to one grow step) and give the rest back to the expert cache.
         if (qwen4_elastic) {
@@ -741,9 +738,8 @@ void ProgramImpl::start_sequence(std::uint32_t lane, SequenceState& sequence,
         sequence.rebuild_work       = request_plan.root_rebuild_work;
         sequence.rebuild_tail_begin = request_plan.root_rebuild_tail_begin;
 
-        if (is_masked_draft_backend(speculative_backend)) {
-            if (!dflash || !io.dflash_prefill || !dflash_prefill_host_ingress ||
-                (backend_kv_cache() && !sequence.kv->backend)) {
+        if (speculative_backend == SpeculativeBackend::DFlash2) {
+            if (!dflash || !io.dflash_prefill || !dflash_prefill_host_ingress) {
                 throw std::logic_error("DFlash prefill state is incomplete");
             }
         }
@@ -855,7 +851,7 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
             sequence.text_kv_valid != pending.base_E ||
             (speculative_backend == SpeculativeBackend::Mtp &&
              sequence.mtp_kv_valid != pending.base_E) ||
-            (is_masked_draft_backend(speculative_backend) &&
+            (speculative_backend == SpeculativeBackend::DFlash2 &&
              sequence.dflash_context_frontier != pending.base_E)) {
             throw std::logic_error("speculative pending row is not at its recorded base");
         }
@@ -927,7 +923,7 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
                 hidden                         = frame.target_hidden.slice(2, 0, batch);
                 selected     = frame.target_continuation_hidden.slice(1, 0, batch);
                 destinations = frame.state_destination_slots.slice(0, 0, batch);
-            } else if (is_masked_draft_backend(speculative_backend) && io.dflash_decode) {
+            } else if (speculative_backend == SpeculativeBackend::DFlash2 && io.dflash_decode) {
                 qwen3_5::DFlashDecodeState& frame = *io.dflash_decode;
                 selector_tensor                   = frame.proposal_extents.slice(0, 0, batch);
                 hidden                            = frame.target_hidden.slice(2, 0, batch);
@@ -964,7 +960,7 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
             }
         }
 
-        if (is_masked_draft_backend(speculative_backend)) {
+        if (speculative_backend == SpeculativeBackend::DFlash2) {
             std::array<std::uint32_t, kMaximumConcurrency> append_lanes{};
             std::array<std::uint32_t, kMaximumConcurrency> append_starts{};
             std::array<std::uint32_t, kMaximumConcurrency> append_counts{};
@@ -992,7 +988,7 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
         // device fault in them surfaces at that round's synchronization. Terminal or cancelled
         // rows release resources below and keep the wait.
         bool defer_wait = speculative_backend == SpeculativeBackend::Mtp &&
-                          qwen4_runtime_record.has_value() && !needs_hidden_correction;
+                          parameters.model.config().text.qwen4() && !needs_hidden_correction;
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             defer_wait = defer_wait && terminal[row] == 0 && cancelled[row] == 0;
         }
@@ -1198,7 +1194,6 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
             selectors.source,
             selectors.destination,
             staged.initial_mtp_extent,
-            0,
             dflash_prefill_host_ingress,
             peer_rewrite_capture_hidden_ptr};
         schedule_state.rope_delta = sequence.rope_delta;
@@ -1208,7 +1203,8 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
 
         if (staged.mtp_bridge == MtpBridgeMode::BeforeSuffix) {
             // After a disk resume the bridge runs at the loaded frontier.
-            const std::uint32_t bridge_base = staged.disk_base != 0 ? staged.disk_base : staged.base;
+            const std::uint32_t bridge_base =
+                staged.disk_base != 0 ? staged.disk_base : staged.base;
             if (staged.cursor != bridge_base || bridge_base == 0 ||
                 staged.cursor >= staged.prompt_tokens) {
                 throw std::logic_error("staged MTP bridge is outside the reusable suffix");
@@ -1250,7 +1246,7 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                 std::min(prefill_chunk, staged.prompt_tokens - staged.cursor);
             mark_workspace_usage(staged.prepare_mtp ? workspace_plan.mtp_prefill
                                                     : workspace_plan.text_prefill);
-            if (is_masked_draft_backend(speculative_backend)) {
+            if (speculative_backend == SpeculativeBackend::DFlash2) {
                 mark_workspace_usage(workspace_plan.dflash_context);
             }
             std::uint32_t remaining          = nominal;
@@ -1261,9 +1257,6 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                 selectors                             = state_selectors(sequence);
                 schedule_state.state_source_slot      = selectors.source;
                 schedule_state.state_destination_slot = selectors.destination;
-                schedule_state.dflash_kv_table_row =
-                    sequence.kv->backend ? backend_kv_addresses->bound_row(*sequence.kv->backend)
-                                         : 0;
                 bind_rewrite_capture_hidden();
                 schedule_state.rewrite_checkpoint_hidden      = rewrite_capture_hidden_ptr;
                 schedule_state.peer_rewrite_checkpoint_hidden = peer_rewrite_capture_hidden_ptr;
@@ -1278,15 +1271,16 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                 const auto rewrite_split                    = std::upper_bound(
                     staged.prompt.identity.rewrite_execution_frontiers.begin(),
                     staged.prompt.identity.rewrite_execution_frontiers.end(), staged.cursor);
-                // T66: Qwen4Exp pays each prefill call's expert pass (streamed over PCIe, or the
-                // CPU path below 2 048 columns): splitting at every rewrite frontier (one per
-                // assistant turn) made a 10-turn 1.2k-token prompt 2.4x slower in ninfer-serve.
-                // Rewrite frontiers only keep resumed and root GDN decompositions bit-identical
-                // (they are not captures), so Qwen4Exp splits at capture frontiers only;
-                // NINFER_QWEN4_REWRITE_SPLITS=1 restores them.
+                // Routed experts cost each prefill call an expert pass (streamed over PCIe,
+                // or the CPU path below 2 048 columns): splitting at every rewrite frontier (one
+                // per assistant turn) made a 10-turn 1.2k-token prompt 2.4x slower in
+                // ninfer-serve. Rewrite frontiers only keep resumed and root GDN decompositions
+                // bit-identical (they are not captures), so a routed-expert model splits at
+                // capture frontiers only; NINFER_QWEN4_REWRITE_SPLITS=1 restores them.
                 if (rewrite_split != staged.prompt.identity.rewrite_execution_frontiers.end() &&
                     (!split_frontier || *rewrite_split < *split_frontier) &&
-                    (qwen4_runtime() == nullptr || qwen4_rewrite_splits())) {
+                    (!parameters.model.config().text.qwen4_routed_experts() ||
+                     qwen4_rewrite_splits())) {
                     split_frontier = *rewrite_split;
                 }
                 execution::PrefillChunkResult result;
@@ -1318,7 +1312,7 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                 final_chunk_tokens     = result.processed_tokens;
                 sequence.text_kv_valid = staged.cursor;
                 if (staged.prepare_mtp) { sequence.mtp_kv_valid = staged.cursor; }
-                if (is_masked_draft_backend(speculative_backend)) {
+                if (speculative_backend == SpeculativeBackend::DFlash2) {
                     sequence.dflash_context_frontier = staged.cursor;
                 }
                 commit_sequence_kv(sequence, sequence.text_kv_valid, backend_kv_valid(sequence));
@@ -1452,7 +1446,7 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
             sequence.mtp_draft_logprobs.fill(std::numeric_limits<float>::quiet_NaN());
             std::copy_n(initial_drafts.begin(), staged.initial_mtp_extent,
                         sequence.mtp_drafts.begin());
-        } else if (is_masked_draft_backend(speculative_backend) &&
+        } else if (speculative_backend == SpeculativeBackend::DFlash2 &&
                    sequence.dflash_context_frontier != prompt_tokens) {
             throw std::logic_error("staged DFlash prefill did not reach the prompt frontier");
         }

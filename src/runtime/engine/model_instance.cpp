@@ -4,6 +4,7 @@
 #include "core/startup.h"
 #include "models/qwen3_5/load.h"
 #include "models/qwen3_5/measurement.h"
+#include "models/qwen3_5/program/program.h"
 #include "ops/sparse_moe/host/host_moe_executor.h"
 
 #include <algorithm>
@@ -178,13 +179,13 @@ EngineOptions normalize_engine_options(EngineOptions options) {
         const auto identity = [](const std::filesystem::path& path) {
             std::error_code error;
             const std::filesystem::path real = std::filesystem::weakly_canonical(path, error);
-            const auto size  = std::filesystem::file_size(real, error);
-            const auto mtime = std::filesystem::last_write_time(real, error);
+            const auto size                  = std::filesystem::file_size(real, error);
+            const auto mtime                 = std::filesystem::last_write_time(real, error);
             return real.string() + ":" + std::to_string(error ? 0 : size) + ":" +
                    std::to_string(mtime.time_since_epoch().count());
         };
-        cache.disk_identity = "artifact=" + identity(options.artifact_path) +
-                              ";exe=" + identity("/proc/self/exe");
+        cache.disk_identity =
+            "artifact=" + identity(options.artifact_path) + ";exe=" + identity("/proc/self/exe");
     }
     if (!cache.enabled) {
         if ((cache.device_state_slots && *cache.device_state_slots != 0) ||
@@ -257,7 +258,6 @@ ModelInstance::ModelInstance(std::unique_ptr<models::qwen3_5::Model> source,
       frontend(models::qwen3_5::make_frontend(
           model->resources(),
           {.chat_template_path       = options.chat_template_path,
-           .architecture             = model->config().text.architecture,
            .vision_enabled           = options.enable_vision,
            .max_context              = options.max_context,
            .media_cache_bytes        = options.media_cache_bytes,
@@ -285,6 +285,10 @@ ConstructedModel construct_model_on(const EngineOptions& requested, DeviceContex
     inspect.complete();
     StartupPhaseScope binding(options.startup_observer, StartupPhase::TargetPlan);
     auto plan = models::qwen3_5::plan_load(reader, models::load_options(options));
+    // The Program page-locks active KV in RAM's Host planes after the weights, inside the same
+    // page-locked limit.
+    plan.reserve_host_pinned_bytes(
+        models::qwen3_5::active_kv_host_pinned_bytes(plan.config(), options));
     binding.complete();
     auto model = execution != nullptr
                      ? models::qwen3_5::materialize_model(std::move(plan), *execution,
@@ -299,19 +303,20 @@ ConstructedModel construct_model_on(const EngineOptions& requested, DeviceContex
     }
     frontend.complete();
     const bool gguf_banks = models::qwen3_5::gguf_routed_experts(instance->parameters);
-    if (instance->parameters.qwen4) {
+    if (instance->parameters.qwen4 &&
+        instance->parameters.model.config().text.qwen4_routed_experts()) {
         // CPU threads of the missing experts: an explicit value (--expert-cpu-threads) wins, 0 is
         // resolved from this machine (v0.7.2, issue #11).
-        auto& e                   = options.routed_experts;
-        std::uint32_t& threads    = gguf_banks ? e.gguf_cpu_threads : e.cpu_threads;
-        std::string reason        = "set by the caller (--expert-cpu-threads)";
+        auto& e                = options.routed_experts;
+        std::uint32_t& threads = gguf_banks ? e.gguf_cpu_threads : e.cpu_threads;
+        std::string reason     = "set by the caller (--expert-cpu-threads)";
         if (threads == 0) {
             threads = static_cast<std::uint32_t>(ops::host::auto_expert_cpu_threads(
                 ops::host::host_cpu_topology(), gguf_banks, &reason));
-            reason = "auto: " + reason;
+            reason  = "auto: " + reason;
         }
-        std::fprintf(stderr, "routed experts: %u CPU threads for the missing experts (%s)\n", threads,
-                     reason.c_str());
+        std::fprintf(stderr, "routed experts: %u CPU threads for the missing experts (%s)\n",
+                     threads, reason.c_str());
     }
     if (gguf_banks) {
         // capy-flash v0.7: ggml block expert banks run without prefill expert streaming, the
@@ -319,15 +324,17 @@ ConstructedModel construct_model_on(const EngineOptions& requested, DeviceContex
         auto& e = options.routed_experts;
         if (e.stream_min_tokens > 0 || e.prefetch_slots > 0 || e.device_reads > 0 ||
             e.miss_split.mode != MissSplitMode::Off) {
-            std::fprintf(stderr, "routed experts: ggml block banks; prefill experts zero-copy from "
-                                 "%u tokens, prefetch and miss split off\n", e.stream_min_tokens);
+            std::fprintf(stderr,
+                         "routed experts: ggml block banks; prefill experts zero-copy from "
+                         "%u tokens, prefetch and miss split off\n",
+                         e.stream_min_tokens);
         }
         e.gguf_stream_min_tokens = e.stream_min_tokens; // the GGUF prefill ring
         e.cpu_threads            = e.gguf_cpu_threads;
         e.stream_min_tokens      = 0;
-        e.prefetch_slots    = 0;
-        e.device_reads      = 0;
-        e.miss_split.mode   = MissSplitMode::Off;
+        e.prefetch_slots         = 0;
+        e.device_reads           = 0;
+        e.miss_split.mode        = MissSplitMode::Off;
     }
     StartupPhaseScope planning(options.startup_observer, StartupPhase::TargetFinalize);
     const auto signature = models::qwen3_5::prefill_signature(*instance->model);
@@ -395,8 +402,20 @@ ConstructedModel construct_model_on(const EngineOptions& requested, DeviceContex
                               ? (budget - fixed - kv) / static_cast<std::size_t>(slot_bytes)
                               : 0;
             };
-            const std::size_t base  = std::min<std::size_t>(slots_with(kv_max), 512);
             const std::size_t total = std::min<std::size_t>(slots_with(kv_init), 512);
+            // The elastic columns must cover the KV's growth from kv_init to kv_max (plus one
+            // granule per KV plane): the arena maps only the base slots, those columns and
+            // kv_init, so flooring both slot counts can leave up to one column short and a
+            // request near max_context then fails with the device memory exhausted. The total
+            // slot count is unchanged: only its split between base slots and elastic columns.
+            const std::size_t growth  = kv_max > kv_init ? kv_max - kv_init : 0;
+            const std::size_t needed  = growth == 0
+                                            ? 0
+                                            : (growth + probe.kv_plane_count() * kElasticGranule +
+                                              static_cast<std::size_t>(slot_bytes) - 1) /
+                                                 static_cast<std::size_t>(slot_bytes);
+            const std::size_t covered = total > needed ? total - needed : 0;
+            const std::size_t base    = std::min<std::size_t>({slots_with(kv_max), covered, 512});
             if (base == 0) {
                 throw std::invalid_argument(
                     "elastic_kv: the KV of max_context (" + std::to_string(kv_max) +
@@ -409,8 +428,10 @@ ConstructedModel construct_model_on(const EngineOptions& requested, DeviceContex
             std::fprintf(
                 stderr,
                 "elastic KV: %zu base + %zu elastic expert slots per layer, KV %zu bytes at "
-                "max context (%zu backed at start, budget %zu)\n",
-                base, total - base, kv_full, kv_init, kv_max);
+                "max context (%zu backed at start, budget %zu); slot %lld bytes, %zu bytes for "
+                "slots and KV, KV growth needs %zu columns\n",
+                base, total - base, kv_full, kv_init, kv_max, static_cast<long long>(slot_bytes),
+                budget > fixed ? budget - fixed : 0, needed);
         }
     } else if (slot_bytes > 0 && options.routed_experts.slots_per_layer == 0) {
         // Offloaded experts: the device memory the rest of the Program leaves, minus the
@@ -483,14 +504,14 @@ ConstructedModel construct_model_on(const EngineOptions& requested, DeviceContex
         }
     }
     summary.weight_formats.assign(formats.begin(), formats.end());
-    summary.load_seconds         = std::chrono::duration<double>(Clock::now() - start).count();
-    summary.upload_seconds       = stats.upload_seconds;
-    summary.artifact_bytes_read  = stats.read_bytes;
-    summary.host_to_device_bytes = stats.h2d_bytes;
-    summary.peak_staging_bytes   = stats.peak_staging_bytes;
-    summary.device_object_count  = stats.device_object_count;
-    summary.host_object_count    = stats.host_object_count;
-    summary.host_mapped_bytes    = stats.host_mapped_bytes;
+    summary.load_seconds             = std::chrono::duration<double>(Clock::now() - start).count();
+    summary.upload_seconds           = stats.upload_seconds;
+    summary.artifact_bytes_read      = stats.read_bytes;
+    summary.host_to_device_bytes     = stats.h2d_bytes;
+    summary.peak_staging_bytes       = stats.peak_staging_bytes;
+    summary.device_object_count      = stats.device_object_count;
+    summary.host_object_count        = stats.host_object_count;
+    summary.host_mapped_bytes        = stats.host_mapped_bytes;
     summary.host_pageable_bytes      = stats.host_pageable_bytes;
     summary.host_pageable_objects    = stats.host_pageable_objects;
     summary.host_mapped_objects      = stats.host_mapped_objects;

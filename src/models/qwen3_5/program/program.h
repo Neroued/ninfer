@@ -25,6 +25,8 @@ struct ExecutionContext;
 
 namespace ninfer::models::qwen3_5 {
 
+struct Config;
+
 namespace execution {
 class Parameters;
 }
@@ -78,11 +80,6 @@ struct DeviceKVCompaction {
     std::uint32_t moved_pages   = 0; // Device replicas packed into lower physical pages
     std::int32_t columns_before = 0; // active elastic expert columns
     std::int32_t columns_after  = 0;
-};
-
-enum class TextPhase {
-    Prefill,
-    Verify,
 };
 
 struct GraphExecutionProfile {
@@ -882,7 +879,9 @@ struct ReleaseResult {
 
 // The transport the captured tp 2 all-reduces use after startup; see LoadSummary::tp_transport.
 struct TpTransportStatus {
-    std::string transport; // "mailbox", "mailbox, MTP draft on copies", "copies"; empty at tp 1
+    // "mailbox", "mailbox, MTP draft on copies", "mailbox, DFlash2 draft on copies" or "copies";
+    // empty at tp 1.
+    std::string transport;
     double probe_ms = 0.0; // startup probe round trip; 0 when no probe ran
     std::string fallback;  // why the mailbox was dropped or narrowed; empty otherwise
     // The mailbox's exchange kernel, "pipelined" or "legacy" (NINFER_TP_MAILBOX_LEGACY=1); empty
@@ -1024,11 +1023,28 @@ public:
     device_kv_lease_shortfall(SequenceHandle sequence) const noexcept;
     // Re-opens growth once the smallest step fits; false while it still does not.
     [[nodiscard]] bool resume_device_kv_lease(SequenceHandle sequence) noexcept;
-    // Device KV pages that releasing this retained owner would return to the pools.
+    // Device KV pages that releasing this retained owner would return to the pools: the pages it
+    // maps alone.
     [[nodiscard]] DeviceKVPages
     retained_device_kv_pages(const ContinuationHandle& continuation) const noexcept;
     [[nodiscard]] DeviceKVPages
     retained_device_kv_pages(const SharedPrefixHandle& shared) const noexcept;
+    // Device KV pages this retained owner maps that no active sequence reads, alone or with other
+    // retained owners: what moving its KV to the Host can free. A page that two idle owners share
+    // (a conversation's continuation and the shared prefix it was built on) is in neither owner's
+    // retained_device_kv_pages, and returns to the pool when one of them moves it to the Host or
+    // when both are released. A stale handle yields no pages; an inconsistent KV store throws.
+    [[nodiscard]] DeviceKVPages idle_device_kv_pages(const ContinuationHandle& continuation) const;
+    [[nodiscard]] DeviceKVPages idle_device_kv_pages(const SharedPrefixHandle& shared) const;
+    // For each listed retained owner (distinct), continuations first, then shared prefixes: the
+    // Device KV pages it maps that releasing all the listed owners together returns to the pools,
+    // i.e. pages no active sequence reads and no owner outside the list maps. A page the listed
+    // owners share counts for each of them. Stale handles throw.
+    [[nodiscard]] std::vector<DeviceKVPages>
+    releasable_device_kv_pages(std::span<const ContinuationHandle* const> continuations,
+                               std::span<const SharedPrefixHandle* const> shared) const;
+    // Unreserved pages of the Device KV pools (Main and, with a backend, Backend).
+    [[nodiscard]] DeviceKVPages device_kv_available_pages() const noexcept;
     // Moves `needed` Device KV pages of an idle retained continuation to the Host tier (the
     // admission pressure's DemoteToHost option, run synchronously), so a lease can take them
     // without losing the conversation. Returns its summary after the move; absent when there is
@@ -1086,6 +1102,17 @@ public:
     [[nodiscard]] MemorySummary memory_summary() const noexcept;
     void reset_memory_peaks() noexcept;
     [[nodiscard]] const TpTransportStatus& tp_transport() const noexcept;
+    // A captured tensor-parallel exchange timed out (the pinned-host mailbox's sticky hang word;
+    // under WSL2 an exchange occasionally hangs while serving). The work in flight
+    // diverged between the ranks, but the poller gave up after a bounded spin, so both devices
+    // are idle and usable.
+    [[nodiscard]] bool peer_exchange_timed_out() const noexcept;
+    // After such a timeout, once fail_all_cleanup() has left no request, context transaction or
+    // retained context: steps the transport down once, as a hang in a graph's first launch does
+    // at startup (mailbox, then the draft phase on the staged copies, then the copies
+    // everywhere), and captures the CUDA Graphs again. Returns the transport now in use; throws
+    // when the graphs cannot be captured again.
+    std::string recover_peer_transport();
 
 private:
     explicit Program(std::unique_ptr<detail::ProgramImpl> impl) noexcept;
@@ -1261,6 +1288,13 @@ struct RuntimeContractAccess {
                                                           const EngineOptions& options);
 // Device bytes of the staged miss split's scratch slots (T18), or 0 when not used.
 [[nodiscard]] std::int64_t offloaded_expert_split_bytes(const execution::Parameters& parameters,
+                                                        const EngineOptions& options);
+
+// Page-locked Host bytes a Program of `options` allocates on all its ranks for active KV in RAM
+// (EngineOptions::kv_ram_active: the Host planes of the text KV pool); 0 without it. They share the
+// page-locked limit with the host-mapped weights, which are placed first (LoadPlan::
+// reserve_host_pinned_bytes).
+[[nodiscard]] std::uint64_t active_kv_host_pinned_bytes(const Config& config,
                                                         const EngineOptions& options);
 
 // Tensor-parallel width 2, with Parameters(model, 0) and Parameters(model, 1) of one two-device

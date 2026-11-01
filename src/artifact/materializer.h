@@ -70,6 +70,10 @@ struct MaterializationPlan {
     // NINFER_HOST_PINNED_MAX_GIB environment variable may still set one). Above it, or when the
     // whole page-locked allocation fails, parents with pageable_rank > 0 move to pageable memory.
     std::uint64_t host_pinned_limit_bytes = 0;
+    // Page-locked bytes the Engine allocates after the weights within the same limit (active KV
+    // in RAM's Host planes): the host-mapped parents keep at most the limit minus them
+    // page-locked, and a failed whole allocation leaves room for them.
+    std::uint64_t host_pinned_reserved_bytes = 0;
     // Residency::HostFile objects, mapped read-only from their files (object order).
     std::vector<ObjectHandle> file_objects;
 };
@@ -99,9 +103,9 @@ struct MaterializationStats {
     std::array<std::uint64_t, kMaximumDevices> per_device_host_mapped_bytes{};
     // v0.7 pinned fallback: the HostMapped parents placed in pageable host memory instead (their
     // allocation with alignment, and how many); 0 when the pinned allocation holds them all.
-    std::uint64_t host_pageable_bytes  = 0;
-    std::size_t host_pageable_objects  = 0;
-    std::size_t host_mapped_objects    = 0; // every HostMapped parent, pinned or pageable
+    std::uint64_t host_pageable_bytes = 0;
+    std::size_t host_pageable_objects = 0;
+    std::size_t host_mapped_objects   = 0; // every HostMapped parent, pinned or pageable
     // The page-locked limit in force (0 = none) and whether the full allocation was tried and
     // failed first.
     std::uint64_t host_pinned_limit_bytes = 0;

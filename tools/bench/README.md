@@ -144,9 +144,8 @@ runner usage and output files.
 
 `run_serve_corpus.py` accepts explicit `--artifact LABEL=PATH` entries. Labels identify report groups;
 the selected artifact supplies the architecture, public name and weight bindings.
-Omitting `--mode` selects MTP0 and MTP3; repeat `--mode` to select a subset. Use `dflash7` for
-Qwen3.6-35B-A3B DFlash K=7 and `dflash2_7` for Qwen3.8-27B DFlash2 K=7, with companion weights
-in the selected artifact. `--sampling greedy` selects exact argmax; the default is stochastic.
+Omitting `--mode` selects MTP0 and MTP3; repeat `--mode` to select a subset. Use `dflash2_7` for
+Qwen3.8-27B DFlash2 K=7, with companion weights in the selected artifact. `--sampling greedy` selects exact argmax; the default is stochastic.
 Run commands with a selected Python 3.11 interpreter, as in the model-page reproduction entries.
 Both serving runners accept `--kv-dtype bf16|int8|fp8|nvfp4|k8v4` (default: `int8`).
 Specify it explicitly when recording a new campaign; the Qwen3.8 performance profile uses
@@ -158,7 +157,7 @@ The serial runner writes `run.jsonl`, `summary.csv`, `summary.md`, and per-serve
 category summaries. The output directory is supplied explicitly with `--output`.
 
 Its schema-v8 result and flattened summaries retain the KV dtype, actual `prefill_signature`, request Host
-exposure, and decode Host/Device-wait time per round received from the schema-v27 serving records.
+exposure, and decode Host/Device-wait time per round received from the schema-v28 serving records.
 Request exposure is a latency distribution value and is never summed across concurrent requests;
 worker aggregation uses the serving `throughput.host_work` interval deltas. The stochastic route pins its complete
 temperature/top-p/top-k/min-p/presence/frequency profile explicitly, so model-default changes do

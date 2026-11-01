@@ -228,11 +228,15 @@ In capy-flash a request's Device KV reservation is a lease: its prompt plus a wi
 4,096 output tokens (or the prefill chunk, if larger), extended at a decode-round boundary as the
 answer grows, up to the request's own `max_tokens`. A client that asks for 64k output tokens and
 uses 300 therefore no longer keeps 64k tokens of KV away from retained conversations. When the pool
-cannot extend a lease, idle retained conversations and idle automatic shared prefixes are released,
-least valuable first; only if that is not enough does the answer end early with `finish_reason`
-`length`. The request log reports the leased pages (`device_*_kv_lease_pages`), the owners released
-for a lease and the answers cut short. `--kv-lease-window N` sets the window (default 4096);
-`--kv-lease-window 0` reserves the whole `max_tokens` at admission, as earlier releases did.
+cannot extend a lease, the KV of idle retained conversations and idle automatic shared prefixes moves
+to the Host tier, least valuable first, and without room there they are released; this includes the
+prefix pages a conversation shares with the shared prefix it was built on, which neither holds alone.
+A conversation is released only for pages the release returns: a page that a kept owner (a shared
+prefix with client credit) also holds never qualifies it. Only if that is not enough does the answer
+end early with `finish_reason` `length`. The request log reports the leased pages
+(`device_*_kv_lease_pages`), the owners released for a lease and the answers cut short.
+`--kv-lease-window N` sets the window (default 4096); `--kv-lease-window 0` reserves the whole
+`max_tokens` at admission, as earlier releases did.
 
 The Host tiers are pinned RAM that the kernel cannot page out. The server refuses to start when
 `--host-kv-mib` plus the Host state slots would leave less than max(4 GiB, 5 % of RAM) available,
@@ -242,8 +246,7 @@ With `C=2` and two extra Device checkpoint slots, the process owns two active St
 plus a global pool of two Device-resident checkpoints. Eight pinned Host State slots and 8 GiB of
 pinned Host KV retain inactive continuations under Device pressure. Active request capacity is two.
 
-Other artifacts use the same command shape with their own path. For 35B-A3B DFlash, replace the MTP
-selection with `--spec dflash --draft-tokens 7 --lm-head-draft`. Qwen3.8-27B
+Other artifacts use the same command shape with their own path. Qwen3.8-27B
 artifacts with DFlash2 companion weights also support `--spec dflash2 --draft-tokens 7`, with
 `--lm-head-draft` optional. DFlash2 accepts draft counts 1..15 and supports the same sampling,
 concurrency, prefix reuse, and image/video request surfaces. It may remain combined with
@@ -256,9 +259,9 @@ HTTP alias override and does not select or alter model execution.
 Vision is disabled by default: its weights and Vision-specific unified-workspace extent are not
 allocated, and media requests and token-count requests fail with HTTP 400 `vision_disabled`. Add
 `--vision` when the server must accept image or video input. Speculative residency is likewise
-frozen by `--spec mtp|dflash|dflash2` and `--draft-tokens`; omitting `--spec` loads no speculative backend, and `--spec off` (after a `--profile`) removes the profile's backend, draft window and proposal head.
-`--lm-head-draft` additionally loads the optimized proposal head. DFlash on 35B-A3B and DFlash2 on Qwen3.8-27B can be combined
-with `--vision`; each accelerates generated-text decode after multimodal prefill, while Vision encode
+frozen by `--spec mtp|dflash2` and `--draft-tokens`; omitting `--spec` loads no speculative backend, and `--spec off` (after a `--profile`) removes the profile's backend, draft window and proposal head.
+`--lm-head-draft` additionally loads the optimized proposal head. DFlash2 on Qwen3.8-27B can be combined
+with `--vision`; it accelerates generated-text decode after multimodal prefill, while Vision encode
 and prefill remain outside speculative acceleration. A later request cannot enable a capability
 omitted at startup. The artifact need only contain the Text backbone and the optional components
 selected for this process.
@@ -283,8 +286,8 @@ selected for this process.
 Engine-wide failure it returns HTTP 503 with `{"status":"unavailable"}`. Temporary queue
 saturation does not make the Engine unavailable. The endpoint remains unauthenticated.
 
-An Engine-wide failure (an error thrown by the Engine worker, such as a timed-out tensor-parallel
-exchange) is permanent for the process: `ninfer-serve` logs it, stops accepting connections within
+An Engine-wide failure (an error thrown by the Engine worker) is permanent for the process:
+`ninfer-serve` logs it, stops accepting connections within
 about 250 ms and **exits with status 2** (startup failures exit with 1; a failed CUDA call aborts
 the process). Run it under a supervisor that restarts on a non-zero exit — `Restart=on-failure` in
 systemd, or llama-swap, which reloads the model on the next request — instead of relying on
@@ -391,8 +394,44 @@ properties, perform recursive JSON Schema validation, or use constrained decodin
 
 String parameters preserve function/tool-call markers and balanced nested
 `<parameter=...>...</parameter>` text as value bytes. The Qwen wire format has no delimiter escape,
-so an unmatched nested parameter opener or a standalone `</parameter>` cannot be represented
-unambiguously; either causes the complete tool-call region to fall back to ordinary content.
+so an unmatched nested parameter opener or a standalone `</parameter>` inside a value cannot be
+represented unambiguously; either causes the complete tool-call region to fall back to ordinary
+content.
+
+Chat Completions, Responses and Anthropic Messages also recover some tool-call markup the grammar
+rejects. Well-formed calls to the effective tool set parse exactly as described above; the rules
+below apply only to output that deviates from them, and each keeps a call only when the client can
+run or refuse it and send it back in the next request's history:
+
+- A structurally complete call whose function name is not in the effective tool set but has only
+  `[A-Za-z0-9_-]` characters within the endpoint's name limit (64 for the OpenAI APIs, 128 for
+  Anthropic Messages) stays a structured call: the client reports an unknown tool and the model
+  can react on the next turn, instead of the markup ending the turn as text. A catalog spelling
+  such as `tools["server"]["tool"]`, `server.tool` or `server/tool` is renamed to the Responses
+  namespace member `server__tool` (the Engine name of `tool` in the namespace `server`) when that
+  is a tool of the effective set, otherwise to its last name segment when that segment is one. Any
+  other name stays text (`invalid_tool_name`).
+- A call to a tool that `allowed_tools` removed for the turn (Chat Completions and Responses), by
+  its name or by a catalog spelling, stays text (`filtered_tool` or `invalid_tool_name`): only
+  the effective tool set can produce a call the client runs.
+- Prose after complete calls returns as content, after the content published before the calls and
+  separated from it by the whitespace the model wrote before its first call (a newline if none).
+  If that prose holds any call tag (`<tool_call>`, `</tool_call>`, `<function=`, `</function>`,
+  `<parameter=`, `</parameter>`), the whole region stays text (`trailing_content`), so a turn
+  never runs only part of its calls and no call markup reaches the content.
+- A `</parameter>` where a parameter should open, and a `</tool_call>` where the next call should
+  open, are dropped.
+- When the model ends its response with its stop token inside a call whose last parameter is
+  complete or runs to the end of the response, the missing `</parameter>`, `</function>` and
+  `</tool_call>` closers are supplied; a call that the stop token ends before any parameter becomes
+  a call with empty arguments (`{}`), as the model wrote no argument. An unterminated value that
+  any call markup follows (a `</tool_call>`, another `<parameter=`) stays text: the markup would
+  become argument bytes. A response cut by its output-token limit, the context capacity, a stop
+  sequence or a cancellation gets no closers: its last value may be incomplete, so its region
+  stays text.
+
+`request_done.result.tool_call_parse` counts these recoveries; see
+[Structured request log](#structured-request-log).
 
 Messages enter the selected template in their input order. The maintained Qwen templates keep
 system/developer messages at their original positions.
@@ -734,10 +773,11 @@ client-executed functions; this does not add a remote MCP executor.
 NInfer renders these definitions in the Qwen prompt and parses model output into separate
 `function_call` output Items. Each output has a protocol Item `id` (`fc_...`) and a distinct
 `call_id` (`call_...`). The client executes the function and sends a `function_call_output` Item in
-a later request. Only functions in the current effective tool set can become structured calls;
-undeclared model output remains ordinary text. `allowed_tools` with mode `auto` filters that set
-without changing declaration order, while `tool_choice:"none"` disables structured tool output even
-when the history contains earlier calls.
+a later request. Calls name functions of the current effective tool set; calls the model makes to
+other names follow the recovery rules under [OpenAI Chat Completions](#openai-chat-completions).
+`allowed_tools` with mode `auto` filters that set without changing declaration order, and a call
+to a function it filters out stays text, while `tool_choice:"none"` disables structured tool output
+even when the history contains earlier calls.
 
 NInfer does not execute functions or enforce JSON Schema through constrained decoding, so
 `strict:true`, required or named tool choice, hosted tools other than web search, and remote MCP
@@ -1040,8 +1080,8 @@ upstream startup example selects a long-context FP8/MTP3 configuration.
 | `--response-store-max-records N` | maximum locally retained Responses objects | `1024` |
 | `--response-store-max-mib N` | total local Response envelope/Item/context budget | `256` |
 | `--kv-dtype bf16\|int8\|fp8\|nvfp4\|k8v4` | KV-cache storage | `bf16` |
-| `--spec mtp\|dflash\|dflash2` | speculative backend | off |
-| `--draft-tokens N` | MTP `1..5`; DFlash/DFlash2 `1..15` | unset |
+| `--spec mtp\|dflash2` | speculative backend | off |
+| `--draft-tokens N` | MTP `1..5`; DFlash2 `1..15` | unset |
 | `--lm-head-draft` | optimized proposal head | off |
 | `--default-max-tokens N` | output limit when omitted by a request | `8192` |
 | `--default-thinking-budget N` | positive thinking cap inherited by thinking-enabled requests | unset |
@@ -1052,7 +1092,7 @@ upstream startup example selects a long-context FP8/MTP3 configuration.
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
 | `--no-tp-mailbox` | keep the captured `--tp 2` all-reduces on cross-device copies; see [Two GPUs](#two-gpus) | mailbox on without P2P |
 | `--embedding-host` | keep the token embedding table in one copy in pinned host memory that every GPU reads in place over PCIe, instead of one copy per GPU: frees its VRAM (1.18 GiB per GPU for Qwen3.8-27B) for the KV pool, identical results; see [Two GPUs](#two-gpus) | off |
-| `--host-pinned-max-gib G` | keep at most `G` GiB of the host-mapped weights (Flash-Next expert banks) page-locked; the banks of the least used layers beyond it stay in pageable RAM (CPU reads them in place, GPU copies go through a pinned staging ring, no prefill streaming for them); same tokens, slower where pageable. Unset: the whole page-locked allocation is tried first and the fallback starts only if the driver refuses it (Windows WDDM / WSL2). `NINFER_HOST_PINNED_MAX_GIB` also sets it | no limit |
+| `--host-pinned-max-gib G` | keep at most `G` GiB of the host-mapped weights (Flash-Next expert banks) page-locked; the banks of the least used layers beyond it stay in pageable RAM (CPU reads them in place, GPU copies go through a pinned staging ring, no prefill streaming for them); same tokens, slower where pageable. Unset: the whole page-locked allocation is tried first and the fallback starts only if the driver refuses it (Windows WDDM / WSL2). With `--kv-ram-active` its Host KV planes count in the limit (the weights keep the rest page-locked). `NINFER_HOST_PINNED_MAX_GIB` also sets it | no limit |
 | `--no-prefix-reuse` | disable compatible-prefix caching | prefix reuse on |
 | `--device-state-slots N` | extra Device checkpoint StateImages beyond the active-lane guarantee | `max-concurrency`; `max(2 * max-concurrency, 8)` at `--tp 2` |
 | `--host-state-slots N` | pinned Host StateImage capacity | `8`; at `--tp 2` `0` unless set (`--profile 27b`, `--profile flash-next`: `8`) |
@@ -1068,6 +1108,7 @@ upstream startup example selects a long-context FP8/MTP3 configuration.
 | `--turn-anchors N` | private long-anchor opportunities at the last N message boundaries before the final message, so a cancelled or edited turn resumes from the end of the previous turn instead of re-prefilling the conversation (`0` disables). Protocol cache markers win the shared marker budget: with a request already carrying four `cache_control` breakpoints the anchor is dropped rather than pushing the request over the limit. Default by model: `0` on Qwen3.8-Flash-Next (each anchor costs one extra prefill pass per turn, ~0.8 s there), `1` on the others, where the extra pass is not measurable | `0` Flash-Next, `1` others |
 | `--elastic` | Qwen3.8-Flash-Next with offloaded experts: the KV pool keeps its address space for `--max-context` but backs pages on demand, and the VRAM it does not use becomes extra expert slots, given back when the KV grows; no effect on models without offloaded experts | off (on in `--profile flash-next` and `flash-next-1gpu`) |
 | `--kv-grow N` | with `--elastic`: step, in tokens, in which the KV backing starts and grows; must be positive | `8192` |
+| `--kv-ram-active` | Qwen3.8-Flash-Next, one request at a time: the K/V of the text attention layers lives in pinned host RAM instead of VRAM (only the QSA indexer's block keys stay on the GPU, 0.75 KiB per token per GPU instead of 10-16 KiB). Each decode step copies the blocks the indexer selected into a VRAM block cache (only the ones not already there cross PCIe), and each prompt chunk copies one layer of the visible context at a time; results are identical to the default. The VRAM this frees goes to routed-expert slots (with `--elastic`). It costs pinned RAM for the whole pool and a fixed VRAM region of one layer of `--max-context` ([sizes and rates](maintainer/active-kv-in-ram.md#cost)) | off |
 | `--kv-budget-gib G` | with `--elastic`: at most `G` GiB of KV per GPU (Text and MTP pools); the base expert slots are sized for it instead of `--max-context`'s KV, and a request that needs more KV fails. Keeps more experts resident when contexts stay short | unset (sized for `--max-context`) |
 | `--miss-split auto\|calibrate\|off` | Qwen3.8-Flash-Next: `auto` lets the GPU read part of each decode window's missing experts over PCIe in parallel with the CPU, choosing the share from fixed costs fitted on a Ryzen 9 9900X; `calibrate` does the same with costs measured on this machine: at startup it times how fast the GPU copies an expert over PCIe, then the first 4,096 decode calls keep every missing expert on the CPU while their time is fitted (fixed + per expert + per extra column, at the configured CPU threads), and the measured costs replace the built-in ones for the rest of the run. Both steps print a `miss split calibrate` line. `off` leaves them all to the CPU. Forced off with GGUF expert banks (the 64 GB edition) | `off` |
 | `--stream-min-tokens N` | Qwen3.8-Flash-Next: prompt chunks of at least `N` tokens stream the non-resident experts to the GPU over PCIe, shorter chunks compute them on the CPU; `0` never streams. With GGUF expert banks it is the threshold from which the prefill reads them in place from host RAM | `256` |
@@ -1097,11 +1138,9 @@ A new representation without a matching measurement uses generic prefill coeffic
 file aborts startup; the operational context-cost record and JSONL `server_start` identify the
 selected source.
 
-Engine selects sampling defaults from the loaded architecture and the request's resolved thinking mode.
-Qwen3.6-27B and Qwen3.8-27B use `1.0/0.95/20/0/0` for
-temperature/top-p/top-k/min-p/presence penalty in thinking mode and `0.7/0.80/20/0/1.5` in
-non-thinking mode. Qwen3.6-35B-A3B differs only in its thinking presence penalty, which is `1.5`.
-Frequency penalty is `0` for all registered presets. Process flags override registered values,
+Engine selects sampling defaults from the request's resolved thinking mode, the same for every
+model: `1.0/0.95/20/0/0` for temperature/top-p/top-k/min-p/presence penalty in thinking mode and
+`0.7/0.80/20/0/1.5` in non-thinking mode. Frequency penalty is `0` in both presets. Process flags override registered values,
 request fields override process flags, and `--greedy` finally forces temperature `0`.
 
 For `C=--max-concurrency` and `H=--device-state-slots`, total Device StateImage capacity is `C+H`:
@@ -1145,7 +1184,7 @@ such as a system prompt another conversation left, made the long conversation pr
 - Each file carries a validity key: artifact and executable (path, size, modification time), tensor
   parallel width, KV dtype, speculative mode and the KV/state layouts; files with another key are
   ignored. A new build or artifact starts with an empty disk tier.
-- Text prompts only (no images); without speculation or with MTP (DFlash/DFlash2 turn the disk tier
+- Text prompts only (no images); without speculation or with MTP (DFlash2 turns the disk tier
   off). Pinned memory: about 320 MiB plus one StateImage. Space, Qwen3.8-27B with INT8 KV (one GPU or
   both halves at `--tp 2`): about 36 KB per token of context plus 147 MiB per saved state.
 - Measured on two RTX 5070 Ti, Qwen3.8-27B GSQ-3, `--profile 27b`, page cache dropped: time to first
@@ -1187,8 +1226,14 @@ wider multi-request payloads keep the copies. Both transports give identical res
 The mailbox is used only when the two GPUs have no peer access (the P2P line of the startup log
 says which); with direct P2P the copies stay the transport. `--no-tp-mailbox` keeps every
 all-reduce on the copies, for comparison. If a mailbox exchange ever waits too long for the other
-GPU, the two ranks' results have diverged: the round fails with an error, and so does every later
-round, so the server must be restarted.
+GPU (under WSL2 it occasionally does while serving), the two ranks' results have diverged: the
+requests that were running fail with HTTP 503 (`service_unavailable`, an error event on a stream
+already started), the context cache is dropped, the transport steps down once (the MTP draft
+phase onto the copies, then the copies everywhere) and the CUDA Graphs are captured again (as long
+as the `CUDA graphs ready` step of startup takes); queued requests are then served, with the same
+tokens. The log records it as an
+`[engine] warning: a tensor-parallel exchange timed out while serving` line. Only when nothing is
+left to step down to, or the graphs cannot be captured again, is it an Engine-wide failure.
 
 At `--tp 2` the Host tiers hold both ranks' halves of a checkpoint: each pinned Host record keeps
 rank 0's half followed by rank 1's, and each GPU copies its own half on its own transfer stream, so
@@ -1301,10 +1346,8 @@ one GPU. A gather reads 5 KiB per token over PCIe: a few rows per decode round, 
 token in prefill.
 
 Tensor parallelism covers ordinary decoding, `--spec mtp` and `--spec dflash2 --lm-head-draft`,
-each with or without `--vision`, with `bf16`, `int8` or `nvfp4` KV. `--spec dflash`, `--spec dflash2` without
-`--lm-head-draft` or with a drafter that has full-attention layers, the Qwen3.5 MoE architecture
-(Qwen3.6-35B-A3B; Qwen3.8-Flash-Next is a different MoE architecture and runs at `--tp 2`) and the
-`fp8` and `k8v4` KV types are rejected at startup (`nvfp4` is accepted since v0.4.2, see [Two GPUs](cli.md#two-gpus)), and so is a `--vision-device` outside
+each with or without `--vision`, with `bf16`, `int8` or `nvfp4` KV. `--spec dflash2` without
+`--lm-head-draft` and the `fp8` and `k8v4` KV types are rejected at startup (`nvfp4` is accepted since v0.4.2, see [Two GPUs](cli.md#two-gpus)), and so is a `--vision-device` outside
 `--devices`.
 
 Serve writes human-readable operational records to stderr using
@@ -1325,7 +1368,7 @@ in append mode and flushes every event, so successive model or MTP blocks may sh
 file. The parent directory must already exist. Failure to open the file aborts startup; the log path
 is also rejected if it resolves to the model artifact.
 
-Every line is one `ninfer_serve_request_log` schema-v27 JSON object. All events carry
+Every line is one `ninfer_serve_request_log` schema-v28 JSON object. All events carry
 `timestamp_unix_ms` and a process-unique `server_instance_id`; request IDs are monotonic only within
 that server instance. Successful request-start records include request-scoped acquisition,
 media-preprocessing wall/work, tokenizer, cache hit/miss/single-flight, and payload-size fields;
@@ -1363,9 +1406,15 @@ thinking control is not model-origin and raw output does not hide it. `thinking_
 
 `request_done.result.tool_call_parse` records whether a complete marker was seen, the structured
 call count, empty non-string arguments omitted during normalization, schema-mismatched arguments
-preserved for consumer validation, and a stable text-fallback reason. Fallback reasons are `none`,
-`malformed_structure`, `duplicate_parameter`, `invalid_tool_name`, `undeclared_tool`, and
-`trailing_content`. These counters contain no tool arguments or generated text.
+preserved for consumer validation, and a stable text-fallback reason. Of the structured calls,
+`salvaged_call_count` kept a name outside the effective tool set or had a catalog spelling renamed,
+and `structural_salvage_count` had closers supplied or a stray `</parameter>` or `</tool_call>`
+dropped;
+`trailing_content_bytes` is the prose returned as content after the calls (the recovery rules are
+under [OpenAI Chat Completions](#openai-chat-completions)). Fallback reasons are `none`,
+`malformed_structure`, `duplicate_parameter`, `invalid_tool_name`, `filtered_tool`, and
+`trailing_content`; recovered output reports `none`. A salvaged name also writes an Info line to
+the operational log. These counters contain no tool arguments or generated text.
 
 `request_done.timings_seconds` contains `prepare`, `ttft`, `vision`, `prefill`, `decode`, and `total`
 as full-precision JSON numbers. Its `speculative` object contains `backend`, `draft_window`, `rounds`,
@@ -1434,7 +1483,7 @@ preparation and token-count-only calls are not measurement requests and do not r
 By default the server persistently reports aggregate activity every five seconds. `prefill` counts
 prompt suffix tokens actually computed during the interval, excluding prefix-cache hits; `decode`
 counts tokens finally committed by decode rounds, excluding the first token produced by prefill.
-For MTP, DFlash and DFlash2 this is the accepted committed output, not draft or rejected tokens.
+For MTP and DFlash2 this is the accepted committed output, not draft or rejected tokens.
 Pretty `batch` and JSONL `average_size` are decode row-rounds divided by decode rounds during the
 same interval. The
 `running`, `prefilling`, `decode_ready`, `waiting`, `materializing`, `capture_pending`, and
@@ -1542,7 +1591,7 @@ history remains eligible for `private_endpoint`. If the client modifies, removes
 historical system message, the token prefix genuinely differs and a miss/reset is correct.
 
 Speculative backends preserve protocol output shapes, stop behavior, and usage accounting. If a stop
-truncates a multi-token MTP, DFlash or DFlash2 round, the Engine commits the exact accepted target prefix so
+truncates a multi-token MTP or DFlash2 round, the Engine commits the exact accepted target prefix so
 a following compatible turn can reuse it. Output-limit and context-capacity finishes map to
 `length`/ `max_tokens`; ordinary model or string stops map to `stop`/ `end_turn`.
 

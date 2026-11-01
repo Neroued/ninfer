@@ -41,7 +41,7 @@ def test_result_record_parses_request_host_exposure() -> None:
     response = {"usage": {"prompt_tokens": 10, "completion_tokens": 5}}
     event = {
         "artifact_type": "ninfer_serve_request_log",
-        "schema_version": 27,
+        "schema_version": corpus.SERVER_LOG_SCHEMA_VERSION,
         "event": "request_done",
         "request": {
             "model": spec.model_id,
@@ -102,7 +102,7 @@ def test_arbitrary_artifact_labels_reach_the_requested_backend(tmp_path: Path) -
     points = build_points(
         artifacts,
         Namespace(
-            mode=["dflash7", "dflash2_7"],
+            mode=["mtp3", "dflash2_7"],
             suite=["decode-saturation"],
             concurrency=[1],
             sampling="greedy",
@@ -110,9 +110,9 @@ def test_arbitrary_artifact_labels_reach_the_requested_backend(tmp_path: Path) -
         ),
     )
     assert [(point.target, point.speculative_backend) for point in points] == [
-        ("org/custom", "dflash"),
+        ("org/custom", "mtp"),
         ("org/custom", "dflash2"),
-        ("org%2Fcustom", "dflash"),
+        ("org%2Fcustom", "mtp"),
         ("org%2Fcustom", "dflash2"),
     ]
     assert all(point.artifact == artifact and point.model_id == point.target for point in points)

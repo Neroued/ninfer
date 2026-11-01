@@ -40,7 +40,7 @@ constexpr std::size_t kDefaultFlush    = 256ULL << 20;
 
 enum class ProfileSelection : std::uint8_t {
     Qwen27B,
-    Qwen35B,
+    Hidden2048,
     FlashNext,
     All,
 };
@@ -103,10 +103,10 @@ std::int32_t parse_i32(std::string_view text, const char* label, std::int32_t mi
 
 ProfileSelection parse_profile(std::string_view value) {
     if (value == "27b") return ProfileSelection::Qwen27B;
-    if (value == "35b") return ProfileSelection::Qwen35B;
+    if (value == "h2048") return ProfileSelection::Hidden2048;
     if (value == "flash-next") return ProfileSelection::FlashNext;
     if (value == "all") return ProfileSelection::All;
-    throw std::invalid_argument("--profile must be 27b, 35b, flash-next, or all");
+    throw std::invalid_argument("--profile must be 27b, h2048, flash-next, or all");
 }
 
 CommitSelection parse_commits(std::string_view value) {
@@ -132,20 +132,21 @@ ValidSelection parse_valid(std::string_view value) {
 }
 
 void print_help(const char* program) {
-    std::printf("Usage: %s [options]\n\n"
-                "  --profile 27b|35b|flash-next|all Registered all-layer geometry (default all).\n"
-                "  --component fold|recurrent|all\n"
-                "                              Measured component (default all).\n"
-                "  --width T                   One physical width in [2,16].\n"
-                "  --batch B                   One active row count in [1,8].\n"
-                "  --commits one|dense|mixed|all\n"
-                "                              Commit policy (default all).\n"
-                "  --valid dense|mixed|all     Recurrent valid-prefix policy (default all).\n"
-                "  --warmup N                  Warmups per point (default 10).\n"
-                "  --repeat N                  Samples per point (default 50).\n"
-                "  --flush-mib N               Cold-L2 eviction storage (default 256 MiB).\n"
-                "  -h, --help                  Show this text.\n",
-                program);
+    std::printf(
+        "Usage: %s [options]\n\n"
+        "  --profile 27b|h2048|flash-next|all Registered all-layer geometry (default all).\n"
+        "  --component fold|recurrent|all\n"
+        "                              Measured component (default all).\n"
+        "  --width T                   One physical width in [2,16].\n"
+        "  --batch B                   One active row count in [1,8].\n"
+        "  --commits one|dense|mixed|all\n"
+        "                              Commit policy (default all).\n"
+        "  --valid dense|mixed|all     Recurrent valid-prefix policy (default all).\n"
+        "  --warmup N                  Warmups per point (default 10).\n"
+        "  --repeat N                  Samples per point (default 50).\n"
+        "  --flush-mib N               Cold-L2 eviction storage (default 256 MiB).\n"
+        "  -h, --help                  Show this text.\n",
+        program);
 }
 
 Options parse_options(int argc, char** argv) {
@@ -190,8 +191,9 @@ std::vector<Profile> selected_profiles(ProfileSelection selection) {
     if (selection == ProfileSelection::Qwen27B || selection == ProfileSelection::All) {
         profiles.push_back({"27b", 48, 48, 10240, {2, 8, 16}});
     }
-    if (selection == ProfileSelection::Qwen35B || selection == ProfileSelection::All) {
-        profiles.push_back({"35b-a3b", 30, 32, 8192, {2, 6, 16}});
+    if (selection == ProfileSelection::Hidden2048 || selection == ProfileSelection::All) {
+        // 30 GDN layers of the 16/32 geometry over hidden 2048.
+        profiles.push_back({"h2048", 30, 32, 8192, {2, 6, 16}});
     }
     if (selection == ProfileSelection::FlashNext || selection == ProfileSelection::All) {
         // Qwen3.8-Flash-Next: 36 GDN layers of the 16/48 geometry; MTP verify widths K+1.

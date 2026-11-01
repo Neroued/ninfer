@@ -49,26 +49,43 @@ struct ToolCallOutputContract {
     };
 
     std::vector<Tool> tools;
-    bool enforce_declared_names = false;
+    // Declared in the request but removed for this turn by tool_choice.allowed_tools: calls naming
+    // them keep falling back to text so the filter stays a restriction.
+    std::vector<std::string> filtered_out_names;
+};
+
+// How the text of a tool-call region ended. The structural repairs that read the end of the text
+// as the end of a call (missing function/tool closers, an unterminated last parameter) apply only
+// when the model ended its own response with a stop token. A token budget, a context limit, a stop
+// string or a cancellation cuts the call short instead: its last value may be incomplete, so the
+// region stays ordinary text, as it would without those repairs.
+enum class ToolCallRegionEnd : std::uint8_t {
+    ModelStop,
+    Cut,
 };
 
 struct ParsedToolCallOutput {
     bool is_tool_call_response = false;
     std::string content;
+    // Prose after the last complete call, right-trimmed; the decoder appends it to the content.
+    std::string trailing_content;
     std::vector<GeneratedToolCall> tool_calls;
     ToolCallParseDiagnostics diagnostics;
 };
 
 [[nodiscard]] std::shared_ptr<const ToolCallOutputContract>
-build_tool_call_output_contract(std::span<const std::string> tool_jsons, bool enabled);
+build_tool_call_output_contract(std::span<const std::string> tool_jsons,
+                                std::span<const std::string> filtered_out_names, bool enabled);
 
 [[nodiscard]] ParsedToolCallOutput
 parse_qwen_tool_call_output(const std::string& text, std::size_t max_tool_name_length,
-                            const ToolCallOutputContract& contract);
+                            const ToolCallOutputContract& contract,
+                            ToolCallRegionEnd end = ToolCallRegionEnd::ModelStop);
 
 // Incrementally publishes bytes that are provably outside a possible terminal Qwen tool-call
-// suffix. At terminal time, valid calls are retained structurally; malformed output is restored
-// verbatim.
+// suffix. At terminal time the region becomes structured calls when it parses, possibly after the
+// recoveries of docs/serving.md (undeclared or catalog-spelled names, closers at the model's stop,
+// stray closers, trailing prose); otherwise it is restored verbatim as content.
 class ToolCallOutputDecoder {
 public:
     struct Terminal {
@@ -81,7 +98,10 @@ public:
                           std::size_t max_tool_name_length);
 
     [[nodiscard]] std::string feed(std::string_view text);
-    [[nodiscard]] Terminal finish();
+    // Trailing prose kept beside salvaged calls is preceded by the whitespace the model wrote
+    // before its first call (a newline when there was none) when visible content was already
+    // published.
+    [[nodiscard]] Terminal finish(ToolCallRegionEnd end);
 
 private:
     std::shared_ptr<const ToolCallOutputContract> contract_;
@@ -90,6 +110,7 @@ private:
     std::size_t marker_prefix_bytes_  = 0;
     std::size_t max_tool_name_length_ = 0;
     bool saw_tool_marker_             = false;
+    bool published_content_           = false;
     bool finished_                    = false;
 };
 

@@ -57,8 +57,8 @@ std::vector<std::byte> hex_bytes(const std::string& hex) {
 
 const qwen::MoeWeights& moe_of(const qwen::ModelWeights& w, const std::string& component,
                                std::uint32_t layer) {
-    if (component == "mtp") { return w.qwen4_mtp.value().layer.moe; }
-    return w.qwen4.value().layers.at(layer).moe;
+    if (component == "mtp") { return std::get<qwen::MoeWeights>(w.qwen4_mtp.value().layer.ffn); }
+    return std::get<qwen::MoeWeights>(w.qwen4.value().layers.at(layer).ffn);
 }
 
 // Config and binding checks that need no device.
@@ -204,8 +204,8 @@ void check_residency(const qwen::LoadPlan& plan, const Json& expect) {
             require(device.contains(object), "dense MoE weight is not on the device");
         }
     };
-    for (const auto& block : w.qwen4->layers) { check_moe(block.moe); }
-    if (w.qwen4_mtp) { check_moe(w.qwen4_mtp->layer.moe); }
+    for (const auto& block : w.qwen4->layers) { check_moe(std::get<qwen::MoeWeights>(block.ffn)); }
+    if (w.qwen4_mtp) { check_moe(std::get<qwen::MoeWeights>(w.qwen4_mtp->layer.ffn)); }
     // Two banks per routed layer, each a stacked plane with one divisor per source matrix.
     const auto layers = w.qwen4->layers.size() + (w.qwen4_mtp ? 1 : 0);
     require_equal(banks.size(), 2 * layers, "expert banks");

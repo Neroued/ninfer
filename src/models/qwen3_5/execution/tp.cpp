@@ -35,19 +35,19 @@ TextConfig shard_text_config(const TextConfig& config, int width, bool hc_split_
     if (width == 1) { return out; }
     if (config.qwen4()) {
         // Routed experts are partitioned by expert ID and the shared expert is held whole by one
-        // rank per block (load/sharding.h), so the MoE geometry is unchanged on each rank; the
-        // QSA indexer and the PLE are replicated.
+        // rank per block (load/sharding.h), so the MoE geometry is unchanged on each rank; a dense
+        // FFN splits its intermediate rows like the Qwen3.5 dense block's. The QSA indexer and the
+        // PLE are replicated.
+        if (const auto* dense = std::get_if<DenseConfig>(&out.ffn)) {
+            out.ffn = DenseConfig{divide(dense->intermediate_size, width, "intermediate_size")};
+        }
         if (hc_split_streams) {
             auto& hc    = out.hyper_connection.value();
             hc.hc_count = divide(hc.hc_count, width, "hc_count");
         }
     } else {
-        const auto* dense = std::get_if<DenseConfig>(&out.ffn);
-        if (dense == nullptr) {
-            throw std::invalid_argument(
-                "tensor-parallel Text config: the MoE FFN has no two-device placement");
-        }
-        out.ffn = DenseConfig{divide(dense->intermediate_size, width, "intermediate_size")};
+        const auto& dense = std::get<DenseConfig>(out.ffn);
+        out.ffn = DenseConfig{divide(dense.intermediate_size, width, "intermediate_size")};
     }
     out.vocab_size = divide(out.vocab_size, width, "vocab_size");
     if (out.attention) {

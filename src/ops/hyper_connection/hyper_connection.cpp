@@ -4,6 +4,7 @@
 #include "ninfer/ops/linear.h"
 #include "ops/hyper_connection/launch.h"
 #include "ops/linear/nvfp4/nvfp4_format.h"
+#include "ops/linear/q8/q8_dispatch.h"
 
 #include <algorithm>
 #include <cmath>
@@ -20,7 +21,6 @@ using detail::kHcFusedMaxT;
 using detail::kHcHidden;
 using detail::kHcRank;
 using detail::kHcStreams;
-using detail::kHcWide;
 
 void require(bool condition, const char* op, const char* message) {
     if (!condition) { throw std::invalid_argument(std::string(op) + ": " + message); }
@@ -36,6 +36,13 @@ void require_matrix(const Tensor& t, DType dtype, const char* op, const char* la
 
 bool aligned16(const void* p) { return (reinterpret_cast<std::uintptr_t>(p) & 0xFU) == 0; }
 
+// Whether the bytes of two tensors intersect.
+bool overlaps(const Tensor& a, const Tensor& b) {
+    const auto begin_a = reinterpret_cast<std::uintptr_t>(a.data);
+    const auto begin_b = reinterpret_cast<std::uintptr_t>(b.data);
+    return begin_a < begin_b + b.bytes() && begin_b < begin_a + a.bytes();
+}
+
 void require_q8(const Weight& w, std::int32_t n, std::int32_t k, const char* op,
                 const char* label) {
     require(w.qtype == QType::Q8_G32_FP16 && w.layout == QuantLayout::RowSplit &&
@@ -45,53 +52,79 @@ void require_q8(const Weight& w, std::int32_t n, std::int32_t k, const char* op,
             (std::string(label) + " has the wrong geometry").c_str());
 }
 
-std::int32_t validate_mix(const Tensor& residual, const HyperConnectionWeights& weights, float eps,
-                          const Tensor& mixed, const Tensor* inject, const char* op) {
+// One mixer's geometry: S = kHcStreams streams of `hidden`, low rank `rank` (the K of Up, read
+// from the weights), and `rows` = rank + inject Down rows. The general route contracts through
+// linear(): with BF16 weights any hidden and rank that are whole numbers of 8-element chunks, with
+// Q8 weights only the registered Q8 Linear shapes (validate_mix refuses the others before any
+// launch). The small-T route is compiled for rank == kHcRank and hidden == kHcHidden (every
+// format; the NVFP4 option has no other route) or, with Q8 weights, hidden == 2 kHcHidden
+// (detail::hyper_connection_fused_compiled).
+struct MixGeometry {
+    std::int32_t hidden = 0;
+    std::int32_t wide   = 0;
+    std::int32_t rows   = 0;
+    std::int32_t rank   = kHcRank;
+};
+
+MixGeometry validate_mix(const Tensor& residual, const HyperConnectionWeights& weights, float eps,
+                         const Tensor& mixed, const Tensor* inject, const char* op) {
     require_matrix(residual, DType::BF16, op, "residual");
     require_matrix(mixed, DType::BF16, op, "mixed");
     const std::int32_t tokens = residual.ne[1];
-    require(residual.ne[0] == kHcWide && mixed.ne[0] == kHcHidden && mixed.ne[1] == tokens, op,
-            "residual must be [4*2560,T] and mixed [2560,T]");
+    MixGeometry g;
+    g.hidden = mixed.ne[0];
+    g.wide   = kHcStreams * g.hidden;
+    require(g.hidden % 8 == 0 && residual.ne[0] == g.wide && mixed.ne[1] == tokens, op,
+            "residual must be [4*H,T] and mixed [H,T] with H a multiple of 8");
     require(weights.norm.dtype == DType::BF16 && weights.norm.data != nullptr &&
-                weights.norm.is_contiguous() && weights.norm.numel() == kHcWide,
-            op, "norm must be contiguous BF16 [10240]");
+                weights.norm.is_contiguous() && weights.norm.numel() == g.wide,
+            op, "norm must be contiguous BF16 [4*H]");
     require(eps > 0.0F && std::isfinite(eps), op, "eps must be positive and finite");
-    const std::int32_t rows = kHcRank + (inject != nullptr ? kHcStreams : 0);
+    g.rank = weights.up.k;
+    require(g.rank > 0 && g.rank % 8 == 0, op,
+            "the low rank (Up K) must be a positive multiple of 8");
+    const std::int32_t rows = g.rank + (inject != nullptr ? kHcStreams : 0);
+    g.rows                  = rows;
     if (weights.down.qtype == QType::NVFP4 || weights.up.qtype == QType::NVFP4) {
         // Option: NVFP4 Down stored with its rows padded to a multiple of 128 (the format's tile).
         require(weights.down.qtype == QType::NVFP4 && weights.up.qtype == QType::NVFP4, op,
                 "down and up must share the weight format");
         (void)detail::validate_nvfp4_weight(weights.down, op);
         (void)detail::validate_nvfp4_weight(weights.up, op);
-        require(weights.down.n == (rows + 127) / 128 * 128 && weights.down.k == kHcWide, op,
+        require(g.hidden == kHcHidden && g.rank == kHcRank, op,
+                "NVFP4 hyper-connection weights need H = 2560 and R = 320 (small-T route only)");
+        require(weights.down.n == (rows + 127) / 128 * 128 && weights.down.k == g.wide, op,
                 "NVFP4 down must be [round_up(R + I, 128), 4*2560]");
-        require(weights.up.n == kHcWide && weights.up.k == kHcRank, op,
-                "NVFP4 up must be [4*2560, 320]");
+        require(weights.up.n == g.wide, op, "NVFP4 up must be [4*2560, 320]");
         require(residual.ne[1] <= kHcFusedMaxT, op,
                 "NVFP4 hyper-connection weights are supported for T <= 8 only (no general route)");
     } else if (weights.down.qtype == QType::BF16 || weights.up.qtype == QType::BF16) {
-        // T103 option: BF16 Down(+inject)/Up (as the checkpoint), small-T route for T <= 8.
+        // BF16 Down(+inject)/Up: the small-T route for T <= 8 at H = 2560, the general route
+        // otherwise.
         require(weights.down.qtype == QType::BF16 && weights.up.qtype == QType::BF16, op,
                 "down and up must share the weight format");
         require(weights.down.qdata != nullptr && weights.up.qdata != nullptr, op,
                 "BF16 down/up must be non-null");
-        require(weights.down.n == rows && weights.down.k == kHcWide, op,
-                "BF16 down must be [R + I, 4*2560]");
-        require(weights.up.n == kHcWide && weights.up.k == kHcRank, op,
-                "BF16 up must be [4*2560, 320]");
+        require(weights.down.n == rows && weights.down.k == g.wide, op,
+                "BF16 down must be [R + I, 4*H]");
+        require(weights.up.n == g.wide, op, "BF16 up must be [4*H, R]");
     } else {
-        require_q8(weights.down, rows, kHcWide, op, "down");
-        require_q8(weights.up, kHcWide, kHcRank, op, "up");
+        require_q8(weights.down, rows, g.wide, op, "down");
+        require_q8(weights.up, g.wide, g.rank, op, "up");
+        // Every T may take the general route, whose Q8 Linears serve registered shapes only.
+        require(detail::q8_shape_registered(rows, g.wide) &&
+                    detail::q8_shape_registered(g.wide, g.rank),
+                op, "Q8 hyper-connection weights need H in {2560, 5120} and R in {320, 640}");
     }
     if (inject != nullptr) {
         require_matrix(*inject, DType::FP32, op, "inject");
         require(inject->ne[0] == kHcStreams && inject->ne[1] == tokens, op,
                 "inject must be FP32 [4,T]");
-        require(inject->data != residual.data && inject->data != mixed.data, op,
+        require(!overlaps(*inject, residual) && !overlaps(*inject, mixed), op,
                 "inject must not overlap");
     }
-    require(mixed.data != residual.data, op, "mixed must not overlap residual");
-    return rows;
+    require(!overlaps(mixed, residual), op, "mixed must not overlap residual");
+    return g;
 }
 
 void validate_combine(const Tensor& y, const Tensor& inject, const Tensor& residual,
@@ -102,7 +135,7 @@ void validate_combine(const Tensor& y, const Tensor& inject, const Tensor& resid
     require(residual.ne[0] == y.ne[0] * inject.ne[0] && residual.ne[1] == y.ne[1] &&
                 inject.ne[1] == y.ne[1],
             op, "residual must be [S*H,T] for y [H,T] and inject [S,T]");
-    require(y.data != residual.data && inject.data != residual.data, op,
+    require(!overlaps(y, residual) && !overlaps(inject, residual), op,
             "y and inject must not overlap residual");
 }
 
@@ -116,16 +149,20 @@ bool general_route_forced() {
     return forced;
 }
 
-bool fused_route(std::int32_t tokens, const HyperConnectionWeights& weights) {
-    return !general_route_forced() && tokens <= kHcFusedMaxT && aligned16(weights.down.qdata) &&
-           aligned16(weights.up.qdata) && aligned16(weights.down.scales) &&
-           aligned16(weights.up.scales) && aligned16(weights.norm.data) &&
-           detail::hyper_connection_fused_supported();
+bool fused_route(std::int32_t tokens, const HyperConnectionWeights& weights,
+                 const MixGeometry& geometry) {
+    return !general_route_forced() && geometry.rank == kHcRank &&
+           detail::hyper_connection_fused_compiled(geometry.hidden,
+                                                   weights.down.qtype == QType::NVFP4,
+                                                   weights.down.qtype == QType::BF16) &&
+           tokens <= kHcFusedMaxT && aligned16(weights.down.qdata) && aligned16(weights.up.qdata) &&
+           aligned16(weights.down.scales) && aligned16(weights.up.scales) &&
+           aligned16(weights.norm.data) && detail::hyper_connection_fused_supported();
 }
 
 void run_fused(Tensor& residual, const Tensor* previous_y, const Tensor* previous_inject,
                const HyperConnectionWeights& weights, float eps, Tensor& mixed, Tensor* inject,
-               std::int32_t rows, WorkspaceArena& workspace, cudaStream_t stream) {
+               const MixGeometry& geometry, WorkspaceArena& workspace, cudaStream_t stream) {
     const std::int32_t tokens = residual.ne[1];
     Tensor squares            = workspace.alloc(DType::FP32, {kHcStreams, tokens});
     Tensor low                = workspace.alloc(DType::FP16, {kHcRank, tokens});
@@ -155,20 +192,21 @@ void run_fused(Tensor& residual, const Tensor* previous_y, const Tensor* previou
     params.inject      = inject != nullptr ? static_cast<float*>(inject->data) : nullptr;
     params.square_sums = static_cast<float*>(squares.data);
     params.low         = static_cast<__half*>(low.data);
-    params.rows        = rows;
+    params.rows        = geometry.rows;
     params.tokens      = tokens;
+    params.hidden      = geometry.hidden;
     params.eps         = eps;
     detail::hyper_connection_fused_mix_launch(params, stream);
 }
 
 void run_general(const Tensor& residual, const HyperConnectionWeights& weights, float eps,
-                 Tensor& mixed, Tensor* inject, std::int32_t rows, WorkspaceArena& workspace,
-                 cudaStream_t stream) {
+                 Tensor& mixed, Tensor* inject, const MixGeometry& geometry,
+                 WorkspaceArena& workspace, cudaStream_t stream) {
     const std::int32_t tokens = residual.ne[1];
-    Tensor normalized         = workspace.alloc(DType::BF16, {kHcWide, tokens});
-    Tensor projection         = workspace.alloc(DType::BF16, {rows, tokens});
-    Tensor lowrank            = workspace.alloc(DType::BF16, {kHcRank, tokens});
-    Tensor up                 = workspace.alloc(DType::BF16, {kHcWide, tokens});
+    Tensor normalized         = workspace.alloc(DType::BF16, {geometry.wide, tokens});
+    Tensor projection         = workspace.alloc(DType::BF16, {geometry.rows, tokens});
+    Tensor lowrank            = workspace.alloc(DType::BF16, {geometry.rank, tokens});
+    Tensor up                 = workspace.alloc(DType::BF16, {geometry.wide, tokens});
     detail::grouped_offset_rmsnorm_launch(residual, weights.norm, kHcStreams, eps, normalized,
                                           stream);
     linear(normalized, weights.down, projection, stream);
@@ -179,11 +217,13 @@ void run_general(const Tensor& residual, const HyperConnectionWeights& weights, 
 
 std::size_t align256(std::size_t bytes) { return (bytes + 255) / 256 * 256; }
 
-std::size_t general_bytes(std::int32_t tokens, bool inject) {
+std::size_t general_bytes(std::int32_t tokens, bool inject, std::int32_t hidden,
+                          std::int32_t rank) {
     const auto t           = static_cast<std::size_t>(tokens);
-    const std::size_t rows = kHcRank + (inject ? kHcStreams : 0);
-    return align256(t * kHcWide * 2) + align256(t * rows * 2) + align256(t * kHcRank * 2) +
-           t * kHcWide * 2;
+    const auto r           = static_cast<std::size_t>(rank);
+    const std::size_t rows = r + (inject ? kHcStreams : 0);
+    const std::size_t wide = static_cast<std::size_t>(kHcStreams) * hidden;
+    return align256(t * wide * 2) + align256(t * rows * 2) + align256(t * r * 2) + t * wide * 2;
 }
 
 } // namespace
@@ -199,7 +239,7 @@ void grouped_offset_rmsnorm(const Tensor& x, const Tensor& weight, std::int32_t 
     require(groups > 0 && x.ne[0] % groups == 0, op, "groups must divide the row width");
     require(out.ne[0] == x.ne[0] && out.ne[1] == x.ne[1], op, "x/out shapes differ");
     require(eps > 0 && std::isfinite(eps), op, "eps must be positive and finite");
-    require(x.data != out.data, op, "x and out must not overlap");
+    require(!overlaps(x, out), op, "x and out must not overlap");
     detail::grouped_offset_rmsnorm_launch(x, weight, groups, eps, out, stream);
 }
 
@@ -210,7 +250,7 @@ void hyper_connection_expand(const Tensor& x, std::int32_t streams, Tensor& resi
     require_matrix(residual, DType::BF16, op, "residual");
     require(streams > 0 && residual.ne[0] == x.ne[0] * streams && residual.ne[1] == x.ne[1], op,
             "residual must be [S*H,T]");
-    require(x.data != residual.data, op, "x and residual must not overlap");
+    require(!overlaps(x, residual), op, "x and residual must not overlap");
     detail::hyper_connection_expand_launch(x, streams, residual, stream);
 }
 
@@ -224,45 +264,56 @@ void hyper_connection_combine(const Tensor& y, const Tensor& inject, Tensor& res
 void hyper_connection_mix(const Tensor& residual, const HyperConnectionWeights& weights, float eps,
                           Tensor& mixed, Tensor* inject, WorkspaceArena& workspace,
                           cudaStream_t stream) {
-    constexpr const char* op  = "hyper_connection_mix";
-    const std::int32_t rows   = validate_mix(residual, weights, eps, mixed, inject, op);
-    const std::int32_t tokens = residual.ne[1];
-    auto scope                = workspace.scope();
-    if (fused_route(tokens, weights)) {
+    constexpr const char* op   = "hyper_connection_mix";
+    const MixGeometry geometry = validate_mix(residual, weights, eps, mixed, inject, op);
+    const std::int32_t tokens  = residual.ne[1];
+    auto scope                 = workspace.scope();
+    if (fused_route(tokens, weights, geometry)) {
         Tensor read_only = residual; // the route writes the residual only with a pending combine
-        run_fused(read_only, nullptr, nullptr, weights, eps, mixed, inject, rows, workspace,
+        run_fused(read_only, nullptr, nullptr, weights, eps, mixed, inject, geometry, workspace,
                   stream);
         return;
     }
-    run_general(residual, weights, eps, mixed, inject, rows, workspace, stream);
+    run_general(residual, weights, eps, mixed, inject, geometry, workspace, stream);
 }
 
 void hyper_connection_combine_mix(Tensor& residual, const Tensor& previous_y,
                                   const Tensor& previous_inject,
                                   const HyperConnectionWeights& weights, float eps, Tensor& mixed,
                                   Tensor* inject, WorkspaceArena& workspace, cudaStream_t stream) {
-    constexpr const char* op = "hyper_connection_combine_mix";
-    const std::int32_t rows  = validate_mix(residual, weights, eps, mixed, inject, op);
+    constexpr const char* op   = "hyper_connection_combine_mix";
+    const MixGeometry geometry = validate_mix(residual, weights, eps, mixed, inject, op);
     validate_combine(previous_y, previous_inject, residual, op);
     require(previous_inject.ne[0] == kHcStreams, op, "previous_inject must be FP32 [4,T]");
+    require(inject == nullptr || !overlaps(*inject, previous_inject), op,
+            "inject must not overlap previous_inject");
     const std::int32_t tokens = residual.ne[1];
     auto scope                = workspace.scope();
-    if (fused_route(tokens, weights)) {
-        run_fused(residual, &previous_y, &previous_inject, weights, eps, mixed, inject, rows,
+    if (fused_route(tokens, weights, geometry)) {
+        run_fused(residual, &previous_y, &previous_inject, weights, eps, mixed, inject, geometry,
                   workspace, stream);
         return;
     }
     detail::hyper_connection_combine_launch(previous_y, previous_inject, residual, stream);
-    run_general(residual, weights, eps, mixed, inject, rows, workspace, stream);
+    run_general(residual, weights, eps, mixed, inject, geometry, workspace, stream);
 }
 
 std::size_t hyper_connection_mix_workspace_bytes(std::int32_t min_tokens, std::int32_t max_tokens,
-                                                 bool inject) {
+                                                 bool inject, std::int32_t hidden,
+                                                 std::int32_t rank) {
     if (min_tokens <= 0 || max_tokens < min_tokens) {
         throw std::invalid_argument("hyper_connection_mix_workspace_bytes: invalid T interval");
     }
-    std::size_t bytes = general_bytes(max_tokens, inject);
-    if (min_tokens <= kHcFusedMaxT) {
+    if (hidden <= 0 || hidden % 8 != 0) {
+        throw std::invalid_argument("hyper_connection_mix_workspace_bytes: invalid hidden width");
+    }
+    if (rank <= 0 || rank % 8 != 0) {
+        throw std::invalid_argument("hyper_connection_mix_workspace_bytes: invalid low rank");
+    }
+    std::size_t bytes = general_bytes(max_tokens, inject, hidden, rank);
+    // The small-T workspace does not depend on H or on the format.
+    if (rank == kHcRank && detail::hyper_connection_fused_compiled(hidden, false, false) &&
+        min_tokens <= kHcFusedMaxT) {
         bytes = std::max(bytes, detail::hyper_connection_fused_workspace_bytes(
                                     std::min(max_tokens, kHcFusedMaxT)));
     }

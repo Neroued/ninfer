@@ -1483,9 +1483,9 @@ private:
                      "[engine] warning: admission planning of request %llu failed (%s); the "
                      "request is rejected, the engine keeps serving\n",
                      static_cast<unsigned long long>(request->id), failure.c_str());
-        (void)remove_pending_error(
-            request, std::make_exception_ptr(std::runtime_error(
-                         "context-cache admission planning failed: " + failure)));
+        (void)remove_pending_error(request,
+                                   std::make_exception_ptr(std::runtime_error(
+                                       "context-cache admission planning failed: " + failure)));
         return std::nullopt;
     }
 
@@ -1872,11 +1872,11 @@ private:
         publish_runtime_stats();
     }
 
-    // Device KV lease (capy-flash, after ninfer-custom 9f108db7): a sequence whose lease can no
-    // longer grow finishes at the frontier the lease covers. When the pool ran out of space,
-    // retained cache is released first so the answer can continue; only a lease that still cannot
-    // take its smallest step has its remaining budget bounded, so the finish carries the
-    // request's generation limit reason instead of a launch failing on coverage.
+    // Device KV lease: a sequence whose lease can no longer grow finishes at the frontier the
+    // lease covers. When the pool ran out of space, retained cache is released first so the
+    // answer can continue; only a lease that still cannot take its smallest step has its remaining
+    // budget bounded, so the finish carries the request's generation limit reason instead of a
+    // launch failing on coverage.
     void apply_device_kv_lease_settlements() {
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
             const auto& request = slots_[lane];
@@ -2078,7 +2078,7 @@ public:
         const auto started  = Clock::now();
         const auto deadline = started + std::chrono::seconds(program.disk_cache_flush_seconds());
         std::size_t saved = 0, failed = 0;
-        bool drained      = false;
+        bool drained = false;
         try {
             std::scoped_lock execution_lock(execution_mutex_);
             if (!failed_ && !program.has_context_transaction()) {
@@ -2099,7 +2099,8 @@ public:
             std::fprintf(stderr,
                          "[disk-kv] shutdown: %zu conversation(s) saved, %zu failed, %s in %.1f s; "
                          "%s\n",
-                         saved, failed, drained ? "all written" : "deadline reached (unfinished dropped)",
+                         saved, failed,
+                         drained ? "all written" : "deadline reached (unfinished dropped)",
                          std::chrono::duration<double>(Clock::now() - started).count(),
                          program.disk_cache_status().c_str());
         } catch (const std::exception& error) {
@@ -2117,21 +2118,92 @@ private:
             failed_ = true;
             pending.swap(pending_);
         }
+        (void)fail_active_locked(error);
+        for (const auto& request : pending) { complete_error(request, error); }
+        publish_runtime_stats();
+    }
+
+    // The requests that held a lane or a materialization when the Program was cleared.
+    struct DetachedRequests {
+        std::array<std::shared_ptr<Request>, kMaximumConcurrency + 1> requests{};
+        std::uint32_t count = 0;
+    };
+
+    // Clears the Program and the ResourceManager as an Engine-wide failure does and moves the
+    // requests that held a lane or a materialization to `detached`, for the caller to complete.
+    void clear_active_locked(DetachedRequests& detached) noexcept {
         scheduler_.reset();
-        const std::shared_ptr<Request> materializing_request =
+        std::shared_ptr<Request> materializing_request =
             materializing_ ? materializing_->request : nullptr;
         materializing_.reset();
         instance_.program->fail_all_cleanup();
         resources_.clear_after_program_cleanup();
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
-            if (slots_[lane] != nullptr) {
-                complete_error(slots_[lane], error);
-                slots_[lane].reset();
-            }
+            if (slots_[lane] == nullptr) { continue; }
+            detached.requests[detached.count++] = std::move(slots_[lane]);
         }
-        if (materializing_request != nullptr) { complete_error(materializing_request, error); }
-        for (const auto& request : pending) { complete_error(request, error); }
-        publish_runtime_stats();
+        if (materializing_request != nullptr) {
+            detached.requests[detached.count++] = std::move(materializing_request);
+        }
+    }
+
+    // Clears the Program and the ResourceManager as an Engine-wide failure does and fails the
+    // requests that held a lane or a materialization with `error`; returns how many.
+    std::uint32_t fail_active_locked(std::exception_ptr error) {
+        DetachedRequests detached;
+        clear_active_locked(detached);
+        for (std::uint32_t i = 0; i < detached.count; ++i) {
+            complete_error(detached.requests[i], error);
+        }
+        return detached.count;
+    }
+
+    // A captured tensor-parallel exchange timed out (under WSL2 the pinned-host mailbox
+    // occasionally hangs while serving). The work in flight diverged between the two ranks, but
+    // the poller gave up after a bounded spin, so both devices are idle and usable. Instead of an
+    // Engine-wide failure, the Program is cleared as for an Engine-wide failure (its retained
+    // context goes with it, so the CUDA Graphs can be captured again as at startup), the
+    // transport steps down once and the graphs are captured again; only then do the requests that
+    // held a lane or a materialization fail with Unavailable and a retry hint. Queued requests stay
+    // queued and are served next. Returns false when no exchange timed out, or when the recovery
+    // itself fails: the requests already detached then fail with `failure`, and the caller fails
+    // the Engine with it.
+    bool recover_peer_transport_locked(std::exception_ptr failure) noexcept {
+        auto& program = *instance_.program;
+        if (!program.peer_exchange_timed_out()) { return false; }
+        DetachedRequests detached;
+        try {
+            const auto started       = Clock::now();
+            const std::string before = program.tp_transport().transport;
+            const auto retry         = std::make_exception_ptr(
+                RequestError(RequestErrorKind::Unavailable,
+                                     "the tensor-parallel exchange between the two GPUs timed out while "
+                                             "this request was running; the server stepped its transport down "
+                                             "and keeps serving: retry the request"));
+            clear_active_locked(detached);
+            const std::string transport = program.recover_peer_transport();
+            for (std::uint32_t i = 0; i < detached.count; ++i) {
+                complete_error(detached.requests[i], retry);
+            }
+            request_admission_check();
+            std::fprintf(stderr,
+                         "[engine] warning: a tensor-parallel exchange timed out while serving "
+                         "(captured all-reduces: %s): %u request(s) failed and the context cache "
+                         "was dropped; captured all-reduces now on %s, CUDA graphs captured again "
+                         "in %.1f s\n",
+                         before.c_str(), detached.count, transport.c_str(),
+                         std::chrono::duration<double>(Clock::now() - started).count());
+            return true;
+        } catch (const std::exception& recovery) {
+            std::fprintf(stderr,
+                         "[engine] error: the tensor-parallel transport could not step down after "
+                         "an exchange timed out: %s\n",
+                         recovery.what());
+        } catch (...) {}
+        for (std::uint32_t i = 0; i < detached.count; ++i) {
+            complete_error(detached.requests[i], failure);
+        }
+        return false;
     }
 
     void worker_loop() noexcept {
@@ -2238,11 +2310,13 @@ private:
             } catch (...) {
                 const std::exception_ptr error = std::current_exception();
                 HostPhaseMeasurement cleanup   = begin_host_phase();
-                fail_all_locked(error);
+                const bool recovered           = recover_peer_transport_locked(error);
+                if (!recovered) { fail_all_locked(error); }
                 finish_engine_phase(cleanup, EngineHostPhase::Maintenance);
                 try {
                     publish_runtime_stats();
                 } catch (...) {}
+                if (recovered) { continue; }
                 return;
             }
             execution_lock.unlock();

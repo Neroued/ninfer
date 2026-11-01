@@ -260,7 +260,7 @@ runtime::ExecutionTiming ProgramImpl::append_forced_tokens(
             sequence.text_kv_valid != sequence.execution_frontier ||
             (speculative_backend == SpeculativeBackend::Mtp &&
              sequence.mtp_kv_valid != sequence.execution_frontier) ||
-            (is_masked_draft_backend(speculative_backend) &&
+            (speculative_backend == SpeculativeBackend::DFlash2 &&
              sequence.dflash_context_frontier > sequence.execution_frontier) ||
             static_cast<std::uint64_t>(sequence.execution_frontier) + row_stride > capacity) {
             throw std::logic_error("forced-token sequence frontier is invalid");
@@ -308,7 +308,7 @@ runtime::ExecutionTiming ProgramImpl::append_forced_tokens(
             const std::uint32_t end                  = base + row_stride;
             const auto started                       = Clock::now();
 
-            if (is_masked_draft_backend(speculative_backend) &&
+            if (speculative_backend == SpeculativeBackend::DFlash2 &&
                 sequence.dflash_context_frontier < base) {
                 const std::array<std::uint32_t, 1> append_lanes{lane};
                 const std::array<std::uint32_t, 1> append_starts{sequence.dflash_context_frontier};
@@ -331,9 +331,8 @@ runtime::ExecutionTiming ProgramImpl::append_forced_tokens(
                 throw std::logic_error("forced-token continuation ledger has an invalid shape");
             }
 
-            if (is_masked_draft_backend(speculative_backend)) {
-                if (!dflash || !io.dflash_prefill || !dflash_prefill_host_ingress || !sequence.kv ||
-                    (backend_kv_cache() && !sequence.kv->backend)) {
+            if (speculative_backend == SpeculativeBackend::DFlash2) {
+                if (!dflash || !io.dflash_prefill || !dflash_prefill_host_ingress || !sequence.kv) {
                     throw std::logic_error("DFlash forced continuation state is incomplete");
                 }
             }
@@ -362,14 +361,12 @@ runtime::ExecutionTiming ProgramImpl::append_forced_tokens(
                     selectors.source,
                     selectors.destination,
                     0,
-                    sequence.kv->backend ? backend_kv_addresses->bound_row(*sequence.kv->backend)
-                                         : 0,
                     dflash_prefill_host_ingress};
                 schedule_state.rope_delta = sequence.rope_delta;
                 mark_workspace_usage(speculative_backend == SpeculativeBackend::Mtp
                                          ? workspace_plan.mtp_prefill
                                          : workspace_plan.text_prefill);
-                if (is_masked_draft_backend(speculative_backend)) {
+                if (speculative_backend == SpeculativeBackend::DFlash2) {
                     mark_workspace_usage(workspace_plan.dflash_context);
                 }
                 const execution::PrefillChunkResult result = execution::prefill_text_chunk(
@@ -382,7 +379,7 @@ runtime::ExecutionTiming ProgramImpl::append_forced_tokens(
                 sequence.text_kv_valid = cursor;
                 if (speculative_backend == SpeculativeBackend::Mtp) {
                     sequence.mtp_kv_valid = cursor;
-                } else if (is_masked_draft_backend(speculative_backend)) {
+                } else if (speculative_backend == SpeculativeBackend::DFlash2) {
                     sequence.dflash_context_frontier = cursor;
                 }
                 commit_sequence_kv(sequence, sequence.text_kv_valid, backend_kv_valid(sequence));

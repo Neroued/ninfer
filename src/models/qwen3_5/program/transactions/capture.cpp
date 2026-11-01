@@ -226,7 +226,7 @@ ProgramImpl::inspect_capture(const CaptureOffer& offer, const SharedPrefixHandle
     if (assessment.state_placement == qwen3_5::CaptureStatePlacement::HostSnapshot) {
         assessment.transfer_requirements.push_back(state_transfer_requirement(
             state_images->host_layout(), runtime::ContextTransferDirection::DeviceToHost));
-    } else if (is_masked_draft_backend(speculative_backend)) {
+    } else if (speculative_backend == SpeculativeBackend::DFlash2) {
         assessment.transfer_requirements.push_back(state_transfer_requirement(
             state_images->host_layout(), runtime::ContextTransferDirection::DeviceToDevice, true));
     }
@@ -255,7 +255,7 @@ ProgramImpl::inspect_capture(const CaptureOffer& offer, const SharedPrefixHandle
         if (assessment.state_placement == qwen3_5::CaptureStatePlacement::HostSnapshot) {
             recovery.push_back(state_transfer_requirement(
                 state_images->host_layout(), runtime::ContextTransferDirection::HostToDevice));
-        } else if (is_masked_draft_backend(speculative_backend)) {
+        } else if (speculative_backend == SpeculativeBackend::DFlash2) {
             recovery.push_back(state_transfer_requirement(
                 state_images->host_layout(), runtime::ContextTransferDirection::DeviceToDevice,
                 true));
@@ -394,9 +394,8 @@ runtime::ContextTransactionReserveStatus ProgramImpl::reserve_active_capture_imp
         // Publication moves these resources out of the request's entitlements. Check that it can
         // before anything changes: a capture whose accounting disagrees is skipped (the request
         // only loses this checkpoint) instead of failing mid-publication for the whole Engine.
-        const RequestControl& request = requests[ContractAccess::lane(offer).value];
-        const detail::PhysicalResources& removed =
-            assessment.implementation->demand.final_removed;
+        const RequestControl& request            = requests[ContractAccess::lane(offer).value];
+        const detail::PhysicalResources& removed = assessment.implementation->demand.final_removed;
         const detail::PhysicalResources& prepared =
             assessment.implementation->capacity_preparation_removed;
         const auto covers = [](const detail::PhysicalResources& held,
@@ -757,7 +756,7 @@ void ProgramImpl::enqueue_active_capture_transfers(ActiveCaptureTransaction& tra
         stop_context_transfer_timer(runtime::ContextResourceClass::State);
         transaction.transfer_timer_mask |=
             1U << context_resource_index(runtime::ContextResourceClass::State);
-    } else if (is_masked_draft_backend(speculative_backend)) {
+    } else if (speculative_backend == SpeculativeBackend::DFlash2) {
         const StateImageSelectors state_fork =
             state_store->selectors(transaction.source_state, transaction.destination_state);
         start_context_transfer_timer(runtime::ContextResourceClass::State);
@@ -913,8 +912,7 @@ ActiveCaptureResult ProgramImpl::publish_active_capture(ActiveCaptureTransaction
                            prefill.prompt_tokens + (prefill.initial_mtp_extent == 0
                                                         ? 0U
                                                         : prefill.initial_mtp_extent - 1U))
-            : speculative_backend == SpeculativeBackend::DFlash ? prefill.prompt_tokens
-                                                                : 0U;
+                : 0U;
         ensure_sequence_kv_mapped(sequence, prefill.prompt_tokens, backend_materialized);
     }
 
@@ -953,12 +951,10 @@ ActiveCaptureResult ProgramImpl::publish_active_capture(ActiveCaptureTransaction
         throw std::logic_error("active capture replacement effect changed after reservation");
     }
 
-    const detail::PhysicalResources private_replacement_removed =
-        checked_resource_difference(removed, transaction.capacity_preparation_removed,
-                                    "capture replacement release");
-    request.optional_resources =
-        checked_resource_difference(request.optional_resources, private_replacement_removed,
-                                    "capture optional entitlement");
+    const detail::PhysicalResources private_replacement_removed = checked_resource_difference(
+        removed, transaction.capacity_preparation_removed, "capture replacement release");
+    request.optional_resources = checked_resource_difference(
+        request.optional_resources, private_replacement_removed, "capture optional entitlement");
     if (transaction.publish_private && !transaction.publish_shared) {
         request.optional_resources =
             checked_resource_sum(request.optional_resources, transaction.resource_delta.added);
@@ -998,9 +994,7 @@ ActiveCaptureResult ProgramImpl::publish_active_capture(ActiveCaptureTransaction
         shared.identity = transaction.group.identity;
         shared.frontier = transaction.group.frontier;
         shared.backend_frontier =
-            speculative_backend == SpeculativeBackend::Mtp      ? transaction.group.frontier - 1U
-            : speculative_backend == SpeculativeBackend::DFlash ? transaction.group.frontier
-                                                                : 0U;
+            speculative_backend == SpeculativeBackend::Mtp ? transaction.group.frontier - 1U : 0U;
         shared.rope_delta        = sequence.rope_delta;
         shared.tail_hidden_valid = sequence.tail_hidden_valid;
         shared.rebuild_work      = validated_rebuild_work(transaction.group.identity->rebuild_work,

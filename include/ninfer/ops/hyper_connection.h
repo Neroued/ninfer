@@ -66,8 +66,8 @@ void hyper_connection_combine(const Tensor& y, const Tensor& inject, Tensor& res
                               cudaStream_t stream);
 
 /**
- * Weights of one hyper-connection mixer of the Qwen4Exp geometry (S = 4 streams of H = 2560,
- * low rank R = 320).
+ * Weights of one hyper-connection mixer: S = 4 streams of width H, low rank R (the geometries each
+ * format serves are listed under hyper_connection_mix).
  *
  *   norm: BF16 [S*H] grouped offset-RMSNorm weight.
  *   down: Q8_G32_FP16 row-split [R + I, S*H]. Rows [0,R) are the low-rank down projection; when
@@ -75,9 +75,10 @@ void hyper_connection_combine(const Tensor& y, const Tensor& inject, Tensor& res
  *         parent). The output mixer of the model has no inject rows (I = 0).
  *   up:   Q8_G32_FP16 row-split [S*H, R].
  *
- * Option (not in a recipe; its quality is unqualified): both projections NVFP4
- * (BlockScaleK16M128x4, E4M3 group scales, FP32 divisor), down stored as [round_up(R + I, 128),
- * S*H] with the rows past R + I unused, up [S*H, R]. Supported for T <= 8 only.
+ * Options: both projections BF16 (down [R + I, S*H], up [S*H, R], as a checkpoint stores them);
+ * or, not in a recipe and of unqualified quality, both NVFP4 (BlockScaleK16M128x4, E4M3 group
+ * scales, FP32 divisor), down stored as [round_up(R + I, 128), S*H] with the rows past R + I
+ * unused, up [S*H, R], supported for T <= 8, H = 2560 and R = 320 only.
  */
 struct HyperConnectionWeights {
     Tensor norm;
@@ -101,8 +102,11 @@ struct HyperConnectionWeights {
  *   residual [S*H, T]; mixed [H, T]; inject [S, T]; T >= 1 (no upper bound).
  *
  * Supported domain:
- *   S = 4, H = 2560, R = 320, eps > 0 and finite. residual, norm, mixed BF16; inject FP32; weights
- *   as HyperConnectionWeights. `inject` must be non-null exactly when `down` has R + S rows.
+ *   S = 4; eps > 0 and finite. residual, norm, mixed BF16; inject FP32; weights as
+ *   HyperConnectionWeights. `inject` must be non-null exactly when `down` has R + S rows. By weight
+ *   format: Q8 H in {2560, 5120} and R in {320, 640} (the Q8 Linear shapes registered for the
+ *   general route); BF16 H and R positive multiples of 8; NVFP4 H = 2560, R = 320, T <= 8. A call
+ *   outside the domain throws std::invalid_argument before anything is enqueued.
  *
  * Numeric:
  *   FP32 accumulation of both projections over exactly decoded weights. Implementations may stage
@@ -115,15 +119,17 @@ struct HyperConnectionWeights {
  *   Writes `mixed` and `inject`; `residual` is read only. Outputs must not overlap inputs.
  *
  * Workspace:
- *   hyper_connection_mix_workspace_bytes(min_tokens, max_tokens, inject).
+ *   hyper_connection_mix_workspace_bytes(min_tokens, max_tokens, inject, H, R).
  *
  * Execution:
- *   Stream ordered, no host synchronization, CUDA Graph capturable for every T. For T <= 8 on a
- *   device with thread block clusters (sm_90+) the Op is two launches and needs no particular SM
- *   count or co-residency: a Down launch of 4-CTA clusters, then an Up launch that is its
- *   programmatic dependent. The Down launch is itself a programmatic dependent of the preceding
- *   kernel in the stream: it requests `norm` and the weights before that kernel completes, so
- *   these must not be written by it. The Op's tensor maps are encoded on the host at each call.
+ *   Stream ordered, no host synchronization, CUDA Graph capturable for every T. For T <= 8 and
+ *   R = 320 on a device with thread block clusters (sm_90+), at H = 2560 (any weight format) or at
+ *   H = 5120 with Q8 weights, the Op is two launches and needs no particular SM count or
+ *   co-residency: a Down launch of thread block clusters, then an Up launch that is its
+ *   programmatic dependent. Other geometries of the domain take the general route at every T. The
+ *   Down launch is itself a programmatic dependent of the preceding kernel in the stream: it
+ *   requests `norm` and the weights before that kernel completes, so these must not be written by
+ *   it. The Op's tensor maps are encoded on the host at each call.
  */
 void hyper_connection_mix(const Tensor& residual, const HyperConnectionWeights& weights, float eps,
                           Tensor& mixed, Tensor* inject, WorkspaceArena& workspace,
@@ -141,9 +147,11 @@ void hyper_connection_mix(const Tensor& residual, const HyperConnectionWeights& 
  * hyper_connection_combine and then hyper_connection_mix.
  *
  * Logical shapes / domain: as the two composed Ops. previous_y [H,T] BF16, previous_inject [S,T]
- *   FP32.
- * Effects: updates `residual` in place to residual'; writes `mixed` and `inject`.
- * Workspace: hyper_connection_mix_workspace_bytes(min_tokens, max_tokens, inject).
+ *   FP32, sharing no byte with `inject`: the small-T route reads previous_inject in the same
+ *   launches that write inject, so overlapping buffers race.
+ * Effects: updates `residual` in place to residual'; writes `mixed` and `inject`. A call outside
+ *   the domain throws before anything is enqueued, leaving `residual` unchanged.
+ * Workspace: hyper_connection_mix_workspace_bytes(min_tokens, max_tokens, inject, H, R).
  * Execution: as hyper_connection_mix.
  */
 void hyper_connection_combine_mix(Tensor& residual, const Tensor& previous_y,
@@ -153,10 +161,13 @@ void hyper_connection_combine_mix(Tensor& residual, const Tensor& previous_y,
 
 /**
  * Minimum caller workspace (bytes, from a 256-byte aligned cursor) sufficient for every
- * hyper_connection_mix / hyper_connection_combine_mix call with T in [min_tokens, max_tokens]
- * and the given inject form. Throws for an empty or non-positive interval.
+ * hyper_connection_mix / hyper_connection_combine_mix call with T in [min_tokens, max_tokens],
+ * the given inject form, hidden width H = `hidden` and low rank R = `rank`. Throws for an empty or
+ * non-positive interval, or for a hidden width or rank that is not a positive multiple of 8.
  */
-[[nodiscard]] std::size_t
-hyper_connection_mix_workspace_bytes(std::int32_t min_tokens, std::int32_t max_tokens, bool inject);
+[[nodiscard]] std::size_t hyper_connection_mix_workspace_bytes(std::int32_t min_tokens,
+                                                               std::int32_t max_tokens, bool inject,
+                                                               std::int32_t hidden,
+                                                               std::int32_t rank);
 
 } // namespace ninfer::ops

@@ -80,7 +80,6 @@ struct MtpDecodeEgress {
 struct DFlashPrefillIngress {
     std::int32_t append_count           = 0;
     std::int32_t state_destination_slot = 0;
-    std::int32_t full_kv_table_row      = 0;
 };
 
 // Stable pinned/device transfer formats for one exact-B DFlash transaction. The proposal is
@@ -97,7 +96,6 @@ struct DFlashDecodeIngress {
     std::array<std::int32_t, kMaximumConcurrency * kDFlashDecodeMaximumWidth>
         target_rope_positions{};
     std::array<std::int32_t, kMaximumConcurrency> text_kv_table_rows{};
-    std::array<std::int32_t, kMaximumConcurrency> dflash_kv_table_rows{};
     std::array<std::int32_t, kMaximumConcurrency> active_lanes{};
     std::array<std::int32_t, kMaximumConcurrency> state_source_slots{};
     std::array<std::int32_t, kMaximumConcurrency> state_destination_slots{};
@@ -225,8 +223,7 @@ struct DFlashPrefillState {
     DeviceSpan ingress;
     Tensor append_count;
     Tensor state_destination_slot;
-    Tensor full_kv_table_row;
-    // Oversized chunks retain only their tail locally; full KV still uses append_count.
+    // Oversized chunks retain only their tail locally (the drafter's sliding window).
     Tensor local_append_count;
 
     DFlashPrefillState() = default;
@@ -287,7 +284,6 @@ struct DFlashDecodeState {
     Tensor proposal_valid_columns;
     Tensor target_rope_positions;
     Tensor text_kv_table_rows;
-    Tensor dflash_kv_table_rows;
     Tensor active_lanes;
     Tensor state_source_slots;
     Tensor state_destination_slots;

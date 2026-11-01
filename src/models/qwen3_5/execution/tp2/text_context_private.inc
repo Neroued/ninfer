@@ -1,16 +1,12 @@
 // Class-body fragment of TextContext (execution/text.h), included at the end of its private
-// section: the two-device (tp == 2) schedule and its state. The definitions are in
-// tp2/text_tp2.cpp. Not a header; our file, see docs/maintainer/upstream-merge.md.
+// section: the two-device (tp == 2) bindings, accessors and Qwen3.5 MTP head. The definitions are in
+// tp2/text_tp2.inc. Not a header; our file, see docs/maintainer/upstream-merge.md.
 
 private:
 // --- tp == 2 -------------------------------------------------------------------------------
-// Separate functions rather than branches inside the single-device ones, so the tp1 schedule
-// is unchanged. The residual x[r] is replicated: each layer ends in an all-reduce that leaves
-// the identical BF16 sum on both ranks, so every later per-rank stage sees identical inputs.
-// Rank r's work is issued on ExecutionContext::dev[r]'s stream; only the collectives inside
-// the row-parallel projections order the two streams, with no host synchronization.
-using RankBlocks = std::array<const BlockParameters*, kTensorParallelWidth>;
-
+// The Text layers run in the Qwen4 forward on both ranks (qwen4_text.cpp); these members hold
+// rank 1's bindings and the Qwen3.5 MTP head's split schedule. Rank r's work is issued on
+// ExecutionContext::dev[r]'s stream; only the collectives order the two streams.
 [[nodiscard]] bool tp2() const noexcept { return tp_ != nullptr; }
 
 void validate_tensor_parallel();
@@ -22,13 +18,6 @@ void require_single_device(const char* operation) const;
 [[nodiscard]] DeviceExecutionView rank_execution_view(int rank) const noexcept;
 [[nodiscard]] LinearAttentionStatePool& rank_state(int rank) const noexcept;
 [[nodiscard]] const qwen3_5::PagedKVCache& rank_text_cache(int rank) const;
-// Rank 0 reads the active_* bindings exactly as the single-device path does; rank 1 reads
-// the peer_* bindings the tp2 entry point sets from rank 1's own control tensors.
-[[nodiscard]] const Tensor& rank_cache_positions(int rank) const;
-[[nodiscard]] const Tensor& rank_rope_positions(int rank) const;
-[[nodiscard]] const Tensor& rank_kv_table_rows(int rank) const;
-[[nodiscard]] const Tensor& rank_linear_state_source_slots(int rank) const;
-[[nodiscard]] const Tensor& rank_linear_state_destination_slots(int rank) const;
 // Both ranks bind valid columns, or neither does (an empty Tensor: every column is live); two
 // ranks masking different columns would diverge silently.
 [[nodiscard]] Tensor rank_valid_columns(int rank) const;
@@ -39,44 +28,6 @@ void require_single_device(const char* operation) const;
 [[nodiscard]] const MtpParameters& rank_mtp(int rank) const;
 [[nodiscard]] const GdnReplayRecords& rank_replay_records(int rank) const;
 void validate_tensor_parallel_mtp();
-// `exchange_lane` >= 0: the block's closing all-reduce is only begun on that lane of the split
-// exchange (ops::allreduce_sum_begin); the caller finishes it before reading x. Non-null `slices`
-// (sliced prefill): the mixer core runs over the whole chunk and its output projection slice by
-// slice, slice s's all-reduce begun on lane s.
-void attn_mix_tp2(const RankBlocks& weights, RankTensors& x, int index, const RankTensors& staging,
-                  int exchange_lane = -1, const PrefillSlicePlan* slices = nullptr);
-void gdn_mix_tp2(const RankBlocks& weights, RankTensors& x, int index, Phase phase,
-                 const RankTensors& staging, int exchange_lane = -1,
-                 const PrefillSlicePlan* slices = nullptr);
-void mlp_tail_tp2(const RankBlocks& weights, RankTensors& x, const RankTensors& staging,
-                  int exchange_lane = -1);
-// Sliced prefill's post-mixer block: per slice s, finish lane s, norm, FFN, begin lane s.
-void mlp_tail_sliced_tp2(const RankBlocks& weights, RankTensors& x, const RankTensors& staging,
-                         const PrefillSlicePlan& slices);
-template <class Tap>
-void run_layers_tp2(RankTensors& x, Phase phase, const RankTensors& staging, Tap& tap);
-// Prefill overlap: the layers of one text prefill chunk as two interleaved halves, [0,split) and
-// [split,len), each block's all-reduce moving while the other half computes. The bindings are the
-// chunk's: `positions`/`rope_positions` per rank, KV visible up to `base + len`, and the GDN slots
-// of set_linear_state_slots(). A prefill tap (DFlash2 features) receives every layer's output
-// per half, once that half's exchange has finished.
-template <class Tap>
-void prefill_layers_overlap_tp2(RankTensors& x, const RankTensors& staging,
-                                const RankTensors& positions, const RankTensors& rope_positions,
-                                int base, int split, Tap& tap);
-// v07/prefill-slices: the layers of one prefill chunk with the column-local tail of every block
-// (output projection, all-reduce, norm, FFN) issued in `slices`, slice s's all-reduces on lane s
-// of the split exchange, so they overlap the later slices' compute. Mixer cores run over the whole
-// chunk with the chunk's bindings (also multimodal RoPE). A tap gets every layer's whole output.
-template <class Tap>
-void prefill_layers_sliced_tp2(RankTensors& x, const RankTensors& staging,
-                               const PrefillSlicePlan& slices, Tap& tap);
-template <class Tap>
-void target_verify_batch_tp2_impl(
-    const RankTensors& ids, const RankTensors& cache_positions, const RankTensors& rope_positions,
-    const RankTensors& valid_columns, const RankTensors& kv_table_rows,
-    const RankTensors& linear_state_source_slots, ops::CausalAttentionExecutionEnvelope envelope,
-    const RankTensors& hidden, Tensor& logits, Tensor& target_tokens, Tap& tap);
 // Vocabulary-split head: each rank projects its half of the vocabulary from its final hidden
 // columns, and rank 0 alone gathers the complete [V, C] logits into its `logits` (one pull of
 // rank 1's half).
@@ -84,8 +35,8 @@ void logits_tp2(const RankTensors& hidden, Tensor& logits);
 void logits_tp2(const RankTensors& hidden, const std::array<const LinearParameters*, 2>& head,
                 Tensor& logits);
 // MTP head over both ranks: three all-reduces (input projection, attention output, post-mixer
-// down projection) leave the replicated residual identical on the two ranks, as in the text
-// layers. The attention runs over each rank's half of the heads and its own MTP KV pages.
+// down projection) leave the replicated residual identical on the two ranks. The attention runs
+// over each rank's half of the heads and its own MTP KV pages.
 // `input_embeddings`, when set, is rank 0's composed embedding of `ids`.
 void mtp_forward_stem_tp2(const Tensor& ids, const RankTensors& hidden,
                           const Tensor* input_embeddings, RankTensors& x, RankTensors& ah,
@@ -98,6 +49,11 @@ void mtp_forward_core_tp2(const Tensor& ids, const RankTensors& hidden,
                           const RankTensors& positions, const RankTensors& rope_positions,
                           ops::CausalAttentionExecutionEnvelope envelope,
                           const RankTensors& mtp_hidden, const Tensor* input_embeddings);
+void mtp_prompt_chunk_tp2(std::span<const int> alignment_ids, std::uint32_t base, int len, int T,
+                          int base_i, bool is_last, const RankTensors& mtp_input,
+                          const RankTensors& positions, const RankTensors& rope_positions,
+                          ops::CausalAttentionExecutionEnvelope chunk_envelope, bool multimodal,
+                          const VisionChunk& vision_chunk);
 void mtp_prefill_chunk_tp2(const Tensor& ids, const RankTensors& hidden,
                            const Tensor* input_embeddings, const RankTensors& positions,
                            const RankTensors& rope_positions,
@@ -107,22 +63,6 @@ void mtp_prefill_chunk_tp2(const Tensor& ids, const RankTensors& hidden,
 // split by vocabulary (execution::proposal_argmax_split, rank 0 combining the two argmaxes);
 // the full head is the vocabulary-split output head, gathered before rank 0's argmax.
 void proposal_argmax_tp2(const RankTensors& hidden, Tensor& logits, Tensor& proposal_tokens);
-void ordinary_decode_batch_tp2(const Tensor& ids, const Tensor& cache_positions,
-                               const Tensor& rope_positions, const Tensor& kv_table_rows,
-                               const Tensor& linear_state_source_slots,
-                               const Tensor& linear_state_destination_slots,
-                               ops::CausalAttentionExecutionEnvelope envelope, Tensor& hidden,
-                               Tensor& logits);
-
-// tp2 prefill of one text or multimodal chunk (exactly one of `text_prefill` and
-// `multimodal`). A multimodal chunk scatters the Vision session's merged embeddings into both
-// ranks' residual, each from its own copy. A DFlash feature tap reads rank 0's replicated
-// residual.
-template <class Tap>
-[[nodiscard]] PrefillChunkResult
-prefill_impl_tp2(std::span<const int> ids, const TextPrefill* text_prefill,
-                 const MultimodalPrefill* multimodal, Tap& tap, bool finalize_at_end);
-
 // rank 1's StateImage column for set_rewrite_checkpoint_hidden_output() (MTP only).
 Tensor* peer_rewrite_checkpoint_hidden_output_ = nullptr;
 // The split DFlash2 drafter's rank 1 feature sink (set_peer_feature_sink); null otherwise.
@@ -137,10 +77,5 @@ void peer_tap_consume_prefill_chunk(std::int32_t tokens, bool rewrite_checkpoint
 const TpExecution* tp_ = nullptr;
 // Each rank's share of config_ (shard_text_config), present only at tp == 2.
 std::optional<TextConfig> shard_config_;
-const Tensor* peer_cache_positions_                = nullptr;
-const Tensor* peer_rope_positions_                 = nullptr;
-const Tensor* peer_kv_table_rows_                  = nullptr;
-const Tensor* peer_linear_state_source_slots_      = nullptr;
-const Tensor* peer_linear_state_destination_slots_ = nullptr;
-const Tensor* peer_valid_columns_                  = nullptr;
-const Tensor* peer_backend_kv_table_rows_          = nullptr;
+const Tensor* peer_valid_columns_         = nullptr;
+const Tensor* peer_backend_kv_table_rows_ = nullptr;

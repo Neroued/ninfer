@@ -139,9 +139,8 @@ explicit_pressure_target(const qwen3_5::detail::PressureDecision& complete) {
     explicit_target.effect.removed     = checked_resource_difference(
         complete.effect.removed, complete.checkpoint_drop_effect.removed,
         "pressure explicit target");
-    explicit_target.effect.added =
-        checked_resource_difference(complete.effect.added, complete.checkpoint_drop_effect.added,
-                                    "pressure explicit target");
+    explicit_target.effect.added = checked_resource_difference(
+        complete.effect.added, complete.checkpoint_drop_effect.added, "pressure explicit target");
     explicit_target.transfer_requirements = complete.transfer_requirements;
     explicit_target.shared_owner          = complete.shared_owner;
     explicit_target.id                    = explicit_pressure_identity(explicit_target);
@@ -722,10 +721,10 @@ ProgramImpl::inspect_pressure_option(const SequenceState& sequence,
         option.state_changes      = current->state_changes;
         option.main_kv_changes    = current->main_kv_changes;
         option.backend_kv_changes = current->backend_kv_changes;
-        option.effect.removed     = checked_resource_difference(
-            current->effect.removed, current->checkpoint_drop_effect.removed,
-            "pressure option base");
-        option.effect.added = checked_resource_difference(
+        option.effect.removed     = checked_resource_difference(current->effect.removed,
+                                                                current->checkpoint_drop_effect.removed,
+                                                                "pressure option base");
+        option.effect.added       = checked_resource_difference(
             current->effect.added, current->checkpoint_drop_effect.added, "pressure option base");
         option.transfer_requirements = current->transfer_requirements;
     }
@@ -2208,7 +2207,7 @@ bool ProgramImpl::compose_pressure_candidate(
             }
             ++details.demand.reservation_credit.device.state_slots;
 
-            if (is_masked_draft_backend(speculative_backend)) {
+            if (speculative_backend == SpeculativeBackend::DFlash2) {
                 const auto copy = std::find_if(
                     details.transfer_requirements.begin(), details.transfer_requirements.end(),
                     [](const runtime::ContextTransferRequirement& requirement) {

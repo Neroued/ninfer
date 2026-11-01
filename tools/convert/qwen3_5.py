@@ -1,6 +1,6 @@
 """Qwen3.5 architecture adapter: mathematical config, source axes, and packing groups.
 
-Dense/MoE text, Vision, MTP, DFlash, and DFlash2 share this explicit mapping.
+Dense text, Vision, MTP and DFlash2 share this explicit mapping; qwen4_exp.py reuses it.
 Official checkpoint names and quantization assignments live in official_recipes.
 """
 
@@ -17,12 +17,7 @@ from .sources.logical import select_rows, transpose_source
 from .sources.safetensors import SafetensorsSource, tensor_source
 from .sources.compressed_tensors import matrix_source
 
-_TEXT_ARCHITECTURES = {
-    "Qwen3_5ForCausalLM": False,
-    "Qwen3_5ForConditionalGeneration": False,
-    "Qwen3_5MoeForCausalLM": True,
-    "Qwen3_5MoeForConditionalGeneration": True,
-}
+_TEXT_ARCHITECTURES = ("Qwen3_5ForCausalLM", "Qwen3_5ForConditionalGeneration")
 
 
 def _positive(value, name):
@@ -71,15 +66,26 @@ def text_config(source: dict, *, mtp: bool) -> dict:
     architectures = source.get("architectures")
     if not isinstance(architectures, list) or len(architectures) != 1 or architectures[0] not in _TEXT_ARCHITECTURES:
         raise ValueError(f"unsupported Qwen text architecture {architectures!r}")
-    moe = _TEXT_ARCHITECTURES[architectures[0]]
-    raw = source.get("text_config", source)
+    result = {"architectures": ["Qwen3_5ForCausalLM"], "model_type": "qwen3_5_text"}
+    result.update(
+        text_fields(
+            source.get("text_config", source),
+            mtp=mtp,
+            moe=False,
+            tied=source.get("tie_word_embeddings", False),
+        )
+    )
+    return result
+
+
+def text_fields(raw: dict, *, mtp: bool, moe: bool, tied=False) -> dict:
+    """The Text fields a Qwen3.5 block shares with Qwen4Exp (qwen4_exp.text_config): a dense FFN, or
+    with ``moe`` the routed-expert fields of a Qwen4Exp MoE. ``tied`` is the checkpoint's top-level
+    tie_word_embeddings, read when the Text config carries none."""
     _fixed(raw, "hidden_act", "silu", "text")
     _fixed(raw, "attention_bias", False, "text")
     _fixed(raw, "attn_output_gate", True, "text")
-    result = {
-        "architectures": ["Qwen3_5MoeForCausalLM" if moe else "Qwen3_5ForCausalLM"],
-        "model_type": "qwen3_5_moe_text" if moe else "qwen3_5_text",
-    }
+    result = {}
     for key in (
         "hidden_size",
         "vocab_size",
@@ -87,7 +93,7 @@ def text_config(source: dict, *, mtp: bool) -> dict:
         "max_position_embeddings",
     ):
         result[key] = _positive(raw.get(key), "text." + key)
-    tied = raw.get("tie_word_embeddings", source.get("tie_word_embeddings", False))
+    tied = raw.get("tie_word_embeddings", tied)
     if type(tied) is not bool:
         raise ValueError("text.tie_word_embeddings must be boolean")
     result["tie_word_embeddings"] = tied
@@ -175,7 +181,7 @@ def vision_config(source: dict, text: dict) -> dict:
     _fixed(raw, "hidden_act", "gelu_pytorch_tanh", "vision")
     _fixed(raw, "deepstack_visual_indexes", [], "vision")
     _fixed(raw, "out_hidden_size", text["hidden_size"], "vision")
-    result = {"model_type": ("qwen3_5_moe_vision" if "num_experts" in text else "qwen3_5_vision")}
+    result = {"model_type": "qwen3_5_vision"}
     for key in (
         "depth",
         "hidden_size",
@@ -194,9 +200,9 @@ def vision_config(source: dict, text: dict) -> dict:
     return result
 
 
-def draft_config(raw: dict, target: dict, backend: str) -> dict:
-    architecture = "DFlash2DraftModel" if backend == "dflash2" else "DFlashDraftModel"
-    _fixed(raw, "architectures", [architecture], backend)
+def draft_config(raw: dict, target: dict) -> dict:
+    backend = "dflash2"  # prefix of the validation messages
+    _fixed(raw, "architectures", ["DFlash2DraftModel"], backend)
     _fixed(raw, "model_type", "qwen3", backend)
     _fixed(raw, "hidden_act", "silu", backend)
     _fixed(raw, "attention_bias", False, backend)
@@ -207,7 +213,7 @@ def draft_config(raw: dict, target: dict, backend: str) -> dict:
         ("num_target_layers", target["num_hidden_layers"]),
     ):
         _fixed(raw, key, value, backend)
-    result = {"architectures": [architecture], "model_type": "qwen3"}
+    result = {"architectures": ["DFlash2DraftModel"], "model_type": "qwen3"}
     for key in (
         "intermediate_size",
         "num_attention_heads",
@@ -243,12 +249,11 @@ def draft_config(raw: dict, target: dict, backend: str) -> dict:
     if (
         not isinstance(layers, list)
         or len(layers) != result["num_hidden_layers"]
-        or any(k not in ("sliding_attention", "full_attention") for k in layers)
+        or any(k != "sliding_attention" for k in layers)
     ):
-        raise ValueError(f"{backend}: invalid layer_types")
+        raise ValueError(f"{backend}: every layer must be sliding_attention")
     result["layer_types"] = list(layers)
-    if "sliding_attention" in layers:
-        result["sliding_window"] = _positive(raw.get("sliding_window"), backend + ".sliding_window")
+    result["sliding_window"] = _positive(raw.get("sliding_window"), backend + ".sliding_window")
     draft = raw.get("dflash_config", {})
     taps = draft.get("target_layer_ids")
     if (
@@ -262,25 +267,24 @@ def draft_config(raw: dict, target: dict, backend: str) -> dict:
     if type(mask) is not int or not 0 <= mask < target["vocab_size"]:
         raise ValueError(f"{backend}: mask token outside target embedding")
     output = {"target_layer_ids": list(taps), "mask_token_id": mask}
-    if backend == "dflash2":
-        for key in (
-            "conv_kernel_size",
-            "conv_group_size",
-            "selector_rank",
-            "selector_top_k",
+    for key in (
+        "conv_kernel_size",
+        "conv_group_size",
+        "selector_rank",
+        "selector_top_k",
+    ):
+        output[key] = _positive(draft.get(key), backend + "." + key)
+    if target["hidden_size"] % output["conv_group_size"]:
+        raise ValueError("DFlash2 hidden width must be divisible by conv_group_size")
+    for scope in (raw, draft):
+        for key, expected in (
+            ("sample_from_anchor", False),
+            ("input_embedding_scale", 1.0),
+            ("output_multiplier", 1.0),
         ):
-            output[key] = _positive(draft.get(key), backend + "." + key)
-        if target["hidden_size"] % output["conv_group_size"]:
-            raise ValueError("DFlash2 hidden width must be divisible by conv_group_size")
-        for scope in (raw, draft):
-            for key, expected in (
-                ("sample_from_anchor", False),
-                ("input_embedding_scale", 1.0),
-                ("output_multiplier", 1.0),
-            ):
-                _fixed(scope, key, expected, backend)
-            if scope.get("final_logit_softcapping") not in (None, 0, 0.0):
-                raise ValueError("DFlash2 final_logit_softcapping must be disabled")
+            _fixed(scope, key, expected, backend)
+        if scope.get("final_logit_softcapping") not in (None, 0, 0.0):
+            raise ValueError("DFlash2 final_logit_softcapping must be disabled")
     result["dflash_config"] = output
     return result
 
@@ -357,7 +361,7 @@ class _Builder:
             if "position_embedding" in name:
                 fields.add("num_position_embeddings")
         else:
-            actual = draft_config(selected.config, target, component)
+            actual = draft_config(selected.config, target)
             expected = self.model.components[component]["config"]
             fields = set()
             if "/attention/" in name:
@@ -578,71 +582,6 @@ class _Builder:
         )
         self.group(prefix + "mlp/gate", prefix + "mlp/up")
 
-    def moe(self, prefix, source_prefix, store, config):
-        h, e = config["hidden_size"], config["num_experts"]
-        ir, shared = (
-            config["moe_intermediate_size"],
-            config["shared_expert_intermediate_size"],
-        )
-        sp, p = source_prefix + "mlp.", prefix + "moe/"
-        self.add(
-            p + "router",
-            store,
-            sp + "gate.weight",
-            (e, h),
-            inputs=(prefix + "ffn_input",),
-        )
-        self.add(
-            p + "shared_score",
-            store,
-            sp + "shared_expert_gate.weight",
-            (1, h),
-            inputs=(prefix + "ffn_input",),
-        )
-        self.group(p + "router", p + "shared_score")
-        gate_up, downs = [], []
-        for expert in range(e):
-            ep = p + f"experts/{expert}/"
-            for role, half in (("gate", 0), ("up", 1)):
-                self.add(
-                    ep + role,
-                    store,
-                    sp + "experts.gate_up_proj",
-                    (ir, h),
-                    source_shape=(e, 2 * ir, h),
-                    offset=(expert * 2 + half) * ir * h,
-                    inputs=(prefix + "ffn_input",),
-                )
-                gate_up.append(ep + role)
-            self.add(
-                ep + "down",
-                store,
-                sp + "experts.down_proj",
-                (h, ir),
-                source_shape=(e, h, ir),
-                offset=expert * h * ir,
-                inputs=(ep + "product",),
-            )
-            downs.append(ep + "down")
-        self.group(*gate_up)
-        self.group(*downs)
-        for role in ("gate", "up"):
-            self.add(
-                p + "shared/" + role,
-                store,
-                sp + "shared_expert." + role + "_proj.weight",
-                (shared, h),
-                inputs=(prefix + "ffn_input",),
-            )
-        self.add(
-            p + "shared/down",
-            store,
-            sp + "shared_expert.down_proj.weight",
-            (h, shared),
-            inputs=(p + "shared/product",),
-        )
-        self.group(p + "shared/gate", p + "shared/up")
-
     def block(self, prefix, source_prefix, store, config, mixer):
         h = config["hidden_size"]
         self.add(prefix + "input_norm", store, source_prefix + "input_layernorm.weight", (h,))
@@ -656,10 +595,7 @@ class _Builder:
             source_prefix + "post_attention_layernorm.weight",
             (h,),
         )
-        if "num_experts" in config:
-            self.moe(prefix, source_prefix, store, config)
-        else:
-            self.dense(prefix, source_prefix, store, h, config["intermediate_size"])
+        self.dense(prefix, source_prefix, store, h, config["intermediate_size"])
 
     def vision(self, store, config, output_width):
         h, intermediate = config["hidden_size"], config["intermediate_size"]
@@ -755,7 +691,8 @@ class _Builder:
                 inputs=inputs,
             )
 
-    def draft(self, store, config, target, backend):
+    def draft(self, store, config, target):
+        backend = "dflash2"
         h, d = target["hidden_size"], config["head_dim"]
         q, k = config["num_attention_heads"] * d, config["num_key_value_heads"] * d
         draft = config["dflash_config"]
@@ -813,38 +750,36 @@ class _Builder:
                 inputs=(p + "attention_output",),
             )
             self.dense(p, sp, store, h, config["intermediate_size"], draft=True)
-            if backend == "dflash2":
-                taps, groups = draft["conv_kernel_size"], h // draft["conv_group_size"]
-                for branch in ("attention_conv", "mlp_conv"):
-                    self.add(
-                        p + branch + "/base_kernel",
-                        store,
-                        sp + branch + ".base_kernel",
-                        (2, taps, h),
-                    )
-                    self.add(
-                        p + branch + "/kernel_projection",
-                        store,
-                        sp + branch + ".kernel_projection.weight",
-                        (2 * taps * groups, h),
-                        inputs=(p + branch + "_input",),
-                    )
-        if backend == "dflash2":
-            rank = draft["selector_rank"]
-            self.add(
-                backend + "/candidate_selector/hidden_projection",
-                store,
-                "candidate_selector.hidden_projection.weight",
-                (rank, h),
-                inputs=(backend + "/final_hidden",),
-            )
-            for role in ("predecessor_codebook", "successor_codebook"):
+            taps, groups = draft["conv_kernel_size"], h // draft["conv_group_size"]
+            for branch in ("attention_conv", "mlp_conv"):
                 self.add(
-                    backend + "/candidate_selector/" + role,
+                    p + branch + "/base_kernel",
                     store,
-                    "candidate_selector." + role,
-                    (target["vocab_size"], rank),
+                    sp + branch + ".base_kernel",
+                    (2, taps, h),
                 )
+                self.add(
+                    p + branch + "/kernel_projection",
+                    store,
+                    sp + branch + ".kernel_projection.weight",
+                    (2 * taps * groups, h),
+                    inputs=(p + branch + "_input",),
+                )
+        rank = draft["selector_rank"]
+        self.add(
+            backend + "/candidate_selector/hidden_projection",
+            store,
+            "candidate_selector.hidden_projection.weight",
+            (rank, h),
+            inputs=(backend + "/final_hidden",),
+        )
+        for role in ("predecessor_codebook", "successor_codebook"):
+            self.add(
+                backend + "/candidate_selector/" + role,
+                store,
+                "candidate_selector." + role,
+                (target["vocab_size"], rank),
+            )
 
 
 def build_model(
@@ -859,7 +794,6 @@ def build_model(
         "text",
         "vision",
         "mtp",
-        "dflash",
         "dflash2",
     }:
         raise ValueError("select text and supported optional components")
@@ -872,16 +806,11 @@ def build_model(
             "target": "text",
         }
     if "mtp" in selected:
-        architecture = "Qwen3_5MoeMTP" if "num_experts" in config else "Qwen3_5MTP"
-        records["mtp"] = {"config": {"architectures": [architecture]}, "target": "text"}
-    for backend in ("dflash", "dflash2"):
-        if backend in selected:
-            if backend not in companions:
-                raise ValueError(f"selected {backend} requires its source")
-            records[backend] = {
-                "config": draft_config(companions[backend].config, config, backend),
-                "target": "text",
-            }
+        records["mtp"] = {"config": {"architectures": ["Qwen3_5MTP"]}, "target": "text"}
+    if "dflash2" in selected:
+        if "dflash2" not in companions:
+            raise ValueError("selected dflash2 requires its source")
+        records["dflash2"] = {"config": draft_config(companions["dflash2"].config, config), "target": "text"}
     refs, resources, count, special = load_resources(
         base.root,
         vocab_size=config["vocab_size"],
@@ -896,9 +825,7 @@ def build_model(
     text_prefix = "model.language_model." if "text_config" in base.config else "model."
     builder.add("text/token_embedding", base, text_prefix + "embed_tokens.weight", (r, h))
     head_source = text_prefix + "embed_tokens.weight" if config["tie_word_embeddings"] else "lm_head.weight"
-    head_inputs = ("text/final_hidden",) + tuple(
-        c + "/final_hidden" for c in ("mtp", "dflash", "dflash2") if c in selected
-    )
+    head_inputs = ("text/final_hidden",) + tuple(c + "/final_hidden" for c in ("mtp", "dflash2") if c in selected)
     builder.add("text/output_head", base, head_source, (r, h), inputs=head_inputs)
     builder.add("text/final_norm", base, text_prefix + "norm.weight", (h,))
     for i, kind in enumerate(config["layer_types"]):
@@ -920,9 +847,8 @@ def build_model(
         builder.block("mtp/layers/0/", "mtp.layers.0.", base, config, "full_attention")
     if "vision" in selected:
         builder.vision(base, records["vision"]["config"], h)
-    for backend in ("dflash", "dflash2"):
-        if backend in selected:
-            if backend == "dflash2" and records[backend]["config"]["dflash_config"]["selector_top_k"] > count:
-                raise ValueError("DFlash2 selector_top_k exceeds public token domain")
-            builder.draft(companions[backend], records[backend]["config"], config, backend)
+    if "dflash2" in selected:
+        if records["dflash2"]["config"]["dflash_config"]["selector_top_k"] > count:
+            raise ValueError("DFlash2 selector_top_k exceeds public token domain")
+        builder.draft(companions["dflash2"], records["dflash2"]["config"], config)
     return model

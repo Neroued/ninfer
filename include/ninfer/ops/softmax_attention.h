@@ -20,11 +20,6 @@ struct CausalAttentionExecutionEnvelope {
     std::uint32_t max_visible_keys = 0;
 };
 
-struct ContextAttentionExecutionEnvelope {
-    std::uint32_t min_context = 0;
-    std::uint32_t max_context = 0;
-};
-
 /**
  * Shared numerical contract.
  *
@@ -165,40 +160,5 @@ void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,
     AttentionHeadGeometry geometry, KvCacheStorage cache_storage,
     CausalAttentionExecutionEnvelope envelope, std::int32_t batch_size, std::int32_t min_tokens,
     std::int32_t max_tokens);
-
-/**
- * Non-causal grouped-query attention over persistent context plus one live query block.
- *
- * The registered profile is D=128, Hq=32, Hkv=8 (group 4), scale=1/sqrt(128), T=1..16, and
- * B=1..8. q/out are contiguous BF16 [128,32,T,B], query_k/query_v are contiguous BF16
- * [128,8,T,B], and context_lengths, valid_columns, and table_rows are contiguous device I32 [B].
- * The read-only paged BFloat16 context uses head-major BF16 K and FP16 V planes
- * [128,64,Nphysical,8].
- *
- * For row b, let L=context_lengths[b] and V=valid_columns[b]. Every live query i<V attends the
- * complete logical set consisting of context rows [0,L) followed by every temporary query K/V row
- * [0,V). There is no causal triangle. Columns i>=V are inert and produce exact BF16 zero. The
- * context and temporary query K/V remain separate physical segments; every input and cache byte is
- * unchanged, and out is the only observable mutation and is completely overwritten.
- *
- * The caller guarantees envelope.min_context <= L <= envelope.max_context and materialized block
- * table entries for every logical page intersecting [0,L). The envelope may affect finite launch
- * selection and workspace capacity, never the admitted key set or numerical result. Inputs,
- * context, output, and live workspace allocations are pairwise non-overlapping.
- */
-void context_softmax_attention(const Tensor& q, const Tensor& query_k, const Tensor& query_v,
-                               const Tensor& context_lengths, const Tensor& valid_columns,
-                               const Tensor& table_rows, AttentionHeadGeometry geometry,
-                               float scale, const PagedKVBatchLayerView& context,
-                               ContextAttentionExecutionEnvelope envelope,
-                               WorkspaceArena& workspace, Tensor& out, cudaStream_t stream);
-
-/**
- * Return transient capacity for every T in the inclusive optimized interval at the exact batch
- * size. The execution envelope is fixed; invalid profiles or intervals throw.
- */
-[[nodiscard]] std::size_t context_softmax_attention_workspace_capacity_bytes(
-    AttentionHeadGeometry geometry, ContextAttentionExecutionEnvelope envelope,
-    std::int32_t min_tokens, std::int32_t max_tokens, std::int32_t batch_size);
 
 } // namespace ninfer::ops

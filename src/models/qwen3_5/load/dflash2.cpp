@@ -4,7 +4,7 @@ namespace ninfer::models::qwen3_5::loading {
 
 void bind_dflash2(Bindings& b, DraftWeights& weights, const DraftConfig& config,
                   const TextConfig& target) {
-    const auto& extra = config.dflash2.value();
+    const auto& extra = config.dflash2;
     const auto h      = target.hidden_size;
     const auto rows =
         artifact::checked_mul(2ULL * extra.conv_kernel_size, h / extra.conv_group_size,

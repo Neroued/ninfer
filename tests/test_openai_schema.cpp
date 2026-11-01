@@ -2,6 +2,7 @@
 #include "serve/openai_chat.h"
 #include "serve/openai_common.h"
 #include "serve/translate.h"
+#include "tool_call_salvage_probe.h"
 
 #include <nlohmann/json.hpp>
 
@@ -770,6 +771,63 @@ int test_stream_observations() {
     return failures;
 }
 
+// Calls the Qwen parser keeps despite their names (undeclared, catalog spellings resolved to a
+// declared tool) come back in the next request's history without a 400, and a tool that
+// allowed_tools filters out for the turn never becomes a call.
+int test_salvaged_tool_calls() {
+    const auto tool = [](const char* name) {
+        return Json{
+            {"type", "function"},
+            {"function",
+             Json{{"name", name},
+                  {"parameters", Json{{"type", "object"},
+                                      {"properties", Json{{"path", Json{{"type", "string"}}}}}}}}}};
+    };
+    Json body     = base_request();
+    body["tools"] = Json::array({tool("Read"), tool("Write")});
+    body["tool_choice"] =
+        Json{{"type", "allowed_tools"},
+             {"allowed_tools",
+              Json{{"mode", "auto"},
+                   {"tools", Json::array({Json{{"type", "function"}, {"name", "Read"}}})}}}};
+    const OpenAIChatRequest request = parse(body);
+    const ninfer::PromptInput input = prompt(request.generation);
+    const std::size_t max_name      = request.generation.tool_name_max_length;
+
+    int failures = 0;
+    for (const char* filtered : {"Write", "srv.Write", "tools[\"srv\"][\"Write\"]"}) {
+        failures +=
+            check(ninfer::test::parse_model_call(input, max_name, filtered).tool_calls.empty(),
+                  std::string("allowed_tools-filtered call became structured: ") + filtered);
+    }
+
+    int kept = 0;
+    for (const std::string& name : ninfer::test::salvage_probe_names()) {
+        const auto parsed = ninfer::test::parse_model_call(input, max_name, name);
+        if (parsed.tool_calls.empty()) { continue; }
+        ++kept;
+        GenerationOutcome outcome;
+        outcome.finish_reason = ninfer::FinishReason::StopToken;
+        outcome.tool_calls    = parsed.tool_calls;
+        const Json message    = Json::parse(
+            make_chat_completion_response(identity(), outcome))["choices"][0]["message"];
+        Json next     = base_request();
+        next["tools"] = body["tools"];
+        next["messages"].push_back(Json{
+            {"role", "assistant"}, {"content", nullptr}, {"tool_calls", message["tool_calls"]}});
+        for (const Json& call : message["tool_calls"]) {
+            next["messages"].push_back(
+                Json{{"role", "tool"}, {"tool_call_id", call["id"]}, {"content", "unknown tool"}});
+        }
+        const ApiError error = api_error([&] { (void)parse(next); });
+        failures +=
+            check(error.message == "no exception",
+                  "kept call '" + name + "' could not come back in history: " + error.message);
+    }
+    failures += check(kept >= 4, "the probe names no longer exercise salvaged calls");
+    return failures;
+}
+
 int test_common_objects() {
     int failures      = 0;
     const Json models = Json::parse(make_models_list("qwen", 7, 240000));
@@ -800,6 +858,7 @@ int main() {
     failures += test_aggregate_response();
     failures += test_stream_response();
     failures += test_stream_observations();
+    failures += test_salvaged_tool_calls();
     failures += test_common_objects();
     if (failures == 0) { std::cout << "OpenAI Chat protocol tests passed\n"; }
     return failures == 0 ? 0 : 1;

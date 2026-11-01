@@ -18,6 +18,15 @@ extern const Nvfp4LinearShape kNvfp4N5120K17408;
 extern const Nvfp4LinearShape kNvfp4N17408K5120;
 extern const Nvfp4LinearShape kNvfp4N5120K8704;
 extern const Nvfp4LinearShape kNvfp4N5120K3072;
+// Dense FFN of width 14336 over hidden 5120: gate|up, down and the down projection's two-device
+// half.
+extern const Nvfp4LinearShape kNvfp4N28672K5120;
+extern const Nvfp4LinearShape kNvfp4N5120K14336;
+extern const Nvfp4LinearShape kNvfp4N5120K7168;
+// Two-device row halves of the GDN q|k|v|z and attention q|k|gate|v parents at hidden 5120 with 24
+// query / 4 key-value heads, as plain Linear problems.
+extern const Nvfp4LinearShape kNvfp4N8192K5120;
+extern const Nvfp4LinearShape kNvfp4N7168K5120;
 extern const Nvfp4LinearShape kNvfp4N8192K2560;
 extern const Nvfp4LinearShape kNvfp4N6656K2560;
 extern const Nvfp4LinearShape kNvfp4N124160K2560;

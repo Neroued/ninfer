@@ -238,43 +238,4 @@ SingleProjectionWeight prepare_linear_swiglu_weight(const WeightInput& gate,
     return single(inputs);
 }
 
-SparseMoeWeights
-prepare_sparse_moe_weights(const WeightInput& router, const WeightInput& shared_score,
-                           std::span<const WeightInput> expert_gate_up,
-                           std::span<const WeightInput> expert_down, const WeightInput& shared_gate,
-                           const WeightInput& shared_up, const WeightInput& shared_down) {
-    require(expert_gate_up.size() == 512 && expert_down.size() == 256,
-            "SparseMoe native input requires 256 experts");
-    require(matrix(router) == std::vector<std::uint64_t>{256, 2048} &&
-                matrix(shared_score) == std::vector<std::uint64_t>{1, 2048},
-            "SparseMoe router geometry differs");
-    for (const auto& input : expert_gate_up) {
-        require(matrix(input) == std::vector<std::uint64_t>{512, 2048},
-                "SparseMoe gate/up geometry differs");
-    }
-    for (const auto& input : expert_down) {
-        require(matrix(input) == std::vector<std::uint64_t>{2048, 512},
-                "SparseMoe down geometry differs");
-    }
-    require(matrix(shared_gate) == std::vector<std::uint64_t>{512, 2048} &&
-                matrix(shared_up) == matrix(shared_gate) &&
-                matrix(shared_down) == std::vector<std::uint64_t>{2048, 512},
-            "SparseMoe shared expert geometry differs");
-    const std::array router_inputs{router, shared_score};
-    const auto router_bank  = single(router_inputs);
-    const auto gate_up_bank = single(expert_gate_up);
-    const auto down_bank    = single(expert_down);
-    const auto shared       = prepare_linear_swiglu_weight(shared_gate, shared_up);
-    const auto down         = prepare_linear_weight(shared_down);
-    const auto gate_format  = gate_up_bank.weight.qtype;
-    const auto down_format  = down_bank.weight.qtype;
-    require(router_bank.weight.qtype == QType::BF16 && shared.weight.qtype == QType::Q8_G32_FP16 &&
-                down.weight.qtype == QType::Q8_G32_FP16 &&
-                ((gate_format == QType::Q4_G64_FP16 &&
-                  (down_format == QType::Q5_G64_FP16 || down_format == QType::Q6_G64_FP16)) ||
-                 (gate_format == QType::Q8_G32_FP16 && down_format == QType::Q8_G32_FP16)),
-            "SparseMoe native bank formats are unsupported");
-    return {router_bank.weight, gate_up_bank.weight, down_bank.weight, shared.weight, down.weight};
-}
-
 } // namespace ninfer::ops

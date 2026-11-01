@@ -27,6 +27,8 @@ public:
     DeviceBuffer(DeviceBuffer&& other) noexcept;
     DeviceBuffer& operator=(DeviceBuffer&& other) noexcept;
 
+    // Completes the fill before returning, like copy_from_host: the memset runs on the default
+    // stream, which the non-blocking streams of the consumers do not wait for.
     void fill(int byte_value = 0);
     // Completes the upload before returning. Callers must first order any prior device
     // accesses to the destination range.

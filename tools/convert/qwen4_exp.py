@@ -1,8 +1,13 @@
 """Qwen4Exp architecture adapter (Qwen3.8-Flash-Next): config, logical parameters, groups.
 
 The mathematics is defined in docs/maintainer/qwen4-exp-model.md. Shared pieces (gated
-attention, GDN, Vision) reuse the Qwen3.5 source mapping; hyper-connections, the QSA indexer,
-the n-gram PLE embedding and the expert banks are mapped here.
+attention, GDN, a dense SwiGLU FFN, Vision) reuse the Qwen3.5 source mapping; hyper-connections,
+the QSA indexer, the n-gram PLE embedding and the expert banks are mapped here.
+
+The FFN is the routed-expert MoE (``num_experts`` ...) or, for a dense Qwen4 checkpoint, the
+Qwen3.5 dense MLP (``intermediate_size``; ``mlp.{gate,up,down}_proj``, MTP included). The PLE is
+optional: no (or an empty) ``ple_layer_ids`` converts no n-gram embedding and writes no n-gram
+field.
 
 Routed expert sources are resolved per expert. A checkpoint that stores fused BF16
 ``experts.gate_up_proj``/``down_proj`` banks exposes them as row ranges; a ModelOpt NVFP4
@@ -23,7 +28,7 @@ from .qwen3_5 import (
     _f32,
     _fixed,
     _positive,
-    text_config as qwen3_5_text_config,
+    text_fields as qwen3_5_text_fields,
     vision_config as qwen3_5_vision_config,
 )
 from .resources import load_resources
@@ -37,6 +42,8 @@ from .sources.modelopt import (
 )
 from .sources.safetensors import SafetensorsSource, tensor_source
 
+# Source architectures of the Qwen4Exp mathematics (Qwen3.8-Flash-Next); the artifact's Text is
+# Qwen4ExpForCausalLM (qwen4_exp_text) and its MTP layer Qwen4ExpMTP.
 ARCHITECTURES = ("Qwen4ExpForConditionalGeneration", "Qwen4ExpForCausalLM")
 
 _QWEN4_FIELDS = (
@@ -46,6 +53,8 @@ _QWEN4_FIELDS = (
     "indexer_head_dim",
     "indexer_budget",
     "indexer_compress_ratio",
+)
+_PLE_FIELDS = (
     "ple_embed_dim",
     "ple_conv_kernel_size",
     "ngram_size",
@@ -53,6 +62,7 @@ _QWEN4_FIELDS = (
     "ngram_vocab_size_base",
     "make_ngram_vocab_size_divisible_by",
 )
+_MOE_FIELDS = ("num_experts", "num_experts_per_tok", "moe_intermediate_size", "shared_expert_intermediate_size")
 
 
 def is_qwen4_exp(config: dict) -> bool:
@@ -60,16 +70,29 @@ def is_qwen4_exp(config: dict) -> bool:
     return isinstance(architectures, list) and bool(set(architectures) & set(ARCHITECTURES))
 
 
+def is_dense(raw: dict) -> bool:
+    """A dense Qwen4 FFN: ``intermediate_size`` and no routed experts."""
+    experts = raw.get("num_experts")
+    if experts in (None, 0):
+        if "intermediate_size" not in raw:
+            raise ValueError("text: a Qwen4 config needs num_experts (MoE) or intermediate_size (dense)")
+        return True
+    return False
+
+
 def text_config(source: dict, *, mtp: bool) -> dict:
     architectures = source.get("architectures")
     if not isinstance(architectures, list) or len(architectures) != 1 or not is_qwen4_exp(source):
         raise ValueError(f"unsupported Qwen4Exp architecture {architectures!r}")
     raw = source.get("text_config", source)
-    # The shared fields follow the Qwen3.5 MoE normalization; its architecture guard is bypassed.
-    shared = qwen3_5_text_config({"architectures": ["Qwen3_5MoeForCausalLM"], "text_config": raw}, mtp=mtp)
-    shared["architectures"] = ["Qwen4ExpForCausalLM"]
-    shared["model_type"] = "qwen4_exp_text"
-    _fixed(raw, "norm_topk_prob", True, "text")
+    dense = is_dense(raw)
+    # The shared fields follow the Qwen3.5 normalization (dense, or the routed-expert fields). A dense
+    # config may carry the HF MoE defaults: only intermediate_size is read.
+    base_raw = {k: v for k, v in raw.items() if k not in _MOE_FIELDS} if dense else raw
+    shared = {"architectures": ["Qwen4ExpForCausalLM"], "model_type": "qwen4_exp_text"}
+    shared.update(qwen3_5_text_fields(base_raw, mtp=mtp, moe=not dense))
+    if not dense:
+        _fixed(raw, "norm_topk_prob", True, "text")
     _fixed(raw, "indexer_kv_heads", 1, "text")
     _fixed(raw, "mtp_use_dedicated_embeddings", False, "text")
     gate = raw.get("output_gate_type") or raw.get("hidden_act", "silu")
@@ -79,28 +102,31 @@ def text_config(source: dict, *, mtp: bool) -> dict:
     for key in _QWEN4_FIELDS:
         shared[key] = _positive(raw.get(key), "text." + key)
     shared["indexer_kv_heads"] = 1
-    seed = raw.get("seed", 1234)
-    if type(seed) is not int or seed < 0:
-        raise ValueError("text.seed must be a nonnegative integer")
-    shared["seed"] = seed
-    eos = raw.get("eos_token_id", source.get("eos_token_id"))
-    eos = eos[0] if isinstance(eos, list) and eos else eos
-    if type(eos) is not int or not 0 <= eos < shared["vocab_size"]:
-        raise ValueError("text.eos_token_id must name one embedding row")
-    shared["eos_token_id"] = eos
-    layers = raw.get("ple_layer_ids")
-    if (
-        not isinstance(layers, list)
-        or len(layers) != 1
-        or type(layers[0]) is not int
-        or not 1 <= layers[0] <= shared["num_hidden_layers"]
-        or shared["layer_types"][layers[0] - 1] != "linear_attention"
-    ):
-        raise ValueError("text.ple_layer_ids must name exactly one one-indexed GDN block")
-    shared["ple_layer_ids"] = list(layers)
-    heads = (shared["ngram_size"] - 1) * shared["heads_per_ngram"]
-    if shared["ngram_size"] < 2 or shared["ple_embed_dim"] % heads:
-        raise ValueError("n-gram heads must divide the PLE embedding width")
+    layers = raw.get("ple_layer_ids") or []
+    if layers:
+        if (
+            not isinstance(layers, list)
+            or len(layers) != 1
+            or type(layers[0]) is not int
+            or not 1 <= layers[0] <= shared["num_hidden_layers"]
+            or shared["layer_types"][layers[0] - 1] != "linear_attention"
+        ):
+            raise ValueError("text.ple_layer_ids must be empty or name exactly one one-indexed GDN block")
+        for key in _PLE_FIELDS:
+            shared[key] = _positive(raw.get(key), "text." + key)
+        seed = raw.get("seed", 1234)
+        if type(seed) is not int or seed < 0:
+            raise ValueError("text.seed must be a nonnegative integer")
+        shared["seed"] = seed
+        eos = raw.get("eos_token_id", source.get("eos_token_id"))
+        eos = eos[0] if isinstance(eos, list) and eos else eos
+        if type(eos) is not int or not 0 <= eos < shared["vocab_size"]:
+            raise ValueError("text.eos_token_id must name one embedding row")
+        shared["eos_token_id"] = eos
+        shared["ple_layer_ids"] = list(layers)
+        heads = (shared["ngram_size"] - 1) * shared["heads_per_ngram"]
+        if shared["ngram_size"] < 2 or shared["ple_embed_dim"] % heads:
+            raise ValueError("n-gram heads must divide the PLE embedding width")
     if shared["indexer_budget"] % shared["indexer_compress_ratio"]:
         raise ValueError("QSA budget must be a whole number of blocks")
     rotary = int(shared["head_dim"] * shared["rope_parameters"]["partial_rotary_factor"])
@@ -343,7 +369,10 @@ class _Qwen4Builder(_Builder):
             self.indexer(prefix, source_prefix, store, config)
         else:
             self.gdn(prefix, source_prefix, store, config)
-        self.moe(prefix, source_prefix, store, config)
+        if "num_experts" in config:
+            self.moe(prefix, source_prefix, store, config)
+        else:
+            self.dense(prefix, source_prefix, store, config["hidden_size"], config["intermediate_size"])
         if ple:
             self.ple(prefix, source_prefix, store, config)
 
@@ -423,7 +452,7 @@ def build_model(
     head_inputs = ("text/final_hidden",) + (("mtp/final_hidden",) if "mtp" in selected else ())
     builder.add("text/output_head", base, "lm_head.weight", (r, h), inputs=head_inputs)
     builder.hyper_connection("text/hc_head/", text_prefix + "hyper_connection_mixer.", base, config, inject=False)
-    ple_block = config["ple_layer_ids"][0] - 1
+    ple_block = config["ple_layer_ids"][0] - 1 if "ple_layer_ids" in config else -1
     for i, kind in enumerate(config["layer_types"]):
         builder.block(
             f"text/layers/{i}/",

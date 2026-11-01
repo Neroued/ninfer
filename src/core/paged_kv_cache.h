@@ -51,6 +51,10 @@ struct KVPlaneGeometry {
     std::int32_t leading_extent = 0;
     std::int32_t head_extent    = 0;
     std::size_t alignment       = 256;
+    // Active KV in RAM (--kv-ram-active): the plane lives in pinned, device-mapped Host memory
+    // (a UVA pointer kernels dereference over PCIe) instead of the pool's device backing. Page
+    // bookkeeping, tables and copies are unchanged; only where the bytes are differs.
+    bool host = false;
 
     friend bool operator==(const KVPlaneGeometry&, const KVPlaneGeometry&) = default;
 };
@@ -87,6 +91,7 @@ struct DeviceKVPagePoolLayout {
     DeviceKVPagePoolSpec spec;
     std::vector<DeviceKVPlaneLayout> planes;
 
+    // Device bytes of the planes (Host planes excluded).
     [[nodiscard]] std::size_t payload_bytes() const noexcept;
 };
 
@@ -97,8 +102,10 @@ struct KVExecutionTableLayout {
     [[nodiscard]] std::size_t metadata_bytes() const noexcept;
 };
 
-[[nodiscard]] DeviceKVPagePoolLayout plan_device_kv_page_pool(LayoutBuilder& builder,
-                                                              const DeviceKVPagePoolSpec& spec);
+// Host planes (KVPlaneGeometry::host) are planned in `host_builder`, which must then be given.
+[[nodiscard]] DeviceKVPagePoolLayout
+plan_device_kv_page_pool(LayoutBuilder& builder, const DeviceKVPagePoolSpec& spec,
+                         LayoutBuilder* host_builder = nullptr);
 
 [[nodiscard]] KVExecutionTableLayout plan_kv_execution_tables(LayoutBuilder& builder,
                                                               const KVExecutionTableSpec& spec);
@@ -207,7 +214,9 @@ private:
 
 class DeviceKVPagePool {
 public:
-    DeviceKVPagePool(DeviceSpan backing, const DeviceKVPagePoolLayout& layout);
+    // `host` backs the Host planes (pinned, device-mapped memory laid out by the host builder).
+    DeviceKVPagePool(DeviceSpan backing, const DeviceKVPagePoolLayout& layout,
+                     DeviceSpan host = {});
 
     DeviceKVPagePool(const DeviceKVPagePool&)            = delete;
     DeviceKVPagePool& operator=(const DeviceKVPagePool&) = delete;
@@ -292,6 +301,20 @@ public:
         return mirror_ != nullptr ? 2U : 1U;
     }
 
+    /**
+     * Active KV in RAM: called with the stream of every write this pool issues into page bytes
+     * (zero, copy, relocation, Host/disk restore) and, through the execution tables, of every
+     * table publication that rebinds an already published logical page. The listener invalidates
+     * device caches keyed by logical page (decoder_state.cpp); it must only enqueue on `stream`.
+     */
+    void set_write_listener(std::function<void(cudaStream_t)> listener) {
+        write_listener_ = std::move(listener);
+    }
+
+    void notify_write(cudaStream_t stream) const {
+        if (write_listener_) { write_listener_(stream); }
+    }
+
     void copy_to_host(std::span<const DeviceKVPageHandle> source, HostKVAllocationView destination,
                       cudaStream_t stream = nullptr) const;
     void copy_from_host(HostKVAllocationConstView source,
@@ -352,6 +375,7 @@ private:
     DeviceKVMirror mirror_where_;
     std::uint32_t backed_pages_ = 0;
     std::function<void(std::uint32_t)> grow_backing_;
+    std::function<void(cudaStream_t)> write_listener_;
 };
 
 struct DeviceKVPageReservationRequest {
@@ -455,7 +479,13 @@ private:
     [[nodiscard]] bool valid_handle(KVExecutionRowHandle handle) const noexcept;
     bool release_row(std::int32_t row, std::uint32_t generation) noexcept;
     void publish_indices(KVExecutionRowHandle row, std::uint32_t logical_begin,
-                         std::span<const std::int32_t> indices, cudaStream_t stream);
+                         std::span<const std::int32_t> indices, cudaStream_t stream,
+                         bool rebinds = false);
+    // Starts a publication of `count` entries from `logical_begin` of `row`: records the row's
+    // published extent before it in published_before_ (entries below it that change rebind a
+    // logical page, for the page pool's write listener), extends it, and returns whether this is
+    // the row's first publication since it was acquired.
+    bool begin_publication(std::int32_t row, std::uint32_t logical_begin, std::size_t count);
 
     KVExecutionTableSpec spec_;
     const DeviceKVPagePool* pages_ = nullptr;
@@ -463,7 +493,9 @@ private:
     PinnedHostBuffer host_shadow_;
     std::vector<bool> row_in_use_;
     std::vector<std::uint32_t> row_generations_;
-    KVExecutionTablePool* mirror_ = nullptr;
+    std::vector<std::uint32_t> published_extent_;
+    std::uint32_t published_before_ = 0;
+    KVExecutionTablePool* mirror_   = nullptr;
     DeviceKVMirror mirror_where_;
     std::vector<std::optional<KVExecutionRowLease>> mirror_rows_;
 };

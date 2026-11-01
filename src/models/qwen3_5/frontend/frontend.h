@@ -2,7 +2,6 @@
 
 #include "ninfer/types.h"
 #include "models/qwen3_5/frontend/output_session.h"
-#include "models/registry.h"
 #include "runtime/contract/request.h"
 
 #include <array>
@@ -15,11 +14,10 @@
 
 namespace ninfer::models::qwen3_5 {
 
-[[nodiscard]] ModelSamplingDefaults default_sampling(Architecture architecture);
+[[nodiscard]] ModelSamplingDefaults default_sampling();
 
 struct FrontendOptions {
     std::filesystem::path chat_template_path;
-    Architecture architecture              = Architecture::Qwen3_5;
     bool vision_enabled                    = true;
     std::uint32_t max_context              = 2'048;
     std::size_t media_cache_bytes          = kDefaultMediaCacheBytes;

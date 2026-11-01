@@ -17,6 +17,7 @@ void add_pool(const qwen3_5::PagedKVCacheLayout& pool, std::uint32_t step_pages,
               std::vector<ElasticRangeSpec>& out) {
     const std::uint32_t pages = pool.pages.spec.page_group_count;
     for (const DeviceKVPlaneLayout& plane : pool.pages.planes) {
+        if (plane.geometry.host) { continue; } // active KV in RAM: not in the elastic arena
         const LayoutRegion& r = plane.storage.region;
         if (pages == 0 || r.bytes % pages != 0) {
             throw std::logic_error("elastic KV: a KV plane is not page-major");
@@ -69,6 +70,7 @@ Qwen4ElasticVram::Qwen4ElasticVram(std::vector<Rank> ranks, execution::Qwen4Offl
         const auto planes = [&](const qwen3_5::PagedKVCacheLayout& pool, std::vector<Plane>& out) {
             const std::uint32_t pages = pool.pages.spec.page_group_count;
             for (const DeviceKVPlaneLayout& plane : pool.pages.planes) {
+                if (plane.geometry.host) { continue; } // Host planes have no elastic range
                 out.push_back(Plane{index++, plane.storage.region.bytes / pages});
             }
         };

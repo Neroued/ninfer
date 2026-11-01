@@ -11,7 +11,9 @@ const std::array kShapes{
     &kNvfp4N5120K17408, &kNvfp4N17408K5120,  &kNvfp4N5120K8704,   &kNvfp4N5120K3072,
     &kNvfp4N8192K2560,  &kNvfp4N6656K2560,   &kNvfp4N124160K2560, &kNvfp4N512K2560,
     &kNvfp4N640K2560,   &kNvfp4N2560K3072,   &kNvfp4N13312K2560,  &kNvfp4N16384K2560,
-    &kNvfp4N1280K2560,  &kNvfp4N248320K2560, &kNvfp4N2560K6144,   &kNvfp4N2560K640};
+    &kNvfp4N1280K2560,  &kNvfp4N248320K2560, &kNvfp4N2560K6144,   &kNvfp4N2560K640,
+    &kNvfp4N28672K5120, &kNvfp4N5120K14336,  &kNvfp4N5120K7168,   &kNvfp4N8192K5120,
+    &kNvfp4N7168K5120};
 
 const Nvfp4LinearShape& resolve_shape(std::int32_t n, std::int32_t k, LinearPolicy policy) {
     if (!valid_linear_policy(policy))

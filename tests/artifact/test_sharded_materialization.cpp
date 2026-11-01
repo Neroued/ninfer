@@ -650,6 +650,46 @@ void large_upload(ExecutionContext& execution) {
     }
 }
 
+// The page-locked limit also holds what the Engine page-locks after the weights
+// (MaterializationPlan::host_pinned_reserved_bytes: active KV in RAM's Host planes). With "fp8" a
+// pageable candidate and a limit that holds both host-mapped parents, nothing is pageable; one
+// reserved byte moves "fp8" to pageable memory; a reservation of the whole limit fails the load.
+void host_mapped_reservation(const Fixture& fixture, std::span<DeviceContext* const> devices) {
+    Reader reader(fixture.entry);
+    const auto plan_with = [&](std::uint64_t reserved, bool whole_limit) {
+        Binder binder(reader, 1);
+        binder.set_shard_resolver([&reader](ObjectHandle object, const WeightGeometry&) {
+            return host_mapped_resolver(reader, object);
+        });
+        (void)bind_all(binder);
+        auto plan = std::move(binder).finish();
+        for (auto& placement : plan.host_mapped_objects) {
+            if (reader.directory().tensor(placement.object).id == "fp8") {
+                placement.pageable_rank = 1;
+            }
+        }
+        plan.host_pinned_limit_bytes    = plan.host_mapped_bytes;
+        plan.host_pinned_reserved_bytes = whole_limit ? plan.host_mapped_bytes : reserved;
+        return plan;
+    };
+    {
+        auto backing = materialize(reader, plan_with(0, false), devices);
+        require(backing.stats().host_pageable_bytes == 0,
+                "a page-locked limit that holds every host-mapped parent made one pageable");
+    }
+    {
+        auto backing = materialize(reader, plan_with(1, false), devices);
+        require(backing.stats().host_pageable_bytes != 0 &&
+                    backing.stats().host_pageable_objects == 1,
+                "a reservation inside the page-locked limit kept every host-mapped parent pinned");
+    }
+    bool refused = false;
+    try {
+        (void)materialize(reader, plan_with(0, true), devices);
+    } catch (const ArtifactError&) { refused = true; }
+    require(refused, "a reservation of the whole page-locked limit left room for the weights");
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -673,6 +713,7 @@ int main(int argc, char** argv) {
             single_device_upload(fixture, device);
             DeviceContext* const one[] = {&device};
             host_mapped_upload(fixture, one);
+            host_mapped_reservation(fixture, one);
             std::cout << "one-device artifact placement checks passed\n";
             return 0;
         }

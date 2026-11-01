@@ -1022,7 +1022,11 @@ void filter_allowed_tools(const Json& choice, ParsedPromptFields& out) {
     std::vector<ToolDefinition> effective;
     effective.reserve(selected.size());
     for (ToolDefinition& tool : out.prompt.generation.tools) {
-        if (selected.contains(tool.name)) { effective.push_back(std::move(tool)); }
+        if (selected.contains(tool.name)) {
+            effective.push_back(std::move(tool));
+        } else {
+            out.prompt.generation.filtered_out_tool_names.push_back(tool.name);
+        }
     }
     out.prompt.generation.tools = std::move(effective);
 }

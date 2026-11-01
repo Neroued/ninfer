@@ -15,6 +15,12 @@
 //   Up + mix: programmatic dependent of Down, 16 hidden columns (64 Up rows) per CTA. Its Up rows
 //     (one tensor-map copy per stream) and mix inputs are requested before the dependency wait;
 //     then low, the Up contraction, the gate mix and the committed residual.
+// Q8 also runs at H = 5120: a lane row segment of Down is then twice the shared
+// memory budget, so each lane splits in Parts = 2 CTAs of 2560 K (a cluster of 2 S = 8 CTAs per
+// tile, the scheme of the BF16 section) whose square partials meet through distributed shared
+// memory (the Down kernel is a template on Parts = H / 2560; Parts = 1 is the H = 2560 code). Its
+// Up launch has H / 16 = 320 CTAs, which load their operands straight into registers (staged, they
+// would need 1.5 waves). NVFP4 and BF16 run at H = 2560 only.
 // The decomposition (Down split by lane, MMA with the tokens as N, exact magic-number widening of
 // Q8 codes to FP16) comes from the fused BF16/FP8 hyper-connection kernel of ninfer6000
 // (src/ops/launcher/hyperconnection.cu, Copyright Lars Karlslund, Apache-2.0).
@@ -274,20 +280,30 @@ __device__ __forceinline__ std::int64_t fp4_scale_word(int row, int tile, int k_
            ((row & 127) >> 5) * 4;
 }
 
-template <bool Fp4, int Tokens>
-__global__ void __cluster_dims__(kS, 1, 1) __launch_bounds__(kThreads, 2)
+// Parts CTAs per lane, each contracting kH = 2560 K of it: the mixer's hidden width is kH * Parts
+// (Parts = 1 at H = 2560, 2 at H = 5120; NVFP4 only 1).
+template <bool Fp4, int Tokens, int Parts>
+__global__ void __cluster_dims__(kS* Parts, 1, 1) __launch_bounds__(kThreads, 2)
     hc_down_kernel(const __grid_constant__ HcFusedMaps maps, HcFusedMix p) {
-    using L = HcLayout<Fp4>;
+    static_assert(Parts == 1 || (Parts == 2 && !Fp4));
+    using L                = HcLayout<Fp4>;
+    constexpr int kHidden  = kH * Parts;
+    constexpr int kWide    = kS * kHidden;
+    constexpr int kCluster = kS * Parts;
     __shared__ DownShared sh;
     const int tid                 = static_cast<int>(threadIdx.x);
     const int lane                = tid & 31;
     const int warp                = tid >> 5;
     const int group               = lane >> 2;
     const int quad                = lane & 3;
-    const int stream              = static_cast<int>(blockIdx.x) % kS; // = rank in the cluster
-    const int tile                = static_cast<int>(blockIdx.x) / kS;
+    const int rank                = static_cast<int>(blockIdx.x) % kCluster; // = cluster rank
+    const int stream              = rank / Parts;
+    const int part                = rank % Parts;
+    const int k_part              = kH * part; // first K of the CTA inside its lane
+    const int tile                = static_cast<int>(blockIdx.x) / kCluster;
     const int row0                = tile * kTile;
     const unsigned weight_barrier = shared_address(&sh.weight_barrier);
+    cooperative_groups::cluster_group cluster = cooperative_groups::this_cluster();
 
     // Constant inputs first (they do not depend on the previous launch, so they are requested
     // while it finishes): the lane's norm weights (16-byte asynchronous copies), the NVFP4 scale
@@ -295,7 +311,7 @@ __global__ void __cluster_dims__(kS, 1, 1) __launch_bounds__(kThreads, 2)
     for (int i = tid; i < kH * 2 / 16; i += kThreads)
         asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(
                          shared_address(sh.stage.norm + 8 * i)),
-                     "l"(p.norm + kH * stream + 8 * i)
+                     "l"(p.norm + kHidden * stream + k_part + 8 * i)
                      : "memory");
     asm volatile("cp.async.commit_group;\n" ::: "memory");
     const bool has_token      = group < Tokens;
@@ -320,10 +336,11 @@ __global__ void __cluster_dims__(kS, 1, 1) __launch_bounds__(kThreads, 2)
         // Whole boxes count, rows past the matrix included (zero filled).
         constexpr unsigned kBytes = kTile * L::kRowBytes + (Fp4 ? 0 : kTile * kDownScaleRow * 2);
         barrier_expect(weight_barrier, kBytes);
-        tensor_load_3d(sh.codes, &maps.down_codes, 0, (L::kRowBytes / 128) * stream, row0,
+        // The CTA's segment is the rank-th of the row (lane-major, then part).
+        tensor_load_3d(sh.codes, &maps.down_codes, 0, (L::kRowBytes / 128) * rank, row0,
                        weight_barrier);
         if constexpr (!Fp4)
-            tensor_load_2d(sh.scales, &maps.down_scales, kDownScaleRow * stream, row0,
+            tensor_load_2d(sh.scales, &maps.down_scales, kDownScaleRow * rank, row0,
                            weight_barrier);
     }
     // The residual, the pending block output and its gates come from earlier launches. The Up
@@ -334,13 +351,14 @@ __global__ void __cluster_dims__(kS, 1, 1) __launch_bounds__(kThreads, 2)
     std::uint32_t raw[L::kPieces][L::kWords], yv[L::kPieces][L::kWords];
     float inject = 0.0F;
     if (has_token) {
-        const __nv_bfloat16* residual =
-            p.residual + static_cast<std::int64_t>(kSH) * group + kH * stream + k_warp;
+        const __nv_bfloat16* residual = p.residual + static_cast<std::int64_t>(kWide) * group +
+                                        kHidden * stream + k_part + k_warp;
 #pragma unroll
         for (int i = 0; i < L::kPieces; ++i) load_words(raw[i], residual + L::k(quad, i));
         if (combine) {
-            inject                 = p.previous_inject[stream + kS * group];
-            const __nv_bfloat16* y = p.previous_y + static_cast<std::int64_t>(kH) * group + k_warp;
+            inject = p.previous_inject[stream + kS * group];
+            const __nv_bfloat16* y =
+                p.previous_y + static_cast<std::int64_t>(kHidden) * group + k_part + k_warp;
 #pragma unroll
             for (int i = 0; i < L::kPieces; ++i) load_words(yv[i], y + L::k(quad, i));
         }
@@ -371,15 +389,31 @@ __global__ void __cluster_dims__(kS, 1, 1) __launch_bounds__(kThreads, 2)
     square += __shfl_xor_sync(0xffffffffU, square, 2);
     if (quad == 0 && has_token) sh.squares[warp][group] = square;
     asm volatile("cp.async.wait_group 0;\n" ::: "memory");
-    __syncthreads(); // square partials, norm weights, barrier initialized
+    // Square partials (of every part of the lane), norm weights, barrier initialized.
+    if constexpr (Parts == 1)
+        __syncthreads();
+    else
+        cluster.sync(); // release/acquire at cluster scope also orders the CTA's own threads
 
     std::uint32_t activation[L::kPieces][L::kWords];
     if (has_token) {
         float sum = 0.0F;
+        if constexpr (Parts == 1) {
 #pragma unroll
-        for (int w = 0; w < kWarps; ++w) sum += sh.squares[w][group];
-        const float inv = rsqrtf(sum / static_cast<float>(kH) + p.eps);
-        if (tile == 0 && warp == 0 && quad == 0) p.square_sums[stream + kS * group] = sum;
+            for (int w = 0; w < kWarps; ++w) sum += sh.squares[w][group];
+        } else {
+            // Fixed order (part 0, then part 1): every part of the lane gets the same sum.
+#pragma unroll
+            for (int h = 0; h < Parts; ++h) {
+                const float* squares =
+                    cluster.map_shared_rank(&sh.squares[0][0], Parts * stream + h);
+#pragma unroll
+                for (int w = 0; w < kWarps; ++w) sum += squares[w * 8 + group];
+            }
+        }
+        const float inv = rsqrtf(sum / static_cast<float>(kHidden) + p.eps);
+        if (tile == 0 && part == 0 && warp == 0 && quad == 0)
+            p.square_sums[stream + kS * group] = sum;
 #pragma unroll
         for (int i = 0; i < L::kPieces; ++i) {
             std::uint32_t n[L::kWords];
@@ -460,19 +494,18 @@ __global__ void __cluster_dims__(kS, 1, 1) __launch_bounds__(kThreads, 2)
         for (int w = 0; w < kWarps; ++w) sum += warp_sums[w][tid / 8][tid % 8];
         tile_sums[tid / 8][tid % 8] = sum;
     }
-    cooperative_groups::cluster_group cluster = cooperative_groups::this_cluster();
     cluster.sync();
-    if (stream == 0 && tid < kTile * 8) {
+    if (rank == 0 && tid < kTile * 8) {
         const int row   = row0 + tid / 8;
         const int token = tid % 8;
         if (token < Tokens && row < p.rows) {
-            float lane_sum[kS];
+            float lane_sum[kCluster]; // in rank order: lane-major, then part
 #pragma unroll
-            for (int s = 0; s < kS; ++s)
+            for (int s = 0; s < kCluster; ++s)
                 lane_sum[s] = *cluster.map_shared_rank(&tile_sums[tid / 8][token], s);
             float v = 0.0F;
 #pragma unroll
-            for (int s = 0; s < kS; ++s) v += lane_sum[s];
+            for (int s = 0; s < kCluster; ++s) v += lane_sum[s];
             v *= 1.0F / kS;
             if constexpr (Fp4) v /= p.down_divisor;
             if (row < kR)
@@ -494,7 +527,7 @@ struct MixItem {
     float committed[kS] = {}, mix_norm[kS] = {};
 };
 
-template <int Tokens>
+template <int Tokens, int Hidden>
 __device__ __forceinline__ MixItem mix_item(const HcFusedMix& p, int tid, int column_begin) {
     MixItem item;
     item.active = tid < Tokens * kCols;
@@ -502,18 +535,20 @@ __device__ __forceinline__ MixItem mix_item(const HcFusedMix& p, int tid, int co
     item.column = tid % kCols;
     item.d      = column_begin + item.column;
     if (item.active) {
-        const float y = p.previous_y != nullptr
-                            ? __bfloat162float(
-                                  p.previous_y[item.d + static_cast<std::int64_t>(kH) * item.token])
-                            : 0.0F;
+        const float y =
+            p.previous_y != nullptr
+                ? __bfloat162float(
+                      p.previous_y[item.d + static_cast<std::int64_t>(Hidden) * item.token])
+                : 0.0F;
 #pragma unroll
         for (int s = 0; s < kS; ++s) {
-            const float h = __bfloat162float(
-                p.residual[static_cast<std::int64_t>(kSH) * item.token + kH * s + item.d]);
+            const float h =
+                __bfloat162float(p.residual[static_cast<std::int64_t>(kS * Hidden) * item.token +
+                                            Hidden * s + item.d]);
             item.committed[s] = p.previous_y != nullptr
                                     ? committed_value(h, p.previous_inject[s + kS * item.token], y)
                                     : h;
-            item.mix_norm[s]  = 1.0F + __bfloat162float(p.norm[kH * s + item.d]);
+            item.mix_norm[s]  = 1.0F + __bfloat162float(p.norm[Hidden * s + item.d]);
         }
     }
     return item;
@@ -521,7 +556,7 @@ __device__ __forceinline__ MixItem mix_item(const HcFusedMix& p, int tid, int co
 
 // After the dependency wait: the Down launch's low-rank activation (16-bit words, FP16 or BF16)
 // into shared memory and the inverse RMS of each (token, stream).
-template <int Tokens, typename Low>
+template <int Tokens, int Hidden, typename Low>
 __device__ __forceinline__ void stage_low(const HcFusedMix& p, int tid, Low (*low)[kLowStride16],
                                           float* inverse_rms) {
     static_assert(sizeof(Low) == 2);
@@ -531,11 +566,12 @@ __device__ __forceinline__ void stage_low(const HcFusedMix& p, int tid, Low (*lo
             *reinterpret_cast<const uint4*>(p.low + t * kR + part * 8);
     }
     if (tid < Tokens * kS)
-        inverse_rms[tid] = rsqrtf(p.square_sums[tid] / static_cast<float>(kH) + p.eps);
+        inverse_rms[tid] = rsqrtf(p.square_sums[tid] / static_cast<float>(Hidden) + p.eps);
 }
 
 // The gate mix of one item over the CTA's Up logits [64][8] (row s * 16 + column, token), and the
 // committed residual with a pending combine.
+template <int Hidden>
 __device__ __forceinline__ void finish_mix(const HcFusedMix& p, const MixItem& item,
                                            const float (*logits)[8], const float* inverse_rms) {
     if (!item.active) return;
@@ -543,20 +579,21 @@ __device__ __forceinline__ void finish_mix(const HcFusedMix& p, const MixItem& i
 #pragma unroll
     for (int s = 0; s < kS; ++s) {
         if (p.previous_y != nullptr)
-            p.residual[static_cast<std::int64_t>(kSH) * item.token + kH * s + item.d] =
+            p.residual[static_cast<std::int64_t>(kS * Hidden) * item.token + Hidden * s + item.d] =
                 __float2bfloat16_rn(item.committed[s]);
         const float normalized =
             item.committed[s] * inverse_rms[item.token * kS + s] * item.mix_norm[s];
         mixed = fmaf(normalized, sigmoidf_(logits[s * kCols + item.column][item.token]), mixed);
     }
-    p.mixed[item.d + static_cast<std::int64_t>(kH) * item.token] =
+    p.mixed[item.d + static_cast<std::int64_t>(Hidden) * item.token] =
         __float2bfloat16_rn(mixed * (1.0F / kS));
 }
 
 template <bool Fp4, int Tokens>
 __global__ void __launch_bounds__(kUpThreads)
     hc_up_mix_kernel(const __grid_constant__ HcFusedMaps maps, HcFusedMix p) {
-    using L = HcLayout<Fp4>;
+    using L               = HcLayout<Fp4>;
+    constexpr int kHidden = kH;
     __shared__ UpShared sh;
     const int tid          = static_cast<int>(threadIdx.x);
     const int lane         = tid & 31;
@@ -577,18 +614,18 @@ __global__ void __launch_bounds__(kUpThreads)
         for (int s = 0; s < kS; ++s) {
             if constexpr (Fp4) {
                 tensor_load_2d(sh.codes[0] + s * kCols * L::kUpRowBytes, &maps.up_codes, 0,
-                               s * kH + column_begin, barrier);
+                               s * kHidden + column_begin, barrier);
             } else {
-                tensor_load_3d(sh.codes[s * kCols], &maps.up_codes, 0, 0, s * kH + column_begin,
-                               barrier);
+                tensor_load_3d(sh.codes[s * kCols], &maps.up_codes, 0, 0,
+                               s * kHidden + column_begin, barrier);
                 bulk_copy(sh.scales[s * kCols],
                           p.up_scales +
-                              (static_cast<std::int64_t>(s) * kH + column_begin) * kUpGroups,
+                              (static_cast<std::int64_t>(s) * kHidden + column_begin) * kUpGroups,
                           kCols * kUpGroups * 2, barrier);
             }
         }
     }
-    const int top_row = warp * 16 + group; // local row; global row warp * kH + column_begin + group
+    const int top_row = warp * 16 + group; // local row; global row warp * H + column_begin + group
     constexpr int kScaleTiles = Fp4 ? kR / 64 : 1;
     std::uint32_t scale_top[kScaleTiles], scale_bottom[kScaleTiles];
     if constexpr (Fp4) {
@@ -602,10 +639,10 @@ __global__ void __launch_bounds__(kUpThreads)
         }
     }
     // Mix inputs (outputs of earlier launches, not of the Down launch).
-    const MixItem item = mix_item<Tokens>(p, tid, column_begin);
+    const MixItem item = mix_item<Tokens, kHidden>(p, tid, column_begin);
 
     cudaGridDependencySynchronize(); // the Down launch has completed: low, square sums, inject
-    stage_low<Tokens>(p, tid, sh.low, sh.inverse_rms);
+    stage_low<Tokens, kHidden>(p, tid, sh.low, sh.inverse_rms);
     __syncthreads(); // also orders the barrier initialization before other threads wait on it
     barrier_wait(barrier);
 
@@ -656,7 +693,81 @@ __global__ void __launch_bounds__(kUpThreads)
     sh.logits[top_row + 8][2 * quad + 1] = acc[3];
     __syncthreads();
 
-    finish_mix(p, item, sh.logits, sh.inverse_rms);
+    finish_mix<kHidden>(p, item, sh.logits, sh.inverse_rms);
+}
+
+// Q8 Up + mix at H = 2 kH: the arithmetic of hc_up_mix_kernel over 2 kH / 16 CTAs, with the lane's
+// operand words (codes of rows g and g + 8, their group scales) loaded straight into registers
+// before the dependency wait, as the BF16 Up. Staged in shared memory (29.5 KiB per CTA) the 320
+// CTAs would need 1.5 waves; with only low, logits and the RMS staged (7.4 KiB) they are all
+// resident.
+struct alignas(16) UpSharedWide {
+    __half low[8][kLowStride16];
+    float logits[kUpRows][8];
+    float inverse_rms[8 * kS];
+};
+
+template <int Tokens>
+__global__ void __launch_bounds__(kUpThreads, 5) // 5 CTAs per SM: all 320 resident
+    hc_up_mix_wide_kernel(const __grid_constant__ HcFusedMaps, HcFusedMix p) {
+    constexpr int kHidden = 2 * kH;
+    constexpr int kChunks = kR / 32; // 10 Q8 groups per row
+    __shared__ UpSharedWide sh;
+    const int tid          = static_cast<int>(threadIdx.x);
+    const int lane         = tid & 31;
+    const int warp         = tid >> 5;
+    const int group        = lane >> 2;
+    const int quad         = lane & 3;
+    const int column_begin = static_cast<int>(blockIdx.x) * kCols;
+
+    cudaTriggerProgrammaticLaunchCompletion(); // dependents still wait for our completion
+    // Warp w contracts stream w's Up rows of columns [column_begin, +16): rows g and g + 8 here.
+    const std::int64_t row = static_cast<std::int64_t>(warp) * kHidden + column_begin + group;
+    const auto* codes      = reinterpret_cast<const uint2*>(p.up_codes + row * kUpKPad + 8 * quad);
+    uint2 top[kChunks], bottom[kChunks];
+#pragma unroll
+    for (int i = 0; i < kChunks; ++i) {
+        top[i]    = __ldg(codes + 4 * i);           // 32 K = 4 uint2 per chunk
+        bottom[i] = __ldg(codes + kUpKPad + 4 * i); // row + 8 (kUpKPad / 8 uint2 per row)
+    }
+    // Group scales of the two rows: 10 FP16 words of the 12 of a row (24-byte rows, 4-byte reads).
+    const auto* scales = reinterpret_cast<const std::uint32_t*>(p.up_scales + row * kUpGroups);
+    std::uint32_t scale_top[kChunks / 2], scale_bottom[kChunks / 2];
+#pragma unroll
+    for (int i = 0; i < kChunks / 2; ++i) {
+        scale_top[i]    = __ldg(scales + i);
+        scale_bottom[i] = __ldg(scales + 8 * kUpGroups / 2 + i);
+    }
+    const int top_row  = warp * 16 + group;
+    const MixItem item = mix_item<Tokens, kHidden>(p, tid, column_begin);
+
+    cudaGridDependencySynchronize(); // the Down launch has completed: low, square sums, inject
+    stage_low<Tokens, kHidden>(p, tid, sh.low, sh.inverse_rms);
+    __syncthreads();
+
+    float acc[4] = {};
+#pragma unroll
+    for (int i = 0; i < kChunks; ++i) {
+        const int k            = 8 * quad + 32 * i;
+        float chunk[4]         = {};
+        const uint4 activation = group < Tokens ? *reinterpret_cast<const uint4*>(&sh.low[group][k])
+                                                : make_uint4(0, 0, 0, 0);
+        mma_chunk(chunk, widen_codes(top[i]), widen_codes(bottom[i]), activation);
+        const float st = __half2float(
+            __ushort_as_half(static_cast<unsigned short>(scale_top[i / 2] >> (16 * (i % 2)))));
+        const float sb = __half2float(
+            __ushort_as_half(static_cast<unsigned short>(scale_bottom[i / 2] >> (16 * (i % 2)))));
+        acc[0] = fmaf(chunk[0], st, acc[0]);
+        acc[1] = fmaf(chunk[1], st, acc[1]);
+        acc[2] = fmaf(chunk[2], sb, acc[2]);
+        acc[3] = fmaf(chunk[3], sb, acc[3]);
+    }
+    sh.logits[top_row][2 * quad]         = acc[0];
+    sh.logits[top_row][2 * quad + 1]     = acc[1];
+    sh.logits[top_row + 8][2 * quad]     = acc[2];
+    sh.logits[top_row + 8][2 * quad + 1] = acc[3];
+    __syncthreads();
+    finish_mix<kHidden>(p, item, sh.logits, sh.inverse_rms);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -915,10 +1026,10 @@ __global__ void __launch_bounds__(kUpThreads)
         bottom[i] = __ldg(up_row + kR + 4 * i); // row + 8 (kR / 8 uint4 per row)
     }
     const int top_row  = warp * 16 + group;
-    const MixItem item = mix_item<Tokens>(p, tid, column_begin);
+    const MixItem item = mix_item<Tokens, kH>(p, tid, column_begin);
 
     cudaGridDependencySynchronize(); // the Down launch has completed: low, square sums, inject
-    stage_low<Tokens>(p, tid, sh.low, sh.inverse_rms);
+    stage_low<Tokens, kH>(p, tid, sh.low, sh.inverse_rms);
     __syncthreads();
 
     float acc[4] = {};
@@ -934,14 +1045,14 @@ __global__ void __launch_bounds__(kUpThreads)
     sh.logits[top_row + 8][2 * quad]     = acc[2];
     sh.logits[top_row + 8][2 * quad + 1] = acc[3];
     __syncthreads();
-    finish_mix(p, item, sh.logits, sh.inverse_rms);
+    finish_mix<kH>(p, item, sh.logits, sh.inverse_rms);
 }
 
 using SplitKernel = void (*)(HcFusedMaps, HcFusedMix);
 
-template <bool Fp4, int... Tokens>
+template <bool Fp4, int Parts, int... Tokens>
 constexpr auto down_kernels(std::integer_sequence<int, Tokens...>) {
-    return std::array<SplitKernel, sizeof...(Tokens)>{hc_down_kernel<Fp4, Tokens + 1>...};
+    return std::array<SplitKernel, sizeof...(Tokens)>{hc_down_kernel<Fp4, Tokens + 1, Parts>...};
 }
 
 template <bool Fp4, int... Tokens>
@@ -949,10 +1060,19 @@ constexpr auto up_kernels(std::integer_sequence<int, Tokens...>) {
     return std::array<SplitKernel, sizeof...(Tokens)>{hc_up_mix_kernel<Fp4, Tokens + 1>...};
 }
 
-constexpr auto kDownKernels = down_kernels<false>(std::make_integer_sequence<int, kHcFusedMaxT>{});
-constexpr auto kUpKernels   = up_kernels<false>(std::make_integer_sequence<int, kHcFusedMaxT>{});
-constexpr auto kDownKernelsF4 = down_kernels<true>(std::make_integer_sequence<int, kHcFusedMaxT>{});
-constexpr auto kUpKernelsF4   = up_kernels<true>(std::make_integer_sequence<int, kHcFusedMaxT>{});
+template <int... Tokens>
+constexpr auto up_wide_kernels(std::integer_sequence<int, Tokens...>) {
+    return std::array<SplitKernel, sizeof...(Tokens)>{hc_up_mix_wide_kernel<Tokens + 1>...};
+}
+
+constexpr auto kTokenSeq      = std::make_integer_sequence<int, kHcFusedMaxT>{};
+constexpr auto kDownKernels   = down_kernels<false, 1>(kTokenSeq);
+constexpr auto kUpKernels     = up_kernels<false>(kTokenSeq);
+constexpr auto kDownKernelsF4 = down_kernels<true, 1>(kTokenSeq);
+constexpr auto kUpKernelsF4   = up_kernels<true>(kTokenSeq);
+// Q8 at H = 2 kH.
+constexpr auto kDownKernelsWide = down_kernels<false, 2>(kTokenSeq);
+constexpr auto kUpKernelsWide   = up_wide_kernels(kTokenSeq);
 
 template <int... Tokens>
 constexpr auto bf16_kernels(std::integer_sequence<int, Tokens...>) {
@@ -1011,22 +1131,25 @@ HcFusedMaps make_maps(const HcFusedMix& p) {
         }
         return maps;
     }
-    { // Down codes [rows][80 lines][128 B]; box = one lane segment (20 lines) of a 16-row tile.
-        const std::uint64_t dims[3]{128, kSH / 128, static_cast<std::uint64_t>(p.rows)};
-        const std::uint64_t strides[2]{128, kSH};
+    // Q8 at H = 2560 or 5120: the Down boxes are those of one Down CTA (2560 K).
+    const auto wide = static_cast<std::uint64_t>(kS) * p.hidden;
+    { // Down codes [rows][S*H/128 lines][128 B]; box = one CTA segment (20 lines) of a 16-row tile.
+        const std::uint64_t dims[3]{128, wide / 128, static_cast<std::uint64_t>(p.rows)};
+        const std::uint64_t strides[2]{128, wide};
         const std::uint32_t box[3]{128, kH / 128, kTile};
         maps.down_codes = encode_map(CU_TENSOR_MAP_DATA_TYPE_UINT8, p.down_codes, 3, dims, strides,
                                      box, CU_TENSOR_MAP_SWIZZLE_128B);
     }
-    { // Down scales [rows][320] FP16; box = 80 words of 16 rows.
-        const std::uint64_t dims[2]{kSH / 32, static_cast<std::uint64_t>(p.rows)};
-        const std::uint64_t strides[1]{kSH / 32 * 2};
+    { // Down scales [rows][S*H/32] FP16; box = 80 words of 16 rows.
+        const std::uint64_t dims[2]{wide / 32, static_cast<std::uint64_t>(p.rows)};
+        const std::uint64_t strides[1]{wide / 32 * 2};
         const std::uint32_t box[2]{kDownScaleRow, kTile};
         maps.down_scales = encode_map(CU_TENSOR_MAP_DATA_TYPE_UINT16, p.down_scales, 2, dims,
                                       strides, box, CU_TENSOR_MAP_SWIZZLE_NONE);
     }
-    { // Up codes [10240][6 x 64 B] (K padded to 384); box = the 320 touched bytes of 16 rows.
-        const std::uint64_t dims[3]{64, kUpKPad / 64, kSH};
+    if (p.hidden != kH) return maps; // the Up launch at 2 kH reads its rows into registers
+    { // Up codes [S*H][6 x 64 B] (K padded to 384); box = the 320 touched bytes of 16 rows.
+        const std::uint64_t dims[3]{64, kUpKPad / 64, wide};
         const std::uint64_t strides[2]{64, kUpKPad};
         const std::uint32_t box[3]{64, kR / 64, kCols};
         maps.up_codes = encode_map(CU_TENSOR_MAP_DATA_TYPE_UINT8, p.up_codes, 3, dims, strides, box,
@@ -1057,19 +1180,30 @@ std::size_t hyper_connection_fused_workspace_bytes(std::int32_t tokens) {
     return (t * kS * 4 + 255) / 256 * 256 + t * kR * 2; // square sums FP32 [T,S], low FP16 [T,R]
 }
 
+bool hyper_connection_fused_compiled(std::int32_t hidden, bool fp4, bool bf16) {
+    return hidden == kH || (hidden == 2 * kH && !fp4 && !bf16);
+}
+
 void hyper_connection_fused_mix_launch(const HcFusedMix& params, cudaStream_t stream) {
+    if (!hyper_connection_fused_compiled(params.hidden, params.fp4, params.bf16))
+        throw std::invalid_argument("hyper_connection small-T route: unsupported hidden width");
+    const bool wide        = params.hidden != kH; // Q8 at 2 kH
     const int tiles        = (params.rows + kTile - 1) / kTile;
     const HcFusedMaps maps = make_maps(params);
     const auto& down       = params.bf16  ? kBf16Kernels.first
                              : params.fp4 ? kDownKernelsF4
+                             : wide       ? kDownKernelsWide
                                           : kDownKernels;
-    const auto& up = params.bf16 ? kBf16Kernels.second : params.fp4 ? kUpKernelsF4 : kUpKernels;
-    const int down_ctas = tiles * (params.bf16 ? kBf16Cluster : kS);
+    const auto& up         = params.bf16  ? kBf16Kernels.second
+                             : params.fp4 ? kUpKernelsF4
+                             : wide       ? kUpKernelsWide
+                                          : kUpKernels;
+    const int down_ctas    = tiles * (params.bf16 || wide ? 2 * kS : kS);
     CUDA_CHECK(pdl::launch_dependent(pdl::LaunchConfig{dim3(down_ctas), dim3(kThreads), 0, stream},
                                      down[params.tokens - 1], maps, params));
-    CUDA_CHECK(
-        pdl::launch_dependent(pdl::LaunchConfig{dim3(kH / kCols), dim3(kUpThreads), 0, stream},
-                              up[params.tokens - 1], maps, params));
+    CUDA_CHECK(pdl::launch_dependent(
+        pdl::LaunchConfig{dim3(params.hidden / kCols), dim3(kUpThreads), 0, stream},
+        up[params.tokens - 1], maps, params));
 }
 
 } // namespace ninfer::ops::detail

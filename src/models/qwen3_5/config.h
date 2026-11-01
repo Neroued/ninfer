@@ -4,7 +4,6 @@
 #include "models/registry.h"
 
 #include <array>
-#include <algorithm>
 #include <cstdint>
 #include <optional>
 #include <variant>
@@ -17,7 +16,6 @@ struct Directory;
 namespace ninfer::models::qwen3_5 {
 
 enum class MixerKind { FullAttention, LinearAttention };
-enum class DraftAttentionKind { FullAttention, SlidingAttention };
 
 struct AttentionConfig {
     std::uint32_t num_attention_heads = 0;
@@ -93,7 +91,8 @@ struct SparseAttentionConfig {
     }
 };
 
-// Qwen4Exp n-gram hash embedding injected before one GDN block.
+// Qwen4Exp n-gram hash embedding injected before one GDN block (absent when the config names no
+// PLE layer).
 struct PleConfig {
     std::uint32_t layer           = 0; // zero-based block index
     std::uint32_t ngram_size      = 0;
@@ -135,12 +134,19 @@ struct TextConfig {
     std::optional<RopeConfig> rope_parameters;
     std::optional<GdnConfig> gdn;
     std::variant<DenseConfig, MoeConfig> ffn;
+    // GDN output norm gate (Qwen4Exp output_gate_type; Qwen3.5 is SiLU).
     GateActivation gdn_gate = GateActivation::Silu;
     std::optional<HyperConnectionConfig> hyper_connection; // Qwen4Exp only
     std::optional<SparseAttentionConfig> sparse_attention; // Qwen4Exp only
-    std::optional<PleConfig> ple;                          // Qwen4Exp only
+    std::optional<PleConfig> ple;                          // Qwen4Exp only, optional
 
     [[nodiscard]] bool qwen4() const noexcept { return architecture == Architecture::Qwen4Exp; }
+
+    // Qwen4Exp with the routed-expert MoE (Qwen3.8-Flash-Next); false for a dense Qwen4Exp FFN,
+    // which instantiates no expert backend, expert planning or host MoE machinery.
+    [[nodiscard]] bool qwen4_routed_experts() const noexcept {
+        return qwen4() && std::holds_alternative<MoeConfig>(ffn);
+    }
 
     // Width of the residual carried between blocks and handed to MTP.
     [[nodiscard]] std::uint64_t residual_width() const noexcept {
@@ -177,26 +183,11 @@ struct DraftConfig {
     std::uint32_t max_position_embeddings = 0;
     float rms_norm_eps                    = 0;
     float rope_theta                      = 0;
-    std::vector<DraftAttentionKind> layer_types;
-    std::optional<std::uint32_t> sliding_window;
+    // Every layer attends over this sliding window (DFlash2 drafters have no full-attention layer).
+    std::uint32_t sliding_window = 0;
     std::vector<std::uint32_t> target_layer_ids;
     std::uint32_t mask_token_id = 0;
-    std::optional<DFlash2Config> dflash2;
-
-    [[nodiscard]] std::uint32_t local_layer_count() const noexcept {
-        return static_cast<std::uint32_t>(std::count(layer_types.begin(), layer_types.end(),
-                                                     DraftAttentionKind::SlidingAttention));
-    }
-
-    [[nodiscard]] std::uint32_t full_layer_count() const noexcept {
-        return num_hidden_layers - local_layer_count();
-    }
-
-    [[nodiscard]] std::uint32_t compact_layer_index(std::uint32_t layer) const {
-        const auto kind = layer_types.at(layer);
-        return static_cast<std::uint32_t>(
-            std::count(layer_types.begin(), layer_types.begin() + layer, kind));
-    }
+    DFlash2Config dflash2;
 };
 
 struct Config {

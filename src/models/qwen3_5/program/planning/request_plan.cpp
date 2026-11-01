@@ -280,13 +280,6 @@ RequestBasePlan ProgramImpl::plan_request(const PreparedPromptData& prompt,
             std::max(leased_output_tokens,
                      draft_window + std::min(draft_window, qwen3_5::kMtpDecodeMaximumDrafts));
         base->backend_kv_page_entitlement = window_pages(backend_window_tokens);
-    } else if (speculative_backend == SpeculativeBackend::DFlash) {
-        // DFlash maps its Full backend KV in the context append (decode.cpp), outside the lease
-        // growth: it keeps the whole reservation.
-        base->backend_kv_page_entitlement = kv_pages_for_tokens(
-            base->summary.prompt_tokens + (base->summary.effective_output_tokens == 0
-                                               ? 0U
-                                               : base->summary.effective_output_tokens - 1U));
     }
     detail::PhysicalDeviceResources root_active{
         .active_lanes     = 1,
@@ -578,13 +571,12 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
     if ((is_rewrite_checkpoint_restore(plan->reuse) ||
          plan->reuse == ReusePath::PrivateLongAnchor ||
          plan->reuse == ReusePath::SharedStablePrefix) &&
-        is_masked_draft_backend(speculative_backend) &&
+        speculative_backend == SpeculativeBackend::DFlash2 &&
         (!dflash ||
-         (source != nullptr && (!source->kv || (backend_kv_cache() && !source->kv->backend) ||
-                                source->dflash_context_frontier < plan->reuse_base)) ||
+         (source != nullptr &&
+          (!source->kv || source->dflash_context_frontier < plan->reuse_base)) ||
          (shared_source != nullptr &&
-          (!shared_source->kv || (backend_kv_cache() && !shared_source->kv->backend) ||
-           shared_source->frontier < plan->reuse_base)))) {
+          (!shared_source->kv || shared_source->frontier < plan->reuse_base)))) {
         throw std::logic_error("published DFlash checkpoint is not materializable");
     }
 
@@ -849,7 +841,7 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
             (plan->source_mode == runtime::PrivateSourceMode::Retain && !splits_private_both) ||
             (plan->source_mode == runtime::PrivateSourceMode::ConsumeToActive &&
              plan->state_fork_required);
-        if (is_masked_draft_backend(speculative_backend) && forks_device_state &&
+        if (speculative_backend == SpeculativeBackend::DFlash2 && forks_device_state &&
             selected_state_residency != StateReplicaResidency::HostOnly) {
             // DFlash has lane-local recurrent state which is copied eagerly when a retained
             // checkpoint forks. The copy completes on the compute stream in the publication

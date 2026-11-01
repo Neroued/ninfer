@@ -62,6 +62,24 @@ int run_nvfp4_a4() {
     // common list) and its MMA and TMA routes.
     failures += run_shape("NVFP4_A4", ActivationCompute::A4, make_nvfp4_weight,
                           {5120, 3072, 731U, Comparison::Sampled, true, invocations});
+    // Dense FFN of width 14336 over hidden 5120: gate|up, down and the down's two-device half; MMA
+    // routes only (no TMA geometry), across the widest tiles.
+    auto mma_invocations = invocations;
+    for (int t : {255, 256, 257, 1024, 1025})
+        mma_invocations.push_back({t, CallForm::Policy, ops::LinearPolicy::AllowA4, true});
+    failures += run_shape("NVFP4_A4", ActivationCompute::A4, make_nvfp4_weight,
+                          {28672, 5120, 737U, Comparison::Sampled, true, mma_invocations});
+    failures += run_shape("NVFP4_A4", ActivationCompute::A4, make_nvfp4_weight,
+                          {5120, 14336, 733U, Comparison::Sampled, true, mma_invocations});
+    failures += run_shape("NVFP4_A4", ActivationCompute::A4, make_nvfp4_weight,
+                          {5120, 7168, 735U, Comparison::Sampled, true, mma_invocations});
+    // Two-device halves of the GDN q|k|v|z and attention q|k|gate|v parents at hidden 5120 as plain
+    // Linear problems; MMA routes only. Each uses its parent's seed (see the
+    // MLP halves above: at T <= 5 the 16 distinct dot products decide the A4 allowance).
+    failures += run_shape("NVFP4_A4", ActivationCompute::A4, make_nvfp4_weight,
+                          {8192, 5120, 721U, Comparison::Sampled, true, mma_invocations});
+    failures += run_shape("NVFP4_A4", ActivationCompute::A4, make_nvfp4_weight,
+                          {7168, 5120, 719U, Comparison::Sampled, true, mma_invocations});
     return failures;
 }
 

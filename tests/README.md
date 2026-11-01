@@ -75,7 +75,7 @@ statistics still drive the normal verdict. Passing tests remain quiet without it
 The suite covers prefill, decode/spec widths, batched prefixes, cache effects, and Graph replay and
 updates with changing live lengths. Numerical cases include small, unit-RMS and RMS1.8 Q/K inputs.
 The FP64 oracle retains internal Q quantization error; the INT8/FP8 compute budgets account for
-that accepted approximation. The default invocation also runs packed and context attention.
+that accepted approximation. The default invocation also runs plain and packed attention.
 
 Linear tests are independently runnable by weight and activation-compute profile:
 
@@ -108,10 +108,11 @@ python3 -m pytest \
   tests/test_serve_corpus.py
 ```
 
-Agentic measurement tests (no GPU):
+Agentic measurement and long-context probe tests (no GPU):
 
 ```bash
 python3.11 -m unittest discover -s tests -p test_agentic_measurement.py
+python3.11 -m unittest discover -s tests -p test_long_context.py
 ```
 
 The Python suites exercise conversion and encoded output, without running model inference.
@@ -129,7 +130,9 @@ Add `--host-only` to check semantic binding without uploading weights. This does
 Program or establish native Op support.
 
 The C++ prefix/MTP integration test is separately opt-in because it loads the full artifact and
-runs the real engine:
+runs the real engine. It and the other one-device 27B tests below need an artifact whose weights
+fit one board (on 16 GB boards the 3-bit GSQ `q3_g128_fp16` artifact; the NVFP4 artifacts need
+`--tp 2`); with a larger one they skip, as described under the tensor-parallel tests:
 
 ```bash
 NINFER_TEST_ARTIFACT=$PWD/out/qwen3_6_27b.ninfer \
@@ -144,12 +147,8 @@ NINFER_TEST_ARTIFACT=$PWD/out/qwen3_8_27b_nvfp4.ninfer \
   ctest --test-dir build -R ninfer_qwen3_5_score_real_test --output-on-failure
 ```
 
-Run the 35B-A3B MoE route independently:
-
-```bash
-NINFER_TEST_ARTIFACT=$PWD/out/qwen3_6_35b_a3b.ninfer \
-  ctest --test-dir build -R ninfer_qwen3_5_moe_real_test --output-on-failure
-```
+`ninfer_qwen3_5_score_tp2_real_test` scores the same artifact on two devices (INT8 KV), through
+the half-chunk prefill overlap of the Text forward.
 
 The two-device (tp 2) tests need two CUDA devices, use devices 0 and 1, and return 77 (skipped)
 with fewer. Without an artifact:
@@ -196,10 +195,17 @@ NINFER_TEST_ARTIFACT=$PWD/out/qwen3_8_27b_nvfp4.ninfer \
   --output-on-failure
 ```
 
-Without `NINFER_TEST_ARTIFACT`, CTest marks these real Engine tests as skipped. Run GPU integration
-tests serially. `NINFER_PREFIX_REAL_SCENARIO` selects a focused prefix scenario such as `vision`,
-`pressure-resume`, `concurrent` or `forced-token-kv-row`; the default is `all`. These integration checks
-use behavior and state accounting rather than another numerical path's generated tokens as a golden.
+Without `NINFER_TEST_ARTIFACT`, CTest marks these real Engine tests as skipped. Every test that loads
+a model artifact, and every other test that can hold more than 1 GiB of a board, holds the CTest
+resource lock `ninfer_gpu_memory` (`tests/CMakeLists.txt`), so `ctest -j` runs them one at a time
+beside the smaller GPU tests. The one-device tests (`prefix_real`, `score_real`,
+`vision_workspace`, `dflash2_real`, `dflash_prefill_real`) plan the load first and skip, with the
+planned weight bytes in their output, when those weights plus 1 GiB of runtime exceed the board's
+total memory: the 27B NVFP4 artifacts (17-18 GB of weights on one device with MTP, DFlash2 or
+Vision) need tp 2 on 16 GB boards, so run these tests with an artifact that fits one board.
+`NINFER_PREFIX_REAL_SCENARIO` selects a focused prefix scenario such as `vision`, `pressure-resume`,
+`concurrent` or `forced-token-kv-row`; the default is `all`. These integration checks use behavior
+and state accounting rather than another numerical path's generated tokens as a golden.
 
 The `attention` scenario checks the selected KV type, chunked prefill, concurrent Graph decode
 across a resource tier, prefix continuation, and workspace bounds:
@@ -211,9 +217,9 @@ NINFER_TEST_SPECULATIVE=mtp NINFER_TEST_BATCH=2 \
   ./build/tests/ninfer_qwen3_5_prefix_real_test
 ```
 
-KV choices are `bf16`, `int8`, `fp8`, `nvfp4`, and `k8v4`; backend choices are `none`, `mtp`,
-`dflash`, and `dflash2`, requiring an artifact with the selected component. Batch defaults to 2;
-`NINFER_TEST_DRAFT_TOKENS` overrides the default MTP3 or DFlash7 block. The DFlash2-specific
+KV choices are `bf16`, `int8`, `fp8`, `nvfp4`, and `k8v4`; backend choices are `none`, `mtp`
+and `dflash2`, requiring an artifact with the selected component. Batch defaults to 2;
+`NINFER_TEST_DRAFT_TOKENS` overrides the default MTP3 or DFlash2 K=7 block. The DFlash2-specific
 integration executable also accepts all five KV names as its fifth positional argument and rejects
 unknown names.
 
@@ -249,7 +255,7 @@ python3 tools/smoke/serve_thinking_preservation.py \
   --artifact out/qwen3_6_27b.ninfer --backend mtp
 
 python3 tools/smoke/serve_thinking_preservation.py \
-  --artifact out/qwen3_6_35b_a3b.ninfer --backend dflash
+  --artifact out/qwen3_8_27b.ninfer --backend dflash2
 ```
 
 The shared messages are in
@@ -272,24 +278,22 @@ broad additions without a concrete regression risk do not belong in the permanen
 
 ## DFlash2 Engine integration
 
-The DFlash prefill regression checks actual KV contents after a StateImage fork and a conflicting
-decode binding, including shortened chunks and oversized local/full KV appends. It uses native
-Program storage and the production prefill route; select the draft component stored in the artifact:
+The DFlash2 prefill regression checks the drafter's local KV contents after a StateImage fork and
+a conflicting decode binding, including shortened chunks and oversized local appends. It uses native
+Program storage and the production prefill route:
 
 ```bash
 cmake --build build -j --target ninfer_qwen3_5_dflash_prefill_real_test
 NINFER_TEST_ARTIFACT=out/qwen3_8_27b_nvfp4.ninfer \
-  build/tests/ninfer_qwen3_5_dflash_prefill_real_test dflash2
-NINFER_TEST_ARTIFACT=out/qwen3_6_35b_a3b.ninfer \
-  build/tests/ninfer_qwen3_5_dflash_prefill_real_test dflash
+  build/tests/ninfer_qwen3_5_dflash_prefill_real_test
 ```
 
 The Engine test uses an artifact containing DFlash2 and checks output budgets, speculative activity,
 forced thinking-control append, penalty-enabled sampling, compact batches with unequal budgets,
 same-route same-seed replay, retained/fresh prefix behavior and absence of a full backend KV pool.
-A shared DFlash/DFlash2 fixture starts decode at token 63, verifies across the page boundary, stops
-after one target column at token 64, and checks the exact retained frontier and subsequent generation
-with and without reuse.
+The page-boundary fixture (`speculative_page_boundary.h`) starts decode at token 63, verifies across
+the page boundary, stops after one target column at token 64, and checks the exact retained frontier
+and subsequent generation with and without reuse.
 The KV Store test checks exact mapping and reservation accounting for the same transition.
 K>=7 also exercises a stop inside a licensed block; K=15 additionally checks oversized prefill,
 local ring wrap, and the logical context-capacity tail. Optional Vision runs image/video capture
@@ -306,6 +310,6 @@ NINFER_TEST_ARTIFACT=out/qwen3_8_27b_nvfp4.ninfer \
 ```
 
 Arguments are K, Graph enabled, optimized head enabled, maximum B, target KV (`bf16` or `int8`),
-Vision enabled, and extra Device StateImage slots. Defaults are `15 1 1 8 bf16 0 3`. Run GPU
-integration tests serially. The individual Op suites remain the numerical/state-transition oracle;
+Vision enabled, and extra Device StateImage slots. Defaults are `15 1 1 8 bf16 0 3`. The individual
+Op suites remain the numerical/state-transition oracle;
 the fixed Engine fixture does not define bit parity across arbitrary floating-point routes.

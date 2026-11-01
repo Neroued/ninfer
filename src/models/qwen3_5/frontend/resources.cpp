@@ -39,7 +39,7 @@ void parse_resources(FrontendResources& resources, const Config& config) {
             }
         }
     }
-    if (config.draft && config.draft->dflash2 && config.draft->dflash2->selector_top_k > count) {
+    if (config.draft && config.draft->dflash2.selector_top_k > count) {
         throw artifact::ArtifactError("DFlash2 selector_top_k exceeds public token domain");
     }
 }

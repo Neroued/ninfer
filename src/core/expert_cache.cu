@@ -35,9 +35,9 @@ __global__ __launch_bounds__(kSmFillThreads) void sm_fill_kernel(const SmFillCop
     const long long stride = static_cast<long long>(gridDim.x) * blockDim.x;
     const long long first  = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
     for (int k = 0; k < c.count; ++k) {
-        const uint4* src   = c.src[k];
-        uint4* dst         = c.dst[k];
-        const long long n  = c.units[k];
+        const uint4* src  = c.src[k];
+        uint4* dst        = c.dst[k];
+        const long long n = c.units[k];
         for (long long base = first; base < n; base += stride * kSmFillUnroll) {
             uint4 v[kSmFillUnroll];
 #pragma unroll
@@ -138,7 +138,8 @@ ExpertCache::ExpertCache(const PolicyConfig& policy, ExpertLayout layout,
     }
     if (layout_.variable()) {
         const auto cells = static_cast<std::size_t>(layers_ * layout_.planes);
-        if (layout_.layer_plane_bytes.size() != cells || layout_.layer_bank_stride.size() != cells ||
+        if (layout_.layer_plane_bytes.size() != cells ||
+            layout_.layer_bank_stride.size() != cells ||
             layout_.layer_plane_offset.size() != cells) {
             throw std::invalid_argument("expert cache: variable layout needs every layer's planes");
         }
@@ -158,11 +159,14 @@ ExpertCache::ExpertCache(const PolicyConfig& policy, ExpertLayout layout,
         for (std::int32_t q = 0; q < layout_.planes; ++q) {
             if (layout_.plane_bytes[q] <= 0 || layout_.bank_stride[q] < layout_.plane_bytes[q] ||
                 layout_.pool_stride[q] <= 0) {
-                throw std::invalid_argument("expert cache: plane " + std::to_string(q) +
-                                            " needs bytes > 0, bank stride >= bytes, pool stride > 0");
+                throw std::invalid_argument(
+                    "expert cache: plane " + std::to_string(q) +
+                    " needs bytes > 0, bank stride >= bytes, pool stride > 0");
             }
         }
-        for (std::int32_t q = 0; q < layout_.planes; ++q) { expert_bytes_ += layout_.plane_bytes[q]; }
+        for (std::int32_t q = 0; q < layout_.planes; ++q) {
+            expert_bytes_ += layout_.plane_bytes[q];
+        }
     }
     if (max_in_flight_bytes_ < expert_bytes_) {
         throw std::invalid_argument("expert cache: the fill depth must hold at least one expert");
@@ -209,9 +213,9 @@ ExpertCache::ExpertCache(const PolicyConfig& policy, ExpertLayout layout,
         CUDA_CHECK(cudaStreamCreateWithFlags(&g.fill_stream, cudaStreamNonBlocking));
         CUDA_CHECK(cudaEventCreateWithFlags(&g.fence, cudaEventDisableTiming));
         if (staging_slots_ > 0) {
-            void* ring       = nullptr;
-            const auto bytes = static_cast<std::size_t>(staging_slots_) *
-                               static_cast<std::size_t>(expert_bytes_);
+            void* ring = nullptr;
+            const auto bytes =
+                static_cast<std::size_t>(staging_slots_) * static_cast<std::size_t>(expert_bytes_);
             const cudaError_t err = cudaHostAlloc(&ring, bytes, cudaHostAllocPortable);
             if (err != cudaSuccess) {
                 throw std::runtime_error(
@@ -284,6 +288,9 @@ void ExpertCache::initialize(std::span<const std::vector<std::int32_t>> profile)
                                   static_cast<std::size_t>(table_entries(policy_.config())) *
                                       sizeof(std::int32_t)));
         }
+        // cudaMemset returns before the fill lands, and the windows publish on the caller's
+        // non-blocking streams: finish the reset here, as the contract promises.
+        CUDA_CHECK(cudaDeviceSynchronize());
     }
     if (!profile.empty()) {
         std::vector<Insert> inserts;
@@ -818,7 +825,7 @@ void ExpertCache::issue(Gpu& g, std::span<const PendingFill> fills) {
             const std::int32_t e = f.cell % experts_;
             // A pageable bank's expert first goes into a free staging slot (pump checked there is
             // one); the slot is held until the batch's event completes (retire).
-            std::byte* stage = nullptr;
+            std::byte* stage          = nullptr;
             std::int64_t staged_bytes = 0; // planes packed back to back in the staging slot
             if (pageable_[static_cast<std::size_t>(l)] != 0) {
                 const std::int64_t at = g.staging_head++ % staging_slots_;
@@ -828,7 +835,7 @@ void ExpertCache::issue(Gpu& g, std::span<const PendingFill> fills) {
                 ++counters_.staged_fills;
             }
             for (std::int32_t q = 0; q < planes; ++q) {
-                const std::byte* src = layout_.bank(l, q, e);
+                const std::byte* src     = layout_.bank(l, q, e);
                 const std::int64_t bytes = layout_.bytes(l, q);
                 if (stage != nullptr) {
                     std::memcpy(stage + staged_bytes, src, static_cast<std::size_t>(bytes));
@@ -842,8 +849,8 @@ void ExpertCache::issue(Gpu& g, std::span<const PendingFill> fills) {
             }
             batch.fills.push_back(f);
         }
-        bool by_kernel = sm_fill_ctas_ > 0 &&
-                         copy_dst_.size() <= static_cast<std::size_t>(kMaxSmFillCopies);
+        bool by_kernel =
+            sm_fill_ctas_ > 0 && copy_dst_.size() <= static_cast<std::size_t>(kMaxSmFillCopies);
         if (by_kernel) {
             SmFillCopies c;
             c.count = static_cast<std::int32_t>(copy_dst_.size());
@@ -862,9 +869,9 @@ void ExpertCache::issue(Gpu& g, std::span<const PendingFill> fills) {
             }
         }
         if (!by_kernel) {
-            CUDA_CHECK(cudaMemcpyBatchAsync(copy_dst_.data(), copy_src_.data(),
-                                            copy_bytes_.data(), copy_dst_.size(), &attr,
-                                            &attr_index, 1, g.fill_stream));
+            CUDA_CHECK(cudaMemcpyBatchAsync(copy_dst_.data(), copy_src_.data(), copy_bytes_.data(),
+                                            copy_dst_.size(), &attr, &attr_index, 1,
+                                            g.fill_stream));
         }
         if (!g.spare_events.empty()) {
             batch.done = g.spare_events.back();

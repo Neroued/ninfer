@@ -236,8 +236,7 @@ bool split_proposal_rows(std::uint64_t rows, const Config& config, const LoadOpt
 // replicated (every rank computes the same context and conv coefficients from its own copy of the
 // replicated residual); the candidate selector sits on one rank (selector_rank()).
 bool split_dflash2_drafter(const Config& config, const LoadOptions& options) {
-    return options.dflash2() && options.tp > 1 && !drafter_primary_requested() && config.draft &&
-           config.draft->dflash2 && config.draft->full_layer_count() == 0;
+    return options.dflash2() && options.tp > 1 && !drafter_primary_requested() && config.draft;
 }
 
 // NINFER_TP_SELECTOR=primary keeps the split drafter's candidate selector on rank 0, the placement
@@ -395,8 +394,11 @@ LogicalShard qwen4_block_shard(std::string_view name, std::string_view leaf,
     if (leaf.starts_with("attention/indexer_")) { return whole(ShardAxis::Replicated); }
     // Router and shared-expert gate: every rank routes the same tokens to the same experts; the
     // routed experts themselves stay HostMapped and are partitioned by expert ID at run time.
-    if (leaf == "moe/router" || leaf == "moe/shared_score") { return whole(ShardAxis::Replicated); }
-    if (leaf.starts_with("moe/shared/")) {
+    const bool moe = std::holds_alternative<MoeConfig>(text.ffn);
+    if (moe && (leaf == "moe/router" || leaf == "moe/shared_score")) {
+        return whole(ShardAxis::Replicated);
+    }
+    if (moe && leaf.starts_with("moe/shared/")) {
         return whole(ShardAxis::SingleDevice, qwen4_shared_expert_rank(name, text, options.tp));
     }
     if (leaf.starts_with("ple/")) {
@@ -410,9 +412,10 @@ LogicalShard qwen4_block_shard(std::string_view name, std::string_view leaf,
         }
         return qwen4_stream_shard(name, ple_leaf, shape, text, options);
     }
-    // Gated attention (12 query and 1 KV heads per rank) and GDN (8 key and 24 value heads per
-    // rank): the dense Qwen3.5 head rules.
-    if (leaf.starts_with("attention/") || leaf.starts_with("gdn/")) {
+    // Gated attention (12 query and 1 KV heads per rank), GDN (8 key and 24 value heads per
+    // rank) and a dense FFN (gate/up rows and down columns halved): the dense Qwen3.5 rules.
+    if (leaf.starts_with("attention/") || leaf.starts_with("gdn/") ||
+        (leaf.starts_with("mlp/") && !moe)) {
         return block_shard(name, leaf, shape, text, options.tp);
     }
     reject(name, "has no Qwen4Exp placement for this parameter");
@@ -464,8 +467,7 @@ LogicalShard shard_rule(std::string_view name, const artifact::Shape& shape, con
     if (in_component(name, "dflash2") && split_dflash2_drafter(config, options)) {
         return drafter_shard(name, shape, config, options);
     }
-    if (in_component(name, "dflash") || in_component(name, "dflash2") ||
-        in_component(name, "proposal")) {
+    if (in_component(name, "dflash2") || in_component(name, "proposal")) {
         return whole(ShardAxis::PrimaryOnly);
     }
     if (name == "text/token_embedding" || name == "text/final_norm" ||
@@ -482,9 +484,6 @@ LogicalShard shard_rule(std::string_view name, const artifact::Shape& shape, con
         return even(name, ShardAxis::Columns, columns, columns, tp);
     }
     if (const auto leaf = block_leaf(name); !leaf.empty()) {
-        if (!std::holds_alternative<DenseConfig>(config.text.ffn)) {
-            reject(name, "supports the dense architecture only");
-        }
         return block_shard(name, leaf, shape, config.text, tp);
     }
     reject(name, "has no placement for this parameter");

@@ -766,9 +766,7 @@ ProgramImpl::checkpoint_summary(const SequenceState& sequence, runtime::Checkpoi
         throw std::logic_error("checkpoint StateImage has no published replica");
     }
     const std::uint32_t backend_frontier =
-        speculative_backend == SpeculativeBackend::Mtp      ? checkpoint.frontier - 1U
-        : speculative_backend == SpeculativeBackend::DFlash ? checkpoint.frontier
-                                                            : 0U;
+        backend_frontier_at(speculative_backend, checkpoint.frontier);
     const std::uint32_t identity_tag = static_cast<std::uint32_t>(speculative_backend) |
                                        (static_cast<std::uint32_t>(proposal_head) << 8U) |
                                        (static_cast<std::uint32_t>(kv_storage) << 16U);
@@ -1401,21 +1399,16 @@ void ProgramImpl::release_active_shared_references(SequenceState& sequence) noex
 
 qwen3_5::PagedKVCache* ProgramImpl::backend_kv_cache() noexcept {
     if (speculative_backend == SpeculativeBackend::Mtp) { return decoder->mtp_cache(); }
-    if (dflash && dflash->full) { return &*dflash->full; }
     return nullptr;
 }
 
 const qwen3_5::PagedKVCache* ProgramImpl::backend_kv_cache() const noexcept {
     if (speculative_backend == SpeculativeBackend::Mtp) { return decoder->mtp_cache(); }
-    if (dflash && dflash->full) { return &*dflash->full; }
     return nullptr;
 }
 
 std::uint32_t ProgramImpl::backend_kv_valid(const SequenceState& sequence) const noexcept {
     if (speculative_backend == SpeculativeBackend::Mtp) { return sequence.mtp_kv_valid; }
-    if (speculative_backend == SpeculativeBackend::DFlash) {
-        return sequence.dflash_context_frontier;
-    }
     return 0;
 }
 
@@ -1677,6 +1670,82 @@ ProgramImpl::retained_device_kv_pages(const ContinuationHandle& continuation) co
             owner_exclusive_resources(continuation_states[ContractAccess::index(continuation)]);
         return {.main = owned.device.main_kv_pages, .backend = owned.device.backend_kv_pages};
     } catch (...) { return {}; }
+}
+
+DeviceKVPages ProgramImpl::idle_device_kv_pages(const SequenceKVBundle& kv) const {
+    DeviceKVPages out{.main = text_kv_addresses->idle_device_pages(kv.text)};
+    if (kv.backend) {
+        if (!backend_kv_addresses) { throw std::logic_error("missing Backend KV stores"); }
+        out.backend = backend_kv_addresses->idle_device_pages(*kv.backend);
+    }
+    return out;
+}
+
+DeviceKVPages ProgramImpl::idle_device_kv_pages(const ContinuationHandle& continuation) const {
+    if (!valid_continuation(continuation)) { return {}; }
+    const SequenceState& sequence = continuation_states[ContractAccess::index(continuation)];
+    return sequence.kv ? idle_device_kv_pages(*sequence.kv) : DeviceKVPages{};
+}
+
+DeviceKVPages ProgramImpl::idle_device_kv_pages(const SharedPrefixHandle& shared) const {
+    if (!valid_shared_prefix(shared)) { return {}; }
+    const SharedPrefixState& state = shared_prefix_states[ContractAccess::index(shared)];
+    return state.kv ? idle_device_kv_pages(*state.kv) : DeviceKVPages{};
+}
+
+std::vector<DeviceKVPages>
+ProgramImpl::releasable_device_kv_pages(std::span<const ContinuationHandle* const> continuations,
+                                        std::span<const SharedPrefixHandle* const> shared) const {
+    std::vector<const SequenceKVBundle*> bundles;
+    bundles.reserve(continuations.size() + shared.size());
+    for (const ContinuationHandle* continuation : continuations) {
+        if (!valid_continuation(*continuation)) {
+            throw std::logic_error("releasable KV owner is not a catalogued continuation");
+        }
+        const SequenceState& sequence = continuation_states[ContractAccess::index(*continuation)];
+        bundles.push_back(sequence.kv ? &*sequence.kv : nullptr);
+    }
+    for (const SharedPrefixHandle* prefix : shared) {
+        if (!valid_shared_prefix(*prefix)) {
+            throw std::logic_error("releasable KV owner is not a catalogued shared prefix");
+        }
+        const SharedPrefixState& state = shared_prefix_states[ContractAccess::index(*prefix)];
+        bundles.push_back(state.kv ? &*state.kv : nullptr);
+    }
+    std::vector<DeviceKVPages> out(bundles.size());
+    // One pass per pool over the owners that map it; `index` maps each result back to its owner.
+    const auto count = [&](const KVAddressSpaceStore* addresses, auto address_of, auto assign) {
+        std::vector<KVAddressSpaceHandle> owners;
+        std::vector<std::size_t> index;
+        for (std::size_t owner = 0; owner < bundles.size(); ++owner) {
+            if (!bundles[owner]) { continue; }
+            if (const std::optional<KVAddressSpaceHandle> address = address_of(*bundles[owner])) {
+                owners.push_back(*address);
+                index.push_back(owner);
+            }
+        }
+        if (owners.empty()) { return; }
+        if (!addresses) { throw std::logic_error("missing KV address store"); }
+        const std::vector<std::uint32_t> pages = addresses->releasable_device_pages(owners);
+        for (std::size_t entry = 0; entry < owners.size(); ++entry) {
+            assign(out[index[entry]], pages[entry]);
+        }
+    };
+    count(
+        text_kv_addresses.get(),
+        [](const SequenceKVBundle& kv) { return std::optional<KVAddressSpaceHandle>(kv.text); },
+        [](DeviceKVPages& pages, std::uint32_t value) { pages.main = value; });
+    count(
+        backend_kv_addresses.get(), [](const SequenceKVBundle& kv) { return kv.backend; },
+        [](DeviceKVPages& pages, std::uint32_t value) { pages.backend = value; });
+    return out;
+}
+
+DeviceKVPages ProgramImpl::device_kv_available_pages() const noexcept {
+    DeviceKVPages out;
+    if (text_kv_pages) { out.main = text_kv_pages->physical_pool().available_pages(); }
+    if (backend_kv_pages) { out.backend = backend_kv_pages->physical_pool().available_pages(); }
+    return out;
 }
 
 bool ProgramImpl::run_lease_demotion(MaterializationTransaction::PressureWork& work) noexcept {

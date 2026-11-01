@@ -9,8 +9,8 @@ Run the commands below from the repository root.
 
 ## Upgrade an existing v2 artifact
 
-The offline upgrade tool supports the official Qwen3.6/3.8-27B groupwise-int and NVFP4 artifacts,
-and Qwen3.6-35B-A3B groupwise-int. Update your checkout to the current `master` and
+The offline upgrade tool supports the official Qwen3.6/3.8-27B groupwise-int and NVFP4 artifacts.
+Update your checkout to the current `master` and
 [rebuild NInfer](../README.md#build), then run with Python 3.11:
 
 ```bash
@@ -54,7 +54,6 @@ The built-in recipes are ordinary Python functions in
 |---|---|---|
 | `qwen3_6_27b` | Q4/Q5 projections, Q6 vocabulary weights | None |
 | `qwen3_8_27b` | Q4/Q5 projections, Q8 vocabulary weights | None |
-| `qwen3_6_35b_a3b` | Q4 experts, Q5/Q6 expert down, Q8 shared/projection weights | None |
 | `qwen3_6_27b_nvfp4` | Imported NVFP4, selected BF16 projections, Q8 vocabulary weights | `quantized` |
 | `qwen3_8_27b_nvfp4` | Imported NVFP4/FP8, FP8 embedding generated from BF16 | `quantized` |
 | `qwen3_8_27b_gsq3` | ISTA-DASLab 3-bit GSQ weights for one 16 GB GPU (the `27b-16gb` profile; published as `Feyd89/Qwen3.8-27B-GSQ-3bit-capy-flash`) | `quantized` |
@@ -95,6 +94,14 @@ python3 -m tools.convert.gguf_experts assemble --gguf /path/to/Qwen3.8-Flash-Nex
 builds and checks the directory without writing the payload. By default the MTP layer's NVFP4 experts are
 re-encoded as IQ4_NL (`--no-mtp-iq4nl` keeps them NVFP4), so every routed-expert layer is a ggml block bank.
 
+Dense Qwen4 (Qwen4Exp mathematics with a dense SwiGLU FFN, with or without PLE) converts with
+`qwen4_bf16`: every matrix BF16 as stored, the n-gram table row-scaled FP8. It is meant for correctness work on new
+geometries before their quantized linear routes exist ([dense FFN](maintainer/qwen4-exp-model.md#dense-ffn)). `qwen4_bf16_hcq8` is the same with
+the hyper-connection mixers in Q8 (the production mixer format), which runs the mixers' Q8 small-T route.
+`qwen4_nvfp4` is the same with the attention, GDN and MLP projections NVFP4 (`nvfp4_mse`, `A16Only`), the
+Qwen3.8-27B projection set: at hidden 5120 it exercises the fused routes of the Text forward
+([fused routes](maintainer/qwen4-exp-model.md#the-text-forwards-options)).
+
 These names select conversion choices. Runtime execution is selected from the architecture,
 configuration and actual bindings stored in the artifact. `--name` sets the public model name;
 it does not select kernels.
@@ -132,8 +139,8 @@ prompts, so the C=1 decode gains 0.6…2.9 % on short prompts and nothing on age
 55-171K tokens. The QUASAR model card's recipe has it as
 `quasar_recipe.py:configure_mtp_nvfp4`.
 
-MTP and Vision use the main source. DFlash and DFlash2 use the corresponding named source, supplied
-as `--source dflash=PATH` or `--source dflash2=PATH`. An artifact may contain several optional
+MTP and Vision use the main source. DFlash2 uses its named source, supplied as
+`--source dflash2=PATH`. An artifact may contain several optional
 components; the Engine loads only the ones selected at startup, including at most one speculative
 backend. Component availability and startup selection are independent.
 
@@ -409,7 +416,7 @@ The official conversion examples select these maintained templates:
 
 | Model | Template | Defaults |
 |---|---|---|
-| Qwen3.6 Dense/MoE | [qwen3_6.jinja](../tools/chat_templates/qwen3_6.jinja) | thinking on; closed-turn reasoning omitted |
+| Qwen3.6 | [qwen3_6.jinja](../tools/chat_templates/qwen3_6.jinja) | thinking on; closed-turn reasoning omitted |
 | Qwen3.8 | [qwen3_8.jinja](../tools/chat_templates/qwen3_8.jinja) | thinking on; effort `xhigh`; closed-turn reasoning retained |
 
 Use your own Jinja file to change the artifact's default template. A startup

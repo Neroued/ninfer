@@ -303,7 +303,6 @@ execution::DFlashEnvelopes dflash_envelopes(std::uint32_t min_frontier, std::uin
     (void)min_frontier;
     return execution::DFlashEnvelopes{
         .local  = {0, max_frontier},
-        .full   = {0, max_frontier},
         .append = {0, k + 1},
     };
 }

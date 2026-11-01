@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <iostream>
 #include <optional>
+#include <set>
 #include <span>
 #include <stdexcept>
 #include <string_view>
@@ -523,6 +524,11 @@ struct FakeCommitResult {
 struct FakeDiscardResult {
     ConsumeStatus status  = ConsumeStatus::InvariantMismatch;
     std::size_t row_count = 0;
+};
+
+struct FakeDeviceKVPages {
+    std::uint32_t main    = 0;
+    std::uint32_t backend = 0;
 };
 
 struct FakePhysicalUsage {
@@ -1150,8 +1156,104 @@ public:
     [[nodiscard]] FakeReleaseResult
     release_continuation(FakeContinuationHandle&& continuation) noexcept {
         released_continuations.push_back(continuation.id);
+        lease_release(lease_private_pages, continuation.id);
         advance_revision();
         return FakeReleaseResult{.status = ConsumeStatus::Consumed};
+    }
+
+    [[nodiscard]] FakeReleaseResult
+    release_shared_prefix(FakeSharedPrefixHandle&& shared) noexcept {
+        released_shared_prefixes.push_back(shared.id);
+        lease_release(lease_shared_pages, shared.id);
+        advance_revision();
+        return FakeReleaseResult{.status = ConsumeStatus::Consumed};
+    }
+
+    // Device KV lease: a page model of the Main KV pool. Retained owners map pages (an owner's
+    // list, by continuation or shared-prefix id); a page returns to the pool when it moves to the
+    // Host or when the last owner mapping it is released. Pages an active sequence reads never
+    // move.
+    [[nodiscard]] FakeDeviceKVPages
+    retained_device_kv_pages(const FakeContinuationHandle& continuation) const noexcept {
+        return lease_owner_pages(lease_private_pages, continuation.id, true);
+    }
+
+    [[nodiscard]] FakeDeviceKVPages
+    retained_device_kv_pages(const FakeSharedPrefixHandle& shared) const noexcept {
+        return lease_owner_pages(lease_shared_pages, shared.id, true);
+    }
+
+    [[nodiscard]] FakeDeviceKVPages
+    idle_device_kv_pages(const FakeContinuationHandle& continuation) const noexcept {
+        return lease_owner_pages(lease_private_pages, continuation.id, false);
+    }
+
+    [[nodiscard]] FakeDeviceKVPages
+    idle_device_kv_pages(const FakeSharedPrefixHandle& shared) const noexcept {
+        return lease_owner_pages(lease_shared_pages, shared.id, false);
+    }
+
+    [[nodiscard]] FakeDeviceKVPages device_kv_available_pages() const noexcept {
+        return FakeDeviceKVPages{.main = lease_available_pages};
+    }
+
+    [[nodiscard]] std::vector<FakeDeviceKVPages>
+    releasable_device_kv_pages(std::span<const FakeContinuationHandle* const> continuations,
+                               std::span<const FakeSharedPrefixHandle* const> shared) const {
+        // References per page from the listed owners; a page is releasable when they are all of
+        // its references.
+        std::unordered_map<std::uint32_t, std::uint32_t> listed;
+        const auto pages_of = [](const LeasePageMap& map, std::uint32_t owner) {
+            const auto found = map.find(owner);
+            return found == map.end() ? std::vector<std::uint32_t>{} : found->second;
+        };
+        for (const FakeContinuationHandle* continuation : continuations) {
+            for (const std::uint32_t page : pages_of(lease_private_pages, continuation->id)) {
+                ++listed[page];
+            }
+        }
+        for (const FakeSharedPrefixHandle* prefix : shared) {
+            for (const std::uint32_t page : pages_of(lease_shared_pages, prefix->id)) {
+                ++listed[page];
+            }
+        }
+        const auto count = [&](const std::vector<std::uint32_t>& pages) {
+            FakeDeviceKVPages out;
+            for (const std::uint32_t page : pages) {
+                if (lease_device_pages.contains(page) && !lease_active_pages.contains(page) &&
+                    lease_references(page) == listed[page]) {
+                    ++out.main;
+                }
+            }
+            return out;
+        };
+        std::vector<FakeDeviceKVPages> out;
+        for (const FakeContinuationHandle* continuation : continuations) {
+            out.push_back(count(pages_of(lease_private_pages, continuation->id)));
+        }
+        for (const FakeSharedPrefixHandle* prefix : shared) {
+            out.push_back(count(pages_of(lease_shared_pages, prefix->id)));
+        }
+        return out;
+    }
+
+    [[nodiscard]] std::optional<FakeContinuationSummary>
+    demote_retained_kv_for_lease(const FakeContinuationHandle& continuation,
+                                 FakeDeviceKVPages needed) noexcept {
+        const auto summary = catalogued_summaries_.find(continuation.id);
+        if (summary == catalogued_summaries_.end() ||
+            lease_demote(lease_private_pages, continuation.id, needed.main) == 0) {
+            return std::nullopt;
+        }
+        return summary->second;
+    }
+
+    [[nodiscard]] std::optional<FakeSharedPrefixSummary>
+    demote_retained_shared_kv_for_lease(const FakeSharedPrefixHandle& shared,
+                                        FakeDeviceKVPages needed) noexcept {
+        if (lease_demote(lease_shared_pages, shared.id, needed.main) == 0) { return std::nullopt; }
+        return FakeSharedPrefixSummary{
+            .checkpoint = shared_checkpoint(shared.content_key, lease_shared_frontier)};
     }
 
     [[nodiscard]] ProgramResourceRevision resource_revision() const noexcept { return revision_; }
@@ -1198,6 +1300,7 @@ public:
     [[nodiscard]] std::uint32_t disk_resume_tokens(const FakePreparedPrompt&) const noexcept {
         return disk_tokens;
     }
+
     std::uint32_t disk_tokens                 = 0;
     std::uint64_t admission_inspections       = 0;
     std::uint64_t pressure_planning_sessions  = 0;
@@ -1221,8 +1324,71 @@ public:
     bool allow_anchor_drops = false;
     std::vector<CheckpointRef> dropped_anchors;
     std::unordered_map<std::uint32_t, FakeContinuationSummary> catalogued_summaries_;
+    std::vector<std::uint32_t> released_shared_prefixes;
+    using LeasePageMap = std::unordered_map<std::uint32_t, std::vector<std::uint32_t>>;
+    LeasePageMap lease_private_pages;
+    LeasePageMap lease_shared_pages;
+    std::set<std::uint32_t> lease_device_pages;
+    std::set<std::uint32_t> lease_active_pages;
+    std::uint32_t lease_available_pages = 0;
+    std::uint32_t lease_shared_frontier = 64;
+    bool lease_host_tier                = true;
 
 private:
+    [[nodiscard]] std::uint32_t lease_references(std::uint32_t page) const noexcept {
+        std::uint32_t references = lease_active_pages.contains(page) ? 1U : 0U;
+        for (const LeasePageMap* map : {&lease_private_pages, &lease_shared_pages}) {
+            for (const auto& [owner, pages] : *map) {
+                references +=
+                    static_cast<std::uint32_t>(std::count(pages.begin(), pages.end(), page));
+            }
+        }
+        return references;
+    }
+
+    [[nodiscard]] FakeDeviceKVPages lease_owner_pages(const LeasePageMap& map, std::uint32_t owner,
+                                                      bool alone) const noexcept {
+        FakeDeviceKVPages out;
+        const auto found = map.find(owner);
+        if (found == map.end()) { return out; }
+        for (const std::uint32_t page : found->second) {
+            if (lease_device_pages.contains(page) && !lease_active_pages.contains(page) &&
+                (!alone || lease_references(page) == 1)) {
+                ++out.main;
+            }
+        }
+        return out;
+    }
+
+    // Moves up to `wanted` of the owner's idle Device pages to the Host, last pages first.
+    std::uint32_t lease_demote(const LeasePageMap& map, std::uint32_t owner,
+                               std::uint32_t wanted) noexcept {
+        const auto found = map.find(owner);
+        if (!lease_host_tier || found == map.end()) { return 0; }
+        std::uint32_t moved = 0;
+        for (auto page = found->second.rbegin(); page != found->second.rend() && moved < wanted;
+             ++page) {
+            if (!lease_active_pages.contains(*page) && lease_device_pages.erase(*page) != 0) {
+                ++moved;
+                ++lease_available_pages;
+            }
+        }
+        if (moved != 0) { advance_revision(); }
+        return moved;
+    }
+
+    void lease_release(LeasePageMap& map, std::uint32_t owner) noexcept {
+        const auto found = map.find(owner);
+        if (found == map.end()) { return; }
+        const std::vector<std::uint32_t> pages = std::move(found->second);
+        map.erase(found);
+        for (const std::uint32_t page : pages) {
+            if (lease_references(page) == 0 && lease_device_pages.erase(page) != 0) {
+                ++lease_available_pages;
+            }
+        }
+    }
+
     void advance_revision() noexcept {
         if (++revision_.value == 0) { ++revision_.value; }
     }
@@ -2460,12 +2626,12 @@ void test_disk_tier_beats_shorter_memory_match() {
     const ActiveRequest first = start_active(manager, program, 7, make_base(7), 1);
     (void)finish_active(manager, program, first);
     program.disk_tokens = 17; // 16 in memory: 1 more is under 17/16
-    auto close = manager.inspect(program, FakePreparedPrompt{7}, make_base(7), 2);
+    auto close          = manager.inspect(program, FakePreparedPrompt{7}, make_base(7), 2);
     require(close.readiness == Readiness::Ready && close.choice &&
                 close.choice->summary().reusable_prompt_tokens == 16,
             "a disk match barely longer displaced the in-memory endpoint");
     program.disk_tokens = 60;
-    auto longer = manager.inspect(program, FakePreparedPrompt{7}, make_base(7), 3);
+    auto longer         = manager.inspect(program, FakePreparedPrompt{7}, make_base(7), 3);
     require(longer.readiness == Readiness::Ready && longer.choice &&
                 longer.choice->summary().reusable_prompt_tokens == 0 &&
                 longer.choice->summary().prefix_reuse_path == PrefixReusePath::Root,
@@ -3269,6 +3435,160 @@ void test_shared_fanout_keeps_owner_edges_live_across_summary_refresh() {
             "shared fanout did not release both logical owner edges");
 }
 
+// A long answer's Device KV lease runs out of pool while the only cache pages left on the Device
+// are the prefix pages an idle conversation's continuation shares with the shared prefix it was
+// built on (admission already moved the continuation's own tail to the Host). Neither owner maps
+// those pages alone. Moving either owner's KV to the Host frees them, and then no conversation is
+// lost; without a Host tier, releasing both does. Pages the active answer reads stay.
+void test_lease_reclaim_frees_pages_two_idle_owners_share() {
+    for (const bool host_tier : {true, false}) {
+        FakeManager manager = make_manager(1, 3, 1);
+        FakeProgram program;
+        FakeRequestBasePlan seed_base = make_base(91);
+        seed_base.cache.opportunities.push_back(FakeContextCache::Opportunity{
+            .kind     = ninfer::PromptCacheMarkerKind::SharedStablePrefix,
+            .evidence = ninfer::SharedCandidateEvidence::EngineStructural,
+            .frontier = 64,
+        });
+        const ActiveRequest seed   = start_active(manager, program, 91, seed_base, 1);
+        program.capture_assessment = FakeCaptureAssessment{
+            .shortlist_key          = FakeShortlistKey{.digest = 91, .frontier = 64},
+            .shared_evidence        = ninfer::SharedCandidateEvidence::EngineStructural,
+            .protected_rebuild_work = PrefillWork{.tokens = 64},
+            .publishes_shared       = true,
+            .physically_feasible    = true,
+        };
+        require(
+            manager.reserve_active_capture(program, seed.lane, FakeCaptureOffer{.id = 41}, 0, {}) ==
+                FakeManager::ActiveCaptureReserveResult::Reserved,
+            "lease fixture could not publish its shared prefix");
+        auto capture_progress = manager.progress_context_transaction(program, {});
+        require(std::get<FakeManager::ActiveCaptureOutcome>(std::move(capture_progress)).status ==
+                    ContextTransactionStatus::Published,
+                "lease fixture did not publish its shared prefix");
+        (void)finish_active(manager, program, seed);
+        // A different conversation answers; it reads pages 100..101 only.
+        const ActiveRequest answer = start_active(manager, program, 92, make_base(92), 2);
+
+        // The idle continuation maps pages 0..9; the shared prefix the same pages 0..5; pages
+        // 6..9 already moved to the Host at admission. A second idle conversation (finished
+        // below as continuation 3) maps nothing on the Device.
+        program.lease_private_pages[seed.sequence.id] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
+        program.lease_shared_pages[1]                 = {0, 1, 2, 3, 4, 5};
+        program.lease_device_pages                    = {0, 1, 2, 3, 4, 5, 100, 101};
+        program.lease_active_pages                    = {100, 101};
+        program.lease_available_pages                 = 0;
+        program.lease_host_tier                       = host_tier;
+        require(
+            program.retained_device_kv_pages(FakeContinuationHandle(seed.sequence.id, 91)).main ==
+                0,
+            "lease fixture: the shared prefix pages belong to the continuation alone");
+
+        (void)manager.reclaim_device_kv_for_lease(program, 4, 0, 1, 0);
+        // Without a Host tier only the smallest growth step (one page) is reclaimed by dropping.
+        require(program.lease_available_pages >= (host_tier ? 4U : 1U),
+                "lease reclaim left the pages two idle owners share on the Device");
+        require(program.lease_device_pages.contains(100) &&
+                    program.lease_device_pages.contains(101),
+                "lease reclaim moved pages the active answer reads");
+        if (host_tier) {
+            require(program.released_continuations.empty() &&
+                        program.released_shared_prefixes.empty(),
+                    "with a Host tier the lease reclaim released a conversation");
+        }
+        (void)finish_active(manager, program, answer);
+    }
+}
+
+// Drop order: without a Host tier the smallest growth step is taken from an owner whose release
+// returns pages by itself before one that only shares its pages, which would return nothing
+// until its partner goes too.
+void test_lease_reclaim_drops_owner_with_own_pages_first() {
+    FakeManager manager = make_manager(1, 3, 1);
+    FakeProgram program;
+    FakeRequestBasePlan seed_base = make_base(93);
+    seed_base.cache.opportunities.push_back(FakeContextCache::Opportunity{
+        .kind     = ninfer::PromptCacheMarkerKind::SharedStablePrefix,
+        .evidence = ninfer::SharedCandidateEvidence::EngineStructural,
+        .frontier = 64,
+    });
+    const ActiveRequest seed   = start_active(manager, program, 93, seed_base, 1);
+    program.capture_assessment = FakeCaptureAssessment{
+        .shortlist_key          = FakeShortlistKey{.digest = 93, .frontier = 64},
+        .shared_evidence        = ninfer::SharedCandidateEvidence::EngineStructural,
+        .protected_rebuild_work = PrefillWork{.tokens = 64},
+        .publishes_shared       = true,
+        .physically_feasible    = true,
+    };
+    require(manager.reserve_active_capture(program, seed.lane, FakeCaptureOffer{.id = 43}, 0, {}) ==
+                FakeManager::ActiveCaptureReserveResult::Reserved,
+            "lease fixture could not publish its shared prefix");
+    auto capture_progress = manager.progress_context_transaction(program, {});
+    require(std::get<FakeManager::ActiveCaptureOutcome>(std::move(capture_progress)).status ==
+                ContextTransactionStatus::Published,
+            "lease fixture did not publish its shared prefix");
+    (void)finish_active(manager, program, seed, 300);
+    // A later, cheaper conversation with Device pages of its own.
+    const ActiveRequest side = start_active(manager, program, 94, make_base(94), 2);
+    (void)finish_active(manager, program, side, 50);
+    const ActiveRequest answer = start_active(manager, program, 95, make_base(95), 3);
+
+    program.lease_private_pages[seed.sequence.id] = {0, 1, 2, 3};
+    program.lease_shared_pages[1]                 = {0, 1, 2, 3};
+    program.lease_private_pages[side.sequence.id] = {10, 11};
+    program.lease_device_pages                    = {0, 1, 2, 3, 10, 11};
+    program.lease_available_pages                 = 0;
+    program.lease_host_tier                       = false;
+    (void)manager.reclaim_device_kv_for_lease(program, 1, 0, 1, 0);
+    require(program.lease_available_pages >= 1 &&
+                program.released_continuations == std::vector<std::uint32_t>{side.sequence.id} &&
+                program.released_shared_prefixes.empty(),
+            "lease reclaim released an owner that only shares its pages before one with its own");
+    (void)finish_active(manager, program, answer);
+}
+
+// An idle continuation whose Device pages are mapped as well by a shared prefix that cannot be
+// released (it holds client credit) frees nothing when it is released: without a Host tier the
+// lease reclaim keeps the conversation and leaves the lease short.
+void test_lease_reclaim_keeps_owner_sharing_pages_with_retained_owner() {
+    FakeManager manager = make_manager(1, 3, 1);
+    FakeProgram program;
+    FakeRequestBasePlan seed_base = make_base(96);
+    seed_base.cache.opportunities.push_back(FakeContextCache::Opportunity{
+        .kind     = ninfer::PromptCacheMarkerKind::SharedStablePrefix,
+        .evidence = ninfer::SharedCandidateEvidence::ExplicitBoundary,
+        .frontier = 64,
+    });
+    const ActiveRequest seed   = start_active(manager, program, 96, seed_base, 1);
+    program.capture_assessment = FakeCaptureAssessment{
+        .shortlist_key          = FakeShortlistKey{.digest = 96, .frontier = 64},
+        .shared_evidence        = ninfer::SharedCandidateEvidence::ExplicitBoundary,
+        .protected_rebuild_work = PrefillWork{.tokens = 64},
+        .publishes_shared       = true,
+        .physically_feasible    = true,
+    };
+    require(manager.reserve_active_capture(program, seed.lane, FakeCaptureOffer{.id = 44}, 0, {}) ==
+                FakeManager::ActiveCaptureReserveResult::Reserved,
+            "lease fixture could not publish its shared prefix");
+    auto capture_progress = manager.progress_context_transaction(program, {});
+    require(std::get<FakeManager::ActiveCaptureOutcome>(std::move(capture_progress)).status ==
+                ContextTransactionStatus::Published,
+            "lease fixture did not publish its shared prefix");
+    (void)finish_active(manager, program, seed);
+    const ActiveRequest answer = start_active(manager, program, 97, make_base(97), 2);
+
+    program.lease_private_pages[seed.sequence.id] = {0, 1, 2, 3};
+    program.lease_shared_pages[1]                 = {0, 1, 2, 3};
+    program.lease_device_pages                    = {0, 1, 2, 3};
+    program.lease_available_pages                 = 0;
+    program.lease_host_tier                       = false;
+    const std::uint32_t released = manager.reclaim_device_kv_for_lease(program, 1, 0, 1, 0);
+    require(released == 0 && program.released_continuations.empty() &&
+                program.released_shared_prefixes.empty() && program.lease_available_pages == 0,
+            "lease reclaim released a conversation whose pages a credited shared prefix keeps");
+    (void)finish_active(manager, program, answer);
+}
+
 void test_shared_capture_combines_two_pressure_owners() {
     FakeManager manager = make_manager(1, 4, 1);
     FakeProgram program;
@@ -3723,6 +4043,12 @@ void test_publication_only_pressure_constructs_adoptable_target() {
 } // namespace
 
 int main() {
+    run_test("lease reclaim frees pages two idle owners share",
+             test_lease_reclaim_frees_pages_two_idle_owners_share);
+    run_test("lease reclaim drops an owner with its own pages first",
+             test_lease_reclaim_drops_owner_with_own_pages_first);
+    run_test("lease reclaim keeps an owner sharing its pages with a retained owner",
+             test_lease_reclaim_keeps_owner_sharing_pages_with_retained_owner);
     run_test("Host-less private capture reclaim",
              test_hostless_private_capture_reclaims_oldest_idle_continuation);
     run_test("Host-less private capture reclaim by rebuild cost",

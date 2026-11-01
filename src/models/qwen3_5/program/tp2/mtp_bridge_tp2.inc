@@ -74,8 +74,8 @@ void mtp_bridge_and_propose_tp2(PrefillContext& state, const Tensor& next_token,
         state.mtp_proposal_extent > static_cast<std::uint32_t>(frame.draft_tokens.ne[0])) {
         throw std::logic_error("MTP bridge proposal extent is outside the configured window");
     }
-    // The remaining proposal steps run as the prompt's do (prefill_impl_tp2): each rank advances
-    // its own copy of the proposal position and hidden.
+    // The remaining proposal steps run as the prompt's do: each rank advances its own copy of the
+    // proposal position and hidden.
     TextContext::RankTensors ar_position{frame.position.slice(0, 0, 1),
                                          peer_frame.position.slice(0, 0, 1)};
     ops::set_i32_scalar(ar_position[0], position + 1, state.execution.device.stream);

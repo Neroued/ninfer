@@ -684,8 +684,10 @@ void apply_allowed_tools(const Json& config, GenerationRequest& output) {
     }
 
     std::erase_if(output.tools, [&](const ToolDefinition& tool) {
-        return std::find(allowed_names.begin(), allowed_names.end(), tool.name) ==
-               allowed_names.end();
+        const bool allowed =
+            std::find(allowed_names.begin(), allowed_names.end(), tool.name) != allowed_names.end();
+        if (!allowed) { output.filtered_out_tool_names.push_back(tool.name); }
+        return !allowed;
     });
     output.tool_choice.mode = ToolChoiceMode::Auto;
 }

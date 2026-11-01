@@ -184,7 +184,13 @@ void test_cross_device_copy() {
         CUDA_CHECK(cudaMemcpy(src, ref.data(), n, cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaSetDevice(to_d0 ? 0 : 1));
         CUDA_CHECK(cudaMemset(dst, 0, n));
-        CUDA_CHECK(cudaDeviceSynchronize());
+        // Both devices: a cudaMemcpy from pageable memory may return before its DMA lands, and
+        // neither stream below waits for the other device's default stream. Without this the copy
+        // could read the previous round's source bytes when another process slows the DMA.
+        for (const int device : {0, 1}) {
+            CUDA_CHECK(cudaSetDevice(device));
+            CUDA_CHECK(cudaDeviceSynchronize());
+        }
         CUDA_CHECK(cudaSetDevice(on_s0 ? 0 : 1));
         CUDA_CHECK(memcpy_device_async(dst, src, n, on_s0 ? s0 : s1));
         CUDA_CHECK(cudaStreamSynchronize(on_s0 ? s0 : s1));

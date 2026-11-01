@@ -5,6 +5,7 @@
 #include "serve/generation_service.h"
 #include "serve/openai_responses.h"
 #include "serve/translate.h"
+#include "tool_call_salvage_probe.h"
 
 #include <nlohmann/json.hpp>
 
@@ -717,6 +718,125 @@ int test_namespace_tools() {
     return failures;
 }
 
+// Calls the Qwen parser keeps despite their names come back as function_call input Items without a
+// 400, and a tool that allowed_tools filters out for the turn never becomes a call.
+int test_salvaged_tool_calls() {
+    const auto tool = [](const char* name) {
+        return Json{{"type", "function"},
+                    {"name", name},
+                    {"parameters", Json{{"type", "object"},
+                                        {"properties", Json{{"path", Json{{"type", "string"}}}}}}}};
+    };
+    const Json tools = Json::array({tool("Read"), tool("Write")});
+    const Json body  = {
+        {"model", "m"},
+        {"input", "read a.txt"},
+        {"store", false},
+        {"tools", tools},
+        {"tool_choice",
+          Json{{"type", "allowed_tools"},
+               {"mode", "auto"},
+               {"tools", Json::array({Json{{"type", "function"}, {"name", "Read"}}})}}}};
+    const OpenAIResponsesCreateRequest request =
+        parse_openai_responses_create_request(body, limits());
+    const ninfer::PromptInput input =
+        to_prompt_input(request.prompt.generation, ResolvedPromptSemantics{}, {});
+    const std::size_t max_name = request.prompt.generation.tool_name_max_length;
+
+    int failures = 0;
+    for (const char* filtered : {"Write", "srv.Write", "tools[\"srv\"][\"Write\"]"}) {
+        failures +=
+            check(ninfer::test::parse_model_call(input, max_name, filtered).tool_calls.empty(),
+                  std::string("allowed_tools-filtered call became structured: ") + filtered);
+    }
+
+    int kept = 0;
+    for (const std::string& name : ninfer::test::salvage_probe_names()) {
+        const auto parsed = ninfer::test::parse_model_call(input, max_name, name);
+        if (parsed.tool_calls.empty()) { continue; }
+        ++kept;
+        GenerationOutcome outcome;
+        outcome.finish_reason = ninfer::FinishReason::StopToken;
+        outcome.tool_calls    = parsed.tool_calls;
+        const BuiltOpenAIResponse built =
+            make_openai_response_object("resp_salvaged", 1, request, {}, outcome);
+        Json history =
+            Json::array({Json{{"type", "message"}, {"role", "user"}, {"content", "read a.txt"}}});
+        for (const Json& item : built.output_items) {
+            history.push_back(item);
+            if (item.at("type") == "function_call") {
+                history.push_back(Json{{"type", "function_call_output"},
+                                       {"call_id", item.at("call_id")},
+                                       {"output", "unknown tool"}});
+            }
+        }
+        const ApiError error = api_error([&] {
+            (void)parse_openai_responses_create_request(
+                Json{{"model", "m"}, {"input", history}, {"store", false}, {"tools", tools}},
+                limits());
+        });
+        failures += check(error.message == "no exception", "kept call '" + name +
+                                                               "' could not come back as an "
+                                                               "input Item: " +
+                                                               error.message);
+    }
+    failures += check(kept >= 4, "the probe names no longer exercise salvaged calls");
+    return failures;
+}
+
+// The model spells a namespace member as a catalog reference (srv.Read): the call reaches the
+// client as that member, with its namespace, not as the plain tool that shares its name, and comes
+// back in the next request's history.
+int test_namespace_member_catalog_spelling() {
+    const Json read = {
+        {"type", "function"},
+        {"name", "Read"},
+        {"parameters",
+         Json{{"type", "object"}, {"properties", Json{{"path", Json{{"type", "string"}}}}}}}};
+    const Json tools                           = Json::array({read, Json{{"type", "namespace"},
+                                                                         {"name", "srv"},
+                                                                         {"description", "Server files"},
+                                                                         {"tools", Json::array({read})}}});
+    const OpenAIResponsesCreateRequest request = parse_openai_responses_create_request(
+        Json{{"model", "m"}, {"input", "read a.txt"}, {"store", false}, {"tools", tools}},
+        limits());
+    const ninfer::PromptInput input =
+        to_prompt_input(request.prompt.generation, ResolvedPromptSemantics{}, {});
+    const std::size_t max_name = request.prompt.generation.tool_name_max_length;
+
+    int failures = 0;
+    for (const char* spelling : {"srv.Read", "srv/Read", "tools[\"srv\"][\"Read\"]"}) {
+        const auto parsed = ninfer::test::parse_model_call(input, max_name, spelling);
+        if (parsed.tool_calls.size() != 1) {
+            failures +=
+                check(false, std::string("namespace member spelling was not kept: ") + spelling);
+            continue;
+        }
+        GenerationOutcome outcome;
+        outcome.finish_reason = ninfer::FinishReason::StopToken;
+        outcome.tool_calls    = parsed.tool_calls;
+        const BuiltOpenAIResponse built =
+            make_openai_response_object("resp_member", 1, request, {}, outcome);
+        const Json& output = built.body.at("output").at(0);
+        failures += check(output.at("name") == "Read" && output.value("namespace", "") == "srv",
+                          std::string("namespace member spelling reached another tool: ") +
+                              spelling + " -> " + output.dump());
+        Json history =
+            Json::array({Json{{"type", "message"}, {"role", "user"}, {"content", "x"}}, output,
+                         Json{{"type", "function_call_output"},
+                              {"call_id", output.at("call_id")},
+                              {"output", "a"}}});
+        const ApiError error = api_error([&] {
+            (void)parse_openai_responses_create_request(
+                Json{{"model", "m"}, {"input", history}, {"store", false}, {"tools", tools}},
+                limits());
+        });
+        failures += check(error.message == "no exception",
+                          std::string("namespace member call did not come back: ") + error.message);
+    }
+    return failures;
+}
+
 int test_explicit_rejections() {
     const Json base = {{"model", "m"}, {"input", "hello"}};
     int failures    = 0;
@@ -1183,6 +1303,8 @@ int main() {
     failures += test_assistant_item_boundaries_and_errors();
     failures += test_tools_and_effective_subset();
     failures += test_namespace_tools();
+    failures += test_salvaged_tool_calls();
+    failures += test_namespace_member_catalog_spelling();
     failures += test_explicit_rejections();
     failures += test_custom_tool_round_trip();
     failures += test_codex_cli_compatibility();

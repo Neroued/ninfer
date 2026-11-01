@@ -1,6 +1,10 @@
 #pragma once
 
-// Phase allocations shared by actual execution and startup sizing.
+// Phase allocations shared by actual execution and startup sizing. text_prefill_roots is startup
+// sizing only: the token ids, positions, rope positions and visual scatter indices a prompt chunk
+// allocates before the Text forward, plus a BF16 [H,T] `residual` that the prompt chunk does not
+// allocate (the forward allocates its residual in its own sized phase), so the reservation exceeds
+// the roots by that matrix.
 
 #include "core/arena.h"
 #include "core/layout.h"
@@ -46,95 +50,6 @@ TextPrefillRoots text_prefill_roots(Allocator& allocator, const TextConfig& conf
 template <class Allocator>
 Tensor visual_scatter_indices(Allocator& allocator, std::int32_t tokens) {
     return vector(allocator, DType::I32, tokens);
-}
-
-struct TextAttentionProjectionRoots {
-    Tensor hidden;
-    Tensor query;
-    Tensor gate;
-    Tensor key;
-    Tensor value;
-};
-
-template <class Allocator>
-TextAttentionProjectionRoots
-text_attention_projection(Allocator& allocator, const TextConfig& config, std::int32_t tokens) {
-    return {
-        matrix(allocator, DType::BF16, dimension(config.hidden_size), tokens),
-        matrix(allocator, DType::BF16, dimension(config.attention->query_width()), tokens),
-        matrix(allocator, DType::BF16, dimension(config.attention->query_width()), tokens),
-        matrix(allocator, DType::BF16, dimension(config.attention->key_width()), tokens),
-        matrix(allocator, DType::BF16, dimension(config.attention->key_width()), tokens),
-    };
-}
-
-struct TextAttentionResultRoots {
-    Tensor normalized_query;
-    Tensor normalized_key;
-    Tensor attention;
-};
-
-template <class Allocator>
-TextAttentionResultRoots text_attention_results(Allocator& allocator, const TextConfig& config,
-                                                std::int32_t tokens) {
-    return {
-        matrix(allocator, DType::BF16, dimension(config.attention->query_width()), tokens),
-        matrix(allocator, DType::BF16, dimension(config.attention->key_width()), tokens),
-        matrix(allocator, DType::BF16, dimension(config.attention->query_width()), tokens),
-    };
-}
-
-struct GdnControlRoots {
-    Tensor hidden;
-    Tensor g;
-    Tensor beta;
-};
-
-template <class Allocator>
-GdnControlRoots gdn_control(Allocator& allocator, const TextConfig& config, std::int32_t tokens) {
-    return {
-        matrix(allocator, DType::BF16, dimension(config.hidden_size), tokens),
-        matrix(allocator, DType::FP32, dimension(config.gdn->linear_num_value_heads), tokens),
-        matrix(allocator, DType::FP32, dimension(config.gdn->linear_num_value_heads), tokens),
-    };
-}
-
-struct GdnProjectionRoots {
-    Tensor output_gate;
-    Tensor query;
-    Tensor key;
-    Tensor value;
-};
-
-template <class Allocator>
-GdnProjectionRoots gdn_projection(Allocator& allocator, const TextConfig& config,
-                                  std::int32_t tokens) {
-    return {
-        matrix(allocator, DType::BF16, dimension(config.gdn->value_width()), tokens),
-        matrix(allocator, DType::BF16, dimension(config.gdn->key_width()), tokens),
-        matrix(allocator, DType::BF16, dimension(config.gdn->key_width()), tokens),
-        matrix(allocator, DType::BF16, dimension(config.gdn->value_width()), tokens),
-    };
-}
-
-template <class Allocator>
-Tensor gdn_prefill_conv(Allocator& allocator, const TextConfig& config, std::int32_t tokens) {
-    return matrix(allocator, DType::BF16, dimension(config.gdn->conv_channels()), tokens);
-}
-
-template <class Allocator>
-Tensor gdn_recurrent_output(Allocator& allocator, const TextConfig& config, std::int32_t tokens) {
-    return matrix(allocator, DType::BF16, dimension(config.gdn->value_width()), tokens);
-}
-
-template <class Allocator>
-Tensor gdn_normalized_output(Allocator& allocator, const TextConfig& config, std::int32_t tokens) {
-    return matrix(allocator, DType::BF16, dimension(config.gdn->value_width()), tokens);
-}
-
-template <class Allocator>
-Tensor post_mixer_hidden(Allocator& allocator, const TextConfig& config, std::int32_t tokens) {
-    return matrix(allocator, DType::BF16, dimension(config.hidden_size), tokens);
 }
 
 struct MtpStemRoots {
@@ -224,62 +139,6 @@ DFlashContextRoots dflash_context(Allocator& allocator, const TextConfig& target
     };
 }
 
-struct DFlashContextLayerRoots {
-    Tensor key_raw;
-    Tensor value;
-    Tensor key;
-};
-
-template <class Allocator>
-DFlashContextLayerRoots dflash_context_layer(Allocator& allocator, const TextConfig& target,
-                                             const DraftConfig& config, std::int32_t tokens) {
-    return {
-        matrix(allocator, DType::BF16, dimension(config.attention.key_width()), tokens),
-        matrix(allocator, DType::BF16, dimension(config.attention.key_width()), tokens),
-        matrix(allocator, DType::BF16, dimension(config.attention.key_width()), tokens),
-    };
-}
-
-struct DFlashProposalRoots {
-    Tensor ids;
-    Tensor positions;
-    Tensor residual;
-};
-
-template <class Allocator>
-DFlashProposalRoots dflash_proposal(Allocator& allocator, const TextConfig& target,
-                                    const DraftConfig& config, std::int32_t tokens) {
-    return {
-        vector(allocator, DType::I32, tokens),
-        vector(allocator, DType::I32, tokens),
-        matrix(allocator, DType::BF16, dimension(target.hidden_size), tokens),
-    };
-}
-
-struct DFlashAttentionRoots {
-    Tensor hidden;
-    Tensor query_raw;
-    Tensor key_raw;
-    Tensor value;
-    Tensor query;
-    Tensor key;
-    Tensor attention;
-};
-
-template <class Allocator>
-DFlashAttentionRoots dflash_attention(Allocator& allocator, const TextConfig& target,
-                                      const DraftConfig& config, std::int32_t tokens) {
-    return {
-        matrix(allocator, DType::BF16, dimension(target.hidden_size), tokens),
-        matrix(allocator, DType::BF16, dimension(config.attention.query_width()), tokens),
-        matrix(allocator, DType::BF16, dimension(config.attention.key_width()), tokens),
-        matrix(allocator, DType::BF16, dimension(config.attention.key_width()), tokens),
-        matrix(allocator, DType::BF16, dimension(config.attention.query_width()), tokens),
-        matrix(allocator, DType::BF16, dimension(config.attention.key_width()), tokens),
-        matrix(allocator, DType::BF16, dimension(config.attention.query_width()), tokens),
-    };
-}
-
 // Dynamic-convolution outputs remain live through the corresponding attention/MLP branch.
 struct DFlash2BranchRoots {
     Tensor prepared;
@@ -291,23 +150,9 @@ DFlash2BranchRoots dflash2_branch(Allocator& allocator, const TextConfig& target
                                   const DraftConfig& config, std::int32_t width,
                                   std::int32_t batch) {
     return {allocator.alloc(DType::BF16, {dimension(target.hidden_size), width, batch}),
-            allocator.alloc(DType::BF16,
-                            {dimension(target.hidden_size / config.dflash2->conv_group_size), 2,
-                             width, batch})};
-}
-
-struct DFlashMlpRoots {
-    Tensor hidden;
-    Tensor intermediate;
-};
-
-template <class Allocator>
-DFlashMlpRoots dflash_mlp(Allocator& allocator, const TextConfig& target, const DraftConfig& config,
-                          std::int32_t tokens) {
-    return {
-        matrix(allocator, DType::BF16, dimension(target.hidden_size), tokens),
-        matrix(allocator, DType::BF16, dimension(config.intermediate_size), tokens),
-    };
+            allocator.alloc(
+                DType::BF16,
+                {dimension(target.hidden_size / config.dflash2.conv_group_size), 2, width, batch})};
 }
 
 } // namespace ninfer::models::qwen3_5::execution::workspace

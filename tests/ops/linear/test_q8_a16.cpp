@@ -27,6 +27,12 @@ constexpr std::array kGeometries{
     // Qwen4Exp hyper-connection Down(+inject)/Up and the PLE key/value parent.
     Geometry{324, 10240, 337U}, Geometry{320, 10240, 347U}, Geometry{10240, 320, 349U},
     Geometry{12800, 2560, 353U},
+    // Hyper-connection Down(+inject)/Up at H = 5120, at low rank 640 (H = 2560 and 5120), and
+    // the stream-split ones of tp 2 (two streams of H = 2560).
+    Geometry{324, 20480, 479U}, Geometry{320, 20480, 487U}, Geometry{20480, 320, 491U},
+    Geometry{644, 10240, 499U}, Geometry{640, 10240, 503U}, Geometry{10240, 640, 509U},
+    Geometry{644, 20480, 521U}, Geometry{640, 20480, 523U}, Geometry{20480, 640, 541U},
+    Geometry{324, 5120, 547U}, Geometry{320, 5120, 557U}, Geometry{5120, 320, 563U},
     // Qwen4Exp dense projections of the Q8 recipe.
     Geometry{13312, 2560, 359U}, Geometry{640, 2560, 367U}, Geometry{2560, 6144, 373U},
     Geometry{16384, 2560, 379U}, Geometry{96, 2560, 383U}, Geometry{1280, 2560, 389U},

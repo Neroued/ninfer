@@ -1225,6 +1225,8 @@ public:
         for (int i = 0; i < 4; ++i)
             CUDA_CHECK(cudaMemcpy(to[i]->data(), from[i]->data(), to[i]->bytes(),
                                   cudaMemcpyDeviceToDevice));
+        // Device-to-device copies may still run; the appends that follow use a non-blocking stream.
+        cuda_synchronize();
     }
 
     PagedKVLayerView single_view(int row) {

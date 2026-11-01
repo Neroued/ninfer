@@ -126,7 +126,7 @@ void logical_policy_27b() {
         expect(config, name, {h}, ShardAxis::Replicated);
     }
     for (const auto* name :
-         {"dflash2/layers/0/mlp/gate", "dflash2/feature_projection", "dflash/layers/1/input_norm",
+         {"dflash2/layers/0/mlp/gate", "dflash2/feature_projection", "dflash2/layers/1/input_norm",
           "dflash2/candidate_selector/successor_codebook", "proposal/head", "proposal/token_ids"}) {
         expect(config, name, {h}, ShardAxis::PrimaryOnly);
     }
@@ -170,9 +170,8 @@ void logical_policy_27b() {
         draft.attention         = qwen::AttentionConfig{32, 8, 128};
         draft.intermediate_size = 17408;
         draft.num_hidden_layers = 5;
-        draft.layer_types.assign(5, qwen::DraftAttentionKind::SlidingAttention);
-        draft.sliding_window = 2048;
-        draft.dflash2        = qwen::DFlash2Config{2, 16, 256, 16};
+        draft.sliding_window    = 2048;
+        draft.dflash2           = qwen::DFlash2Config{2, 16, 256, 16};
         const LoadOptions dflash2{.speculative = SpeculativeBackend::DFlash2, .tp = 2};
         const std::string d = "dflash2/layers/3/";
         expect(drafted, d + "attention/query", {4096, h}, ShardAxis::Rows,
@@ -241,11 +240,6 @@ void logical_policy_27b() {
     rejects<std::invalid_argument>(
         [&] { (void)loading::logical_shard("text/layers/3/attention/key", {768, h}, odd, kTp2); },
         "KV heads that do not divide by tp were split");
-    auto moe     = config;
-    moe.text.ffn = qwen::MoeConfig{256, 8, 512, 512};
-    rejects<std::invalid_argument>(
-        [&] { (void)loading::logical_shard("text/layers/0/input_norm", {h}, moe, kTp2); },
-        "a MoE block was placed");
 }
 
 // Fused parents of a Qwen3.8-27B NVFP4 artifact, with their logical parameters in row order.
@@ -670,19 +664,6 @@ void planned_fixture() {
             (void)qwen::plan_load(reader, {.speculative = SpeculativeBackend::DFlash2, .tp = 2});
         },
         "a rank-0 drafter reading the vocabulary-split head was planned");
-
-    auto& config            = fixture.file.root["components"]["text"]["config"];
-    config["architectures"] = Json::array({"Qwen3_5MoeForCausalLM"});
-    config["model_type"]    = "qwen3_5_moe_text";
-    config.erase("intermediate_size");
-    config["num_experts"]                     = 256;
-    config["num_experts_per_tok"]             = 8;
-    config["moe_intermediate_size"]           = 128;
-    config["shared_expert_intermediate_size"] = 128;
-    fixture.file.write();
-    artifact::Reader moe(fixture.file.entry);
-    rejects<std::invalid_argument>([&] { (void)qwen::plan_load(moe, kTp2); },
-                                   "tensor-parallel MoE was planned");
 }
 
 } // namespace

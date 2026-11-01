@@ -14,7 +14,7 @@
 
 namespace ninfer::ops::detail {
 
-// Qwen4Exp mixer geometry compiled into the fused route.
+// The mixer geometry compiled into the fused route (4 streams of 2560, low rank 320).
 inline constexpr std::int32_t kHcStreams   = 4;
 inline constexpr std::int32_t kHcHidden    = 2560;
 inline constexpr std::int32_t kHcWide      = kHcStreams * kHcHidden;
@@ -36,6 +36,7 @@ void hyper_connection_expand_launch(const Tensor& x, std::int32_t streams, Tenso
                                     cudaStream_t stream);
 
 // Small-T mix (T <= 8) over Q8 row-split, NVFP4 or BF16 Down/Up: two launches (mix_small_t.cu).
+// Compiled for H = kHcHidden (every format) and for Q8 at H = 2 kHcHidden.
 // The residual is written only with a pending combine (previous_y non-null).
 struct HcFusedMix {
     __nv_bfloat16* residual         = nullptr; // [S*H,T]
@@ -66,6 +67,8 @@ struct HcFusedMix {
     std::int32_t down_padded_rows       = 0;
     // BF16 weights (the FP4-Local checkpoint's mixers): no scales, BF16 activation operands.
     bool bf16 = false;
+    // Hidden width H: kHcHidden, or 2 kHcHidden for Q8 (hyper_connection_fused_compiled).
+    std::int32_t hidden = kHcHidden;
 };
 
 // TMA descriptors of the small-T route (encoded per launch from HcFusedMix's weight pointers).
@@ -77,6 +80,9 @@ struct HcFusedMaps {
 
 // Whether the current device runs the small-T route (thread block clusters, sm_90+).
 [[nodiscard]] bool hyper_connection_fused_supported();
+// Whether the small-T route is compiled for hidden width H and the weight format (Q8 when neither
+// fp4 nor bf16): every format at kHcHidden, Q8 also at 2 kHcHidden.
+[[nodiscard]] bool hyper_connection_fused_compiled(std::int32_t hidden, bool fp4, bool bf16);
 [[nodiscard]] std::size_t hyper_connection_fused_workspace_bytes(std::int32_t tokens);
 void hyper_connection_fused_mix_launch(const HcFusedMix& params, cudaStream_t stream);
 

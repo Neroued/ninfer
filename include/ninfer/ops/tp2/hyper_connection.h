@@ -1,6 +1,6 @@
 #pragma once
 
-// Two-device (tp 2) stream-split form of the Qwen4Exp hyper-connection mix (T30). Our file.
+// Two-device (tp 2) stream-split form of the hyper-connection mix.
 //
 // With models::LoadOptions::hc_split_streams, rank r holds streams [2r, 2r+2) of the wide residual
 // R (S = 4 streams of H = 2560) and the matching shards of every mixer (models/qwen3_5/load/
@@ -77,7 +77,8 @@ void hyper_connection_mix_split(const std::array<Tensor, 2>& residual,
  * the rank's streams, then the next mixer), as hyper_connection_combine_mix over the split.
  *
  * previous_y[r] BF16 [H, T] (the block output, identical on both ranks); previous_inject[r] FP32
- * [2, T] (the rank's streams' gates of the previous mixer). Updates residual[r] in place to its
+ * [2, T] (the rank's streams' gates of the previous mixer, not overlapping inject[r], as in
+ * hyper_connection_combine_mix). Updates residual[r] in place to its
  * committed values (one BF16 rounding each) and writes mixed and inject as
  * hyper_connection_mix_split over the committed residual. Same routes and workspace.
  */

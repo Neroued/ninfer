@@ -78,6 +78,9 @@ add_test(NAME ninfer_host_isa_guard_test
 ninfer_add_op_test(ninfer_host_moe_mailbox_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_host_moe_mailbox.cu"
   LIBRARIES ninfer_ops)
+# The slice table check bounds the host gap between a layer's two slices (300 us; about 20 us alone):
+# another process on the GPU or the CPU cores stretches it past a millisecond, so it runs alone.
+set_tests_properties(ninfer_host_moe_mailbox_test PROPERTIES RUN_SERIAL TRUE)
 
 # GGUF routed-expert Ops; real banks with NINFER_GGUF_BANKS, --bench for timings. The FP64 oracle
 # is host code of a .cu file: keep its host compiler from contracting.
@@ -107,11 +110,14 @@ ninfer_add_op_test(ninfer_sparse_attention_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_sparse_attention.cpp"
   LIBRARIES ninfer_ops)
 
+ninfer_add_op_test(ninfer_qsa_staging_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_qsa_staging.cpp"
+  LIBRARIES ninfer_ops ninfer_core)
+
 ninfer_add_op_test(ninfer_softmax_attention_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/softmax_attention/main.cpp"
           "${CMAKE_CURRENT_LIST_DIR}/softmax_attention/causal_cache.cpp"
           "${CMAKE_CURRENT_LIST_DIR}/softmax_attention/plain_and_packed.cpp"
-          "${CMAKE_CURRENT_LIST_DIR}/softmax_attention/context.cpp"
   LIBRARIES ninfer_ops)
 
 ninfer_add_op_test(ninfer_sliding_window_attention_test
@@ -147,10 +153,6 @@ set_tests_properties(
 
 ninfer_add_op_test(ninfer_prepare_masked_block_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_prepare_masked_block.cpp"
-  LIBRARIES ninfer_ops)
-
-ninfer_add_op_test(ninfer_sparse_moe_test
-  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_sparse_moe.cpp"
   LIBRARIES ninfer_ops)
 
 ninfer_add_op_test(ninfer_mtp_pack_test

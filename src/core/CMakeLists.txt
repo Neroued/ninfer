@@ -17,6 +17,7 @@ add_library(ninfer_core STATIC
   expert_cache.cu
   expert_staging.cu
   elastic_arena.cu
+  uva_copy.cu
 )
 ninfer_internal_includes(ninfer_core)
 ninfer_cuda_archive(ninfer_core)

@@ -98,12 +98,12 @@ def main(argv=None):
         action="append",
         default=[],
         metavar="NAME=PATH",
-        help="named source such as quantized, dflash or dflash2",
+        help="named source such as quantized or dflash2",
     )
     parser.add_argument(
         "--components",
         default="text",
-        help="comma-separated text,vision,mtp,dflash,dflash2",
+        help="comma-separated text,vision,mtp,dflash2",
     )
     parser.add_argument(
         "--resource",
@@ -135,7 +135,7 @@ def main(argv=None):
     with ExitStack() as stack:
         base = stack.enter_context(SafetensorsSource(args.model))
         sources = SourceInputs(base, paths, stack)
-        companions = {key: sources[key] for key in ("dflash", "dflash2") if key in components}
+        companions = {"dflash2": sources["dflash2"]} if "dflash2" in components else {}
         if is_qwen4_exp(base.config):
             if companions:
                 raise ValueError("Qwen4Exp has no DFlash companions")

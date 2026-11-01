@@ -40,7 +40,7 @@ DraftWeights bind_draft(Bindings& b, const DraftConfig& config, const TextConfig
         layer.mlp = bind_dense(b, h, config.intermediate_size, p, true);
         out.layers.push_back(std::move(layer));
     }
-    if (config.dflash2) { bind_dflash2(b, out, config, target); }
+    bind_dflash2(b, out, config, target);
     return out;
 }
 

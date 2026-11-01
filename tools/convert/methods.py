@@ -298,7 +298,7 @@ def import_encoded(request: PrepareRequest) -> PreparedMethod:
     return request.job(produce=produce, auxiliaries=auxiliaries)
 
 
-_NVFP4_MSE_TARGETS = (E2M1_MAX, 5.5, 5.0, 4.5, 4.0)
+NVFP4_MSE_TARGETS = (E2M1_MAX, 5.5, 5.0, 4.5, 4.0)
 
 
 def _nvfp4_quantized(request: PrepareRequest, targets: tuple[float, ...], *, stacked: bool = False) -> PreparedMethod:
@@ -352,7 +352,7 @@ def nvfp4_absmax(request: PrepareRequest) -> PreparedMethod:
 
 def nvfp4_mse(request: PrepareRequest) -> PreparedMethod:
     """NVFP4 with each group's scale chosen among five targets by least squared error."""
-    return _nvfp4_quantized(request, _NVFP4_MSE_TARGETS)
+    return _nvfp4_quantized(request, NVFP4_MSE_TARGETS)
 
 
 def nvfp4_mse_stacked(request: PrepareRequest) -> PreparedMethod:
@@ -361,7 +361,7 @@ def nvfp4_mse_stacked(request: PrepareRequest) -> PreparedMethod:
     Each source is quantised alone, exactly as nvfp4_mse would quantise it as its own parent, and
     keeps its divisor word; the recipe planner gives such a parent one divisor per source.
     """
-    return _nvfp4_quantized(request, _NVFP4_MSE_TARGETS, stacked=True)
+    return _nvfp4_quantized(request, NVFP4_MSE_TARGETS, stacked=True)
 
 
 METHODS: dict[str, Method] = {

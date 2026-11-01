@@ -95,6 +95,34 @@ const Weight* single_projection(const ops::ProjectionWeights& projection) noexce
     return single != nullptr ? &single->weight : nullptr;
 }
 
+void append_ffn_input_prefetch(const DenseParameters& ffn, std::size_t bytes,
+                               ExchangePrefetch& out) {
+    append_prefetch_paired_prefix(ffn.gate_up.weight, bytes, out);
+}
+
+void append_mixer_input_prefetch(const AttentionParameters& attention, std::size_t bytes,
+                                 ExchangePrefetch& out) {
+    if (const Weight* w = single_projection(attention.projection)) {
+        append_prefetch_prefix(*w, bytes, out);
+    }
+}
+
+void append_mixer_input_prefetch(const GdnParameters& gdn, std::size_t bytes,
+                                 ExchangePrefetch& out) {
+    std::size_t left = bytes;
+    if (const Weight* control = single_projection(gdn.control)) {
+        const std::size_t whole =
+            prefetch_row_bytes(*control) * static_cast<std::size_t>(control->n);
+        if (whole != 0 && whole <= bytes / 2) {
+            append_prefetch_rows(*control, 0, control->n, out);
+            left -= whole;
+        }
+    }
+    if (const Weight* w = single_projection(gdn.projection)) {
+        append_prefetch_prefix(*w, left, out);
+    }
+}
+
 std::size_t exchange_prefetch_budget(const ops::PeerEvents& events,
                                      const ExecutionContext& execution,
                                      std::size_t exchange_bytes) {

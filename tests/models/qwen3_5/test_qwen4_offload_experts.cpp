@@ -685,7 +685,9 @@ void unrouted_columns(Fixture& f) {
 // layer of experts per GPU at tp 2 (o-prefill: the 1-GPU count halved FP4-Local's prompt chunk).
 void test_ring_layers() {
     ::unsetenv("NINFER_QWEN4_TP2_HALF_RING");
-    const auto uniform = [](std::int32_t K) { return std::vector<std::int32_t>(48, K); };
+    const auto uniform = [](std::int32_t K, std::size_t layers = 48) {
+        return std::vector<std::int32_t>(layers, K);
+    };
     check(Qwen4OffloadExperts::ring_slots_for(576, 2) == 288, "tp 2 ring is half");
     check(Qwen4OffloadExperts::ring_layers(576, uniform(59), 48, 2) == 5,
           "tp 2 ring layers at 59 slots");
@@ -698,6 +700,13 @@ void test_ring_layers() {
     ::unsetenv("NINFER_QWEN4_TP2_HALF_RING");
     check(Qwen4OffloadExperts::layers_below(uniform(10), 5, 51) == 6,
           "layers_below: end + 1 when the layers below do not hold the slots");
+    // A ring wider than every Text layer (ring_layers = text_layers + 1) leaves the workspace an
+    // `end` of -1: nothing below, no read outside the profile.
+    check(Qwen4OffloadExperts::ring_layers(512, uniform(24, 4), 4, 1) == 5,
+          "ring_layers: text_layers + 1 when the Text layers cannot hold the ring");
+    check(Qwen4OffloadExperts::layers_below(uniform(24, 4), -1, 1) == 1 &&
+              Qwen4OffloadExperts::layers_below(uniform(24, 4), 0, 1) == 1,
+          "layers_below: an end <= 0 holds nothing");
     check(Qwen4OffloadExperts::may_lend(uniform(66), 48, 36, 2) &&
               !Qwen4OffloadExperts::may_lend(uniform(66), 48, 37, 2),
           "uniform layers, tp 2: at most 36 of 48 lent");

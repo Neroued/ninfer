@@ -155,6 +155,9 @@ Result run(bool unsafe, std::uint32_t seed, int windows) {
             host_table[l * kExperts + static_cast<int>(rng() % kBank)] = k;
     }
     CUDA_CHECK(cudaMemcpy(table, host_table.data(), host_table.size() * 4, cudaMemcpyHostToDevice));
+    // The pageable upload may return before its DMA lands, and the non-blocking streams below do
+    // not wait for the default stream: staging_overlay could read the table before it is written.
+    CUDA_CHECK(cudaDeviceSynchronize());
 
     cudaStream_t compute, copy;
     CUDA_CHECK(cudaStreamCreateWithFlags(&compute, cudaStreamNonBlocking));

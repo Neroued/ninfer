@@ -38,6 +38,15 @@ linear_swiglu_workspace_capacity_bytes(QType qtype, std::int32_t gate_up_rows,
                                        std::int32_t min_tokens, std::int32_t max_tokens);
 
 /**
+ * Whether linear_swiglu() registers the format and the [gate_up_rows,input_rows] parent shape
+ * (the profiles below, and the two-device output-row halves linear_swiglu_column_parallel() takes).
+ * A caller that holds only the weight format and shape chooses with it between this Op and a
+ * Linear + SiLU-multiply chain. It reports no workspace and launches nothing.
+ */
+[[nodiscard]] bool linear_swiglu_registered(QType qtype, std::int32_t gate_up_rows,
+                                            std::int32_t input_rows);
+
+/**
  * Op: linear_swiglu
  *
  * Math / indexing:
@@ -50,10 +59,12 @@ linear_swiglu_workspace_capacity_bytes(QType qtype, std::int32_t gate_up_rows,
  *   - Q8_G32_FP16 weight [12288,2048], x [2048,T], out [6144,T];
  *   - Q8_G32_FP16 weight [34816,5120], x [5120,T], out [17408,T];
  *   - NVFP4 BlockScaleK16M128x4 weight [34816,5120], x [5120,T], out [17408,T];
+ *   - NVFP4 BlockScaleK16M128x4 weight [28672,5120], x [5120,T], out [14336,T] (a dense FFN of
+ *     intermediate width 14336);
  *   - FP8_E4M3FN_ROW_BF16 RowScale weight [34816,5120], x [5120,T], out [17408,T].
  *   Inputs and output are contiguous BF16. Q4/Q8 scales are FP16, NVFP4 scales are E4M3FN, and
- *   row-scaled FP8 has one BF16 multiplier per gate/up parent row. Gate rows `[0,17408)` precede
- *   their matching up rows `[17408,34816)`.
+ *   row-scaled FP8 has one BF16 multiplier per gate/up parent row. Gate rows `[0,M)` precede
+ *   their matching up rows `[M,2M)`.
  *
  * Numeric:
  *   The oracle exact-decodes the registered weight and evaluates `ideal` naively in FP64 from the

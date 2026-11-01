@@ -12,10 +12,9 @@
 
 namespace ninfer::models::qwen3_5::execution::workspace {
 
-// Tensor-parallel (tp == 2) calls run the recipes above on each rank's own arena with the rank's
-// share of the config (execution::shard_text_config): the attention, GDN, FFN and vocabulary
-// extents are halved and the hidden/residual extent is not. These two recipes are the tp-only
-// roots of one call.
+// Tensor-parallel (tp == 2) calls run the workspace.h recipes on each rank's own arena with the
+// rank's share of the config (execution::shard_text_config): the attention, GDN, FFN and vocabulary
+// extents are halved and the hidden/residual extent is not. The recipes below are tp-only.
 
 // The all-reduce staging of one call: every row-parallel projection of every layer reuses it, one
 // per rank, because each all-reduce leaves its source and staging free on return.

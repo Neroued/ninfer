@@ -113,6 +113,13 @@ void require_q8(const Weight& w, std::int32_t n, std::int32_t k, const char* lab
             label);
 }
 
+// Whether the bytes of two tensors intersect.
+bool overlaps(const Tensor& a, const Tensor& b) {
+    const auto begin_a = reinterpret_cast<std::uintptr_t>(a.data);
+    const auto begin_b = reinterpret_cast<std::uintptr_t>(b.data);
+    return begin_a < begin_b + b.bytes() && begin_b < begin_a + a.bytes();
+}
+
 std::size_t align256(std::size_t bytes) { return (bytes + 255) / 256 * 256; }
 
 std::size_t workspace_bytes(std::int32_t tokens, bool inject) {
@@ -208,7 +215,7 @@ Validated validate(const std::array<Tensor, 2>& residual,
                         std::max(workspace_bytes(v.tokens, v.inject),
                                  detail::hyper_connection_split_fused_workspace_bytes(v.tokens)),
                 "workspace too small");
-        require(mixed[rank].data != residual[rank].data, "mixed must not overlap residual");
+        require(!overlaps(mixed[rank], residual[rank]), "mixed must not overlap residual");
     }
     return v;
 }
@@ -393,9 +400,11 @@ void hyper_connection_combine_mix_split(const std::array<Tensor, 2>& residual,
                        "previous_y must be BF16 [2560, T]");
         require_matrix(previous_inject[rank], DType::FP32, kLocalStreams, v.tokens,
                        "previous_inject must be FP32 [2, T] (the rank's streams)");
-        require(previous_y[rank].data != residual[rank].data &&
-                    previous_inject[rank].data != residual[rank].data,
+        require(!overlaps(previous_y[rank], residual[rank]) &&
+                    !overlaps(previous_inject[rank], residual[rank]),
                 "previous_y and previous_inject must not overlap the residual");
+        require(inject[rank] == nullptr || !overlaps(*inject[rank], previous_inject[rank]),
+                "inject must not overlap previous_inject");
     }
     const ScopedCurrentDevice guard;
     if (PeerMailbox* mailbox = fused_mailbox(v, weights, ec, events)) {

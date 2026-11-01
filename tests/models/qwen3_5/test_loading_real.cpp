@@ -32,8 +32,7 @@ void check_selection(const qwen::LoadPlan& plan, const LoadOptions& options) {
             "Vision demand differs from startup selection");
     require(weights.mtp.has_value() == (options.speculative == SpeculativeBackend::Mtp),
             "MTP selection differs");
-    require(weights.draft.has_value() == (options.speculative == SpeculativeBackend::DFlash ||
-                                          options.speculative == SpeculativeBackend::DFlash2),
+    require(weights.draft.has_value() == (options.speculative == SpeculativeBackend::DFlash2),
             "draft selection differs");
     require(weights.proposal.has_value() == options.proposal_enabled(),
             "proposal selection differs");
@@ -104,21 +103,7 @@ void check_native_inputs(const qwen::Model& model) {
                                                        model.input(gdn.b_projection));
             (void)linear(gdn.output);
         }
-        if (const auto* mlp = std::get_if<qwen::DenseWeights>(&weights.ffn)) {
-            dense(*mlp);
-        } else {
-            const auto& moe = std::get<qwen::MoeWeights>(weights.ffn);
-            std::vector<ops::WeightInput> gate_up, down;
-            for (const auto& expert : moe.experts) {
-                gate_up.push_back(model.input(expert.gate));
-                gate_up.push_back(model.input(expert.up));
-                down.push_back(model.input(expert.down));
-            }
-            (void)ops::prepare_sparse_moe_weights(
-                model.input(moe.router), model.input(moe.shared_score), gate_up, down,
-                model.input(moe.shared.gate), model.input(moe.shared.up),
-                model.input(moe.shared.down));
-        }
+        dense(weights.ffn);
     };
     const auto& weights = model.weights();
     (void)native_weight(model.weight(weights.text.token_embedding).view);
@@ -194,8 +179,6 @@ int main(int argc, char** argv) {
                     options.speculative = SpeculativeBackend::None;
                 } else if (backend == "mtp") {
                     options.speculative = SpeculativeBackend::Mtp;
-                } else if (backend == "dflash") {
-                    options.speculative = SpeculativeBackend::DFlash;
                 } else if (backend == "dflash2") {
                     options.speculative = SpeculativeBackend::DFlash2;
                 } else {

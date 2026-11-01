@@ -1,6 +1,8 @@
 #include "ninfer/engine.h"
 #include "speculative_page_boundary.h"
 #include "kv_cache_storage.h"
+#include "single_device_fit.h"
+#include "models/load_options.h"
 
 #include <algorithm>
 #include <cstdlib>
@@ -90,6 +92,11 @@ int main(int argc, char** argv) {
         options.speculative.draft_tokens             = k;
         options.speculative.proposal_head =
             optimized ? ninfer::ProposalHead::Optimized : ninfer::ProposalHead::Full;
+        if (const auto shortfall = ninfer::test::single_device_shortfall(
+                artifact, ninfer::models::load_options(options))) {
+            std::cout << "skip: " << *shortfall << '\n';
+            return 77;
+        }
         ninfer::Engine engine(options);
         require(engine.memory_summary().kv_cache == options.kv_cache,
                 "Engine did not select the requested KV dtype");

@@ -462,20 +462,21 @@ int main() {
     }
     failures += run_pair_case({"27b text decode", 256, 64, 1, 1, kTextTheta}, 24, 4, 31);
     failures += run_pair_case({"27b text mrope prefill", 256, 64, 3, 128, kTextTheta}, 24, 4, 4096);
+    failures += run_pair_case({"head 256 text native-context tail", 256, 64, 1, 7, kTextTheta}, 16,
+                              2, 262'137);
     failures +=
-        run_pair_case({"35b text native-context tail", 256, 64, 1, 7, kTextTheta}, 16, 2, 262'137);
-    failures += run_pair_case({"35b text mrope", 256, 64, 3, 7, kTextTheta}, 16, 2, 2048, 16, 8);
+        run_pair_case({"head 256 text mrope", 256, 64, 3, 7, kTextTheta}, 16, 2, 2048, 16, 8);
 
     // MTP bulk K append uses the single-tensor form; proposal tail uses the pair form above.
     failures += run_single_case({"27b mtp k mrope", 256, 64, 3, 128, kTextTheta}, 4, 8192);
-    failures += run_single_case({"35b mtp k text", 256, 64, 1, 5, kTextTheta}, 2, 16384, 8);
+    failures += run_single_case({"head 256 k text", 256, 64, 1, 5, kTextTheta}, 2, 16384, 8);
 
     failures += run_vision_packed_case();
 
-    // DFlash proposal consumes 2..16 tokens; context append uses the single-K form.
-    failures += run_pair_case({"35b dflash proposal", 128, 128, 1, 16, kTextTheta}, 32, 8, 262'128);
+    // Head dim 128 with full rotation: the pair form at 16 tokens and the single-K form at 128.
+    failures += run_pair_case({"head 128 pair", 128, 128, 1, 16, kTextTheta}, 32, 8, 262'128);
     failures +=
-        run_single_case({"35b dflash context k", 128, 128, 1, 128, kTextTheta}, 8, 131'072, 16);
+        run_single_case({"head 128 single k", 128, 128, 1, 128, kTextTheta}, 8, 131'072, 16);
 
     std::cout << (failures == 0 ? "OK" : "FAIL") << " rope correctness\n";
     return failures == 0 ? 0 : 1;

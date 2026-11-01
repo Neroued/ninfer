@@ -5,6 +5,7 @@
 #include <cstdlib>
 
 #include "models/qwen3_5/frontend/prepared_prompt.h"
+#include "single_device_fit.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -28,12 +29,16 @@ int main() {
             return 77;
         }
         CUDA_CHECK(status);
-        ninfer::DeviceContext device;
         ninfer::models::LoadOptions selected;
         selected.vision        = true;
         selected.speculative   = ninfer::SpeculativeBackend::Mtp;
         selected.proposal_head = ninfer::ProposalHead::Optimized;
-        auto model             = qwen::load_model(artifact, selected, device);
+        if (const auto shortfall = ninfer::test::single_device_shortfall(artifact, selected)) {
+            std::cout << "skip: " << *shortfall << '\n';
+            return 77;
+        }
+        ninfer::DeviceContext device;
+        auto model = qwen::load_model(artifact, selected, device);
         const qwen::execution::Parameters parameters(*model);
         const auto capacity = [&](std::uint32_t max_context) {
             ninfer::EngineOptions options;

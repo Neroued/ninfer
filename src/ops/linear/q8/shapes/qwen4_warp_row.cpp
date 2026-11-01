@@ -11,19 +11,19 @@ namespace ninfer::ops::detail {
 // key/value parent and the MTP stem.
 Q8Launch select_q8_qwen4_rows_k2560(std::int32_t tokens) {
     if (tokens <= 4) return launch_q8_a16_warp_row_r4_p10;
-    return select_q8_generic_hidden2560(tokens);
+    return select_q8_generic(tokens);
 }
 
 // Shared-expert down [2560, 640].
 Q8Launch select_q8_qwen4_n2560_k640(std::int32_t tokens) {
     if (tokens <= 4) return launch_q8_a16_warp_row_r4_p3;
-    return select_q8_generic_hidden2560(tokens);
+    return select_q8_generic(tokens);
 }
 
 // GDN a|b TP2 shard [48, 2560]: two warps per row, as the low-rank SIMT route.
 Q8Launch select_q8_qwen4_n48_k2560(std::int32_t tokens) {
     if (tokens <= 4) return launch_q8_a16_warp_row_r2_w2_p5;
-    return select_q8_low_rank_k10240(tokens);
+    return select_q8_few_rows_wide_k(tokens);
 }
 
 } // namespace ninfer::ops::detail

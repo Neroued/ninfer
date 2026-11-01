@@ -1,32 +1,55 @@
 #include "models/registry.h"
 
+#include <array>
 #include <stdexcept>
 #include <string>
 
 namespace ninfer::models {
+namespace {
+
+// The checkpoint names of one implementation: Text architecture, its model_type, and the
+// architecture of its MTP component.
+struct ArchitectureNames {
+    std::string_view text;
+    std::string_view model_type;
+    std::string_view mtp;
+    Architecture architecture;
+};
+
+// One entry per Architecture; `text` is its canonical name (architecture_name()).
+constexpr std::array kNames{
+    ArchitectureNames{"Qwen3_5ForCausalLM", "qwen3_5_text", "Qwen3_5MTP", Architecture::Qwen3_5},
+    ArchitectureNames{"Qwen4ExpForCausalLM", "qwen4_exp_text", "Qwen4ExpMTP",
+                      Architecture::Qwen4Exp},
+};
+
+} // namespace
 
 Architecture resolve_architecture(std::string_view architecture, std::string_view model_type) {
-    if (architecture == "Qwen3_5ForCausalLM" && model_type == "qwen3_5_text") {
-        return Architecture::Qwen3_5;
+    for (const auto& names : kNames) {
+        if (names.text == architecture && names.model_type == model_type) {
+            return names.architecture;
+        }
     }
-    if (architecture == "Qwen3_5MoeForCausalLM" && model_type == "qwen3_5_moe_text") {
-        return Architecture::Qwen3_5Moe;
+    std::string supported;
+    for (const auto& names : kNames) {
+        supported += (supported.empty() ? "" : ", ") + std::string(names.text) + "/" +
+                     std::string(names.model_type);
     }
-    if (architecture == "Qwen4ExpForCausalLM" && model_type == "qwen4_exp_text") {
-        return Architecture::Qwen4Exp;
+    throw std::invalid_argument("unsupported architecture " + std::string(architecture) + "/" +
+                                std::string(model_type) + " (supported: " + supported + ")");
+}
+
+std::string_view mtp_architecture(std::string_view architecture) noexcept {
+    for (const auto& names : kNames) {
+        if (names.text == architecture) { return names.mtp; }
     }
-    throw std::invalid_argument("unsupported architecture/config pair " +
-                                std::string(architecture) + "/" + std::string(model_type));
+    return {};
 }
 
 std::string_view architecture_name(Architecture architecture) noexcept {
-    switch (architecture) {
-    case Architecture::Qwen3_5:
-        return "Qwen3_5ForCausalLM";
-    case Architecture::Qwen3_5Moe:
-        return "Qwen3_5MoeForCausalLM";
-    case Architecture::Qwen4Exp:
-        return "Qwen4ExpForCausalLM";
+    for (const auto& names : kNames) {
+        if (names.architecture == architecture) { return names.text; }
     }
     return {};
 }

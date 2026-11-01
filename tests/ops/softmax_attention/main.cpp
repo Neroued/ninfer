@@ -5,7 +5,6 @@
 
 int run_softmax_attention_causal_cache_tests(std::optional<ninfer::KvCacheStorage> storage);
 int run_softmax_attention_plain_and_packed_tests();
-int run_softmax_attention_context_tests();
 
 int main(int argc, char** argv) {
     bool causal_only = false;
@@ -36,10 +35,7 @@ int main(int argc, char** argv) {
     const int plain_and_packed = run_softmax_attention_plain_and_packed_tests();
     if (plain_and_packed == 77) return 77;
 
-    const int context = run_softmax_attention_context_tests();
-    if (context == 77) return 77;
-
-    const int failures = causal + plain_and_packed + context;
+    const int failures = causal + plain_and_packed;
     std::cout << (failures == 0 ? "softmax_attention: PASS\n" : "softmax_attention: FAIL\n");
     return failures == 0 ? 0 : 1;
 }

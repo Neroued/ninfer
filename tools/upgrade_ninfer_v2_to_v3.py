@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""One-time, standard-library upgrade of the seven known official NInfer v2 inputs.
+"""One-time, standard-library upgrade of the six known official NInfer v2 inputs (Qwen3.6-27B and
+Qwen3.8-27B).
 
 Run: python3 upgrade_ninfer_v2_to_v3.py INPUT.ninfer OUTPUT.ninfer
 Weight bytes are preserved and the maintained Qwen chat template is installed.
@@ -39,7 +40,6 @@ KNOWN_COUNTS = {
     ("qwen3.6-27b", "nvfp4"): (1307,),
     ("qwen3.8-27b", "groupwise-int"): (1124, 1190),
     ("qwen3.8-27b", "nvfp4"): (1124, 1190),
-    ("qwen3.6-35b-a3b", "groupwise-int"): (940,),
 }
 LIMIT = 32_000_000_000
 HEADER = struct.Struct("<8sQ16s")
@@ -55,20 +55,20 @@ def f32(value):
     return struct.unpack("<f", struct.pack("<f", value))[0]
 
 
-def text_config(moe):
-    layers = 40 if moe else 64
-    result = {
-        "architectures": ["Qwen3_5MoeForCausalLM" if moe else "Qwen3_5ForCausalLM"],
-        "model_type": "qwen3_5_moe_text" if moe else "qwen3_5_text",
-        "hidden_size": 2048 if moe else 5120,
+def text_config():
+    layers = 64
+    return {
+        "architectures": ["Qwen3_5ForCausalLM"],
+        "model_type": "qwen3_5_text",
+        "hidden_size": 5120,
         "vocab_size": 248320,
         "tie_word_embeddings": False,
         "num_hidden_layers": layers,
         "layer_types": ["full_attention" if i % 4 == 3 else "linear_attention" for i in range(layers)],
         "max_position_embeddings": 262144,
         "rms_norm_eps": f32(1e-6),
-        "num_attention_heads": 16 if moe else 24,
-        "num_key_value_heads": 2 if moe else 4,
+        "num_attention_heads": 24,
+        "num_key_value_heads": 4,
         "head_dim": 256,
         "rope_parameters": {
             "rope_theta": f32(10000000),
@@ -77,25 +77,16 @@ def text_config(moe):
         },
         "linear_num_key_heads": 16,
         "linear_key_head_dim": 128,
-        "linear_num_value_heads": 32 if moe else 48,
+        "linear_num_value_heads": 48,
         "linear_value_head_dim": 128,
         "linear_conv_kernel_dim": 4,
+        "intermediate_size": 17408,
     }
-    if moe:
-        result.update(
-            num_experts=256,
-            num_experts_per_tok=8,
-            moe_intermediate_size=512,
-            shared_expert_intermediate_size=512,
-        )
-    else:
-        result["intermediate_size"] = 17408
-    return result
 
 
-def vision_config(moe):
+def vision_config():
     return {
-        "model_type": "qwen3_5_moe_vision" if moe else "qwen3_5_vision",
+        "model_type": "qwen3_5_vision",
         "depth": 27,
         "hidden_size": 1152,
         "intermediate_size": 4304,
@@ -107,27 +98,28 @@ def vision_config(moe):
     }
 
 
-def draft_config(second):
-    draft = {
-        "target_layer_ids": ([5, 19, 33, 47, 61] if second else [1, 6, 11, 16, 22, 27, 32, 37]),
-        "mask_token_id": 248070 if second else 248077,
-    }
-    if second:
-        draft.update(conv_kernel_size=2, conv_group_size=16, selector_rank=256, selector_top_k=16)
+def draft_config():
     return {
-        "architectures": ["DFlash2DraftModel" if second else "DFlashDraftModel"],
+        "architectures": ["DFlash2DraftModel"],
         "model_type": "qwen3",
-        "intermediate_size": 17408 if second else 6144,
+        "intermediate_size": 17408,
         "num_attention_heads": 32,
         "num_key_value_heads": 8,
         "head_dim": 128,
-        "num_hidden_layers": 5 if second else 6,
+        "num_hidden_layers": 5,
         "rms_norm_eps": f32(1e-6),
         "rope_parameters": {"rope_theta": f32(10000000)},
         "max_position_embeddings": 262144,
-        "layer_types": ["sliding_attention"] * 5 + ([] if second else ["full_attention"]),
-        "sliding_window": 2048 if second else 4096,
-        "dflash_config": draft,
+        "layer_types": ["sliding_attention"] * 5,
+        "sliding_window": 2048,
+        "dflash_config": {
+            "target_layer_ids": [5, 19, 33, 47, 61],
+            "mask_token_id": 248070,
+            "conv_kernel_size": 2,
+            "conv_group_size": 16,
+            "selector_rank": 256,
+            "selector_top_k": 16,
+        },
     }
 
 
@@ -160,7 +152,7 @@ def encoded_bytes(obj):
 
 
 def _input_names(name, components):
-    backends = [c for c in ("mtp", "dflash", "dflash2") if c in components]
+    backends = [c for c in ("mtp", "dflash2") if c in components]
     if name == "text/output_head":
         return ["text/final_hidden"] + [c + "/final_hidden" for c in backends]
     if name == "proposal/head":
@@ -185,17 +177,10 @@ def _input_names(name, components):
             return [block + "mixer_input"]
         if role in ("attention/output", "gdn/output"):
             return [block + role.rsplit("/", 1)[0] + "/gated_output"]
-        if role in (
-            "mlp/gate",
-            "mlp/up",
-            "moe/router",
-            "moe/shared_score",
-        ) or re.fullmatch(r"moe/(experts/\d+|shared)/(gate|up)", role):
+        if role in ("mlp/gate", "mlp/up"):
             return [block + "ffn_input"]
         if role == "mlp/down":
             return [block + "mlp/product"]
-        if re.fullmatch(r"moe/(experts/\d+|shared)/down", role):
-            return [block + role.rsplit("/", 1)[0] + "/product"]
     if name == "vision/patch_embedding":
         return ["vision/patch_input"]
     if name in ("vision/merger/fc1", "vision/merger/fc2"):
@@ -212,7 +197,7 @@ def _input_names(name, components):
             "mlp/fc2": "mlp_activation",
         }.get(role)
         return [] if position is None else [block + position]
-    match = re.fullmatch(r"(dflash2?)/(.*)", name)
+    match = re.fullmatch(r"(dflash2)/(.*)", name)
     if match:
         backend, role = match.groups()
         if role == "feature_projection":
@@ -245,25 +230,22 @@ def make_directory(identity, old_objects):
     key = (identity["model_id"], identity["weights_id"])
     if key not in KNOWN_COUNTS or len(old_objects) not in KNOWN_COUNTS[key]:
         raise ValueError(f"unsupported v2 input {key} with {len(old_objects)} objects")
-    moe = key[0] == "qwen3.6-35b-a3b"
     has_dflash2 = any(o["name"].startswith("dflash2/") for o in old_objects)
-    text = text_config(moe)
+    text = text_config()
     components = {
         "text": {
             "config": text,
             "resources": {},
             "proposal": {"domain": "indexed", "rows": 131072},
         },
-        "vision": {"config": vision_config(moe), "target": "text", "resources": {}},
+        "vision": {"config": vision_config(), "target": "text", "resources": {}},
         "mtp": {
-            "config": {"architectures": ["Qwen3_5MoeMTP" if moe else "Qwen3_5MTP"]},
+            "config": {"architectures": ["Qwen3_5MTP"]},
             "target": "text",
         },
     }
-    if moe:
-        components["dflash"] = {"config": draft_config(False), "target": "text"}
     if has_dflash2:
-        components["dflash2"] = {"config": draft_config(True), "target": "text"}
+        components["dflash2"] = {"config": draft_config(), "target": "text"}
     objects = []
     for value in old_objects:
         obj = {
@@ -429,36 +411,10 @@ def make_directory(identity, old_objects):
                     else ((128,) if role == "gdn/norm" else (4, channels) if role == "gdn/convolution" else (h, vg))
                 )
                 put(block + role, obj, shape)
-            elif role == "mlp/gate_up" and not moe:
+            elif role == "mlp/gate_up":
                 split(obj, [(block + "mlp/gate", 17408), (block + "mlp/up", 17408)], h)
-            elif role == "mlp/down" and not moe:
+            elif role == "mlp/down":
                 put(block + role, obj, (h, 17408))
-            elif role.startswith("moe/") and moe:
-                prefix = block + "moe/"
-                if role == "moe/router_shared_gate":
-                    split(obj, [(prefix + "router", 256), (prefix + "shared_score", 1)], h)
-                elif role == "moe/routed_gate_up":
-                    split(
-                        obj,
-                        [(prefix + f"experts/{e}/" + part, 512) for e in range(256) for part in ("gate", "up")],
-                        h,
-                    )
-                elif role == "moe/routed_down":
-                    split(
-                        obj,
-                        [(prefix + f"experts/{e}/down", h) for e in range(256)],
-                        512,
-                    )
-                elif role == "moe/shared_gate_up":
-                    split(
-                        obj,
-                        [(prefix + "shared/gate", 512), (prefix + "shared/up", 512)],
-                        h,
-                    )
-                elif role == "moe/shared_down":
-                    put(prefix + "shared/down", obj, (h, 512))
-                else:
-                    raise ValueError(f"unknown MoE object {name}")
             else:
                 raise ValueError(f"unknown decoder object {name}")
             continue
@@ -525,7 +481,7 @@ def make_directory(identity, old_objects):
                 raise ValueError(f"unknown Vision object {name}")
             put("vision/merger/" + role.replace("norm/", "norm_"), obj, sizes[role])
             continue
-        match = re.fullmatch(r"(dflash2?)/(.*)", name)
+        match = re.fullmatch(r"(dflash2)/(.*)", name)
         if match:
             backend, role = match.groups()
             if backend not in components:
@@ -538,7 +494,7 @@ def make_directory(identity, old_objects):
                 )
                 put(name, obj, shape)
                 continue
-            if role.startswith("candidate_selector/") and backend == "dflash2":
+            if role.startswith("candidate_selector/"):
                 shape = (256, h) if role.endswith("hidden_projection") else (r, 256)
                 put(name, obj, shape)
                 continue
@@ -582,10 +538,9 @@ def make_directory(identity, old_objects):
                     "attention/output": (h, 4096),
                     "mlp/down": (h, inter),
                 }
-                if backend == "dflash2":
-                    for branch in ("attention_conv", "mlp_conv"):
-                        sizes[branch + "/base_kernel"] = (2, 2, h)
-                        sizes[branch + "/kernel_projection"] = (h // 4, h)
+                for branch in ("attention_conv", "mlp_conv"):
+                    sizes[branch + "/base_kernel"] = (2, 2, h)
+                    sizes[branch + "/kernel_projection"] = (h // 4, h)
                 put(block + role, obj, sizes[role])
             continue
         raise ValueError(f"unknown stored tensor {name}")
@@ -601,7 +556,7 @@ def make_directory(identity, old_objects):
             uses.append(use)
     if scalar_uses.keys() - bindings.keys():
         raise ValueError("activation scalar refers to an absent logical projection")
-    expected_bindings = 32713 if moe else 1513 if has_dflash2 else 1422
+    expected_bindings = 1513 if has_dflash2 else 1422
     if len(bindings) != expected_bindings:
         raise ValueError("the known logical parameter mapping is incomplete")
     for component, required in (

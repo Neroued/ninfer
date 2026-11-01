@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/arena.h"
 #include "core/layout.h"
 #include "core/paged_kv_cache.h"
 #include "ninfer/ops/sparse_attention.h"
@@ -28,6 +29,33 @@ struct DecoderStateSpec {
     // records BF16 [136,64,1,pages] and pooled block keys BF16 [32,64,1,pages]) in the same page
     // pool, so they share the K/V frontier, paging, prefix reuse and page copies.
     bool qsa_index = false;
+    // Active KV in RAM (--kv-ram-active, docs/maintainer/active-kv-in-ram.md): the text pool's K/V,
+    // scale and QSA record planes live in pinned, device-mapped Host memory; only the QSA block
+    // keys stay in device memory. A persistent device region (ops::QsaStagingRegion) serves the
+    // attention: `staging_cache_blocks` 4-token blocks per attention layer (0 = default, raised so
+    // the region holds one layer of `capacity`) plus an overflow area for `staging_window` columns
+    // of `staging_selection_groups` blocks each (ceil(max_selected / 4)). Requires qsa_index.
+    bool kv_ram_active                    = false;
+    std::int32_t staging_window           = 1;
+    std::int32_t staging_selection_groups = 0;
+    std::uint32_t staging_cache_blocks    = 0;
+};
+
+// The device region of active KV in RAM (planned in the main persistent layout).
+struct QsaStagingLayout {
+    TensorRegion k_pages;
+    TensorRegion v_pages;
+    std::optional<TensorRegion> k_scale_pages;
+    std::optional<TensorRegion> v_scale_pages;
+    TensorRegion block_table; // identity I32 [pages, 1]
+    TensorRegion table_row;   // I32 [1] = 0
+    TensorRegion tags;
+    TensorRegion claims;
+    TensorRegion counters;
+    TensorRegion stats;
+    std::int32_t layers          = 0;
+    std::int32_t cache_blocks    = 0;
+    std::int32_t overflow_blocks = 0;
 };
 
 struct PagedKVCacheLayout {
@@ -41,6 +69,9 @@ struct PagedKVCacheLayout {
     // T64 elastic KV: the page planes are offsets into a second backing (the elastic arena), the
     // execution tables into the main one.
     bool elastic_pages = false;
+    // Active KV in RAM: the Host planes' layout size and the device region (absent when off).
+    std::size_t host_bytes = 0;
+    std::optional<QsaStagingLayout> staging;
 
     [[nodiscard]] std::size_t payload_bytes() const noexcept { return pages.payload_bytes(); }
 };
@@ -66,8 +97,10 @@ private:
 
 class PagedKVCache {
 public:
-    // `elastic` backs the page planes of a layout planned with elastic_pages (else unused).
-    PagedKVCache(DeviceSpan backing, const PagedKVCacheLayout& layout, DeviceSpan elastic = {});
+    // `device` holds `backing`; `elastic` backs the page planes of a layout planned with
+    // elastic_pages (else unused).
+    PagedKVCache(int device, DeviceSpan backing, const PagedKVCacheLayout& layout,
+                 DeviceSpan elastic = {});
 
     PagedKVCache(const PagedKVCache&)            = delete;
     PagedKVCache& operator=(const PagedKVCache&) = delete;
@@ -98,10 +131,20 @@ public:
     // tables: every row addresses the same pages in every plane). Requires has_qsa_index().
     [[nodiscard]] ops::QsaIndexPlanes qsa_index_planes(std::uint32_t layer) const;
 
+    // Active KV in RAM: the device region QSA attention reads (null when the pool is in VRAM).
+    [[nodiscard]] const ops::QsaStagingRegion* qsa_staging() const noexcept {
+        return staging_ ? &*staging_ : nullptr;
+    }
+
+    // The NINFER_KVRAM_STATS diagnostic: prints the staging region's per-layer counters summed
+    // (and clears them) to stderr; synchronizes the region's device. No-op without a region.
+    void report_staging_stats(const char* why) const;
+
 private:
     friend class PagedKVCacheView;
     [[nodiscard]] PagedKVLayerView layer_view(std::uint32_t layer, Tensor block_table) const;
 
+    std::optional<PinnedHostBuffer> host_; // before pages_: it backs the Host planes
     DeviceKVPagePool pages_;
     KVExecutionTablePool execution_tables_;
     std::uint32_t layers_      = 0;
@@ -109,6 +152,8 @@ private:
     std::int32_t kv_heads_     = 0;
     PagedKVStorageLayout layer_storage_;
     bool qsa_index_ = false;
+    std::optional<ops::QsaStagingRegion> staging_;
+    int staging_device_ = -1;
 };
 
 struct DecoderStateLayout {
@@ -124,11 +169,16 @@ struct DecoderStateLayout {
                                                     const DecoderStateSpec& spec,
                                                     LayoutBuilder* pages_builder = nullptr);
 
+// Active KV in RAM: the bytes of the page-locked Host planes a DecoderState of `spec`
+// (spec.kv_ram_active) allocates, which PagedKVCacheLayout::host_bytes records.
+[[nodiscard]] std::size_t active_kv_host_plane_bytes(const DecoderStateSpec& spec);
+
 struct DecoderState {
     PagedKVCache text_kv;
     std::optional<PagedKVCache> mtp_kv;
 
-    DecoderState(DeviceSpan backing, const DecoderStateLayout& layout, DeviceSpan elastic = {});
+    DecoderState(int device, DeviceSpan backing, const DecoderStateLayout& layout,
+                 DeviceSpan elastic = {});
 
     [[nodiscard]] PagedKVCache* mtp_cache() noexcept;
     [[nodiscard]] const PagedKVCache* mtp_cache() const noexcept;

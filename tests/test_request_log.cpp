@@ -690,7 +690,7 @@ int main() {
                     .at("schema_mismatch_arguments") == 2 &&
             normalized_tool_done.at("result").at("tool_call_parse").at("fallback_reason") ==
                 "none" &&
-            !render_tool_call_fallback(context, normalized_tool_outcome),
+            !render_tool_call_parse(context, normalized_tool_outcome),
         "successful tool-call normalization diagnostics are incomplete or noisy");
 
     GenerationOutcome fallback_outcome = outcome;
@@ -708,11 +708,32 @@ int main() {
                               "duplicate_parameter",
                       "tool-call text fallback diagnostics missing from JSONL");
     const std::optional<OperationalRecord> fallback_warning =
-        render_tool_call_fallback(context, fallback_outcome);
+        render_tool_call_parse(context, fallback_outcome);
     failures += check(
         fallback_warning && fallback_warning->severity == OperationalSeverity::Warning &&
             fallback_warning->message == "req#7 tool markup returned as text | duplicate parameter",
         "tool-call text fallback warning is absent or exposes raw content");
+
+    GenerationOutcome salvaged_outcome = outcome;
+    salvaged_outcome.tool_call_parse   = {
+          .marker_seen              = true,
+          .structured_call_count    = 1,
+          .salvaged_call_count      = 1,
+          .trailing_content_bytes   = 12,
+          .structural_salvage_count = 1,
+    };
+    const Json salvaged_done =
+        Json::parse(format_request_done_json("serve-test", 3004, context, salvaged_outcome));
+    const std::optional<OperationalRecord> salvage_record =
+        render_tool_call_parse(context, salvaged_outcome);
+    failures += check(
+        salvaged_done.at("result").at("tool_call_parse").at("salvaged_call_count") == 1 &&
+            salvaged_done.at("result").at("tool_call_parse").at("trailing_content_bytes") == 12 &&
+            salvaged_done.at("result").at("tool_call_parse").at("structural_salvage_count") == 1 &&
+            salvage_record && salvage_record->severity == OperationalSeverity::Info &&
+            salvage_record->message ==
+                "req#7 tool call name salvaged (undeclared or catalog spelling) | 1 call(s)",
+        "salvaged tool-call diagnostics are absent or misrouted");
 
     const Json error =
         Json::parse(format_request_error_json("serve-test", 4000, context, "generation failed"));

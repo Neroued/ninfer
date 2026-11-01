@@ -2,11 +2,11 @@
 
 // SM120 BF16 GDN gating projection for the two exact registered geometries:
 //
-//   Qwen3.6-27B:     a/b = W[48,5120] @ x[5120,T]
-//   Qwen3.6-35B-A3B: a/b = W[32,2048] @ x[2048,T]
+//   hidden 5120: a/b = W[48,5120] @ x[5120,T]
+//   hidden 2048: a/b = W[32,2048] @ x[2048,T]
 //
-// A CTA computes the same 16 output rows from both weights over 128 (27B) or
-// 64 (35B) tokens.
+// A CTA computes the same 16 output rows from both weights over 128 (hidden 5120) or
+// 64 (hidden 2048) tokens.
 // Split-K routes use a tuned eight- or sixteen-warp specialization and an
 // in-kernel cooperative grid reduction; the unsplit long-context route uses
 // eight warps for more independent MMA accumulators. One cooperative launch remains fused, while

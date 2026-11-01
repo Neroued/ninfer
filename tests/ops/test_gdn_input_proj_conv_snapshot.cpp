@@ -68,6 +68,9 @@ std::vector<std::uint16_t> make_state(std::int32_t channels, std::int32_t slots,
     return state;
 }
 
+// The FP64 formula of the contract: projection, width-four causal convolution over the BF16
+// history (the initial state and, for a later column, each earlier column's projection as its
+// published BF16 value), SiLU, and the snapshots [s1, s2, newest] of every column.
 struct SnapshotOracle {
     std::vector<double> query;
     std::vector<double> key;
@@ -109,9 +112,11 @@ SnapshotOracle snapshot_oracle(std::int32_t value_rows, std::int32_t tokens,
             oracle.state.push_back(state1);
             oracle.state.push_back(state2);
             oracle.state.push_back(projected);
+            // A later column reads this one's projection as the published BF16 value; only the
+            // column's own tap keeps the projection's precision.
             state0 = state1;
             state1 = state2;
-            state2 = projected;
+            state2 = bf16_to_f32(f32_to_bf16(static_cast<float>(projected)));
         }
     };
 

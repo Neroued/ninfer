@@ -1706,6 +1706,106 @@ int test_structured_tool_output() {
     return failures;
 }
 
+// The decoder learns how the output ended: a call missing its closers is repaired only after the
+// model's own stop token, never when the token budget cut it short.
+int test_tool_output_end() {
+    const Frontend frontend = make_frontend(resources());
+    ninfer::ChatMessage message;
+    message.role = ninfer::ChatRole::User;
+    message.parts.push_back(
+        ninfer::MessagePart{.kind = ninfer::MessagePartKind::Text, .text = "x", .media = {}});
+    ninfer::PromptInput input;
+    input.messages.push_back(std::move(message));
+    input.options.enable_thinking = false;
+    input.options.tool_jsons.push_back(
+        R"({"type":"function","function":{"name":"TaskUpdate","parameters":{"type":"object","properties":{"taskId":{"type":"string"}}}}})");
+    auto prompt = frontend.prepare(std::move(input));
+    ninfer::StopPolicy stop;
+    stop.token_ids     = {248046};
+    const auto session = [&] {
+        return frontend.make_output_session(prompt, stop,
+                                            ninfer::OutputOptions{.tool_name_max_length = 64});
+    };
+    const auto encode = [](std::string_view text) {
+        return fixture_tokenizer().encode(std::string(text));
+    };
+    const std::string open_call =
+        "\n\n<tool_call>\n<function=TaskUpdate>\n<parameter=taskId>\n1\n</parameter>\n";
+    int failures = 0;
+
+    auto stopped = session();
+    (void)stopped.preview_model(encode("Calling."), 1000, ninfer::FinishReason::OutputLimit);
+    std::string stopped_text =
+        channel_text(stopped.commit_preview(), ninfer::OutputChannel::Content);
+    (void)stopped.preview_model(encode(open_call), 1000, ninfer::FinishReason::OutputLimit);
+    stopped_text += channel_text(stopped.commit_preview(), ninfer::OutputChannel::Content);
+    const auto stop_decision = stopped.preview_model(std::array<ninfer::TokenId, 1>{248046}, 1000,
+                                                     ninfer::FinishReason::OutputLimit);
+    stopped_text += channel_text(stopped.commit_preview(), ninfer::OutputChannel::Content);
+    failures += check(stop_decision.finish_reason == ninfer::FinishReason::StopToken &&
+                          stopped_text == "Calling." && stopped.take_tool_calls().size() == 1 &&
+                          stopped.tool_call_parse_diagnostics().structural_salvage_count == 1,
+                      "a call the model stopped after without closers was not repaired");
+
+    auto cut              = session();
+    const auto cut_tokens = encode("Calling." + open_call);
+    const auto cut_decision =
+        cut.preview_model(cut_tokens, static_cast<std::uint32_t>(cut_tokens.size()),
+                          ninfer::FinishReason::OutputLimit);
+    const std::string cut_text = channel_text(cut.commit_preview(), ninfer::OutputChannel::Content);
+    failures += check(cut_decision.finish_reason == ninfer::FinishReason::OutputLimit &&
+                          cut_text == "Calling." + open_call && cut.take_tool_calls().empty() &&
+                          cut.tool_call_parse_diagnostics().fallback_reason ==
+                              ninfer::ToolCallParseFallbackReason::MalformedStructure,
+                      ("a call cut by the token budget became structured: " + cut_text).c_str());
+
+    return failures;
+}
+
+// Trailing prose kept beside a call follows the content published in earlier rounds with the
+// model's separator: never duplicated, lost or welded onto it.
+int test_streamed_trailing_prose() {
+    const Frontend frontend = make_frontend(resources());
+    ninfer::ChatMessage message;
+    message.role = ninfer::ChatRole::User;
+    message.parts.push_back(
+        ninfer::MessagePart{.kind = ninfer::MessagePartKind::Text, .text = "x", .media = {}});
+    ninfer::PromptInput input;
+    input.messages.push_back(std::move(message));
+    input.options.enable_thinking = false;
+    input.options.tool_jsons.push_back(
+        R"({"type":"function","function":{"name":"TaskUpdate","parameters":{"type":"object","properties":{"taskId":{"type":"string"}}}}})");
+    auto prompt = frontend.prepare(std::move(input));
+    ninfer::StopPolicy stop;
+    stop.token_ids     = {248046};
+    const auto session = [&] {
+        return frontend.make_output_session(prompt, stop,
+                                            ninfer::OutputOptions{.tool_name_max_length = 64});
+    };
+    const auto encode = [](std::string_view text) {
+        return fixture_tokenizer().encode(std::string(text));
+    };
+    const std::string open_call =
+        "\n\n<tool_call>\n<function=TaskUpdate>\n<parameter=taskId>\n1\n</parameter>\n";
+    int failures  = 0;
+    auto trailing = session();
+    (void)trailing.preview_model(encode("Let me check."), 1000, ninfer::FinishReason::OutputLimit);
+    std::string trailing_text =
+        channel_text(trailing.commit_preview(), ninfer::OutputChannel::Content);
+    (void)trailing.preview_model(encode(open_call + "</function>\n</tool_call>\nextra answer"),
+                                 1000, ninfer::FinishReason::OutputLimit);
+    trailing_text += channel_text(trailing.commit_preview(), ninfer::OutputChannel::Content);
+    (void)trailing.preview_model(std::array<ninfer::TokenId, 1>{248046}, 1000,
+                                 ninfer::FinishReason::OutputLimit);
+    trailing_text += channel_text(trailing.commit_preview(), ninfer::OutputChannel::Content);
+    failures +=
+        check(trailing_text == "Let me check.\n\nextra answer" &&
+                  trailing.take_tool_calls().size() == 1 &&
+                  trailing.tool_call_parse_diagnostics().trailing_content_bytes == 12,
+              ("streamed trailing prose was duplicated, lost or welded: " + trailing_text).c_str());
+    return failures;
+}
+
 int test_reasoning_split(const Frontend& frontend) {
     ninfer::ChatMessage message;
     message.role = ninfer::ChatRole::User;
@@ -2294,6 +2394,8 @@ int main() {
     failures += test_same_token_stop_priority(frontend);
     failures += test_terminal_flush(frontend);
     failures += test_structured_tool_output();
+    failures += test_tool_output_end();
+    failures += test_streamed_trailing_prose();
     failures += test_reasoning_split(frontend);
     failures += test_thinking_budget_control(frontend);
     failures += test_utf8_and_hidden_eos(frontend);

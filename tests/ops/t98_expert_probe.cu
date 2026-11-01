@@ -193,6 +193,8 @@ int main(int argc, char** argv) try {
         check(cudaMemcpy(d_x, cs[i].x, 2 * kH, cudaMemcpyHostToDevice), "copy");
         check(cudaMemcpy(d_ids, cs[i].ids, 4 * kK, cudaMemcpyHostToDevice), "copy");
         check(cudaMemcpy(d_w, cs[i].alpha, 4 * kK, cudaMemcpyHostToDevice), "copy");
+        // Pageable uploads may still be in flight; the non-blocking stream does not wait for them.
+        check(cudaDeviceSynchronize(), "sync");
         Tensor tx(d_x, DType::BF16, {kH, 1}), ti(d_ids, DType::I32, {kK, 1}),
             tw(d_w, DType::FP32, {kK, 1}), to(d_out, DType::FP32, {kH, 1});
         ops::moe_slots_nvfp4(tx, ti, tw, view, pool, ops::MoeSlotsOutput::Store, to, work, stream);

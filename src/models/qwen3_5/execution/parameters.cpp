@@ -2,11 +2,19 @@
 
 #include "core/device.h"
 #include "core/weight_view.h"
+#include "ninfer/ops/attn_input_proj.h"
+#include "ninfer/ops/gdn_gating_proj.h"
+#include "ninfer/ops/gdn_input_proj.h"
 #include "ninfer/ops/linear.h"
+#include "ninfer/ops/linear_swiglu.h"
 #include "ninfer/ops/moe_route.h"
+#include "ninfer/ops/tp2/attn_input_proj.h"
+#include "ninfer/ops/tp2/gdn_gating_proj.h"
+#include "ninfer/ops/tp2/gdn_input_proj.h"
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <limits>
 #include <span>
 #include <stdexcept>
@@ -37,6 +45,28 @@ bool contiguous(std::span<const ops::WeightInput> inputs) {
     }
     return parent != nullptr;
 }
+
+// Whether a capacity query of a fused Op accepts the profile (registered routes answer, the
+// others throw). Startup only: the answer is kept in Qwen4FusedRoutes.
+template <class Query>
+bool registered(Query&& query) {
+    try {
+        (void)query();
+        return true;
+    } catch (const std::exception&) { return false; }
+}
+
+// NINFER_QWEN4_FUSED=0 keeps every Qwen4Exp block on the generic chain (A/B and bisection).
+bool qwen4_fused_enabled() {
+    static const bool on = [] {
+        const char* value = std::getenv("NINFER_QWEN4_FUSED");
+        return value == nullptr || std::string(value) != "0";
+    }();
+    return on;
+}
+
+// The largest prompt chunk a capacity query covers (the routes are T-independent past it).
+constexpr std::int32_t kRouteQueryColumns = 65536;
 
 class Prepare {
 public:
@@ -124,37 +154,18 @@ public:
                 linear(w.down)};
     }
 
-    FfnParameters ffn(const BlockWeights& w) const {
-        if (const auto* d = std::get_if<DenseWeights>(&w.ffn)) { return dense(*d); }
-        const auto& moe = std::get<MoeWeights>(w.ffn);
-        if (std::get<MoeConfig>(model_.config().text.ffn).num_experts_per_tok != 8) {
-            throw std::invalid_argument("SparseMoe implements top-8 routing");
-        }
-        std::vector<ops::WeightInput> gate_up, down;
-        gate_up.reserve(2 * moe.experts.size());
-        down.reserve(moe.experts.size());
-        for (const auto& expert : moe.experts) {
-            gate_up.push_back(input(expert.gate));
-            gate_up.push_back(input(expert.up));
-            down.push_back(input(expert.down));
-        }
-        return with_context(weight(moe.router).name, [&] {
-            return ops::prepare_sparse_moe_weights(input(moe.router), input(moe.shared_score),
-                                                   gate_up, down, input(moe.shared.gate),
-                                                   input(moe.shared.up), input(moe.shared.down));
-        });
-    }
-
-    BlockParameters block(const BlockWeights& w) const {
-        BlockParameters out;
+    // A Qwen3.5 block as the Text forward runs it: plain residual, and the 27B's fused Ops for
+    // every projection (they dispatch on the bound forms themselves).
+    Qwen4BlockParameters qwen35_block(const BlockWeights& w) const {
+        Qwen4BlockParameters out;
         out.input_norm          = tensor(w.input_norm);
         out.post_attention_norm = tensor(w.post_attention_norm);
-        out.ffn                 = ffn(w);
+        out.ffn                 = dense(w.ffn);
+        out.fused               = Qwen4FusedRoutes{
+                          .gdn_input = true, .gdn_gating = true, .attn_input = true, .swiglu = true};
         if (const auto* a = std::get_if<AttentionWeights>(&w.mixer)) {
             out.mixer = AttentionParameters{attention_projection(*a), tensor(a->query_norm),
                                             tensor(a->key_norm), linear(a->output)};
-            out.projection_prefetch =
-                prefetch(std::get<AttentionParameters>(out.mixer).projection, a->query);
         } else {
             const auto& g = std::get<GdnWeights>(w.mixer);
             out.mixer     = GdnParameters{.projection  = gdn_projection(g),
@@ -164,21 +175,8 @@ public:
                                           .convolution = tensor(g.convolution),
                                           .norm        = tensor(g.norm),
                                           .output      = linear(g.output)};
-            out.projection_prefetch =
-                prefetch(std::get<GdnParameters>(out.mixer).projection, g.query);
         }
         return out;
-    }
-
-    ops::SparseMoeHints prefetch(const ops::ProjectionWeights& projection, WeightId query) const {
-        const auto* single = std::get_if<LinearParameters>(&projection);
-        const auto& weight =
-            single ? single->weight : std::get<ops::PairedProjectionWeights>(projection).first;
-        const auto& geometry = model_.weight(query, device_).view.parts.front().parent->geometry;
-        const auto row_bytes = geometry.layout == QuantLayout::Contiguous
-                                   ? std::uint64_t(weight.k) * dtype_size(DType::BF16)
-                                   : geometry.code_bytes_per_row;
-        return {weight.qdata, static_cast<std::size_t>(row_bytes * weight.n)};
     }
 
     MtpParameters mtp(const MtpWeights& w) const {
@@ -192,13 +190,11 @@ public:
         out.post_attention_norm = tensor(w.layer.post_attention_norm);
         out.final_norm          = tensor(w.final_norm);
         out.projection.packed   = ops::prepare_linear_weight(inputs);
-        if (model_.config().text.architecture == Architecture::Qwen3_5) {
-            out.projection.rows = {linear(a.query), linear(a.key), linear(a.gate), linear(a.value)};
-        }
-        out.query_norm = tensor(a.query_norm);
-        out.key_norm   = tensor(a.key_norm);
-        out.output     = linear(a.output);
-        out.ffn        = ffn(w.layer);
+        out.projection.rows     = {linear(a.query), linear(a.key), linear(a.gate), linear(a.value)};
+        out.query_norm          = tensor(a.query_norm);
+        out.key_norm            = tensor(a.key_norm);
+        out.output              = linear(a.output);
+        out.ffn                 = dense(w.layer.ffn);
         if (resident(w.output_head)) { out.output_head = linear(w.output_head_use); }
         return out;
     }
@@ -362,13 +358,20 @@ public:
     static Qwen4ExpertBank gguf_bank(const WeightParent& gate_up, const WeightParent& down) {
         const auto format = [](QType q) -> std::optional<ops::MoeGgufFormat> {
             switch (q) {
-            case QType::GGUF_IQ3_XXS: return ops::MoeGgufFormat::IQ3_XXS;
-            case QType::GGUF_IQ4_NL: return ops::MoeGgufFormat::IQ4_NL;
-            case QType::GGUF_IQ3_S: return ops::MoeGgufFormat::IQ3_S;
-            case QType::GGUF_IQ2_S: return ops::MoeGgufFormat::IQ2_S;
-            case QType::GGUF_IQ4_XS: return ops::MoeGgufFormat::IQ4_XS;
-            case QType::GGUF_Q2_0: return ops::MoeGgufFormat::Q2_0;
-            default: return std::nullopt;
+            case QType::GGUF_IQ3_XXS:
+                return ops::MoeGgufFormat::IQ3_XXS;
+            case QType::GGUF_IQ4_NL:
+                return ops::MoeGgufFormat::IQ4_NL;
+            case QType::GGUF_IQ3_S:
+                return ops::MoeGgufFormat::IQ3_S;
+            case QType::GGUF_IQ2_S:
+                return ops::MoeGgufFormat::IQ2_S;
+            case QType::GGUF_IQ4_XS:
+                return ops::MoeGgufFormat::IQ4_XS;
+            case QType::GGUF_Q2_0:
+                return ops::MoeGgufFormat::Q2_0;
+            default:
+                return std::nullopt;
             }
         };
         const auto gu = format(gate_up.geometry.format);
@@ -622,18 +625,108 @@ public:
         } else {
             const auto& g = std::get<GdnWeights>(w.mixer);
             out.mixer =
-                Qwen4GdnParameters{ops::prepare_linear_weight(std::array{
-                                       input(g.query), input(g.key), input(g.value), input(g.z)}),
-                                   ops::prepare_linear_weight(
-                                       std::array{input(g.a_projection), input(g.b_projection)}),
-                                   tensor(g.a_log),
-                                   tensor(g.dt_bias),
-                                   tensor(g.convolution),
-                                   tensor(g.norm),
-                                   linear(g.output)};
+                GdnParameters{ops::prepare_linear_weight(std::array{input(g.query), input(g.key),
+                                                                    input(g.value), input(g.z)}),
+                              ops::prepare_linear_weight(
+                                  std::array{input(g.a_projection), input(g.b_projection)}),
+                              tensor(g.a_log),
+                              tensor(g.dt_bias),
+                              tensor(g.convolution),
+                              tensor(g.norm),
+                              linear(g.output)};
         }
-        out.moe = qwen4_moe(w.moe, mtp, uniform);
+        if (const auto* moe = std::get_if<MoeWeights>(&w.ffn)) {
+            out.ffn = qwen4_moe(*moe, mtp, uniform);
+        } else {
+            out.ffn = dense(std::get<DenseWeights>(w.ffn));
+        }
         if (w.ple) { out.ple = ple(*w.ple); }
+        out.fused = qwen4_routes(out);
+        return out;
+    }
+
+    // Shape-keyed fused routes of a Qwen4Exp block on this rank (Qwen4FusedRoutes): the 27B's
+    // fused Ops answer for their registered geometries and formats (e.g. hidden 5120, 24 Q / 4 KV
+    // heads of 256, GDN 16 K / 48 V heads of 128, NVFP4/FP8 parents); every other geometry,
+    // Qwen3.8-Flash-Next's hidden 2560 included, keeps the generic chain. At tp 2 the routes are
+    // the two-device split forms at this rank's shard shapes.
+    Qwen4FusedRoutes qwen4_routes(const Qwen4BlockParameters& b) const {
+        Qwen4FusedRoutes out;
+        if (!qwen4_fused_enabled()) { return out; }
+        const int last = kRouteQueryColumns;
+        if (const auto* g = std::get_if<GdnParameters>(&b.mixer)) {
+            if (const auto* p = std::get_if<LinearParameters>(&g->projection)) {
+                const Weight& w = p->weight;
+                out.gdn_input   = registered([&] {
+                    if (sharded_) {
+                        (void)ops::gdn_input_proj_column_parallel_workspace_capacity_bytes(
+                            w.qtype, w.n, w.k, p->policy, 1, last);
+                    } else {
+                        (void)ops::gdn_input_proj_workspace_capacity_bytes(w.qtype, w.n, w.k,
+                                                                             p->policy, 1, last);
+                    }
+                    for (const std::int32_t batch : {1, 8}) {
+                        if (sharded_) {
+                            (void)ops::
+                                gdn_input_proj_conv_snapshot_column_parallel_workspace_capacity_bytes(
+                                    w.qtype, w.n, w.k, p->policy, batch, 1, 16);
+                            (void)ops::
+                                gdn_input_proj_conv_record_column_parallel_workspace_capacity_bytes(
+                                    w.qtype, w.n, w.k, p->policy, batch, 2, 16);
+                        } else {
+                            (void)ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
+                                w.qtype, w.n, w.k, p->policy, batch, 1, 16);
+                            (void)ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
+                                w.qtype, w.n, w.k, p->policy, batch, 2, 16);
+                        }
+                    }
+                });
+            }
+            if (const auto* c = std::get_if<LinearParameters>(&g->control);
+                c != nullptr && c->weight.qtype == QType::BF16 && c->weight.n % 2 == 0) {
+                const Weight& w = c->weight;
+                out.gdn_gating  = registered([&] {
+                    if (sharded_) {
+                        (void)ops::gdn_gating_proj_column_parallel_workspace_capacity_bytes(
+                            w.n / 2, w.k, 1, last);
+                    } else {
+                        (void)ops::gdn_gating_proj_workspace_capacity_bytes(w.n / 2, w.k, 1, last);
+                    }
+                });
+            }
+        }
+        if (const auto* q = std::get_if<QsaParameters>(&b.mixer)) {
+            const Weight& w     = q->projection.weight;
+            const auto& a       = *model_.config().text.attention;
+            const auto width    = model_.device_count() > 1 ? 2U : 1U;
+            const auto expected = 2 * (a.query_width() + a.key_width()) / width;
+            // The registered parents hold q|k|gate|v rows of 24 query / 4 KV heads of 256 (one
+            // rank's half at tp 2) over hidden 5120.
+            const bool shape = static_cast<std::uint64_t>(w.n) == expected &&
+                               w.n == (sharded_ ? 7168 : 14336) && w.k == 5120 &&
+                               a.head_dim == 256 && a.num_attention_heads == 24 &&
+                               a.num_key_value_heads == 4;
+            out.attn_input =
+                shape && registered([&] {
+                    if (sharded_) {
+                        if (w.qtype != QType::NVFP4 && w.qtype != QType::FP8_E4M3FN_ROW_BF16) {
+                            throw std::invalid_argument("no split route");
+                        }
+                        (void)ops::attn_input_proj_column_parallel_workspace_capacity_bytes(
+                            w.qtype, q->projection.policy, 1, last);
+                    } else {
+                        (void)ops::attn_input_proj_workspace_capacity_bytes(
+                            w.qtype, w.n, w.k, q->projection.policy, 1, last);
+                    }
+                });
+        }
+        if (const auto* d = std::get_if<DenseParameters>(&b.ffn)) {
+            const Weight& w = d->gate_up.weight;
+            out.swiglu      = ops::linear_swiglu_registered(w.qtype, w.n, w.k) && registered([&] {
+                             (void)ops::linear_swiglu_workspace_capacity_bytes(
+                                 w.qtype, w.n, w.k, d->gate_up.policy, 1, last);
+                         });
+        }
         return out;
     }
 
@@ -687,8 +780,10 @@ Parameters::Parameters(const Model& source, int rank) : model(source), device(ra
         }
         qwen4 = std::move(q);
         if (w.qwen4_mtp) {
-            qwen4_mtp  = with_context("mtp", [&] { return prepare.qwen4_mtp(*w.qwen4_mtp); });
-            auto& bank = qwen4_mtp->layer.moe.experts;
+            qwen4_mtp = with_context("mtp", [&] { return prepare.qwen4_mtp(*w.qwen4_mtp); });
+        }
+        if (qwen4_mtp && model.config().text.qwen4_routed_experts()) {
+            auto& bank = qwen4_mtp->layer.moe().experts;
             if (!bank.gguf &&
                 (!(bank.gate_up_input_divisor > 0.0F) || !(bank.down_input_divisor > 0.0F))) {
                 // No calibrated activation divisors for the MTP experts: the widest calibrated
@@ -696,8 +791,8 @@ Parameters::Parameters(const Model& source, int rank) : model(source), device(ra
                 float gate_up = std::numeric_limits<float>::infinity();
                 float down    = std::numeric_limits<float>::infinity();
                 for (const auto& layer : qwen4->layers) {
-                    gate_up = std::min(gate_up, layer.moe.experts.gate_up_input_divisor);
-                    down    = std::min(down, layer.moe.experts.down_input_divisor);
+                    gate_up = std::min(gate_up, layer.moe().experts.gate_up_input_divisor);
+                    down    = std::min(down, layer.moe().experts.down_input_divisor);
                 }
                 bank.gate_up_input_divisor             = gate_up / kQwen4MtpActivationRangeMargin;
                 bank.down_input_divisor                = down / kQwen4MtpActivationRangeMargin;
@@ -711,15 +806,19 @@ Parameters::Parameters(const Model& source, int rank) : model(source), device(ra
     }
     text.token_embedding = native_weight(prepare.weight(w.text.token_embedding).view);
     text.output_head     = prepare.linear(w.text.output_head_use);
-    text.final_norm      = prepare.tensor(w.text.final_norm);
-    text.layers.reserve(w.text.layers.size());
-    for (std::size_t i = 0; i < w.text.layers.size(); ++i) {
-        text.layers.push_back(with_context("text/layers/" + std::to_string(i),
-                                           [&] { return prepare.block(w.text.layers[i]); }));
-    }
     if (w.mtp) {
         mtp = with_context("mtp", [&] { return prepare.mtp(*w.mtp); });
     }
+    // A dense Qwen3.5 model runs its Text layers through the Qwen4 forward with the plain
+    // residual. The MTP head stays the Qwen3.5 one (`mtp`).
+    Qwen4Parameters q;
+    q.final_norm = prepare.tensor(w.text.final_norm);
+    q.layers.reserve(w.text.layers.size());
+    for (std::size_t i = 0; i < w.text.layers.size(); ++i) {
+        q.layers.push_back(with_context("text/layers/" + std::to_string(i),
+                                        [&] { return prepare.qwen35_block(w.text.layers[i]); }));
+    }
+    qwen4 = std::move(q);
     if (w.vision && prepare.resident(w.vision->patch_embedding)) {
         vision = with_context("vision", [&] { return prepare.vision(*w.vision); });
     }

@@ -60,7 +60,6 @@ struct PrefillContext {
     std::int32_t state_source_slot                             = 0;
     std::int32_t state_destination_slot                        = 0;
     std::uint32_t mtp_proposal_extent                          = 0;
-    std::int32_t dflash_kv_table_row                           = 0;
     qwen3_5::DFlashPrefillIngress* dflash_prefill_host_ingress = nullptr;
     // Tensor-parallel width 2 under MTP: rank 1's column of the StateImage rank 0's
     // `rewrite_checkpoint_hidden` names (the same slot of rank 1's mirror pool).
@@ -123,7 +122,6 @@ struct MtpCausalAttentionEnvelopes {
 
 struct DFlashEnvelopes {
     ops::SlidingWindowAttentionExecutionEnvelope local;
-    ops::ContextAttentionExecutionEnvelope full;
     ops::KVCacheAppendPrefixExecutionEnvelope append;
 };
 
@@ -242,11 +240,9 @@ void mtp_decode_batch(MtpBatchContext& state, std::int32_t batch_size, std::uint
 dflash_feature_sink(PrefillContext& state, DFlashFeatureSink::PrefillConsumer consume_prefill = {});
 void dflash_append_context(DFlashAppendContext& state, const Tensor& features,
                            const Tensor& positions, const Tensor& commit_counts,
-                           const Tensor& lanes, const Tensor& table_rows,
-                           ops::KVCacheAppendPrefixExecutionEnvelope envelope);
+                           const Tensor& lanes, ops::KVCacheAppendPrefixExecutionEnvelope envelope);
 void dflash_append_context(PrefillContext& state, const Tensor& features, const Tensor& positions,
                            const Tensor& commit_counts, const Tensor& lanes,
-                           const Tensor& table_rows,
                            ops::KVCacheAppendPrefixExecutionEnvelope envelope);
 void capture_dflash_decode_batch(DFlashBatchContext& state, std::int32_t batch_size,
                                  std::uint32_t k, DFlashEnvelopes envelopes,

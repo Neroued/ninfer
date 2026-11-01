@@ -118,11 +118,16 @@ License, Version 2.0:
     src/ops/offload_moe/a4_kernels.cu and the routed MMA kernel of
     src/ops/linear/nvfp4/nvfp4_w4a4_mma.cuh) and the double-buffered layer
     staging idea of the prefill expert stream (execution/qwen4_expert_pager).
+    tools/ref_q4/qwen4_reference.py is a copy of its FP64 NumPy oracle
+    tests/models/qwen4_exp/reference.py, with the changes marked in the file.
   * sybrix -- https://github.com/sybrix/qwen3.8-flash-next-ninfer
     flash-next-reference/gen_synthetic.py, the source of the synthetic
     checkpoint fixture tests/convert/qwen4_exp_fixture.py; the Program wiring
     of the Qwen4Exp state (index planes beside the Main KV planes, the PLE
     convolution state in the StateImage, decode n-gram rows per round).
+    tools/ref_q4/flashnext_ref.py is a copy of its layer-streaming transformers
+    reference flash-next-reference/flashnext_ref.py (commit a2fd69bb), with the
+    changes marked in the file.
 
 Qwen3.8-Flash-Next Ops: prior work
 ----------------------------------

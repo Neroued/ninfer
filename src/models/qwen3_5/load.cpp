@@ -40,6 +40,10 @@ const artifact::MaterializationPlan& LoadPlan::materialization() const {
     return impl_->materialization;
 }
 
+void LoadPlan::reserve_host_pinned_bytes(std::uint64_t bytes) {
+    impl_->materialization.host_pinned_reserved_bytes = bytes;
+}
+
 std::size_t LoadPlan::parameter_count() const { return impl_->pending.size(); }
 
 const artifact::ParameterReference& LoadPlan::parameter(WeightId id) const {
@@ -57,19 +61,9 @@ void validate_tensor_parallel(const LoadOptions& options) {
     // The full output head is split by vocabulary rows and the DFlash2 candidate ranking has a
     // vocabulary-split form only for the optimized head (ops::linear_topk_split): the drafter
     // proposes through it.
-    if (options.tp > 1 && options.masked_draft() && !options.proposal_enabled()) {
+    if (options.tp > 1 && options.dflash2() && !options.proposal_enabled()) {
         throw std::invalid_argument(
-            "tensor-parallel DFlash requires the optimized proposal head (--lm-head-draft)");
-    }
-}
-
-// Dense Qwen3.5 and Qwen4Exp have tensor-parallel placements (load/sharding.h); a Qwen4Exp plan
-// at tp 2 binds and materializes its per-rank shards, and its execution is the Program's.
-void validate_tensor_parallel(const Config& config, const LoadOptions& options) {
-    if (options.tp > 1 && config.text.architecture != Architecture::Qwen3_5 &&
-        config.text.architecture != Architecture::Qwen4Exp) {
-        throw std::invalid_argument(std::string(architecture_name(config.text.architecture)) +
-                                    " does not support tensor parallelism");
+            "tensor-parallel DFlash2 requires the optimized proposal head (--lm-head-draft)");
     }
 }
 
@@ -127,7 +121,6 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
     validate_tensor_parallel(options);
     out->options = options;
     out->config  = parse_config(reader.directory(), options);
-    validate_tensor_parallel(out->config, options);
     artifact::Binder binder(reader, options.tp);
     out->resources = loading::bind_resources(binder, out->config);
     loading::Bindings bindings(binder);
@@ -157,10 +150,10 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
         }
         out->weights.proposal = loading::bind_proposal(bindings, *proposal, text, options,
                                                        out->resources.public_token_count);
-        if (out->config.draft && out->config.draft->dflash2) {
+        if (out->config.draft) {
             const auto domain =
                 proposal->indexed ? proposal->rows : out->resources.public_token_count;
-            if (out->config.draft->dflash2->selector_top_k > domain) {
+            if (out->config.draft->dflash2.selector_top_k > domain) {
                 throw artifact::ArtifactError(
                     "proposal domain is smaller than DFlash2 selector_top_k");
             }
@@ -180,11 +173,11 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
                          std::string(options.speculative_component()) + "/final_hidden");
     }
     loading::install_shard_resolver(binder, bindings.weights, out->config, options);
-    out->pending         = std::move(bindings.weights);
-    out->materialization = std::move(binder).finish();
+    out->pending                                 = std::move(bindings.weights);
+    out->materialization                         = std::move(binder).finish();
     out->materialization.host_pinned_limit_bytes = options.host_pinned_max_bytes;
-    if (text.qwen4()) { rank_host_mapped(out->materialization, out->pending, text); }
-    out->info.name       = reader.directory().metadata.value(
+    if (text.qwen4_routed_experts()) { rank_host_mapped(out->materialization, out->pending, text); }
+    out->info.name = reader.directory().metadata.value(
         "name", std::string(architecture_name(text.architecture)));
     out->info.metadata_json   = reader.directory().metadata.dump();
     out->info.provenance_json = reader.directory().provenance.dump();

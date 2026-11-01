@@ -48,8 +48,9 @@ DF2_PROMPTS=${GATE_DF2_PROMPTS:-10}
 EXTRA_FLAGS=${GATE_EXTRA_FLAGS:-}
 PPL_PAIRED=${GATE_PPL_PAIRED:-0}    # 1: a perplexity table that differs is judged by ppl_paired.py, not FAIL
 PPL_ALPHA=${GATE_PPL_ALPHA:-0.05}; PPL_MAX_DELTA=${GATE_PPL_MAX_DELTA:-0.5}
-# Tests that cannot run on one 16 GB board (tp1 27B artifacts) or need a different artifact.
-CTEST_EXCLUDE=${GATE_CTEST_EXCLUDE:-ninfer_qwen3_5_(prefix|score|moe|dflash|dflash2|dflash_prefill)_real_test|ninfer_qwen3_5_vision_workspace_test}
+# Tests to leave out (a ctest -E regex). The one-device tests that a tp 2 artifact does not fit skip
+# by themselves (exit 77), so none by default.
+CTEST_EXCLUDE=${GATE_CTEST_EXCLUDE:-}
 
 record=0; stages="shards,ctest,golden,ppl,greedy,dflash2"; attention=0; out=""
 while [ $# -gt 0 ]; do
@@ -107,9 +108,10 @@ fi
 if has ctest; then
     t0=$(date +%s)
     exclude=$CTEST_EXCLUDE
-    [ $attention = 1 ] || exclude="$exclude|ninfer_softmax_attention_test"
+    [ $attention = 1 ] || exclude="${exclude:+$exclude|}ninfer_softmax_attention_test"
     NINFER_TEST_ARTIFACT=$TEST_ARTIFACT NINFER_TEST_SCRATCH_DIR=$TEST_SCRATCH \
-        ctest --test-dir "$build" -j1 --timeout 900 --output-on-failure -E "$exclude" > "$out/ctest.log" 2>&1
+        ctest --test-dir "$build" -j1 --timeout 900 --output-on-failure ${exclude:+-E "$exclude"} \
+        > "$out/ctest.log" 2>&1
     rc=$?
     line=$(grep -E 'tests passed|tests failed' "$out/ctest.log" | tail -1)
     tp2=$(grep -cE 'tp2.*Passed' "$out/ctest.log")

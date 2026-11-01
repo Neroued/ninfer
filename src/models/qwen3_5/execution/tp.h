@@ -31,7 +31,7 @@ namespace ninfer::models::qwen3_5::execution {
 inline constexpr int kTensorParallelWidth = 2;
 
 struct DFlashPeerDrafter; // execution/tp2/draft_split.h
-struct Qwen4Runtime;      // execution/qwen4_forward.h
+struct Qwen4Runtime;      // execution/qwen4_runtime.h
 
 // The logical Text config narrowed to one rank's share: attention query/KV heads, GDN key/value
 // heads, the Dense intermediate width and the vocabulary are divided by `width`; the hidden size,
@@ -39,8 +39,8 @@ struct Qwen4Runtime;      // execution/qwen4_forward.h
 // shared workspace recipes, KV planes and GDN state pools. Qwen4Exp keeps its MoE geometry (routed
 // experts partitioned by ID, shared expert whole on one rank per block), its QSA indexer and PLE,
 // and with `hc_split_streams` halves the hyper-connection streams (the rank's residual is
-// hc_count/width streams wide). Throws std::invalid_argument for an extent `width` does not divide
-// and for the Qwen3.5 MoE FFN, which has no tensor-parallel placement.
+// hc_count/width streams wide). Throws std::invalid_argument for an extent `width` does not
+// divide.
 [[nodiscard]] TextConfig shard_text_config(const TextConfig& config, int width,
                                            bool hc_split_streams = false);
 
@@ -125,8 +125,8 @@ struct TpExecution {
     // Rank 1's ReplaySSM records of its GDN heads, written by speculative target verification
     // (MTP and DFlash2); null without a speculative backend.
     const GdnReplayRecords* replay_records = nullptr;
-    // Qwen4Exp only: rank 1's runtime inputs (its routed-expert backend over the odd expert IDs,
-    // its PLE convolution states and decode PLE rows); null for the Qwen3.5 architectures.
+    // Rank 1's runtime inputs of the Text forward (with routed experts its backend over the odd
+    // expert IDs, its PLE convolution states and decode PLE rows).
     const Qwen4Runtime* qwen4 = nullptr;
 
     // --- DFlash2 with the split drafter (load/sharding.h; null otherwise)

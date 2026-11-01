@@ -19,6 +19,10 @@
 //   * prefix reuse: a second turn repeats the first turn's conversation and asks a new question.
 //     It resumes the retained prefix (restored KV pages and StateImages on both ranks, the
 //     drafter's rings on rank 0): the second turn must reuse prompt tokens and answer correctly.
+//   * wide rounds: a third Engine with K=15, eight lanes and 128-column prefill chunks runs the
+//     widest verification a round plans (8 x 16 columns, the width of a whole prefill chunk):
+//     eight concurrent requests share the rounds, answer correctly and stay within the planned
+//     workspace.
 //
 // Returns 77 without the artifact or below two CUDA devices.
 
@@ -242,6 +246,47 @@ int exercise_prefix_reuse(ninfer::Engine& engine) {
     return failures;
 }
 
+int exercise_wide_rounds(const char* artifact) {
+    constexpr std::uint32_t kLanes   = 8;
+    ninfer::EngineOptions options    = engine_options(artifact, true);
+    options.prefill_chunk            = 128;
+    options.max_concurrency          = kLanes;
+    options.max_pending_requests     = kLanes;
+    options.speculative.draft_tokens = 15;
+    ninfer::Engine engine(options);
+    const ninfer::RuntimeStats before = engine.runtime_stats();
+    std::vector<ninfer::GenerationHandle> handles;
+    for (std::uint32_t lane = 0; lane < kLanes; ++lane) {
+        handles.push_back(engine.submit(
+            engine.prepare(user_prompt("Write the integers from 1 to 40, separated by a comma and "
+                                       "a space, and nothing else.")),
+            greedy(160)));
+    }
+    int failures = 0;
+    for (ninfer::GenerationHandle& handle : handles) {
+        const ninfer::GenerationResult result = handle.wait();
+        failures += check_answer(result, "38, 39, 40", "wide round lane");
+        failures += check_dflash2(result, "wide round lane");
+    }
+    const ninfer::RuntimeStats after   = engine.runtime_stats();
+    const ninfer::MemorySummary memory = engine.memory_summary();
+    const std::uint64_t rounds         = after.decode_rounds - before.decode_rounds;
+    const std::uint64_t rows           = after.decode_row_rounds - before.decode_row_rounds;
+    std::cout << "wide rounds: " << rounds << " rounds, " << rows << " rows, workspace peak "
+              << memory.workspace_logical_peak_bytes << " of " << memory.workspace.capacity_bytes
+              << " B\n";
+    // Eight lanes that start together share most rounds; fewer rows would not reach the width.
+    if (rounds == 0 || rows < 4 * rounds) {
+        std::cerr << "wide rounds: the lanes did not share their DFlash2 rounds\n";
+        ++failures;
+    }
+    if (memory.workspace_logical_peak_bytes > memory.workspace.capacity_bytes) {
+        std::cerr << "wide rounds: the workspace peak exceeds the planned capacity\n";
+        ++failures;
+    }
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -262,10 +307,14 @@ int main() {
             ninfer::Engine ordinary(engine_options(artifact, false));
             reference = run_probes(ordinary);
         }
-        ninfer::Engine engine(engine_options(artifact, true));
-        int failures = exercise_parity(engine, reference);
-        failures += exercise_concurrent(engine);
-        failures += exercise_prefix_reuse(engine);
+        int failures = 0;
+        {
+            ninfer::Engine engine(engine_options(artifact, true));
+            failures += exercise_parity(engine, reference);
+            failures += exercise_concurrent(engine);
+            failures += exercise_prefix_reuse(engine);
+        }
+        failures += exercise_wide_rounds(artifact);
         if (failures != 0) { return 1; }
     } catch (const std::exception& error) {
         std::cerr << "tp 2 DFlash2 Engine failed: " << error.what() << '\n';

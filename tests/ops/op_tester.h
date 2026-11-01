@@ -279,6 +279,9 @@ public:
         auto* destination = static_cast<std::uint8_t*>(data()) + byte_offset;
         cuda_check(cudaMemcpy(destination, source, count, cudaMemcpyHostToDevice),
                    "cudaMemcpy host-to-guarded-device");
+        // A pageable upload may return before its DMA lands, on the legacy stream that the
+        // non-blocking streams of the Ops do not wait for (as DeviceBuffer::copy_from_host).
+        cuda_check(cudaStreamSynchronize(nullptr), "cudaStreamSynchronize guarded upload");
     }
 
     void copy_to_host(void* destination, std::size_t count, std::size_t byte_offset = 0) const {

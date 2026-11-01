@@ -176,7 +176,7 @@ void mtp_bridge_and_propose(PrefillContext& state, const Tensor& next_token,
     Tensor logits     = state.execution.io.logits.slice(1, 0, 1);
     Tensor draft0     = state.execution.io.mtp->draft_tokens.slice(0, 0, 1);
     // Qwen4Exp runs a text position (the same on the three M-RoPE axes) one-axis, as its decode.
-    const bool one_axis = state.execution.qwen4 != nullptr &&
+    const bool one_axis = state.execution.parameters.qwen4_mtp.has_value() &&
                           rope_position[1] == rope_position[0] &&
                           rope_position[2] == rope_position[0];
     Tensor rope_position_view = state.execution.work.alloc(DType::I32, {1, one_axis ? 1 : 3});

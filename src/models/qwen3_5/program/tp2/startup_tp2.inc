@@ -59,8 +59,8 @@ std::size_t dflash_proposal_workspace_split(const SequencePlanImpl& plan, std::i
             reserve_matrix(layout, DType::BF16, 128 * heads.query_heads, columns);
             reserve_scratch(layout,
                             ops::sliding_window_attention_head_block_workspace_capacity_bytes(
-                                heads, dimension(draft.sliding_window.value_or(0)),
-                                {0, plan.capacity}, width, width, batch));
+                                heads, dimension(draft.sliding_window), {0, plan.capacity}, width,
+                                width, batch));
             reserve_matrix(layout, DType::BF16, hidden, columns);
             reserve_linear(layout, block.output, columns, columns);
         }
@@ -83,7 +83,7 @@ std::size_t dflash_proposal_workspace_split(const SequencePlanImpl& plan, std::i
         }
     }
     reserve_matrix(layout, DType::BF16, hidden, mask);
-    reserve_matrix(layout, DType::FP32, dimension(draft.dflash2->selector_top_k), mask);
+    reserve_matrix(layout, DType::FP32, dimension(draft.dflash2.selector_top_k), mask);
     const execution::ProposalParameters& head = *parameters.proposal;
     reserve_scratch(
         layout,
@@ -98,33 +98,28 @@ std::size_t dflash_proposal_workspace_split(const SequencePlanImpl& plan, std::i
     if (!selecting.draft || !selecting.draft->selector) {
         throw std::logic_error("tensor-parallel DFlash2 planning found no candidate selector");
     }
-    reserve_matrix(layout, DType::BF16, dimension(draft.dflash2->selector_rank), mask);
+    reserve_matrix(layout, DType::BF16, dimension(draft.dflash2.selector_rank), mask);
     reserve_linear(layout, selecting.draft->selector->hidden_projection, mask, mask);
     reserve_scratch(layout, ops::candidate_selector_path_workspace_capacity_bytes(drafts, drafts,
                                                                                   batch, batch));
     return layout.peak_bytes(1);
 }
 
-// One rank's transient workspace at tensor-parallel width 2, following the allocation order of
-// TextContext's split schedule (execution/text.cpp: prefill_impl_tp2 with its MTP prompt
-// alignment, ordinary_decode_batch_tp2, target verification, the MTP forwards and proposals,
-// run_layers_tp2 and logits_tp2) and of rank 0's DFlash2 drafter (execution/draft.cpp). Per-layer
-// stages use the rank's share of the config and the rank's shard Parameters; the call roots (ids,
-// positions, residual, all-reduce staging) keep the replicated hidden width. Both ranks allocate
+// One rank's transient workspace of a dense model's Qwen3.5 heads at tensor-parallel width 2: the
+// call roots (ids, positions, residual, all-reduce staging) and vocabulary-split logits of each
+// phase, the MTP prompt alignment, forwards and proposals (execution/tp2/text_tp2.inc), and the
+// DFlash2 drafter (execution/draft.cpp); the Text layers are the Qwen4 forward's
+// (build_qwen4_workspace_plan). Per-layer MTP stages use the rank's share of the config and the
+// rank's shard Parameters; the call roots keep the replicated hidden width. Both ranks allocate
 // this capacity: where the ranks differ (rank 0's logits gather staging, sampling, token
 // embedding, optimized proposal head and drafter, rank 1's last hidden column), the plan covers
 // both. It is built from rank 0's Parameters, whose shard shapes equal rank 1's except for the
 // heads and the drafter only rank 0 holds.
-WorkspacePlan build_tensor_parallel_workspace_plan(const SequencePlanImpl& plan) {
+WorkspacePlan build_qwen3_5_head_workspace_plan_tp2(const SequencePlanImpl& plan) {
     const auto& parameters = *plan.parameters;
     const auto& config     = parameters.model.config().text;
     const TextConfig shard = execution::shard_text_config(config, plan.tp);
-    if (plan.speculative_backend == SpeculativeBackend::DFlash) {
-        throw std::invalid_argument(
-            "tensor-parallel workspace supports ordinary, MTP and DFlash2 generation and causal "
-            "scoring only");
-    }
-    const bool mtp = plan.speculative_backend == SpeculativeBackend::Mtp;
+    const bool mtp         = plan.speculative_backend == SpeculativeBackend::Mtp;
     if (mtp && (!parameters.mtp || !shard.attention)) {
         throw std::invalid_argument("tensor-parallel MTP workspace requires the MTP parameters");
     }
@@ -143,12 +138,6 @@ WorkspacePlan build_tensor_parallel_workspace_plan(const SequencePlanImpl& plan)
     const std::int32_t public_tokens = dimension(parameters.model.resources().public_token_count);
 
     const auto finish = [](const WorkspaceLayoutBuilder& layout) { return layout.peak_bytes(1); };
-    const auto row_parallel_scratch = [&](WorkspaceLayoutBuilder& layout,
-                                          const execution::LinearParameters& p, int first,
-                                          int last) {
-        reserve_scratch(layout, ops::linear_add_row_parallel_workspace_capacity_bytes(
-                                    p.weight.qtype, p.weight.n, p.weight.k, p.policy, first, last));
-    };
     const auto attention_scratch = [&](WorkspaceLayoutBuilder& layout, std::int32_t batch_size,
                                        std::int32_t min_width, std::int32_t max_width) {
         reserve_scratch(layout,
@@ -157,56 +146,6 @@ WorkspacePlan build_tensor_parallel_workspace_plan(const SequencePlanImpl& plan)
                              dimension(shard.attention->num_attention_heads),
                              dimension(shard.attention->num_key_value_heads)},
                             plan.kv_storage, text_envelope, batch_size, min_width, max_width));
-    };
-    // `record` selects the ReplaySSM record projection of speculative verification instead of the
-    // in-place snapshot of ordinary decode.
-    const auto target_body = [&](WorkspaceLayoutBuilder& layout, std::int32_t first,
-                                 std::int32_t last, TextPhase phase, bool record,
-                                 std::int32_t batch_size, std::int32_t min_width,
-                                 std::int32_t max_width) {
-        for (const auto& block : parameters.text.layers) {
-            {
-                auto stage = layout.scope();
-                if (const auto* attention =
-                        std::get_if<execution::AttentionParameters>(&block.mixer)) {
-                    (void)workspace::text_attention_projection(layout, shard, last);
-                    reserve_scratch(layout, execution::attention_projection_split_workspace_bytes(
-                                                *attention, first, last));
-                    (void)workspace::text_attention_results(layout, shard, last);
-                    attention_scratch(layout, batch_size, min_width, max_width);
-                    row_parallel_scratch(layout, attention->output, first, last);
-                } else {
-                    const auto& gdn = std::get<execution::GdnParameters>(block.mixer);
-                    (void)workspace::gdn_control(layout, shard, last);
-                    reserve_scratch(layout, execution::gdn_control_split_workspace_bytes(
-                                                *shard.gdn, hidden, first, last));
-                    (void)workspace::gdn_projection(layout, shard, last);
-                    if (phase == TextPhase::Verify) {
-                        reserve_scratch(layout, record
-                                                    ? execution::gdn_record_split_workspace_bytes(
-                                                          gdn, batch_size, min_width, max_width)
-                                                    : execution::gdn_snapshot_split_workspace_bytes(
-                                                          gdn, batch_size, min_width, max_width));
-                    } else {
-                        (void)workspace::gdn_prefill_conv(layout, shard, last);
-                        reserve_scratch(layout, execution::gdn_projection_split_workspace_bytes(
-                                                    gdn, first, last));
-                    }
-                    (void)workspace::gdn_recurrent_output(layout, shard, last);
-                    if (phase == TextPhase::Prefill) {
-                        reserve_scratch(layout, ops::gated_delta_net_workspace_capacity_bytes(
-                                                    dimension(shard.gdn->linear_num_key_heads),
-                                                    dimension(shard.gdn->linear_num_value_heads),
-                                                    first, last));
-                    }
-                    (void)workspace::gdn_normalized_output(layout, shard, last);
-                    row_parallel_scratch(layout, gdn.output, first, last);
-                }
-            }
-            auto stage = layout.scope();
-            (void)workspace::post_mixer_hidden(layout, config, last);
-            reserve_scratch(layout, execution::ffn_split_workspace_bytes(block.ffn, first, last));
-        }
     };
     // Vocabulary-split head over `columns` final hidden columns: this rank's rows, rank 0's
     // staging of rank 1's rows, and the column-parallel projection's scratch.
@@ -296,7 +235,6 @@ WorkspacePlan build_tensor_parallel_workspace_plan(const SequencePlanImpl& plan)
         (void)workspace::text_prefill_roots(layout, config, chunk, plan.features.vision ? 3 : 1,
                                             plan.features.vision ? chunk : 0);
         (void)workspace::tp_call_roots(layout, config, chunk);
-        target_body(layout, 1, chunk, TextPhase::Prefill, false, 1, 1, chunk);
         reserve_matrix(layout, DType::BF16, hidden, 1);
         split_logits(layout, 1);
         reserve_scratch(layout, ops::sampling_workspace_capacity_bytes(public_tokens, 1, 1));
@@ -306,14 +244,13 @@ WorkspacePlan build_tensor_parallel_workspace_plan(const SequencePlanImpl& plan)
         text_prefill(layout);
         out.text_prefill = finish(layout);
     }
-    // Speculative verification of `batch` rows of K+1 columns on both ranks, with ReplaySSM
-    // records and the gathered logits in rank 0's frame.
+    // Speculative verification of `batch` rows of K+1 columns: the call roots and the gathered
+    // logits in rank 0's frame (the Text forward is build_qwen4_workspace_plan's).
     const auto verification = [&](std::int32_t batch) {
         const std::int32_t aggregate = batch * verify;
         WorkspaceLayoutBuilder target;
         reserve_matrix(target, DType::BF16, hidden, aggregate);
         (void)workspace::tp_call_roots(target, config, aggregate);
-        target_body(target, aggregate, aggregate, TextPhase::Verify, true, batch, verify, verify);
         {
             auto logits             = target.scope();
             const std::int32_t rows = parameters.text.output_head.weight.n;
@@ -349,7 +286,6 @@ WorkspacePlan build_tensor_parallel_workspace_plan(const SequencePlanImpl& plan)
             WorkspaceLayoutBuilder layout;
             reserve_matrix(layout, DType::BF16, hidden, batch);
             (void)workspace::tp_call_roots(layout, config, batch);
-            target_body(layout, batch, batch, TextPhase::Verify, false, batch, 1, 1);
             reserve_matrix(layout, DType::BF16, hidden, batch);
             split_logits(layout, batch);
             reserve_scratch(layout,
@@ -442,28 +378,12 @@ void validate_tensor_parallel_options(const execution::Parameters& parameters,
             throw std::invalid_argument("tensor-parallel planning requires rank 0 and rank 1 "
                                         "Parameters of one two-device Model");
         }
-        // The split schedule implements text and multimodal prefill, the ordinary decode round,
-        // the MTP round and the DFlash2 round of the dense Text model (TextContext), and causal
-        // scoring over its text prefill; everything else runs on one device only.
-        if (options.speculative.backend == SpeculativeBackend::DFlash) {
-            throw std::invalid_argument(
-                "tensor-parallel execution supports ordinary, MTP and DFlash2 generation and "
-                "causal scoring only (no DFlash)");
-        }
-        // The DFlash2 drafter runs whole on rank 0, while the full output head is split by
-        // vocabulary rows across the ranks.
+        // The full output head is split by vocabulary rows across the ranks, and the DFlash2
+        // candidate ranking has a vocabulary-split form only for the optimized head.
         if (options.speculative.backend == SpeculativeBackend::DFlash2 &&
             options.speculative.proposal_head != ProposalHead::Optimized) {
             throw std::invalid_argument(
                 "tensor-parallel DFlash2 requires the optimized proposal head (--lm-head-draft)");
-        }
-        // The drafter's full-attention KV lives on rank 0 only and has no rank 1 mirror, while the
-        // tensor-parallel KV row publication expects every paged pool to have one.
-        if (options.speculative.backend == SpeculativeBackend::DFlash2 &&
-            parameters.model.config().draft &&
-            parameters.model.config().draft->full_layer_count() != 0) {
-            throw std::invalid_argument(
-                "tensor-parallel DFlash2 supports only drafters without full-attention layers");
         }
         if (options.kv_cache != KvCacheStorage::BFloat16 &&
             options.kv_cache != KvCacheStorage::Int8Group64 &&
@@ -480,7 +400,7 @@ void validate_tensor_parallel_options(const execution::Parameters& parameters,
                 "tensor-parallel DFlash2: the candidate selector on rank 1 requires the "
                 "vocabulary-split proposal head (set NINFER_TP_SELECTOR=primary)");
         }
-        // Rejects the MoE FFN and extents the width does not divide.
+        // Rejects extents the width does not divide.
         (void)execution::shard_text_config(parameters.model.config().text, options.tp);
     }
 }

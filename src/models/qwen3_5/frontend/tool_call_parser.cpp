@@ -3,7 +3,10 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <array>
+#include <initializer_list>
 #include <stdexcept>
+#include <string>
 #include <string_view>
 #include <utility>
 
@@ -23,6 +26,15 @@ constexpr std::string_view kFunctionOpen  = "<function=";
 constexpr std::string_view kFunctionClose = "</function>";
 constexpr std::string_view kParamOpen     = "<parameter=";
 constexpr std::string_view kParamClose    = "</parameter>";
+constexpr std::array kCallTags{kToolOpen,      kToolClose, kFunctionOpen,
+                               kFunctionClose, kParamOpen, kParamClose};
+
+// Whether `text` holds any tag of the call markup.
+bool contains_call_markup(std::string_view text) {
+    return std::any_of(kCallTags.begin(), kCallTags.end(), [&](std::string_view tag) {
+        return text.find(tag) != std::string_view::npos;
+    });
+}
 
 struct RawParameter {
     std::string_view name;
@@ -32,6 +44,13 @@ struct RawParameter {
 struct RawToolCall {
     std::string_view name;
     std::vector<RawParameter> parameters;
+    // Name kept as a call despite being undeclared, or repaired from a punctuated spelling to a
+    // declared tool: counted in diagnostics.salvaged_call_count.
+    bool salvaged = false;
+    // Repaired without guessing bytes: closers supplied at the model's stop, or a stray
+    // </parameter> or </tool_call> dropped where a parameter or the next call should open
+    // (diagnostics.structural_salvage_count).
+    bool structural = false;
 };
 
 enum class JsonValueKind : std::uint8_t {
@@ -61,10 +80,6 @@ constexpr bool is_format_whitespace(char byte) {
 
 constexpr bool is_ascii_digit(char byte) { return byte >= '0' && byte <= '9'; }
 
-constexpr bool is_ascii_alphanumeric(char byte) {
-    return (byte >= 'a' && byte <= 'z') || (byte >= 'A' && byte <= 'Z') || is_ascii_digit(byte);
-}
-
 std::string_view trim_format_whitespace(std::string_view text) {
     std::size_t begin = 0;
     while (begin < text.size() && is_format_whitespace(text[begin])) { ++begin; }
@@ -87,11 +102,54 @@ bool starts_with_at(std::string_view text, std::size_t pos, std::string_view pre
     return pos <= text.size() && text.substr(pos, prefix.size()) == prefix;
 }
 
+// The characters the request parsers accept in a tool-call name of the history
+// (serve::valid_tool_name, [A-Za-z0-9_-]): salvaging any other name back to the client would fail
+// the next request when the history comes back. Names with other punctuation become calls only
+// when unwrapping resolves one to a declared tool (parse_function below).
+constexpr bool is_tool_name_byte(char byte) {
+    return (byte >= 'a' && byte <= 'z') || (byte >= 'A' && byte <= 'Z') || is_ascii_digit(byte) ||
+           byte == '_' || byte == '-';
+}
+
 bool valid_function_name(std::string_view name, std::size_t max_name_length) {
     if (name.empty() || name.size() > max_name_length) { return false; }
-    return std::all_of(name.begin(), name.end(), [](char byte) {
-        return is_ascii_alphanumeric(byte) || byte == '_' || byte == '-';
-    });
+    return std::all_of(name.begin(), name.end(), is_tool_name_byte);
+}
+
+// The name runs of a catalog spelling: tools["srv"]["tool"], srv.tool and srv/tool yield the tool
+// `tool` in the scope `srv`.
+struct CatalogSpelling {
+    std::string_view scope;
+    std::string_view tool;
+};
+
+// The last run of name bytes past any trailing punctuation, and the run before it. A spelling
+// holds name bytes and . [ ] / " ' only: `tool` is empty when the name has any other byte (a
+// space, a line break, markup), no separator, no run after a separator, or a run longer than
+// max_name_length.
+CatalogSpelling unwrap_catalog_spelling(std::string_view name, std::size_t max_name_length) {
+    const auto spelling_byte = [](char byte) {
+        return is_tool_name_byte(byte) || byte == '.' || byte == '[' || byte == ']' ||
+               byte == '/' || byte == '"' || byte == '\'';
+    };
+    if (!std::all_of(name.begin(), name.end(), spelling_byte) ||
+        name.find_first_of(".[/") == std::string_view::npos) {
+        return {};
+    }
+    const auto run_before = [&](std::size_t end) {
+        while (end > 0 && !is_tool_name_byte(name[end - 1])) { --end; }
+        std::size_t begin = end;
+        while (begin > 0 && is_tool_name_byte(name[begin - 1])) { --begin; }
+        return std::pair{begin, end};
+    };
+    const auto [begin, run_end] = run_before(name.size());
+    // begin/run_end bracket the last name run: nothing at the end, or no separator in front of it,
+    // means there is no namespace to strip.
+    if (run_end == 0 || begin == 0 || begin == run_end) { return {}; }
+    const std::string_view tool = name.substr(begin, run_end - begin);
+    if (tool.size() > max_name_length) { return {}; }
+    const auto [scope_begin, scope_end] = run_before(begin);
+    return {.scope = name.substr(scope_begin, scope_end - scope_begin), .tool = tool};
 }
 
 constexpr std::uint8_t type_bit(SchemaType type) { return static_cast<std::uint8_t>(type); }
@@ -410,8 +468,12 @@ NormalizedParameter normalize_parameter(std::string_view encoded_value,
 class QwenToolRegionParser {
 public:
     QwenToolRegionParser(std::string_view text, std::size_t max_name_length,
-                         const Contract& contract)
-        : text_(text), max_name_length_(max_name_length), contract_(contract) {}
+                         const Contract& contract, ToolCallRegionEnd end)
+        : text_(text), max_name_length_(max_name_length), contract_(contract),
+          end_closes_call_(end == ToolCallRegionEnd::ModelStop) {}
+
+    // Where parsing stopped; meaningful when parse() returned TrailingContent.
+    mutable std::size_t stop_pos = 0;
 
     FallbackReason parse(std::vector<RawToolCall>& calls) const {
         std::size_t pos = 0;
@@ -420,7 +482,15 @@ public:
             if (pos == text_.size()) {
                 return calls.empty() ? FallbackReason::MalformedStructure : FallbackReason::None;
             }
+            // A stray `</tool_call>` where the next call should open: no call is open, so dropping
+            // the tag repairs the region without guessing any bytes.
+            if (!calls.empty() && starts_with_at(text_, pos, kToolClose)) {
+                calls.back().structural = true;
+                pos += kToolClose.size();
+                continue;
+            }
             if (!starts_with_at(text_, pos, kToolOpen)) {
+                stop_pos = pos;
                 return calls.empty() ? FallbackReason::MalformedStructure
                                      : FallbackReason::TrailingContent;
             }
@@ -439,13 +509,52 @@ private:
         return true;
     }
 
+    // Declared in the request but removed for this turn by tool_choice.allowed_tools.
+    bool is_filtered_out(std::string_view name) const {
+        for (const std::string& filtered : contract_.filtered_out_names) {
+            if (filtered == name) { return true; }
+        }
+        return false;
+    }
+
+    // The declared, allowed tool a catalog spelling names (a view of its contract name), or an
+    // empty view. Responses lowers the member `tool` of the namespace `scope` to `scope__tool`
+    // (openai_responses_request.cpp): when the request declares that name, the spelling means it,
+    // even if a plain tool is also called `tool`; otherwise it means the short name. A name that
+    // allowed_tools filters out leaves the call text.
+    std::string_view resolve_catalog_spelling(std::string_view name) const {
+        const CatalogSpelling spelling = unwrap_catalog_spelling(name, max_name_length_);
+        if (spelling.tool.empty()) { return {}; }
+        const auto resolve = [&](std::string_view candidate) -> std::string_view {
+            const Contract::Tool* tool = find_tool_contract(contract_, candidate);
+            return tool != nullptr ? std::string_view(tool->name) : std::string_view{};
+        };
+        if (!spelling.scope.empty()) {
+            std::string member(spelling.scope);
+            member += "__";
+            member.append(spelling.tool);
+            if (is_filtered_out(member)) { return {}; }
+            if (const std::string_view declared = resolve(member); !declared.empty()) {
+                return declared;
+            }
+        }
+        return is_filtered_out(spelling.tool) ? std::string_view{} : resolve(spelling.tool);
+    }
+
     FallbackReason parse_tool_call(std::size_t& pos, RawToolCall& call) const {
         if (!consume(pos, kToolOpen)) { return FallbackReason::MalformedStructure; }
         skip_format_whitespace(text_, pos);
         const FallbackReason failure = parse_function(pos, call);
         if (failure != FallbackReason::None) { return failure; }
         skip_format_whitespace(text_, pos);
-        return consume(pos, kToolClose) ? FallbackReason::None : FallbackReason::MalformedStructure;
+        if (consume(pos, kToolClose)) { return FallbackReason::None; }
+        // The response ended right after the function: no closer can be matched, but nothing is
+        // guessed either - the remaining bytes are all already consumed by the call.
+        if (end_closes_call_ && pos == text_.size()) {
+            call.structural = true;
+            return FallbackReason::None;
+        }
+        return FallbackReason::MalformedStructure;
     }
 
     FallbackReason parse_function(std::size_t& pos, RawToolCall& call) const {
@@ -457,17 +566,39 @@ private:
         }
         call.name = text_.substr(name_begin, name_end - name_begin);
         if (!valid_function_name(call.name, max_name_length_)) {
-            return FallbackReason::InvalidToolName;
-        }
-        if (contract_.enforce_declared_names &&
-            find_tool_contract(contract_, call.name) == nullptr) {
-            return FallbackReason::UndeclaredTool;
+            // A harness catalog reference (tools["server"]["tool"]) can name a tool the client does
+            // expose. Only rename to a declared, allowed tool; a punctuated name the client cannot
+            // echo back must not become a call.
+            const std::string_view declared = resolve_catalog_spelling(call.name);
+            if (declared.empty()) { return FallbackReason::InvalidToolName; }
+            call.name     = declared;
+            call.salvaged = true;
+        } else if (is_filtered_out(call.name)) {
+            // Declared but excluded for this turn (tool_choice.allowed_tools): falling back to text
+            // keeps the filter a restriction, as docs/serving.md promises.
+            return FallbackReason::FilteredTool;
+        } else if (find_tool_contract(contract_, call.name) == nullptr) {
+            // Undeclared but request-legal name: keep the call. The client has no such tool and
+            // returns an unknown-tool result the model can react to; as text the markup would end
+            // the turn silently.
+            call.salvaged = true;
         }
         pos = name_end + 1;
 
         for (;;) {
             skip_format_whitespace(text_, pos);
             if (consume(pos, kFunctionClose)) { return FallbackReason::None; }
+            if (end_closes_call_ && pos == text_.size()) {
+                call.structural = true;
+                return FallbackReason::None;
+            }
+            // A stray `</parameter>` where a parameter should open: no parameter is open, so
+            // dropping the tag repairs the call without guessing any bytes.
+            if (starts_with_at(text_, pos, kParamClose)) {
+                call.structural = true;
+                pos += kParamClose.size();
+                continue;
+            }
             const FallbackReason failure = parse_parameter(pos, call);
             if (failure != FallbackReason::None) { return failure; }
         }
@@ -489,7 +620,18 @@ private:
         const std::size_t value_begin = name_end + 1;
         std::size_t value_end         = 0;
         if (!find_parameter_close(value_begin, value_end)) {
-            return FallbackReason::MalformedStructure;
+            // Truncated at the end of the response: nothing after the value can end it (no call
+            // markup follows - a closer, the next parameter, function or call), so the value is
+            // exactly the bytes that remain. Any other unterminated case would make the value end
+            // a guess, or carry the markup into the argument.
+            if (!end_closes_call_ || markup_follows(value_begin)) {
+                return FallbackReason::MalformedStructure;
+            }
+            call.parameters.push_back(
+                RawParameter{.name = name, .value = text_.substr(value_begin)});
+            call.structural = true;
+            pos             = text_.size();
+            return FallbackReason::None;
         }
         call.parameters.push_back(RawParameter{
             .name = name, .value = text_.substr(value_begin, value_end - value_begin)});
@@ -511,6 +653,8 @@ private:
         }
         return false;
     }
+
+    bool markup_follows(std::size_t pos) const { return contains_call_markup(text_.substr(pos)); }
 
     bool find_parameter_close(std::size_t value_begin, std::size_t& value_end) const {
         std::size_t depth = 1;
@@ -538,6 +682,8 @@ private:
     std::string_view text_;
     std::size_t max_name_length_;
     const Contract& contract_;
+    // The model stopped right after this text, so its end may close the last call.
+    bool end_closes_call_;
 };
 
 GeneratedToolCall normalize_raw_tool_call(const RawToolCall& raw, const Contract& contract,
@@ -583,10 +729,11 @@ ParsedToolCallOutput fallback(const std::string& text, ToolCallParseDiagnostics 
 } // namespace
 
 std::shared_ptr<const ToolCallOutputContract>
-build_tool_call_output_contract(std::span<const std::string> tool_jsons, bool enabled) {
+build_tool_call_output_contract(std::span<const std::string> tool_jsons,
+                                std::span<const std::string> filtered_out_names, bool enabled) {
     if (!enabled) { return {}; }
-    auto contract                    = std::make_shared<ToolCallOutputContract>();
-    contract->enforce_declared_names = true;
+    auto contract = std::make_shared<ToolCallOutputContract>();
+    contract->filtered_out_names.assign(filtered_out_names.begin(), filtered_out_names.end());
     contract->tools.reserve(tool_jsons.size());
     for (const std::string& tool_json : tool_jsons) {
         const Json definition = Json::parse(tool_json, nullptr, false);
@@ -597,7 +744,8 @@ build_tool_call_output_contract(std::span<const std::string> tool_jsons, bool en
 
 ParsedToolCallOutput parse_qwen_tool_call_output(const std::string& text,
                                                  std::size_t max_tool_name_length,
-                                                 const ToolCallOutputContract& contract) {
+                                                 const ToolCallOutputContract& contract,
+                                                 ToolCallRegionEnd end) {
     const std::size_t first = text.find(kToolOpen);
     if (first == std::string::npos) { return fallback(text); }
 
@@ -607,16 +755,31 @@ ParsedToolCallOutput parse_qwen_tool_call_output(const std::string& text,
 
     std::vector<RawToolCall> raw_calls;
     const std::string_view tool_region = std::string_view(text).substr(first);
-    const QwenToolRegionParser parser(tool_region, max_tool_name_length, contract);
+    const QwenToolRegionParser parser(tool_region, max_tool_name_length, contract, end);
     const FallbackReason failure = parser.parse(raw_calls);
     if (failure != FallbackReason::None) {
-        out.diagnostics.fallback_reason = failure;
-        return fallback(text, out.diagnostics);
+        // Complete calls followed by prose: keep the calls, hand the prose back as content. Prose
+        // that carries any call tag holds a call the parser could not read (only a stray
+        // `</tool_call>` where the next call would open is dropped, above): running the calls
+        // before it while that one returns as text would split one turn's calls, so the whole
+        // region stays text.
+        const std::string_view trailing = tool_region.substr(parser.stop_pos);
+        const bool salvage_trailing     = failure == FallbackReason::TrailingContent &&
+                                      !raw_calls.empty() && !contains_call_markup(trailing);
+        if (!salvage_trailing) {
+            out.diagnostics.fallback_reason = failure;
+            return fallback(text, out.diagnostics);
+        }
+        out.trailing_content = rtrim_format_whitespace(trailing);
+        out.diagnostics.trailing_content_bytes =
+            static_cast<std::uint32_t>(out.trailing_content.size());
     }
 
     out.tool_calls.reserve(raw_calls.size());
     for (const RawToolCall& raw : raw_calls) {
         out.tool_calls.push_back(normalize_raw_tool_call(raw, contract, out.diagnostics));
+        if (raw.salvaged) { ++out.diagnostics.salvaged_call_count; }
+        if (raw.structural) { ++out.diagnostics.structural_salvage_count; }
     }
 
     out.diagnostics.structured_call_count = static_cast<std::uint32_t>(out.tool_calls.size());
@@ -670,21 +833,33 @@ std::string ToolCallOutputDecoder::feed(std::string_view text) {
             visible.push_back(byte);
         }
     }
+    published_content_ = published_content_ || !visible.empty();
     return visible;
 }
 
-ToolCallOutputDecoder::Terminal ToolCallOutputDecoder::finish() {
+ToolCallOutputDecoder::Terminal ToolCallOutputDecoder::finish(ToolCallRegionEnd end) {
     if (finished_) { throw std::logic_error("tool-call output decoder is already finished"); }
     finished_ = true;
     if (!contract_) { return {}; }
 
     ParsedToolCallOutput parsed =
-        parse_qwen_tool_call_output(tool_region_, max_tool_name_length_, *contract_);
+        parse_qwen_tool_call_output(tool_region_, max_tool_name_length_, *contract_, end);
     if (saw_tool_marker_ && parsed.is_tool_call_response) {
+        std::string content;
+        if (!parsed.trailing_content.empty()) {
+            // The region starts with the whitespace held before its marker: the separator the
+            // model wrote between the published prose and its calls.
+            if (published_content_) {
+                const std::string_view held =
+                    std::string_view(tool_region_).substr(0, tool_region_.find(kToolOpen));
+                content = held.empty() ? std::string("\n") : std::string(held);
+            }
+            content += parsed.trailing_content;
+        }
         trailing_whitespace_.clear();
         tool_region_.clear();
         marker_prefix_bytes_ = 0;
-        return Terminal{.content     = {},
+        return Terminal{.content     = std::move(content),
                         .tool_calls  = std::move(parsed.tool_calls),
                         .diagnostics = parsed.diagnostics};
     }

@@ -603,13 +603,13 @@ void ProgramImpl::prepare_consumed_source(MaterializationTransaction& transactio
     source.text_kv_valid = details.reuse_base;
     if (speculative_backend == SpeculativeBackend::Mtp) {
         source.mtp_kv_valid = backend_frontier_at(speculative_backend, details.reuse_base);
-    } else if (is_masked_draft_backend(speculative_backend)) {
+    } else if (speculative_backend == SpeculativeBackend::DFlash2) {
         source.dflash_context_frontier = details.reuse_base;
     }
     if (host_kv_extents) { (void)host_kv_extents->release_unreferenced(); }
     refresh_state_views(source);
 
-    const detail::PhysicalResources after   = owner_exclusive_resources(source);
+    const detail::PhysicalResources after = owner_exclusive_resources(source);
     const detail::PhysicalResources removed =
         checked_resource_difference(before, after, "consumed source release");
     (void)checked_resource_difference(details.demand.final_removed, removed,

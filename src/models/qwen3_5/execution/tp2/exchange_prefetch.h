@@ -12,6 +12,7 @@
 
 #include "core/device.h"
 #include "core/weight.h"
+#include "models/qwen3_5/execution/parameters.h"
 #include "ninfer/ops/allreduce.h"
 #include "ninfer/ops/peer_mailbox.h"
 #include "ninfer/ops/weight_input.h"
@@ -44,6 +45,17 @@ void append_prefetch_paired_prefix(const Weight& w, std::size_t bytes, ExchangeP
 
 // The weight of a projection with a single parent; null for a paired one.
 [[nodiscard]] const Weight* single_projection(const ops::ProjectionWeights& projection) noexcept;
+
+// The hints of the dense block schedule (the plain residual, qwen4_forward/plain.h). A mixer's
+// all-reduce is followed by the post-attention norm and the paired gate|up GEMM of the same layer;
+// an FFN's by the next layer's input norm and input projection: Q|K|G|V for attention, for GDN the
+// small BF16 A|B gating projection (whole, when it fits half the budget) and then Q|K|V|Z.
+void append_ffn_input_prefetch(const DenseParameters& ffn, std::size_t bytes,
+                               ExchangePrefetch& out);
+void append_mixer_input_prefetch(const AttentionParameters& attention, std::size_t bytes,
+                                 ExchangePrefetch& out);
+void append_mixer_input_prefetch(const GdnParameters& gdn, std::size_t bytes,
+                                 ExchangePrefetch& out);
 
 // The prefetch budget of the mailbox a captured exchange of `exchange_bytes` would take, 0 when
 // there is none (eager, staged, prefetch off).

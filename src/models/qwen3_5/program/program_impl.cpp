@@ -151,7 +151,7 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
                    ? std::make_optional<PinnedHostBuffer>(sizeof(qwen3_5::MtpDecodeIngress) +
                                                           sizeof(qwen3_5::MtpDecodeEgress))
                    : std::nullopt),
-      dflash_host(is_masked_draft_backend(plan.speculative_backend)
+      dflash_host(plan.speculative_backend == SpeculativeBackend::DFlash2
                       ? std::make_optional<PinnedHostBuffer>(sizeof(qwen3_5::DFlashDecodeIngress) +
                                                              sizeof(qwen3_5::DFlashDecodeEgress) +
                                                              sizeof(qwen3_5::DFlashPrefillIngress))
@@ -203,7 +203,8 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
     };
 
     decoder = std::make_unique<qwen3_5::DecoderState>(
-        backing, plan.persistent.decoder, elastic_arena ? elastic_arena->span() : DeviceSpan{});
+        device.device, backing, plan.persistent.decoder,
+        elastic_arena ? elastic_arena->span() : DeviceSpan{});
     state_images =
         std::make_unique<qwen3_5::StateImageDevicePool>(backing, plan.persistent.state_images);
     // Mirrors first: a mirrored pool's Host records hold both ranks' halves, so every Host layout
@@ -263,7 +264,7 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         }
         dflash.emplace(backing, *plan.persistent.dflash, *local);
     }
-    if (dflash.has_value() != plan.features.masked_draft()) {
+    if (dflash.has_value() != plan.features.dflash2()) {
         throw std::logic_error("DFlash state does not match the frozen sequence plan");
     }
     if (qwen3_5::PagedKVCache* backend = backend_kv_cache()) {
@@ -326,10 +327,10 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         (!causal_scoring && speculative_backend == SpeculativeBackend::None)) {
         throw std::logic_error("ordinary decode frame does not match the sequence plan");
     }
-    if (io.dflash_prefill.has_value() != is_masked_draft_backend(speculative_backend)) {
+    if (io.dflash_prefill.has_value() != (speculative_backend == SpeculativeBackend::DFlash2)) {
         throw std::logic_error("DFlash prefill scratch does not match the sequence plan");
     }
-    if (io.dflash_decode.has_value() != is_masked_draft_backend(speculative_backend)) {
+    if (io.dflash_decode.has_value() != (speculative_backend == SpeculativeBackend::DFlash2)) {
         throw std::logic_error("DFlash decode frame does not match the sequence plan");
     }
     prefill_hidden = plan.persistent.prefill_hidden.bind(backing);
@@ -472,267 +473,15 @@ private:
 void ProgramImpl::construct_qwen4(const SequencePlanImpl& plan, DeviceSpan backing) {
     const auto& config = parameters.model.config().text;
     const auto& q      = *plan.persistent.qwen4;
-    if (!parameters.qwen4 || (peer && (!peer_parameters || !peer_parameters->qwen4 ||
-                                       !peer->qwen4_expert_table.data || !tp_execution))) {
-        throw std::logic_error("Qwen4Exp Program state requires Qwen4Exp blocks on every rank");
+    if (!parameters.qwen4 ||
+        (peer && (!peer_parameters || !peer_parameters->qwen4 || !tp_execution))) {
+        throw std::logic_error("Text forward Program state requires its blocks on every rank");
     }
-    // The in-place expert tables: rank r reads expert e from the host-mapped bank when it is in
-    // its partition (all experts at one device, e % 2 == r at tp 2: T14's ID-parity partition,
-    // the routing being identical on both ranks), -1 otherwise.
-    const auto upload_table = [&](Tensor table, int rank, int ranks, cudaStream_t stream) {
-        std::vector<std::int32_t> slots(static_cast<std::size_t>(table.numel()));
-        for (std::size_t e = 0; e < slots.size(); ++e) {
-            slots[e] = static_cast<int>(e % static_cast<std::size_t>(ranks)) == rank
-                           ? static_cast<std::int32_t>(e)
-                           : -1;
-        }
-        CUDA_CHECK(cudaMemcpyAsync(table.data, slots.data(), table.bytes(), cudaMemcpyHostToDevice,
-                                   stream));
-        CUDA_CHECK(cudaStreamSynchronize(stream));
-    };
-    const int ranks = peer ? execution::kTensorParallelWidth : 1;
     execution::Qwen4Runtime runtime;
-    // MTP layer (T24): its bank, with a bank-wide weight divisor (ninfer-ext's artifact)
-    // expanded into the per-expert planes moe_slots indexes (device copy for the zero-copy
-    // backend, host copy for the offload backend's CPU path and its device divisor table).
-    const bool mtp = speculative_backend == SpeculativeBackend::Mtp;
-    std::optional<execution::Qwen4ExpertBank> mtp_host_bank;
-    if (mtp) {
-        if (!parameters.qwen4_mtp) { throw std::logic_error("Qwen4Exp MTP has no MTP layer"); }
-        qwen4_mtp_bank = parameters.qwen4_mtp->layer.moe.experts;
-        mtp_host_bank  = qwen4_mtp_bank;
-        if (parameters.qwen4_mtp->uniform_gate_up_divisor > 0.0F) {
-            if (!q.mtp_gate_up_divisors || !q.mtp_down_divisors) {
-                throw std::logic_error("Qwen4Exp MTP divisor planes are not planned");
-            }
-            Tensor gate_up = q.mtp_gate_up_divisors->bind(backing);
-            Tensor down    = q.mtp_down_divisors->bind(backing);
-            qwen4_mtp_host_divisors.assign(static_cast<std::size_t>(gate_up.numel()),
-                                           parameters.qwen4_mtp->uniform_gate_up_divisor);
-            qwen4_mtp_host_divisors.resize(static_cast<std::size_t>(gate_up.numel() + down.numel()),
-                                           parameters.qwen4_mtp->uniform_down_divisor);
-            CUDA_CHECK(cudaMemcpy(gate_up.data, qwen4_mtp_host_divisors.data(), gate_up.bytes(),
-                                  cudaMemcpyHostToDevice));
-            CUDA_CHECK(cudaMemcpy(down.data, qwen4_mtp_host_divisors.data() + gate_up.numel(),
-                                  down.bytes(), cudaMemcpyHostToDevice));
-            qwen4_mtp_bank->gate_up_divisors = static_cast<const float*>(gate_up.data);
-            qwen4_mtp_bank->down_divisors    = static_cast<const float*>(down.data);
-            mtp_host_bank->gate_up_divisors  = qwen4_mtp_host_divisors.data();
-            mtp_host_bank->down_divisors =
-                qwen4_mtp_host_divisors.data() + static_cast<std::size_t>(gate_up.numel());
-        }
-    }
-    // Routed experts. At one device the table is the identity (the offload backend's device
-    // reads of the host bank use it too).
-    Tensor table = q.expert_table.bind(backing);
-    upload_table(table, 0, ranks, device.stream);
-    std::optional<execution::Qwen4OffloadExperts::Peer> offload_peer;
-    if (plan.qwen4_experts.backend == RoutedExpertBackend::Offload) {
-        if (peer) {
-            // tp 2: one cache over both GPUs (partition by ID parity), the CPU path on rank 0.
-            if (!q.cache_mirror || peer->qwen4_cache_table == nullptr ||
-                peer->qwen4_cache_divisors == nullptr) {
-                throw std::logic_error("Qwen4Exp tp 2 offloaded experts are not planned on rank 1");
-            }
-            offload_peer.emplace();
-            offload_peer->device        = peer->device.device;
-            offload_peer->stream        = peer->device.stream;
-            offload_peer->pool          = peer->qwen4_cache_pool;
-            offload_peer->table         = peer->qwen4_cache_table;
-            offload_peer->divisors      = peer->qwen4_cache_divisors;
-            offload_peer->stream_tables = peer->qwen4_stream_tables;
-            offload_peer->mirror        = peer->qwen4_cache_mirror;
-            offload_peer->reads         = peer->qwen4_cache_reads;
-            offload_peer->stage_table   = peer->qwen4_stage_table;
-            offload_peer->picks         = peer->qwen4_stage_picks;
-            offload_peer->staging       = peer->qwen4_staging;
-            offload_peer->slot_offsets  = peer->qwen4_slot_offsets;
-        }
-        if (q.expert_slots <= 0 ||
-            q.cache_layers !=
-                static_cast<std::int32_t>(parameters.qwen4->layers.size()) + (mtp ? 1 : 0)) {
-            throw std::logic_error("Qwen4Exp offloaded experts need a resolved slot count");
-        }
-        // Cache layers: the Text layers, then the MTP layer (layer num_hidden_layers).
-        std::vector<execution::Qwen4ExpertBank> banks;
-        banks.reserve(static_cast<std::size_t>(q.cache_layers));
-        for (const auto& layer : parameters.qwen4->layers) { banks.push_back(layer.moe.experts); }
-        if (mtp) { banks.push_back(*mtp_host_bank); }
-        execution::Qwen4OffloadExperts::DeviceMemory memory;
-        memory.pool     = q.bind_pool(elastic_arena ? elastic_arena->span() : backing);
-        memory.table    = static_cast<std::int32_t*>(q.cache_table->bind(backing).data);
-        memory.divisors = static_cast<float*>(q.cache_divisors->bind(backing).data);
-        memory.identity = static_cast<std::int32_t*>(table.data);
-        memory.reads    = static_cast<std::int32_t*>(q.cache_reads->bind(backing).data);
-        if (q.cache_slot_offsets) {
-            memory.slot_offsets =
-                static_cast<std::int64_t*>(q.cache_slot_offsets->bind(backing).data);
-        }
-        if (q.cache_mirror) {
-            memory.mirror = static_cast<std::int32_t*>(q.cache_mirror->bind(backing).data);
-        }
-        if (q.staging_slots > 0) {
-            if (!q.prefetch_tags || !q.prefetch_epoch || !q.prefetch_rows) {
-                throw std::logic_error("Qwen4Exp prefetch memory is not planned");
-            }
-            memory.prefetch.tags = static_cast<std::uint32_t*>(q.prefetch_tags->bind(backing).data);
-            memory.prefetch.epoch =
-                static_cast<std::uint32_t*>(q.prefetch_epoch->bind(backing).data);
-            memory.prefetch.rows = static_cast<std::int32_t*>(q.prefetch_rows->bind(backing).data);
-            memory.prefetch.predict_workspace = q.prefetch_workspace.bind(backing).data;
-        }
-        memory.stream_tables =
-            static_cast<std::int32_t*>(q.cache_stream_tables->bind(backing).data);
-        if (q.stage_table) {
-            memory.stage_table = static_cast<std::int32_t*>(q.stage_table->bind(backing).data);
-            memory.picks       = static_cast<std::int32_t*>(q.stage_picks->bind(backing).data);
-            for (std::size_t plane = 0; plane < memory.staging.size(); ++plane) {
-                memory.staging[plane] =
-                    static_cast<std::byte*>(q.stage_pool[plane].bind(backing).data);
-            }
-        }
-        execution::Qwen4OffloadOptions options;
-        options.slots_per_layer      = q.expert_slots;
-        options.elastic_columns      = q.elastic_columns;
-        // 0 (auto) is resolved by the Engine at load; callers that plan without it get the same rule.
-        options.cpu_threads = plan.qwen4_experts.cpu_threads != 0
-                                  ? static_cast<std::int32_t>(plan.qwen4_experts.cpu_threads)
-                                  : ops::host::auto_expert_cpu_threads(ops::host::host_cpu_topology(),
-                                                                       parameters.qwen4->layers.front().moe.experts.gguf);
-        options.insert_cap           = static_cast<std::int32_t>(plan.qwen4_experts.insert_cap);
-        options.admit_threshold      = plan.qwen4_experts.admit_threshold;
-        options.half_life_tokens     = plan.qwen4_experts.half_life_tokens;
-        options.evict_tau_windows    = plan.qwen4_experts.evict_tau_windows;
-        options.prompt_tokens        = static_cast<std::int32_t>(prefill_chunk);
-        const MissSplitOptions split = execution::effective_miss_split(plan.qwen4_experts);
-        options.split                = execution::host_miss_split(split);
-        options.split_staged         = split.mode != MissSplitMode::Off && split.staged;
-        options.split_on_peer        = offload_peer.has_value() && split.peer_share;
-        options.split_calibrate      = split.mode == MissSplitMode::Auto && split.calibrate;
-        options.stream_min_tokens = static_cast<std::int32_t>(plan.qwen4_experts.stream_min_tokens);
-        options.gguf_stream_min_tokens =
-            static_cast<std::int32_t>(plan.qwen4_experts.gguf_stream_min_tokens);
-        options.stream_ring_slots = static_cast<std::int32_t>(plan.qwen4_experts.stream_ring_slots);
-        options.stream_cpu_tail   = plan.qwen4_experts.stream_cpu_tail;
-        options.stream_cpu_max_tokens =
-            static_cast<std::int32_t>(plan.qwen4_experts.stream_cpu_max_tokens);
-        options.stream_cpu_expert_us = plan.qwen4_experts.stream_cpu_expert_us;
-        options.stream_cpu_token_us  = plan.qwen4_experts.stream_cpu_token_us;
-        options.stream_link_us       = plan.qwen4_experts.stream_link_us;
-        // T42: chunks wider than the base chunk run on workspace lent from the slot pool.
-        options.base_chunk             = static_cast<std::int32_t>(plan.qwen4_base_chunk);
-        options.prompt_workspace_bytes = static_cast<std::int64_t>(plan.workspace.qwen4_prompt);
-        for (const auto& [width, bytes] : plan.workspace.qwen4_prompt_steps) {
-            options.prompt_workspace_steps.emplace_back(static_cast<std::int32_t>(width),
-                                                        static_cast<std::int64_t>(bytes));
-        }
-        options.text_layers = static_cast<std::int32_t>(parameters.qwen4->layers.size());
-        options.prefetch.slots_per_layer = q.staging_slots / 2;
-        options.prefetch.min_score       = plan.qwen4_experts.prefetch_min_score;
-        options.prefetch.first_layer =
-            static_cast<std::int32_t>(plan.qwen4_experts.prefetch_first_layer);
-        options.prefetch.link_gbps = plan.qwen4_experts.prefetch_link_gbps;
-        options.warm_start         = plan.qwen4_experts.warm_start;
-        // Validation / measurement aid (off by default): per-window JSON lines.
-        if (const char* trace = std::getenv("NINFER_QWEN4_EXPERT_TRACE")) {
-            options.trace_path = trace;
-        }
-        if (const char* dump = std::getenv("NINFER_QWEN4_ROUTING_DUMP")) {
-            options.routing_path = dump;
-        }
-        if (const char* freeze = std::getenv("NINFER_QWEN4_EXPERT_FREEZE")) {
-            options.freeze_after_prompt = std::string_view(freeze) == "1";
-            // T59 fast bench: nothing is ever inserted (residency = initialization / snapshot).
-            options.freeze_all = std::string_view(freeze) == "all";
-        }
-        if (const char* sync = std::getenv("NINFER_QWEN4_EXPERT_SYNC")) {
-            options.sync_fills = std::string_view(sync) == "1";
-        }
-        if (const char* snap = std::getenv("NINFER_QWEN4_EXPERT_SNAPSHOT");
-            snap != nullptr && *snap != 0) {
-            options.snapshot_load = snap;
-        }
-        if (const char* snap = std::getenv("NINFER_QWEN4_EXPERT_SNAPSHOT_SAVE");
-            snap != nullptr && *snap != 0) {
-            options.snapshot_save = snap;
-        }
-        qwen4_experts = std::make_unique<execution::Qwen4OffloadExperts>(
-            banks, options, memory, device.device, device.stream,
-            offload_peer ? &*offload_peer : nullptr);
-        qwen4_expert_slots      = static_cast<std::uint32_t>(q.expert_slots);
-        qwen4_expert_pool_bytes = q.cache_pool_bytes;
-    } else {
-        // The mapped backend has every expert kernel read its bank in place: v0.7's pageable
-        // fallback banks (--host-pinned-max-gib, or a refused page-locked allocation) cannot.
-        const auto pinned = [](const execution::Qwen4ExpertBank& bank) {
-            const ops::MoeSlotPool& b = bank.bank;
-            if (bank.gguf) { // rows outside the NVFP4 planes (issue #22)
-                return expert_cache::pinned_host_memory(bank.gguf_gate_up_rows) &&
-                       expert_cache::pinned_host_memory(bank.gguf_down_rows);
-            }
-            return expert_cache::pinned_host_memory(b.gate_up_codes.base) &&
-                   expert_cache::pinned_host_memory(b.gate_up_scales.base) &&
-                   expert_cache::pinned_host_memory(b.down_codes.base) &&
-                   expert_cache::pinned_host_memory(b.down_scales.base);
-        };
-        bool all_pinned = !mtp || pinned(*qwen4_mtp_bank);
-        for (const auto& layer : parameters.qwen4->layers) {
-            all_pinned = all_pinned && pinned(layer.moe.experts);
-        }
-        if (!all_pinned) {
-            throw std::invalid_argument(
-                "the mapped expert backend reads every expert bank in place from page-locked "
-                "memory, and part of the banks is in pageable memory (page-locked limit); use "
-                "the offload backend");
-        }
-        qwen4_experts = std::make_unique<execution::Qwen4MappedExperts>(table);
-    }
-    if (use_cuda_graph && !qwen4_experts->graph_capturable()) {
-        throw std::logic_error("Qwen4Exp expert backend cannot run inside a CUDA Graph");
-    }
-    runtime.experts = qwen4_experts.get();
-    if (mtp) {
-        // The offload backend serves the MTP layer itself (resident slots + CPU, its own cache
-        // layer); the zero-copy one reads the MTP bank in place through the same backend.
-        runtime.mtp_experts     = qwen4_experts.get();
-        runtime.mtp_expert_bank = &*qwen4_mtp_bank;
-        if (const char* probe = std::getenv("NINFER_QWEN4_MTP_PROBE");
-            probe != nullptr && *probe != '\0') {
-            if (use_cuda_graph) {
-                throw std::invalid_argument("NINFER_QWEN4_MTP_PROBE requires eager execution");
-            }
-            qwen4_mtp_probe = std::make_unique<Qwen4MtpProbeFile>(
-                probe, static_cast<std::int32_t>(config.num_hidden_layers));
-            runtime.moe_probe = qwen4_mtp_probe.get();
-        }
-    }
     execution::Qwen4Runtime peer_runtime;
-    if (peer) {
-        const ScopedCurrentDevice rank1(peer->device.device);
-        upload_table(peer->qwen4_expert_table, 1, ranks, peer->device.stream);
-        if (offload_peer) {
-            qwen4_peer_experts = std::make_unique<execution::Qwen4OffloadPeerExperts>(
-                q.cache_layers, q.expert_slots, *offload_peer,
-                static_cast<execution::Qwen4OffloadExperts*>(qwen4_experts.get()),
-                q.elastic_columns);
-        } else {
-            qwen4_peer_experts =
-                std::make_unique<execution::Qwen4MappedExperts>(peer->qwen4_expert_table);
-        }
-        peer_runtime.experts = qwen4_peer_experts.get();
-        if (mtp) {
-            // MTP at tp 2 (T33): rank 1 runs the MTP layer's experts of its partition through its
-            // offload view (layer num_hidden_layers of the shared cache); the bank only supplies
-            // the activation divisors there.
-            if (!offload_peer || !peer_parameters->qwen4_mtp) {
-                throw std::invalid_argument(
-                    "Qwen4Exp MTP at tp 2 requires the offload expert backend and both ranks' "
-                    "MTP layers");
-            }
-            qwen4_peer_mtp_bank          = peer_parameters->qwen4_mtp->layer.moe.experts;
-            peer_runtime.mtp_experts     = qwen4_peer_experts.get();
-            peer_runtime.mtp_expert_bank = &*qwen4_peer_mtp_bank;
-        }
+    // Routed experts (MoE); a dense FFN binds no expert backend (runtime.experts stays null).
+    if (config.qwen4_routed_experts()) {
+        construct_qwen4_experts(plan, backing, runtime, peer_runtime);
     }
     // PLE: the n-gram table gather (mapped, with prefetch), its staging and the convolution state.
     // At tp 2 rank 0 gathers once and both ranks upload the same staging (replicated PLE); each
@@ -864,8 +613,7 @@ void ProgramImpl::construct_qwen4(const SequencePlanImpl& plan, DeviceSpan backi
     qwen4_tfdump = execution::Qwen4TfDump::from_environment(
         static_cast<std::int32_t>(config.num_hidden_layers));
     if (qwen4_tfdump) {
-        qwen4_tfdump->write_meta(peer ? "ninfer-tp2 fn/tp2-run (T31), tp 2"
-                                      : "ninfer-tp2 fn/tp2-run (T31), tp 1",
+        qwen4_tfdump->write_meta(peer ? "capy-flash engine, tp 2" : "capy-flash engine, tp 1",
                                  parameters.model.info().name);
         if (!use_cuda_graph) { runtime.taps = qwen4_tfdump.get(); }
     }
@@ -970,6 +718,277 @@ void ProgramImpl::construct_qwen4(const SequencePlanImpl& plan, DeviceSpan backi
     if (peer) {
         qwen4_peer_runtime_record = peer_runtime;
         tp_execution->qwen4       = &*qwen4_peer_runtime_record;
+    }
+}
+
+// The routed-expert backends of a Qwen4Exp MoE on every rank: the in-place expert tables, the MTP
+// layer's bank and its divisor planes, the offload or mapped backend, bound into each rank's
+// runtime.
+void ProgramImpl::construct_qwen4_experts(const SequencePlanImpl& plan, DeviceSpan backing,
+                                          execution::Qwen4Runtime& runtime,
+                                          execution::Qwen4Runtime& peer_runtime) {
+    const auto& config = parameters.model.config().text;
+    const auto& q      = *plan.persistent.qwen4;
+    if (!q.expert_table || (peer && !peer->qwen4_expert_table.data)) {
+        throw std::logic_error("Qwen4Exp routed experts have no planned expert table");
+    }
+    // The in-place expert tables: rank r reads expert e from the host-mapped bank when it is in
+    // its partition (all experts at one device, e % 2 == r at tp 2: T14's ID-parity partition,
+    // the routing being identical on both ranks), -1 otherwise.
+    const auto upload_table = [&](Tensor table, int rank, int ranks, cudaStream_t stream) {
+        std::vector<std::int32_t> slots(static_cast<std::size_t>(table.numel()));
+        for (std::size_t e = 0; e < slots.size(); ++e) {
+            slots[e] = static_cast<int>(e % static_cast<std::size_t>(ranks)) == rank
+                           ? static_cast<std::int32_t>(e)
+                           : -1;
+        }
+        CUDA_CHECK(cudaMemcpyAsync(table.data, slots.data(), table.bytes(), cudaMemcpyHostToDevice,
+                                   stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+    };
+    const int ranks = peer ? execution::kTensorParallelWidth : 1;
+    // MTP layer (T24): its bank, with a bank-wide weight divisor (ninfer-ext's artifact)
+    // expanded into the per-expert planes moe_slots indexes (device copy for the zero-copy
+    // backend, host copy for the offload backend's CPU path and its device divisor table).
+    const bool mtp = speculative_backend == SpeculativeBackend::Mtp;
+    std::optional<execution::Qwen4ExpertBank> mtp_host_bank;
+    if (mtp) {
+        if (!parameters.qwen4_mtp) { throw std::logic_error("Qwen4Exp MTP has no MTP layer"); }
+        qwen4_mtp_bank = parameters.qwen4_mtp->layer.moe().experts;
+        mtp_host_bank  = qwen4_mtp_bank;
+        if (parameters.qwen4_mtp->uniform_gate_up_divisor > 0.0F) {
+            if (!q.mtp_gate_up_divisors || !q.mtp_down_divisors) {
+                throw std::logic_error("Qwen4Exp MTP divisor planes are not planned");
+            }
+            Tensor gate_up = q.mtp_gate_up_divisors->bind(backing);
+            Tensor down    = q.mtp_down_divisors->bind(backing);
+            qwen4_mtp_host_divisors.assign(static_cast<std::size_t>(gate_up.numel()),
+                                           parameters.qwen4_mtp->uniform_gate_up_divisor);
+            qwen4_mtp_host_divisors.resize(static_cast<std::size_t>(gate_up.numel() + down.numel()),
+                                           parameters.qwen4_mtp->uniform_down_divisor);
+            CUDA_CHECK(cudaMemcpy(gate_up.data, qwen4_mtp_host_divisors.data(), gate_up.bytes(),
+                                  cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(down.data, qwen4_mtp_host_divisors.data() + gate_up.numel(),
+                                  down.bytes(), cudaMemcpyHostToDevice));
+            qwen4_mtp_bank->gate_up_divisors = static_cast<const float*>(gate_up.data);
+            qwen4_mtp_bank->down_divisors    = static_cast<const float*>(down.data);
+            mtp_host_bank->gate_up_divisors  = qwen4_mtp_host_divisors.data();
+            mtp_host_bank->down_divisors =
+                qwen4_mtp_host_divisors.data() + static_cast<std::size_t>(gate_up.numel());
+        }
+    }
+    // Routed experts. At one device the table is the identity (the offload backend's device
+    // reads of the host bank use it too).
+    Tensor table = q.expert_table->bind(backing);
+    upload_table(table, 0, ranks, device.stream);
+    std::optional<execution::Qwen4OffloadExperts::Peer> offload_peer;
+    if (plan.qwen4_experts.backend == RoutedExpertBackend::Offload) {
+        if (peer) {
+            // tp 2: one cache over both GPUs (partition by ID parity), the CPU path on rank 0.
+            if (!q.cache_mirror || peer->qwen4_cache_table == nullptr ||
+                peer->qwen4_cache_divisors == nullptr) {
+                throw std::logic_error("Qwen4Exp tp 2 offloaded experts are not planned on rank 1");
+            }
+            offload_peer.emplace();
+            offload_peer->device        = peer->device.device;
+            offload_peer->stream        = peer->device.stream;
+            offload_peer->pool          = peer->qwen4_cache_pool;
+            offload_peer->table         = peer->qwen4_cache_table;
+            offload_peer->divisors      = peer->qwen4_cache_divisors;
+            offload_peer->stream_tables = peer->qwen4_stream_tables;
+            offload_peer->mirror        = peer->qwen4_cache_mirror;
+            offload_peer->reads         = peer->qwen4_cache_reads;
+            offload_peer->stage_table   = peer->qwen4_stage_table;
+            offload_peer->picks         = peer->qwen4_stage_picks;
+            offload_peer->staging       = peer->qwen4_staging;
+            offload_peer->slot_offsets  = peer->qwen4_slot_offsets;
+        }
+        if (q.expert_slots <= 0 ||
+            q.cache_layers !=
+                static_cast<std::int32_t>(parameters.qwen4->layers.size()) + (mtp ? 1 : 0)) {
+            throw std::logic_error("Qwen4Exp offloaded experts need a resolved slot count");
+        }
+        // Cache layers: the Text layers, then the MTP layer (layer num_hidden_layers).
+        std::vector<execution::Qwen4ExpertBank> banks;
+        banks.reserve(static_cast<std::size_t>(q.cache_layers));
+        for (const auto& layer : parameters.qwen4->layers) { banks.push_back(layer.moe().experts); }
+        if (mtp) { banks.push_back(*mtp_host_bank); }
+        execution::Qwen4OffloadExperts::DeviceMemory memory;
+        memory.pool     = q.bind_pool(elastic_arena ? elastic_arena->span() : backing);
+        memory.table    = static_cast<std::int32_t*>(q.cache_table->bind(backing).data);
+        memory.divisors = static_cast<float*>(q.cache_divisors->bind(backing).data);
+        memory.identity = static_cast<std::int32_t*>(table.data);
+        memory.reads    = static_cast<std::int32_t*>(q.cache_reads->bind(backing).data);
+        if (q.cache_slot_offsets) {
+            memory.slot_offsets =
+                static_cast<std::int64_t*>(q.cache_slot_offsets->bind(backing).data);
+        }
+        if (q.cache_mirror) {
+            memory.mirror = static_cast<std::int32_t*>(q.cache_mirror->bind(backing).data);
+        }
+        if (q.staging_slots > 0) {
+            if (!q.prefetch_tags || !q.prefetch_epoch || !q.prefetch_rows) {
+                throw std::logic_error("Qwen4Exp prefetch memory is not planned");
+            }
+            memory.prefetch.tags = static_cast<std::uint32_t*>(q.prefetch_tags->bind(backing).data);
+            memory.prefetch.epoch =
+                static_cast<std::uint32_t*>(q.prefetch_epoch->bind(backing).data);
+            memory.prefetch.rows = static_cast<std::int32_t*>(q.prefetch_rows->bind(backing).data);
+            memory.prefetch.predict_workspace = q.prefetch_workspace.bind(backing).data;
+        }
+        memory.stream_tables =
+            static_cast<std::int32_t*>(q.cache_stream_tables->bind(backing).data);
+        if (q.stage_table) {
+            memory.stage_table = static_cast<std::int32_t*>(q.stage_table->bind(backing).data);
+            memory.picks       = static_cast<std::int32_t*>(q.stage_picks->bind(backing).data);
+            for (std::size_t plane = 0; plane < memory.staging.size(); ++plane) {
+                memory.staging[plane] =
+                    static_cast<std::byte*>(q.stage_pool[plane].bind(backing).data);
+            }
+        }
+        execution::Qwen4OffloadOptions options;
+        options.slots_per_layer = q.expert_slots;
+        options.elastic_columns = q.elastic_columns;
+        // 0 (auto) is resolved by the Engine at load; callers that plan without it get the same
+        // rule.
+        options.cpu_threads          = plan.qwen4_experts.cpu_threads != 0
+                                           ? static_cast<std::int32_t>(plan.qwen4_experts.cpu_threads)
+                                           : ops::host::auto_expert_cpu_threads(
+                                        ops::host::host_cpu_topology(),
+                                        parameters.qwen4->layers.front().moe().experts.gguf);
+        options.insert_cap           = static_cast<std::int32_t>(plan.qwen4_experts.insert_cap);
+        options.admit_threshold      = plan.qwen4_experts.admit_threshold;
+        options.half_life_tokens     = plan.qwen4_experts.half_life_tokens;
+        options.evict_tau_windows    = plan.qwen4_experts.evict_tau_windows;
+        options.prompt_tokens        = static_cast<std::int32_t>(prefill_chunk);
+        const MissSplitOptions split = execution::effective_miss_split(plan.qwen4_experts);
+        options.split                = execution::host_miss_split(split);
+        options.split_staged         = split.mode != MissSplitMode::Off && split.staged;
+        options.split_on_peer        = offload_peer.has_value() && split.peer_share;
+        options.split_calibrate      = split.mode == MissSplitMode::Auto && split.calibrate;
+        options.stream_min_tokens = static_cast<std::int32_t>(plan.qwen4_experts.stream_min_tokens);
+        options.gguf_stream_min_tokens =
+            static_cast<std::int32_t>(plan.qwen4_experts.gguf_stream_min_tokens);
+        options.stream_ring_slots = static_cast<std::int32_t>(plan.qwen4_experts.stream_ring_slots);
+        options.stream_cpu_tail   = plan.qwen4_experts.stream_cpu_tail;
+        options.stream_cpu_max_tokens =
+            static_cast<std::int32_t>(plan.qwen4_experts.stream_cpu_max_tokens);
+        options.stream_cpu_expert_us = plan.qwen4_experts.stream_cpu_expert_us;
+        options.stream_cpu_token_us  = plan.qwen4_experts.stream_cpu_token_us;
+        options.stream_link_us       = plan.qwen4_experts.stream_link_us;
+        // T42: chunks wider than the base chunk run on workspace lent from the slot pool.
+        options.base_chunk             = static_cast<std::int32_t>(plan.qwen4_base_chunk);
+        options.prompt_workspace_bytes = static_cast<std::int64_t>(plan.workspace.qwen4_prompt);
+        for (const auto& [width, bytes] : plan.workspace.qwen4_prompt_steps) {
+            options.prompt_workspace_steps.emplace_back(static_cast<std::int32_t>(width),
+                                                        static_cast<std::int64_t>(bytes));
+        }
+        options.text_layers = static_cast<std::int32_t>(parameters.qwen4->layers.size());
+        options.prefetch.slots_per_layer = q.staging_slots / 2;
+        options.prefetch.min_score       = plan.qwen4_experts.prefetch_min_score;
+        options.prefetch.first_layer =
+            static_cast<std::int32_t>(plan.qwen4_experts.prefetch_first_layer);
+        options.prefetch.link_gbps = plan.qwen4_experts.prefetch_link_gbps;
+        options.warm_start         = plan.qwen4_experts.warm_start;
+        // Validation / measurement aid (off by default): per-window JSON lines.
+        if (const char* trace = std::getenv("NINFER_QWEN4_EXPERT_TRACE")) {
+            options.trace_path = trace;
+        }
+        if (const char* dump = std::getenv("NINFER_QWEN4_ROUTING_DUMP")) {
+            options.routing_path = dump;
+        }
+        if (const char* freeze = std::getenv("NINFER_QWEN4_EXPERT_FREEZE")) {
+            options.freeze_after_prompt = std::string_view(freeze) == "1";
+            // T59 fast bench: nothing is ever inserted (residency = initialization / snapshot).
+            options.freeze_all = std::string_view(freeze) == "all";
+        }
+        if (const char* sync = std::getenv("NINFER_QWEN4_EXPERT_SYNC")) {
+            options.sync_fills = std::string_view(sync) == "1";
+        }
+        if (const char* snap = std::getenv("NINFER_QWEN4_EXPERT_SNAPSHOT");
+            snap != nullptr && *snap != 0) {
+            options.snapshot_load = snap;
+        }
+        if (const char* snap = std::getenv("NINFER_QWEN4_EXPERT_SNAPSHOT_SAVE");
+            snap != nullptr && *snap != 0) {
+            options.snapshot_save = snap;
+        }
+        qwen4_experts = std::make_unique<execution::Qwen4OffloadExperts>(
+            banks, options, memory, device.device, device.stream,
+            offload_peer ? &*offload_peer : nullptr);
+        qwen4_expert_slots      = static_cast<std::uint32_t>(q.expert_slots);
+        qwen4_expert_pool_bytes = q.cache_pool_bytes;
+    } else {
+        // The mapped backend has every expert kernel read its bank in place: v0.7's pageable
+        // fallback banks (--host-pinned-max-gib, or a refused page-locked allocation) cannot.
+        const auto pinned = [](const execution::Qwen4ExpertBank& bank) {
+            const ops::MoeSlotPool& b = bank.bank;
+            if (bank.gguf) { // rows outside the NVFP4 planes (issue #22)
+                return expert_cache::pinned_host_memory(bank.gguf_gate_up_rows) &&
+                       expert_cache::pinned_host_memory(bank.gguf_down_rows);
+            }
+            return expert_cache::pinned_host_memory(b.gate_up_codes.base) &&
+                   expert_cache::pinned_host_memory(b.gate_up_scales.base) &&
+                   expert_cache::pinned_host_memory(b.down_codes.base) &&
+                   expert_cache::pinned_host_memory(b.down_scales.base);
+        };
+        bool all_pinned = !mtp || pinned(*qwen4_mtp_bank);
+        for (const auto& layer : parameters.qwen4->layers) {
+            all_pinned = all_pinned && pinned(layer.moe().experts);
+        }
+        if (!all_pinned) {
+            throw std::invalid_argument(
+                "the mapped expert backend reads every expert bank in place from page-locked "
+                "memory, and part of the banks is in pageable memory (page-locked limit); use "
+                "the offload backend");
+        }
+        qwen4_experts = std::make_unique<execution::Qwen4MappedExperts>(table);
+    }
+    if (use_cuda_graph && !qwen4_experts->graph_capturable()) {
+        throw std::logic_error("Qwen4Exp expert backend cannot run inside a CUDA Graph");
+    }
+    runtime.experts = qwen4_experts.get();
+    if (mtp) {
+        // The offload backend serves the MTP layer itself (resident slots + CPU, its own cache
+        // layer); the zero-copy one reads the MTP bank in place through the same backend.
+        runtime.mtp_experts     = qwen4_experts.get();
+        runtime.mtp_expert_bank = &*qwen4_mtp_bank;
+        if (const char* probe = std::getenv("NINFER_QWEN4_MTP_PROBE");
+            probe != nullptr && *probe != '\0') {
+            if (use_cuda_graph) {
+                throw std::invalid_argument("NINFER_QWEN4_MTP_PROBE requires eager execution");
+            }
+            qwen4_mtp_probe = std::make_unique<Qwen4MtpProbeFile>(
+                probe, static_cast<std::int32_t>(config.num_hidden_layers));
+            runtime.moe_probe = qwen4_mtp_probe.get();
+        }
+    }
+    if (peer) {
+        const ScopedCurrentDevice rank1(peer->device.device);
+        upload_table(peer->qwen4_expert_table, 1, ranks, peer->device.stream);
+        if (offload_peer) {
+            qwen4_peer_experts = std::make_unique<execution::Qwen4OffloadPeerExperts>(
+                q.cache_layers, q.expert_slots, *offload_peer,
+                static_cast<execution::Qwen4OffloadExperts*>(qwen4_experts.get()),
+                q.elastic_columns);
+        } else {
+            qwen4_peer_experts =
+                std::make_unique<execution::Qwen4MappedExperts>(peer->qwen4_expert_table);
+        }
+        peer_runtime.experts = qwen4_peer_experts.get();
+        if (mtp) {
+            // MTP at tp 2 (T33): rank 1 runs the MTP layer's experts of its partition through its
+            // offload view (layer num_hidden_layers of the shared cache); the bank only supplies
+            // the activation divisors there.
+            if (!offload_peer || !peer_parameters->qwen4_mtp) {
+                throw std::invalid_argument(
+                    "Qwen4Exp MTP at tp 2 requires the offload expert backend and both ranks' "
+                    "MTP layers");
+            }
+            qwen4_peer_mtp_bank          = peer_parameters->qwen4_mtp->layer.moe().experts;
+            peer_runtime.mtp_experts     = qwen4_peer_experts.get();
+            peer_runtime.mtp_expert_bank = &*qwen4_peer_mtp_bank;
+        }
     }
 }
 
@@ -1352,9 +1371,9 @@ std::vector<float> ProgramImpl::causal_score(PreparedPromptData&& prompt,
             Tensor target_ids = work.alloc(DType::I32, {columns});
             Tensor logprobs   = work.alloc(DType::FP32, {columns});
             Tensor hidden     = score_hidden->slice(1, 0, columns);
-            if (parameters.qwen4) {
+            if (parameters.qwen4 && parameters.model.config().text.hyper_connection) {
                 // The carried hidden is the wide residual: the Text output mixer (replicated, on
-                // rank 0), then the head.
+                // rank 0), then the head. (Without hyper-connections it is the final-normed one.)
                 Tensor mixed = work.alloc(
                     DType::BF16, {dimension(parameters.model.config().text.hidden_size), columns});
                 ops::hyper_connection_mix(hidden, parameters.qwen4->head.weights,
@@ -1394,8 +1413,8 @@ std::vector<float> ProgramImpl::causal_score(PreparedPromptData&& prompt,
         std::uint32_t cursor = 0;
         while (cursor < predictor_count) {
             const std::uint32_t nominal = std::min(prefill_chunk, predictor_count - cursor);
-            // At tp 2 the chunk runs TextContext's split schedule on both ranks; rank 1's KV row
-            // and StateImage slot are rank 0's, replayed by the mirrors.
+            // At tp 2 the chunk runs the Text forward on both ranks; rank 1's KV row and StateImage
+            // slot are rank 0's, replayed by the mirrors.
             execution::PrefillContext schedule_state{
                 {device, parameters, work, state_images->linear(), nullptr, io, prefill_hidden,
                  prefill_chunk, proposal_head, tp_binding(), nullptr, qwen4_runtime()},
@@ -1409,7 +1428,6 @@ std::vector<float> ProgramImpl::causal_score(PreparedPromptData&& prompt,
                 nullptr,
                 state_slot,
                 state_slot,
-                0,
                 0,
                 nullptr};
             mark_workspace_usage(workspace_plan.text_prefill);

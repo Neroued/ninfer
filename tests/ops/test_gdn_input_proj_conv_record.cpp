@@ -7,10 +7,12 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <iostream>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -247,6 +249,156 @@ int run_case(std::string_view label, std::int32_t hidden, std::int32_t value_row
     return failures;
 }
 
+// A ReplaySSM verification window of W columns against W ordinary one-column decode steps
+// (conv snapshot), each reading the previous columns back from the BF16 convolution state the
+// step before published: q|k|v, z and the record column (= the step's newest history) bit for bit.
+// A fused window that convolved its later columns over the accumulator values of the earlier ones
+// would differ. Fused A16 windows and the AllowA4 window (a materialized window convolves its BF16
+// projection plane). The activations make every projection exact in FP32 (exact_sum_activation),
+// so the window's small-T projection and the decode projection agree whatever their K reduction
+// order, and the comparison holds for every column and output.
+// Activations whose projections every reduction order sums exactly in FP32: integers in [-3, 3]
+// times 2^-7 (exact products with the patterned weights, partial sums far below 2^24 units), so a
+// window's projection and the one-column decode projection agree bit for bit and only the history
+// between columns can make them differ. The sums keep more significant bits than BF16 holds, so a
+// window that carried FP32 history would differ.
+std::vector<float> exact_sum_activation(std::int32_t rows, std::int32_t tokens,
+                                        std::uint32_t seed) {
+    std::vector<float> values(static_cast<std::size_t>(rows) * tokens);
+    std::uint32_t state = seed;
+    for (float& value : values) {
+        state = state * 1664525U + 1013904223U;
+        value = std::ldexp(static_cast<float>(static_cast<int>((state >> 16) % 7U) - 3), -7);
+    }
+    return values;
+}
+
+template <class Snapshot, class Record>
+int run_steps_case(std::string_view label, std::int32_t hidden, std::int32_t value_rows,
+                   std::int32_t width, Snapshot&& snapshot, Record&& record_window,
+                   std::uint32_t seed) {
+    const std::int32_t channels         = kQueryRows + kKeyRows + value_rows;
+    const std::int32_t rows[4]          = {kQueryRows, kKeyRows, value_rows, value_rows};
+    const std::vector<float> activation = exact_sum_activation(hidden, width, seed);
+    const std::vector<std::uint16_t> conv_weight_bits =
+        make_bf16_bits(static_cast<std::size_t>(channels) * 4, seed + 1, -0.02F, 0.02F);
+    const std::size_t slot = static_cast<std::size_t>(channels) * 3;
+    // Slot 1: the history a step reads; slot 0: the snapshot it publishes.
+    std::vector<std::uint16_t> state(2 * slot);
+    const std::vector<std::uint16_t> initial = make_bf16_bits(slot, seed + 2, -0.05F, 0.05F);
+    std::copy(initial.begin(), initial.end(), state.begin() + static_cast<std::ptrdiff_t>(slot));
+    DeviceBuffer device_x    = to_device_bf16(activation);
+    DeviceBuffer device_conv = to_device(conv_weight_bits);
+    DeviceBuffer device_one  = to_device(std::vector<std::int32_t>{1});
+    DeviceBuffer device_zero = to_device(std::vector<std::int32_t>{0});
+    Tensor conv_weight(device_conv.p, DType::BF16, {channels, 4});
+    Tensor read_slot(device_one.p, DType::I32, {1});
+    Tensor write_slot(device_zero.p, DType::I32, {1});
+
+    // q, k, v, z [rows, columns] and the record [channels, columns].
+    using Outputs   = std::array<std::vector<std::uint16_t>, 5>;
+    const auto call = [&](std::int32_t first, std::int32_t columns, DeviceBuffer& device_state,
+                          bool window) {
+        std::array<DeviceBuffer, 5> out{
+            DeviceBuffer(static_cast<std::size_t>(rows[0]) * columns * 2),
+            DeviceBuffer(static_cast<std::size_t>(rows[1]) * columns * 2),
+            DeviceBuffer(static_cast<std::size_t>(rows[2]) * columns * 2),
+            DeviceBuffer(static_cast<std::size_t>(rows[3]) * columns * 2),
+            DeviceBuffer(static_cast<std::size_t>(channels) * columns * 2)};
+        Tensor x(static_cast<std::uint16_t*>(device_x.p) + static_cast<std::size_t>(first) * hidden,
+                 DType::BF16, {hidden, columns, 1});
+        Tensor states(device_state.p, DType::BF16, {channels, 3, 2});
+        Tensor q(out[0].p, DType::BF16, {rows[0], columns, 1});
+        Tensor k(out[1].p, DType::BF16, {rows[1], columns, 1});
+        Tensor v(out[2].p, DType::BF16, {rows[2], columns, 1});
+        Tensor z(out[3].p, DType::BF16, {rows[3], columns, 1});
+        Tensor record(out[4].p, DType::BF16, {channels, columns, 1});
+        if (window) {
+            record_window(x, conv_weight, states, read_slot, record, q, k, v, z, columns);
+        } else {
+            snapshot(x, conv_weight, states, read_slot, write_slot, q, k, v, z);
+        }
+        cuda_synchronize();
+        Outputs bits;
+        for (std::size_t i = 0; i < 4; ++i) {
+            bits[i] = from_device<std::uint16_t>(out[i], out[i].bytes / sizeof(std::uint16_t));
+        }
+        if (window) {
+            bits[4] = from_device<std::uint16_t>(out[4], out[4].bytes / sizeof(std::uint16_t));
+        } else {
+            // The published snapshot [s1, s2, newest]: its newest plane is the record column.
+            const std::vector<std::uint16_t> after =
+                from_device<std::uint16_t>(device_state, 2 * slot);
+            bits[4].assign(after.begin() + 2 * channels, after.begin() + 3 * channels);
+            std::copy(after.begin(), after.begin() + static_cast<std::ptrdiff_t>(slot),
+                      state.begin() + static_cast<std::ptrdiff_t>(slot));
+        }
+        return bits;
+    };
+
+    DeviceBuffer window_state = to_device(state);
+    const Outputs window      = call(0, width, window_state, true);
+    int failures              = 0;
+    for (std::int32_t column = 0; column < width; ++column) {
+        DeviceBuffer step_state = to_device(state);
+        const Outputs step      = call(column, 1, step_state, false);
+        for (std::size_t i = 0; i < 5; ++i) {
+            static constexpr std::string_view kNames[5] = {"query", "key", "value", "z", "record"};
+            const std::size_t n                         = step[i].size();
+            if (!std::equal(step[i].begin(), step[i].end(),
+                            window[i].begin() + static_cast<std::ptrdiff_t>(n * column))) {
+                std::cerr << label << ": window column " << column << " " << kNames[i]
+                          << " differs from the one-column decode step\n";
+                ++failures;
+            }
+        }
+    }
+    return failures;
+}
+
+int run_steps() {
+    int failures         = 0;
+    const auto run_width = [&](std::string_view name, const Weight& parent,
+                               ops::LinearPolicy policy, std::int32_t width, std::uint32_t seed) {
+        failures += run_steps_case(
+            std::string(name) + " W=" + std::to_string(width), 5120, 6144, width,
+            [&](const Tensor& x, const Tensor& conv, Tensor& states, const Tensor& read,
+                const Tensor& write, Tensor& q, Tensor& k, Tensor& v, Tensor& z) {
+                WorkspaceArena workspace(std::max<std::size_t>(
+                    256, ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
+                             parent.qtype, parent.n, parent.k, policy, 1, 1, 1)));
+                ops::gdn_input_proj_conv_snapshot(x, parent, conv, states, Tensor{}, read, write, q,
+                                                  k, v, z, policy, workspace, nullptr);
+            },
+            [&](const Tensor& x, const Tensor& conv, const Tensor& states, const Tensor& read,
+                Tensor& record, Tensor& q, Tensor& k, Tensor& v, Tensor& z, std::int32_t columns) {
+                WorkspaceArena workspace(std::max<std::size_t>(
+                    256, ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
+                             parent.qtype, parent.n, parent.k, policy, 1, columns, columns)));
+                ops::gdn_input_proj_conv_record(x, parent, conv, states, Tensor{}, read, record, q,
+                                                k, v, z, policy, workspace, nullptr);
+            },
+            seed + static_cast<std::uint32_t>(width));
+    };
+    quantized_weight::PatternedWeightOptions options;
+    options.weight_scale_divisor = 0.125F;
+    options.input_scale_divisor  = 3.5F;
+    DevicePackedWeight nvfp4(
+        quantized_weight::make_patterned_weight(QType::NVFP4, 16384, 5120, 1901U, options));
+    DevicePackedWeight fp8(
+        quantized_weight::make_patterned_weight(QType::FP8_E4M3FN_ROW_BF16, 16384, 5120, 1921U));
+    // Every fused window through T=4 (NVFP4 A16Only small-T reaches T=16, AllowA4 and FP8 T=3).
+    const auto a16 = ops::LinearPolicy::A16Only;
+    run_width("steps NVFP4 A16Only", nvfp4.view(), a16, 2, 1900U);
+    run_width("steps NVFP4 A16Only", nvfp4.view(), a16, 3, 1900U);
+    run_width("steps NVFP4 A16Only", nvfp4.view(), a16, 4, 1900U);
+    run_width("steps NVFP4 AllowA4", nvfp4.view(), ops::LinearPolicy::AllowA4, 2, 1910U);
+    run_width("steps NVFP4 AllowA4", nvfp4.view(), ops::LinearPolicy::AllowA4, 3, 1910U);
+    run_width("steps FP8 A16Only", fp8.view(), a16, 2, 1920U);
+    run_width("steps FP8 A16Only", fp8.view(), a16, 3, 1920U);
+    return failures;
+}
+
 std::vector<std::int32_t> ragged(std::int32_t width, std::int32_t batch) {
     std::vector<std::int32_t> valid(batch);
     for (int b = 0; b < batch; ++b) valid[b] = b == 0 ? width : 1 + (3 * b) % width;
@@ -454,6 +606,7 @@ int main() {
     failures += run_q8();
     failures += run_nvfp4();
     failures += run_fp8();
+    failures += run_steps();
     std::cout << (failures == 0 ? "OK" : "FAIL") << " gdn_input_proj_conv_record\n";
     return failures == 0 ? 0 : 1;
 }

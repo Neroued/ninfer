@@ -3,11 +3,11 @@
 // Reasoning-close retry (--reasoning-close-retry, on in --profile flash-next). Qwen3.8-Flash-Next
 // sometimes emits its end-of-turn token while the thinking phase is still open, at the very first
 // token after "<think>\n" or after some reasoning: the reply comes back with empty content and no
-// tool call, and an agent harness stops (capy-flash dossier docs/v07/vuote-fn.md). When that
-// happens the service closes the thinking with the canonical "\n</think>\n\n" and lets the model
-// continue once, from the reply so far. A reply that stops right after "</think>" with blank
-// content is resumed once from the same point with a different seed. Nothing changes for a reply
-// that does not end this way: the first generation runs exactly as without the option.
+// tool call, and an agent harness stops. When that happens the service closes the thinking with
+// the canonical "\n</think>\n\n" and lets the model continue once, from the reply so far. A reply
+// that stops right after "</think>" with blank content is resumed once from the same point with a
+// different seed. Nothing changes for a reply that does not end this way: the first generation runs
+// exactly as without the option.
 
 #include "ninfer/types.h"
 
@@ -28,7 +28,7 @@ enum class ReasoningRetryTrigger : std::uint8_t {
 [[nodiscard]] const char* reasoning_retry_trigger_name(ReasoningRetryTrigger trigger) noexcept;
 
 struct ReasoningRetryInput {
-    bool starts_in_reasoning = false;
+    bool starts_in_reasoning   = false;
     FinishReason finish_reason = FinishReason::None;
     std::span<const TokenId> generated; // the reply's token ids, terminal token included
     std::string_view content;

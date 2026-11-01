@@ -27,7 +27,7 @@ Growing KV 使用一组启动时固定的 homogeneous pools。每个 pool：
 一个 request 的 KV 不要求物理连续，也不与 control lane 固定绑定。所有 active 与 inactive address spaces
 共享 pool capacity；active request 通过 reservation 获得不会被其他 request 使用的完成容量。
 
-Paged storage 覆盖按上下文增长的 KV。DFlash local cyclic state、Vision/query temporary K/V 和其他固定
+Paged storage 覆盖按上下文增长的 KV。DFlash2 local cyclic state、Vision/query temporary K/V 和其他固定
 state 具有不同 lifetime，由其各自的 StateImage 或 workspace contract 管理。
 
 ---
@@ -65,13 +65,12 @@ MTP:
     Main Text
     MTP
 
-DFlash / DFlash2:
+DFlash2:
     Main Text
-    Draft Full, when the selected draft config contains full-attention layers
 ```
 
-Speculative backends 在一个 Engine 内互斥，因此当前最多有两个 growing pools。官方 DFlash2
-配置的五层全部是 local attention，只需要 Main growing pool，其 draft context 使用 cyclic storage。
+Speculative backends 在一个 Engine 内互斥，因此当前最多有两个 growing pools。DFlash2 的 draft
+层只能是 local attention，只需要 Main growing pool，其 draft context 使用 cyclic storage。
 
 | Pool | 内容 | 逻辑 frontier |
 |---|---|---|
@@ -167,10 +166,6 @@ backend off:
 MTP with draft window K:
     Main physical pages = M
     MTP physical pages  = M + C * ceil((K - 1) / P)
-
-DFlash / DFlash2 with full-attention layers:
-    Main physical pages        = M
-    Draft Full physical pages = M
 ```
 
 MTP 的额外 pages 只覆盖每条 active row 在一个 speculative round 中相对 Main 的 provisional lead，
@@ -200,8 +195,8 @@ Main 与 selected backend 的 Host replicas共用一个 startup-fixed pinned `Ho
 4. 使用相同 page size；
 5. 没有独立释放或独立容量复用的语义。
 
-因此 Main layers 的 K、V、code 和 scale 可以共享一个 page-group ID；Main、MTP 与 DFlash Full
-必须属于不同 pools。
+因此 Main layers 的 K、V、code 和 scale 可以共享一个 page-group ID；Main 与 MTP 必须属于不同
+pools。
 
 ### 4.2 Page group
 
@@ -232,7 +227,7 @@ Main Text 与 MTP 使用 page-major：
 [X,P,H,N_{physical}]
 \]
 
-DFlash Full 使用 head-major page run：
+head-major page run（当前没有模型 pool 使用）：
 
 \[
 [X,P,N_{physical},H]
@@ -513,8 +508,8 @@ KV Store 从该 active address space 的 reservation materialize 全部必需 pa
 frontier、不裁剪已有 mappings，也不改变 entitlement。新增页只把当前 address 的 reservation 转成
 allocation；缩短范围只能由显式 truncate 完成。
 
-各阶段只保障自己会写入的 pool：target prefill/verify 负责 Main KV；draft context append 只保障
-DFlash Full backend KV。DFlash2 的 draft context 全部写入固定 cyclic state，不需要 paged KV 物化。
+各阶段只保障自己会写入的 pool：target prefill/verify 负责 Main KV，MTP draft 负责 MTP KV。DFlash2 的
+draft context 全部写入固定 cyclic state，不需要 paged KV 物化。
 
 Unit 成功后，Program 才推进 corresponding committed frontiers。部分 layers 已写但 unit 没有形成合法
 commit 时，新 frontier 不可见。
@@ -622,7 +617,7 @@ Reference count 表示 sharing，不单独决定写权限。Program 同时验证
 
 ### 9.1 Independent pool frontiers
 
-MTP 和带 full layer 的 DFlash backend 使用 Program KV Store 的 backend pool，不建立独立 allocator。
+MTP backend 使用 Program KV Store 的 backend pool，不建立独立 allocator。
 
 一次 speculative unit 中，Main 与 backend：
 
@@ -631,7 +626,7 @@ MTP 和带 full layer 的 DFlash backend 使用 Program KV Store 的 backend poo
 - 分别提交 accepted frontier；
 - 分别 trim rejected trailing mappings。
 
-MTP draft 期间 backend mapped extent可以暂时领先 Main；DFlash Full 通常落后于 Main。Provisional lead
+MTP draft 期间 backend mapped extent 可以暂时领先 Main。Provisional lead
 不构成 committed checkpoint coverage。Rejected bytes 可以留在 partial page 中，但后续读取前必须被新的
 canonical write 覆盖。
 
@@ -641,11 +636,11 @@ canonical write 覆盖。
 
 | Resource | Owner |
 |---|---|
-| DFlash/DFlash2 local sliding-window K/V | fixed per-sequence StateImage |
-| DFlash/DFlash2 boundary-local snapshot | fixed checkpoint StateImage |
+| DFlash2 local sliding-window K/V | fixed per-sequence StateImage |
+| DFlash2 boundary-local snapshot | fixed checkpoint StateImage |
 | Vision/query temporary K/V | Program workspace |
 
-DFlash/DFlash2 cyclic K/V 使用自己的 `CyclicKVCacheLayerView` 与 modulo/window 语义；它不持有 page ID、
+DFlash2 cyclic K/V 使用自己的 `CyclicKVCacheLayerView` 与 modulo/window 语义；它不持有 page ID、
 block table 或 growing reservation。模型配置决定其 layer count、heads 和 window。
 
 ---
@@ -715,6 +710,13 @@ Paging 不引入 gather-to-contiguous cache或与 context 长度成比例的 sta
 split、warp和shared-memory方案可以独立优化，只要保持同一 logical Attention、persistent codec与上述
 address contract。Op 的数值与性能准入规则见 [Op development](op-development.md)。
 
+唯一例外是 opt-in 的 [Active KV in RAM](active-kv-in-ram.md)（`--kv-ram-active`）：Main Text pool 的
+K/V code/scale 与 QSA record planes 标记为 `KVPlaneGeometry::host`，位于 pinned、device-mapped Host
+memory；QSA attention 之前，staging Ops 把本次读取的 rows 复制到 Program 持有的 device staging
+region（decode：selected blocks 经 per-layer block cache；prefill：可见 pages），attention 读取的
+bytes 与顺序不变。Host plane 的 zero/copy/Host 交换由 core 的 stream-ordered kernel 完成；pool 的 write
+listener 使 staging cache 失效。
+
 ---
 
 ## 11. CUDA Graph 与 table publication
@@ -758,7 +760,8 @@ consumer，且 replay in-flight期间不得改写同一 row。
 12. Inactive address space不占execution row；execution row不拥有logical pages。
 13. Main与backend pools分别reserve、materialize、commit和truncate。
 14. Growing-cache consumer只通过paged view和block table访问KV，不取得allocator或ownership authority。
-15. Kernel correctness不依赖physical page ID连续性，也不通过gather建立request-contiguous KV。
+15. Kernel correctness不依赖physical page ID连续性，也不通过gather建立request-contiguous KV（opt-in
+    的 Active KV in RAM staging 除外，见 10.4）。
 16. Checkpoint可复用性由完整target continuation证明，KV page存在本身不构成hit。
 
 ---
@@ -776,8 +779,10 @@ consumer，且 replay in-flight期间不得改写同一 row。
 | model pool layout与capacity curve | `src/models/qwen3_5/program/planning/startup.cpp` |
 | public paged consumer views | `src/core/paged_kv_cache.h` |
 | growing-cache Ops | `include/ninfer/ops/`, `src/ops/` |
+| Host planes 的 stream-ordered raw copy | `src/core/uva_copy.*` |
+| QSA staging region（Active KV in RAM） | `src/models/qwen3_5/state/decoder_state.*`、`src/ops/sparse_attention/staging.cu` |
 
 Exact model state 和 backend mathematics 见
-[Qwen3.5 model](qwen3_5-model.md)与 [DFlash](dflash.md)；persistent KV codec 和 causal consumer
+[Qwen3.5 model](qwen3_5-model.md)与 [DFlash2](dflash.md)；persistent KV codec 和 causal consumer
 numerical contract 由上表中的 growing-cache Ops 定义。路径用于定位当前实现，不把文件或类名本身提升为
 外部接口。

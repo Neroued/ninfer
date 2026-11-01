@@ -28,9 +28,9 @@ Generation purpose 的 NInfer Engine 固定运行：
 - 不抢占已经激活的请求；
 - 每个 decode round 将全部 decode-ready 请求组成一个紧凑批次。
 
-Text、Vision、prefix reuse、MTP、DFlash/DFlash2、CLI 和 HTTP serving 都通过公共 `ninfer::Engine` 路径。
-MTP、DFlash 和 DFlash2 是 Program 内部的执行后端，不产生第二套请求调度或结果发布机制。
-Artifact 必须提供 Text；Vision、MTP、DFlash 和 DFlash2 的私有权重与资源可以缺省。
+Text、Vision、prefix reuse、MTP、DFlash2、CLI 和 HTTP serving 都通过公共 `ninfer::Engine` 路径。
+MTP 与 DFlash2 是 Program 内部的执行后端，不产生第二套请求调度或结果发布机制。
+Artifact 必须提供 Text；Vision、MTP 和 DFlash2 的私有权重与资源可以缺省。
 启动独立选择 Vision，以及 none 或一个 spec 后端，只为所选功能及其共享依赖绑定和准备资源。
 
 同一个公共 Engine 还提供启动时固定的 CausalScoring purpose。它只服务离线文本评分：
@@ -50,7 +50,7 @@ inactive cache 的保留而丢失完成能力。
 
 模型代码拥有数学公式、调用顺序、组件交接和状态转移。Config 提供层数、维度、Attention/GDN
 分布和 expert 几何等实例参数。当前标准架构入口是 `Qwen3_5ForCausalLM` 与
-`Qwen3_5MoeForCausalLM`；训练实例和物理权重分配作为数据进入对应实现。
+`Qwen4ExpForCausalLM`；训练实例和物理权重分配作为数据进入对应实现。
 
 V3 artifact 保存配置、物理对象、逻辑参数的 Binding、使用位置的 Use，以及 Frontend 资源。
 Converter 负责源映射、量化或保值导入、融合存储、packing 和 layout 转换；loader 根据实际绑定
@@ -141,7 +141,7 @@ Program 是模型实例的物理执行入口，拥有：
 
 - active sequence 与完整 continuation state；
 - State/KV stores、allocator、replica、reference 和 reservation；
-- prefill、ordinary decode、MTP/DFlash/DFlash2 和 forced control；
+- prefill、ordinary decode、MTP/DFlash2 和 forced control；
 - provisional model state 及 accepted-prefix commit/rollback；
 - resident prefix identity、shortlist digest 及 committed execution provenance；
 - resource feasibility、物理 transition 和 `ResourceResult`；
@@ -240,9 +240,9 @@ View 保留完整 parent 的几何、planes 和元素范围；原生准备按入
 `LoadOptions.tp=2` 时 Dense Qwen3.5 在加载阶段按逻辑参数名切分（`qwen3_5/load/sharding.h`）：
 Attention 与 GDN 投影、MLP gate/up、`text/output_head` 按 head/中间宽度/词表分行，输出投影、
 MLP down、`mtp/input_projection` 与 GDN 卷积通道分列；norm 与 `text/token_embedding` 复制；
-Vision 只驻留在 `vision_rank`，DFlash 与 proposal 只驻留在设备 0。同一 parent 上的逻辑参数
-合成一个 parent 放置。Model 为每个设备保存一组视图，每个设备构造自己的 Parameters；
-MoE、以及读取整份 head 的设备 0 drafter（完整 proposal head）在 tp=2 下被拒绝。
+Vision 只驻留在 `vision_rank`，DFlash2 的放置见[双 GPU 张量并行](tensor-parallel.md#2-weight-partitioning)。
+同一 parent 上的逻辑参数合成一个 parent 放置。Model 为每个设备保存一组视图，每个设备构造自己的
+Parameters；读取整份 head 的 DFlash2 drafter（完整 proposal head）在 tp=2 下被拒绝。
 
 模型代码直接维护有限调用写法、跨 Op 融合和阶段关系；闭合计算及其 shape/格式分派属于 Op。
 Reader、binder、原生参数准备、容量查询、warmup 和实际执行各自检查所消费的合同。
@@ -466,7 +466,7 @@ Forced control 使用同一提交顺序，但 token 由 Frontend 提供，不调
 Frontend 产生的 boundary metadata 只描述当前 accepted span 内的相对位置。Engine 验证它落在该 span 内并随
 对应 row 搬运，不解释 delimiter，也不修改 resident identity。Program 使用 pending row 的 base frontier
 转换为绝对位置，并与 accepted token、Main/backend state 及 prefix digest 原子提交。Program commit 失败时，
-`OutputSession` 的 preview state 同样不提交；ordinary、MTP、DFlash 和 forced control 共享这一所有权链。
+`OutputSession` 的 preview state 同样不提交；ordinary、MTP、DFlash2 和 forced control 共享这一所有权链。
 
 ---
 
@@ -565,9 +565,9 @@ rank 1 在 `ProgramImpl::PeerRuntime` 中分配与 rank 0 相同的 per-rank per
 要求 Host State 与 Host KV 容量为 0。每次 bind、prefill step 与 forced-token prefill 都在两个 rank
 上发布同一个 prefill KV row；decode 把同一个 host ingress 上传到两个 rank 的 frame。CUDA Graph 把
 rank 1 的 stream fork/join 进 rank 0 的同一次 capture，launch 前以 rank 1 已提交的 mirror 工作为 gate。
-两个 rank 保留相同的 runtime reservation，KV 容量按空闲显存较少的 rank 求解。当前支持 dense 架构的
-ordinary、MTP 与 DFlash2（需 `--lm-head-draft`；drafter 只在 rank 0 运行）生成，可带 Vision，KV 为
-`bf16`/`int8`；DFlash、CausalScoring 与 MoE 在启动时拒绝。Vision tower 与 encode workspace 只在
+两个 rank 保留相同的 runtime reservation，KV 容量按空闲显存较少的 rank 求解。当前支持
+ordinary、MTP 与 DFlash2（需 `--lm-head-draft`）生成及 CausalScoring，可带 Vision，KV 为
+`bf16`/`int8`/`nvfp4`。Vision tower 与 encode workspace 只在
 `vision_rank`（`--vision-device`）上：该 rank 编码每个 item，merged embeddings 由另一 rank 的 stream
 经事件排序复制到它自己的 handoff，两个 rank 各自 scatter 自己的副本；另一 rank 不分配 encode 区域，
 KV 求解时按差额为其预算加回。Prefix reuse 与单卡相同，包括 zero-suffix 与 MTP

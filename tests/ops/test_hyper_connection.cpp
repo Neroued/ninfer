@@ -1,10 +1,9 @@
-// Hyper-connection Ops against FP64 oracles at the Qwen3.8-Flash-Next geometry (4 streams of
-// 2560, low rank 320, Q8_G32_FP16 Down/Up as in the ninfer-ext NVFP4 recipe; BF16 Down/Up as in the
-// FP4-Local checkpoint).
+// Hyper-connection Ops against FP64 oracles: 4 streams of H = 2560 and 5120, low rank 320 and 640;
+// Q8_G32_FP16 and BF16 Down/Up, and the NVFP4 option.
 //
-// --bench: us per mixer of combine_mix (Q8, BF16) at T = 1, 2, 4, 8 in one CUDA Graph of 12 mixers
-// over distinct device copies of the weights (they stream from DRAM, as in a forward). Run it again
-// with NINFER_QWEN4_HC_GENERAL=1 to time the general route.
+// --bench [H]: us per mixer of combine_mix (Q8, BF16) at T = 1, 2, 4, 8 in one CUDA Graph of 12
+// mixers over distinct device copies of the weights (they stream from DRAM, as in a forward). Run
+// it again with NINFER_QWEN4_HC_GENERAL=1 to time the general route.
 //
 // The mix oracle evaluates the complete formula of include/ninfer/ops/hyper_connection.h from the
 // represented BF16 inputs and the independently decoded Q8 weights. It ports the fused oracle of
@@ -39,10 +38,13 @@ using namespace ninfer::test;
 namespace {
 
 constexpr std::int32_t kStreams = 4;
-constexpr std::int32_t kHidden  = 2560;
-constexpr std::int32_t kWide    = kStreams * kHidden;
-constexpr std::int32_t kRank    = 320;
-constexpr float kEps            = 1.0e-6F;
+// The geometry under test: H = 2560 first, then main() switches to H = 5120 (small-T route for Q8
+// at T <= 8, general route otherwise) and reruns the mix cases.
+std::int32_t kHidden = 2560;
+std::int32_t kWide   = kStreams * kHidden;
+// The low rank under test: 320 except in the rank-640 section of main().
+std::int32_t kRank   = 320;
+constexpr float kEps = 1.0e-6F;
 
 // Elementwise BF16 results: one output rounding (2^-9 relative) over an FP64 reference, with a 2x
 // margin for the FP32 evaluation of exp/rsqrt.
@@ -453,7 +455,8 @@ int mix_case(const MixFixture& f, std::int32_t tokens, bool combine, Execution e
     Tensor t_mixed(d_mixed.data(), DType::BF16, {kHidden, tokens});
     Tensor t_inject(d_inject.data(), DType::FP32, {kStreams, tokens});
     Tensor* inject = f.inject ? &t_inject : nullptr;
-    WorkspaceArena workspace(ops::hyper_connection_mix_workspace_bytes(tokens, tokens, f.inject));
+    WorkspaceArena workspace(
+        ops::hyper_connection_mix_workspace_bytes(tokens, tokens, f.inject, kHidden, kRank));
 
     DeviceContext device(device_id);
     const auto launch = [&] {
@@ -507,6 +510,77 @@ int mix_case(const MixFixture& f, std::int32_t tokens, bool combine, Execution e
     return failures;
 }
 
+// combine_mix with previous_inject and inject overlapping, as one buffer or as two views of it
+// that start apart (`offset` floats) and share bytes: the small-T route reads the previous gates in
+// the launches that write the new ones (from other CTAs), so the Op rejects the overlap at every T
+// rather than racing.
+int aliased_inject_case(const MixFixture& f, std::int32_t tokens, std::int32_t offset) {
+    const std::size_t wide   = static_cast<std::size_t>(kWide) * tokens;
+    const std::size_t narrow = static_cast<std::size_t>(kHidden) * tokens;
+    const std::size_t gates  = static_cast<std::size_t>(kStreams) * tokens;
+    DeviceBuffer d_residual  = to_device(bits(random_bf16(wide, 0x31U, -0.75F, 0.75F)));
+    DeviceBuffer d_y         = to_device(bits(random_bf16(narrow, 0x32U, -0.5F, 0.5F)));
+    DeviceBuffer d_inject    = to_device(std::vector<float>(gates + offset, 1.0F));
+    GuardedDeviceBuffer d_mixed(narrow * 2);
+    Tensor t_residual(d_residual.p, DType::BF16, {kWide, tokens});
+    Tensor t_y(d_y.p, DType::BF16, {kHidden, tokens});
+    Tensor t_previous(d_inject.p, DType::FP32, {kStreams, tokens});
+    Tensor t_inject(static_cast<float*>(d_inject.p) + offset, DType::FP32, {kStreams, tokens});
+    Tensor t_mixed(d_mixed.data(), DType::BF16, {kHidden, tokens});
+    WorkspaceArena workspace(
+        ops::hyper_connection_mix_workspace_bytes(tokens, tokens, true, kHidden, kRank));
+    DeviceContext device;
+    try {
+        ops::hyper_connection_combine_mix(t_residual, t_y, t_previous, f.weights, kEps, t_mixed,
+                                          &t_inject, workspace, device.stream);
+    } catch (const std::invalid_argument&) { return 0; }
+    std::cerr << "FAIL combine_mix T=" << tokens << " offset " << offset
+              << " accepted inject overlapping previous_inject\n";
+    return 1;
+}
+
+// A geometry the weight format cannot serve is refused before anything is enqueued: Q8 Down/Up at
+// low rank 328 (a multiple of 8 that no Q8 Linear shape registers), at a small-T and a general
+// width, leaves the residual of combine_mix unchanged.
+int unservable_geometry_case(std::int32_t tokens) {
+    const std::int32_t rank = kRank;
+    kRank                   = 328;
+    const MixFixture f(true, 0x9700U);
+    const std::size_t wide   = static_cast<std::size_t>(kWide) * tokens;
+    const std::size_t narrow = static_cast<std::size_t>(kHidden) * tokens;
+    const auto residual_bits = bits(random_bf16(wide, 0x41U, -0.75F, 0.75F));
+    DeviceBuffer d_residual  = to_device(residual_bits);
+    DeviceBuffer d_y         = to_device(bits(random_bf16(narrow, 0x42U, -0.5F, 0.5F)));
+    DeviceBuffer d_previous =
+        to_device(std::vector<float>(static_cast<std::size_t>(kStreams) * tokens, 1.0F));
+    GuardedDeviceBuffer d_mixed(narrow * 2);
+    GuardedDeviceBuffer d_inject(static_cast<std::size_t>(kStreams) * tokens * 4);
+    Tensor t_residual(d_residual.p, DType::BF16, {kWide, tokens});
+    Tensor t_y(d_y.p, DType::BF16, {kHidden, tokens});
+    Tensor t_previous(d_previous.p, DType::FP32, {kStreams, tokens});
+    Tensor t_mixed(d_mixed.data(), DType::BF16, {kHidden, tokens});
+    Tensor t_inject(d_inject.data(), DType::FP32, {kStreams, tokens});
+    WorkspaceArena workspace(
+        ops::hyper_connection_mix_workspace_bytes(tokens, tokens, true, kHidden, kRank));
+    DeviceContext device;
+    bool refused = false;
+    try {
+        ops::hyper_connection_combine_mix(t_residual, t_y, t_previous, f.weights, kEps, t_mixed,
+                                          &t_inject, workspace, device.stream);
+    } catch (const std::invalid_argument&) { refused = true; }
+    cuda_synchronize(device.stream);
+    kRank        = rank;
+    int failures = 0;
+    if (!refused) {
+        std::cerr << "FAIL combine_mix T=" << tokens << " accepted Q8 weights of rank 328\n";
+        ++failures;
+    }
+    failures += verify_exact(
+        ("combine_mix T=" + std::to_string(tokens) + " Q8 rank 328 residual preserved").c_str(),
+        from_device<std::uint16_t>(d_residual, wide), residual_bits);
+    return failures;
+}
+
 // Two consecutive combine_mix calls in one stream (eager and CUDA Graph). The second call's first
 // launch is a programmatic dependent of the first call's last launch, which writes the committed
 // residual and is already running when the second call starts: the second call must read the
@@ -536,7 +610,8 @@ int chain_case(const MixFixture& first, const MixFixture& second, std::int32_t t
     Tensor t_mixed2(d_mixed2.data(), DType::BF16, {kHidden, tokens});
     Tensor t_inject1(d_inject1.data(), DType::FP32, {kStreams, tokens});
     Tensor t_inject2(d_inject2.data(), DType::FP32, {kStreams, tokens});
-    WorkspaceArena workspace(ops::hyper_connection_mix_workspace_bytes(tokens, tokens, true));
+    WorkspaceArena workspace(
+        ops::hyper_connection_mix_workspace_bytes(tokens, tokens, true, kHidden, kRank));
 
     DeviceContext device;
     const auto launch = [&] {
@@ -590,9 +665,9 @@ int chain_case(const MixFixture& first, const MixFixture& second, std::int32_t t
     return failures;
 }
 
-// BF16 weights: the small-T route at T against the general route on the same tokens (the general
-// route at T = 9, whose first T columns are the small-T input), with the oracle criteria taking the
-// general route as reference. Both routes are also qualified against the oracle (mix_case).
+// The small-T route at T against the general route on the same tokens (the general route at T = 9,
+// whose first T columns are the small-T input), with the oracle criteria taking the general route
+// as reference. Both routes are also qualified against the oracle (mix_case).
 int route_parity_case(const MixFixture& f, std::int32_t tokens, bool combine, std::uint32_t seed) {
     constexpr std::int32_t kGeneral = 9; // first T of the general route
     const std::size_t wide          = static_cast<std::size_t>(kWide) * kGeneral;
@@ -617,7 +692,8 @@ int route_parity_case(const MixFixture& f, std::int32_t tokens, bool combine, st
         Tensor t_mixed(d_mixed[route].p, DType::BF16, {kHidden, n});
         Tensor t_inject(d_inject[route].p, DType::FP32, {kStreams, n});
         Tensor* inject = f.inject ? &t_inject : nullptr;
-        WorkspaceArena workspace(ops::hyper_connection_mix_workspace_bytes(n, n, f.inject));
+        WorkspaceArena workspace(
+            ops::hyper_connection_mix_workspace_bytes(n, n, f.inject, kHidden, kRank));
         if (combine)
             ops::hyper_connection_combine_mix(t_residual, t_y, t_inj_prev, f.weights, kEps, t_mixed,
                                               inject, workspace, device.stream);
@@ -628,9 +704,10 @@ int route_parity_case(const MixFixture& f, std::int32_t tokens, bool combine, st
     }
     const std::size_t used_narrow = static_cast<std::size_t>(kHidden) * tokens;
     const std::size_t used_wide   = static_cast<std::size_t>(kWide) * tokens;
-    const std::string label       = std::string("route parity bf16 ") +
-                              (combine ? "combine_mix" : "mix") + (f.inject ? " inject" : " head") +
-                              " T=" + std::to_string(tokens);
+    const std::string label =
+        std::string("route parity ") + (f.weight_format == Format::Bf16 ? "bf16 " : "q8 ") +
+        "H=" + std::to_string(kHidden) + " " + (combine ? "combine_mix" : "mix") +
+        (f.inject ? " inject" : " head") + " T=" + std::to_string(tokens);
     int failures = verify_reduction(label + " mixed", from_device_bf16(d_mixed[0].p, used_narrow),
                                     from_device_bf16(d_mixed[1].p, used_narrow), kMixed);
     if (f.inject) {
@@ -643,6 +720,49 @@ int route_parity_case(const MixFixture& f, std::int32_t tokens, bool combine, st
             verify_pointwise(label + " residual", from_device_bf16(d_residual[0], used_wide),
                              from_device_bf16(d_residual[1], used_wide), kBf16Output);
     return failures;
+}
+
+// Kernel launches of one mix / combine_mix call, counted on its captured CUDA Graph: the small-T
+// route is exactly two (Down, Up + mix); the general route is at least five (norm, Down linear,
+// gates, Up linear, collapse, plus the combine). It shows which route a geometry takes.
+std::size_t route_launches(const MixFixture& f, std::int32_t tokens, bool combine) {
+    const std::size_t wide = static_cast<std::size_t>(kWide) * tokens;
+    DeviceBuffer d_residual(wide * 2);
+    DeviceBuffer d_y(static_cast<std::size_t>(kHidden) * tokens * 2);
+    DeviceBuffer d_inj_prev(static_cast<std::size_t>(kStreams) * tokens * 4);
+    DeviceBuffer d_mixed(static_cast<std::size_t>(kHidden) * tokens * 2);
+    DeviceBuffer d_inject(static_cast<std::size_t>(kStreams) * tokens * 4);
+    Tensor t_residual(d_residual.p, DType::BF16, {kWide, tokens});
+    Tensor t_y(d_y.p, DType::BF16, {kHidden, tokens});
+    Tensor t_inj_prev(d_inj_prev.p, DType::FP32, {kStreams, tokens});
+    Tensor t_mixed(d_mixed.p, DType::BF16, {kHidden, tokens});
+    Tensor t_inject(d_inject.p, DType::FP32, {kStreams, tokens});
+    WorkspaceArena workspace(
+        ops::hyper_connection_mix_workspace_bytes(tokens, tokens, f.inject, kHidden, kRank));
+    DeviceContext device;
+    DecodeGraphDefinition definition;
+    definition.capture(device.stream, [&] {
+        if (combine)
+            ops::hyper_connection_combine_mix(t_residual, t_y, t_inj_prev, f.weights, kEps, t_mixed,
+                                              f.inject ? &t_inject : nullptr, workspace,
+                                              device.stream);
+        else
+            ops::hyper_connection_mix(t_residual, f.weights, kEps, t_mixed,
+                                      f.inject ? &t_inject : nullptr, workspace, device.stream);
+    });
+    return definition.node_count();
+}
+
+// NINFER_QWEN4_HC_GENERAL=1 (the diagnostic that forces the general route) is honored.
+int expect_route(const MixFixture& f, std::int32_t tokens, bool combine, bool small_t) {
+    const char* forced = std::getenv("NINFER_QWEN4_HC_GENERAL");
+    if (forced != nullptr && std::string(forced) == "1") small_t = false;
+    const std::size_t launches = route_launches(f, tokens, combine);
+    if ((launches == 2) == small_t) return 0;
+    std::cerr << "FAIL route H=" << kHidden << (f.weight_format == Format::Bf16 ? " bf16" : " q8")
+              << (combine ? " combine_mix" : " mix") << " T=" << tokens << ": " << launches
+              << " launches, expected the " << (small_t ? "small-T" : "general") << " route\n";
+    return 1;
 }
 
 void bench(const MixFixture& f, const char* name) {
@@ -670,7 +790,8 @@ void bench(const MixFixture& f, const char* name) {
         Tensor tp(d_prev.p, DType::FP32, {kStreams, T}); // zero gates: replays keep the residual
         Tensor tm(d_mixed.p, DType::BF16, {kHidden, T});
         Tensor ti(d_inject.p, DType::FP32, {kStreams, T});
-        WorkspaceArena workspace(ops::hyper_connection_mix_workspace_bytes(T, T, true));
+        WorkspaceArena workspace(
+            ops::hyper_connection_mix_workspace_bytes(T, T, true, kHidden, kRank));
         DeviceContext device;
         DecodeGraphDefinition definition;
         definition.capture(device.stream, [&] {
@@ -716,7 +837,8 @@ void quantization_report(const MixFixture& f, const char* name, std::int32_t tok
     Tensor t_residual(d_residual.p, DType::BF16, {kWide, tokens});
     Tensor t_mixed(d_mixed.p, DType::BF16, {kHidden, tokens});
     Tensor t_inject(d_inject.p, DType::FP32, {kStreams, tokens});
-    WorkspaceArena workspace(ops::hyper_connection_mix_workspace_bytes(tokens, tokens, f.inject));
+    WorkspaceArena workspace(
+        ops::hyper_connection_mix_workspace_bytes(tokens, tokens, f.inject, kHidden, kRank));
     ops::hyper_connection_mix(t_residual, f.weights, kEps, t_mixed, f.inject ? &t_inject : nullptr,
                               workspace, nullptr);
     cuda_synchronize();
@@ -747,6 +869,10 @@ int main(int argc, char** argv) {
     }
     try {
         if (argc > 1 && std::string(argv[1]) == "--bench") {
+            if (argc > 2) { // --bench H: time the mixers at hidden width H (e.g. 5120)
+                kHidden = std::stoi(argv[2]);
+                kWide   = kStreams * kHidden;
+            }
             bench(MixFixture(true, 0x9000U), "q8");
             bench(MixFixture(true, 0x9000U, Format::Bf16), "bf16");
             return 0;
@@ -780,6 +906,17 @@ int main(int argc, char** argv) {
             failures += chain_case(with_inject, second, tokens, Execution::Eager, 0xD000U + tokens);
             failures += chain_case(with_inject, second, tokens, Execution::Graph, 0xD100U + tokens);
         }
+        for (const bool combine : {false, true}) {
+            failures += expect_route(with_inject, 1, combine, true);
+            failures += expect_route(with_inject, 8, combine, true);
+            failures += expect_route(with_inject, 9, combine, false);
+            failures += expect_route(head, 8, combine, true);
+        }
+        for (const std::int32_t tokens : {1, 8, 9}) {
+            failures += aliased_inject_case(with_inject, tokens, 0);
+            failures += aliased_inject_case(with_inject, tokens, kStreams * tokens - 1);
+        }
+        for (const std::int32_t tokens : {4, 9}) { failures += unservable_geometry_case(tokens); }
         // NVFP4 weights (option): the same criteria against the formula over the decoded weights
         // (identical arithmetic: exact decode, FP16 staging, FP32 accumulation), small-T route
         // only.
@@ -840,6 +977,113 @@ int main(int argc, char** argv) {
             }
             cuda_check(cudaSetDevice(0), "cudaSetDevice");
         }
+        // H = 5120: Q8 Down/Up on the small-T route for T <= 8 (two Down CTAs
+        // per lane) and the general route past it; BF16 Down/Up on the general route at every T
+        // (its small-T route and the NVFP4 option are compiled for H = 2560). The same oracle and
+        // criteria; the route is asserted (expect_route) and the two Q8 routes compared.
+        kHidden = 5120;
+        kWide   = kStreams * kHidden;
+        {
+            for (const std::int32_t tokens : {1, 72}) {
+                failures += grouped_norm_case(tokens, 0x1100U + tokens);
+                failures += combine_expand_case(tokens, 0x1400U + tokens);
+            }
+            const MixFixture q8_wide(true, 0x9300U);
+            const MixFixture q8_wide_head(false, 0xA300U);
+            const MixFixture bf16_wide(true, 0x9300U, Format::Bf16);
+            const MixFixture bf16_wide_head(false, 0xA300U, Format::Bf16);
+            for (const std::int32_t tokens : {1, 2, 3, 4, 5, 6, 7, 8, 9, 17, 64}) {
+                failures += mix_case(q8_wide, tokens, false, Execution::Eager, 0x15000U + tokens);
+                failures += mix_case(q8_wide, tokens, true, Execution::Eager, 0x16000U + tokens);
+            }
+            for (const std::int32_t tokens : {1, 2, 4, 8, 9, 17, 64}) {
+                failures += mix_case(bf16_wide, tokens, false, Execution::Eager, 0x1F000U + tokens);
+                failures += mix_case(bf16_wide, tokens, true, Execution::Eager, 0x1F100U + tokens);
+            }
+            for (const std::int32_t tokens : {1, 4, 8, 9}) {
+                failures +=
+                    mix_case(q8_wide_head, tokens, false, Execution::Eager, 0x17000U + tokens);
+                failures +=
+                    mix_case(q8_wide_head, tokens, true, Execution::Eager, 0x17100U + tokens);
+            }
+            for (const std::int32_t tokens : {1, 8, 9}) {
+                failures +=
+                    mix_case(bf16_wide_head, tokens, true, Execution::Eager, 0x1F200U + tokens);
+            }
+            for (const std::int32_t tokens : {1, 4, 8, 9}) {
+                failures += mix_case(q8_wide, tokens, true, Execution::Graph, 0x18000U + tokens);
+                failures +=
+                    mix_case(q8_wide_head, tokens, false, Execution::Graph, 0x18100U + tokens);
+            }
+            for (const std::int32_t tokens : {1, 4, 8}) {
+                failures +=
+                    mix_case(bf16_wide_head, tokens, false, Execution::Graph, 0x1F500U + tokens);
+            }
+            const MixFixture q8_wide_second(true, 0x9400U);
+            for (const std::int32_t tokens : {1, 4, 8}) {
+                failures += chain_case(q8_wide, q8_wide_second, tokens, Execution::Eager,
+                                       0x1D000U + tokens);
+                failures += chain_case(q8_wide, q8_wide_second, tokens, Execution::Graph,
+                                       0x1D200U + tokens);
+                failures += chain_case(bf16_wide, q8_wide_second, tokens, Execution::Graph,
+                                       0x1D100U + tokens);
+            }
+            for (const std::int32_t tokens : {1, 2, 3, 4, 5, 6, 7, 8}) {
+                failures += route_parity_case(q8_wide, tokens, true, 0x1E000U + tokens);
+                failures += route_parity_case(q8_wide, tokens, false, 0x1E100U + tokens);
+            }
+            failures += route_parity_case(q8_wide_head, 8, false, 0x1E200U);
+            failures += route_parity_case(q8_wide_head, 1, true, 0x1E300U);
+            for (const bool combine : {false, true}) {
+                for (const std::int32_t tokens : {1, 2, 3, 4, 5, 6, 7, 8})
+                    failures += expect_route(q8_wide, tokens, combine, true);
+                failures += expect_route(q8_wide_head, 1, combine, true);
+                failures += expect_route(q8_wide_head, 8, combine, true);
+                failures += expect_route(q8_wide, 9, combine, false);
+                failures += expect_route(bf16_wide, 1, combine, false);
+                failures += expect_route(bf16_wide, 8, combine, false);
+            }
+            try {
+                const MixFixture fp4_wide(true, 0x9300U, Format::Nvfp4);
+                (void)mix_case(fp4_wide, 4, false, Execution::Eager, 0x1B000U);
+                std::cerr
+                    << "FAIL NVFP4 at H = 5120 accepted (small-T route is compiled for 2560)\n";
+                ++failures;
+            } catch (const std::invalid_argument&) {}
+            if (ops::hyper_connection_mix_workspace_bytes(4, 4, true, 5120, 320) <=
+                ops::hyper_connection_mix_workspace_bytes(4, 4, true, 2560, 320)) {
+                std::cerr << "FAIL workspace at H = 5120 is not larger than at 2560\n";
+                ++failures;
+            }
+        }
+        // Low rank 640 at H = 5120 and 2560: the
+        // general route at every T (the small-T route is compiled for rank 320), Q8 and BF16.
+        kRank = 640;
+        for (const std::int32_t hidden : {5120, 2560}) {
+            kHidden = hidden;
+            kWide   = kStreams * kHidden;
+            const MixFixture q8_r(true, 0x9500U + hidden);
+            const MixFixture q8_r_head(false, 0xA500U + hidden);
+            const MixFixture bf16_r(true, 0x9500U + hidden, Format::Bf16);
+            for (const std::int32_t tokens : {1, 4, 8, 9, 64}) {
+                failures += mix_case(q8_r, tokens, false, Execution::Eager, 0x25000U + tokens);
+                failures += mix_case(q8_r, tokens, true, Execution::Eager, 0x26000U + tokens);
+                failures += mix_case(bf16_r, tokens, true, Execution::Eager, 0x2F100U + tokens);
+            }
+            failures += mix_case(q8_r_head, 8, false, Execution::Eager, 0x27008U);
+            failures += mix_case(q8_r, 4, true, Execution::Graph, 0x28004U);
+            failures += expect_route(q8_r, 4, true, false);
+            const MixFixture q8_r_second(true, 0x9600U + hidden);
+            failures += chain_case(q8_r, q8_r_second, 4, Execution::Graph, 0x2D004U);
+        }
+        if (ops::hyper_connection_mix_workspace_bytes(4, 4, true, 5120, 640) <=
+            ops::hyper_connection_mix_workspace_bytes(4, 4, true, 5120, 320)) {
+            std::cerr << "FAIL workspace at rank 640 is not larger than at 320\n";
+            ++failures;
+        }
+        kRank   = 320;
+        kHidden = 2560;
+        kWide   = kStreams * kHidden;
         quantization_report(with_inject, "q8", 4, 0xC000U);
         quantization_report(fp4_inject, "nvfp4", 4, 0xC000U);
         quantization_report(bf16_inject, "bf16", 4, 0xC000U);

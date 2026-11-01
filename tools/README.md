@@ -24,6 +24,22 @@ Python tools are independent of CMake; there is no `NINFER_BUILD_TOOLS` option.
 | Exercise thinking preservation through a managed server | [`smoke/serve_thinking_preservation.py`](smoke/serve_thinking_preservation.py) |
 | Measure the physical HBM read/copy ceiling | [`hbm_bandwidth_probe.cu`](hbm_bandwidth_probe.cu); [build command](#standalone-hbm-probe) |
 | Check whether the two-GPU mailbox transport works on a machine | [`tp2/mailbox_probe.cu`](tp2/mailbox_probe.cu); [build command](#standalone-tp2-mailbox-probe) |
+| Validate the Qwen4 forward end to end on synthetic checkpoints: generate (dense FFN, PLE or not, hidden 2560 and 5120, Q8 hyper-connections, NVFP4 snapped), convert, FP64 oracle and floor, then the engine against it on every route | [`ref_q4/synthetic.sh`](ref_q4/synthetic.sh); [Qwen4Exp model](../docs/maintainer/qwen4-exp-model.md) |
+| Compare one synthetic Qwen4 artifact's engine forward with the FP64 oracle (scoring, chunked prefill, MTP teacher forcing, forced ordinary and MTP decode, tp 1 and 2) | [`ref_q4/engine_check.sh`](ref_q4/engine_check.sh) |
+| Snap a synthetic dense Qwen4 checkpoint's projections onto an exact NVFP4 grid, so that the FP64 oracle sees the weights a `qwen4_nvfp4` artifact decodes | [`ref_q4/snap_nvfp4.py`](ref_q4/snap_nvfp4.py); [fused routes](../docs/maintainer/qwen4-exp-model.md#the-text-forwards-options) |
+| Run a Qwen4 reference on a token sequence and write its teacher-forcing dump: the FP64 NumPy oracle (`--impl fp64`, [`ref_q4/qwen4_reference.py`](ref_q4/qwen4_reference.py)) or the layer-streaming transformers reference (`--impl hf`, [`ref_q4/flashnext_ref.py`](ref_q4/flashnext_ref.py)) | [`ref_q4/ref_dump.py`](ref_q4/ref_dump.py) |
+| Compare an engine dump with a reference dump (KL, top-1, NLL, per-layer hidden error) against a threshold profile; exit 0 pass, 1 a threshold failed, 2 bad or incomparable input | [`ref_q4/tf_compare.py`](ref_q4/tf_compare.py) |
+| Read and write the teacher-forcing dump format (`tfdump/1`) shared by the references and the engine | [`ref_q4/tfdump.py`](ref_q4/tfdump.py) |
+| Greedy token identity of two `ninfer` runs: a build against a release binary, or one binary under two environments, with flags for one arm only | [`greedy_ab.sh`](greedy_ab.sh) |
+
+## Python dependencies of `ref_q4/`
+
+The validation scripts run on Python 3.11 or newer with: NumPy (every script); safetensors
+(checkpoints, and `.safetensors` dumps); PyTorch and transformers with the `qwen4_exp` models
+(`flashnext_ref.py`, `ref_dump.py --impl hf`, `snap_nvfp4.py`, and the synthetic checkpoints of
+`synthetic.sh`); tokenizers (`ref_dump.py --text-file`). They were validated with NumPy 2.5.3,
+safetensors 0.8.0, PyTorch 2.14.0, transformers 5.16.1 and tokenizers 0.23.2. `synthetic.sh` and
+`engine_check.sh` take the interpreter from `PYTHON`.
 
 ## Standalone HBM probe
 
@@ -90,14 +106,6 @@ python3 -m tools.convert \
   --resource chat_template.jinja=tools/chat_templates/qwen3_8.jinja \
   --name qwen3.8-27b \
   --out out/qwen3_8_27b.ninfer
-
-python3 -m tools.convert \
-  --model /path/to/Qwen3.6-35B-A3B-base \
-  --recipe qwen3_6_35b_a3b --components text,vision,mtp,dflash --proposal \
-  --source dflash=/path/to/Qwen3.6-35B-A3B-DFlash \
-  --resource chat_template.jinja=tools/chat_templates/qwen3_6.jinja \
-  --name qwen3.6-35b-a3b \
-  --out out/qwen3_6_35b_a3b.ninfer
 ```
 
 Inspect a result:

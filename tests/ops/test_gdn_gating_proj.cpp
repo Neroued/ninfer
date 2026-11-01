@@ -29,7 +29,7 @@ struct Geometry {
 
 constexpr Geometry kQwen27{"qwen3_6_27b", 5120, 48, false};
 constexpr Geometry kQwen38Parent{"qwen3_8_27b_parent", 5120, 48, true};
-constexpr Geometry kQwen35{"qwen3_6_35b_a3b", 2048, 32, true};
+constexpr Geometry kHidden2048{"hidden2048", 2048, 32, true};
 
 constexpr ReductionCriterion kGdnProjectionFp32{/*relative_l2=*/1.4e-6,
                                                 /*gross_absolute=*/5.0e-7,
@@ -495,7 +495,7 @@ int main() {
     const DeviceExecutionView norm_execution{device.stream, device.multiprocessor_count()};
     int failures = 0;
     failures += verify_workspace_capacity_contract(kQwen27, {1, 8, 1024, 2048, 4096, 4097});
-    failures += verify_workspace_capacity_contract(kQwen35, {1, 127, 1024, 2048, 4096, 4097});
+    failures += verify_workspace_capacity_contract(kHidden2048, {1, 127, 1024, 2048, 4096, 4097});
 
     // Every registered 27B projection route, including predicated and full token tiles.
     for (const std::int32_t tokens : {1, 8, 9, 1024, 1025, 2049, 4097}) {
@@ -505,13 +505,13 @@ int main() {
     // The Qwen3.8 parent changes only the public storage boundary. One direct oracle case proves
     // its [A,B] row partition; the split 27B cases above cover every unchanged execution route.
     failures += run_projection_case(kQwen38Parent, 1, 0x1801u, execution);
-    // Every registered 35B projection route and its contiguous-parent storage contract.
+    // Every registered hidden-2048 projection route and its contiguous-parent storage contract.
     for (const std::int32_t tokens : {1, 127, 128, 1024, 1025, 2049, 4097}) {
-        failures += run_projection_case(kQwen35, tokens,
+        failures += run_projection_case(kHidden2048, tokens,
                                         0x2000u + static_cast<std::uint32_t>(tokens), execution);
     }
 
-    // Direct complete norm/control oracles across variable widths and the existing 35B profile.
+    // Direct complete norm/control oracles across variable widths and the hidden-2048 profile.
     failures += run_norm_projection_case(kQwen27, 1, 0x3001u, norm_execution);
     failures += run_norm_projection_case(kQwen27, 9, 0x3009u, norm_execution);
     failures += run_norm_projection_case(kQwen27, 64, 0x3040u, norm_execution);
@@ -524,17 +524,17 @@ int main() {
     for (int mode : {1, 2, 3, 4})
         failures +=
             run_norm_projection_case(kQwen38Parent, 16, 0x5800u + mode, norm_execution, true, mode);
-    failures += run_norm_projection_case(kQwen35, 1, 0x4001u, norm_execution);
-    failures += run_norm_projection_case(kQwen35, 16, 0x4010u, norm_execution);
-    failures += run_norm_projection_case(kQwen35, 17, 0x4011u, norm_execution);
-    failures += run_norm_projection_case(kQwen35, 64, 0x4040u, norm_execution);
+    failures += run_norm_projection_case(kHidden2048, 1, 0x4001u, norm_execution);
+    failures += run_norm_projection_case(kHidden2048, 16, 0x4010u, norm_execution);
+    failures += run_norm_projection_case(kHidden2048, 17, 0x4011u, norm_execution);
+    failures += run_norm_projection_case(kHidden2048, 64, 0x4040u, norm_execution);
 
     // Requalify the retained BF16-staging profile at every prefill reduction boundary.
     for (int tokens : {1024, 1025, 2048, 2049, 4097})
         failures +=
             run_norm_projection_case(kQwen38Parent, tokens, 0x6800u + tokens, norm_execution);
     for (int tokens : {2, 8, 15, 127, 128, 1024, 1025, 2048, 2049, 4097})
-        failures += run_norm_projection_case(kQwen35, tokens, 0x7800u + tokens, norm_execution,
+        failures += run_norm_projection_case(kHidden2048, tokens, 0x7800u + tokens, norm_execution,
                                              tokens == 15);
 
     std::cout << (failures == 0 ? "OK" : "FAIL") << " gdn_gating_proj correctness\n";

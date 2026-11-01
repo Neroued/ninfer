@@ -2,8 +2,8 @@
 
 // Routed-expert backends of the Qwen4Exp (Qwen3.8-Flash-Next) MoE block.
 //
-// The block computes router, shared expert and output combine itself (qwen4_forward.h); a backend
-// only produces the FP32 partial sum of the routed experts,
+// The block computes router, shared expert and output combine itself (qwen4_forward/moe.h); a
+// backend only produces the FP32 partial sum of the routed experts,
 //
 //   partial[:,t] = sum_k weights[k,t] * expert_{ids[k,t]}(x[:,t])     (every k, every t)
 //
@@ -87,7 +87,7 @@ enum class Qwen4Window : std::uint8_t {
 // rank's partition of the experts (ID parity, T14); routed()/run() are called on the rank's
 // stream with the rank's device current and write that partition's FP32 partial alone. The
 // forward adds the gated shared expert on the block's owner rank and then sums the two partials
-// with one FP32 all-reduce (qwen4_forward.h). The offload backend at tp 2 (T33) is one
+// with one FP32 all-reduce (qwen4_forward/moe.h). The offload backend at tp 2 (T33) is one
 // Qwen4OffloadExperts on rank 0 owning the cache of both GPUs (partition by ID parity), the
 // mailbox and the CPU executor, and a Qwen4OffloadPeerExperts on rank 1: each rank runs the
 // experts resident in its own slots; the CPU computes every routed expert resident on neither GPU
@@ -503,6 +503,7 @@ public:
         return gguf_ && options_.gguf_stream_min_tokens > 0 && columns > ops::kMoeSlotsMaxTokens &&
                columns >= options_.gguf_stream_min_tokens && layer < text_layers_;
     }
+
     // tp 2: whether rank 1's call of `layer` with `columns` columns streams (then rank 1's
     // Qwen4OffloadPeerExperts runs it through run_peer_streamed).
     [[nodiscard]] bool streams_call(std::int32_t layer, std::int32_t columns) const noexcept;
@@ -570,6 +571,7 @@ public:
         std::int64_t column_bytes = 0;         // one elastic column (one slot of every layer)
         std::int64_t total_bytes  = 0;
     };
+
     // True when every bank is a ggml block bank, false when none is; throws on a mix.
     [[nodiscard]] static bool gguf_banks(std::span<const Qwen4ExpertBank> banks);
     [[nodiscard]] static std::int64_t gguf_slot_bytes(const Qwen4ExpertBank& bank) noexcept;
@@ -577,11 +579,12 @@ public:
                                             std::span<const std::int32_t> layer_base,
                                             std::int32_t elastic_columns);
     // T42 for ggml block banks: the fewest layers just below `end` whose base slots hold `bytes`
-    // of the arena (end + 1 when even layers [0, end) do not). They lend a prompt workspace (no
-    // ring: the zero-copy prefill needs none).
+    // of the arena (end + 1 when even layers [0, end) do not; 1 when `end` <= 0). They lend a
+    // prompt workspace (no ring: the zero-copy prefill needs none).
     [[nodiscard]] static std::int32_t gguf_layers_below(std::span<const std::int32_t> layer_base,
                                                         std::span<const std::int64_t> slot_bytes,
                                                         std::int32_t end, std::int64_t bytes);
+
     // The prefill ring of ggml block banks: one layer's non-resident experts of a GPU's partition,
     // at most kExperts / partitions, each in a ring slot of the largest Text expert's bytes. Its
     // slots follow the pool's in the slot offset table (DeviceMemory::slot_offsets holds
@@ -590,6 +593,7 @@ public:
     [[nodiscard]] static std::int32_t gguf_ring_slots(std::int32_t partitions) noexcept {
         return 2 * (kGgufExperts / std::max(partitions, 1));
     }
+
     [[nodiscard]] static std::int64_t gguf_ring_bytes(std::span<const std::int64_t> slot_bytes,
                                                       std::int32_t text_layers,
                                                       std::int32_t partitions);
@@ -638,7 +642,7 @@ public:
                                                   std::int32_t text_layers,
                                                   std::int32_t partitions);
     // The fewest layers just below layer `end` whose base slots hold `slots` (end + 1 when even
-    // layers [0, end) do not).
+    // layers [0, end) do not; 1 when `end` <= 0).
     [[nodiscard]] static std::int32_t layers_below(std::span<const std::int32_t> layer_base,
                                                    std::int32_t end, std::int64_t slots);
 
@@ -713,11 +717,13 @@ private:
     std::int32_t gguf_ring_slots_  = 0;
     std::int64_t gguf_ring_base_   = 0;
     std::int64_t gguf_ring_stride_ = 0;
+
     struct RingCopies {
         std::vector<std::int64_t> dst; // arena offsets
         std::vector<const std::byte*> src;
         std::vector<std::size_t> bytes;
     };
+
     std::array<std::vector<RingCopies>, 2> gguf_ring_copies_;
     // Overlap: per rank a copy stream and, per ring half, "copied" and "free again" events; the
     // layers whose copies this window already issued.
@@ -734,6 +740,7 @@ private:
     std::vector<void*> ring_dst_;
     std::vector<const void*> ring_src_;
     std::vector<std::size_t> ring_bytes_;
+
     [[nodiscard]] bool gguf_ring_ready() const noexcept {
         return gguf_ring_slots_ > 0 && lend_count_ > 0 && cache_->lending();
     }
@@ -744,6 +751,7 @@ public:
     bool gguf_ring_copy(int rank, std::int32_t layer, cudaStream_t stream);
     // After the layer's grouped call on `stream`: its ring half may be overwritten again.
     void gguf_ring_done(int rank, std::int32_t layer, cudaStream_t stream);
+
     [[nodiscard]] std::int32_t gguf_stream_slots() const noexcept {
         return pool_slots_ + gguf_ring_slots_;
     }

@@ -1,5 +1,5 @@
-// plan_reasoning_retry (serve --reasoning-close-retry): when a reply is continued, with which tokens,
-// and when it is left alone (docs/v07/vuote-fn.md).
+// plan_reasoning_retry (serve --reasoning-close-retry): when a reply is continued, with which
+// tokens, and when it is left alone.
 #include "serve/reasoning_retry.h"
 
 #include <iostream>
@@ -29,13 +29,13 @@ ninfer::ReasoningGuardTokens qwen_tokens() {
 }
 
 ReasoningRetryInput stopped(const std::vector<TokenId>& generated) {
-    return ReasoningRetryInput{.starts_in_reasoning     = true,
-                               .finish_reason           = FinishReason::StopToken,
-                               .generated               = generated,
-                               .content                 = "",
-                               .tool_calls              = 0,
+    return ReasoningRetryInput{.starts_in_reasoning      = true,
+                               .finish_reason            = FinishReason::StopToken,
+                               .generated                = generated,
+                               .content                  = "",
+                               .tool_calls               = 0,
                                .thinking_control_applied = false,
-                               .requested_output_tokens = 32000};
+                               .requested_output_tokens  = 32000};
 }
 
 } // namespace
@@ -57,16 +57,17 @@ int main() {
     {
         const std::vector<TokenId> generated{100, 101, 102, 248044};
         const auto plan = plan_reasoning_retry(stopped(generated), tokens);
-        failures += check(plan.trigger == ReasoningRetryTrigger::StopInReasoning &&
-                              plan.appended == std::vector<TokenId>({100, 101, 102, 198, 248069, 271}) &&
-                              plan.kept_tokens == 3,
-                          "a stop inside the reasoning does not keep the reasoning before the close");
+        failures +=
+            check(plan.trigger == ReasoningRetryTrigger::StopInReasoning &&
+                      plan.appended == std::vector<TokenId>({100, 101, 102, 198, 248069, 271}) &&
+                      plan.kept_tokens == 3,
+                  "a stop inside the reasoning does not keep the reasoning before the close");
     }
     // Stop right after "</think>" with blank content: resumed from the same point, nothing added.
     {
         const std::vector<TokenId> generated{100, 248069, 271, 248046};
-        auto input    = stopped(generated);
-        input.content = "\n";
+        auto input      = stopped(generated);
+        input.content   = "\n";
         const auto plan = plan_reasoning_retry(input, tokens);
         failures += check(plan.trigger == ReasoningRetryTrigger::EmptyAfterClose &&
                               plan.appended == std::vector<TokenId>({100, 248069, 271}) &&
@@ -79,8 +80,9 @@ int main() {
         const std::vector<TokenId> generated{100, 248069, 271, 300, 248046};
         auto answer    = stopped(generated);
         answer.content = "Done.";
-        failures += check(plan_reasoning_retry(answer, tokens).trigger == ReasoningRetryTrigger::None,
-                          "a reply with content was retried");
+        failures +=
+            check(plan_reasoning_retry(answer, tokens).trigger == ReasoningRetryTrigger::None,
+                  "a reply with content was retried");
         auto tool       = stopped(generated);
         tool.tool_calls = 1;
         failures += check(plan_reasoning_retry(tool, tokens).trigger == ReasoningRetryTrigger::None,
@@ -90,23 +92,27 @@ int main() {
         const std::vector<TokenId> generated{100, 101};
         auto length          = stopped(generated);
         length.finish_reason = FinishReason::OutputLimit;
-        failures += check(plan_reasoning_retry(length, tokens).trigger == ReasoningRetryTrigger::None,
-                          "a reply cut by the output limit was retried");
+        failures +=
+            check(plan_reasoning_retry(length, tokens).trigger == ReasoningRetryTrigger::None,
+                  "a reply cut by the output limit was retried");
     }
     {
         const std::vector<TokenId> generated{248046};
         auto plain                = stopped(generated);
         plain.starts_in_reasoning = false;
-        failures += check(plan_reasoning_retry(plain, tokens).trigger == ReasoningRetryTrigger::None,
-                          "a reply without thinking was retried");
+        failures +=
+            check(plan_reasoning_retry(plain, tokens).trigger == ReasoningRetryTrigger::None,
+                  "a reply without thinking was retried");
         auto budget                     = stopped(generated);
         budget.thinking_control_applied = true;
-        failures += check(plan_reasoning_retry(budget, tokens).trigger == ReasoningRetryTrigger::None,
-                          "a reply whose thinking budget was applied was retried");
+        failures +=
+            check(plan_reasoning_retry(budget, tokens).trigger == ReasoningRetryTrigger::None,
+                  "a reply whose thinking budget was applied was retried");
         auto tight                    = stopped(generated);
         tight.requested_output_tokens = 3;
-        failures += check(plan_reasoning_retry(tight, tokens).trigger == ReasoningRetryTrigger::None,
-                          "a retry was planned without room for one token after the close");
+        failures +=
+            check(plan_reasoning_retry(tight, tokens).trigger == ReasoningRetryTrigger::None,
+                  "a retry was planned without room for one token after the close");
         auto open                    = stopped(generated);
         open.requested_output_tokens = 0;
         const auto plan              = plan_reasoning_retry(open, tokens);

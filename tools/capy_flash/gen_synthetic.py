@@ -1,6 +1,6 @@
 # Copied from sybrix/qwen3.8-flash-next-ninfer @a2fd69bb, flash-next-reference/gen_synthetic.py
 # Copyright sybrix, Apache License 2.0 (see the repository LICENSE / NOTICE). capy-flash adds the
-# fp4_local variant; the CSF reference encoder is from vLLM PR #60646 (Apache-2.0).
+# fp4_local variant and --ffn dense; the CSF reference encoder is from vLLM PR #60646 (Apache-2.0).
 """Write a small random Qwen3.8-Flash-Next checkpoint in an NVIDIA ModelOpt layout.
 
 Real per-layer geometry (hidden 2560, 512 NVFP4 experts, GDN 16/48 heads, 24/2 attention heads,
@@ -14,6 +14,12 @@ FP8 n-gram table, FP8_PB_WO MTP experts. --variant fp4_local follows Qwen3.8-Fla
 per 32 columns), NVFP4 routed experts with CSF-compressed scales, a row-scaled NVFP4 n-gram table
 (80 code bytes + 10 E4M3FN scales per row, one FP32 weight_scale_2), W4A16 NVFP4 MTP experts,
 F32 Text hyper-connection and PLE norms, BF16 elsewhere (embedding, head, router, MTP dense part).
+
+--ffn dense (capy-flash) writes a dense Qwen4 checkpoint instead: every
+tensor BF16 (no quantization_config), a SwiGLU MLP (mlp.{gate,up,down}_proj, --intermediate) in every
+Text block and in the MTP layer, no MoE field in the config. --hidden / --kv-heads / --hc-lowrank
+change the geometry (hidden 5120: --hidden 5120 --kv-heads 4 --intermediate 14336, the q4d-5120
+preset of tools/ref_q4/synthetic.sh), --no-ple drops the n-gram embedding (empty ple_layer_ids), --output-gate sets output_gate_type.
 """
 
 from __future__ import annotations
@@ -155,8 +161,20 @@ def main():
     p.add_argument("--mtp", action="store_true", help="add the MTP head (FP8_PB_WO experts)")
     p.add_argument("--vision", action="store_true", help="add the (Qwen3.5-shaped) vision tower")
     p.add_argument("--variant", choices=("nvfp4", "fp4_local"), default="nvfp4")
+    p.add_argument("--ffn", choices=("moe", "dense"), default="moe", help="dense: BF16 dense Qwen4 checkpoint")
+    p.add_argument("--intermediate", type=int, default=6912, help="dense FFN width (--ffn dense)")
+    p.add_argument("--hidden", type=int, help="hidden_size (default: the source config's)")
+    p.add_argument("--kv-heads", type=int, help="num_key_value_heads (default: the source config's)")
+    p.add_argument("--hc-lowrank", type=int, help="hc_lowrank (default: the source config's)")
+    p.add_argument("--no-ple", action="store_true", help="no n-gram embedding (empty ple_layer_ids)")
+    p.add_argument("--output-gate", choices=("sigmoid", "silu"), help="output_gate_type (default: the source's)")
     args = p.parse_args()
     fp4_local = args.variant == "fp4_local"
+    dense_ffn = args.ffn == "dense"
+    if dense_ffn and (fp4_local or args.vision):
+        p.error("--ffn dense writes a BF16 text+MTP checkpoint (no fp4_local variant, no vision)")
+    if not dense_ffn and (args.hidden or args.kv_heads or args.hc_lowrank or args.no_ple or args.output_gate):
+        p.error("geometry, PLE and output-gate options apply to --ffn dense only")
     if fp4_local and args.vision:
         p.error("the fp4_local variant has no vision tower (served as text,mtp)")
     src, out = Path(args.source), Path(args.out)
@@ -185,13 +203,39 @@ def main():
     t["layer_types"] = ["full_attention" if (i + 1) % 4 == 0 else "linear_attention" for i in range(n)]
     t["ngram_vocab_size_base"] = args.ngram_base
     t["mtp_num_hidden_layers"] = 1 if args.mtp else 0
+    if dense_ffn:
+        config.pop("quantization_config", None)
+        config.pop("vision_config", None)
+        for key in (
+            "num_experts",
+            "num_experts_per_tok",
+            "moe_intermediate_size",
+            "shared_expert_intermediate_size",
+            "norm_topk_prob",
+            "router_aux_loss_coef",
+            "output_router_logits",
+        ):
+            t.pop(key, None)
+        t["intermediate_size"] = args.intermediate
+        for key, value in (
+            ("hidden_size", args.hidden),
+            ("num_key_value_heads", args.kv_heads),
+            ("hc_lowrank", args.hc_lowrank),
+            ("output_gate_type", args.output_gate),
+        ):
+            if value:
+                t[key] = value
+        if args.no_ple:
+            t["ple_layer_ids"] = []
     (out / "config.json").write_text(json.dumps(config, indent=2))
 
     gen = torch.Generator().manual_seed(args.seed)
     rng = np.random.default_rng(args.seed)
     H, S, R = t["hidden_size"], t["hc_count"], t["hc_lowrank"]
-    V, E, I = t["vocab_size"], t["num_experts"], t["moe_intermediate_size"]
-    Is = t["shared_expert_intermediate_size"]
+    V = t["vocab_size"]
+    if not dense_ffn:
+        E, I = t["num_experts"], t["moe_intermediate_size"]
+        Is = t["shared_expert_intermediate_size"]
     pre = "model.language_model."
     tensors = {}
     tensors[pre + "embed_tokens.weight"] = bf16((V, H), 0.02, gen)
@@ -221,7 +265,7 @@ def main():
     nv, vd = t["linear_num_value_heads"], t["linear_value_head_dim"]
     qh, kvh, hd = t["num_attention_heads"], t["num_key_value_heads"], t["head_dim"]
     ih, ihd = t["indexer_n_heads"], t["indexer_head_dim"]
-    ple_blocks = [b - 1 for b in t["ple_layer_ids"]]
+    ple_blocks = [b - 1 for b in t.get("ple_layer_ids") or []]
 
     def attention(a, quantized=False):
         dense(a + "q_proj", (2 * qh * hd, H), quantized=quantized)
@@ -235,6 +279,11 @@ def main():
         tensors[a + "indexer.k_layernorm.weight"] = bf16((ihd,), 0.05, gen)
 
     def mlp(m, fp8=False, quantized=False, experts=nvfp4):
+        if dense_ffn:
+            dense(m + "gate_proj", (args.intermediate, H))
+            dense(m + "up_proj", (args.intermediate, H))
+            dense(m + "down_proj", (H, args.intermediate))
+            return
         tensors[m + "gate.weight"] = bf16((E, H), 0.05, gen)
         dense(m + "shared_expert.gate_proj", (Is, H), quantized=quantized)
         dense(m + "shared_expert.up_proj", (Is, H), quantized=quantized)

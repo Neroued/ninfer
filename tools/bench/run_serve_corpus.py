@@ -25,7 +25,6 @@ MANIFEST_PATH = REPO_ROOT / "examples/cli/manifest.json"
 SPECULATIVE_MODES = {
     "mtp0": ("none", 0),
     "mtp3": ("mtp", 3),
-    "dflash7": ("dflash", 7),
     "dflash2_7": ("dflash2", 7),
 }
 DEFAULT_MODES = ("mtp0", "mtp3")
@@ -86,7 +85,7 @@ WARMUP_FIXTURE = "text_smoke_zh"
 RUN_ARTIFACT_TYPE = "ninfer_serve_corpus_result"
 RUN_SCHEMA_VERSION = 8
 SERVER_LOG_ARTIFACT_TYPE = "ninfer_serve_request_log"
-SERVER_LOG_SCHEMA_VERSION = 27
+SERVER_LOG_SCHEMA_VERSION = 28
 STARTUP_TIMEOUT_SECONDS = 1800.0
 REQUEST_TIMEOUT_SECONDS = 24.0 * 60.0 * 60.0
 LOG_EVENT_TIMEOUT_SECONDS = 10.0
@@ -373,7 +372,7 @@ def block_fixture_names(speculative_backend: str) -> tuple[str, ...]:
     scenarios = tuple(name for names in SCENARIO_FIXTURES.values() for name in names)
     if speculative_backend == "none":
         return NIAH_FIXTURES
-    if speculative_backend in {"mtp", "dflash", "dflash2"}:
+    if speculative_backend in {"mtp", "dflash2"}:
         return (*LONG_DECODE_FIXTURES, *scenarios)
     raise CampaignError(f"unsupported speculative backend: {speculative_backend}")
 
@@ -1070,8 +1069,6 @@ def mode_display_name(mode_name: str) -> str:
         return "MTP0"
     if mode_name == "mtp3":
         return "MTP3"
-    if mode_name == "dflash7":
-        return "DFlash block=8 (k=7)"
     if mode_name == "dflash2_7":
         return "DFlash2 block=8 (k=7)"
     raise CampaignError(f"unsupported summary mode: {mode_name}")

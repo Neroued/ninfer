@@ -3,7 +3,7 @@
 #include "models/qwen3_5/program/context_work.h"
 #include "models/qwen3_5/program/context.h"
 #include "models/qwen3_5/program/graph_execution.h"
-#include "models/qwen3_5/execution/qwen4_forward.h"
+#include "models/qwen3_5/execution/qwen4_runtime.h"
 #include "models/qwen3_5/execution/qwen4_tfdump.h"
 #include "core/nvtx.h"
 #include "core/device.h"
@@ -245,7 +245,7 @@ void ProgramImpl::mark_workspace_usage(std::size_t phase_bytes) noexcept {
 void ProgramImpl::enqueue_dflash_context_append(std::span<const std::uint32_t> lanes,
                                                 std::span<const std::uint32_t> starts,
                                                 std::span<const std::uint32_t> counts) {
-    if (!is_masked_draft_backend(speculative_backend) || !dflash || !io.dflash_decode ||
+    if (speculative_backend != SpeculativeBackend::DFlash2 || !dflash || !io.dflash_decode ||
         lanes.empty() || lanes.size() > max_concurrency || starts.size() != lanes.size() ||
         counts.size() != lanes.size()) {
         throw std::logic_error("DFlash context append has invalid membership");
@@ -266,8 +266,6 @@ void ProgramImpl::enqueue_dflash_context_append(std::span<const std::uint32_t> l
         const std::uint64_t end64 = static_cast<std::uint64_t>(start) + counts[row];
         const std::uint32_t end   = static_cast<std::uint32_t>(end64);
         if (!sequence.kv || text_kv_addresses->bound_row(sequence.kv->text) < 0 ||
-            (backend_kv_cache() && (!sequence.kv->backend ||
-                                    backend_kv_addresses->bound_row(*sequence.kv->backend) < 0)) ||
             end64 > capacity) {
             throw std::logic_error("DFlash context append is outside retained target storage");
         }
@@ -275,19 +273,12 @@ void ProgramImpl::enqueue_dflash_context_append(std::span<const std::uint32_t> l
             checked_i32(start, "DFlash append context frontier");
         dflash_host_ingress->execution_frontiers[row] =
             checked_i32(end, "DFlash append target frontier");
-        dflash_host_ingress->dflash_kv_table_rows[row] =
-            sequence.kv->backend ? backend_kv_addresses->bound_row(*sequence.kv->backend) : 0;
         dflash_host_ingress->active_lanes[row]            = static_cast<std::int32_t>(lane);
         const StateImageSelectors selectors               = state_selectors(sequence);
         dflash_host_ingress->state_source_slots[row]      = selectors.source;
         dflash_host_ingress->state_destination_slots[row] = selectors.destination;
-        // Context append writes only the draft caches. Target execution owns Main KV
-        // coverage, including any uncommitted suffix that survives until the round is settled.
-        // DFlash2 has only fixed cyclic state; DFlash also grows its Full backend KV here.
-        if (sequence.kv->backend) {
-            backend_kv_addresses->ensure_mapped_to_tokens(*sequence.kv->backend, end,
-                                                          device.stream);
-        }
+        // Context append writes only the drafter's fixed cyclic state. Target execution owns Main
+        // KV coverage, including any uncommitted suffix that survives until the round is settled.
         minimum_count = std::min(minimum_count, counts[row]);
         maximum_count = std::max(maximum_count, counts[row]);
     }
@@ -301,7 +292,6 @@ void ProgramImpl::enqueue_dflash_context_append(std::span<const std::uint32_t> l
     Tensor state_destination_tensor = frame.state_destination_slots.slice(0, 0, batch);
     Tensor device_starts            = frame.context_frontiers.slice(0, 0, batch);
     Tensor device_ends              = frame.execution_frontiers.slice(0, 0, batch);
-    Tensor table_rows               = frame.dflash_kv_table_rows.slice(0, 0, batch);
     Tensor positions                = frame.append_positions.slice(1, 0, batch);
     Tensor device_counts            = frame.append_counts.slice(0, 0, batch);
 
@@ -318,8 +308,7 @@ void ProgramImpl::enqueue_dflash_context_append(std::span<const std::uint32_t> l
                                          *dflash};
     mark_workspace_usage(workspace_plan.dflash_context);
     execution::dflash_append_context(state, features, positions, device_counts,
-                                     state_destination_tensor, table_rows,
-                                     {minimum_count, maximum_count});
+                                     state_destination_tensor, {minimum_count, maximum_count});
     // The split drafter at tp 2 catches rank 1's context up from its own pending features.
     if (peer && peer->drafter) {
         execution::dflash_append_context_peer(*peer->drafter, *dflash_host_ingress, batch,
@@ -917,7 +906,7 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
     nvtx::ScopedRange round_range(nvtx::Name::DecodeDFlashRound, nvtx::Category::DFlash,
                                   static_cast<std::uint64_t>(lanes.size()));
     runtime::ExecutionTimingRecorder timing(runtime::ExecutionTimingPhase::Submit, failed_timing);
-    if (!is_masked_draft_backend(speculative_backend) || !io.dflash_decode || !dflash) {
+    if (speculative_backend != SpeculativeBackend::DFlash2 || !io.dflash_decode || !dflash) {
         throw std::logic_error("DFlash batch execution requires the DFlash backend");
     }
     if (lanes.empty() || lanes.size() > max_concurrency || budgets.size() != lanes.size()) {
@@ -939,8 +928,6 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
         if (request.lifecycle != Lifecycle::Active ||
             budgets[row].generated_tokens_remaining == 0 || !sequence.kv ||
             text_kv_addresses->bound_row(sequence.kv->text) < 0 ||
-            (backend_kv_cache() && (!sequence.kv->backend ||
-                                    backend_kv_addresses->bound_row(*sequence.kv->backend) < 0)) ||
             sequence.execution_frontier >= capacity ||
             sequence.text_kv_valid != sequence.execution_frontier ||
             sequence.dflash_context_frontier > sequence.execution_frontier ||
@@ -1006,15 +993,12 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
             }
             dflash_host_ingress->text_kv_table_rows[row] =
                 text_kv_addresses->bound_row(sequence.kv->text);
-            dflash_host_ingress->dflash_kv_table_rows[row] =
-                sequence.kv->backend ? backend_kv_addresses->bound_row(*sequence.kv->backend) : 0;
             dflash_host_ingress->active_lanes[row]       = static_cast<std::int32_t>(sequence.lane);
             const StateImageSelectors selectors          = state_selectors(sequence);
             dflash_host_ingress->state_source_slots[row] = selectors.source;
             dflash_host_ingress->state_destination_slots[row] = selectors.destination;
             dflash_host_ingress->sampling[row]                = request.sampling_host;
-            ensure_sequence_kv_mapped(sequence, frontier + extent + 1U,
-                                      backend_kv_cache() ? frontier : 0U);
+            ensure_sequence_kv_mapped(sequence, frontier + extent + 1U, 0U);
         }
 
         execution::DFlashBatchContext schedule_state{

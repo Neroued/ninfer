@@ -35,9 +35,12 @@ using Nvfp4N17408K5120 = Nvfp4Geometry<17408, 5120>;
 using Nvfp4N5120K8704  = Nvfp4Geometry<5120, 8704>;
 using Nvfp4N5120K3072  = Nvfp4Geometry<5120, 3072>;
 // Two-device head-local shards of the fused attention [14336,5120] and GDN [16384,5120] input
-// parents. They are problems of those projections' own kernels only, not Linear registrations.
+// parents: problems of those projections' fused kernels and Linear registrations.
 using Nvfp4N7168K5120 = Nvfp4Geometry<7168, 5120>;
 using Nvfp4N8192K5120 = Nvfp4Geometry<8192, 5120>;
+// The gate|up parent of a dense FFN of intermediate width 14336 (one device; its two-device half
+// is [14336,5120], Nvfp4N14336K5120).
+using Nvfp4N28672K5120 = Nvfp4Geometry<28672, 5120>;
 
 // First token count at which nvfp4 linear_add over the attention output ([5120,6144] and its
 // two-device half [5120,3072]) and over the MLP down projection ([5120,17408] and [5120,8704])
@@ -52,6 +55,9 @@ using Nvfp4Activation5120Geometry  = Nvfp4ActivationGeometry<5120>;
 using Nvfp4Activation6144Geometry  = Nvfp4ActivationGeometry<6144>;
 using Nvfp4Activation8704Geometry  = Nvfp4ActivationGeometry<8704>;
 using Nvfp4Activation17408Geometry = Nvfp4ActivationGeometry<17408>;
+// The dense FFN-14336 down projection's activation and its two-device half.
+using Nvfp4Activation14336Geometry = Nvfp4ActivationGeometry<14336>;
+using Nvfp4Activation7168Geometry  = Nvfp4ActivationGeometry<7168>;
 
 enum class Nvfp4GeometryId : std::uint8_t {
     N14336K5120,

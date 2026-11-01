@@ -250,7 +250,7 @@ def exercise(base_url: str, fixture: dict[str, Any], log_path: Path, backend: st
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--artifact", type=Path, required=True)
-    parser.add_argument("--backend", choices=("mtp", "dflash"), required=True)
+    parser.add_argument("--backend", choices=("mtp", "dflash2"), required=True)
     parser.add_argument("--server-bin", type=Path, default=Path("build/apps/ninfer-serve"))
     parser.add_argument(
         "--fixture",

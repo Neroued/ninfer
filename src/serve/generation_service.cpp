@@ -276,6 +276,7 @@ GenerationService::GenerationService(ServeOptions options, StartupObserver start
     engine_options.kv_lease_window_tokens = options_.kv_lease_window_tokens;
     engine_options.kv_cache               = options_.kv_cache;
     engine_options.elastic_kv             = options_.elastic_kv;
+    engine_options.kv_ram_active          = options_.kv_ram_active;
     if (options_.miss_split) {
         engine_options.routed_experts.miss_split.mode      = *options_.miss_split;
         engine_options.routed_experts.miss_split.calibrate = options_.miss_split_calibrate;

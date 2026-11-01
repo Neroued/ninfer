@@ -156,7 +156,13 @@ Qwen4BlockWeights bind_qwen4_block(Bindings& b, const TextConfig& config, const 
     }
     // Routed experts bind as device parameters; the Qwen4Exp shard rule places their banks
     // HostMapped (load/sharding.h), one page-locked copy that every device and the host read.
-    out.moe = bind_moe(b, config, p);
+    // A dense FFN binds as the Qwen3.5 dense block's (row-split gate/up, column-split down at tp
+    // 2).
+    if (const auto* dense = std::get_if<DenseConfig>(&config.ffn)) {
+        out.ffn = bind_dense(b, config.hidden_size, dense->intermediate_size, p);
+    } else {
+        out.ffn = bind_moe(b, config, p);
+    }
     if (ple) { out.ple = bind_ple(b, config, p); }
     return out;
 }
@@ -198,11 +204,8 @@ BlockWeights bind_block(Bindings& b, const TextConfig& config, const std::string
     } else {
         out.mixer = bind_gdn(b, config, p);
     }
-    if (const auto* dense = std::get_if<DenseConfig>(&config.ffn)) {
-        out.ffn = bind_dense(b, config.hidden_size, dense->intermediate_size, p);
-    } else {
-        out.ffn = bind_moe(b, config, p);
-    }
+    out.ffn =
+        bind_dense(b, config.hidden_size, std::get<DenseConfig>(config.ffn).intermediate_size, p);
     return out;
 }
 

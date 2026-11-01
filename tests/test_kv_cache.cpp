@@ -1,6 +1,8 @@
+#include "core/arena.h"
 #include "core/device.h"
 #include "core/host_kv_arena.h"
 #include "core/paged_kv_cache.h"
+#include "core/uva_copy.h"
 
 #include <cuda_runtime.h>
 
@@ -535,6 +537,9 @@ int exercise_mirror(ninfer::DeviceContext& context) {
         set_page(origin_plane, physical[index], origin_values[index]);
         set_page(mirror_plane, physical[index], mirror_values[index]);
     }
+    // cudaMemset runs on the default stream, which the context's non-blocking streams do not wait
+    // for: the D2H below would otherwise race the fill and capture the previous page bytes.
+    CUDA_CHECK(cudaDeviceSynchronize());
     std::optional<ninfer::HostKVAllocation> both = host_arena.allocate(paired, 2);
     failures += expect(both.has_value(), "two-replica Host allocation failed");
     ninfer::HostKVAllocationView both_view = host_arena.writable_view(*both);
@@ -654,6 +659,104 @@ int exercise_relocation(ninfer::DeviceContext& context, ninfer::KVPageGeometry g
     return failures;
 }
 
+// Host planes (active KV in RAM): a page-major pool whose first plane lives in pinned, mapped
+// Host memory. Its zero/copy/Host transfers keep the stream order (a Host-to-Host cudaMemcpyAsync
+// would run at once on the CPU), host records round-trip exactly, and the write listener sees every
+// page write and every table publication that rebinds a published logical page.
+int exercise_host_planes(ninfer::DeviceContext& context) {
+    int failures = 0;
+    const ninfer::KVPageGeometry geometry{
+        .device_plane_order = ninfer::PagedKVPlaneOrder::PageMajor,
+        .planes =
+            {
+                {ninfer::DType::I8, 256, 2, 256, /*host=*/true},
+                {ninfer::DType::BF16, 32, 1, 256},
+            },
+    };
+    constexpr std::uint32_t kPages = 8;
+    ninfer::LayoutBuilder device_builder, host_builder;
+    const ninfer::DeviceKVPagePoolLayout layout = ninfer::plan_device_kv_page_pool(
+        device_builder, {.page_group_count = kPages, .geometry = geometry}, &host_builder);
+    const ninfer::KVExecutionTableLayout table_layout = ninfer::plan_kv_execution_tables(
+        device_builder, {.logical_page_capacity = 4, .table_rows = 1});
+    const std::size_t host_page = 256ULL * 64 * 2, device_page = 32ULL * 2 * 64;
+    failures +=
+        expect_size(layout.payload_bytes(), device_page * kPages, "Host planes: device bytes");
+    std::size_t host_bytes = 0;
+    for (const ninfer::DeviceKVPlaneLayout& plane : layout.planes) {
+        if (plane.geometry.host) { host_bytes += plane.storage.region.bytes; }
+    }
+    failures += expect_size(host_bytes, host_page * kPages, "Host planes: Host bytes");
+    ninfer::DeviceArena arena(device_builder.finish(256));
+    ninfer::PinnedHostBuffer host(host_builder.finish(256), ninfer::HostMapping::Yes);
+    ninfer::DeviceKVPagePool pool({arena.base(), arena.capacity()}, layout,
+                                  {host.device_data(), host.size()});
+    ninfer::KVExecutionTablePool tables({arena.base(), arena.capacity()}, table_layout, pool);
+    int notified = 0;
+    pool.set_write_listener([&](cudaStream_t) { ++notified; });
+    failures +=
+        expect(pool.plane(0).data == host.device_data() && pool.plane(1).data != host.device_data(),
+               "Host planes: the Host plane is not bound to the Host backing");
+
+    std::vector<ninfer::DeviceKVPageLease> pages = materialize(pool, 3);
+    auto* bytes                                  = static_cast<unsigned char*>(host.data());
+    const auto at                                = [&](const ninfer::DeviceKVPageLease& page) {
+        return bytes + host_page * static_cast<std::size_t>(pool.page_index(page.handle()));
+    };
+    // Stream order: the source page is written by a kernel queued just before the copy.
+    std::memset(host.data(), 0x11, host.size());
+    ninfer::uva_fill_async(at(pages[0]), 0x5A, host_page, context.stream);
+    pool.copy_page(pages[0].handle(), pages[1].handle(), context.stream);
+    ninfer::uva_fill_async(at(pages[2]), 0x77, host_page, context.stream);
+    const ninfer::DeviceKVPageHandle zero[] = {pages[2].handle()};
+    pool.zero_pages(zero, context.stream);
+    context.synchronize();
+    const auto all = [&](const unsigned char* p, unsigned char v) {
+        return std::all_of(p, p + host_page, [v](unsigned char b) { return b == v; });
+    };
+    failures += expect(all(at(pages[1]), 0x5A),
+                       "Host planes: copy_page did not follow the queued write of its source");
+    failures += expect(all(at(pages[2]), 0),
+                       "Host planes: zero_pages did not follow the queued write of its page");
+    failures += expect(notified == 2, "Host planes: copy/zero did not notify the write listener");
+
+    // Host records round trip (copy_to_host, then copy_from_host into other pages).
+    for (std::size_t i = 0; i < host_page; ++i) {
+        at(pages[0])[i] = static_cast<unsigned char>(i * 31U + 7U);
+    }
+    const ninfer::HostKVPageLayout record    = ninfer::plan_host_kv_page_layout(pool.geometry());
+    const ninfer::HostKVPageLayout layouts[] = {record};
+    ninfer::HostKVArena arena_host(record.page_stride * 2,
+                                   std::span<const ninfer::HostKVPageLayout>(layouts));
+    std::optional<ninfer::HostKVAllocation> extent = arena_host.allocate(record, 1);
+    failures += expect(extent.has_value(), "Host planes: Host record allocation failed");
+    if (!extent) { return failures; }
+    const ninfer::DeviceKVPageHandle source[]      = {pages[0].handle()};
+    const ninfer::DeviceKVPageHandle destination[] = {pages[2].handle()};
+    pool.copy_to_host(source, arena_host.writable_view(*extent), context.stream);
+    pool.copy_from_host(arena_host.view(*extent), destination, context.stream);
+    context.synchronize();
+    failures += expect(std::memcmp(at(pages[0]), at(pages[2]), host_page) == 0,
+                       "Host planes: a Host record did not round-trip the Host plane");
+    failures += expect(notified == 3, "Host planes: a restore did not notify the write listener");
+
+    // Table publication: the first publication after acquire and a rebind notify; extending the
+    // row or republishing the same pages does not.
+    ninfer::KVExecutionRowLease row = tables.acquire(0);
+    const std::vector<ninfer::DeviceKVPageHandle> first{pages[0].handle(), pages[1].handle()};
+    tables.publish(row.handle(), 0, first, context.stream);
+    failures += expect(notified == 4, "Host planes: a row's first publication did not notify");
+    tables.publish(row.handle(), 0, first, context.stream);
+    const std::vector<ninfer::DeviceKVPageHandle> grow{pages[2].handle()};
+    tables.publish(row.handle(), 2, grow, context.stream);
+    failures += expect(notified == 4, "Host planes: an unchanged or growing publication notified");
+    const std::vector<ninfer::DeviceKVPageHandle> rebind{pages[2].handle()};
+    tables.publish(row.handle(), 1, rebind, context.stream);
+    failures += expect(notified == 5, "Host planes: a rebinding publication did not notify");
+    context.synchronize();
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -672,6 +775,7 @@ int main() {
         ninfer::DeviceContext context(0);
         int failures = exercise_reservation_and_mapping(context);
         failures += exercise_mirror(context);
+        failures += exercise_host_planes(context);
         failures +=
             exercise_relocation(context,
                                 ninfer::KVPageGeometry{

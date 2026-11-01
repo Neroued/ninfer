@@ -1,6 +1,7 @@
 #include "ops/linear/q8/q8_dispatch.h"
 #include "ops/linear/q8/q8_shapes.h"
 
+#include <algorithm>
 #include <array>
 #include <stdexcept>
 
@@ -45,9 +46,9 @@ constexpr std::array kShapes{
     shape<Q8N5120K2048>(select_q8_n5120_k2048),
     shape<Q8N124160K5120>(select_q8_n124160_k5120),
     // Qwen4Exp hyper-connection Down(+inject) and Up, and the PLE key/value parent.
-    ShapeEntry{324, 10240, select_q8_low_rank_k10240},
-    ShapeEntry{320, 10240, select_q8_low_rank_k10240},
-    ShapeEntry{10240, 320, select_q8_generic_hidden2560},
+    ShapeEntry{324, 10240, select_q8_few_rows_wide_k},
+    ShapeEntry{320, 10240, select_q8_few_rows_wide_k},
+    ShapeEntry{10240, 320, select_q8_generic},
     ShapeEntry{12800, 2560, select_q8_qwen4_rows_k2560},
     // Qwen4Exp dense projections of the `qwen3_8_flash_next_nvfp4` recipe (Q8): QSA q|k|gate|v,
     // QSA indexer q|k, attention and GDN output, GDN q|k|v|z and a|b, shared-expert gate|up and
@@ -67,9 +68,21 @@ constexpr std::array kShapes{
     ShapeEntry{8192, 2560, select_q8_qwen4_rows_k2560},
     ShapeEntry{48, 2560, select_q8_qwen4_n48_k2560},
     ShapeEntry{2560, 3072, select_q8_qwen4_n2560_k3072},
-    ShapeEntry{324, 5120, select_q8_low_rank_k10240},
-    ShapeEntry{320, 5120, select_q8_low_rank_k10240},
-    ShapeEntry{5120, 320, select_q8_generic_hidden2560},
+    ShapeEntry{324, 5120, select_q8_few_rows_wide_k},
+    ShapeEntry{320, 5120, select_q8_few_rows_wide_k},
+    ShapeEntry{5120, 320, select_q8_generic},
+    // Hyper-connection Down(+inject) [R + I, 4*5120] and Up [4*5120, R] at H = 5120, on the same
+    // generic routes as H = 2560.
+    ShapeEntry{324, 20480, select_q8_few_rows_wide_k},
+    ShapeEntry{320, 20480, select_q8_few_rows_wide_k},
+    ShapeEntry{20480, 320, select_q8_generic},
+    // Low rank 640: Down(+inject) and Up at H = 2560 and 5120, same generic routes.
+    ShapeEntry{644, 10240, select_q8_few_rows_wide_k},
+    ShapeEntry{640, 10240, select_q8_few_rows_wide_k},
+    ShapeEntry{10240, 640, select_q8_generic},
+    ShapeEntry{644, 20480, select_q8_few_rows_wide_k},
+    ShapeEntry{640, 20480, select_q8_few_rows_wide_k},
+    ShapeEntry{20480, 640, select_q8_generic},
     // Qwen4Exp MTP stem: fc_embedding and fc_hidden (the latter over S columns per token).
     ShapeEntry{2560, 2560, select_q8_qwen4_rows_k2560},
     // Qwen4Exp Vision merger output (the Qwen3.5 tower's [4608 -> H] projection at H = 2560): the
@@ -77,13 +90,18 @@ constexpr std::array kShapes{
     ShapeEntry{2560, 4608, select_q8_n5120_k4608},
     // Qwen3.5 Vision tower stored Q8 (a Flash-Next tower recipe): q|k|v, attention output, MLP
     // fc1/fc2 and the patch embedding, on the generic routes (K 4304 is padded to whole groups).
-    ShapeEntry{3456, 1152, select_q8_generic_hidden2560},
-    ShapeEntry{1152, 1152, select_q8_generic_hidden2560},
-    ShapeEntry{4304, 1152, select_q8_generic_hidden2560},
-    ShapeEntry{1152, 4304, select_q8_generic_hidden2560},
-    ShapeEntry{1152, 1536, select_q8_generic_hidden2560},
+    ShapeEntry{3456, 1152, select_q8_generic},
+    ShapeEntry{1152, 1152, select_q8_generic},
+    ShapeEntry{4304, 1152, select_q8_generic},
+    ShapeEntry{1152, 4304, select_q8_generic},
+    ShapeEntry{1152, 1536, select_q8_generic},
 };
 } // namespace
+
+bool q8_shape_registered(std::int32_t n, std::int32_t k) noexcept {
+    return std::any_of(kShapes.begin(), kShapes.end(),
+                       [&](const ShapeEntry& entry) { return entry.n == n && entry.k == k; });
+}
 
 Q8Launch select_q8_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
     if (t <= 0) throw std::invalid_argument("q8 linear: T must be positive");

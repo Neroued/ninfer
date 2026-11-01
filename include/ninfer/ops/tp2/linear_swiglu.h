@@ -4,8 +4,9 @@
 // carries no hook.
 //
 // Shapes registered for the two-device forms: NVFP4 and FP8 register the output-row half,
-// weight [17408,5120], x [5120,T], out [8704,T], with the same routes as the whole problem. Gate
-// rows [0,M) precede their matching up rows [M,2M), M = N/2.
+// weight [17408,5120], x [5120,T], out [8704,T], with the same routes as the whole problem; NVFP4
+// also the half of the dense FFN-14336 gate|up, weight [14336,5120], out [7168,T]. Gate rows [0,M)
+// precede their matching up rows [M,2M), M = N/2.
 
 #include "core/device.h"
 #include "ninfer/ops/allreduce.h"

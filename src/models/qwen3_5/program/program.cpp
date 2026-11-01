@@ -2,6 +2,7 @@
 #include "models/qwen3_5/frontend/prepared_prompt.h"
 #include "models/qwen3_5/program/planning/startup.h"
 #include "models/qwen3_5/program/program_impl.h"
+#include <algorithm>
 #include <stdexcept>
 #include <utility>
 
@@ -67,7 +68,13 @@ std::uint32_t SequencePlanner::kv_pool_pages() const noexcept {
 std::size_t SequencePlanner::kv_plane_count() const noexcept {
     if (impl_ == nullptr || impl_->minimum == nullptr) { return 0; }
     const auto& d = impl_->minimum->persistent.decoder;
-    return d.text_kv.pages.planes.size() + (d.mtp_kv ? d.mtp_kv->pages.planes.size() : 0);
+    // Device planes only: active KV in RAM keeps the others in Host memory (no elastic range).
+    const auto devices = [](const qwen3_5::PagedKVCacheLayout& pool) {
+        return static_cast<std::size_t>(
+            std::count_if(pool.pages.planes.begin(), pool.pages.planes.end(),
+                          [](const DeviceKVPlaneLayout& plane) { return !plane.geometry.host; }));
+    };
+    return devices(d.text_kv) + (d.mtp_kv ? devices(*d.mtp_kv) : 0);
 }
 
 const runtime::SequenceCapacityCurve& SequencePlanner::capacity_curve() const noexcept {
@@ -504,6 +511,24 @@ DeviceKVPages Program::retained_device_kv_pages(const SharedPrefixHandle& shared
     return impl_->retained_device_kv_pages(shared);
 }
 
+DeviceKVPages Program::idle_device_kv_pages(const ContinuationHandle& continuation) const {
+    return impl_->idle_device_kv_pages(continuation);
+}
+
+DeviceKVPages Program::idle_device_kv_pages(const SharedPrefixHandle& shared) const {
+    return impl_->idle_device_kv_pages(shared);
+}
+
+std::vector<DeviceKVPages>
+Program::releasable_device_kv_pages(std::span<const ContinuationHandle* const> continuations,
+                                    std::span<const SharedPrefixHandle* const> shared) const {
+    return impl_->releasable_device_kv_pages(continuations, shared);
+}
+
+DeviceKVPages Program::device_kv_available_pages() const noexcept {
+    return impl_->device_kv_available_pages();
+}
+
 std::optional<ContinuationSummary>
 Program::demote_retained_kv_for_lease(const ContinuationHandle& continuation,
                                       DeviceKVPages needed) noexcept {
@@ -583,14 +608,22 @@ const TpTransportStatus& Program::tp_transport() const noexcept {
     return impl_->tp_transport_status;
 }
 
+bool Program::peer_exchange_timed_out() const noexcept {
+    return impl_->peer_mailbox && impl_->peer_mailbox->hang_reported();
+}
+
+std::string Program::recover_peer_transport() { return impl_->recover_peer_transport(); }
+
 bool gguf_routed_experts(const execution::Parameters& parameters) {
-    return parameters.qwen4 && !parameters.qwen4->layers.empty() &&
-           parameters.qwen4->layers.front().moe.experts.gguf;
+    return parameters.qwen4 && parameters.model.config().text.qwen4_routed_experts() &&
+           !parameters.qwen4->layers.empty() && parameters.qwen4->layers.front().moe().experts.gguf;
 }
 
 std::int64_t offloaded_expert_slot_bytes(const execution::Parameters& parameters,
                                          const EngineOptions& options) {
-    if (!parameters.qwen4 || options.routed_experts.backend != RoutedExpertBackend::Offload) {
+    // A dense Qwen4Exp FFN has no routed experts, so no slot.
+    if (!parameters.qwen4 || !parameters.model.config().text.qwen4_routed_experts() ||
+        options.routed_experts.backend != RoutedExpertBackend::Offload) {
         return 0;
     }
     // Under MTP the MTP layer is one more cache layer (planning: Qwen4PersistentLayout).
@@ -602,11 +635,11 @@ std::int64_t offloaded_expert_slot_bytes(const execution::Parameters& parameters
         // profile-weighted and the uniform bytes (an elastic column is uniform).
         std::vector<std::int64_t> bytes;
         for (const auto& layer : parameters.qwen4->layers) {
-            bytes.push_back(execution::Qwen4OffloadExperts::gguf_slot_bytes(layer.moe.experts));
+            bytes.push_back(execution::Qwen4OffloadExperts::gguf_slot_bytes(layer.moe().experts));
         }
         if (mtp) {
-            bytes.push_back(
-                execution::Qwen4OffloadExperts::gguf_slot_bytes(parameters.qwen4_mtp->layer.moe.experts));
+            bytes.push_back(execution::Qwen4OffloadExperts::gguf_slot_bytes(
+                parameters.qwen4_mtp->layer.moe().experts));
         }
         constexpr std::int32_t kProbe = 100;
         const auto base               = execution::Qwen4OffloadExperts::layer_slot_profile(
@@ -624,9 +657,7 @@ std::int64_t offloaded_expert_slot_bytes(const execution::Parameters& parameters
 
 std::int64_t offloaded_expert_staging_bytes(const execution::Parameters& parameters,
                                             const EngineOptions& options) {
-    if (!parameters.qwen4 || options.routed_experts.backend != RoutedExpertBackend::Offload) {
-        return 0;
-    }
+    if (offloaded_expert_slot_bytes(parameters, options) == 0) { return 0; }
     return static_cast<std::int64_t>(2U * options.routed_experts.prefetch_slots) *
            execution::Qwen4OffloadExperts::slot_bytes(1);
 }

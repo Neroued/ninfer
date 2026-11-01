@@ -18,7 +18,7 @@ using namespace ninfer::bench;
 
 namespace {
 struct Options {
-    bool geometry35 = false, parent = true, norm = true, profile = false;
+    bool hidden2048 = false, parent = true, norm = true, profile = false;
     std::vector<int> tokens{1, 2, 4, 6, 8, 9, 16, 32, 64, 128};
     std::string execution = "graph", cache = "cold", csv;
     int warmup = 10, repeat = 61, graph_calls = 1;
@@ -26,7 +26,7 @@ struct Options {
 
 void help() {
     std::cout
-        << "usage: ninfer_gdn_gating_proj_bench [--geometry 27b|35b] [--weights parent|split] "
+        << "usage: ninfer_gdn_gating_proj_bench [--geometry h5120|h2048] [--weights parent|split] "
            "[--op norm|control] [--tokens T,...] [--execution eager|graph|both] [--cache "
            "cold|warm|both] "
            "[--graph-calls N] [--warmup N] [--repeat N] [--profile] [--csv-out PATH]\n";
@@ -52,8 +52,8 @@ Options parse(int argc, char** argv) {
             std::exit(0);
         } else if (a == "--geometry") {
             auto v = next();
-            if (v != "27b" && v != "35b") throw std::invalid_argument("invalid geometry");
-            o.geometry35 = v == "35b";
+            if (v != "h5120" && v != "h2048") throw std::invalid_argument("invalid geometry");
+            o.hidden2048 = v == "h2048";
         } else if (a == "--weights") {
             auto v = next();
             if (v != "parent" && v != "split") throw std::invalid_argument("invalid weight form");
@@ -95,8 +95,8 @@ Options parse(int argc, char** argv) {
         throw std::invalid_argument("invalid execution");
     if (o.cache != "cold" && o.cache != "warm" && o.cache != "both")
         throw std::invalid_argument("invalid cache state");
-    if (o.geometry35 && !o.parent)
-        throw std::invalid_argument("35b requires the parent weight form");
+    if (o.hidden2048 && !o.parent)
+        throw std::invalid_argument("h2048 requires the parent weight form");
     if (o.graph_calls > 1 && (o.execution != "graph" || o.cache != "warm"))
         throw std::invalid_argument("repeated graphs require --execution graph --cache warm");
     if (o.profile && (o.tokens.size() != 1 || o.execution == "both" || o.cache == "both"))
@@ -141,7 +141,7 @@ Weight weight(const void* data, int rows, int hidden) {
 
 void run(const Options& o, int t, DeviceExecutionView execution, bench::L2FlushBuffer& flush,
          std::ostream* csv) {
-    const int heads = o.geometry35 ? 32 : 48, hidden = o.geometry35 ? 2048 : 5120;
+    const int heads = o.hidden2048 ? 32 : 48, hidden = o.hidden2048 ? 2048 : 5120;
     auto x    = bf16_values(std::size_t(hidden) * t, 13u, 1.0f);
     auto nw   = bf16_values(hidden, 29u, 0.2f);
     auto w    = bf16_values(std::size_t(2 * heads) * hidden, 47u, 0.015f);
@@ -219,13 +219,13 @@ void run(const Options& o, int t, DeviceExecutionView execution, bench::L2FlushB
             time.p95_us /= calls;
             if (ws.used() != 0 || ws.peak_used() != capacity)
                 throw std::runtime_error("workspace query/peak mismatch");
-            std::cout << (o.geometry35 ? "35b" : "27b") << ' ' << (o.norm ? "norm" : "control")
+            std::cout << (o.hidden2048 ? "h2048" : "h5120") << ' ' << (o.norm ? "norm" : "control")
                       << " T=" << t << ' ' << mode << ' ' << cache << " median=" << time.median_us
                       << " min=" << time.min_us << " p95=" << time.p95_us
                       << " us workspace=" << capacity << " nodes=" << (gr ? graph.nodes() : 0)
                       << " calls=" << calls << '\n';
             if (csv)
-                *csv << (o.geometry35 ? "35b" : "27b") << ',' << (o.norm ? "norm" : "control")
+                *csv << (o.hidden2048 ? "h2048" : "h5120") << ',' << (o.norm ? "norm" : "control")
                      << ',' << (o.parent ? "parent" : "split") << ',' << t << ',' << mode << ','
                      << cache << ',' << calls << ',' << (gr ? graph.nodes() : 0) << ',' << capacity
                      << ',' << ws.peak_used() << ',' << time.median_us << ',' << time.min_us << ','

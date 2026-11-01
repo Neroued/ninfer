@@ -6,6 +6,9 @@ experts with ``weight_scale``/``weight_scale_2``/``input_scale``, block-FP8 MTP 
 else, no final norm), at dimensions small enough for unit tests yet valid for every Flash-Next recipe:
 each dense projection group and the output head have N % 128 == 0 and K % 64 == 0, so the
 NVFP4-dense recipe applies too. Adapted from sybrix's flash-next-reference/gen_synthetic.py.
+``dense=True`` writes a dense Qwen4 checkpoint instead (BF16 SwiGLU MLP of width DENSE_IR in every
+block and in the MTP layer, no MoE field), ``ple=False`` one without the n-gram embedding (empty
+ple_layer_ids).
 """
 
 from __future__ import annotations
@@ -29,9 +32,28 @@ PLE_DIM, NGRAM, HEADS_PER_NGRAM, NGRAM_BASE, NGRAM_DIVISOR = 32, 3, 2, 11, 8
 SEED, EOS = 1234, 256  # EOS = <|endoftext|>, the first added token
 LAYER_TYPES = ["linear_attention", "full_attention"]
 PLE_LAYER_IDS = [1]  # one-indexed: block 0, a GDN block
+DENSE_IR = 256
 
 
-def config() -> dict:
+def config(*, dense: bool = False, ple: bool = True) -> dict:
+    cfg = _moe_config()
+    text = cfg["text_config"]
+    if dense:
+        for key in (
+            "num_experts",
+            "num_experts_per_tok",
+            "norm_topk_prob",
+            "moe_intermediate_size",
+            "shared_expert_intermediate_size",
+        ):
+            del text[key]
+        text["intermediate_size"] = DENSE_IR
+    if not ple:
+        text["ple_layer_ids"] = []
+    return cfg
+
+
+def _moe_config() -> dict:
     return {
         "architectures": ["Qwen4ExpForConditionalGeneration"],
         "model_type": "qwen4_exp",
@@ -157,9 +179,9 @@ def _block_fp8(tensors: dict, prefix: str, shape, generator: torch.Generator) ->
     tensors[prefix + ".weight_scale_inv"] = (torch.rand(tiles, generator=generator) * 4e-4 + 2e-4).to(torch.bfloat16)
 
 
-def write_checkpoint(path: Path, *, seed: int = 0) -> dict:
+def write_checkpoint(path: Path, *, seed: int = 0, dense: bool = False, ple: bool = True) -> dict:
     """Write config, safetensors (two shards + index) and tokenizer files; return the tensors."""
-    cfg = config()
+    cfg = config(dense=dense, ple=ple)
     text = cfg["text_config"]
     g = torch.Generator().manual_seed(seed)
     tensors: dict[str, torch.Tensor] = {}
@@ -176,6 +198,10 @@ def write_checkpoint(path: Path, *, seed: int = 0) -> dict:
             bf16(prefix + "block_inject_weight.weight", (HC, wide))
 
     def moe(prefix, expert):
+        if dense:
+            for role, shape in (("gate", (DENSE_IR, H)), ("up", (DENSE_IR, H)), ("down", (H, DENSE_IR))):
+                bf16(prefix + f"mlp.{role}_proj.weight", shape)
+            return
         bf16(prefix + "mlp.gate.weight", (E, H))
         bf16(prefix + "mlp.shared_expert_gate.weight", (1, H))
         for role, shape in (("gate", (SHARED, H)), ("up", (SHARED, H)), ("down", (H, SHARED))):
@@ -225,7 +251,7 @@ def write_checkpoint(path: Path, *, seed: int = 0) -> dict:
         else:
             attention(p)
         moe(p, _nvfp4_expert)
-        if i + 1 in PLE_LAYER_IDS:
+        if i + 1 in text["ple_layer_ids"]:
             e = p + "ple."
             emb = e + "ple_embedding."
             half = constants["rows"] // 2

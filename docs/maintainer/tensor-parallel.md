@@ -3,12 +3,12 @@
 This fork adds a two-device tensor-parallel mode, `--tp 2 --devices A,B`, so that a dense Qwen3.5
 artifact too large for one 16 GB board (Qwen3.8-27B NVFP4, 20.9 GiB of weights) runs split across
 two. This reference records the design of that mode from end to end. Narrower contracts stay with
-their owners: the per-layer mathematics of the split schedule is in
+their owners: the per-layer mathematics at tp 2 is in
 [Qwen3.5 model](qwen3_5-model.md#tensor-parallel-execution), the column- and row-parallel Op forms
 in [Op development](op-development.md#26-tensor-parallel-forms), the KV mirror in
 [Paged KV context store](paged-kv-cache.md#56-tensor-parallel-mirror), parent slicing in
 [Artifact container](artifact-container.md), and DFlash2 at width 2 in
-[DFlash and DFlash2](dflash.md#tensor-parallel-execution). This document links them and owns the
+[DFlash2](dflash.md#tensor-parallel-execution). This document links them and owns the
 contracts that cut across them. It was checked against the tree at `a0369376`; the file layout
 (§12) follows the isolation of `refactor/tp2-isolation`, and [Merging upstream](upstream-merge.md)
 says where the two-GPU code lives relative to upstream's files and how to merge. Points where the
@@ -46,13 +46,10 @@ What the mode rejects, and where the first check sits:
 
 | Rejected at tp 2 | First check |
 |---|---|
-| `--spec dflash` | `validate_options` in `model_instance.cpp`, before the artifact is read; again in the planner and `ProgramImpl` |
 | `--spec dflash2` without `--lm-head-draft` | `validate_options`; `validate_tensor_parallel` in [`load.cpp`](../../src/models/qwen3_5/load.cpp); planner |
-| DFlash2 drafter with full-attention layers | planner (`startup.cpp`): that drafter KV pool would have no rank 1 mirror |
 | KV storage other than `bf16`, `int8` and `nvfp4` | `validate_options`; `TextContext`: the head-local `[256,12,2]` attention geometry is registered for BF16, INT8-G64 and NVFP4-G16 only |
 | nonzero Host State slots or Host KV bytes | `validate_options`; `ninfer-serve` turns omitted values into 0 and rejects explicit nonzero ones ([`serve_options.cpp`](../../src/serve/serve_options.cpp)) |
-| the Qwen3.5 MoE architecture (Qwen4Exp has its own placement, §13) | `validate_tensor_parallel(config)` in `load.cpp`; also `shard_text_config` and the shard rules |
-| paired (two-parent) Q4/Q5 input projections | `TextContext` constructor ([`text.cpp`](../../src/models/qwen3_5/execution/text.cpp)); split routes in `attention.cpp` and `gdn.cpp` |
+| paired (two-parent) Q4/Q5 input projections | the split routes ([`tp2/attention_split.cpp`](../../src/models/qwen3_5/execution/tp2/attention_split.cpp), [`tp2/gdn_split.cpp`](../../src/models/qwen3_5/execution/tp2/gdn_split.cpp)), first reached by the forward's startup workspace sizing |
 | a shard shape without a registered problem | the Op's shape registry, as for any unregistered shape |
 
 `--tp 1` is meant to be upstream's engine. The mechanism is structural: the width-1 path passes
@@ -88,7 +85,7 @@ hidden/residual axis is never split.
 | `dflash2/layers/*/attention/output`, `…/mlp/{gate,up}`, `…/mlp/down` | Columns by query heads, Rows, Columns | `[5120,4096]` → `[5120,2048]`, gate\|up `[34816,5120]` → `[17408,5120]`, `[5120,17408]` → `[5120,8704]` |
 | `dflash2/` norms, `…/{attention,mlp}_conv/*`, `feature_projection`, `context_norm`, `final_norm` | Replicated | whole on both ranks |
 | `dflash2/candidate_selector/*` | SingleDevice(1); PrimaryOnly with Vision on rank 1, `NINFER_TP_DRAFT_HEAD=primary` or `NINFER_TP_SELECTOR=primary` | whole on rank 1 (257 MB for Qwen3.8-27B) |
-| `dflash/*`, `dflash2/*` with `NINFER_TP_DRAFTER=primary`, `proposal/*` otherwise | PrimaryOnly | whole on rank 0 |
+| `dflash2/*` with `NINFER_TP_DRAFTER=primary`, `proposal/*` otherwise | PrimaryOnly | whole on rank 0 |
 
 A shard is a standalone weight of the parent's format and layout with one axis narrowed, never a
 view into the parent's payload, so each rank runs the ordinary single-device dispatch at the shard's
@@ -135,12 +132,14 @@ rank's address of it. Rank `r` then builds `execution::Parameters(model, r)`, an
 
 ## 3. The forward pass at tp 2
 
-`TextContext` runs the split schedule when it is given an `execution::TpExecution`
+`TextContext` runs over both ranks when it is given an `execution::TpExecution`
 ([`tp.h`](../../src/models/qwen3_5/execution/tp.h)) naming rank 1's Parameters, arena, GDN state
-pool, KV caches, prefill KV row, ordinary-decode frame, ReplaySSM records and MTP storage; without
-one it runs the single-device schedule unchanged. The Program owns one `TpExecution`, and
-`ProgramImpl::prefill_tp_binding` copies it per prefill call to name the sequence's rank 1 MTP row.
-Each Text layer (`TextContext::run_layers_tp2`) issues each rank's work on that device's stream:
+pool, KV caches, prefill KV row, ordinary-decode frame, ReplaySSM records, Text forward runtime and
+MTP storage. The Program owns one `TpExecution`, and `ProgramImpl::prefill_tp_binding` copies it per
+prefill call to name the sequence's rank 1 MTP row. The Text layers run in the Qwen4 forward
+([`qwen4_forward.h`](../../src/models/qwen3_5/execution/qwen4_forward.h); the 27B takes its plain
+residual, `run_plain`, entered from `execution/qwen4_text.cpp`), which issues each rank's work on
+that device's stream:
 
 ```text
 attention:  q|k|gate|v_r = attn_input_proj shard(rmsnorm(x))   column-parallel, no exchange
@@ -156,8 +155,8 @@ Each layer therefore contains exactly two all-reduces, 128 per decode token for 
 residual once: rank 0 runs `linear_add` into its residual copy, rank 1 overwrites its copy with its
 plain partial, and `allreduce_sum` leaves `residual + partial_0 + partial_1` on both. Both ranks then
 hold the identical BF16 residual, so every later per-rank input (norms, KV pages, GDN state) agrees
-without further exchange. Prefill has its own chunk loop, `TextContext::prefill_impl_tp2`, separate
-from the single-device `prefill_impl`.
+without further exchange. One prefill chunk loop serves both widths (`TextContext::qwen4_prefill`,
+over the ranks of the forward); at tp 2 a chunk overlaps its exchanges with compute (§4.3).
 
 **Logits are assembled on rank 0 only.** The final norm is replicated and each rank projects its
 vocabulary half. In `execution::output_logits_split_rank0` ([`tp.cpp`](../../src/models/qwen3_5/execution/tp.cpp))
@@ -252,9 +251,8 @@ at 3.25 s on two RTX 5070 Ti; `run_mailbox_hang_case` in
 [`test_allreduce.cpp`](../../tests/ops/test_allreduce.cpp) keeps it under a 2 s display watchdog),
 sets the sticky hang word and skips its combine. `ProgramImpl::synchronize_devices`, called after
 every round, checks the word after syncing both devices and throws `std::runtime_error`, because
-the ranks' results have diverged. After startup that is an Engine-wide failure: every later round
-fails, and `ninfer-serve` exits with status 2 so a supervisor restarts it
-([`apps/serve/main.cpp`](../../apps/serve/main.cpp)).
+the ranks' results have diverged. During startup the step-down of §4.5 answers it; while serving,
+the step-down of §4.5.1.
 
 ### 4.3 Why both exist
 
@@ -277,7 +275,18 @@ One rule per prefill chunk: a text chunk of at least 768 tokens without a batche
 the half-chunk overlap (lanes 0 and 1); a shorter, multimodal or batched-tap chunk runs the column
 slices (`NINFER_TP_PREFILL_SLICES`, one lane per slice, up to eight); with no split transport
 (`NINFER_TP_PEER_OVERLAP=0` with P2P, `NINFER_TP_HOST_EXCHANGE=0` without) or
-`NINFER_TP_PREFILL_OVERLAP=0` the chunk runs one call per all-reduce. PR #15 (tzolkincz) measured
+`NINFER_TP_PREFILL_OVERLAP=0` the chunk runs one call per all-reduce. The rule and both schedules
+belong to the plain residual (`Qwen4Forward::run_plain`, `prefill_overlap`, `prefill_slices`); the
+hyper-connection residual of Qwen4Exp runs one call per exchange. Under the overlap the chunk's two
+halves (`PlainHalf`: column views of the residual and staging, positions, RoPE, causal envelope)
+are two consecutive prompt chunks issued block by block, mixer A, mixer B, FFN A, FFN B, next
+layer's mixer A: each block binds its half's columns (half B's GDN source slot is the destination
+half A published), begins its closing all-reduce on the half's lane and leaves it open until the
+half's next block, so one half's exchange moves while the other half computes; a DFlash2 feature
+tap takes each layer's columns once that half's exchange has finished. Every split keeps the tile
+boundaries of one call (`prefill_overlap_split`: multiples of 128, both halves at least 384
+columns), so the bits are those of one call. A teacher-forcing tap (`Qwen4Taps`) reads whole
+layers and keeps a chunk off the halves. PR #15 (tzolkincz) measured
 the same lane choreography (`DirectExchange` there) on 2x RTX 5070 Ti with the P2P driver patch:
 27B cold prefill 4k/16k/64k +45/+45/+29 % over the one-call copies and +41/+33/+20 % over host
 staging at stock clocks (chunk 2048).
@@ -292,7 +301,7 @@ trip exceeds 50 ms (`kMaxRoundTripMs`), the probe detaches and destroys the mail
 reason, and the transport becomes `copies`. `NINFER_TP_MAILBOX_PROBE=off` skips the probe; `=fail`
 makes only rank 0 enqueue its half, so the poller must give up, which exercises the real fallback.
 The probe proves one exchange shape only; a mailbox that passes it and hangs later is handled by
-§4.5 during startup and by the Engine-wide failure above after it.
+§4.5 during startup and by §4.5.1 after it.
 
 ### 4.5 Step-down in `prepare_graphs`
 
@@ -305,14 +314,35 @@ mailbox's addresses, and then takes one step down. The loop then captures everyt
 | Step | Transport string (`LoadSummary::tp_transport`) | Entered when |
 |---|---|---|
 | 1 | `mailbox` | the probe passed (or was skipped) |
-| 2 | `mailbox, MTP draft on copies` | `--spec mtp` only: a first launch hung at step 1, or `NINFER_TP_MAILBOX_DRAFT=copies` at startup |
-| 3 | `copies` | a first launch hung at step 2, or at step 1 without MTP; also `--no-tp-mailbox`, direct P2P, `--no-cuda-graph`, or a failed probe |
+| 2 | `mailbox, MTP draft on copies` or `mailbox, DFlash2 draft on copies` | `--spec mtp` or `--spec dflash2`: a first launch hung at step 1; for MTP also `NINFER_TP_MAILBOX_DRAFT=copies` at startup |
+| 3 | `copies` | a first launch hung at step 2, or at step 1 without speculative decoding; also `--no-tp-mailbox`, direct P2P, `--no-cuda-graph`, or a failed probe |
 
-Step 2 creates a **new** mailbox and sets `TpExecution::staged_draft_collectives`. The MTP round then
-opens a `PeerEvents::StagedScope` around its draft phase, so the verification's all-reduces keep the
-mailbox while the MTP head's are captured on the copies. `NINFER_TP_MAILBOX_FAULT=draft` sets the
+Step 2 creates a **new** mailbox and sets `TpExecution::staged_draft_collectives`. The MTP or DFlash2
+round then opens a `PeerEvents::StagedScope` around its draft phase, so the verification's all-reduces
+keep the mailbox while the draft phase's are captured on the copies. `NINFER_TP_MAILBOX_FAULT=draft` sets the
 hang word at `prepare_graphs`' synchronizations while the MTP draft phase is on the mailbox, and
 `=any` whenever a mailbox is attached. Both are test aids for hardware where no exchange hangs.
+
+#### 4.5.1 Step-down while serving (issue #20)
+
+Under WSL2 an exchange occasionally hangs mid-service too, with the transport already at step 2.
+The poller gives up after its bounded spin, so both devices are idle and usable; only the work in
+flight diverged. When the Engine worker catches an error and `Program::peer_exchange_timed_out()`
+reports the hang word, `EngineCore::recover_peer_transport_locked` fails the requests that held a
+lane or a materialization with `RequestErrorKind::Unavailable` (HTTP 503 `service_unavailable`),
+clears the Program and the ResourceManager as an Engine-wide failure does (`fail_all_cleanup`:
+the retained context cache goes too) and calls `Program::recover_peer_transport()`. That runs
+`degrade_peer_mailbox("while serving")`, one step down the table above, and `prepare_graphs()`
+again: with no request and no retained context left, the capture finds its StateImages, KV rows and
+execution-table rows free and runs exactly as at startup, including its own step-down if a first
+launch hangs. Queued requests stay queued and are served next. The log records a `[engine] warning:
+a tensor-parallel exchange timed out while serving` line with the transports before and after and
+the capture time. Only when nothing is left to step down to, or the capture throws, does the error
+become the Engine-wide failure (`ninfer-serve` exits with status 2, so a supervisor restarts it;
+[`apps/serve/main.cpp`](../../apps/serve/main.cpp)). Dropping the cache is the price of capturing
+again under the startup conditions: the retained checkpoints themselves were computed before the
+hang and were not touched by it. `ninfer_serve_tp_transport_recovery_real_test` injects the hang
+with a link-time wrapper around `PeerMailbox::hang_reported()` (no production hook).
 
 ### 4.6 Reporting and the standalone probe
 
@@ -553,10 +583,10 @@ pull of the drafts and of `proposal_q` onto rank 0's critical path costs 0.09 ms
 request (+0.5 %) and about 0.2 ms at two to four (+1.0 %) on two RTX 5070 Ti
 (`NINFER_TP_SELECTOR=primary` restores the selector on rank 0). `--lm-head-draft` is mandatory at
 tp 2: the full output head is split by vocabulary and candidate ranking has a vocabulary-split form
-only for the optimized head. The Engine, `plan_load` and the planner each reject the other case. A drafter with
-full-attention layers is also rejected, since its paged KV would have no rank 1 mirror while
-`publish_kv_rows` requires one; the published drafter has none. The full contract is in
-[DFlash and DFlash2](dflash.md#tensor-parallel-execution).
+only for the optimized head. The Engine, `plan_load` and the planner each reject the other case. The
+DFlash2 config accepts only `sliding_attention` draft layers, so the drafter has no paged KV to
+mirror. The full contract is in
+[DFlash2](dflash.md#tensor-parallel-execution).
 
 ## 8. Vision at tp 2
 
@@ -582,7 +612,7 @@ docs recommend the GPU with more free memory as `--vision-device`.
 `construct_model_on` passes a null `ExecutionContext`, so loading, `materialize`, the sequence planner
 and `create_program` take their single-device overloads; the Binder has no shard resolver, so every
 parent is Replicated and the layout is byte-identical to upstream's. `TextContext` without a
-`TpExecution` runs the single-device schedule, and no `PeerEvents`, `PeerMailbox` or
+`TpExecution` runs the single-device forward, and no `PeerEvents`, `PeerMailbox` or
 `DecodeGraphPeerBridge` exists. Arenas are not zero-filled, graph allowances are upstream's
 constants, the private-capture reclaim is off, only batch 1 is warmed before capture, and a
 rejected `cudaGraphExecUpdate` throws (§5).
@@ -609,7 +639,7 @@ mode of the `ninfer_qwen3_5_text_context_tp2_test` executable that
 upstream `e31bc99b`, and upstream `e31bc99b` (`recorded/2026-09-27`), identical on all three cases.
 
 The gate covers the Engine, scheduler, prefill and decode programs, attention, GDN, and the FP8 and
-BF16 Ops on one device. It does not cover the NVFP4 and INT-quantized GEMMs, MTP, DFlash/DFlash2,
+BF16 Ops on one device. It does not cover the NVFP4 and INT-quantized GEMMs, MTP, DFlash2,
 Vision, prefix reuse or concurrent requests; a board that holds a 27B artifact would let
 `record.sh` cover the GEMMs as-is.
 
@@ -641,6 +671,7 @@ in [`tests/ops/tests.cmake`](../../tests/ops/tests.cmake), `tests/artifact/tests
 | `ninfer_proposal_topk_split_test`, `ninfer_dflash2_head_blocks_test` | the split top sixteen against `linear_topk` over the whole head (ids and score bits, eager and through the mailbox, planted ties); the drafter's head-block Ops (16/4 attention, H4 context K/V, the Q8 QKV shard, 16/4 norm-RoPE) against the complete profiles' heads bit for bit, the convolution finish and `n5120_k2048` against FP64 |
 | `ninfer_qwen3_5_engine_vision_tp2_real_test` (+ `_mtp_real`, `_dflash2_real`) | `vision_device` outside `devices` rejected, text identical with and without Vision, colors of synthetic images with the tower on device 0, same token ids with it on device 1, second turn resumed |
 | `ninfer_serve_engine_failure_real_test` | a thrown decode-round failure (injected by wrapping `cudaStreamSynchronize`) stops the server with `engine_failed()` set, so it exits 2 |
+| `ninfer_serve_tp_transport_recovery_real_test` | MTP K=3: a mailbox hang (injected by wrapping `PeerMailbox::hang_reported()`) mid-stream in a streamed answer's decode, and again at the first check of a later request, fails each request with `service_unavailable` (503), the server keeps serving, and after each step-down (copies everywhere at the end) the greedy answer, reasoning included, is the one the mailbox gave; on `NINFER_TEST_ARTIFACT` and on `NINFER_TEST_QWEN4_ARTIFACT` (Qwen4Exp, routed-expert residency frozen with `NINFER_QWEN4_VALIDATION=1 NINFER_QWEN4_EXPERT_FREEZE=all`), each when set |
 
 A real artifact does not fit one board, so the real tests are semantic and do not compare with
 tp 1. Beyond the per-Op suites, the numerical tp 2 versus tp 1 comparisons are the synthetic
@@ -671,17 +702,16 @@ short DFlash2 run. It is the gate of every upstream merge and every change to th
 - **Unused rank 1 memory.** Rank 1's round state keeps the full-vocabulary logits frames of rank 0's
   layout, which it never writes (`persistent_layout` in `startup.cpp`); under DFlash2 with
   `NINFER_TP_DRAFTER=primary` it is also budgeted for rank 0's drafter state.
-- **Transport after startup.** A mailbox hang after `prepare_graphs` stops the Engine; there is no
-  runtime step-down. Kernel-serializing profilers can trigger it (`--no-tp-mailbox` avoids it). The
-  probe exercises one 4 KiB exchange. DFlash2 steps straight to copies and has not been run under
-  WSL2.
+- **Transport after startup.** A mailbox hang after `prepare_graphs` fails the running requests and
+  drops the context cache (§4.5.1); the transport does not step back up. Kernel-serializing
+  profilers can trigger it (`--no-tp-mailbox` avoids it). The probe exercises one 4 KiB exchange.
+  The recovery has been run with an injected hang word only; under WSL2 it is unverified. DFlash2's
+  intermediate step (§4.5) has not been run under WSL2.
 - **Numerics.** Split projections sum their halves in a different order and round each partial to
   BF16 before the all-reduce, so long greedy generations can drift from a single-GPU run.
 - **Host-less reuse.** Many parallel conversations evict the oldest idle ones. The reclaim does not
   check beforehand whether its releases can make the capture fit, so it can release continuations
   for a capture that is still skipped.
-- **Duplicated code.** `TextContext::prefill_impl_tp2` (`execution/tp2/text_tp2.inc`) duplicates
-  `prefill_impl`; a change to one must be carried to the other.
 - **Not ported.** YaRN long-context RoPE from the pre-v3 fork line is not in this tree; RoPE has no
   per-rank override.
 
@@ -713,7 +743,7 @@ lists. The `tp2/` directories below are ours throughout.
 | `src/artifact/slices.*`, `binder.*`, `materializer.*`, `views.cpp` | shard geometry and plane copies, per-device placement, upload and views |
 | `src/models/load_options.h`, `src/models/qwen3_5/load/sharding.*`, `load.cpp` | `LoadOptions::{tp,vision_rank}`, placement rules, tp load checks |
 | `src/models/qwen3_5/execution/tp.*` | `TpExecution`, `shard_text_config`, rank-0 logits gather |
-| `src/models/qwen3_5/execution/tp2/` | split Text schedule (`text_tp2.inc`, `text_context_{public,private}.inc`), split attention/GDN/FFN/MTP forms, the split DFlash2 drafter (`draft_split.{h,cpp}`, `draft_tp2.inc`), split projection helpers, tp2 workspace recipes |
+| `src/models/qwen3_5/execution/tp2/` | TextContext's tp 2 bindings and split MTP head (`text_tp2.inc`, `text_context_{public,private}.inc`), the prefill overlap and slices plan (`prefill_slices.h`), split attention/GDN/FFN/MTP forms, the split DFlash2 drafter (`draft_split.{h,cpp}`, `draft_tp2.inc`), split projection helpers, tp2 workspace recipes |
 | `src/models/qwen3_5/execution/{draft,vision,parameters}.cpp` | DFlash2 and Vision two-device branches, `Parameters(model, rank)` |
 | `src/models/qwen3_5/state/state_image.h` | StateImage mirror |
 | `src/models/qwen3_5/program/tp2/` | `PeerRuntime`, mirrors, mailbox, probe, step-down (`program_impl_tp2.inc`, `program_impl_{public,private}.inc`); tp2 workspace plan and rejections (`startup_tp2.inc`); MTP bridge, split verification, split prefill head |
@@ -846,8 +876,8 @@ real parents of both recipes, per-rank bytes of the 48-block model).
    also unconfirmed whether step 2 fixes the reported hang or the engine ends on step 3.
 3. **DFlash2 under that hypothesis.** The notes say the DFlash2 round has no exchange after a
    cross-device copy. The code (`dflash_decode_batch_body`) pulls the draft tokens to rank 1 before
-   verification's exchanges, the pattern the hypothesis blames. DFlash2 has no intermediate step and
-   has not been run under WSL2.
+   verification's exchanges, the pattern the hypothesis blames. Step 2 of §4.5 moves its draft phase
+   to the copies as it does MTP's; DFlash2 has not been run under WSL2.
 4. **Placement and test lists in the porting notes.** A porting note counts the GDN convolution
    among the replicated weights; the current rules split it by Q/K/V channel sections and split
    `gdn/{a_projection,b_projection,a_log,dt_bias}` by value heads, and only norms and

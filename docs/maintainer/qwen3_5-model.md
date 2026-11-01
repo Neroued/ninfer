@@ -1,8 +1,8 @@
 # Qwen3.5 model reference
 
-This reference describes the Qwen3.5 Dense and MoE mathematics implemented by NInfer, including
+This reference describes the Qwen3.5 Dense mathematics implemented by NInfer, including
 Text, MTP, Vision and their state semantics. The Qwen3.6 and Qwen3.8 releases used by the official
-artifacts are instances of these architectures. Their release names do not choose another graph.
+artifacts are instances of this architecture. Their release names do not choose another graph.
 
 [Engine architecture](engine-architecture.md) defines ownership and execution;
 [artifact container](artifact-container.md) defines stored objects and bindings;
@@ -15,7 +15,6 @@ The architecture registry recognizes these Text config pairs:
 | `architectures[0]` | `model_type` | Feed-forward block |
 |---|---|---|
 | `Qwen3_5ForCausalLM` | `qwen3_5_text` | Dense SwiGLU |
-| `Qwen3_5MoeForCausalLM` | `qwen3_5_moe_text` | Routed SwiGLU experts and a gated shared expert |
 
 Code fixes the pre-norm residual order, gated GQA, zero-centered Text norms, GDN recurrence,
 interleaved partial MRoPE, FFN mathematics and component relationships. Config supplies instance
@@ -33,7 +32,6 @@ Their responsibilities are:
 | `rope_parameters` | Theta, partial rotary factor and three interleaved MRoPE sections |
 | `linear_num_*_heads`, `linear_*_head_dim`, `linear_conv_kernel_dim` | GDN heads, state dimensions and convolution width |
 | `intermediate_size` | Dense FFN width |
-| `num_experts`, `num_experts_per_tok`, `moe_intermediate_size`, `shared_expert_intermediate_size` | MoE dimensions |
 
 Projection widths, compact attention/GDN layer indices, rotary dimensions and parameter shapes are
 derived. The converter expands source shorthand such as a full-attention interval into the explicit
@@ -43,10 +41,10 @@ do not become mathematical config.
 Text is required. Optional components target `text` and supply their private data:
 
 - Vision supplies tower dimensions and patch/merge geometry. Its output width comes from Text.
-- MTP identifies `Qwen3_5MTP` or `Qwen3_5MoeMTP`. The single-layer predictor inherits Text's
+- MTP identifies `Qwen3_5MTP`. The single-layer predictor inherits Text's
   attention, RoPE and FFN geometry and shares its embedding/output semantics.
-- DFlash/DFlash2 supply private draft dimensions, attention pattern, conditioning taps and their
-  algorithm parameters. See [DFlash](dflash.md).
+- DFlash2 supplies private draft dimensions, attention pattern, conditioning taps and its
+  algorithm parameters. See [DFlash2](dflash.md).
 
 Only selected components are semantically bound and materialized. A model's weights and config
 remain immutable after loading; request capacity, concurrency, KV codecs and graph profiles are
@@ -56,29 +54,27 @@ runtime choices.
 
 These are useful workload points, rather than a second config registry:
 
-| Quantity | 27B Dense | 35B-A3B MoE |
-|---|---:|---:|
-| Hidden width H | 5120 | 2048 |
-| Text layers | 64 | 40 |
-| Full attention / GDN layers | 16 / 48 | 10 / 30 |
-| Q heads / KV heads / head dimension | 24 / 4 / 256 | 16 / 2 / 256 |
-| GDN key heads / value heads | 16 / 48 | 16 / 32 |
-| GDN key/value head dimension | 128 / 128 | 128 / 128 |
-| GDN convolution width | 4 | 4 |
-| Dense intermediate width | 17408 | — |
-| Routed experts / selected per token | — | 256 / 8 |
-| Routed / shared intermediate width | — | 512 / 512 |
-| Embedding/output matrix rows | 248320 | 248320 |
-| Position capacity | 262144 | 262144 |
+| Quantity | 27B Dense |
+|---|---:|
+| Hidden width H | 5120 |
+| Text layers | 64 |
+| Full attention / GDN layers | 16 / 48 |
+| Q heads / KV heads / head dimension | 24 / 4 / 256 |
+| GDN key heads / value heads | 16 / 48 |
+| GDN key/value head dimension | 128 / 128 |
+| GDN convolution width | 4 |
+| Dense intermediate width | 17408 |
+| Embedding/output matrix rows | 248320 |
+| Position capacity | 262144 |
 
-Both use `rms_norm_eps=1e-6`, `rope_theta=1e7`, `partial_rotary_factor=0.25` and
-`mrope_section=[11,11,10]`. Their full-attention layers occur at indices `3,7,...`; that pattern is
-stored in config. Both have untied embedding and output matrices. Qwen3.6-27B and Qwen3.8-27B share
+It uses `rms_norm_eps=1e-6`, `rope_theta=1e7`, `partial_rotary_factor=0.25` and
+`mrope_section=[11,11,10]`. Its full-attention layers occur at indices `3,7,...`; that pattern is
+stored in config. It has untied embedding and output matrices. Qwen3.6-27B and Qwen3.8-27B share
 this Dense geometry, while training results, representations and frontend semantics can differ.
 
 Config parsing accepts structural variation. Actual execution remains bounded by implemented
-Ops: the current fused input projections have explicit Dense/MoE shapes, GDN uses the implemented
-128-dimensional recurrence, and the native sparse-MoE path uses 256 experts with top-8 routing.
+Ops: the current fused input projections have explicit shapes and GDN uses the implemented
+128-dimensional recurrence.
 The current multimodal RoPE entry requires the implemented interleaved axis mapping. These checks
 belong to the relevant consumers; parsing a config is not a promise to execute every size.
 
@@ -88,9 +84,9 @@ belong to the relevant consumers; parsing a config is not a promise to execute e
 and mathematical input Uses. The converter's
 [`qwen3_5.py`](../../tools/convert/qwen3_5.py) maps source tensors into the same roles.
 
-The main namespaces are `text/`, `vision/`, `mtp/`, `dflash/`, `dflash2/` and the optional
-`proposal/`. Text block `i` contains `text/layers/i/attention/...` or `.../gdn/...`, plus its Dense
-`mlp/...` or `moe/...` parameters. A projection such as `attention/query` has logical shape
+The main namespaces are `text/`, `vision/`, `mtp/`, `dflash2/` and the optional `proposal/`. Text
+block `i` contains `text/layers/i/attention/...` or `.../gdn/...`, plus its Dense `mlp/...`
+parameters. A projection such as `attention/query` has logical shape
 `[num_attention_heads * head_dim, H]` and a Use at `text/layers/i/mixer_input`.
 
 Bindings describe the logical values in physical parents. They can use complete objects,
@@ -100,8 +96,8 @@ A simple split at the middle of the source matrix would change the model.
 
 The Dense groupwise attention recipe packs Q/K into Q4 and gate/V into Q5. A supported FP8 or NVFP4
 recipe can pack their union into one parent. The same four logical roles then become either the
-two-weight or one-weight native fused call. Dense gate/up and MoE expert banks follow their finite
-packing and execution rules. [Storage layouts](storage-layouts.md#8-logical-views-and-native-operands)
+two-weight or one-weight native fused call. Dense gate/up follows its finite packing and execution
+rules. [Storage layouts](storage-layouts.md#8-logical-views-and-native-operands)
 describes the difference between logical views and native operand restrictions.
 
 `tie_word_embeddings` records a training relationship; bindings choose whether physical data is
@@ -133,7 +129,7 @@ x = x + ffn(h)
 ```
 
 The mixer is gated GQA or GDN according to `layer_types`. Dense FFN is
-`down(SiLU(gate(h)) * up(h))`; MoE is defined below. Text/MTP projections and GDN convolution are
+`down(SiLU(gate(h)) * up(h))`. Text/MTP projections and GDN convolution are
 bias-free. Fusion may combine projection, activation, normalization and residual work while
 preserving the declared mathematical and observable precision boundaries.
 
@@ -194,29 +190,13 @@ the committed prefix of that recorded physical block. The projection/convolution
 remains in the model's finite execution choices. [ReplaySSM](replayssm-gdn.md) defines the record
 and commit semantics, including their numerical boundary.
 
-### Sparse MoE
-
-For token h, with E routed experts and K selected experts:
-
-```text
-router_probs = softmax(W_router h)
-(values, ids) = topk(router_probs, K)
-routing_weight = values / sum(values)
-
-y_e = W_down[e](SiLU(W_gate[e] h) * (W_up[e] h))
-y_routed = sum(routing_weight[e] * y_e for e in ids)
-shared = W_shared_down(SiLU(W_shared_gate h) * (W_shared_up h))
-y = y_routed + sigmoid(W_shared_score h) * shared
-```
-
-The shared expert always executes and is outside top-k. Logical expert id e identifies router row e
-and the corresponding expert matrices. Physical bank ordering and fused dispatch preserve that
-relationship. Router loss coefficients and training-only outputs add no inference term.
-
 ## Prefill, decode and MTP
 
 Text prefill gathers embedding columns, replaces media placeholders with Vision outputs, and runs
-the configured blocks in chunks. It preserves state and positions across chunks. Final offset
+the configured blocks in chunks. It preserves state and positions across chunks. The blocks run in
+the Text forward's plain residual ([Qwen4Exp reference, the Text forward's
+options](qwen4-exp-model.md#the-text-forwards-options); `execution/qwen4_forward.h`), with the
+27B's fused Ops in every block. Final offset
 RMSNorm and the full output head produce the target distribution. Ordinary decode repeats this
 schedule for one new token. CUDA Graph replay uses the same selected model implementation.
 
@@ -233,7 +213,7 @@ draft_logits = target_output_head(draft_hidden)
 ```
 
 The stem concatenates embedding first, hidden second. MTP has private stem, block, final norm and
-KV state. Its attention and Dense/MoE geometry come from Text. It can recursively propose several
+KV state. Its attention and FFN geometry come from Text. It can recursively propose several
 tokens using the previous MTP hidden output.
 
 For prompt tokens x_0 through x_n and the target's first generated token x_(n+1), MTP prefill uses:
@@ -257,12 +237,11 @@ output head. Backend selection, draft width and proposal-head choice are fixed a
 
 A Dense model loaded with `LoadOptions.tp=2` is split across two devices by heads, intermediate
 width and vocabulary ([`sharding.h`](../../src/models/qwen3_5/load/sharding.h)); rank r holds
-`execution::Parameters(model, r)`. The hidden/residual axis is replicated. `TextContext` runs the
-split schedule when it is given a `TpExecution`
-([`tp.h`](../../src/models/qwen3_5/execution/tp.h)) naming rank 1's parameters, arena, GDN state
-pool, KV caches, prefill KV rows, ordinary decode control, the ReplaySSM records of a speculative
-backend and, under MTP, its prefill frames; without one it runs the single-device schedule
-unchanged.
+`execution::Parameters(model, r)`. The hidden/residual axis is replicated. `TextContext` runs over
+both ranks when it is given a `TpExecution` ([`tp.h`](../../src/models/qwen3_5/execution/tp.h))
+naming rank 1's parameters, arena, GDN state pool, KV caches, prefill KV rows, ordinary decode
+control, Text forward runtime, the ReplaySSM records of a speculative backend and, under MTP, its
+prefill frames; the Text layers run in the Qwen4 forward on both ranks.
 
 Each block issues one rank's work on that device's stream:
 
@@ -292,7 +271,7 @@ reads its KV row from `TpExecution::text_kv_table_row`; ordinary decode reads
 KV page and row bookkeeping stay on rank 0 and are mirrored to rank 1 at the same indices.
 
 The split path covers text and multimodal prefill, ordinary decode, the MTP and DFlash2 rounds and
-their logits. It rejects DFlash, the MoE FFN, paired (two-parent) input projections, and KV caches
+their logits. It rejects paired (two-parent) input projections and KV caches
 other than BF16, INT8-G64 and NVFP4-G16, for which the 12/2-head attention has no route. RoPE has no per-rank
 override.
 
@@ -363,18 +342,11 @@ split MTP stem reads; the prompt MTP head, its final column and the prefix-reuse
 `[T,3]` positions, and a visual bridge column passes its composed embedding to rank 0. A DFlash2
 tap reads rank 0's residual as for text.
 
-DFlash2 splits only the target. The drafter (`dflash2/*`) and the optimized proposal head
-(`proposal/*`) are placed on rank 0 alone, and the full-head proposal is rejected at width 2
-because the candidate ranking (`linear_topk`) is registered for the complete head only. A DFlash
-feature tap reads rank 0's residual after each captured layer's all-reduce, which is the complete
-hidden state, in prefill and in verification; rank 1 captures nothing. A round uploads the ingress
-record to both ranks, appends the context and proposes on rank 0, copies the draft tokens to rank
-1 after a cross-device event, prepares both ranks' verification inputs, verifies on both, accepts
-(sparse) on rank 0 and copies the accepted counts to rank 1, as for MTP. DFlash2 has no bridge;
-it resumes retained prefixes with the drafter's rings in rank 0's StateImages.
+At tp 2 DFlash2 splits the drafter and the candidate ranking of the optimized proposal head as
+well as the target; placement, round and state are in [DFlash2](dflash.md#tensor-parallel-execution).
 
 The Program plans one per-rank layout (`SequencePlanImpl::tp`): KV heads and GDN state halved,
-and a workspace sized from the split schedule's own allocation order with the rank's
+and a workspace sized from the tp 2 workspace plan's allocation order with the rank's
 `shard_text_config` extents, the all-reduce staging and the vocabulary-split logits; the ReplaySSM
 records hold one rank's heads. Rank 1 allocates the same layout without the drafter's state
 (`SequencePlanImpl::peer_persistent`: no DFlash context or features and no StateImage DFlash
@@ -471,8 +443,8 @@ state has one `[Dv,Dk]` matrix per value head, and convolution history has
 capacity under the [context resource contract](resource-scheduling-and-context-cache.md#11-配置语义与有界性).
 ReplaySSM records are separate pending-round scratch when speculation is enabled.
 
-Text GQA KV grows with visible context. Selected MTP owns separate KV; DFlash backends own the
-state described in their reference. Continuation hidden values and prefix checkpoints belong to
+Text GQA KV grows with visible context. Selected MTP owns separate KV; DFlash2 owns the state described
+in its reference. Continuation hidden values and prefix checkpoints belong to
 Program. Workspace, storage capacities and graph buffers are derived from actual parameters and
 startup options by the planners described in [Engine architecture](engine-architecture.md).
 

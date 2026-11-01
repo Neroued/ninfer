@@ -33,10 +33,10 @@ namespace ninfer::models::qwen3_5::loading {
 //            each layer's stacked gate/up and down banks (65 GiB for Qwen3.8-Flash-Next with MTP)
 //            stay in host memory, where the expert cache copies them from and the CPU reads them.
 //   SingleDevice(vision_rank)  vision/*.
-//   PrimaryOnly  dflash/*, dflash2/* and proposal/*: the drafter and the optimized proposal head
-//            run on rank 0 only, so rank 1 holds none of them. Under MTP, proposal/head instead
-//            splits by vocabulary Rows when indexed with at most ops::kArgmaxSplitMaxRowsPerRank
-//            rows per rank ([131072,5120] -> [65536,5120]); proposal/token_ids stays PrimaryOnly.
+//   PrimaryOnly  dflash2/* and proposal/* unless split below: rank 1 holds none of them. Under
+//            MTP, proposal/head instead splits by vocabulary Rows when indexed with at most
+//            ops::kArgmaxSplitMaxRowsPerRank rows per rank ([131072,5120] -> [65536,5120]);
+//            proposal/token_ids stays PrimaryOnly.
 //            Under DFlash2 the indexed head splits into ops::kLinearTopKSplitRows blocks and
 //            proposal/token_ids splits with it (the split top sixteen keys carry global IDs).
 //            NINFER_TP_DRAFT_HEAD=primary, and for DFlash2 NINFER_TP_DRAFTER=primary, keep them

@@ -14,6 +14,7 @@ ninfer_add_op_bench(ninfer_gated_delta_net_bench SOURCES "${CMAKE_CURRENT_LIST_D
 ninfer_add_op_bench(ninfer_kimi_delta_attention_bench
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/kimi_delta_attention_bench.cu")
 ninfer_add_op_bench(ninfer_qsa_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/qsa_bench.cu")
+ninfer_add_op_bench(ninfer_qsa_staging_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/qsa_staging_bench.cu")
 ninfer_add_op_bench(ninfer_gdn_replay_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/gdn_replay_bench.cu")
 ninfer_add_op_bench(ninfer_rope_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/rope_bench.cu")
 ninfer_add_op_bench(ninfer_rmsnorm_rope_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/rmsnorm_rope_bench.cu")
@@ -50,8 +51,6 @@ ninfer_add_op_bench(ninfer_nvfp4_linear_add_bench SOURCES "${CMAKE_CURRENT_LIST_
 ninfer_add_op_bench(ninfer_fp8_linear_add_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/fp8_linear_add_bench.cu")
 ninfer_add_op_bench(ninfer_causal_softmax_attention_bench
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/causal_softmax_attention_bench.cu")
-ninfer_add_op_bench(ninfer_context_softmax_attention_bench
-  SOURCES "${CMAKE_CURRENT_LIST_DIR}/context_softmax_attention_bench.cu")
 ninfer_add_op_bench(ninfer_sliding_window_attention_bench
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/sliding_window_attention_bench.cu")
 ninfer_add_op_bench(ninfer_kv_cache_append_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/kv_cache_append_bench.cu")
@@ -60,7 +59,6 @@ ninfer_add_op_bench(ninfer_prepare_masked_block_bench
 ninfer_add_op_bench(ninfer_sampling_select_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/sampling_select_bench.cu")
 ninfer_add_op_bench(ninfer_moe_slots_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/moe_slots_bench.cu")
 ninfer_add_op_bench(ninfer_host_moe_layer_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/host_moe_layer_bench.cu")
-ninfer_add_op_bench(ninfer_sparse_moe_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/sparse_moe_bench.cu")
 ninfer_add_op_bench(ninfer_linear_pair_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/linear_pair_bench.cu")
 ninfer_add_op_bench(ninfer_context_kv_materialize_bench
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/context_kv_materialize_bench.cu")

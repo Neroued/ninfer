@@ -81,7 +81,6 @@ enum class ProposalHead : std::uint8_t {
 enum class SpeculativeBackend : std::uint8_t {
     None,
     Mtp,
-    DFlash,
     DFlash2,
 };
 
@@ -94,7 +93,7 @@ enum class MtpWindowRule : std::uint8_t {
 
 struct SpeculativeOptions {
     SpeculativeBackend backend = SpeculativeBackend::None;
-    // Startup-fixed K: MTP 1..5; DFlash and DFlash2 1..15 (query width K+1).
+    // Startup-fixed K: MTP 1..5; DFlash2 1..15 (query width K+1).
     std::uint32_t draft_tokens = 0;
     ProposalHead proposal_head = ProposalHead::Full;
     // MTP only: 0 verifies every round's K proposals. In (0,1) a round verifies only its first k
@@ -312,7 +311,8 @@ struct RoutedExpertOptions {
     // CPU threads of the missing experts with ggml block banks (they replace cpu_threads there):
     // their decode-once kernels are compute-bound at 6 threads and reach the RAM bandwidth at 12
     // (one per physical core of the 9900X; T219: replay decode 196.7 -> 204.9 tok/s at 6 -> 12).
-    // ninfer-serve --expert-cpu-threads sets both. 0 = one per allowed physical core (12 on the 9900X).
+    // ninfer-serve --expert-cpu-threads sets both. 0 = one per allowed physical core (12 on the
+    // 9900X).
     std::uint32_t gguf_cpu_threads = 0;
     // Ring slots the cache lends while streaming (rounded up to whole cache layers; >= 512).
     std::uint32_t stream_ring_slots = 576;
@@ -366,10 +366,9 @@ struct EngineOptions {
     int device            = 0;
     // Tensor-parallel width, 1 or 2. At 2 the dense Text model is split across `devices`
     // (one id per rank, rank 0 first; rank 0 must equal `device`) for generation, ordinary, with
-    // MTP or with DFlash2 speculative decoding (DFlash2 with the optimized proposal head only; its
-    // drafter runs on rank 0), with or without Vision (see `vision_device`), and for
-    // CausalScoring: DFlash, the Qwen3.5 MoE architecture and KV storage other than
-    // BF16/INT8/NVFP4 are rejected. Qwen4Exp (Qwen3.8-Flash-Next) runs at tp 2 too (ordinary
+    // MTP or with DFlash2 speculative decoding (DFlash2 with the optimized proposal head only),
+    // with or without Vision (see `vision_device`), and for CausalScoring. KV storage other than
+    // BF16/INT8/NVFP4 is rejected. Qwen4Exp (Qwen3.8-Flash-Next) runs at tp 2 too (ordinary
     // generation, MTP, Vision and CausalScoring), its routed experts partitioned by ID parity
     // between the ranks. At 1 `devices` is empty or {device}.
     int tp = 1;
@@ -424,10 +423,16 @@ struct EngineOptions {
     // memory at about half the RAM), the expert banks of the least important layers stay in
     // pageable memory: the CPU reads them in place, the expert cache fills its slots from them
     // through a pinned staging ring, prefill streaming and GPU reads in place skip them. Same
-    // results; slower where they are used.
+    // results; slower where they are used. With kv_ram_active the Host KV planes count in the
+    // limit: the weights keep the limit minus them page-locked.
     std::uint64_t host_pinned_max_bytes = 0;
     RoutedExpertOptions routed_experts;
     ElasticKvOptions elastic_kv;
+    // Active KV in RAM (Qwen4Exp, docs/maintainer/active-kv-in-ram.md): the text KV pool's K/V and
+    // QSA index records live in pinned Host memory (only the QSA block keys stay in VRAM); each
+    // step brings the indexer's selected blocks into a VRAM cache, prefill stages the visible pages
+    // of each layer. Frees the KV's VRAM for expert slots. Requires max_concurrency 1.
+    bool kv_ram_active = false;
     ContextCacheOptions context_cache;
     ContextCostOptions context_cost;
     StartupObserver startup_observer;
@@ -558,14 +563,20 @@ struct GeneratedToolCall {
 };
 
 // Terminal interpretation of model-origin tool-call markup. Parameter schemas guide JSON
-// normalization but do not validate the call; only a structure/identity failure can return a
-// complete marker region to ordinary content.
+// normalization but do not validate the call; a structure failure, a function name outside the
+// charset the request parsers accept ([A-Za-z0-9_-], unless unwrapping resolves it to a declared
+// tool), or a declared name filtered out for this turn returns a complete marker region to
+// ordinary content. An undeclared name that the request charset accepts is kept as a structured
+// call (salvaged_call_count) so the client sees a visible unknown-tool error it can feed back to
+// the model; a punctuated name the client could not echo back next turn is not. Complete calls
+// followed by prose without call markup, and calls damaged only at their closers, are kept too
+// (trailing_content_bytes, structural_salvage_count).
 enum class ToolCallParseFallbackReason : std::uint8_t {
     None,
     MalformedStructure,
     DuplicateParameter,
     InvalidToolName,
-    UndeclaredTool,
+    FilteredTool,
     TrailingContent,
 };
 
@@ -580,8 +591,8 @@ tool_call_parse_fallback_reason_name(ToolCallParseFallbackReason reason) noexcep
         return "duplicate_parameter";
     case ToolCallParseFallbackReason::InvalidToolName:
         return "invalid_tool_name";
-    case ToolCallParseFallbackReason::UndeclaredTool:
-        return "undeclared_tool";
+    case ToolCallParseFallbackReason::FilteredTool:
+        return "filtered_tool";
     case ToolCallParseFallbackReason::TrailingContent:
         return "trailing_content";
     }
@@ -589,10 +600,18 @@ tool_call_parse_fallback_reason_name(ToolCallParseFallbackReason reason) noexcep
 }
 
 struct ToolCallParseDiagnostics {
-    bool marker_seen                            = false;
-    std::uint32_t structured_call_count         = 0;
-    std::uint32_t empty_arguments_omitted       = 0;
-    std::uint32_t schema_mismatch_arguments     = 0;
+    bool marker_seen                    = false;
+    std::uint32_t structured_call_count = 0;
+    // Calls kept despite an undeclared name, or renamed from a catalog spelling to a declared tool.
+    std::uint32_t salvaged_call_count       = 0;
+    std::uint32_t empty_arguments_omitted   = 0;
+    std::uint32_t schema_mismatch_arguments = 0;
+    // Bytes of prose after the calls, returned as content.
+    std::uint32_t trailing_content_bytes = 0;
+    // Subset of structured_call_count repaired structurally: closers supplied at the model's stop,
+    // or a stray </parameter> or </tool_call> dropped where a parameter or the next call should
+    // open.
+    std::uint32_t structural_salvage_count      = 0;
     ToolCallParseFallbackReason fallback_reason = ToolCallParseFallbackReason::None;
 
     [[nodiscard]] friend constexpr bool
@@ -672,6 +691,9 @@ struct PromptOptions {
     std::string chat_template_kwargs_json;
     bool add_vision_id = false;
     std::vector<std::string> tool_jsons;
+    // Names declared in the request but removed for this turn by tool_choice.allowed_tools. The
+    // output contract needs them so calls naming them keep falling back to text.
+    std::vector<std::string> filtered_out_tool_names;
 };
 
 enum class CacheRetentionHint : std::uint8_t {
@@ -1327,9 +1349,9 @@ struct LoadSummary {
     std::uint64_t host_mapped_bytes = 0;
     // v0.7 pinned fallback (EngineOptions::host_pinned_max_bytes): the host-mapped weights kept in
     // pageable memory instead (with alignment) and how many parents; 0 when all are page-locked.
-    std::uint64_t host_pageable_bytes  = 0;
-    std::size_t host_pageable_objects  = 0;
-    std::size_t host_mapped_objects    = 0;
+    std::uint64_t host_pageable_bytes     = 0;
+    std::size_t host_pageable_objects     = 0;
+    std::size_t host_mapped_objects       = 0;
     std::uint64_t host_pinned_limit_bytes = 0;
     bool host_pinned_alloc_failed         = false;
     std::vector<LoadDeviceSummary> devices; // One entry per tensor-parallel rank.

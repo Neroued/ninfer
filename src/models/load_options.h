@@ -38,13 +38,9 @@ struct LoadOptions {
 
     [[nodiscard]] bool mtp() const noexcept { return speculative == SpeculativeBackend::Mtp; }
 
-    [[nodiscard]] bool dflash() const noexcept { return speculative == SpeculativeBackend::DFlash; }
-
     [[nodiscard]] bool dflash2() const noexcept {
         return speculative == SpeculativeBackend::DFlash2;
     }
-
-    [[nodiscard]] bool masked_draft() const noexcept { return dflash() || dflash2(); }
 
     [[nodiscard]] bool proposal_enabled() const noexcept {
         return purpose == EnginePurpose::Generation && speculative != SpeculativeBackend::None &&
@@ -57,18 +53,12 @@ struct LoadOptions {
             return {};
         case SpeculativeBackend::Mtp:
             return "mtp";
-        case SpeculativeBackend::DFlash:
-            return "dflash";
         case SpeculativeBackend::DFlash2:
             return "dflash2";
         }
         return {};
     }
 };
-
-[[nodiscard]] constexpr bool is_masked_draft_backend(SpeculativeBackend backend) noexcept {
-    return backend == SpeculativeBackend::DFlash || backend == SpeculativeBackend::DFlash2;
-}
 
 // The rank whose device holds the Vision tower: the index of `vision_device` in `devices`, and
 // rank 0 when it is unset. Engine validation rejects a `vision_device` outside `devices`.
@@ -80,14 +70,14 @@ struct LoadOptions {
 }
 
 [[nodiscard]] inline LoadOptions load_options(const EngineOptions& options) noexcept {
-    return {.purpose          = options.purpose,
-            .vision           = options.enable_vision,
-            .speculative      = options.speculative.backend,
-            .proposal_head    = options.speculative.proposal_head,
-            .tp               = options.tp,
-            .vision_rank      = vision_rank(options),
-            .embedding_host   = options.embedding_host,
-            .hc_split_streams = options.tp_hc_split_streams,
+    return {.purpose               = options.purpose,
+            .vision                = options.enable_vision,
+            .speculative           = options.speculative.backend,
+            .proposal_head         = options.speculative.proposal_head,
+            .tp                    = options.tp,
+            .vision_rank           = vision_rank(options),
+            .embedding_host        = options.embedding_host,
+            .hc_split_streams      = options.tp_hc_split_streams,
             .host_pinned_max_bytes = options.host_pinned_max_bytes};
 }
 

@@ -37,7 +37,7 @@ std::string tool_definition(const std::string& tool_name, Json properties,
 std::shared_ptr<const fi::ToolCallOutputContract>
 contract_from_definitions(const std::vector<std::string>& definitions) {
     return fi::build_tool_call_output_contract(
-        std::span<const std::string>(definitions.data(), definitions.size()), true);
+        std::span<const std::string>(definitions.data(), definitions.size()), {}, true);
 }
 
 std::shared_ptr<const fi::ToolCallOutputContract> output_contract_for(const std::string& tool_name,
@@ -445,7 +445,7 @@ int test_empty_declared_non_string_is_omitted() {
         fi::ToolCallOutputDecoder decoder(contract, 128);
         std::string visible = decoder.feed(std::string_view(text).substr(0, split));
         visible += decoder.feed(std::string_view(text).substr(split));
-        auto terminal = decoder.finish();
+        auto terminal = decoder.finish(fi::ToolCallRegionEnd::ModelStop);
         if (visible != "I need one more check." || !terminal.content.empty() ||
             terminal.tool_calls.size() != 1 ||
             terminal.tool_calls.front().arguments_json !=
@@ -461,7 +461,7 @@ int test_empty_declared_non_string_is_omitted() {
     fi::ToolCallOutputDecoder bytewise(contract, 128);
     std::string bytewise_visible;
     for (const char byte : text) { bytewise_visible += bytewise.feed(std::string_view(&byte, 1)); }
-    auto bytewise_terminal = bytewise.finish();
+    auto bytewise_terminal = bytewise.finish(fi::ToolCallRegionEnd::ModelStop);
     failures +=
         check(bytewise_visible == "I need one more check." && bytewise_terminal.content.empty() &&
                   bytewise_terminal.tool_calls.size() == 1 &&
@@ -542,26 +542,30 @@ int test_unsupported_schema_uses_legacy_policy() {
     return failures;
 }
 
-int test_strict_structure_and_active_tool_set() {
+int test_structure_failures_and_name_salvage() {
     const auto contract = contract_for("configure", Json{{"value", Json{{"type", "string"}}}});
     int failures        = 0;
 
-    const std::string malformed = "<tool_call>\n<function=configure>\n";
-    failures +=
-        check_rejected(malformed, contract, ninfer::ToolCallParseFallbackReason::MalformedStructure,
-                       "missing structural tags were accepted");
+    const std::string end_truncated = "<tool_call>\n<function=configure>\n";
+    {
+        const auto parsed = fi::parse_qwen_tool_call_output(end_truncated, 64, contract);
+        failures += check(parsed.is_tool_call_response && parsed.tool_calls.size() == 1 &&
+                              parsed.diagnostics.structural_salvage_count == 1 &&
+                              Json::parse(parsed.tool_calls.front().arguments_json).empty(),
+                          "call ended at response end without closers was not salvaged");
+    }
 
     const std::string suffix = tool_call("configure", {{"value", "x"}}) + "\nextra answer";
-    failures +=
-        check_rejected(suffix, contract, ninfer::ToolCallParseFallbackReason::TrailingContent,
-                       "non-whitespace suffix was accepted");
-
-    const std::string missing_parameter_close =
-        "<tool_call>\n<function=configure>\n<parameter=value>\nx\n"
-        "</function>\n</tool_call>";
-    failures += check_rejected(missing_parameter_close, contract,
-                               ninfer::ToolCallParseFallbackReason::MalformedStructure,
-                               "missing parameter close was repaired");
+    {
+        const auto parsed = fi::parse_qwen_tool_call_output(suffix, 64, contract);
+        failures += check(parsed.is_tool_call_response && parsed.tool_calls.size() == 1,
+                          "call before trailing prose was dropped instead of salvaged");
+        failures += check(parsed.trailing_content == "extra answer",
+                          "trailing prose was not returned as content");
+        failures +=
+            check(parsed.diagnostics.fallback_reason == ninfer::ToolCallParseFallbackReason::None,
+                  "salvaged trailing content still counted as fallback");
+    }
 
     const std::string duplicate = tool_call("configure", {{"value", "first"}, {"value", "second"}});
     failures +=
@@ -569,14 +573,81 @@ int test_strict_structure_and_active_tool_set() {
                        "duplicate parameter was silently overwritten");
 
     const std::string unknown_tool = tool_call("other", {{"value", "x"}});
-    failures +=
-        check_rejected(unknown_tool, contract, ninfer::ToolCallParseFallbackReason::UndeclaredTool,
-                       "undeclared tool name was accepted");
+    {
+        const auto parsed = fi::parse_qwen_tool_call_output(unknown_tool, 64, contract);
+        failures += check(parsed.is_tool_call_response && parsed.tool_calls.size() == 1 &&
+                              parsed.tool_calls.front().name == "other" &&
+                              parsed.diagnostics.salvaged_call_count == 1,
+                          "undeclared tool name was not kept as a salvaged call");
+    }
 
+    // A punctuated name that resolves to no declared tool stays text: the request parsers accept
+    // only [A-Za-z0-9_-] in tool-call history, so handing it back would fail the next request.
     const std::string invalid_name = tool_call("bad.name", {{"value", "x"}});
     failures += check_rejected(invalid_name, kLegacyContract,
                                ninfer::ToolCallParseFallbackReason::InvalidToolName,
-                               "invalid function-name character was accepted");
+                               "unresolved punctuated function name was accepted");
+
+    const std::string spacey_name = "<tool_call>\n<function=bad name>\n</function>\n</tool_call>";
+    failures +=
+        check_rejected(spacey_name, contract, ninfer::ToolCallParseFallbackReason::InvalidToolName,
+                       "multi-token function name was accepted");
+    return failures;
+}
+
+int test_unresolved_punctuated_names_stay_text() {
+    // The Code Mode catalog spelling models emit for sandbox-only tools carries punctuation the
+    // request parsers reject in tool-call history ([A-Za-z0-9_-]{1,128}). Kept as a structured
+    // call it kills the conversation one turn later with a 400, so an unresolved spelling must
+    // stay ordinary text like any other malformed call.
+    const auto contract = contract_for("configure", Json{{"value", Json{{"type", "string"}}}});
+
+    int failures = 0;
+    failures += check_rejected(tool_call("tools[\"context-mode\"].ctx_batch_execute",
+                                         {{"commands", "[{\"label\":\"x\"}]"}}),
+                               contract, ninfer::ToolCallParseFallbackReason::InvalidToolName,
+                               "unresolved catalog spelling was kept as a call");
+    const auto other_only = contract_for("other", Json{{"value", Json{{"type", "string"}}}});
+    failures += check_rejected(tool_call("tools[\"srv\"][\"configure\"]", {{"value", "x"}}),
+                               other_only, ninfer::ToolCallParseFallbackReason::InvalidToolName,
+                               "namespaced reference to an undeclared tool was kept as a call");
+    return failures;
+}
+
+int test_namespaced_reference_resolves_to_declared_name() {
+    // The model writes the harness catalog reference while the
+    // tool is declared under its short name. Unwrapping only applies when the short name is
+    // itself declared, valid, and not filtered out for this turn.
+    const auto contract = contract_for("configure", Json{{"value", Json{{"type", "string"}}}});
+
+    int failures = 0;
+    for (const std::string& spelling :
+         {std::string("tools[\"srv\"][\"configure\"]"), std::string("srv.configure"),
+          std::string("srv/configure")}) {
+        const auto parsed =
+            fi::parse_qwen_tool_call_output(tool_call(spelling, {{"value", "x"}}), 64, contract);
+        failures += check(parsed.is_tool_call_response && parsed.tool_calls.size() == 1 &&
+                              parsed.tool_calls.front().name == "configure" &&
+                              parsed.diagnostics.salvaged_call_count == 1,
+                          std::string("namespaced reference was not resolved: ") + spelling);
+    }
+    return failures;
+}
+
+int test_allowed_tools_filter_stays_a_restriction() {
+    // tool_choice.allowed_tools removes the non-selected tools from the effective tool set. The
+    // output contract still learns their names: a call naming one keeps falling back to text,
+    // otherwise salvage would let the client run a tool the request excluded.
+    auto contract = contract_for("configure", Json{{"value", Json{{"type", "string"}}}});
+    contract.filtered_out_names.push_back("hidden");
+
+    int failures = 0;
+    failures += check_rejected(tool_call("hidden", {{"value", "x"}}), contract,
+                               ninfer::ToolCallParseFallbackReason::FilteredTool,
+                               "call to a tool filtered out for this turn became structured");
+    failures += check_rejected(tool_call("srv.hidden", {{"value", "x"}}), contract,
+                               ninfer::ToolCallParseFallbackReason::InvalidToolName,
+                               "namespaced reference to a filtered-out tool was accepted");
     return failures;
 }
 
@@ -634,12 +705,57 @@ int test_conflicting_duplicate_tool_contracts_use_legacy_normalization() {
     return failures;
 }
 
-int test_all_or_nothing_structural_commit() {
+int test_partial_region_salvages_truncated_call() {
     const auto contract    = contract_for("configure", Json{{"flag", Json{{"type", "boolean"}}}});
     const std::string text = tool_call("configure", {{"flag", "true"}}) +
                              "\n<tool_call>\n<function=configure>\n<parameter=flag>\nfalse\n";
-    return check_rejected(text, contract, ninfer::ToolCallParseFallbackReason::MalformedStructure,
-                          "partially valid tool-call region was partially committed");
+    const auto parsed = fi::parse_qwen_tool_call_output(text, 64, contract);
+
+    int failures = 0;
+    failures += check(parsed.is_tool_call_response && parsed.tool_calls.size() == 2 &&
+                          parsed.diagnostics.structural_salvage_count == 1,
+                      "region with one complete and one end-truncated call was fully rejected");
+    if (parsed.tool_calls.size() == 2) {
+        const Json first  = Json::parse(parsed.tool_calls[0].arguments_json);
+        const Json second = Json::parse(parsed.tool_calls[1].arguments_json);
+        failures += check(first.at("flag") == true && second.at("flag") == false,
+                          "partial commit changed call argument bytes");
+    }
+    return failures;
+}
+
+int test_unambiguous_structural_salvage() {
+    const auto contract = contract_for("configure", Json{{"value", Json{{"type", "string"}}}});
+    int failures        = 0;
+
+    // Seen in model output: a stray closer before any parameter was opened, then a normal close.
+    const std::string stray =
+        "<tool_call>\n<function=configure>\n</parameter>\n</function>\n</tool_call>";
+    const auto stray_parsed = fi::parse_qwen_tool_call_output(stray, 64, contract);
+    failures += check(stray_parsed.is_tool_call_response && stray_parsed.tool_calls.size() == 1 &&
+                          stray_parsed.diagnostics.structural_salvage_count == 1,
+                      "stray parameter close before any parameter lost the call");
+
+    // Both function and tool closers missing at the end of the response, parameter fully closed.
+    const std::string no_closers =
+        "<tool_call>\n<function=configure>\n<parameter=value>\nx\n</parameter>\n";
+    const auto no_closers_parsed = fi::parse_qwen_tool_call_output(no_closers, 64, contract);
+    failures += check(no_closers_parsed.tool_calls.size() == 1 &&
+                          no_closers_parsed.diagnostics.structural_salvage_count == 1,
+                      "missing closers at response end lost the call");
+    if (no_closers_parsed.tool_calls.size() == 1) {
+        const Json args = Json::parse(no_closers_parsed.tool_calls.front().arguments_json);
+        failures += check(args.at("value") == "x", "salvaged call changed closed parameter bytes");
+    }
+
+    // Ambiguous damage stays rejected: a closer exists but belongs to another depth, so the
+    // value end would be a guess.
+    const std::string ambiguous =
+        "<tool_call>\n<function=configure>\n<parameter=value>\nx\n</function>\n</tool_call>";
+    failures +=
+        check_rejected(ambiguous, contract, ninfer::ToolCallParseFallbackReason::MalformedStructure,
+                       "ambiguous value end was guessed into a call");
+    return failures;
 }
 
 int test_incremental_valid_and_boolean() {
@@ -648,7 +764,7 @@ int test_incremental_valid_and_boolean() {
     visible += legacy.feed("Calling weather.  \n<tool_");
     visible += legacy.feed("call>\n<function=get_weather>");
     visible += legacy.feed("\n</function>\n</tool_call>");
-    auto legacy_terminal = legacy.finish();
+    auto legacy_terminal = legacy.finish(fi::ToolCallRegionEnd::ModelStop);
     visible += legacy_terminal.content;
 
     auto bool_contract =
@@ -658,7 +774,7 @@ int test_incremental_valid_and_boolean() {
     boolean_visible += boolean.feed("<tool_call>\n<function=configure>\n<parameter=enabled>\nT");
     boolean_visible += boolean.feed("r");
     boolean_visible += boolean.feed("ue\n</parameter>\n</function>\n</tool_call>");
-    auto boolean_terminal = boolean.finish();
+    auto boolean_terminal = boolean.finish(fi::ToolCallRegionEnd::ModelStop);
 
     int failures = 0;
     failures += check(visible == "Calling weather." && legacy_terminal.tool_calls.size() == 1,
@@ -675,25 +791,26 @@ int test_incremental_valid_and_boolean() {
 }
 
 int test_incremental_fallback_preserves_bytes() {
+    // Cut short (token budget, stop string, cancellation): the open call is restored verbatim.
     const std::string original = "prefix  \n<tool_call>\n<function=broken>";
     fi::ToolCallOutputDecoder malformed(std::make_shared<fi::ToolCallOutputContract>(), 64);
     std::string restored;
     restored += malformed.feed(original.substr(0, 10));
     restored += malformed.feed(original.substr(10));
-    auto malformed_terminal = malformed.finish();
+    auto malformed_terminal = malformed.finish(fi::ToolCallRegionEnd::Cut);
     restored += malformed_terminal.content;
 
     fi::ToolCallOutputDecoder ordinary(std::make_shared<fi::ToolCallOutputContract>(), 64);
     std::string ordinary_text;
     ordinary_text += ordinary.feed("ordinary text  ");
-    ordinary_text += ordinary.finish().content;
+    ordinary_text += ordinary.finish(fi::ToolCallRegionEnd::ModelStop).content;
 
     const std::string partial_original = "  <tool_x then <tool_";
     fi::ToolCallOutputDecoder partial(std::make_shared<fi::ToolCallOutputContract>(), 64);
     std::string partial_restored;
     partial_restored += partial.feed("  <too");
     partial_restored += partial.feed("l_x then <tool_");
-    partial_restored += partial.finish().content;
+    partial_restored += partial.finish(fi::ToolCallRegionEnd::ModelStop).content;
 
     int failures = 0;
     failures += check(restored == original && malformed_terminal.diagnostics.marker_seen &&
@@ -704,6 +821,90 @@ int test_incremental_fallback_preserves_bytes() {
                       "ordinary incremental output lost trailing whitespace");
     failures +=
         check(partial_restored == partial_original, "partial marker mismatch lost raw bytes");
+    return failures;
+}
+
+// The repairs that read the end of the output as the end of a call (missing closers, an
+// unterminated last parameter) need the model's own stop: a budget or stop string cuts the call
+// short, and its arguments would then be a prefix the client executes.
+int test_end_repairs_need_model_stop() {
+    const auto contract = contract_for("configure", Json{{"value", Json{{"type", "string"}}}});
+    int failures        = 0;
+    for (const std::string& text :
+         {std::string("<tool_call>\n<function=configure>\n"),
+          std::string("<tool_call>\n<function=configure>\n<parameter=value>\nx\n</parameter>\n"),
+          std::string("<tool_call>\n<function=configure>\n<parameter=value>\nx\n</parameter>\n"
+                      "</function>\n"),
+          std::string("<tool_call>\n<function=configure>\n<parameter=value>\nhalf a val")}) {
+        const auto stopped =
+            fi::parse_qwen_tool_call_output(text, 64, contract, fi::ToolCallRegionEnd::ModelStop);
+        failures += check(stopped.is_tool_call_response && stopped.tool_calls.size() == 1 &&
+                              stopped.diagnostics.structural_salvage_count == 1,
+                          "end repair did not apply after the model's stop: " + text);
+        const auto cut =
+            fi::parse_qwen_tool_call_output(text, 64, contract, fi::ToolCallRegionEnd::Cut);
+        failures += check(!cut.is_tool_call_response && cut.content == text &&
+                              cut.diagnostics.fallback_reason ==
+                                  ninfer::ToolCallParseFallbackReason::MalformedStructure,
+                          "a call cut short became structured: " + text);
+
+        fi::ToolCallOutputDecoder decoder(
+            output_contract_for("configure", Json{{"value", Json{{"type", "string"}}}}), 64);
+        std::string restored = decoder.feed("Checking.\n" + text);
+        const auto terminal  = decoder.finish(fi::ToolCallRegionEnd::Cut);
+        restored += terminal.content;
+        failures += check(restored == "Checking.\n" + text && terminal.tool_calls.empty(),
+                          "decoder committed a call cut short: " + text);
+    }
+    // The stray closer before any parameter does not read the end: it applies either way.
+    const std::string stray =
+        "<tool_call>\n<function=configure>\n</parameter>\n</function>\n</tool_call>";
+    failures +=
+        check(fi::parse_qwen_tool_call_output(stray, 64, contract, fi::ToolCallRegionEnd::Cut)
+                      .tool_calls.size() == 1,
+              "stray parameter close repair depended on the output end");
+    return failures;
+}
+
+// Prose after complete calls returns as content; prose that carries more call markup is a call the
+// parser could not read, so the whole region stays text instead of running only the first calls.
+int test_trailing_prose_and_markup() {
+    const auto contract     = contract_for("configure", Json{{"value", Json{{"type", "string"}}}});
+    int failures            = 0;
+    const std::string first = tool_call("configure", {{"value", "x"}});
+    failures += check_rejected(first + "\nThen: <tool_call>\n<function=configure>\nbroken",
+                               contract, ninfer::ToolCallParseFallbackReason::TrailingContent,
+                               "calls before unreadable call markup were committed");
+    failures += check_rejected(first + "\nI will call <function=configure> next", contract,
+                               ninfer::ToolCallParseFallbackReason::TrailingContent,
+                               "calls before function markup in trailing text were committed");
+    // Every call tag counts, closers included: such prose holds a call the parser did not read.
+    for (const std::string tag :
+         {"</function>", "<parameter=value>", "</parameter>", "</tool_call>"}) {
+        failures += check_rejected(first + "\nDone, then " + tag + " more", contract,
+                                   ninfer::ToolCallParseFallbackReason::TrailingContent,
+                                   "calls before " + tag + " in trailing text were committed");
+    }
+
+    // Streaming: the prose before the calls was published rounds earlier; the trailing prose
+    // follows it with the whitespace the model wrote before the calls, never glued to it.
+    const auto streamed = [&](std::string_view before, std::string_view region) {
+        fi::ToolCallOutputDecoder decoder(
+            output_contract_for("configure", Json{{"value", Json{{"type", "string"}}}}), 64);
+        std::string visible = decoder.feed(before);
+        visible += decoder.feed(region);
+        const auto terminal = decoder.finish(fi::ToolCallRegionEnd::ModelStop);
+        return std::make_pair(visible + terminal.content, terminal.tool_calls.size());
+    };
+    const auto spaced = streamed("Let me check.", "\n\n" + first + "\nextra answer\n");
+    failures += check(spaced.first == "Let me check.\n\nextra answer" && spaced.second == 1,
+                      "trailing prose lost the separator the model wrote: " + spaced.first);
+    const auto glued = streamed("Let me check.", first + "extra answer");
+    failures += check(glued.first == "Let me check.\nextra answer" && glued.second == 1,
+                      "trailing prose was welded onto published content: " + glued.first);
+    const auto alone = streamed("", "\n" + first + "\nextra answer");
+    failures += check(alone.first == "extra answer" && alone.second == 1,
+                      "trailing prose without earlier content gained a separator: " + alone.first);
     return failures;
 }
 
@@ -719,7 +920,7 @@ int test_incremental_embedded_parameter_markup() {
     for (std::size_t offset = 0; offset < text.size(); offset += kChunk) {
         visible += decoder.feed(std::string_view(text).substr(offset, kChunk));
     }
-    auto terminal = decoder.finish();
+    auto terminal = decoder.finish(fi::ToolCallRegionEnd::ModelStop);
 
     int failures = 0;
     failures +=
@@ -730,6 +931,110 @@ int test_incremental_embedded_parameter_markup() {
         failures += check(args.at("command") == command,
                           "chunked embedded parameter markup changed string bytes");
     }
+    return failures;
+}
+
+// A last value runs to the model's stop only when no call markup follows it: a `</tool_call>` or
+// the next `<parameter=` would otherwise become part of the argument (here the command a client
+// would execute), so such a region stays text.
+int test_unterminated_value_takes_no_call_markup() {
+    const auto contract = contract_for("bash", Json{{"command", Json{{"type", "string"}}},
+                                                    {"timeout", Json{{"type", "integer"}}}});
+    int failures        = 0;
+    for (const std::string& text :
+         {std::string("<tool_call>\n<function=bash>\n<parameter=command>\nls\n</tool_call>"),
+          std::string("<tool_call>\n<function=bash>\n<parameter=command>\nls\n</tool_call>\n"),
+          std::string("<tool_call>\n<function=bash>\n<parameter=command>\nls\n"
+                      "<parameter=timeout>\n5\n")}) {
+        failures +=
+            check_rejected(text, contract, ninfer::ToolCallParseFallbackReason::MalformedStructure,
+                           "an unterminated value took call markup: " + text);
+    }
+    return failures;
+}
+
+// A `</tool_call>` where the next call should open closes nothing: it is dropped, like a stray
+// `</parameter>`, and neither ends the turn as text nor reaches the client as prose.
+int test_stray_tool_call_closer_after_calls() {
+    const auto contract      = contract_for("configure", Json{{"value", Json{{"type", "string"}}}});
+    const std::string first  = tool_call("configure", {{"value", "x"}});
+    const std::string second = tool_call("configure", {{"value", "y"}});
+    int failures             = 0;
+
+    const auto alone = fi::parse_qwen_tool_call_output(first + "\n</tool_call>", 64, contract);
+    failures += check(alone.is_tool_call_response && alone.tool_calls.size() == 1 &&
+                          alone.content.empty() && alone.trailing_content.empty() &&
+                          alone.diagnostics.structural_salvage_count == 1,
+                      "a stray </tool_call> after a complete call was not dropped");
+    const auto prose =
+        fi::parse_qwen_tool_call_output(first + "\n</tool_call>\nDone.", 64, contract);
+    failures += check(prose.is_tool_call_response && prose.tool_calls.size() == 1 &&
+                          prose.trailing_content == "Done.",
+                      "the prose after a stray </tool_call> changed: " + prose.trailing_content);
+    const auto two =
+        fi::parse_qwen_tool_call_output(first + "</tool_call>\n" + second, 64, contract);
+    failures += check(two.is_tool_call_response && two.tool_calls.size() == 2 &&
+                          two.trailing_content.empty(),
+                      "a stray </tool_call> between two calls lost the second call");
+
+    fi::ToolCallOutputDecoder decoder(
+        output_contract_for("configure", Json{{"value", Json{{"type", "string"}}}}), 64);
+    std::string visible = decoder.feed("Let me check.\n");
+    visible += decoder.feed(first + "\n</tool_call>\n");
+    const auto terminal = decoder.finish(fi::ToolCallRegionEnd::ModelStop);
+    visible += terminal.content;
+    failures += check(visible == "Let me check." && terminal.tool_calls.size() == 1,
+                      "streamed stray </tool_call> reached the content: " + visible);
+    return failures;
+}
+
+// Responses flattens a namespace member to `<namespace>__<name>` (openai_responses_request.cpp).
+// A catalog spelling of such a member resolves to that declared name, not to a plain tool that
+// shares its last segment; the plain tool keeps its own spellings.
+int test_catalog_spelling_resolves_namespace_member() {
+    const Json value                           = Json{{"value", Json{{"type", "string"}}}};
+    const std::vector<std::string> definitions = {tool_definition("Read", value),
+                                                  tool_definition("srv__Read", value),
+                                                  tool_definition("mcp__clock__now", value)};
+    const auto contract                        = contract_from_definitions(definitions);
+    int failures                               = 0;
+    const auto resolved                        = [&](const fi::ToolCallOutputContract& tools,
+                              const std::string& spelling) {
+        const auto parsed =
+            fi::parse_qwen_tool_call_output(tool_call(spelling, {{"value", "x"}}), 64, tools);
+        return parsed.tool_calls.size() == 1 && parsed.diagnostics.salvaged_call_count == 1
+                                          ? parsed.tool_calls.front().name
+                                          : std::string();
+    };
+    for (const std::string& spelling : {std::string("srv.Read"), std::string("srv/Read"),
+                                        std::string("tools[\"srv\"][\"Read\"]")}) {
+        failures += check(resolved(*contract, spelling) == "srv__Read",
+                          "namespace member spelling did not resolve to srv__Read: " + spelling);
+    }
+    failures += check(resolved(*contract, "mcp__clock.now") == "mcp__clock__now",
+                      "a namespace with an underscore pair did not resolve");
+    failures += check(resolved(*contract, "other.Read") == "Read",
+                      "a spelling outside every namespace lost the plain tool");
+
+    const std::vector<std::string> member_only = {tool_definition("srv__Read", value)};
+    failures += check(resolved(*contract_from_definitions(member_only), "srv.Read") == "srv__Read",
+                      "a namespace member declared alone did not resolve");
+
+    // A spelling holds name bytes and . [ ] / " ' only: prose, line breaks or markup in the name
+    // are not a catalog reference, even when they end in one.
+    for (const std::string& name : {std::string("I will use srv.Read"),
+                                    std::string("call\nsrv.Read"), std::string("x<y.Read")}) {
+        failures += check_rejected(tool_call(name, {{"value", "x"}}), *contract,
+                                   ninfer::ToolCallParseFallbackReason::InvalidToolName,
+                                   "a name with prose resolved as a catalog spelling: " + name);
+    }
+
+    // A filtered member stays text even when a plain tool shares its last segment.
+    auto filtered = *contract_from_definitions({tool_definition("Read", value)});
+    filtered.filtered_out_names.push_back("srv__Read");
+    failures += check_rejected(tool_call("srv.Read", {{"value", "x"}}), filtered,
+                               ninfer::ToolCallParseFallbackReason::InvalidToolName,
+                               "a filtered namespace member resolved to the plain tool");
     return failures;
 }
 
@@ -749,13 +1054,22 @@ int main() {
     failures += test_empty_declared_non_string_is_omitted();
     failures += test_schema_mismatches_remain_structured();
     failures += test_unsupported_schema_uses_legacy_policy();
-    failures += test_strict_structure_and_active_tool_set();
+    failures += test_structure_failures_and_name_salvage();
+    failures += test_unresolved_punctuated_names_stay_text();
+    failures += test_namespaced_reference_resolves_to_declared_name();
+    failures += test_allowed_tools_filter_stays_a_restriction();
     failures += test_name_limits_and_non_strict_omissions();
     failures += test_conflicting_duplicate_tool_contracts_use_legacy_normalization();
-    failures += test_all_or_nothing_structural_commit();
+    failures += test_partial_region_salvages_truncated_call();
+    failures += test_unambiguous_structural_salvage();
     failures += test_incremental_valid_and_boolean();
     failures += test_incremental_fallback_preserves_bytes();
     failures += test_incremental_embedded_parameter_markup();
+    failures += test_end_repairs_need_model_stop();
+    failures += test_trailing_prose_and_markup();
+    failures += test_unterminated_value_takes_no_call_markup();
+    failures += test_stray_tool_call_closer_after_calls();
+    failures += test_catalog_spelling_resolves_namespace_member();
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }

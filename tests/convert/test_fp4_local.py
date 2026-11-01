@@ -2,14 +2,16 @@
 
 References are written here from the format definitions; the CSF reference decoder and encoder are
 transcriptions of vLLM PR #60646 (``csf_scales.py`` and its test, Apache-2.0), not of the code under
-test. Tests marked ``real`` read the downloaded checkpoint (skipped where it is absent) and compare
-against bytes read straight from the safetensors files.
+test. Tests marked ``real`` read the downloaded checkpoint at ``NINFER_TEST_FP4_LOCAL_CHECKPOINT``
+(skipped when it is unset or holds no checkpoint) and compare against bytes read straight from the
+safetensors files.
 """
 
 from __future__ import annotations
 
 import json
 import math
+import os
 from pathlib import Path
 import struct
 
@@ -32,8 +34,11 @@ from tools.convert.sources.csf import decode_csf, decode_csf_slabs, exception_wo
 from tools.convert.sources.modelopt import nvfp4_row_table_source, nvfp4_source
 from tools.convert.sources.safetensors import SafetensorsSource
 
-REAL = Path("/mnt/archivio/models/qwen3.8-flash-next-fp4-local")
-real = pytest.mark.skipif(not (REAL / "model.safetensors.index.json").is_file(), reason="FP4-Local checkpoint absent")
+REAL = Path(os.environ.get("NINFER_TEST_FP4_LOCAL_CHECKPOINT", ""))
+real = pytest.mark.skipif(
+    not os.environ.get("NINFER_TEST_FP4_LOCAL_CHECKPOINT") or not (REAL / "model.safetensors.index.json").is_file(),
+    reason="NINFER_TEST_FP4_LOCAL_CHECKPOINT does not name an FP4-Local checkpoint",
+)
 LM = "model.language_model."
 MXFP8 = "mxfp8_e4m3fn_g32_ue8m0"
 NVFP4_ROW = "nvfp4_row_e4m3_g16"

@@ -10,7 +10,6 @@
 #include "core/weight.h"
 #include "ninfer/ops/sampling.h"
 #include "ninfer/ops/softmax_attention.h"
-#include "ninfer/ops/sparse_moe.h"
 #include "models/qwen3_5/state/decoder_state.h"
 #include "models/qwen3_5/execution/tp.h"
 #include "models/qwen3_5/frontend/prepared_prompt.h"
@@ -25,15 +24,9 @@
 
 namespace ninfer::models::qwen3_5::execution {
 
-using Phase = qwen3_5::TextPhase;
-
 enum class GdnStateAction : std::uint8_t {
     UpdateInPlace,
     RecordForReplay,
-};
-
-struct NullTap {
-    static constexpr bool enabled = false;
 };
 
 struct PrefillChunkResult {
@@ -43,8 +36,7 @@ struct PrefillChunkResult {
 };
 
 struct DFlashFeatureSink {
-    static constexpr bool enabled = true;
-    using PrefillConsumer         = std::function<void(const Tensor&, const Tensor&, bool)>;
+    using PrefillConsumer = std::function<void(const Tensor&, const Tensor&, bool)>;
 
     Tensor* features                  = nullptr;
     Tensor* positions                 = nullptr;
@@ -70,7 +62,14 @@ struct DFlashFeatureSink {
 };
 
 class VisionPrefillSession;
+struct VisionChunk;
 struct Qwen4Runtime;
+struct Qwen4Columns;
+struct Qwen4State;
+template <class Arena>
+struct Qwen4Rank;
+template <class Arena>
+class Qwen4Forward;
 
 class TextContext {
 public:
@@ -113,15 +112,11 @@ public:
     void set_linear_state_slots(std::int32_t source_slot, std::int32_t destination_slot);
     void set_gdn_state_action(GdnStateAction action, const GdnReplayRecords* replay_records);
 
-    // Qwen4Exp: the Program's runtime inputs (expert backend, PLE states and staging). Required
-    // before any Qwen4Exp call; ignored by the Qwen3.5 architectures.
+    // The Program's runtime inputs of the Text forward (expert backend, PLE states and staging;
+    // the experts only with routed experts). Required before any Text call.
     void set_qwen4_runtime(const Qwen4Runtime* runtime) noexcept { qwen4_runtime_ = runtime; }
 
     [[nodiscard]] const LinearParameters* proposal_head() const noexcept { return proposal_head_; }
-
-    [[nodiscard]] const std::int32_t* proposal_head_ids() const noexcept {
-        return proposal_head_ids_;
-    }
 
     [[nodiscard]] int proposal_head_n() const noexcept { return proposal_head_n_; }
 
@@ -185,22 +180,6 @@ private:
         return mtp_kv_.valid() || batch_mtp_kv_ != nullptr;
     }
 
-    void attn_mix(const BlockParameters& weights, Tensor& x, int index, Phase phase);
-    void gdn_mix(const BlockParameters& weights, Tensor& x, int index, Phase phase);
-    void mlp_tail(const BlockParameters& weights, Tensor& x, Phase phase,
-                  const ops::SparseMoeHints& hints);
-    [[nodiscard]] ops::SparseMoeHints next_projection_hints(int layer) const;
-    void run_layers(Tensor& x, Phase phase);
-    template <class Tap>
-    void run_layers(Tensor& x, Phase phase, Tap& tap);
-    template <class Tap>
-    void target_verify_batch_impl(const Tensor& ids, const Tensor& cache_positions,
-                                  const Tensor& rope_positions, const Tensor& valid_columns,
-                                  const Tensor& kv_table_rows,
-                                  const Tensor& linear_state_source_slots,
-                                  ops::CausalAttentionExecutionEnvelope envelope, Tensor& hidden,
-                                  Tensor& logits, Tensor& target_tokens, Tap& tap);
-
     void mtp_forward_stem(const Tensor& ids, const Tensor& hidden, const Tensor* input_embeddings,
                           Tensor& x, Tensor& ah);
     void mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& positions,
@@ -215,6 +194,17 @@ private:
                            ops::CausalAttentionExecutionEnvelope envelope, bool final_chunk,
                            Tensor* final_hidden, Tensor* logits, Tensor* draft_token);
     void proposal_argmax(const Tensor& hidden, Tensor& logits, Tensor& proposal_tokens);
+    // The Qwen3.5 MTP head's prompt alignment of one prefill chunk (text.cpp; driven by
+    // qwen4_text.cpp's prefill).
+    void mtp_prompt_chunk(std::span<const int> alignment_ids, std::uint32_t alignment_begin,
+                          int len, int total, int base_i, bool is_last, const Tensor& xf,
+                          const Tensor& positions, const Tensor& rope_positions,
+                          ops::CausalAttentionExecutionEnvelope chunk_envelope, bool multimodal,
+                          const VisionChunk& vision_chunk);
+
+    // The MTP head the Qwen4 forward drives: the Qwen4 layer (qwen4_mtp_, hyper-connections) or,
+    // for a dense Qwen3.5 model, the Qwen3.5 head (mtp_) through the Qwen3.5 MTP entry points.
+    [[nodiscard]] bool qwen4_mtp_layer() const noexcept { return qwen4_mtp_ != nullptr; }
 
     struct MultimodalPrefill {
         std::span<const int> token_ids;
@@ -229,18 +219,12 @@ private:
         std::uint32_t begin = 0;
     };
 
-    template <class Tap>
-    [[nodiscard]] PrefillChunkResult
-    prefill_impl(std::span<const int> ids, const TextPrefill* text_prefill,
-                 const MultimodalPrefill* multimodal, Tap& tap, bool finalize_at_end);
+    // The Text forward (execution/qwen4_text.cpp, qwen4_forward.h).
 
-    // Qwen4Exp (execution/qwen4_text.cpp).
-    [[nodiscard]] bool qwen4() const noexcept { return parameters_.qwen4.has_value(); }
-
-    // Rows of the hidden a round carries: Qwen4Exp carries the wide residual (S*H), the other
-    // architectures the final-normed hidden (H).
+    // Rows of the hidden a round carries: the wide residual (S*H) with hyper-connections, the
+    // final-normed hidden (H) without them.
     [[nodiscard]] std::int32_t carried_hidden_rows() const noexcept {
-        return qwen4() ? dimension(config_.residual_width()) : dimension(config_.hidden_size);
+        return dimension(config_.residual_width());
     }
 
     [[nodiscard]] const Qwen4Runtime& qwen4_runtime() const;
@@ -249,10 +233,14 @@ private:
                                                     const MultimodalPrefill* multimodal) const;
     // One prompt chunk of a text (`text_prefill`) or multimodal (`multimodal`) prompt: exactly one
     // of them names the whole prompt.
+    // `sink` (plain residual only): a DFlash drafter's target features of the chunk.
     [[nodiscard]] PrefillChunkResult qwen4_prefill(std::span<const int> ids,
                                                    const TextPrefill* text_prefill,
                                                    const MultimodalPrefill* multimodal,
-                                                   bool finalize_at_end);
+                                                   bool finalize_at_end,
+                                                   DFlashFeatureSink* sink = nullptr);
+    // A DFlashFeatureSink (and at tp 2 the peer sink) as the Qwen4 forward's feature tap.
+    class Qwen4SinkTap;
 
     // The shifted visual columns of a multimodal chunk's MTP prompt input: each rank's merged
     // Vision embeddings of the chunk's item (rank 1's only at tp 2), the chunk-relative MTP
@@ -263,6 +251,32 @@ private:
         std::size_t source_begin = 0;
     };
 
+    // The forward's ranks: 2 at tensor-parallel width 2, else 1; each rank's arena (rank 1's null
+    // at one device), runtime and device.
+    [[nodiscard]] int qwen4_width() const noexcept;
+    [[nodiscard]] std::array<WorkspaceArena*, 2> qwen4_arenas() const noexcept;
+    void reset_qwen4_arenas();
+    [[nodiscard]] std::array<const Qwen4Runtime*, 2> qwen4_runtimes() const;
+    [[nodiscard]] int qwen4_device(int rank) const noexcept;
+    // Rank `rank`'s operands of a Text forward over `columns` and `state`: at one device the
+    // logical config, at tp 2 the rank's shard geometry.
+    [[nodiscard]] Qwen4Rank<WorkspaceArena> qwen4_rank(int rank, const Qwen4Columns& columns,
+                                                       const Qwen4State& state) const;
+    // The Text forward over `ranks` (rank 0 first) for `columns` columns.
+    [[nodiscard]] Qwen4Forward<WorkspaceArena>
+    qwen4_forward(const std::array<Qwen4Rank<WorkspaceArena>, 2>& ranks,
+                  std::int32_t columns) const;
+    // Rank `rank`'s Main KV cache, with its QSA index planes for a model with QSA (`call` names
+    // the execution in the error).
+    [[nodiscard]] const qwen3_5::PagedKVCache& qwen4_text_cache(int rank, const char* call) const;
+    // The complete logits on rank 0 from each rank's output head input (vocabulary-split at tp 2).
+    void qwen4_logits(const RankTensors& x, Tensor& logits);
+    // Each rank's copy of rank 0's device ids (rank 1's: qwen4_ids_on_rank1).
+    [[nodiscard]] RankTensors qwen4_rank_ids(const Tensor& ids);
+    // Every rank's Qwen4 MTP layer, with (`cache`) the MTP KV cache and its QSA planes required.
+    [[nodiscard]] std::array<const Qwen4MtpParameters*, 2>
+    qwen4_mtp_layers(const char* call, bool cache = true) const;
+
     void qwen4_ordinary_decode(const Tensor& ids, const Tensor& cache_positions,
                                const Tensor& rope_positions, const Tensor& kv_table_rows,
                                const Tensor& source_slots, const Tensor& destination_slots,
@@ -271,66 +285,73 @@ private:
     // tp 2 (both ranks in lockstep, rank 1's operands from TpExecution; qwen4_text.cpp).
     void validate_tensor_parallel_qwen4();
     [[nodiscard]] const Qwen4Runtime& qwen4_peer_runtime() const;
-    [[nodiscard]] PrefillChunkResult qwen4_prefill_tp2(std::span<const int> ids,
-                                                       const TextPrefill* text_prefill,
-                                                       const MultimodalPrefill* multimodal,
-                                                       bool finalize_at_end);
-    void qwen4_ordinary_decode_tp2(const Tensor& ids, const Tensor& cache_positions,
-                                   const Tensor& rope_positions, const Tensor& kv_table_rows,
-                                   const Tensor& source_slots, const Tensor& destination_slots,
-                                   ops::CausalAttentionExecutionEnvelope envelope, Tensor& hidden,
-                                   Tensor& logits);
-    // MTP at tp 2 (T33): the verification over both ranks, the MTP layer per rank (each rank
-    // embeds its own copy of the ids), the proposal through the replicated MTP output mixer and
-    // the vocabulary-split head, and the prompt's MTP KV and drafts.
-    void qwen4_target_verify_tp2(const RankTensors& ids, const RankTensors& cache_positions,
-                                 const RankTensors& rope_positions,
-                                 const RankTensors& valid_columns, const RankTensors& kv_table_rows,
-                                 const RankTensors& source_slots,
-                                 ops::CausalAttentionExecutionEnvelope envelope,
-                                 const RankTensors& hidden, Tensor& logits, Tensor& target_tokens);
-    void qwen4_mtp_forward_decode_tp2(const Tensor& ids, const RankTensors& hidden,
-                                      const RankTensors& cache_positions,
-                                      const RankTensors& rope_positions,
-                                      const RankTensors& valid_columns,
-                                      const RankTensors& kv_table_rows,
-                                      ops::CausalAttentionExecutionEnvelope envelope,
-                                      const RankTensors& mtp_hidden);
-    void qwen4_mtp_propose_tp2(const RankTensors& hidden, Tensor& logits, Tensor& draft_tokens,
-                               Tensor* draft_logprobs = nullptr);
-    void qwen4_mtp_prefill_tp2(const Tensor& ids, const RankTensors& hidden,
-                               const RankTensors& positions, const RankTensors& rope_positions,
-                               std::uint32_t max_visible, bool propose,
-                               const Qwen4MtpVisual* visual = nullptr);
-    // T66b: the prefix-reuse bridge column and its proposal steps over both ranks.
-    void qwen4_mtp_forward_batch_tp2(const Tensor& ids, const RankTensors& hidden,
-                                     const RankTensors& positions,
-                                     const RankTensors& rope_positions,
-                                     ops::CausalAttentionExecutionEnvelope envelope,
-                                     const RankTensors& mtp_hidden, int logits_column,
-                                     Tensor* logits, Tensor* draft_token,
-                                     const Tensor* input_embeddings);
     // Rank 1's copy (its transient arena) of rank 0's device ids, ordered after rank 0's stream.
     [[nodiscard]] Tensor qwen4_ids_on_rank1(const Tensor& ids);
+    // The speculative calls take each rank's operands (rank 1's only at tp 2); the one-device
+    // overloads validate single tensors and run as rank 0. MTP (T33 at tp 2): the verification,
+    // the MTP layer per rank (each rank embeds its own copy of the ids), the proposal through the
+    // replicated MTP output mixer and the output head, and the prompt's MTP KV and drafts.
     void qwen4_target_verify(const Tensor& ids, const Tensor& cache_positions,
                              const Tensor& rope_positions, const Tensor& valid_columns,
                              const Tensor& kv_table_rows, const Tensor& source_slots,
                              ops::CausalAttentionExecutionEnvelope envelope, Tensor& hidden,
-                             Tensor& logits, Tensor& target_tokens);
+                             Tensor& logits, Tensor& target_tokens,
+                             DFlashFeatureSink* sink = nullptr);
+    void qwen4_target_verify(const RankTensors& ids, const RankTensors& cache_positions,
+                             const RankTensors& rope_positions, const RankTensors& valid_columns,
+                             const RankTensors& kv_table_rows, const RankTensors& source_slots,
+                             ops::CausalAttentionExecutionEnvelope envelope,
+                             const RankTensors& hidden, Tensor& logits, Tensor& target_tokens,
+                             DFlashFeatureSink* sink = nullptr);
     void qwen4_mtp_forward_decode(const Tensor& ids, const Tensor& hidden,
                                   const Tensor& cache_positions, const Tensor& rope_positions,
                                   const Tensor& valid_columns, const Tensor& kv_table_rows,
                                   ops::CausalAttentionExecutionEnvelope envelope,
                                   Tensor& mtp_hidden);
+    void qwen4_mtp_forward_decode(const Tensor& ids, const RankTensors& hidden,
+                                  const RankTensors& cache_positions,
+                                  const RankTensors& rope_positions,
+                                  const RankTensors& valid_columns,
+                                  const RankTensors& kv_table_rows,
+                                  ops::CausalAttentionExecutionEnvelope envelope,
+                                  const RankTensors& mtp_hidden);
     void qwen4_mtp_forward_batch(const Tensor& ids, const Tensor& hidden, const Tensor& positions,
                                  ops::CausalAttentionExecutionEnvelope envelope, Tensor& mtp_hidden,
                                  int logits_column, Tensor* logits, Tensor* draft_token,
                                  const Tensor* explicit_rope_positions,
                                  const Tensor* input_embeddings);
-    void qwen4_mtp_propose(const Tensor& hidden, Tensor& logits, Tensor& draft_tokens,
+    // T66b at tp 2: the prefix-reuse bridge column and its proposal steps over both ranks.
+    void qwen4_mtp_forward_batch(const Tensor& ids, const RankTensors& hidden,
+                                 const RankTensors& positions, const RankTensors& rope_positions,
+                                 ops::CausalAttentionExecutionEnvelope envelope,
+                                 const RankTensors& mtp_hidden, int logits_column, Tensor* logits,
+                                 Tensor* draft_token, const Tensor* input_embeddings);
+    void qwen4_mtp_propose(const RankTensors& hidden, Tensor& logits, Tensor& draft_tokens,
                            Tensor* draft_logprobs = nullptr);
-    void qwen4_mtp_prefill(const Tensor& ids, const Tensor& hidden, const Tensor& positions,
-                           const Tensor& rope_positions, std::uint32_t max_visible, bool propose,
+    struct Qwen4ChunkInputs;
+    [[nodiscard]] Qwen4ChunkInputs qwen4_chunk_inputs(std::span<const int> ids, int len, int base_i,
+                                                      std::span<const std::int32_t> rope_rows,
+                                                      std::span<const std::int32_t> visual_columns,
+                                                      std::int32_t merged_begin,
+                                                      const VisionChunk& vision_chunk,
+                                                      std::uint32_t ple_width);
+    void upload_chunk_ple(Qwen4ChunkInputs& in, int rank, int len, std::uint32_t ple_width);
+    void qwen4_prompt_token(Qwen4Forward<WorkspaceArena>& forward, const RankTensors& xf, int len,
+                            int total, std::span<const int> prompt);
+    void qwen4_retain_chunk(const RankTensors& xf, int len, bool rewrite, DFlashFeatureSink* sink);
+    void qwen4_mtp_prompt_chunk(std::span<const int> prompt, std::uint32_t base, int len,
+                                bool is_last, const RankTensors& xf, const RankTensors& positions,
+                                const RankTensors& rope_positions, const VisionChunk& vision_chunk);
+    void qwen4_mtp_columns(const std::array<const Qwen4MtpParameters*, 2>& mtp,
+                           const RankTensors& ids, const RankTensors& hidden, RankTensors& out,
+                           const RankTensors& positions, const RankTensors& rope_positions,
+                           std::int32_t count, bool append_only, std::uint32_t max_visible,
+                           const RankTensors* embeddings);
+    void qwen4_mtp_drafts(const std::array<const Qwen4MtpParameters*, 2>& mtp,
+                          RankTensors& ar_hidden, std::uint32_t max_visible);
+    void qwen4_mtp_prefill(const Tensor& ids, const RankTensors& hidden,
+                           const RankTensors& positions, const RankTensors& rope_positions,
+                           std::uint32_t max_visible, bool propose,
                            const Qwen4MtpVisual* visual = nullptr);
     DeviceContext& ctx_;
     const Parameters& parameters_;
@@ -345,27 +366,20 @@ private:
     Tensor& prefill_hidden_;
     std::uint32_t prefill_chunk_;
     std::uint32_t text_kv_base_;
-    const Tensor* active_cache_positions_                                          = nullptr;
-    const Tensor* active_rope_positions_                                           = nullptr;
-    const Tensor* active_kv_table_rows_                                            = nullptr;
-    const Tensor* active_linear_state_source_slots_                                = nullptr;
-    const Tensor* active_linear_state_destination_slots_                           = nullptr;
-    const Tensor* active_valid_columns_                                            = nullptr;
-    const Tensor* active_backend_kv_table_rows_                                    = nullptr;
-    const ops::CausalAttentionExecutionEnvelope* active_causal_attention_envelope_ = nullptr;
-    std::int32_t active_sequence_batch_                                            = 0;
-    std::int32_t active_sequence_width_                                            = 0;
-    std::int32_t rope_delta_                                                       = 0;
-    std::int32_t linear_state_source_slot_                                         = 0;
-    std::int32_t linear_state_destination_slot_                                    = 0;
-    GdnStateAction gdn_state_action_          = GdnStateAction::UpdateInPlace;
-    const GdnReplayRecords* replay_records_   = nullptr;
-    std::int64_t prefill_split_frontier_      = -1;
-    Tensor* rewrite_checkpoint_hidden_output_ = nullptr;
-    std::uint32_t mtp_proposal_extent_        = 0;
+    const Tensor* active_valid_columns_         = nullptr;
+    const Tensor* active_backend_kv_table_rows_ = nullptr;
+    std::int32_t active_sequence_batch_         = 0;
+    std::int32_t active_sequence_width_         = 0;
+    std::int32_t rope_delta_                    = 0;
+    std::int32_t linear_state_source_slot_      = 0;
+    std::int32_t linear_state_destination_slot_ = 0;
+    GdnStateAction gdn_state_action_            = GdnStateAction::UpdateInPlace;
+    const GdnReplayRecords* replay_records_     = nullptr;
+    std::int64_t prefill_split_frontier_        = -1;
+    Tensor* rewrite_checkpoint_hidden_output_   = nullptr;
+    std::uint32_t mtp_proposal_extent_          = 0;
 
     const Weight* embed_                        = nullptr;
-    const Tensor* final_norm_                   = nullptr;
     const LinearParameters* lm_head_            = nullptr;
     const LinearParameters* proposal_head_      = nullptr;
     const std::int32_t* proposal_head_ids_      = nullptr;

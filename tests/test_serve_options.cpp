@@ -113,15 +113,6 @@ int main() {
     } catch (const std::invalid_argument&) { empty_model_id_rejected = true; }
     failures += check(empty_model_id_rejected, "empty --model-id was accepted");
 
-    const ServeOptions dflash = parse({"ninfer-serve", "model.ninfer", "--spec", "dflash",
-                                       "--draft-tokens", "15", "--lm-head-draft"});
-    failures += check(dflash.speculative.backend == ninfer::SpeculativeBackend::DFlash,
-                      "--spec dflash did not select DFlash");
-    failures += check(dflash.speculative.draft_tokens == 15,
-                      "--draft-tokens did not preserve the DFlash window");
-    failures += check(dflash.speculative.proposal_head == ninfer::ProposalHead::Optimized,
-                      "--lm-head-draft did not select the optimized proposal head");
-
     const ServeOptions spec_off =
         parse({"ninfer-serve", "model.ninfer", "--profile", "27b-16gb", "--spec", "off"});
     failures += check(spec_off.speculative.backend == ninfer::SpeculativeBackend::None &&
@@ -149,11 +140,12 @@ int main() {
     }
 
     const ServeOptions dflash_vision = parse(
-        {"ninfer-serve", "model.ninfer", "--spec", "dflash", "--draft-tokens", "15", "--vision"});
-    failures += check(dflash_vision.enable_vision &&
-                          dflash_vision.speculative.backend == ninfer::SpeculativeBackend::DFlash &&
-                          dflash_vision.speculative.draft_tokens == 15,
-                      "serve options did not preserve combined DFlash and Vision features");
+        {"ninfer-serve", "model.ninfer", "--spec", "dflash2", "--draft-tokens", "15", "--vision"});
+    failures +=
+        check(dflash_vision.enable_vision &&
+                  dflash_vision.speculative.backend == ninfer::SpeculativeBackend::DFlash2 &&
+                  dflash_vision.speculative.draft_tokens == 15,
+              "serve options did not preserve combined DFlash2 and Vision features");
 
     bool implicit_backend_rejected = false;
     try {
@@ -349,7 +341,6 @@ int main() {
                       "turn anchors are not left to the model by default");
     failures += check(resolve_turn_anchors(std::nullopt, "Qwen4ExpForCausalLM") == 0 &&
                           resolve_turn_anchors(std::nullopt, "Qwen3_5ForCausalLM") == 1 &&
-                          resolve_turn_anchors(std::nullopt, "Qwen3_5MoeForCausalLM") == 1 &&
                           resolve_turn_anchors(2U, "Qwen4ExpForCausalLM") == 2 &&
                           resolve_turn_anchors(0U, "Qwen3_5ForCausalLM") == 0,
                       "turn anchors model default (Qwen4Exp 0 T152, others 1 T161) not resolved");
@@ -376,8 +367,8 @@ int main() {
                   "--miss-split off did not reach serving options");
         {
             const auto c = parse({"ninfer-serve", "model.ninfer", "--miss-split", "calibrate"});
-            failures += check(c.miss_split == ninfer::MissSplitMode::Auto && c.miss_split_calibrate &&
-                                  !e.miss_split_calibrate,
+            failures += check(c.miss_split == ninfer::MissSplitMode::Auto &&
+                                  c.miss_split_calibrate && !e.miss_split_calibrate,
                               "--miss-split calibrate did not reach serving options");
         }
         int rejected = 0;
@@ -392,10 +383,15 @@ int main() {
             } catch (const std::invalid_argument&) { ++rejected; }
         }
         failures += check(rejected == 4, "invalid Qwen4Exp product options were accepted");
+        failures +=
+            check(!e.kv_ram_active &&
+                      parse({"ninfer-serve", "model.ninfer", "--kv-ram-active"}).kv_ram_active,
+                  "--kv-ram-active did not reach serving options");
         failures += check(
             serve_usage_text("ninfer-serve").find("--elastic") != std::string::npos &&
                 serve_usage_text("ninfer-serve").find("--miss-split") != std::string::npos &&
-                serve_usage_text("ninfer-serve").find("--stream-min-tokens") != std::string::npos,
+                serve_usage_text("ninfer-serve").find("--stream-min-tokens") != std::string::npos &&
+                serve_usage_text("ninfer-serve").find("--kv-ram-active") != std::string::npos,
             "serve help omits the Qwen4Exp product options");
     }
     // T211: prompt streaming threshold.
@@ -545,8 +541,9 @@ int main() {
     failures += check(profile_flash.context_cache.host_state_slots == 8 &&
                           profile_flash.context_cache.host_kv_capacity_bytes == 4096ULL << 20U,
                       "--profile flash-next does not set 4 GiB of Host KV and 8 Host states");
-    failures += check(profile_flash.embedding_host,
-                      "--profile flash-next does not keep the token embedding in host memory (T200)");
+    failures +=
+        check(profile_flash.embedding_host,
+              "--profile flash-next does not keep the token embedding in host memory (T200)");
     // v0.7: both reasoning guards are on by default for every model and every profile.
     failures += check(defaults.reasoning_close_retry && profile_flash.reasoning_close_retry &&
                           profile_27b.reasoning_close_retry &&
@@ -557,17 +554,17 @@ int main() {
                                  "--reasoning-close-retry"})
                               .reasoning_close_retry,
                       "--reasoning-close-retry is not on by default, or its switches are not "
-                      "parsed (docs/v07/vuote-fn.md)");
-    failures += check(defaults.reasoning_eos_guard && profile_flash.reasoning_eos_guard &&
-                          profile_27b.reasoning_eos_guard &&
-                          !parse({"ninfer-serve", "model.ninfer", "--profile", "27b",
-                                  "--no-reasoning-eos-guard"})
-                               .reasoning_eos_guard,
-                      "--reasoning-eos-guard is not on by default, or --no-reasoning-eos-guard "
-                      "does not turn it off");
-    failures += check(serve_usage_text("ninfer-serve").find("--reasoning-close-retry") !=
-                          std::string::npos,
-                      "serve help omits --reasoning-close-retry");
+                      "parsed");
+    failures += check(
+        defaults.reasoning_eos_guard && profile_flash.reasoning_eos_guard &&
+            profile_27b.reasoning_eos_guard &&
+            !parse({"ninfer-serve", "model.ninfer", "--profile", "27b", "--no-reasoning-eos-guard"})
+                 .reasoning_eos_guard,
+        "--reasoning-eos-guard is not on by default, or --no-reasoning-eos-guard "
+        "does not turn it off");
+    failures +=
+        check(serve_usage_text("ninfer-serve").find("--reasoning-close-retry") != std::string::npos,
+              "serve help omits --reasoning-close-retry");
     failures += check(profile_27b.prefill_chunk == 2048,
                       "--profile 27b does not use 2048-token prefill chunks (T205b, T205c)");
     failures += check(
@@ -630,21 +627,21 @@ int main() {
                           dense.vision_device == 0 && dense.max_vision_tokens == 4096u &&
                           !dense.elastic_kv.enabled,
                       "--profile 27b does not apply the launcher configuration");
-    const ServeOptions fn1 = parse({"ninfer-serve", "model.ninfer", "--profile", "flash-next-1gpu"});
-    failures += check(fn1.tp == 1 && fn1.device == 0 && fn1.max_context == 262144 &&
-                          fn1.elastic_kv.enabled && fn1.embedding_host &&
-                          fn1.context_cache.host_state_slots == 8 &&
-                          fn1.context_cache.host_kv_capacity_bytes == (1024ULL << 20),
-                      "--profile flash-next-1gpu does not apply the one-GPU Flash-Next configuration");
+    const ServeOptions fn1 =
+        parse({"ninfer-serve", "model.ninfer", "--profile", "flash-next-1gpu"});
+    failures += check(
+        fn1.tp == 1 && fn1.device == 0 && fn1.max_context == 262144 && fn1.elastic_kv.enabled &&
+            fn1.embedding_host && fn1.context_cache.host_state_slots == 8 &&
+            fn1.context_cache.host_kv_capacity_bytes == (1024ULL << 20),
+        "--profile flash-next-1gpu does not apply the one-GPU Flash-Next configuration");
     const ServeOptions single = parse({"ninfer-serve", "model.ninfer", "--profile", "27b-16gb"});
-    failures += check(single.tp == 1 && single.device == 0 && single.max_context == 65536 &&
-                          single.kv_capacity.mode == ninfer::KvCapacityMode::Automatic &&
-                          single.enable_vision && single.vision_device == 0 &&
-                          single.context_cache.host_state_slots == 8 &&
-                          single.context_cache.host_kv_capacity_bytes == (4096ULL << 20) &&
-                          single.prefill_chunk == 2048 && single.embedding_host &&
-                          single.reasoning_eos_guard,
-                      "--profile 27b-16gb does not apply the one-GPU configuration");
+    failures += check(
+        single.tp == 1 && single.device == 0 && single.max_context == 65536 &&
+            single.kv_capacity.mode == ninfer::KvCapacityMode::Automatic && single.enable_vision &&
+            single.vision_device == 0 && single.context_cache.host_state_slots == 8 &&
+            single.context_cache.host_kv_capacity_bytes == (4096ULL << 20) &&
+            single.prefill_chunk == 2048 && single.embedding_host && single.reasoning_eos_guard,
+        "--profile 27b-16gb does not apply the one-GPU configuration");
     const ServeOptions blind =
         parse({"ninfer-serve", "model.ninfer", "--profile", "27b", "--no-vision"});
     failures += check(!blind.enable_vision && !blind.vision_device && !blind.max_vision_tokens,
@@ -656,9 +653,9 @@ int main() {
         check(serve_usage_text("ninfer-serve").find("flash-next: --tp 2") != std::string::npos,
               "the usage text does not list the profiles");
 
-    {   // issue #25: --api-key-file and NINFER_API_KEY
+    { // issue #25: --api-key-file and NINFER_API_KEY
         const std::string key_path = "test_serve_options.api_key";
-        const auto write_key = [&](const char* text) {
+        const auto write_key       = [&](const char* text) {
             std::ofstream(key_path, std::ios::binary | std::ios::trunc) << text;
         };
         const auto rejected = [&](std::vector<std::string> arguments) {
@@ -679,9 +676,10 @@ int main() {
         }
         failures += check(!file_key_logged, "--api-key-file put the key in the startup argv");
         write_key("crlf-secret\r\n");
-        failures += check(parse({"ninfer-serve", "model.ninfer", "--api-key-file", key_path})
-                                  .api_key == "crlf-secret",
-                          "--api-key-file kept a CRLF line ending");
+        failures +=
+            check(parse({"ninfer-serve", "model.ninfer", "--api-key-file", key_path}).api_key ==
+                      "crlf-secret",
+                  "--api-key-file kept a CRLF line ending");
         failures += check(rejected({"ninfer-serve", "model.ninfer", "--api-key", "a",
                                     "--api-key-file", key_path}),
                           "--api-key together with --api-key-file was accepted");
@@ -699,18 +697,19 @@ int main() {
         ::setenv("NINFER_API_KEY", "env-secret", 1);
         failures += check(parse({"ninfer-serve", "model.ninfer"}).api_key == "env-secret",
                           "NINFER_API_KEY was not used");
-        failures += check(parse({"ninfer-serve", "model.ninfer", "--api-key", "flag"}).api_key ==
-                              "flag",
-                          "NINFER_API_KEY overrode --api-key");
+        failures +=
+            check(parse({"ninfer-serve", "model.ninfer", "--api-key", "flag"}).api_key == "flag",
+                  "NINFER_API_KEY overrode --api-key");
         write_key("file-secret");
-        failures += check(parse({"ninfer-serve", "model.ninfer", "--api-key-file", key_path})
-                                  .api_key == "file-secret",
-                          "NINFER_API_KEY overrode --api-key-file");
+        failures +=
+            check(parse({"ninfer-serve", "model.ninfer", "--api-key-file", key_path}).api_key ==
+                      "file-secret",
+                  "NINFER_API_KEY overrode --api-key-file");
         std::remove(key_path.c_str());
         ::unsetenv("NINFER_API_KEY");
-        failures += check(serve_usage_text("ninfer-serve").find("NINFER_API_KEY") !=
-                              std::string::npos,
-                          "serve help omits NINFER_API_KEY");
+        failures +=
+            check(serve_usage_text("ninfer-serve").find("NINFER_API_KEY") != std::string::npos,
+                  "serve help omits NINFER_API_KEY");
     }
 
     if (failures == 0) { std::cout << "ok\n"; }

@@ -141,8 +141,9 @@ int main(int argc, char** argv) {
             const qwen::execution::Parameters parameters(*model, device);
             require(parameters.text.output_head.weight.n == std::int32_t(text.vocab_size / 2),
                     "output head is not split by vocabulary");
-            for (std::size_t layer = 0; layer < parameters.text.layers.size(); ++layer) {
-                const auto& block = parameters.text.layers[layer];
+            require(parameters.qwen4.has_value(), "the Text forward has no blocks");
+            for (std::size_t layer = 0; layer < parameters.qwen4->layers.size(); ++layer) {
+                const auto& block = parameters.qwen4->layers[layer];
                 const auto& ffn   = std::get<qwen::execution::DenseParameters>(block.ffn);
                 require(ffn.gate_up.weight.n == std::int32_t(dense.intermediate_size) &&
                             ffn.down.weight.k == std::int32_t(dense.intermediate_size / 2),

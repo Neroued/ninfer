@@ -61,9 +61,7 @@ def add_proposal(
             raise ValueError("provide a proposal source when the main head uses split sources")
         source = selections[0].source
     head = gather_source(source, ids)
-    inputs = tuple(
-        component + "/final_hidden" for component in ("mtp", "dflash", "dflash2") if component in model.components
-    )
+    inputs = tuple(component + "/final_hidden" for component in ("mtp", "dflash2") if component in model.components)
     model.components["text"]["proposal"] = {"domain": "indexed", "rows": rows}
     model.add(Parameter("proposal/head", head.shape, head, inputs=inputs, residency="proposal"))
     model.add(

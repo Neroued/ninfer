@@ -168,12 +168,12 @@ crossover 或 candidate-legality 表。
 
 ### 1.4 典型模型 suite
 
-为避免每次手写 `(qtype,N,K,T)`，benchmark 注册少量 27B/35B 代表性 point。一次
+为避免每次手写 `(qtype,N,K,T)`，benchmark 注册少量 27B 与 hidden 2048 代表性 point。一次
 suite 调用顺序运行全部 point：
 
 ```bash
 ./build/bench/ninfer_linear_bench --suite qwen3_6_27b
-./build/bench/ninfer_linear_bench --suite qwen3_6_35b_a3b
+./build/bench/ninfer_linear_bench --suite hidden2048
 ./build/bench/ninfer_linear_bench --suite all
 ```
 
@@ -228,38 +228,35 @@ activation/output。不同 T 复用同一组 allocation，不重复构造大权�
 pure Linear suite。它们当前由 Attention/GDN/LinearSwiGLU/LinearAdd 等独立语义 Op
 拥有，应在相应 Op benchmark 中测量。
 
-### 2.3 `qwen3_6_35b_a3b`
+### 2.3 `hidden2048`
 
-35B-A3B core suite 登记当前真正通过 pure public Linear 使用的主要 head、MTP 和
-DFlash 几何：
-
-| Label | QType | `(N,K)` | T class | 实际角色 |
-|---|---|---:|---|---|
-| `35b.output_head` | Q6 | `(248320,2048)` | Continuous | full output head |
-| `35b.draft_head` | Q4 | `(131072,2048)` | Continuous | optimized proposal head |
-| `35b.mtp_projection` | Q8 | `(2048,4096)` | Continuous | MTP input/output projection geometry |
-| `35b.dflash_feature` | Q8 | `(2048,16384)` | Continuous | DFlash conditioning projection |
-
-35B-A3B Vision backbone 与 27B 共享前六个几何，merger output 进入 2048 hidden：
+hidden2048 suite 登记 hidden 2048 的已注册 head 与投影几何。它们不属于当前产品模型，作为 Op
+的测量点保留：
 
 | Label | QType | `(N,K)` | T class | 实际角色 |
 |---|---|---:|---|---|
-| `35b.vision_patch` | Q6 | `(1152,1536)` | VisionStep4 | patch projection |
-| `35b.vision_qkv` | Q4 | `(3456,1152)` | VisionStep4 | attention QKV |
-| `35b.vision_attn_out` | Q5 | `(1152,1152)` | VisionStep4 | attention output |
-| `35b.vision_fc1` | Q4 | `(4304,1152)` | VisionStep4 | MLP expansion |
-| `35b.vision_fc2` | Q5 | `(1152,4304)` | VisionStep4 | MLP contraction |
-| `35b.vision_merger_fc1` | Q8 | `(4608,4608)` | VisionStep4 | merger expansion |
-| `35b.vision_merger_fc2` | Q8 | `(2048,4608)` | VisionStep4 | merger output |
+| `h2048.n248320_q6` | Q6 | `(248320,2048)` | Continuous | vocabulary rows |
+| `h2048.n131072_q4` | Q4 | `(131072,2048)` | Continuous | shortlist rows |
+| `h2048.k4096_q8` | Q8 | `(2048,4096)` | Continuous | two-hidden input |
+| `h2048.k16384_q8` | Q8 | `(2048,16384)` | Continuous | eight-hidden input |
 
-35B routed expert `[262144,2048]` gate/up 和 `[524288,512]` down 不加入 pure Linear
-suite。它们属于 `sparse_moe` 的 execution contract，当前也不是 pure Linear selector
-注册的 geometry。Attention/GDN/DFlash layer projections 同理继续由其 fused Op
-benchmark 负责。
+Vision 几何与 27B 共享前六个，merger output 进入 2048 hidden：
+
+| Label | QType | `(N,K)` | T class | 实际角色 |
+|---|---|---:|---|---|
+| `h2048.vision_patch` | Q6 | `(1152,1536)` | VisionStep4 | patch projection |
+| `h2048.vision_qkv` | Q4 | `(3456,1152)` | VisionStep4 | attention QKV |
+| `h2048.vision_attn_out` | Q5 | `(1152,1152)` | VisionStep4 | attention output |
+| `h2048.vision_fc1` | Q4 | `(4304,1152)` | VisionStep4 | MLP expansion |
+| `h2048.vision_fc2` | Q5 | `(1152,4304)` | VisionStep4 | MLP contraction |
+| `h2048.vision_merger_fc1` | Q8 | `(4608,4608)` | VisionStep4 | merger expansion |
+| `h2048.vision_merger_fc2` | Q8 | `(2048,4608)` | VisionStep4 | merger output |
+
+Attention/GDN layer projections 继续由其 fused Op benchmark 负责。
 
 ### 2.4 `all`
 
-`all` 是两个 model suite 的 union。完全相同的
+`all` 是两个 suite 的 union。完全相同的
 `(qtype,policy,N,K,T)` point 只执行一次；共享 Vision point 不因两个 target 都使用而
 重复计时。结果可以保留多个 role label，但 timing row 只有一份。
 
@@ -428,7 +425,7 @@ selector 源码是 host launcher route 的唯一 executable authority。
 
 1. selector 和 public numerical test 完成注册；
 2. 立即可以用数字 `--n/--k/--t/--qtype` 测量；
-3. 只有当它成为 27B/35B 的高频或架构代表性 geometry 时，才加入 model suite。
+3. 只有当它成为 27B 的高频或架构代表性 geometry 时，才加入 suite。
 
 suite entry 只包含：
 
@@ -475,7 +472,7 @@ policy 只是许可，长期 benchmark 不把许可本身冒充为低精度执�
 以下保留已完成的验证与 RTX 5090 测量记录，计时条件随各项列出：
 
 1. `ninfer_linear_bench` Release target 可构建；
-2. 27B suite 的 49 个 point 和 35B-A3B suite 的 37 个 point 均通过 public Linear
+2. 27B suite 的 49 个 point 和 hidden2048 suite 的 37 个 point 均通过 public Linear
    执行；
 3. `all` 合并为 68 个 unique point，共享 Vision exact point 只执行一次；
 4. Text `T=1..3` sweep 和 Vision `T=4,8` step-4 sweep 均输出连续结果；

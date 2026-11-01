@@ -8,6 +8,9 @@
 
 namespace ninfer::ops::detail {
 
+// Whether a Q8 Linear of N = n output rows over K = k input rows is a registered shape (the only
+// shapes select_q8_a16_launch serves, at every T).
+[[nodiscard]] bool q8_shape_registered(std::int32_t n, std::int32_t k) noexcept;
 Q8Launch select_q8_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t);
 Q8Launch select_q8_launch(std::int32_t n, std::int32_t k, std::int32_t t, LinearPolicy policy);
 

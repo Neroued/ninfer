@@ -54,11 +54,12 @@ Options parse(int argc, char** argv) {
             continue;
         }
         if (arg == "--help") {
-            std::puts("usage: ninfer_rmsnorm_bench [--kind dflash2_hidden|hidden27|target_q27|"
-                      "target_k27|dflash_hidden|dflash_q|dflash_k|target_hidden35|target_q35|"
-                      "target_k35|gated35|gated27] [--tokens T,...] [--execution eager|graph] "
-                      "[--cache cold|warm] [--graph-calls 1..64] [--warmup N] [--repeat N] "
-                      "[--csv-out PATH] [--profile]");
+            std::puts(
+                "usage: ninfer_rmsnorm_bench [--kind dflash2_hidden|hidden27|target_q27|"
+                "target_k27|hidden2048|q128x32|k128x8|target_hidden2048|target_q256x16|"
+                "target_k256x2|gated128x32|gated27] [--tokens T,...] [--execution eager|graph] "
+                "[--cache cold|warm] [--graph-calls 1..64] [--warmup N] [--repeat N] "
+                "[--csv-out PATH] [--profile]");
             std::exit(0);
         }
         if (++i >= argc) throw std::invalid_argument("missing option value");
@@ -100,10 +101,10 @@ struct Shape {
 constexpr Shape shapes[]{
     {"dflash2_hidden", 5120, 1, false, false}, {"hidden27", 5120, 1, true, false},
     {"target_q27", 256, 24, true, false},      {"target_k27", 256, 4, true, false},
-    {"dflash_hidden", 2048, 1, false, false},  {"dflash_q", 128, 32, false, false},
-    {"dflash_k", 128, 8, false, false},        {"target_hidden35", 2048, 1, true, false},
-    {"target_q35", 256, 16, true, false},      {"target_k35", 256, 2, true, false},
-    {"gated35", 128, 32, false, true},         {"gated27", 128, 48, false, true}};
+    {"hidden2048", 2048, 1, false, false},     {"q128x32", 128, 32, false, false},
+    {"k128x8", 128, 8, false, false},          {"target_hidden2048", 2048, 1, true, false},
+    {"target_q256x16", 256, 16, true, false},  {"target_k256x2", 256, 2, true, false},
+    {"gated128x32", 128, 32, false, true},     {"gated27", 128, 48, false, true}};
 
 const Shape& find_shape(const std::string& name) {
     for (const auto& shape : shapes)

@@ -472,7 +472,28 @@ void test_kv_store(ninfer::DeviceContext& device) {
     expect(branch_two_tail != shared_tail && branch_two_tail != branch_one_tail &&
                pages.address_references(shared_full) == 3,
            "independent shared branches own distinct partial tails and one shared full page");
+    // Idle pages: the full page the active branch reads stays out, every private tail is in.
+    const std::array retained_owners{*shared, *branch_one};
+    expect(addresses.idle_device_pages(*shared) == 1 &&
+               addresses.idle_device_pages(*branch_one) == 1 &&
+               addresses.releasable_device_pages(retained_owners) ==
+                   std::vector<std::uint32_t>({1, 1}),
+           "a page an active address reads is neither idle nor releasable");
     addresses.deactivate(*branch_two);
+    // With every branch idle the shared full page is idle for each owner, but releasing the
+    // shared prefix and one branch frees only their tails: the other branch keeps the full page.
+    const std::array all_owners{*shared, *branch_one, *branch_two};
+    const std::array one_branch{*branch_one};
+    expect(addresses.idle_device_pages(*shared) == 2 &&
+               addresses.idle_device_pages(*branch_one) == 2 &&
+               addresses.idle_device_pages(*branch_two) == 2,
+           "a page idle owners share is idle for each of them");
+    expect(addresses.releasable_device_pages(retained_owners) ==
+                   std::vector<std::uint32_t>({1, 1}) &&
+               addresses.releasable_device_pages(one_branch) == std::vector<std::uint32_t>({1}),
+           "a page an address outside the released set maps is not releasable");
+    expect(addresses.releasable_device_pages(all_owners) == std::vector<std::uint32_t>({2, 2, 2}),
+           "a page all its owners release together is releasable for each of them");
     expect(addresses.release(*branch_one) && pages.address_references(shared_full) == 2 &&
                addresses.release(*branch_two) && pages.address_references(shared_full) == 1 &&
                addresses.release(*shared) && pages.occupied() == 0 &&

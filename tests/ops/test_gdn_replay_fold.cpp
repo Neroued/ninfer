@@ -358,6 +358,9 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
         DeviceBuffer original(state_bytes);
         cuda_check(cudaMemcpy(original.p, state_base, state_bytes, cudaMemcpyDeviceToDevice),
                    "save graph initial state");
+        // A device-to-device cudaMemcpy may return before it completes, and the restores below run
+        // on a non-blocking stream that does not wait for the default stream.
+        cuda_synchronize();
         DeviceContext context;
         DecodeGraphDefinition definition;
         DecodeGraphExecutable graph;

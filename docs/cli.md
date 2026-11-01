@@ -85,9 +85,8 @@ output capacity for the inserted suffix and the answer:
 
 GPU residency is frozen when the Engine starts:
 
-- no `--spec` omits MTP/DFlash/DFlash2 weights and state and the optimized proposal head;
-- `--spec mtp`, `--spec dflash` (35B-A3B), and `--spec dflash2` (Qwen3.8-27B) load only
-  the selected speculative backend;
+- no `--spec` omits MTP/DFlash2 weights and state and the optimized proposal head;
+- `--spec mtp` and `--spec dflash2` (Qwen3.8-27B) load only the selected speculative backend;
 - a speculative backend with the full proposal head omits the optimized proposal head;
 - Vision is disabled by default, omitting its weights and Vision-specific unified-workspace extent;
 - `--vision` loads the weights, expands the one Program workspace for Vision encode/handoff, and
@@ -96,7 +95,7 @@ GPU residency is frozen when the Engine starts:
   checkpoint StateImage or capture a continuation that no later request could consume.
 
 The complete `.ninfer` inventory is still validated. These choices are not lazy loading: an Engine
-started without Vision rejects media and cannot enable Vision later. DFlash/DFlash2 and Vision may
+started without Vision rejects media and cannot enable Vision later. DFlash2 and Vision may
 be enabled together; these backends apply to generated-text decode after multimodal prefill and does not
 accelerate Vision encode. The default speculative and Vision settings produce the smallest resident
 profile.
@@ -163,12 +162,11 @@ long-decode, and long-context inputs.
 ## Speculative decoding
 
 Speculative decoding is disabled by default. Select MTP with one to five draft positions, or the
-35B-A3B DFlash or Qwen3.8-27B DFlash2 backend with one to fifteen. Both masked-draft backends
-may be combined with `--vision`.
+Qwen3.8-27B DFlash2 backend with one to fifteen; DFlash2 may be combined with `--vision`.
 `--lm-head-draft` selects the optimized proposal head and requires a selected backend:
 
 ```bash
-./build/apps/ninfer models/qwen3_6_35b_a3b.ninfer \
+./build/apps/ninfer models/qwen3_8_27b.ninfer \
   --prompt "Write a short explanation of speculative decoding." \
   --max-context 16384 \
   --max-new 512 \
@@ -177,28 +175,18 @@ may be combined with `--vision`.
   --lm-head-draft
 ```
 
-For DFlash:
-
-```bash
-./build/apps/ninfer models/qwen3_6_35b_a3b.ninfer \
-  --prompt "Write a short explanation of speculative decoding." \
-  --max-context 16384 --max-new 512 \
-  --kv-dtype fp8 \
-  --spec dflash --draft-tokens 7 --lm-head-draft
-```
-
 For Qwen3.8-27B artifacts containing the DFlash2 companion weights, select
 `--spec dflash2 --draft-tokens 7`, optionally with `--lm-head-draft` and `--vision`.
 DFlash2 accepts every draft count from 1 through 15; seven is the checkpoint recommendation.
 Both `groupwise-int` and `nvfp4` artifacts use the same Engine route, including CUDA Graph,
 concurrent requests, sampling penalties, and prefix reuse. An artifact without the companion
-weights reports a missing DFlash2 component when selected. Vision, MTP and DFlash follow the same
+weights reports a missing DFlash2 component when selected. Vision and MTP follow the same
 rule: their weights are required only when that component is enabled at startup.
 
 Only one speculative backend can be enabled per Engine. The published [performance results](performance.md)
-use MTP with three draft tokens and DFlash with seven draft tokens (block length eight), both with
-the optimized proposal head. DFlash accepts one to fifteen draft tokens; seven forms the measured
-block length eight, while fifteen uses the maximum supported block length sixteen.
+use MTP with three draft tokens and DFlash2 with seven draft tokens (block length eight), both with
+the optimized proposal head. Seven forms the measured block length eight, while fifteen uses the
+maximum supported block length sixteen.
 
 ## Common options
 
@@ -215,8 +203,8 @@ The table lists executable defaults. The examples above select FP8 KV and MTP3.
 | `--tp 1\|2` | tensor-parallel width; see [Two GPUs](#two-gpus) | `1` |
 | `--devices A,B` | one CUDA device per rank, rank 0 first; required with `--tp 2` | `--device` |
 | `--kv-dtype bf16\|int8\|fp8\|nvfp4\|k8v4` | KV-cache storage | `bf16` |
-| `--spec mtp\|dflash\|dflash2\|off` | speculative backend; `off` (or `none`) also drops `--draft-tokens` and `--lm-head-draft` given before it, so `--profile NAME --spec off` runs a profile without speculation | off |
-| `--draft-tokens N` | MTP `1..5`; DFlash/DFlash2 `1..15` | unset |
+| `--spec mtp\|dflash2\|off` | speculative backend; `off` (or `none`) also drops `--draft-tokens` and `--lm-head-draft` given before it, so `--profile NAME --spec off` runs a profile without speculation | off |
+| `--draft-tokens N` | MTP `1..5`; DFlash2 `1..15` | unset |
 | `--lm-head-draft` | optimized proposal head | off |
 | `--vision` | enable image/video input and load Vision GPU allocations | off |
 | `--vision-device N` | CUDA device that holds the Vision tower and encodes; equal to `--device` on one GPU, one of `--devices` at `--tp 2` | `--device` |
@@ -229,27 +217,23 @@ The table lists executable defaults. The examples above select FP8 KV and MTP3.
 | `--thinking-budget N` | positive model-origin thinking-token cap; omitted means unlimited | unset |
 | `--reasoning-effort none\|minimal\|low\|medium\|high\|xhigh\|max` | pass an effort value to the selected template | template default |
 | `--greedy` | exact argmax decoding | off |
-| `--temperature F` | sampling temperature override | registered model/mode default |
-| `--top-p F` | nucleus-threshold override | registered model/mode default |
-| `--top-k N` | top-k-threshold override (`0..20`; zero selects the top-20 cap) | registered model/mode default |
-| `--min-p F` | min-p-threshold override | registered model/mode default |
-| `--presence-penalty F` | presence-penalty override | registered model/mode default |
-| `--frequency-penalty F` | frequency-penalty override | registered model/mode default (`0`) |
+| `--temperature F` | sampling temperature override | prompt-mode default |
+| `--top-p F` | nucleus-threshold override | prompt-mode default |
+| `--top-k N` | top-k-threshold override (`0..20`; zero selects the top-20 cap) | prompt-mode default |
+| `--min-p F` | min-p-threshold override | prompt-mode default |
+| `--presence-penalty F` | presence-penalty override | prompt-mode default |
+| `--frequency-penalty F` | frequency-penalty override | prompt-mode default (`0`) |
 | `--seed N` | sampling seed | `0` |
 
-When a sampling flag is omitted, Engine selects the general-task preset for the loaded architecture
-and rendered prompt mode. The current official models use:
+When a sampling flag is omitted, Engine selects the general-task preset of the rendered prompt
+mode; the presets are the same for every model:
 
-| Model | Prompt mode | Temperature | Top-p | Top-k | Min-p | Presence penalty |
-|---|---|---:|---:|---:|---:|---:|
-| Qwen3.6-27B | thinking | `1.0` | `0.95` | `20` | `0` | `0` |
-| Qwen3.6-27B | non-thinking | `0.7` | `0.80` | `20` | `0` | `1.5` |
-| Qwen3.8-27B | thinking | `1.0` | `0.95` | `20` | `0` | `0` |
-| Qwen3.8-27B | non-thinking | `0.7` | `0.80` | `20` | `0` | `1.5` |
-| Qwen3.6-35B-A3B | thinking | `1.0` | `0.95` | `20` | `0` | `1.5` |
-| Qwen3.6-35B-A3B | non-thinking | `0.7` | `0.80` | `20` | `0` | `1.5` |
+| Prompt mode | Temperature | Top-p | Top-k | Min-p | Presence penalty |
+|---|---:|---:|---:|---:|---:|
+| thinking | `1.0` | `0.95` | `20` | `0` | `0` |
+| non-thinking | `0.7` | `0.80` | `20` | `0` | `1.5` |
 
-Frequency penalty is `0` in every registered preset. Task-specific profiles such as Qwen's
+Frequency penalty is `0` in both presets. Task-specific profiles such as Qwen's
 precise-coding profile use explicit sampling overrides.
 
 Repeat `--stop-token-id`, `--stop`, or `--reasoning-stop` to add stop conditions. Use
@@ -344,8 +328,7 @@ with the recurrent state mirrored on both); its candidate selector sits on rank 
 rank 0 with `NINFER_TP_SELECTOR=primary` or when Vision is on rank 1. It requires `--lm-head-draft`,
 since the full output head is split by vocabulary across the ranks; a drafter with full-attention
 layers is not supported.
-`--spec dflash`, the Qwen3.5 MoE architecture (Qwen3.6-35B-A3B) and the `fp8` and `k8v4` KV types
-are rejected at startup. `ninfer-perplexity` takes the same `--tp 2 --devices A,B` ([Perplexity](perplexity.md#two-gpus)).
+The `fp8` and `k8v4` KV types are rejected at startup. `ninfer-perplexity` takes the same `--tp 2 --devices A,B` ([Perplexity](perplexity.md#two-gpus)).
 The split attention and Gated DeltaNet projections take FP8 or NVFP4 weights and the split MLP
 FP8 or NVFP4, so both the official mixed artifact (FP8 attention and GDN, NVFP4 MLP) and an
 all-NVFP4 recipe run at `--tp 2`; the MTP head splits only in Q8, as the official recipes store it.

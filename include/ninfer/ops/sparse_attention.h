@@ -161,4 +161,126 @@ void qsa_attention(const Tensor& q, const Tensor& selected, const Tensor& counts
 [[nodiscard]] std::size_t qsa_attention_workspace_bytes(const QsaGeometry& geometry,
                                                         std::int32_t columns);
 
+// ---------------------------------------------------------------------------------------------
+// QSA K/V staging (active KV in RAM, docs/maintainer/active-kv-in-ram.md)
+//
+// The paged K/V planes a QSA attention reads may live in pinned, device-mapped Host memory (any
+// address the device can dereference). A staging region is device memory laid out as K/V pages
+// (the same planes, profile and heads) behind an identity table: the Ops below copy the K/V rows
+// a call will read into it and give qsa_attention a selection over the region, so qsa_attention
+// reads exactly the bytes, in exactly the order, it would read from the source pages and its
+// output is bit-identical. Only K/V code and scale planes are staged; the index planes are not.
+
+/** Per-layer counters a staging call adds to when the caller asks for them (`stats`). */
+enum QsaStagingStat : std::int32_t {
+    kQsaStagingHits = 0,      // cacheable block whose slot already held it
+    kQsaStagingMisses,        // cacheable block copied into its slot
+    kQsaStagingShared,        // block another column of the same call had claimed
+    kQsaStagingUncacheable,   // block not wholly before the window, copied into the overflow
+    kQsaStagingCollisions,    // slot claimed by another block in the same call, overflow copy
+    kQsaStagingPages,         // pages copied by qsa_stage_visible_pages
+    kQsaStagingBlockCalls,    // qsa_stage_selected_blocks calls
+    kQsaStagingPageCalls,     // qsa_stage_visible_pages calls
+    kQsaStagingUnionBlocks,   // qsa_count_selected_blocks: distinct selected complete blocks
+    kQsaStagingVisibleBlocks, // qsa_count_selected_blocks: complete blocks the last column sees
+    kQsaStagingStatCount
+};
+
+/** Words of QsaStagingRegion::counters per attention layer. */
+inline constexpr std::int32_t kQsaStagingCounterWords = 8;
+
+/**
+ * Persistent staging state of one device for `layers` attention layers. Region slot s (a 4-token
+ * block) occupies rows (s % 16) * 4 .. +3 of region page s / 16: layer l's cache slots are
+ * [l * cache_blocks, (l + 1) * cache_blocks), the overflow slots follow all layers. The caller
+ * owns the memory and initializes it: tags -1, claims 0, counters 0 except word 0 (epoch) = 1,
+ * stats 0, block_tables[i] = i, table_row = 0.
+ */
+struct QsaStagingRegion {
+    PagedKVBatchLayerView pages; // planes [leading, 64, kv_heads, total_pages], identity table
+    Tensor table_row;            // I32 [1] = 0: the identity row for the one lane
+    // I64 [layers * cache_blocks]: (generation << 32 | key) of the block a slot holds, key =
+    // table row << 20 | block index (32 bits: table rows below 4096, blocks below 2^20); -1 =
+    // empty.
+    Tensor tags;
+    Tensor claims;   // I64 [layers * cache_blocks]: (epoch << 32 | key) of a call's claimant
+    Tensor counters; // I32 [layers * kQsaStagingCounterWords]: epoch, finished CTAs, overflow
+                     // cursor, last first position + 1, generation, 3 spare words
+    Tensor stats;    // I64 [layers * kQsaStagingStatCount]
+    std::int32_t layers          = 0;
+    std::int32_t cache_blocks    = 0; // per layer, a multiple of 16
+    std::int32_t overflow_blocks = 0; // a multiple of 16
+
+    [[nodiscard]] std::int32_t total_pages() const noexcept {
+        return (layers * cache_blocks + overflow_blocks) / 16;
+    }
+};
+
+/**
+ * Copies whole pages for a prefill call of W columns of one lane (cache_positions I32 [W,1],
+ * valid_columns empty or I32 [1], table_rows I32 [1]): with n = 1 + the largest cache position of
+ * the valid columns, logical page i < ceil(n / 64) of the lane's row of kv.block_tables is copied,
+ * every K/V code and scale plane and every head, from `kv` to region page i; then
+ * qsa_attention(q, selected, counts, region.table_row, region.pages, ...) equals
+ * qsa_attention(q, selected, counts, table_rows, kv, ...) bit for bit for any selection of
+ * positions below n. Region pages from ceil(n / 64) on are not written. State: every tag of every
+ * layer becomes -1 (the copied pages overwrite cache slots). `max_visible_keys` is the host launch
+ * envelope (>= n, ceil(max_visible_keys / 64) <= region.total_pages()). With `stats`, the call adds
+ * to layer 0's counters (it has no layer).
+ */
+void qsa_stage_visible_pages(const PagedKVBatchLayerView& kv, const Tensor& cache_positions,
+                             const Tensor& valid_columns, const Tensor& table_rows,
+                             std::uint32_t max_visible_keys, const QsaStagingRegion& region,
+                             bool stats, cudaStream_t stream);
+
+/**
+ * Copies the selected blocks of a decode/verify call of W columns of one lane into layer
+ * `layer`'s part of the region and rewrites the selection onto it. `selected` I32
+ * [max_selected, W, 1] and `counts` I32 [W, 1] follow qsa_select's contract: each aligned group of
+ * four entries is one 4-token block (a count above max_selected, or a group naming two blocks,
+ * traps: the device context is lost rather than a read past the selection). `rewritten` (I32
+ * shaped like `selected`, not aliasing it)
+ * receives, for every column w and entry j < counts[w],
+ *
+ *   rewritten[j, w] = slot * 4 + (selected[j, w] & 3)
+ *
+ * where the region rows of `slot` hold, when the call completes, the K/V rows (every plane and
+ * head) of block selected[j, w] / 4 of the lane's table row in `kv`. Entries past a count are not
+ * written. Then qsa_attention(q, rewritten, counts, region.table_row, region.pages, ...) equals
+ * qsa_attention(q, selected, counts, table_rows, kv, ...) bit for bit.
+ *
+ * State: a block wholly before p0 = cache_positions[0] is cacheable. It maps to slot
+ * block % cache_blocks of the layer and is copied only when the slot's tag differs from
+ * (generation << 32 | key); columns of the call asking for the same block share its slot; a
+ * cacheable block whose slot another block claimed in this call, and every block that is not
+ * cacheable, is copied into the overflow (W * ceil(max_selected / 4) <= overflow_blocks). The
+ * call advances the layer's epoch, records p0, and starts a new generation when p0 is below the
+ * previous call's (the caller may then have rewritten committed rows of the row). Cached bytes
+ * are trusted: the caller calls qsa_staging_invalidate whenever K/V bytes of a cacheable block of
+ * a table row change or a table row maps another sequence, before the next call. No host
+ * metadata: graph-capturable.
+ */
+void qsa_stage_selected_blocks(const Tensor& selected, const Tensor& counts,
+                               const Tensor& cache_positions, const Tensor& table_rows,
+                               const PagedKVBatchLayerView& kv, const QsaStagingRegion& region,
+                               std::int32_t layer, bool stats, Tensor& rewritten,
+                               cudaStream_t stream);
+
+/** Sets every tag of every layer to -1 (enqueued on `stream`). */
+void qsa_staging_invalidate(const QsaStagingRegion& region, cudaStream_t stream);
+
+/**
+ * Diagnostics: adds to layer `layer`'s stats the number of distinct complete blocks (blocks b
+ * with 4b + 3 <= the column's cache position) named by the selections of a call of W columns of
+ * one lane, and the number of complete blocks below its largest cache position + 1. `workspace`
+ * holds qsa_count_selected_blocks_workspace_bytes(max_visible_keys); max_visible_keys bounds every
+ * cache position + 1.
+ */
+void qsa_count_selected_blocks(const Tensor& selected, const Tensor& counts,
+                               const Tensor& cache_positions, std::uint32_t max_visible_keys,
+                               const QsaStagingRegion& region, std::int32_t layer,
+                               WorkspaceArena& workspace, cudaStream_t stream);
+
+[[nodiscard]] std::size_t qsa_count_selected_blocks_workspace_bytes(std::uint32_t max_visible_keys);
+
 } // namespace ninfer::ops

@@ -193,7 +193,7 @@ void test_round_layout() {
         speculative_builder, q36::RoundStateSpec{.hidden       = 32,
                                                  .output_rows  = 128,
                                                  .draft_window = 15,
-                                                 .backend = ninfer::SpeculativeBackend::DFlash});
+                                                 .backend = ninfer::SpeculativeBackend::DFlash2});
     q36::complete_round_state_layout(speculative_builder, dflash);
     (void)speculative_builder.finish(256);
     expect(dflash.logits.shape[1] == 1 && dflash.dflash_prefill.has_value() &&
@@ -460,9 +460,9 @@ void test_resource_difference_names_the_failing_ledger() {
                "Qwen3.5 resource subtraction underflow in capture active entitlement (Main KV "
                "pages 513 - 1730)",
            "resource underflow names its ledger and dimension");
-    taken.device.main_kv_pages                      = 500;
-    const q36::detail::PhysicalResources remaining = q36::detail::checked_resource_difference(
-        held, taken, "capture active entitlement");
+    taken.device.main_kv_pages = 500;
+    const q36::detail::PhysicalResources remaining =
+        q36::detail::checked_resource_difference(held, taken, "capture active entitlement");
     expect(remaining.device.main_kv_pages == 13 && remaining.device.state_slots == 2,
            "covered resource difference is exact");
 }

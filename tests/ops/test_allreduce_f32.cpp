@@ -598,7 +598,7 @@ int run_split_lane_case(const char* label, std::int32_t ne0, std::int32_t ne1, s
 int run_peer_lane_selection(const ExecutionContext& ec, const ops::PeerEvents& events,
                             const ops::PeerLanes& lanes, const ops::HostExchange& exchange) {
     constexpr std::int32_t ne0 = 16, ne1 = 8;
-    const std::size_t bytes    = static_cast<std::size_t>(ne0) * ne1 * 2;
+    const std::size_t bytes = static_cast<std::size_t>(ne0) * ne1 * 2;
     std::array<std::unique_ptr<GuardedDeviceBuffer>, 2> buffer, staging;
     std::array<Tensor, 2> buffer_t, staging_t;
     const std::vector<std::uint16_t> zeros(bytes / 2, 0);
@@ -740,7 +740,9 @@ int run_host_copy_case(const ExecutionContext& ec, ops::HostExchange& exchange,
             cuda_check(cudaSetDevice(ec.dev[to]->device), "cudaSetDevice");
             cuda_check(cudaMalloc(&dst, bytes), "cudaMalloc destination");
             cuda_check(cudaMemset(dst, 0, bytes), "cudaMemset");
-            cuda_check(cudaDeviceSynchronize(), "sync");
+            // Both devices: the pageable upload of the source may still be in flight on its
+            // device's default stream, which the exchange's non-blocking streams do not wait for.
+            retire_staging(ec);
             cuda_check(cudaSetDevice(ec.dev[from]->device), "cudaSetDevice");
             cuda_check(cudaEventRecord(events.inputs_ready(from), ec.dev[from]->stream), "record");
             exchange.copy(from, src, dst, bytes, ec, events);
@@ -759,6 +761,37 @@ int run_host_copy_case(const ExecutionContext& ec, ops::HostExchange& exchange,
     std::cout << "host copy one-way (1 B .. 3 MiB, both directions): " << (failures ? "FAIL" : "ok")
               << '\n';
     return failures;
+}
+
+// A pipelined call abandoned while open (its caller failed between begin_sum_f32 and
+// finish_sum_f32, after rank 0 had reported part of its columns) leaves the exchange free: the next
+// call on the same exchange opens and sums exactly. Abandoning without an open call does nothing.
+int run_abandoned_case(const ExecutionContext& ec, ops::HostExchange& exchange,
+                       const ops::PeerEvents& events) {
+    using Payload = ops::HostExchange::Payload;
+    {
+        constexpr std::int32_t kColumns = 64;
+        const std::size_t count         = static_cast<std::size_t>(kHidden) * kColumns;
+        RankBuffers buffers(ec, kHidden, kColumns);
+        buffers.upload(ec, make_partial(count, 313u), make_partial(count, 314u));
+        synchronize_both(ec);
+        exchange.abandon_sum_f32();
+        if (!exchange.begin_sum_f32(buffers.partial_t, buffers.staging_t, &buffers.out_t,
+                                    Payload::FP16, ec)) {
+            std::cerr << "abandoned pipelined call: begin_sum_f32 refused an eager call\n";
+            return 1;
+        }
+        exchange.columns_ready(0, 0, kColumns / 2);
+        exchange.abandon_sum_f32();
+        if (exchange.columns_done(0) != 0) {
+            std::cerr << "abandoned pipelined call: the call is still open\n";
+            return 1;
+        }
+        synchronize_both(ec);
+    }
+    return run_pipelined_case("pipelined fp16 [2560,64] after an abandoned call", kHidden, 64,
+                              Payload::FP16, {{{32, 32}, {64}}}, 1, false, 315u, ec, exchange,
+                              events);
 }
 
 int main(int argc, char** argv) {
@@ -885,27 +918,27 @@ int main(int argc, char** argv) {
                                       std::to_string(ne0) + "," + std::to_string(ne1) + "] " +
                                       std::to_string(split) + "+" + std::to_string(ne1 - split) +
                                       " x" + std::to_string(rounds) + " + sum";
-            failures += report(label, run_split_lane_case(label.c_str(), ne0, ne1, split, rounds,
-                                                          static_cast<std::uint32_t>(seed), ec,
-                                                          mixed));
+            failures +=
+                report(label, run_split_lane_case(label.c_str(), ne0, ne1, split, rounds,
+                                                  static_cast<std::uint32_t>(seed), ec, mixed));
         }
         // PR #15 (tzolkincz) shapes: odd column counts (odd lane bytes, the pull and the residual
         // add unaligned) and tiny lanes; then a graph capture with the lanes attached stays on
         // the staged nodes (the lanes are eager only).
         for (const auto& [ne0, ne1, split, rounds, seed] :
-             {std::array<int, 5>{kHidden, 101, 37, 2, 231},
-              std::array<int, 5>{17, 5, 2, 2, 233}}) {
+             {std::array<int, 5>{kHidden, 101, 37, 2, 231}, std::array<int, 5>{17, 5, 2, 2, 233}}) {
             const std::string label = "peer lanes (" + staged + ") + host exchange bf16 [" +
                                       std::to_string(ne0) + "," + std::to_string(ne1) + "] " +
                                       std::to_string(split) + "+" + std::to_string(ne1 - split) +
                                       " x" + std::to_string(rounds) + " + sum";
-            failures += report(label, run_split_lane_case(label.c_str(), ne0, ne1, split, rounds,
-                                                          static_cast<std::uint32_t>(seed), ec,
-                                                          mixed));
+            failures +=
+                report(label, run_split_lane_case(label.c_str(), ne0, ne1, split, rounds,
+                                                  static_cast<std::uint32_t>(seed), ec, mixed));
         }
-        failures += report("captured with peer lanes + host exchange stays staged",
-                           run_captured_case("captured with peer lanes + host exchange stays staged",
-                                             kHidden, 1, 5, 0, ec, mixed, nullptr));
+        failures +=
+            report("captured with peer lanes + host exchange stays staged",
+                   run_captured_case("captured with peer lanes + host exchange stays staged",
+                                     kHidden, 1, 5, 0, ec, mixed, nullptr));
         if (p2p) {
             ops::PeerEvents direct(ec);
             direct.attach_peer_lanes(&lanes);
@@ -915,13 +948,12 @@ int main(int argc, char** argv) {
                  {std::array<int, 5>{kHidden, 101, 37, 2, 235},
                   std::array<int, 5>{17, 5, 2, 2, 237}}) {
                 const std::string label = "peer lanes direct bf16 [" + std::to_string(ne0) + "," +
-                                          std::to_string(ne1) + "] " + std::to_string(split) +
-                                          "+" + std::to_string(ne1 - split) + " x" +
+                                          std::to_string(ne1) + "] " + std::to_string(split) + "+" +
+                                          std::to_string(ne1 - split) + " x" +
                                           std::to_string(rounds) + " + sum";
-                failures += report(label, run_split_lane_case(label.c_str(), ne0, ne1, split,
-                                                              rounds,
-                                                              static_cast<std::uint32_t>(seed), ec,
-                                                              direct));
+                failures += report(
+                    label, run_split_lane_case(label.c_str(), ne0, ne1, split, rounds,
+                                               static_cast<std::uint32_t>(seed), ec, direct));
             }
             failures += report("peer lanes direct: one-call [2560,48]",
                                run_eager_case("peer lanes direct: one-call [2560,48]", kHidden, 48,
@@ -940,13 +972,12 @@ int main(int argc, char** argv) {
                  {std::array<int, 5>{kHidden, 96, 32, 3, 221},
                   std::array<int, 5>{5120, 2048, 1024, 4, 223}}) {
                 const std::string label = "peer lanes direct bf16 [" + std::to_string(ne0) + "," +
-                                          std::to_string(ne1) + "] " + std::to_string(split) +
-                                          "+" + std::to_string(ne1 - split) + " x" +
+                                          std::to_string(ne1) + "] " + std::to_string(split) + "+" +
+                                          std::to_string(ne1 - split) + " x" +
                                           std::to_string(rounds) + " + sum";
-                failures += report(label, run_split_lane_case(label.c_str(), ne0, ne1, split,
-                                                              rounds,
-                                                              static_cast<std::uint32_t>(seed), ec,
-                                                              direct));
+                failures += report(
+                    label, run_split_lane_case(label.c_str(), ne0, ne1, split, rounds,
+                                               static_cast<std::uint32_t>(seed), ec, direct));
             }
         } else {
             std::cout << "peer lanes direct: skipped (no peer access)\n";
@@ -972,6 +1003,7 @@ int main(int argc, char** argv) {
         failures +=
             run_pipelined_case("pipelined fp16 [17,5] empty group", 17, 5, Payload::FP16,
                                {{{0, 5}, {2, 3}}}, 1, false, 307u, ec, exchange, host_events);
+        failures += run_abandoned_case(ec, exchange, host_events);
         ops::HostExchange wide(ec);
         ops::PeerEvents wide_events(ec);
         wide_events.attach_host_exchange(&wide);

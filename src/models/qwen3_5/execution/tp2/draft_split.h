@@ -104,8 +104,4 @@ void dflash2_candidates_split(const std::array<Tensor, 2>& hidden,
                                                                    std::int32_t columns,
                                                                    bool broadcast);
 
-// Whether the DFlash2 drafter ranks its candidates through the vocabulary-split head: rank 1 holds
-// its block of the optimized head.
-[[nodiscard]] bool dflash2_split_candidates(const Parameters& rank0, const Parameters* rank1);
-
 } // namespace ninfer::models::qwen3_5::execution

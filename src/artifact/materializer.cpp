@@ -99,8 +99,8 @@ std::uint64_t host_pinned_limit(const MaterializationPlan& plan) {
     if (plan.host_pinned_limit_bytes != 0) { return plan.host_pinned_limit_bytes; }
     const char* env = std::getenv("NINFER_HOST_PINNED_MAX_GIB");
     if (env == nullptr || *env == 0) { return 0; }
-    char* end         = nullptr;
-    const double gib  = std::strtod(env, &end);
+    char* end        = nullptr;
+    const double gib = std::strtod(env, &end);
     if (end == env || *end != 0 || !(gib > 0.0) || !std::isfinite(gib)) {
         throw ArtifactError("NINFER_HOST_PINNED_MAX_GIB must be a positive number of GiB");
     }
@@ -560,9 +560,24 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
         }
         require_host_memory(plan.host_mapped_bytes);
         const std::span<const HostMappedPlacement> placements(plan.host_mapped_objects);
-        const std::uint64_t limit = host_pinned_limit(plan);
-        const bool may_split      = any_pageable_candidate(placements);
-        out.stats_.host_pinned_limit_bytes = limit;
+        const std::uint64_t pinned_limit = host_pinned_limit(plan);
+        const std::uint64_t reserved     = plan.host_pinned_reserved_bytes;
+        if (pinned_limit != 0 && reserved >= pinned_limit) {
+            const auto mib = [](std::uint64_t bytes) {
+                return std::to_string((bytes + (1ULL << 20) - 1) >> 20) + " MiB";
+            };
+            throw ArtifactError("host-mapped weights: the page-locked limit of " +
+                                mib(pinned_limit) + " leaves nothing for them after the " +
+                                mib(reserved) +
+                                " of Host KV planes of --kv-ram-active; raise the limit "
+                                "(--host-pinned-max-gib / NINFER_HOST_PINNED_MAX_GIB) or drop "
+                                "--kv-ram-active");
+        }
+        // The weights' share of the limit (0 = none): what the Engine's later page-locked
+        // buffers inside it leave.
+        const std::uint64_t limit          = pinned_limit != 0 ? pinned_limit - reserved : 0;
+        const bool may_split               = any_pageable_candidate(placements);
+        out.stats_.host_pinned_limit_bytes = pinned_limit;
         HostResidency residency;
         bool placed_whole = false;
         if (limit == 0 || limit >= plan.host_mapped_bytes || !may_split) {
@@ -570,8 +585,8 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
                 out.host_mapped_ = std::make_unique<PinnedHostBuffer>(
                     static_cast<std::size_t>(plan.host_mapped_bytes), HostMapping::Yes,
                     PinnedHostPages::Huge);
-                residency    = plan_host_residency(placements, plan.host_mapped_bytes,
-                                                   plan.host_mapped_bytes);
+                residency =
+                    plan_host_residency(placements, plan.host_mapped_bytes, plan.host_mapped_bytes);
                 placed_whole = true;
             } catch (const std::exception& error) {
                 if (!may_split) {
@@ -588,12 +603,13 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
         }
         if (!placed_whole) {
             // The first try leaves room for the engine's other page-locked buffers (Host KV,
-            // StateImages, mailboxes, the staging ring) unless the limit is explicit; every failed
-            // try steps down.
-            const std::uint64_t reserve = std::min(plan.host_mapped_bytes, kPinnedReserveBytes);
-            std::uint64_t budget        = limit != 0 && limit < plan.host_mapped_bytes
-                                              ? limit
-                                              : plan.host_mapped_bytes - reserve;
+            // StateImages, mailboxes, the staging ring, the Host KV planes of --kv-ram-active)
+            // unless the limit is explicit; every failed try steps down.
+            const std::uint64_t reserve =
+                std::min(plan.host_mapped_bytes, kPinnedReserveBytes + reserved);
+            std::uint64_t budget = limit != 0 && limit < plan.host_mapped_bytes
+                                       ? limit
+                                       : plan.host_mapped_bytes - reserve;
             for (;;) {
                 residency = plan_host_residency(placements, plan.host_mapped_bytes, budget);
                 if (residency.required_pinned_bytes > budget) {
@@ -701,8 +717,8 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
                 auto& backing = object.device[device];
                 // A pageable parent has one host address for every device (no device mapping:
                 // only the CPU reads it in place, devices receive copies through pinned staging).
-                const std::byte* base = in_pageable ? bytes.data()
-                                                    : mapped[device] + residency.offset[i];
+                const std::byte* base =
+                    in_pageable ? bytes.data() : mapped[device] + residency.offset[i];
                 backing.parent = WeightParent{geometry, base, divisor};
                 backing.shard  = {ShardAxis::HostMapped, {}, geometry.shape};
                 if (!in_pageable) {

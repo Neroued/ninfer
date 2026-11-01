@@ -58,9 +58,10 @@ using Q8N124160K5120 = Q8LinearGeometry<124160, 5120>;
 [[nodiscard]] Q8Launch select_q8_n17408_k5120(std::int32_t tokens);
 [[nodiscard]] Q8Launch select_q8_n124160_k5120(std::int32_t tokens);
 
-// Untemplated Qwen4Exp hyper-connection and PLE problems (shapes/n_low_rank_k10240.cpp).
-[[nodiscard]] Q8Launch select_q8_generic_hidden2560(std::int32_t tokens);
-[[nodiscard]] Q8Launch select_q8_low_rank_k10240(std::int32_t tokens);
+// Generic routes of the untemplated problems (shapes/generic.cpp): any rows, and few rows over a
+// wide K.
+[[nodiscard]] Q8Launch select_q8_generic(std::int32_t tokens);
+[[nodiscard]] Q8Launch select_q8_few_rows_wide_k(std::int32_t tokens);
 
 // Qwen4Exp dense projections at decode widths (shapes/qwen4_dense.cu, T49).
 [[nodiscard]] Q8Launch select_q8_qwen4_n13312_k2560(std::int32_t tokens);

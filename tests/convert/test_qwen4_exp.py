@@ -1,4 +1,4 @@
-"""Qwen4Exp (Qwen3.8-Flash-Next): config mapping and the two Flash-Next official recipes."""
+"""Qwen4Exp: config mapping, the Flash-Next official recipes and qwen4_bf16."""
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ from tools.artifact.codecs.nvfp4 import unswizzle_nvfp4_scales
 from tools.artifact.layouts import block_scale_geometry
 from tools.artifact.reader import Artifact
 from tools.convert.official_recipes import (
+    qwen4_bf16,
     qwen3_8_flash_next_nvfp4,
     qwen3_8_flash_next_nvfp4_dense,
     qwen3_8_flash_next_nvfp4_mix,
@@ -40,6 +41,62 @@ def test_config_keeps_qwen4_fields_and_checks_fixed_mathematics():
     bad["text_config"]["norm_topk_prob"] = False
     with pytest.raises(ValueError, match="norm_topk_prob"):
         text_config(bad, mtp=False)
+
+
+@pytest.mark.parametrize("ple", [True, False])
+def test_dense_config_without_moe_fields_and_optional_ple(ple):
+    config = text_config(fixture.config(dense=True, ple=ple), mtp=True)
+    assert (config["architectures"][0], config["model_type"]) == ("Qwen4ExpForCausalLM", "qwen4_exp_text")
+    assert config["intermediate_size"] == fixture.DENSE_IR
+    assert not {"num_experts", "moe_intermediate_size", "shared_expert_intermediate_size"} & set(config)
+    assert config["output_gate_type"] == "sigmoid" and config["hc_count"] == fixture.HC
+    ple_fields = {"ple_layer_ids", "ple_embed_dim", "ngram_size", "seed", "eos_token_id"}
+    assert (ple_fields <= set(config)) if ple else not (ple_fields & set(config))
+
+
+def test_dense_config_needs_an_ffn_width():
+    bad = fixture.config(dense=True)
+    del bad["text_config"]["intermediate_size"]
+    with pytest.raises(ValueError, match="intermediate_size"):
+        text_config(bad, mtp=False)
+
+
+@pytest.mark.parametrize("ple", [True, False])
+def test_qwen4_bf16_recipe_converts_a_dense_checkpoint(tmp_path, ple):
+    source_dir = tmp_path / "source"
+    fixture.write_checkpoint(source_dir, dense=True, ple=ple)
+    with SafetensorsSource(source_dir) as source:
+        model = build_model(source, components=("text", "mtp"))
+        recipe = Recipe(model)
+        qwen4_bf16(model, recipe, {"base": source})
+        out = tmp_path / "dense.ninfer"
+        convert(model, recipe, out, device="cpu", rows_per_chunk=128)
+    with SafetensorsSource(source_dir) as store, Artifact(out) as artifact:
+        directory = artifact.directory
+        text = directory.components["text"]["config"]
+        assert text["intermediate_size"] == fixture.DENSE_IR and "num_experts" not in text
+        mtp = directory.components["mtp"]["config"]["architectures"]
+        assert mtp == ["Qwen4ExpMTP"]
+        assert ("text/layers/0/ple/table" in directory.bindings) == ple
+        assert not any("/moe/" in name for name in directory.bindings)
+        for prefix, source_prefix in (
+            ("text/layers/1/", "model.language_model.layers.1."),
+            ("mtp/layers/0/", "mtp.layers.0."),
+        ):
+            (gate,) = _parts(directory, prefix + "mlp/gate")
+            (up,) = _parts(directory, prefix + "mlp/up")
+            (down,) = _parts(directory, prefix + "mlp/down")
+            # gate|up one BF16 parent (gate rows first), down its own; the values are the source's.
+            assert gate["object"] == up["object"] and gate["range"][1] == up["range"][0]
+            parent = artifact.object(gate["object"])
+            assert parent.format == "bf16" and parent.shape == (2 * fixture.DENSE_IR, fixture.H)
+            raw = artifact.read_object(gate["object"])
+            want = torch.cat([store.read_flat(source_prefix + f"mlp.{r}_proj.weight") for r in ("gate", "up")])
+            assert raw[: parent.shape[0] * parent.shape[1] * 2] == want.view(torch.uint8).numpy().tobytes()
+            assert artifact.object(down["object"]).format == "bf16"
+        if ple:
+            (part,) = _parts(directory, "text/layers/0/ple/table")
+            assert artifact.object(part["object"]).format == "fp8_e4m3fn_row_bf16"
 
 
 def test_ngram_table_rows_match_official_shards_and_the_independent_constants():

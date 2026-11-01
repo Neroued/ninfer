@@ -290,6 +290,12 @@ public:
                                      const ExecutionContext& ec);
     void columns_ready(int rank, std::int64_t first, std::int64_t count);
     void finish_sum_f32();
+    // Closes the open call without combining, for a caller that failed between begin_sum_f32 and
+    // finish_sum_f32: each rank's stream waits for the copies already enqueued, after which
+    // partial, staging and the pinned buffers may be reused and the next begin_sum_f32 opens.
+    // partial[r] and bf16_out[r] are left unspecified. Does nothing without an open call; CUDA
+    // errors are ignored (the caller is already propagating a failure).
+    void abandon_sum_f32() noexcept;
 
     // Columns of rank r reported in the open call (0 when none is open).
     [[nodiscard]] std::int64_t columns_done(int rank) const noexcept {
@@ -416,6 +422,7 @@ public:
     PeerLanes& operator=(const PeerLanes&) = delete;
 
     [[nodiscard]] bool serves(const ExecutionContext& ec) const noexcept;
+
     [[nodiscard]] bool direct() const noexcept { return direct_; }
 
     void sum_begin(int lane, const std::array<Tensor, 2>& buffer,

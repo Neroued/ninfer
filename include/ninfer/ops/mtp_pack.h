@@ -15,7 +15,7 @@ namespace ninfer::ops {
  *
  * Logical shapes:
  *   BF16 embedding_norm and hidden_norm [D,T], out [2D,T], contiguous. The registered domains are
- *   D=5120 for Qwen3.6-27B and D=2048 for Qwen3.6-35B-A3B.
+ *   D=5120 and D=2048.
  *
  * Numeric:
  *   Exact BF16 element copies; no arithmetic or conversion.

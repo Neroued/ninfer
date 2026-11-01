@@ -159,6 +159,9 @@ int main() {
     CUDA_CHECK(cudaMemset(recurrent1.data, 0x4d, recurrent1.bytes()));
     CUDA_CHECK(cudaMemset(conv1_layer1.data, 0x3c, conv1_layer1.bytes()));
     CUDA_CHECK(cudaMemset(recurrent1_layer1.data, 0x2d, recurrent1_layer1.bytes()));
+    // cudaMemset runs on the default stream, which the non-blocking ctx.stream does not wait for:
+    // the slot copy would otherwise race the fills.
+    CUDA_CHECK(cudaDeviceSynchronize());
 
     slotted.copy_slot(1, 2, ctx.stream);
     ctx.synchronize();

@@ -64,7 +64,7 @@ struct MoeWeights {
 struct BlockWeights {
     WeightId input_norm, post_attention_norm;
     std::variant<AttentionWeights, GdnWeights> mixer;
-    std::variant<DenseWeights, MoeWeights> ffn;
+    DenseWeights ffn;
 };
 
 struct TextWeights {
@@ -149,11 +149,12 @@ struct PleWeights {
     WeightId table_global_scale;
 };
 
-// Qwen4Exp block: hyper-connection mixers around a QSA or GDN mixer and the offloaded MoE.
+// Qwen4Exp block: hyper-connection mixers around a QSA or GDN mixer and the FFN: the offloaded
+// MoE (Qwen3.8-Flash-Next) or a dense SwiGLU FFN (mlp/gate, mlp/up, mlp/down).
 struct Qwen4BlockWeights {
     HyperConnectionWeights attention_hc, ffn_hc;
     std::variant<QsaWeights, GdnWeights> mixer;
-    MoeWeights moe;
+    std::variant<MoeWeights, DenseWeights> ffn;
     std::optional<PleWeights> ple;
 };
 

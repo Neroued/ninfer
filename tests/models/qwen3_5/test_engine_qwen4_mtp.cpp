@@ -36,6 +36,11 @@
 //      differences into different greedy tokens. For the same reason the draft proposals are not
 //      compared: on this model they flip between near-equal tokens from run to run of one
 //      configuration. The bridge's MTP state is checked on the real model, through acceptance.)
+//   7. repeatable MTP head: the teacher-forced MTP pass (NINFER_QWEN4_TFDUMP with
+//      NINFER_QWEN4_TFDUMP_MTP=1: every prompt column runs the MTP layer at T = 1, on the
+//      hyper-connection small-T route) of one prompt on two fresh Engines writes the same MTP
+//      logits bit for bit: a buffer that two launches of the pass read and write concurrently
+//      (as the MTP layer's FFN mixer gates, which have a buffer of their own) would change them.
 #include "ninfer/engine.h"
 
 #include <cuda_runtime.h>
@@ -45,7 +50,10 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <fstream>
+#include <iterator>
+#include <map>
 #include <iostream>
 #include <optional>
 #include <string>
@@ -66,6 +74,16 @@ constexpr std::uint32_t kDrafts = 3;
 // 1 token from the prefill, then rounds of K+1 = 4 under oracle drafts: 1 + 4 * 10 = 41, so the
 // 42nd token comes from a round with one token of budget left (extent 0).
 constexpr std::uint32_t kOutput = 42;
+
+// A per-process path `stem` + pid under NINFER_TEST_SCRATCH_DIR (the system temporary directory
+// when unset).
+std::string scratch_path(const std::string& stem) {
+    const char* scratch              = std::getenv("NINFER_TEST_SCRATCH_DIR");
+    const std::filesystem::path root = scratch != nullptr && *scratch
+                                           ? std::filesystem::path(scratch)
+                                           : std::filesystem::temp_directory_path();
+    return (root / (stem + std::to_string(::getpid()))).string();
+}
 
 class ScopedEnv {
 public:
@@ -160,6 +178,49 @@ void check(bool ok, const std::string& what) {
     }
 }
 
+// The MTP logits of every column of the 64-token prompt, by dump file name, from a fresh Engine.
+std::map<std::string, std::string> teacher_forced_mtp_logits(const char* artifact,
+                                                             const std::string& directory) {
+    std::filesystem::remove_all(directory);
+    {
+        const ScopedEnv dump("NINFER_QWEN4_TFDUMP", directory);
+        const ScopedEnv mtp("NINFER_QWEN4_TFDUMP_MTP", "1");
+        const ScopedEnv layers("NINFER_QWEN4_TFDUMP_LAYERS", "none");
+        const ScopedEnv logits("NINFER_QWEN4_TFDUMP_LOGITS", "0");
+        auto o           = options(artifact, Experts::Mapped, 1);
+        o.use_cuda_graph = false;
+        ninfer::Engine engine(o);
+        (void)generate(engine, kIds, 1);
+    }
+    std::map<std::string, std::string> columns;
+    const std::filesystem::path mtp = std::filesystem::path(directory) / "mtp_logits";
+    if (std::filesystem::exists(mtp)) {
+        for (const auto& entry : std::filesystem::directory_iterator(mtp)) {
+            std::ifstream in(entry.path(), std::ios::binary);
+            columns[entry.path().filename().string()] =
+                std::string(std::istreambuf_iterator<char>(in), {});
+        }
+    }
+    std::filesystem::remove_all(directory);
+    return columns;
+}
+
+void repeatable_mtp_head(const char* artifact) {
+    const std::string base = scratch_path("ninfer_qwen4_mtp_tfdump_");
+    const auto first       = teacher_forced_mtp_logits(artifact, base + "_a");
+    const auto second      = teacher_forced_mtp_logits(artifact, base + "_b");
+    std::size_t differing  = 0;
+    for (const auto& [name, bytes] : first) {
+        const auto other = second.find(name);
+        if (other == second.end() || other->second != bytes) { ++differing; }
+    }
+    std::printf("repeatable MTP head: %zu columns, %zu differ between two Engines\n", first.size(),
+                differing);
+    check(first.size() + 1 >= kIds.size() && first.size() == second.size(),
+          "repeatable MTP head: the dump does not cover the prompt columns");
+    check(differing == 0, "repeatable MTP head: two runs of one prompt gave different MTP logits");
+}
+
 // MTP, no-draft and oracle-draft runs of one prompt with `experts`.
 void exactness(const char* artifact, Experts experts, const char* label) {
     const std::vector<ninfer::TokenId> ids = prompt(0, 33);
@@ -169,8 +230,7 @@ void exactness(const char* artifact, Experts experts, const char* label) {
         const ScopedEnv none("NINFER_QWEN4_MTP_NO_DRAFTS", "1");
         no_draft = generate_once(artifact, experts, ids);
     }
-    const std::string oracle_path =
-        "/tmp/ninfer_qwen4_mtp_oracle_" + std::to_string(::getpid()) + ".txt";
+    const std::string oracle_path = scratch_path("ninfer_qwen4_mtp_oracle_") + ".txt";
     {
         std::ofstream out(oracle_path);
         for (const auto id : ids) { out << id << ' '; }
@@ -424,6 +484,7 @@ int main() {
             std::cout << "OK qwen4 mtp engine (prefix reuse only)\n";
             return 0;
         }
+        repeatable_mtp_head(artifact);
         exactness(artifact, Experts::Mapped, "mapped experts");
         {
             const ScopedEnv validation("NINFER_QWEN4_VALIDATION", "1");
@@ -434,7 +495,7 @@ int main() {
         // 4. T43 draft shortlist: proposals over the ID prefix [0, 3000) plus three high IDs (the
         //    gathered extra rows; 3003 IDs, completed to 3008 rows): MTP == no-draft == oracle
         //    drafts (the verification head is the full one, whatever the proposals).
-        g_shortlist = "/tmp/ninfer_qwen4_mtp_shortlist_" + std::to_string(::getpid()) + ".txt";
+        g_shortlist = scratch_path("ninfer_qwen4_mtp_shortlist_") + ".txt";
         {
             std::ofstream out(g_shortlist);
             out << "# test shortlist\n";

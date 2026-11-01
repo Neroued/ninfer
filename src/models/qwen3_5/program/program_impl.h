@@ -24,7 +24,7 @@
 #include "models/qwen3_5/execution/text.h"
 #include "models/qwen3_5/execution/qwen4_draft_head.h"
 #include "models/qwen3_5/execution/qwen4_experts.h"
-#include "models/qwen3_5/execution/qwen4_forward.h"
+#include "models/qwen3_5/execution/qwen4_runtime.h"
 #include "models/qwen3_5/execution/qwen4_tfdump.h"
 #include "models/qwen3_5/execution/vision.h"
 #include "models/qwen3_5/program/vision_prefill.h"
@@ -36,6 +36,7 @@
 #include <array>
 #include <functional>
 #include <string>
+#include <string_view>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -464,7 +465,7 @@ struct RequestControl {
         MtpBridgeMode mtp_bridge            = MtpBridgeMode::None;
         // Disk tier (v0.7.2): the resume was tried; the frontier it loaded (0: none). The MTP
         // bridge then runs at this frontier instead of `base` (which stays the admitted reuse).
-        bool disk_attempted    = false;
+        bool disk_attempted     = false;
         std::uint32_t disk_base = 0;
     };
 
@@ -615,6 +616,13 @@ public:
     retained_device_kv_pages(const ContinuationHandle& continuation) const noexcept;
     [[nodiscard]] DeviceKVPages
     retained_device_kv_pages(const SharedPrefixHandle& shared) const noexcept;
+    [[nodiscard]] DeviceKVPages idle_device_kv_pages(const ContinuationHandle& continuation) const;
+    [[nodiscard]] DeviceKVPages idle_device_kv_pages(const SharedPrefixHandle& shared) const;
+    [[nodiscard]] DeviceKVPages idle_device_kv_pages(const SequenceKVBundle& kv) const;
+    [[nodiscard]] std::vector<DeviceKVPages>
+    releasable_device_kv_pages(std::span<const ContinuationHandle* const> continuations,
+                               std::span<const SharedPrefixHandle* const> shared) const;
+    [[nodiscard]] DeviceKVPages device_kv_available_pages() const noexcept;
     [[nodiscard]] std::optional<ContinuationSummary>
     demote_retained_kv_for_lease(const ContinuationHandle& continuation,
                                  DeviceKVPages needed) noexcept;
@@ -635,7 +643,8 @@ public:
     void disk_synchronize() const;
     [[nodiscard]] std::string disk_cache_status() const;
     // At the first step of a root prefill: loads the longest saved checkpoint the prompt begins
-    // with (KV, MTP KV, StateImage) and moves the cursor there. Returns the tokens loaded (0: none).
+    // with (KV, MTP KV, StateImage) and moves the cursor there. Returns the tokens loaded (0:
+    // none).
     std::uint32_t disk_cache_resume(SequenceState& sequence, RequestControl& request);
     [[nodiscard]] std::uint32_t disk_resume_tokens(const PreparedPromptData& prompt);
 
@@ -699,12 +708,14 @@ public:
     std::unique_ptr<DiskKVCache> disk_kv;
     std::optional<PinnedHostBuffer> disk_state_scratch;
     std::optional<PinnedHostBuffer> disk_read_buffer;
+
     // Per continuation slot: the slot generation and the frontier last handed to the disk.
     struct DiskSaved {
         std::uint64_t generation = 0;
         std::uint32_t frontier   = 0;
         std::uint64_t digest     = 0; // xxh64 of the tokens up to `frontier`
     };
+
     std::vector<DiskSaved> disk_saved;
     std::optional<GdnReplayRecords> replay_records;
     std::optional<ops::GdnReplayFoldPlan> replay_fold;
@@ -833,6 +844,9 @@ public:
     }
 
     void construct_qwen4(const SequencePlanImpl& plan, DeviceSpan backing);
+    void construct_qwen4_experts(const SequencePlanImpl& plan, DeviceSpan backing,
+                                 execution::Qwen4Runtime& runtime,
+                                 execution::Qwen4Runtime& peer_runtime);
     // Expert window of one execution on every rank's backend (qwen4_experts.h window protocol):
     // begin before anything of it is enqueued, observe once it is enqueued, end after the
     // devices completed it (abandon on failure). No-ops without Qwen4Exp experts.

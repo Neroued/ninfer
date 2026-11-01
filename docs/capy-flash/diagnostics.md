@@ -48,7 +48,9 @@ residency (`NINFER_QWEN4_EXPERT_FREEZE`, see below).
 | `NINFER_HOST_ISA` | `auto` (default), `avx2`, `avx512` | Instruction set of the CPU expert kernels: `auto` takes AVX-512 VNNI where the CPU has it, else AVX2 + FMA + F16C; `avx2` forces the AVX2 kernels on an AVX-512 CPU (to test them); a value the CPU cannot run stops the server at startup. The log line `qwen4 experts: host expert kernels …` names the choice. Both compute identical bits (`ninfer_host_nvfp4_isa_test`); only speed differs. | performance | timing | capy |
 | `NINFER_RAM_GUARD` | `0` / unset (on) | Startup check that MemAvailable ≥ the page-locked host weights (64.6 GiB for Flash-Next) + max(2 GiB, 5 % of MemTotal). Otherwise the server refuses to start and prints the numbers. `0` skips the check (T156). | production | none | capy |
 | `NINFER_HOST_TIER_RAM_GUARD` | `0` / unset (on) | Startup check that MemAvailable ≥ the page-locked RAM tiers of the context cache (`--host-state-slots`, `--host-kv-mib`) + max(4 GiB, 5 % of MemTotal); otherwise the server stops with the sizes. `0` skips it. | production | none | capy |
-| `NINFER_HOST_PINNED_MAX_GIB` | GiB, may be fractional (unset = no limit) | Same as `--host-pinned-max-gib` (the flag wins): at most this much of the host-mapped weights (Flash-Next expert banks) is page-locked; the banks of the least used layers beyond it stay in pageable RAM (CPU reads them in place, GPU copies go through a pinned staging ring, no prefill streaming for them). Unset: the whole page-locked allocation is tried first and the fallback starts only if the driver refuses it (Windows WDDM / WSL2). A value that is not a positive number stops the server at startup. | production | same tokens, slower where pageable | capy |
+| `NINFER_KVRAM_CACHE_BLOCKS` | blocks (unset = 4096) | With `--kv-ram-active`: 4-token blocks of the VRAM block cache per text attention layer. Raised automatically so the region also holds one layer of `--max-context` (the prefill staging); a larger value keeps more of the indexer's past selections on the GPU at the cost of VRAM ([cost per block](../maintainer/active-kv-in-ram.md#memory)). | tuning | none (same tokens) | capy |
+| `NINFER_KVRAM_STATS` | `1` / unset | With `--kv-ram-active`: count the block cache's outcomes (hits, blocks shared by the columns of an MTP window, misses, uncacheable tail blocks, collisions), the staged prefill pages, and how many distinct blocks a prompt chunk's selections touch out of the visible ones, and print them summed over the layers before each prompt (`active KV stats`). Synchronizes the GPU at each prompt; diagnostics only. | diagnostics | timing | capy |
+| `NINFER_HOST_PINNED_MAX_GIB` | GiB, may be fractional (unset = no limit) | Same as `--host-pinned-max-gib` (the flag wins): at most this much of the host-mapped weights (Flash-Next expert banks) is page-locked; the banks of the least used layers beyond it stay in pageable RAM (CPU reads them in place, GPU copies go through a pinned staging ring, no prefill streaming for them). Unset: the whole page-locked allocation is tried first and the fallback starts only if the driver refuses it (Windows WDDM / WSL2). With `--kv-ram-active` its Host KV planes count in the limit. A value that is not a positive number stops the server at startup. | production | same tokens, slower where pageable | capy |
 | `NINFER_HOST_STAGING_MIB` | MiB (128) | Size of the pinned staging ring per GPU that fills expert slots from pageable banks; only allocated when some bank is pageable. At least one expert, at most the fill depth. If the allocation fails the server stops and suggests lowering `--host-pinned-max-gib` or this value. | performance | timing | capy |
 | `NINFER_CUDA_SYNC` | `spin` (default), `blocking`, `yield`, `auto` | CUDA device synchronization schedule ([cli.md](../cli.md#cuda-synchronization)). | performance | timing (host CPU use) | ninfer |
 
@@ -186,6 +188,7 @@ These variables change execution on purpose so that runs can be compared exactly
 | `NINFER_TP_AR_DITHER_BIT` | 0..15 | Which bit the dither flips. | numerics | capy |
 | `NINFER_HOST_MOE_W4A4` | `1` | The CPU emulates the GPU's W4A4 recipe exactly, with FP64 sums. Slow; reference for T98. | numerics | capy |
 | `NINFER_QWEN4_HC_GENERAL` | `1` | Q8/NVFP4 hyper-connection mixers take the general (non-fused) route, to separate route from weight format (T103). | may change rounding | capy |
+| `NINFER_QWEN4_FUSED` | `0` / unset (on) | Every Qwen4Exp block takes the generic chain (Linear, row copies, elementwise Ops) instead of the fused Ops registered for its geometry (hidden 5120: GDN input projection and gating, QSA input projection, SwiGLU). Flash-Next (hidden 2560) has none; a dense Qwen3.5 model's blocks always take their fused Ops. | numerics | capy |
 
 ## 7. Benchmark kernel selectors
 
@@ -209,13 +212,12 @@ TP2 transport. These apply to capy-flash as well, and the defaults are right for
 | `NINFER_TP_MAILBOX_FAULT` | `draft`, `any` | Simulates a mailbox hang to test the degradation path. | diagnostic (test) | timing |
 | `NINFER_TP_MAILBOX_DRAFT` | `copies` | Starts with the MTP draft exchanges on copies instead of the mailbox. | performance A/B | timing |
 
-For other models only (DFlash drafters of the Qwen3.x 27B models; capy-flash drafts with MTP, so these have no effect
-on it):
+For `--spec dflash2` only (the Qwen3.8-27B DFlash2 drafter; the `--profile` configurations draft with MTP):
 
 | variable | values | effect |
 |---|---|---|
 | `NINFER_TP_DRAFT_HEAD` | `primary` | Proposal head whole on rank 0 instead of split. |
-| `NINFER_TP_DRAFTER` | `primary` | Whole DFlash drafter on rank 0. |
+| `NINFER_TP_DRAFTER` | `primary` | Whole DFlash2 drafter on rank 0. |
 | `NINFER_TP_SELECTOR` | `primary` | DFlash2 candidate selector on rank 0. |
 
 Exists, but has no execution route:
@@ -231,6 +233,7 @@ These are not read by the server. The list is not exhaustive; see `tests/README.
 | variable | used by |
 |---|---|
 | `NINFER_TEST_ARTIFACT`, `NINFER_TEST_QWEN4_ARTIFACT`, `NINFER_TEST_QWEN4_VISION_ARTIFACT` | real-artifact tests (skipped when unset) |
+| `NINFER_TEST_FP4_LOCAL_CHECKPOINT` | the FP4-Local checkpoint directory whose real tensors the conversion and PLE gather tests compare (skipped when unset) |
 | `NINFER_TEST_QWEN4_REUSE_ONLY`, `NINFER_PREFIX_REAL_SCENARIO`, `NINFER_TEST_PORT`, `NINFER_TEST_SCRATCH_DIR` | integration test selection and setup |
 | `NINFER_OP_REPORT_STATS` | op tests print statistics |
 | `NINFER_DRIVER_TEMPS` | validation driver: one sampling temperature per prompt line (T121) |

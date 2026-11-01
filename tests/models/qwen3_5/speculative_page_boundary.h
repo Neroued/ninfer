@@ -8,7 +8,8 @@
 
 namespace ninfer::test {
 
-// Exercise the same resource transition for DFlash's Full KV and DFlash2's cyclic-only state.
+// A speculative verify that crosses a KV page boundary and stops one column past it, then the
+// retained frontier and the generation that resumes from it, with and without prefix reuse.
 inline void speculative_page_boundary(Engine& engine) {
     const auto check = [](bool condition, const char* message) {
         if (!condition) { throw std::runtime_error(message); }

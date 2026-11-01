@@ -22,7 +22,7 @@
 // the Program after a scored tile or a decode round has completed.
 
 #include "core/tensor.h"
-#include "models/qwen3_5/execution/qwen4_forward.h"
+#include "models/qwen3_5/execution/qwen4_runtime.h"
 
 #include <cuda_runtime.h>
 

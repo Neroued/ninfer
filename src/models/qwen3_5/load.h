@@ -27,6 +27,9 @@ public:
     [[nodiscard]] const ModelWeights& weights() const;
     [[nodiscard]] const FrontendResources& resources() const;
     [[nodiscard]] const artifact::MaterializationPlan& materialization() const;
+    // Page-locked bytes the Engine allocates after the weights within the same page-locked limit
+    // (artifact::MaterializationPlan::host_pinned_reserved_bytes).
+    void reserve_host_pinned_bytes(std::uint64_t bytes);
     [[nodiscard]] std::size_t parameter_count() const;
     [[nodiscard]] const artifact::ParameterReference& parameter(WeightId id) const;
     [[nodiscard]] std::span<const WeightUse> uses(WeightId id) const;
@@ -43,8 +46,7 @@ private:
 };
 
 // options.tp == 2 plans one backing per device from the logical tensor-parallel placement in
-// load/sharding.h; it rejects the MoE architecture and a masked draft that reads the full
-// output head.
+// load/sharding.h; it rejects a masked draft that reads the full output head.
 [[nodiscard]] LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options = {});
 // Requires a plan for one device.
 [[nodiscard]] std::unique_ptr<Model> materialize_model(LoadPlan&& plan, DeviceContext& device,

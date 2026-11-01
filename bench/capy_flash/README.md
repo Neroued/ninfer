@@ -26,3 +26,26 @@ requested with transparent huge pages and, on a machine with THP defrag `madvise
 
 `gen_sessions.py` documents how `sessions.json` was built (from a source tree and the model tokenizer); the published
 numbers all used the `sessions.json` committed here.
+
+## Long-context decode and greedy identity (`long_context.py`)
+
+Decode speed at fixed context sizes, one fresh conversation per size (a distinct slice of a long text cut to the
+size with the model tokenizer, then a summarization request, temperature 0), and a greedy probe whose output files
+compare byte for byte between two configurations of the same binary (for example a placement option on and off,
+with `NINFER_QWEN4_VALIDATION=1 NINFER_QWEN4_EXPERT_FREEZE=all` so that expert residency does not differ). Used for
+active KV in RAM (`--kv-ram-active`, [design](../../docs/maintainer/active-kv-in-ram.md)).
+
+```
+TOK=<model dir>/tokenizer.json; WIKI=<wikitext-2-raw>
+python3 bench/capy_flash/long_context.py decode http://127.0.0.1:8098 capy-flash lc.jsonl --text $WIKI/wiki.train.raw \
+  --tokenizer $TOK --sizes 16000,64000,128000,250000 --max-tokens 512 --server-log serve.log
+python3 bench/capy_flash/long_context.py summarize reqlog.jsonl lc.jsonl
+python3 bench/capy_flash/long_context.py greedy http://127.0.0.1:8098 capy-flash greedy.jsonl --text $WIKI/wiki.valid.raw \
+  --tokenizer $TOK --sizes 1000,3000,12000,30000,60000
+```
+
+`summarize` reads the server-side decode rate (completion tokens / decode seconds) from the request log and, with
+the probe output, the expert slots per layer per GPU and the KV bytes per GPU of an `--elastic` server. Each `decode`
+request carries an `X-Ninfer-Client` label unique to its run and size, which the probe records and the request log
+keeps: `summarize` pairs a request with its probe by that label, so other requests in the log and earlier runs
+appended to the probe file do not shift the pairing.

@@ -144,7 +144,6 @@ void ProgramImpl::prepare_graphs() {
 
     std::vector<KVAddressSpaceHandle> text_capture_allocations;
     std::vector<KVAddressSpaceHandle> mtp_capture_allocations;
-    std::vector<KVAddressSpaceHandle> dflash_capture_allocations;
     const auto reserve_capture_rows = [&](qwen3_5::PagedKVCache& cache,
                                           KVAddressSpaceStore& addresses,
                                           std::vector<KVAddressSpaceHandle>& allocations,
@@ -176,9 +175,6 @@ void ProgramImpl::prepare_graphs() {
     if (speculative_backend == SpeculativeBackend::Mtp) {
         reserve_capture_rows(*decoder->mtp_cache(), *backend_kv_addresses, mtp_capture_allocations,
                              "MTP KV cache");
-    } else if (dflash && dflash->full) {
-        reserve_capture_rows(*dflash->full, *backend_kv_addresses, dflash_capture_allocations,
-                             "DFlash Full KV cache");
     }
     // Rank 1's capture rows, pages and StateImages follow through the mirrors attached at
     // construction.
@@ -239,10 +235,6 @@ void ProgramImpl::prepare_graphs() {
             zero_capture_pages(*decoder->mtp_cache(), *backend_kv_addresses,
                                mtp_capture_allocations, batch_size);
         }
-        if (dflash && dflash->full) {
-            zero_capture_pages(*dflash->full, *backend_kv_addresses, dflash_capture_allocations,
-                               batch_size);
-        }
         for (std::uint32_t row = 0; row < batch_size; ++row) {
             state_images->zero_slot(capture_state_slot(row), device.stream);
             if (dflash) {
@@ -284,7 +276,6 @@ void ProgramImpl::prepare_graphs() {
                                     "graph representative DFlash target RoPE position");
                 }
                 dflash_host_ingress->text_kv_table_rows[row]      = static_cast<std::int32_t>(row);
-                dflash_host_ingress->dflash_kv_table_rows[row]    = static_cast<std::int32_t>(row);
                 dflash_host_ingress->active_lanes[row]            = static_cast<std::int32_t>(row);
                 dflash_host_ingress->state_source_slots[row]      = capture_state_slot(row);
                 dflash_host_ingress->state_destination_slots[row] = capture_state_slot(row);
@@ -460,9 +451,8 @@ void ProgramImpl::prepare_graphs() {
                 }
             }
         }
-        if (is_masked_draft_backend(speculative_backend)) {
-            const auto planned_profiles =
-                dflash_graph_profiles(speculative_backend, capacity, draft_window);
+        if (speculative_backend == SpeculativeBackend::DFlash2) {
+            const auto planned_profiles = dflash_graph_profiles(capacity, draft_window);
             validate_graph_profiles(planned_profiles, capacity - 1, "DFlash");
             execution::DFlashBatchContext dflash_state{
                 execution_core(),
@@ -522,7 +512,7 @@ void ProgramImpl::prepare_graphs() {
             instantiate_graph_family(mtp_graphs, "MTP", device, prepare_representative,
                                      synchronize_graphs);
         }
-        if (is_masked_draft_backend(speculative_backend)) {
+        if (speculative_backend == SpeculativeBackend::DFlash2) {
             instantiate_graph_family(dflash_graphs, "DFlash", device, prepare_representative,
                                      synchronize_graphs);
         }
@@ -534,7 +524,8 @@ void ProgramImpl::prepare_graphs() {
         } catch (const std::runtime_error&) {
             // synchronize_devices() found the hang word set: both devices are idle, the executables
             // are discarded by degrade_peer_mailbox() before the mailbox they address.
-            if (!peer_mailbox || !peer_mailbox->hang_reported() || !degrade_peer_mailbox()) {
+            if (!peer_mailbox || !peer_mailbox->hang_reported() ||
+                !degrade_peer_mailbox("in the first launch of a CUDA graph")) {
                 throw;
             }
         }
@@ -581,9 +572,6 @@ void ProgramImpl::prepare_graphs() {
         }
         allocations.clear();
     };
-    if (!dflash_capture_allocations.empty()) {
-        release_capture_rows(*backend_kv_addresses, dflash_capture_allocations);
-    }
     if (!mtp_capture_allocations.empty()) {
         release_capture_rows(*backend_kv_addresses, mtp_capture_allocations);
     }

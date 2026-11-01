@@ -7,6 +7,8 @@
 //    accepted by the slicer at the stored format's tile boundaries and has the per-rank shape the
 //    split Ops consume, and the per-rank device bytes are printed (the T30 dossier's table).
 // 3. Rejections: a Qwen4Exp parameter without a rule, an odd stream split.
+// 4. A dense Qwen4Exp FFN: mlp/* split like the Qwen3.5 dense block, no MoE rule applies, the
+//    per-rank config halves the intermediate width.
 
 #include "artifact/binder.h"
 #include "artifact/fixture.h"
@@ -244,6 +246,53 @@ void logical_policy() {
             "per-rank Qwen4Exp config");
     require(split.residual_width() == kWide / 2 && split.hyper_connection->hc_count == 2,
             "per-rank Qwen4Exp config with split streams");
+}
+
+// Dense FFN: gate/up rows and down columns halved per rank (Text and MTP blocks); the MoE leaves of
+// a Flash-Next block have no placement in a dense model, and a dense model's mlp/* none in a MoE
+// one.
+void dense_policy() {
+    for (const std::uint64_t hidden : {kH, std::uint64_t(5120)}) {
+        auto config               = flash_next(4);
+        config.text.hidden_size   = static_cast<std::uint32_t>(hidden);
+        const std::uint64_t width = hidden == kH ? 6912 : 14336;
+        config.text.ffn           = qwen::DenseConfig{static_cast<std::uint32_t>(width)};
+        config.text.attention     = qwen::AttentionConfig{24, hidden == kH ? 2U : 4U, 256};
+        for (const std::string p : {"text/layers/0/", "text/layers/3/", "mtp/layers/0/"}) {
+            for (const auto* leaf : {"mlp/gate", "mlp/up"}) {
+                expect(config, p + leaf, {width, hidden}, ShardAxis::Rows,
+                       {halves(width, 0), halves(width, 1)});
+            }
+            expect(config, p + "mlp/down", {hidden, width}, ShardAxis::Columns,
+                   {halves(width, 0), halves(width, 1)});
+            rejects<std::invalid_argument>(
+                [&] {
+                    (void)loading::logical_shard(p + "moe/router", {512, hidden}, config, kTp2);
+                },
+                "a MoE router was placed for a dense Qwen4Exp FFN");
+            rejects<std::invalid_argument>(
+                [&] {
+                    (void)loading::logical_shard(p + "moe/shared/gate", {640, hidden}, config,
+                                                 kTp2);
+                },
+                "a shared expert was placed for a dense Qwen4Exp FFN");
+        }
+        const auto rank = qwen::execution::shard_text_config(config.text, 2);
+        require(std::get<qwen::DenseConfig>(rank.ffn).intermediate_size == width / 2 &&
+                    rank.attention->num_key_value_heads ==
+                        config.text.attention->num_key_value_heads / 2 &&
+                    !rank.qwen4_routed_experts() && rank.qwen4(),
+                "per-rank dense Qwen4Exp config");
+        auto no_ple     = config;
+        no_ple.text.ple = std::nullopt;
+        expect(no_ple, "text/layers/1/mlp/gate", {width, hidden}, ShardAxis::Rows,
+               {halves(width, 0), halves(width, 1)});
+    }
+    rejects<std::invalid_argument>(
+        [&] {
+            (void)loading::logical_shard("text/layers/0/mlp/gate", {6912, kH}, flash_next(), kTp2);
+        },
+        "a dense FFN leaf was placed for a MoE Qwen4Exp");
 }
 
 // ---- combined placements of the real parents ---------------------------------------------------
@@ -519,6 +568,7 @@ void combined_placements() {
 int main() {
     try {
         logical_policy();
+        dense_policy();
         combined_placements();
         std::cout << "qwen4 tensor-parallel shard map passed\n";
         return 0;

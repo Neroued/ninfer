@@ -92,12 +92,18 @@ TpTransportStatus tp_transport_status;
 // NINFER_TP_MAILBOX_PROBE=off skips the probe, =fail runs it with a missing peer (test aid).
 void probe_peer_mailbox();
 
-// Called by prepare_graphs() after a mailbox exchange timed out in a graph's first launch,
-// with both devices idle: discards every captured graph and steps the transport down once,
-// from the mailbox everywhere to the mailbox with the MTP draft phase on the staged copies
-// (MTP only), then to the staged copies everywhere. Returns false when nothing is left to
-// step down to. The replacement mailbox is fresh: the hung one's words have diverged.
-bool degrade_peer_mailbox();
+// Called by prepare_graphs() after a mailbox exchange timed out in a graph's first launch (and
+// by recover_peer_transport() after one timed out while serving), with both devices idle:
+// discards every captured graph and steps the transport down once, from the mailbox everywhere
+// to the mailbox with the MTP draft phase on the staged copies (MTP only), then to the staged
+// copies everywhere. `when` completes the recorded reason ("an exchange timed out <when>").
+// Returns false when nothing is left to step down to. The replacement mailbox is fresh: the
+// hung one's words have diverged.
+bool degrade_peer_mailbox(std::string_view when);
+
+// Program::recover_peer_transport: steps down after an exchange timed out while serving and
+// captures the graphs again, as at startup. Requires an empty Program.
+std::string recover_peer_transport();
 
 [[nodiscard]] bool tensor_parallel() const noexcept { return peer != nullptr; }
 

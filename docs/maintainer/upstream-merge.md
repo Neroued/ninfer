@@ -13,7 +13,7 @@ so a merge either applies cleanly or conflicts on a line whose resolution is obv
 
 | Path | What |
 |---|---|
-| `src/models/qwen3_5/execution/tp.{h,cpp}`, `execution/tp2/` | `TpExecution`, the split Text schedule (`text_tp2.inc`), the split attention/GDN/FFN/MTP forms (`*_split.{h,cpp}`), split projection helpers and workspace recipes; `split.h` includes them all |
+| `src/models/qwen3_5/execution/tp.{h,cpp}`, `execution/tp2/` | `TpExecution`, TextContext's tp 2 bindings and split MTP head (`text_tp2.inc`), the split attention/GDN/FFN/MTP forms (`*_split.{h,cpp}`), split projection helpers and workspace recipes; `split.h` includes them all |
 | `src/models/qwen3_5/program/tp2/` | ProgramImpl's rank 1 runtime, mirrors, mailbox probe and step-down (`program_impl_tp2.inc`), the tp2 workspace plan and option checks (`startup_tp2.inc`), MTP bridge, split verification and split prefill head |
 | `src/models/qwen3_5/load/sharding.{h,cpp}` | the placement rules (`shard_rule`) |
 | `src/ops/wrapper/tp2/`, `include/ninfer/ops/tp2/` | the column/row-parallel Op forms and their declarations |
@@ -191,7 +191,7 @@ what a new model family implements:
 |---|---|
 | `ExecutionContext`, peer access, `--tp/--devices` options, symmetric KV capacity (`runtime/engine`) | placement rules per logical parameter: `shard_rule` in [`load/sharding.cpp`](../../src/models/qwen3_5/load/sharding.cpp) (Rows/Columns/Replicated/PrimaryOnly/SingleDevice) |
 | sharded materialization (`artifact::Binder` shard resolver, `tensor_slice`, `materialize` on an `ExecutionContext`) | the config split: `shard_text_config` in [`execution/tp.cpp`](../../src/models/qwen3_5/execution/tp.cpp) (which heads, channels and widths halve) |
-| transport: `allreduce_sum`, `PeerEvents`, `PeerMailbox`, `concat_rows`, split argmax | the split schedule: `execution/tp2/` (`text_tp2.inc` and the `*_split` forms: which projection is column- or row-parallel, where the two all-reduces of a layer sit) |
+| transport: `allreduce_sum`, `PeerEvents`, `PeerMailbox`, `concat_rows`, split argmax | the split schedule: `execution/tp2/` (the `*_split` forms the Qwen4 forward and the MTP head use: which projection is column- or row-parallel, where the two all-reduces of a layer sit) |
 | split Op forms (`include/ninfer/ops/tp2/`): column/row-parallel `linear`, `linear_add`, `linear_swiglu`, `attn_input_proj`, `gdn_input_proj`, `gdn_gating_proj` | the shard shapes of the new model's dimensions: registered in each Op like any problem (`linear` shapes files; the `tp2/*_shard_*` sets of the fused Ops, one more set per new shard shape) |
 | dual-device CUDA Graph capture (`core/tp2`), KV and StateImage mirrors | the Program integration: rank 1's runtime and mirrors (`program/tp2/program_impl_tp2.inc`), the rounds' peer ingress, `TpExecution` |
 | `tp2::DeviceTuning`, `tools/tp2/gate.sh` | per-rank persistent layouts and the tp2 workspace plan (`program/tp2/startup_tp2.inc`), the tp2 checks of the planner and the Engine |

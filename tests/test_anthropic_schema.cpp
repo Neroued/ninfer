@@ -2,6 +2,7 @@
 
 #include "serve/generation_service.h"
 #include "serve/translate.h"
+#include "tool_call_salvage_probe.h"
 
 #include <nlohmann/json.hpp>
 
@@ -741,6 +742,56 @@ int test_aggregate_and_errors() {
     return failures;
 }
 
+// Calls the Qwen parser keeps despite their names come back as tool_use history blocks without a
+// 400.
+int test_salvaged_tool_calls() {
+    Json body     = base_request();
+    body["tools"] = Json::array(
+        {Json{{"name", "Read"},
+              {"input_schema", Json{{"type", "object"},
+                                    {"properties", Json{{"path", Json{{"type", "string"}}}}}}}}});
+    const AnthropicMessagesRequest request = parse(body);
+    const ninfer::PromptInput input        = prompt(request.generation);
+    const std::size_t max_name             = request.generation.tool_name_max_length;
+    const AnthropicResponseIdentity identity =
+        make_anthropic_response_identity("req_salvaged", "claude-local");
+
+    int failures = 0;
+    int kept     = 0;
+    for (const std::string& name : ninfer::test::salvage_probe_names()) {
+        const auto parsed = ninfer::test::parse_model_call(input, max_name, name);
+        if (parsed.tool_calls.empty()) { continue; }
+        ++kept;
+        GenerationOutcome outcome;
+        outcome.finish_reason = ninfer::FinishReason::StopToken;
+        outcome.tool_calls    = parsed.tool_calls;
+        const Json response   = Json::parse(make_anthropic_messages_response(identity, outcome));
+        Json results          = Json::array();
+        for (const Json& block : response.at("content")) {
+            if (block.at("type") == "tool_use") {
+                results.push_back(Json{{"type", "tool_result"},
+                                       {"tool_use_id", block.at("id")},
+                                       {"content", "unknown tool"},
+                                       {"is_error", true}});
+            }
+        }
+        Json next = body;
+        next["messages"].push_back(
+            Json{{"role", "assistant"}, {"content", response.at("content")}});
+        next["messages"].push_back(Json{{"role", "user"}, {"content", results}});
+        std::string error;
+        try {
+            (void)parse(next);
+        } catch (const ApiException& exception) {
+            error = exception.error().message;
+        } catch (const std::exception& exception) { error = exception.what(); }
+        failures += check(error.empty(),
+                          "kept call '" + name + "' could not come back as tool_use: " + error);
+    }
+    failures += check(kept >= 4, "the probe names no longer exercise salvaged calls");
+    return failures;
+}
+
 int test_tool_call_presentation() {
     const AnthropicResponseIdentity identity =
         make_anthropic_response_identity("req_tool", "claude-local");
@@ -987,6 +1038,7 @@ int main() {
     failures += test_content_and_cache_hints();
     failures += test_aggregate_and_errors();
     failures += test_tool_call_presentation();
+    failures += test_salvaged_tool_calls();
     failures += test_stream();
     failures += test_hidden_reasoning_signature();
     failures += test_hidden_reasoning_round_trip();

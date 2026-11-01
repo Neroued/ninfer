@@ -9,6 +9,7 @@
 #include <exception>
 #include <limits>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -1713,6 +1714,52 @@ public:
 
     [[nodiscard]] bool has_active_reference(LogicalKVPageHandle page) const noexcept {
         return pages_->valid(page) && pages_->active_address_references(page) != 0;
+    }
+
+    // Device-resident pages of `handle` that no active address reads, alone or shared: what
+    // moving its KV to the Host can return to the pool (a shared page returns once).
+    [[nodiscard]] std::uint32_t idle_device_pages(KVAddressSpaceHandle handle) const {
+        const Address& address = require(handle);
+        std::uint32_t idle     = 0;
+        for (std::uint32_t page = 0; page < address.page_count; ++page) {
+            const LogicalKVPageHandle logical = membership(address, page);
+            if (pages_->device_resident(logical) &&
+                pages_->active_address_references(logical) == 0) {
+                ++idle;
+            }
+        }
+        return idle;
+    }
+
+    // For each address of `owners` (distinct), in order: its Device-resident pages that releasing
+    // all of `owners` returns to the pool, i.e. pages that no active address reads and that no
+    // address outside `owners` maps. A page the owners share counts for each owner mapping it.
+    [[nodiscard]] std::vector<std::uint32_t>
+    releasable_device_pages(std::span<const KVAddressSpaceHandle> owners) const {
+        std::vector<std::uint32_t> held(pages_->capacity(), 0U);
+        for (const KVAddressSpaceHandle owner : owners) {
+            const Address& address = require(owner);
+            for (std::uint32_t page = 0; page < address.page_count; ++page) {
+                ++held[pages_->descriptor_index(membership(address, page))];
+            }
+        }
+        std::vector<std::uint32_t> out;
+        out.reserve(owners.size());
+        for (const KVAddressSpaceHandle owner : owners) {
+            const Address& address = require(owner);
+            std::uint32_t pages    = 0;
+            for (std::uint32_t page = 0; page < address.page_count; ++page) {
+                const LogicalKVPageHandle logical = membership(address, page);
+                if (pages_->device_resident(logical) &&
+                    pages_->active_address_references(logical) == 0 &&
+                    pages_->address_references(logical) ==
+                        held[pages_->descriptor_index(logical)]) {
+                    ++pages;
+                }
+            }
+            out.push_back(pages);
+        }
+        return out;
     }
 
     [[nodiscard]] bool can_release(KVAddressSpaceHandle handle) const noexcept {

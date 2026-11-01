@@ -819,6 +819,25 @@ void HostExchange::finish_sum_f32() {
     p.active = false;
 }
 
+void HostExchange::abandon_sum_f32() noexcept {
+    Pending& p = pending_;
+    if (!p.active) { return; }
+    p.active                   = false;
+    const ExecutionContext& ec = *p.ec;
+    int previous               = 0;
+    const bool restore         = cudaGetDevice(&previous) == cudaSuccess;
+    for (std::size_t r = 0; r < 2; ++r) {
+        (void)cudaSetDevice(ec.dev[r]->device);
+        (void)cudaEventRecord(received_[r], receive_[r]);
+    }
+    for (std::size_t r = 0; r < 2; ++r) {
+        (void)cudaSetDevice(ec.dev[r]->device);
+        (void)cudaStreamWaitEvent(ec.dev[r]->stream, received_[r], 0);
+        (void)cudaStreamWaitEvent(ec.dev[r]->stream, received_[1 - r], 0);
+    }
+    if (restore) { (void)cudaSetDevice(previous); }
+}
+
 namespace {
 // Chunk of a lane's transfer: the peer's host-to-device copy of chunk c overlaps the
 // device-to-host copy of chunk c+1 (the two directions run on the two boards' links).

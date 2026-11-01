@@ -131,8 +131,9 @@ void gdn_input_proj(const Tensor& x, const Weight& query_key_value_z_weight, Ten
  *   z is projected for all B*W safe input columns. A row writes only its valid destination state
  *   prefix. The caller reserves disjoint complete [base,base+W) intervals, prevents one row from
  *   overwriting another row's initial slot, and may overlap a row's own initial slot with its
- *   destination after that initial history has been loaded. Other slots are unchanged. Newly
- *   projected convolution channels remain private to the call while published snapshots are BF16.
+ *   destination after that initial history has been loaded. Other slots are unchanged. Published
+ *   snapshots are BF16, and a later column's convolution reads an earlier column's newly projected
+ *   channels as those BF16 values; a column's own tap may keep the projection's private precision.
  */
 void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& qk_weight,
                                   const Weight& value_z_weight, const Tensor& conv_weight,
@@ -204,7 +205,7 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& query_key_value
  * modified. Only the valid prefix of conv_record is semantically defined. Outputs and valid
  * record columns are bit-identical to the corresponding snapshot execution from the same initial
  * history, inputs, physical T/B, format and policy; records equal its newest history columns.
- * A private convolution intermediate need not be rounded to BF16 before use.
+ * As in the snapshot form, earlier columns enter a column's convolution as their BF16 values.
  *
  * The two-parent form registers Q4 q/k [4096,5120] and the Q5 value/z parent [12288,5120]. All
  * tensor operands, outputs, conv_record, source state, and live workspace must be disjoint.

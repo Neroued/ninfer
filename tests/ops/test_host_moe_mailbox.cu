@@ -163,6 +163,9 @@ void table_and_slices(HostMoeMailboxConfig cfg, const std::vector<HostExpertLaye
         CK(cudaMemcpy(dalpha, alpha.data(), nr * 4, cudaMemcpyHostToDevice));
         CK(cudaMemcpy(dtable, table.data(), table.size() * 4, cudaMemcpyHostToDevice));
         CK(cudaMemcpy(dyf, y0s.data(), nx * 4, cudaMemcpyHostToDevice));
+        // A cudaMemcpy from pageable memory may return before its DMA lands, and the non-blocking
+        // stream s does not wait for the default stream: settle the uploads before the launch.
+        CK(cudaDeviceSynchronize());
         mailbox.clear_route_flags();
         mailbox.clear_trace();
         CK(cudaGraphLaunch(exec, s));
@@ -517,6 +520,8 @@ void split_shares(HostMoeMailboxConfig cfg, const LayerData& data, const std::ve
             CK(cudaMemcpy(dalpha, alpha.data(), 4 * T * K, cudaMemcpyHostToDevice));
             CK(cudaMemcpy(dtable, table.data(), 4 * E, cudaMemcpyHostToDevice));
             CK(cudaMemcpy(dyf, y0.data(), 4 * T * H, cudaMemcpyHostToDevice));
+            // Pageable uploads may still be in flight; s does not wait for the default stream.
+            CK(cudaDeviceSynchronize());
             mailbox.clear_route_flags();
             mailbox.publish_table(s, 0, T, dx, dids, dalpha, dtable, E, 0, c.split,
                                   HostMoeDeviceShare{dreads, dpicks, dstage});
@@ -711,8 +716,9 @@ void cost_fit() {
     std::normal_distribution<float> noise(0.0F, 2.0F);
     std::vector<HostMoeCostSample> s;
     for (int i = 0; i < 4000; ++i) {
-        const int e = 1 + static_cast<int>(rng() % 12), extra = static_cast<int>(rng() % (3 * e + 1));
-        float us = 20.0F + 50.0F * e + 3.0F * extra + noise(rng);
+        const int e     = 1 + static_cast<int>(rng() % 12),
+                  extra = static_cast<int>(rng() % (3 * e + 1));
+        float us        = 20.0F + 50.0F * e + 3.0F * extra + noise(rng);
         if (i % 97 == 0) us += 2000.0F; // wake-up after idle
         s.push_back({e, e + extra, us});
     }
@@ -737,8 +743,7 @@ void cost_fit() {
 int main() {
     cost_fit();
     int devices = 0;
-    if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0 ||
-        !host_experts_supported()) {
+    if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0 || !host_experts_supported()) {
         std::printf("SKIP: needs a CUDA device and AVX2 + FMA + F16C\n");
         return 77;
     }
@@ -809,6 +814,8 @@ int main() {
             CK(cudaMemcpy(dalpha, r.alpha.data(), nr * 4, cudaMemcpyHostToDevice));
             CK(cudaMemcpy(dy, y0.data(), nx * 2, cudaMemcpyHostToDevice));
             CK(cudaMemcpy(dyf, y0f.data(), nx * 4, cudaMemcpyHostToDevice));
+            // Pageable uploads may still be in flight; s does not wait for the default stream.
+            CK(cudaDeviceSynchronize());
             mailbox.clear_trace();
             CK(cudaGraphLaunch(exec, s));
             CK(cudaStreamSynchronize(s));
@@ -862,6 +869,7 @@ int main() {
         CK(cudaMemcpy(dids, r.ids.data(), nr * 4, cudaMemcpyHostToDevice));
         CK(cudaMemcpy(dslot, r.slot.data(), nr * 4, cudaMemcpyHostToDevice));
         CK(cudaMemcpy(dy, y0.data(), nx * 2, cudaMemcpyHostToDevice));
+        CK(cudaDeviceSynchronize());
         CK(cudaGraphLaunch(exec, s));
         CK(cudaStreamSynchronize(s)); // must not hang
         expect(mailbox.failed(), "failure reported");

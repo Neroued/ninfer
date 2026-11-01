@@ -238,7 +238,7 @@ struct Call {
         whole_inject =
             std::make_unique<GuardedDeviceBuffer>(static_cast<std::size_t>(kStreams) * t * 4);
         whole_workspace = std::make_unique<WorkspaceArena>(
-            ops::hyper_connection_mix_workspace_bytes(t, t, f.inject));
+            ops::hyper_connection_mix_workspace_bytes(t, t, f.inject, kHidden, kRank));
         for (int r = 0; r < 2; ++r) {
             set_device(ec, r);
             std::vector<float> half(static_cast<std::size_t>(kLocal) * t);
@@ -619,7 +619,7 @@ void bench(const ExecutionContext& ec, const Fixture& f) {
             mix[r] = DeviceBuffer(static_cast<std::size_t>(kHidden) * T * 2);
             inj[r] = DeviceBuffer(static_cast<std::size_t>(kStreams) * T * 4);
             ws[r]  = std::make_unique<WorkspaceArena>(
-                ops::hyper_connection_mix_workspace_bytes(T, T, true));
+                ops::hyper_connection_mix_workspace_bytes(T, T, true, kHidden, kRank));
             norm[r]         = to_device(bits(f.norm));
             down[r]         = to_device(f.down.payload);
             up[r]           = to_device(f.up.payload);

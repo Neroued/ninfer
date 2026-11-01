@@ -6,7 +6,9 @@
 // tp 1 on device 0 and once at tp 2 on devices 0 and 1, and driven through the same 64-token
 // prompt (two prefill chunks) and four ordinary decode steps. The rank-0 logits of the split
 // forward are compared with the single-device logits after every call. Last, the rank-0 logits
-// gather runs alone over three columns and is checked byte for byte against the two partials.
+// gather runs alone over three columns and is checked byte for byte against the two partials, and
+// a 512-column chunk that fails inside its sliced FFN must leave no all-reduce lane open: rerun on
+// intact Parameters, the chunk reproduces its logits (failed_slice_closes_lanes).
 //
 // Criterion: the split forward differs from the single-device one only in summation order and in
 // the BF16 rounding of each rank's partial before every all-reduce (four per token here: two per
@@ -35,6 +37,7 @@
 #include "core/weight_view.h"
 #include "models/qwen3_5/execution/linear.h"
 #include "models/qwen3_5/execution/parameters.h"
+#include "models/qwen3_5/execution/qwen4_runtime.h"
 #include "models/qwen3_5/execution/text.h"
 #include "models/qwen3_5/execution/tp.h"
 #include "models/qwen3_5/frontend/tokenizer.h"
@@ -63,6 +66,7 @@
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <variant>
 #include <vector>
 
 namespace {
@@ -508,7 +512,6 @@ std::filesystem::path write_synthetic_model(SyntheticArtifact& file) {
 // ------------------------------------------------------------------------------------------------
 
 constexpr std::uint32_t kCapacity = 128;
-constexpr std::uint32_t kPages    = kCapacity / kPagedKVPageSize;
 
 DeviceBuffer device_bytes(int device, std::size_t bytes) {
     CUDA_CHECK(cudaSetDevice(device));
@@ -532,31 +535,35 @@ struct RankStorage {
     std::optional<qwen::RoundState> round;
     std::optional<WorkspaceArena> work;
     Tensor prefill_hidden;
+    // The Text forward's Program runtime: empty for a dense model without PLE or experts.
+    exec::Qwen4Runtime qwen4_runtime;
 
     RankStorage(const DeviceContext& device, const qwen::TextConfig& config,
-                std::uint32_t logit_rows, KvCacheStorage storage, std::size_t workspace_bytes) {
+                std::uint32_t logit_rows, KvCacheStorage storage, std::size_t workspace_bytes,
+                std::uint32_t capacity = kCapacity) {
         CUDA_CHECK(cudaSetDevice(device.device));
+        const std::uint32_t page_groups = capacity / kPagedKVPageSize;
         LayoutBuilder kv_builder;
         const auto kv = qwen::plan_decoder_state(
             kv_builder, qwen::DecoderStateSpec{
                             .full_attention_layers = config.full_attention_layers,
                             .mtp_layers            = 1,
-                            .capacity              = kCapacity,
+                            .capacity              = capacity,
                             .kv_heads = exec::dimension(config.attention->num_key_value_heads),
                             .attention_head_dim = exec::dimension(config.attention->head_dim),
                             .kv_storage         = storage,
                             .enable_mtp         = false,
                             .kv_table_rows      = 1,
-                            .text_physical_page_groups = kPages,
+                            .text_physical_page_groups = page_groups,
                             .mtp_physical_page_groups  = 0,
                         });
         decoder_bytes = device_bytes(device.device, kv_builder.finish(256));
-        decoder.emplace(DeviceSpan{decoder_bytes.p, decoder_bytes.bytes}, kv);
+        decoder.emplace(device.device, DeviceSpan{decoder_bytes.p, decoder_bytes.bytes}, kv);
         auto& pool  = decoder->text_kv.page_pool();
-        reservation = pool.reserve(kPages);
+        reservation = pool.reserve(page_groups);
         require(reservation.has_value(), "KV page reservation failed");
-        pages.reserve(kPages);
-        pool.materialize(*reservation, kPages, pages);
+        pages.reserve(page_groups);
+        pool.materialize(*reservation, page_groups, pages);
         row = decoder->text_kv.execution_tables().acquire(0);
         decoder->text_kv.execution_tables().publish(
             row.handle(), 0, std::span<const DeviceKVPageLease>(pages), device.stream);
@@ -619,6 +626,7 @@ public:
                                    qwen::PagedKVCacheView{}, *storage0_.state, *storage0_.round,
                                    storage0_.prefill_hidden, chunk_, base, {},
                                    &storage0_.decoder->text_kv, nullptr, tp_, rope_delta);
+            card.set_qwen4_runtime(&storage0_.qwen4_runtime);
             const auto result = card.prefill_chunk(
                 prompt, base, static_cast<std::uint32_t>(prompt.size()) - base, true);
             require(result.processed_tokens != 0, "prefill made no progress");
@@ -658,6 +666,7 @@ public:
                                qwen::PagedKVCacheView{}, *storage0_.state, *storage0_.round,
                                storage0_.prefill_hidden, chunk_, 0, {}, &storage0_.decoder->text_kv,
                                nullptr, tp_);
+        card.set_qwen4_runtime(&storage0_.qwen4_runtime);
         auto& frame        = *storage0_.round->ordinary;
         Tensor hidden      = frame.hidden.slice(1, 0, 1);
         Tensor out         = frame.logits.slice(1, 0, 1);
@@ -710,7 +719,8 @@ struct PeerBinding {
                                .text_cache        = &storage.decoder->text_kv,
                                .text_kv_table_row = storage.round->text_kv_table_row,
                                .rope_delta        = storage.round->rope_delta,
-                               .ordinary          = &frame};
+                               .ordinary          = &frame,
+                               .qwen4             = &storage.qwen4_runtime};
     }
 
     PeerBinding(const PeerBinding&)            = delete;
@@ -827,6 +837,59 @@ void gather_columns(const ExecutionContext& execution, const ops::PeerEvents& ev
     work1.reset();
 }
 
+// A prompt chunk that fails inside its sliced FFN must leave no split-exchange lane open for the
+// next chunk. A 512-column chunk over a HostExchange runs its block tails as four 128-column
+// slices (tp2/prefill_slices.h): the first layer's mixer begins one all-reduce per slice, and the
+// FFN finishes slice s's before it runs. Rank 0's copy of that FFN disagrees with rank 1's on the
+// activation policy, so it throws at slice 0 with slices 1-3 still open. The same chunk then runs
+// again from fresh state on intact Parameters, through the same exchange, and must reproduce the
+// logits of the run before the failure bit for bit.
+void failed_slice_closes_lanes(ExecutionContext& execution, const qwen::Model& split,
+                               const exec::Parameters& rank0, const exec::Parameters& rank1) {
+    constexpr std::uint32_t kTokens = 512;
+    require(exec::prefill_overlap_split(kTokens) == 0 &&
+                exec::prefill_slice_plan(kTokens, 0).count == 4,
+            "the chunk no longer runs as four slices");
+    ops::PeerEvents events(execution);
+    ops::HostExchange exchange(execution);
+    events.attach_host_exchange(&exchange);
+    require(ops::allreduce_sum_split_available(execution, events), "no split exchange");
+
+    exec::Parameters broken(split, 0);
+    auto& ffn          = std::get<exec::DenseParameters>(broken.qwen4->layers.front().ffn);
+    ffn.gate_up.policy = ffn.gate_up.policy == ops::LinearPolicy::A16Only
+                             ? ops::LinearPolicy::AllowA8
+                             : ops::LinearPolicy::A16Only;
+
+    const auto& config               = split.config().text;
+    const auto shard                 = exec::shard_text_config(config, exec::kTensorParallelWidth);
+    constexpr std::size_t kWorkspace = std::size_t{256} << 20U;
+    std::vector<int> prompt(kTokens);
+    std::uint64_t state = 29;
+    for (auto& token : prompt) { token = static_cast<int>(splitmix(state) % 256U); }
+    // Each run starts from fresh KV and GDN state; only the exchange carries over.
+    const auto prefill = [&](const exec::Parameters& parameters) {
+        RankStorage storage0(*execution.dev[0], shard, config.vocab_size, KvCacheStorage::BFloat16,
+                             kWorkspace, kTokens);
+        RankStorage storage1(*execution.dev[1], shard, config.vocab_size, KvCacheStorage::BFloat16,
+                             kWorkspace, kTokens);
+        PeerBinding peer(execution, events, rank1, storage1);
+        return Runner(execution, parameters, storage0, kTokens, &peer.tp, &storage1)
+            .prefill(prompt);
+    };
+    const auto before = prefill(rank0);
+    std::string failure;
+    try {
+        (void)prefill(broken);
+    } catch (const std::exception& error) { failure = error.what(); }
+    std::cout << "injected sliced FFN failure: " << failure << '\n';
+    require(failure.find("text/layers/0 ") != std::string::npos &&
+                failure.find("ranks disagree on the activation policy") != std::string::npos,
+            "the mismatched rank policies did not fail the first layer's FFN");
+    require(prefill(rank0) == before,
+            "the chunk after a failed sliced FFN does not reproduce the logits before it");
+}
+
 int parity() {
     const char* scratch              = std::getenv("NINFER_TEST_SCRATCH_DIR");
     const std::filesystem::path root = scratch != nullptr && *scratch
@@ -910,6 +973,7 @@ int parity() {
     require(moved > 0.0F, "a later prefill chunk ignored the rope delta");
     gather_columns(execution, events, reference, rank0, rank1, *reference_storage.work,
                    *storage0.work, *storage1.work, domain);
+    failed_slice_closes_lanes(execution, *split, rank0, rank1);
     std::cout << "qwen3_5 tensor-parallel Text parity passed\n";
     return 0;
 }

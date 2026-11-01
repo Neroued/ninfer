@@ -1,7 +1,6 @@
 #include "models/qwen3_5/program/internal.h"
 #include "models/qwen3_5/execution/text.h"
 #include "models/qwen3_5/execution/attention.h"
-#include "models/qwen3_5/execution/gdn.h"
 #include "models/qwen3_5/execution/ffn.h"
 #include "models/qwen3_5/execution/mtp.h"
 #include "models/qwen3_5/execution/workspace.h"
@@ -11,30 +10,17 @@
 #include "models/qwen3_5/execution/vision.h"
 #include "models/qwen3_5/program/vision_control.h"
 #include "ninfer/ops/argmax.h"
-#include "ninfer/ops/attn_input_proj.h"
-#include "ninfer/ops/causal_conv1d_silu.h"
 #include "ninfer/ops/embedding.h"
-#include "ninfer/ops/gated_delta_net.h"
-#include "ninfer/ops/gated_rmsnorm.h"
-#include "ninfer/ops/gdn_gating.h"
-#include "ninfer/ops/gdn_gating_proj.h"
-#include "ninfer/ops/gdn_input_proj.h"
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/kv_cache_append.h"
 #include "ninfer/ops/speculative_round.h"
-#include "ninfer/ops/linear_add.h"
-#include "ninfer/ops/linear_pair.h"
-#include "ninfer/ops/linear_swiglu.h"
 #include "ninfer/ops/mtp_pack.h"
 #include "ninfer/ops/position.h"
 #include "ninfer/ops/residual_add.h"
 #include "ninfer/ops/rmsnorm.h"
-#include "ninfer/ops/rope.h"
-#include "ninfer/ops/sparse_moe.h"
 #include "ninfer/ops/scatter.h"
 #include "ninfer/ops/scalar.h"
 #include "ninfer/ops/sigmoid_mul.h"
-#include "ninfer/ops/silu_mul.h"
 #include "ninfer/ops/softmax_attention.h"
 #include "ninfer/ops/target_logprobs.h"
 
@@ -47,8 +33,6 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
-#include <utility>
-#include <vector>
 
 namespace ninfer::models::qwen3_5::execution {
 namespace {
@@ -104,38 +88,6 @@ Tensor matrix_window(Tensor& t, std::int32_t cols) {
     }
     return t.slice(1, 0, cols);
 }
-
-class ScopedPositions {
-public:
-    ScopedPositions(const Tensor*& slot, const Tensor& positions) : slot_(slot) {
-        slot_ = &positions;
-    }
-
-    ScopedPositions(const ScopedPositions&)            = delete;
-    ScopedPositions& operator=(const ScopedPositions&) = delete;
-
-    ~ScopedPositions() { slot_ = nullptr; }
-
-private:
-    const Tensor*& slot_;
-};
-
-class ScopedEnvelope {
-public:
-    ScopedEnvelope(const ops::CausalAttentionExecutionEnvelope*& slot,
-                   const ops::CausalAttentionExecutionEnvelope& envelope)
-        : slot_(slot) {
-        slot_ = &envelope;
-    }
-
-    ScopedEnvelope(const ScopedEnvelope&)            = delete;
-    ScopedEnvelope& operator=(const ScopedEnvelope&) = delete;
-
-    ~ScopedEnvelope() { slot_ = nullptr; }
-
-private:
-    const ops::CausalAttentionExecutionEnvelope*& slot_;
-};
 
 template <class T>
 class ScopedValue {
@@ -276,11 +228,10 @@ TextContext::TextContext(DeviceContext& ctx, const execution::Parameters& weight
         throw std::invalid_argument("MTP TextContext requires MTP round state");
     }
     set_linear_state_slots(0, 0);
-    embed_      = &parameters_.text.token_embedding;
-    final_norm_ = &parameters_.text.final_norm;
-    lm_head_    = &parameters_.text.output_head;
-    mtp_        = parameters_.mtp ? &*parameters_.mtp : nullptr;
-    qwen4_mtp_  = parameters_.qwen4_mtp ? &*parameters_.qwen4_mtp : nullptr;
+    embed_     = &parameters_.text.token_embedding;
+    lm_head_   = &parameters_.text.output_head;
+    mtp_       = parameters_.mtp ? &*parameters_.mtp : nullptr;
+    qwen4_mtp_ = parameters_.qwen4_mtp ? &*parameters_.qwen4_mtp : nullptr;
     if (mtp_enabled() && mtp_ == nullptr && qwen4_mtp_ == nullptr) {
         throw std::invalid_argument("MTP state requires selected MTP parameters");
     }
@@ -289,6 +240,9 @@ TextContext::TextContext(DeviceContext& ctx, const execution::Parameters& weight
         set_proposal_head(
             &p.head, p.token_ids ? static_cast<const std::int32_t*>(p.token_ids->data) : nullptr,
             dimension(p.rows));
+    }
+    if (!parameters_.qwen4) {
+        throw std::invalid_argument("TextContext requires the Text forward's Parameters");
     }
     if (tp_ != nullptr) { validate_tensor_parallel(); }
 }
@@ -435,7 +389,7 @@ void TextContext::mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& po
 
     {
         auto post_mixer_scope = work_.scope();
-        ffn(mh, mtp_->ffn, x, {}, work_, s, true);
+        dense_ffn(mh, mtp_->ffn, x, work_, s, true);
     }
 
     Tensor flat_mtp_hidden = mtp_hidden.view({dimension(config_.hidden_size), T});
@@ -507,7 +461,7 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
 
         Tensor k_flat = work_.alloc(DType::BF16, {dimension(config_.attention->key_width()), T});
         Tensor v_flat = work_.alloc(DType::BF16, {dimension(config_.attention->key_width()), T});
-        mtp_kv_projection(ah, mtp_->projection, *config_.attention, k_flat, v_flat, work_, s);
+        mtp_kv_projection(ah, mtp_->projection, k_flat, v_flat, s);
         Tensor k = k_flat.view({dimension(config_.attention->head_dim),
                                 dimension(config_.attention->num_key_value_heads), T});
         Tensor v = v_flat.view({dimension(config_.attention->head_dim),
@@ -535,8 +489,7 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
         Tensor q_flat = work_.alloc(DType::BF16, {dimension(config_.attention->query_width()), 1});
         Tensor gate_flat =
             work_.alloc(DType::BF16, {dimension(config_.attention->query_width()), 1});
-        mtp_query_gate_projection(ah_last, mtp_->projection, *config_.attention, q_flat, gate_flat,
-                                  work_, s);
+        mtp_query_gate_projection(ah_last, mtp_->projection, q_flat, gate_flat, work_, s);
         Tensor q    = q_flat.view({dimension(config_.attention->head_dim),
                                    dimension(config_.attention->num_attention_heads), 1});
         Tensor gate = gate_flat.view({dimension(config_.attention->head_dim),
@@ -580,7 +533,7 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
         ops::rmsnorm(x_last, mtp_->post_attention_norm, config_.rms_norm_eps, true, mh, s);
         {
             auto post_mixer_scope = work_.scope();
-            ffn(mh, mtp_->ffn, x_last, {}, work_, s, true);
+            dense_ffn(mh, mtp_->ffn, x_last, work_, s, true);
         }
         ops::rmsnorm(x_last, mtp_->final_norm, config_.rms_norm_eps, true, *final_hidden, s);
         proposal_argmax(*final_hidden, *logits, *draft_token);
@@ -624,7 +577,7 @@ void TextContext::mtp_forward_batch(const Tensor& ids, const Tensor& hidden,
                                     const Tensor* input_embeddings) {
     require_single_device("MTP forward");
     if (batch_mtp_kv_ == nullptr) { throw std::runtime_error("MTP forward is not enabled"); }
-    if (qwen4()) {
+    if (qwen4_mtp_layer()) {
         qwen4_mtp_forward_batch(ids, hidden, positions, envelope, mtp_hidden, logits_column, logits,
                                 draft_token, explicit_rope_positions, input_embeddings);
         return;
@@ -677,7 +630,7 @@ void TextContext::mtp_forward_ar_step(const Tensor& token, const Tensor& previou
                                       Tensor& mtp_hidden, Tensor& logits, Tensor& draft_token) {
     require_single_device("MTP proposal");
     if (batch_mtp_kv_ == nullptr) { throw std::runtime_error("MTP forward is not enabled"); }
-    if (qwen4()) {
+    if (qwen4_mtp_layer()) {
         qwen4_mtp_forward_batch(token, previous_hidden, position, envelope, mtp_hidden, 0, &logits,
                                 &draft_token, nullptr, nullptr);
         return;
@@ -722,115 +675,9 @@ void TextContext::ordinary_decode_batch(const Tensor& ids, const Tensor& cache_p
                          "ordinary decode hidden");
     require_tensor_shape(logits, DType::BF16, {dimension(config_.vocab_size), batch},
                          "ordinary decode logits");
-    if (qwen4()) {
-        qwen4_ordinary_decode(ids, cache_positions, rope_positions, kv_table_rows,
-                              linear_state_source_slots, linear_state_destination_slots, envelope,
-                              hidden, logits);
-        return;
-    }
-    if (tp2()) {
-        ordinary_decode_batch_tp2(ids, cache_positions, rope_positions, kv_table_rows,
-                                  linear_state_source_slots, linear_state_destination_slots,
-                                  envelope, hidden, logits);
-        return;
-    }
-
-    cudaStream_t stream = ctx_.stream;
-    work_.reset();
-    {
-        ScopedPositions cache_binding(active_cache_positions_, cache_positions);
-        ScopedPositions rope_binding(active_rope_positions_, rope_positions);
-        ScopedEnvelope envelope_binding(active_causal_attention_envelope_, envelope);
-        ScopedValue<const Tensor*> kv_binding(active_kv_table_rows_, &kv_table_rows);
-        ScopedValue<const Tensor*> source_binding(active_linear_state_source_slots_,
-                                                  &linear_state_source_slots);
-        ScopedValue<const Tensor*> destination_binding(active_linear_state_destination_slots_,
-                                                       &linear_state_destination_slots);
-        ScopedValue<std::int32_t> batch_binding(active_sequence_batch_, batch);
-        ScopedValue<std::int32_t> width_binding(active_sequence_width_, 1);
-
-        Tensor x = work_.alloc(DType::BF16, {dimension(config_.hidden_size), batch});
-        ops::embedding(ids, *embed_, x, stream);
-        NullTap tap;
-        run_layers(x, Phase::Verify, tap);
-        ops::rmsnorm(x, *final_norm_, config_.rms_norm_eps, true, hidden, stream);
-        project(hidden, *lm_head_, logits, work_, stream);
-    }
-    work_.reset();
-}
-
-template <class Tap>
-void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cache_positions,
-                                           const Tensor& rope_positions,
-                                           const Tensor& valid_columns, const Tensor& kv_table_rows,
-                                           const Tensor& linear_state_source_slots,
-                                           ops::CausalAttentionExecutionEnvelope envelope,
-                                           Tensor& hidden, Tensor& logits, Tensor& target_tokens,
-                                           Tap& tap) {
-    require_single_device("target verification");
-    const std::int32_t width = ids.ne[0];
-    const std::int32_t batch = ids.ne[1];
-    if constexpr (!Tap::enabled) {
-        if (qwen4()) {
-            qwen4_target_verify(ids, cache_positions, rope_positions, valid_columns, kv_table_rows,
-                                linear_state_source_slots, envelope, hidden, logits, target_tokens);
-            return;
-        }
-    } else {
-        if (qwen4()) {
-            throw std::logic_error("Qwen4Exp verification publishes no speculative feature taps");
-        }
-    }
-    if (width <= 0 || width > static_cast<std::int32_t>(kDFlashDecodeMaximumWidth) || batch <= 0 ||
-        batch > static_cast<std::int32_t>(kMaximumConcurrency)) {
-        throw std::invalid_argument("target verify batch shape is outside the supported domain");
-    }
-    const std::int32_t columns = width * batch;
-    require_tensor_shape(ids, DType::I32, {width, batch}, "target verify batch ids");
-    require_tensor_shape(cache_positions, DType::I32, {width, batch},
-                         "target verify batch cache positions");
-    require_tensor_shape(rope_positions, DType::I32, {width, batch},
-                         "target verify batch RoPE positions");
-    require_tensor_shape(valid_columns, DType::I32, {batch}, "target verify batch valid columns");
-    require_tensor_shape(kv_table_rows, DType::I32, {batch}, "target verify batch KV rows");
-    require_tensor_shape(linear_state_source_slots, DType::I32, {batch},
-                         "target verify batch Linear Attention slots");
-    require_tensor_shape(hidden, DType::BF16, {dimension(config_.hidden_size), width, batch},
-                         "target verify batch hidden");
-    require_tensor_shape(logits, DType::BF16, {dimension(config_.vocab_size), width, batch},
-                         "target verify batch logits");
-    require_tensor_shape(target_tokens, DType::I32, {width, batch}, "target verify batch tokens");
-
-    cudaStream_t stream = ctx_.stream;
-    work_.reset();
-    {
-        ScopedPositions cache_binding(active_cache_positions_, cache_positions);
-        ScopedPositions rope_binding(active_rope_positions_, rope_positions);
-        ScopedEnvelope envelope_binding(active_causal_attention_envelope_, envelope);
-        ScopedValue<const Tensor*> kv_binding(active_kv_table_rows_, &kv_table_rows);
-        ScopedValue<const Tensor*> state_binding(active_linear_state_source_slots_,
-                                                 &linear_state_source_slots);
-        ScopedValue<const Tensor*> valid_binding(active_valid_columns_, &valid_columns);
-        ScopedValue<std::int32_t> batch_binding(active_sequence_batch_, batch);
-        ScopedValue<std::int32_t> width_binding(active_sequence_width_, width);
-
-        Tensor x        = work_.alloc(DType::BF16, {dimension(config_.hidden_size), columns});
-        Tensor flat_ids = ids.view({columns});
-        ops::embedding(flat_ids, *embed_, x, stream);
-        if constexpr (Tap::enabled) { tap.begin(x); }
-        run_layers(x, Phase::Verify, tap);
-        if constexpr (requires { tap.capture_positions(cache_positions, stream); }) {
-            tap.capture_positions(cache_positions, stream);
-        }
-        Tensor flat_hidden = hidden.view({dimension(config_.hidden_size), columns});
-        Tensor flat_logits = logits.view({dimension(config_.vocab_size), columns});
-        Tensor flat_tokens = target_tokens.view({columns});
-        ops::rmsnorm(x, *final_norm_, config_.rms_norm_eps, true, flat_hidden, stream);
-        project(flat_hidden, *lm_head_, flat_logits, work_, stream);
-        ops::argmax(flat_logits, flat_tokens,
-                    dimension(parameters_.model.resources().public_token_count), stream);
-    }
-    work_.reset();
+    qwen4_ordinary_decode(ids, cache_positions, rope_positions, kv_table_rows,
+                          linear_state_source_slots, linear_state_destination_slots, envelope,
+                          hidden, logits);
 }
 
 void TextContext::target_verify_batch(const Tensor& ids, const Tensor& cache_positions,
@@ -839,10 +686,9 @@ void TextContext::target_verify_batch(const Tensor& ids, const Tensor& cache_pos
                                       const Tensor& linear_state_source_slots,
                                       ops::CausalAttentionExecutionEnvelope envelope,
                                       Tensor& hidden, Tensor& logits, Tensor& target_tokens) {
-    NullTap tap;
-    target_verify_batch_impl(ids, cache_positions, rope_positions, valid_columns, kv_table_rows,
-                             linear_state_source_slots, envelope, hidden, logits, target_tokens,
-                             tap);
+    require_single_device("target verification");
+    qwen4_target_verify(ids, cache_positions, rope_positions, valid_columns, kv_table_rows,
+                        linear_state_source_slots, envelope, hidden, logits, target_tokens);
 }
 
 void TextContext::target_verify_batch(const Tensor& ids, const Tensor& cache_positions,
@@ -852,9 +698,10 @@ void TextContext::target_verify_batch(const Tensor& ids, const Tensor& cache_pos
                                       ops::CausalAttentionExecutionEnvelope envelope,
                                       Tensor& hidden, Tensor& logits, Tensor& target_tokens,
                                       DFlashFeatureSink& sink) {
-    target_verify_batch_impl(ids, cache_positions, rope_positions, valid_columns, kv_table_rows,
-                             linear_state_source_slots, envelope, hidden, logits, target_tokens,
-                             sink);
+    require_single_device("target verification");
+    // A drafter's feature sink rides along on the Qwen4 forward (plain residual only).
+    qwen4_target_verify(ids, cache_positions, rope_positions, valid_columns, kv_table_rows,
+                        linear_state_source_slots, envelope, hidden, logits, target_tokens, &sink);
 }
 
 void TextContext::mtp_forward_decode_batch(const Tensor& ids, const Tensor& hidden,
@@ -867,7 +714,7 @@ void TextContext::mtp_forward_decode_batch(const Tensor& ids, const Tensor& hidd
     if (batch_mtp_kv_ == nullptr) { throw std::runtime_error("MTP forward is not enabled"); }
     const std::int32_t width = ids.ne[0];
     const std::int32_t batch = ids.ne[1];
-    if (qwen4()) {
+    if (qwen4_mtp_layer()) {
         qwen4_mtp_forward_decode(ids, hidden, cache_positions, rope_positions, valid_columns,
                                  kv_table_rows, envelope, mtp_hidden);
         return;
@@ -899,8 +746,8 @@ void TextContext::mtp_propose_batch(const Tensor& hidden, Tensor& logits, Tensor
                                     Tensor* draft_logprobs) {
     require_single_device("MTP proposal");
     const std::int32_t batch = hidden.ne[1];
-    if (qwen4()) {
-        qwen4_mtp_propose(hidden, logits, draft_tokens, draft_logprobs);
+    if (qwen4_mtp_layer()) {
+        qwen4_mtp_propose(RankTensors{hidden, Tensor{}}, logits, draft_tokens, draft_logprobs);
         return;
     }
     if (draft_logprobs != nullptr && proposal_head_ != nullptr) {
@@ -919,569 +766,77 @@ void TextContext::mtp_propose_batch(const Tensor& hidden, Tensor& logits, Tensor
     }
 }
 
-void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase ph) {
-    const auto& p  = std::get<AttentionParameters>(w.mixer);
-    cudaStream_t s = ctx_.stream;
-    const int T    = x.ne[1];
-    if (active_causal_attention_envelope_ == nullptr) {
-        throw std::logic_error("Text GQA execution envelope is not set");
+// The Qwen3.5 MTP head's prompt alignment of one prefill chunk
+// (qwen3_5-model.md#prefill-decode-and-mtp): hidden h_p and position p with token x_(p+1), the
+// chunk's last prompt column taking the generated token; the MTP KV of every column, and on the
+// prompt's last chunk the first proposal and the autoregressive drafts into io_.mtp.
+// `alignment_ids` is the whole prompt (or the call's ids), `xf` the chunk's final-normed hidden,
+// `total` the call's token count. The Text forward's prefill (qwen4_text.cpp) calls it for a model
+// without a Qwen4 MTP layer.
+void TextContext::mtp_prompt_chunk(std::span<const int> alignment_ids,
+                                   std::uint32_t alignment_begin, int len, int total, int base_i,
+                                   bool is_last, const Tensor& xf, const Tensor& positions,
+                                   const Tensor& rope_positions,
+                                   ops::CausalAttentionExecutionEnvelope chunk_envelope,
+                                   bool multimodal, const VisionChunk& vision_chunk) {
+    cudaStream_t s                               = ctx_.stream;
+    const int T                                  = total;
+    const std::uint32_t alignment_tokens         = static_cast<std::uint32_t>(alignment_ids.size());
+    const qwen3_5::MtpAlignmentWindow mtp_window = qwen3_5::plan_mtp_alignment_window(
+        alignment_tokens, alignment_begin, static_cast<std::uint32_t>(len));
+    const int prompt_columns = len - static_cast<int>(mtp_window.final_column_uses_generated_token);
+    Tensor mtp_ids           = work_.alloc(DType::I32, {len});
+    if (prompt_columns != 0) {
+        Tensor prompt_mtp_ids = mtp_ids.slice(0, 0, prompt_columns);
+        copy_i32(alignment_ids.data() + mtp_window.shifted_embedding_begin, prompt_mtp_ids, s);
+    }
+    if (mtp_window.final_column_uses_generated_token) {
+        Tensor generated_mtp_id = mtp_ids.slice(0, len - 1, 1);
+        CUDA_CHECK(::ninfer::memcpy_device_async(generated_mtp_id.data, io_.token.data,
+                                                 sizeof(std::int32_t), s));
     }
 
-    const auto projection = workspace::text_attention_projection(work_, config_, T);
-    Tensor h              = projection.hidden;
-    ops::rmsnorm(x, w.input_norm, config_.rms_norm_eps, true, h, s);
-
-    Tensor q         = projection.query.view({dimension(config_.attention->head_dim),
-                                              dimension(config_.attention->num_attention_heads), T});
-    Tensor gate      = projection.gate.view({dimension(config_.attention->head_dim),
-                                             dimension(config_.attention->num_attention_heads), T});
-    Tensor k         = projection.key.view({dimension(config_.attention->head_dim),
-                                            dimension(config_.attention->num_key_value_heads), T});
-    Tensor v         = projection.value.view({dimension(config_.attention->head_dim),
-                                              dimension(config_.attention->num_key_value_heads), T});
-    Tensor q_flat    = q.view({dimension(config_.attention->query_width()), T});
-    Tensor gate_flat = gate.view({dimension(config_.attention->query_width()), T});
-    Tensor k_flat    = k.view({dimension(config_.attention->key_width()), T});
-    Tensor v_flat    = v.view({dimension(config_.attention->key_width()), T});
-    attention_projection(h, p, q_flat, gate_flat, k_flat, v_flat, work_, s);
-
-    const auto results = workspace::text_attention_results(work_, config_, T);
-    Tensor qn =
-        results.normalized_query.view({dimension(config_.attention->head_dim),
-                                       dimension(config_.attention->num_attention_heads), T});
-    Tensor kn = results.normalized_key.view({dimension(config_.attention->head_dim),
-                                             dimension(config_.attention->num_key_value_heads), T});
-    ops::rmsnorm(q, p.query_norm, config_.rms_norm_eps, true, qn, s);
-    ops::rmsnorm(k, p.key_norm, config_.rms_norm_eps, true, kn, s);
-    const Tensor& cache_positions =
-        active_cache_positions_ != nullptr ? *active_cache_positions_ : io_.pos;
-    const Tensor& rope_positions =
-        active_rope_positions_ != nullptr ? *active_rope_positions_ : io_.rope_pos;
-    Tensor rope_for_op = active_sequence_batch_ != 0 ? rope_positions.view({T}) : rope_positions;
-    text_rope(rope_for_op, *config_.rope_parameters, qn, kn, s);
-
-    Tensor a = results.attention.view({dimension(config_.attention->head_dim),
-                                       dimension(config_.attention->num_attention_heads), T});
-    const Tensor& kv_table_rows =
-        active_kv_table_rows_ != nullptr ? *active_kv_table_rows_ : io_.text_kv_table_row;
-    if (active_sequence_batch_ != 0) {
-        const std::int32_t width = active_sequence_width_;
-        if (width <= 0 || width * active_sequence_batch_ != T) {
-            throw std::logic_error("Text sequence batch binding does not match aggregate columns");
-        }
-        Tensor q_batch        = qn.view({dimension(config_.attention->head_dim),
-                                         dimension(config_.attention->num_attention_heads), width,
-                                         active_sequence_batch_});
-        Tensor k_batch        = kn.view({dimension(config_.attention->head_dim),
-                                         dimension(config_.attention->num_key_value_heads), width,
-                                         active_sequence_batch_});
-        Tensor v_batch        = v.view({dimension(config_.attention->head_dim),
-                                        dimension(config_.attention->num_key_value_heads), width,
-                                        active_sequence_batch_});
-        Tensor a_batch        = a.view({dimension(config_.attention->head_dim),
-                                        dimension(config_.attention->num_attention_heads), width,
-                                        active_sequence_batch_});
-        Tensor position_batch = cache_positions.view({width, active_sequence_batch_});
-        const Tensor valid = active_valid_columns_ != nullptr ? *active_valid_columns_ : Tensor{};
-        ops::causal_softmax_attention(
-            q_batch, k_batch, v_batch, position_batch, valid, kv_table_rows,
-            {dimension(config_.attention->head_dim),
-             dimension(config_.attention->num_attention_heads),
-             dimension(config_.attention->num_key_value_heads)},
-            static_cast<float>(1.0 / std::sqrt(static_cast<double>(config_.attention->head_dim))),
-            batch_text_kv_->batch_layer_view(fidx), *active_causal_attention_envelope_, work_,
-            a_batch, s);
-    } else {
-        ops::causal_softmax_attention(
-            qn, kn, v, cache_positions, Tensor{}, kv_table_rows,
-            {dimension(config_.attention->head_dim),
-             dimension(config_.attention->num_attention_heads),
-             dimension(config_.attention->num_key_value_heads)},
-            static_cast<float>(1.0 / std::sqrt(static_cast<double>(config_.attention->head_dim))),
-            batch_text_kv_->batch_layer_view(fidx), *active_causal_attention_envelope_, work_, a,
-            s);
-    }
-    ops::sigmoid_mul(gate, a, s);
-
-    ops::linear_add(a.view({dimension(config_.attention->query_width()), T}), p.output.weight, x,
-                    p.output.policy, work_, s);
-}
-
-void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase ph) {
-    const auto& p  = std::get<GdnParameters>(w.mixer);
-    cudaStream_t s = ctx_.stream;
-    const int T    = x.ne[1];
-
-    const auto control = workspace::gdn_control(work_, config_, T);
-    Tensor h           = control.hidden;
-    Tensor g           = control.g;
-    Tensor beta        = control.beta;
-    gdn_norm_control(x, w.input_norm, config_.rms_norm_eps, p, h, g, beta, work_,
-                     ctx_.execution_view());
-
-    const auto projection = workspace::gdn_projection(work_, config_, T);
-    Tensor z  = projection.output_gate.view({dimension(config_.gdn->linear_value_head_dim),
-                                             dimension(config_.gdn->linear_num_value_heads), T});
-    Tensor qc = projection.query;
-    Tensor kc = projection.key;
-    Tensor vc = projection.value;
-    if (ph == Phase::Verify) {
-        if (active_sequence_batch_ == 0 || active_linear_state_source_slots_ == nullptr) {
-            throw std::logic_error(
-                "Verify GDN requires an explicit sequence batch and state slots");
-        }
-        const std::int32_t width = active_sequence_width_;
-        if (width <= 0 || width * active_sequence_batch_ != T) {
-            throw std::logic_error("GDN sequence batch binding does not match aggregate columns");
-        }
-        if (gdn_state_action_ == GdnStateAction::UpdateInPlace && width != 1) {
-            throw std::logic_error("In-place batched GDN update requires width one");
-        }
-        Tensor projection_input =
-            h.view({dimension(config_.hidden_size), width, active_sequence_batch_});
-        Tensor query_output =
-            qc.view({dimension(config_.gdn->key_width()), width, active_sequence_batch_});
-        Tensor key_output =
-            kc.view({dimension(config_.gdn->key_width()), width, active_sequence_batch_});
-        Tensor value_output =
-            vc.view({dimension(config_.gdn->value_width()), width, active_sequence_batch_});
-        Tensor gate_output =
-            z.view({dimension(config_.gdn->value_width()), width, active_sequence_batch_});
-        Tensor conv_states = state_.layer_view(static_cast<std::uint32_t>(gidx)).conv;
-        const Tensor valid = active_valid_columns_ != nullptr ? *active_valid_columns_ : Tensor{};
-        if (gdn_state_action_ == GdnStateAction::RecordForReplay) {
-            if (replay_records_ == nullptr) {
-                throw std::logic_error("Replay-record GDN has no record storage");
+    Tensor mtp_input_embeddings;
+    const Tensor* mtp_input_embeddings_ptr = nullptr;
+    if (multimodal) {
+        mtp_input_embeddings = work_.alloc(DType::BF16, {dimension(config_.hidden_size), len});
+        ops::embedding(mtp_ids, *embed_, mtp_input_embeddings, s);
+        if (vision_chunk.control != nullptr) {
+            const qwen3_5::MtpVisualOverlap overlap = qwen3_5::shifted_visual_overlap(
+                vision_chunk.control->scatter_indices, alignment_tokens, mtp_window);
+            if (!overlap.empty()) {
+                Tensor shifted_indices = workspace::visual_scatter_indices(
+                    work_, static_cast<std::int32_t>(overlap.size()));
+                qwen3_5::detail::scatter_shifted_visual_embeddings(
+                    mtp_input_embeddings, vision_chunk.embeddings, overlap, shifted_indices, s);
             }
-            GdnReplayRecordLayer records = replay_records_->layer(gidx, active_sequence_batch_);
-            gdn_projection_record(projection_input, p, *config_.gdn, conv_states, valid,
-                                  *active_linear_state_source_slots_, records.conv, query_output,
-                                  key_output, value_output, gate_output, work_, s);
-        } else {
-            gdn_projection_snapshot(projection_input, p, *config_.gdn, conv_states, valid,
-                                    *active_linear_state_source_slots_,
-                                    *active_linear_state_destination_slots_, query_output,
-                                    key_output, value_output, gate_output, work_, s);
+        }
+        mtp_input_embeddings_ptr = &mtp_input_embeddings;
+    }
+    if (is_last && mtp_proposal_extent_ != 0) {
+        Tensor logits = matrix_window(io_.logits, 1);
+        Tensor draft0 = io_.mtp->draft_tokens.slice(0, 0, 1);
+        mtp_prefill_chunk(mtp_ids, xf, mtp_input_embeddings_ptr, positions, rope_positions,
+                          chunk_envelope, true, &io_.mtp->ar_hidden, &logits, &draft0);
+
+        Tensor ar_position = io_.mtp->position.slice(0, 0, 1);
+        ops::set_i32_scalar(ar_position, base_i + T, s);
+        for (int i = 1; i < static_cast<int>(mtp_proposal_extent_); ++i) {
+            Tensor prev_token     = io_.mtp->draft_tokens.slice(0, i - 1, 1);
+            Tensor next_token     = io_.mtp->draft_tokens.slice(0, i, 1);
+            Tensor next_hidden    = work_.alloc(DType::BF16, {dimension(config_.hidden_size), 1});
+            const auto ar_visible = static_cast<std::uint32_t>(base_i + T + i);
+            const ops::CausalAttentionExecutionEnvelope ar_envelope{ar_visible, ar_visible};
+            mtp_forward_ar_step(prev_token, io_.mtp->ar_hidden, ar_position, ar_envelope,
+                                next_hidden, logits, next_token);
+            CUDA_CHECK(::ninfer::memcpy_device_async(io_.mtp->ar_hidden.data, next_hidden.data,
+                                                     io_.mtp->ar_hidden.bytes(), s));
+            ops::increment_i32_scalar(ar_position, s);
         }
     } else {
-        Tensor qkv    = workspace::gdn_prefill_conv(work_, config_, T);
-        Tensor z_flat = z.view({dimension(config_.gdn->value_width()), T});
-        gdn_projection(h, p, qkv, z_flat, work_, s);
-        Tensor conv_state_in =
-            state_.conv_slot(static_cast<std::uint32_t>(gidx), linear_state_source_slot_);
-        Tensor conv_state_out =
-            state_.conv_slot(static_cast<std::uint32_t>(gidx), linear_state_destination_slot_);
-        ops::causal_conv1d_silu_split(qkv, p.convolution, conv_state_in, conv_state_out, qc, kc, vc,
-                                      s);
+        mtp_prefill_chunk(mtp_ids, xf, mtp_input_embeddings_ptr, positions, rope_positions,
+                          chunk_envelope, false, nullptr, nullptr, nullptr);
     }
-
-    Tensor q_recurrent = qc.view({dimension(config_.gdn->linear_key_head_dim),
-                                  dimension(config_.gdn->linear_num_key_heads), T});
-    Tensor k_recurrent = kc.view({dimension(config_.gdn->linear_key_head_dim),
-                                  dimension(config_.gdn->linear_num_key_heads), T});
-
-    Tensor vv = vc.view({dimension(config_.gdn->linear_value_head_dim),
-                         dimension(config_.gdn->linear_num_value_heads), T});
-    Tensor o  = workspace::gdn_recurrent_output(work_, config_, T)
-                   .view({dimension(config_.gdn->linear_value_head_dim),
-                          dimension(config_.gdn->linear_num_value_heads), T});
-    if (ph == Phase::Verify) {
-        Tensor recurrent_states  = state_.layer_view(static_cast<std::uint32_t>(gidx)).recurrent;
-        const std::int32_t width = active_sequence_width_;
-        Tensor q_batch           = q_recurrent.view({dimension(config_.gdn->linear_key_head_dim),
-                                                     dimension(config_.gdn->linear_num_key_heads), width,
-                                                     active_sequence_batch_});
-        Tensor k_batch           = k_recurrent.view({dimension(config_.gdn->linear_key_head_dim),
-                                                     dimension(config_.gdn->linear_num_key_heads), width,
-                                                     active_sequence_batch_});
-        Tensor v_batch           = vv.view({dimension(config_.gdn->linear_value_head_dim),
-                                            dimension(config_.gdn->linear_num_value_heads), width,
-                                            active_sequence_batch_});
-        Tensor g_batch =
-            g.view({dimension(config_.gdn->linear_num_value_heads), width, active_sequence_batch_});
-        Tensor beta_batch = beta.view(
-            {dimension(config_.gdn->linear_num_value_heads), width, active_sequence_batch_});
-        Tensor out_batch =
-            o.view({dimension(config_.gdn->linear_value_head_dim),
-                    dimension(config_.gdn->linear_num_value_heads), width, active_sequence_batch_});
-        const Tensor valid = active_valid_columns_ != nullptr ? *active_valid_columns_ : Tensor{};
-        if (gdn_state_action_ == GdnStateAction::RecordForReplay) {
-            GdnReplayRecordLayer records = replay_records_->layer(gidx, active_sequence_batch_);
-            ops::gated_delta_net_replay_record(
-                q_batch, k_batch, v_batch, g_batch, beta_batch,
-                static_cast<float>(
-                    1.0 / std::sqrt(static_cast<double>(config_.gdn->linear_key_head_dim))),
-                recurrent_states, valid, *active_linear_state_source_slots_, records.key,
-                records.value, records.gate, out_batch, s);
-        } else {
-            ops::gated_delta_net_batch_update(
-                q_batch, k_batch, v_batch, g_batch, beta_batch,
-                static_cast<float>(
-                    1.0 / std::sqrt(static_cast<double>(config_.gdn->linear_key_head_dim))),
-                /*normalize_qk=*/true, recurrent_states, *active_linear_state_source_slots_,
-                *active_linear_state_destination_slots_, out_batch, s);
-        }
-    } else {
-        Tensor recurrent_state_in =
-            state_.recurrent_slot(static_cast<std::uint32_t>(gidx), linear_state_source_slot_);
-        Tensor recurrent_state_out =
-            state_.recurrent_slot(static_cast<std::uint32_t>(gidx), linear_state_destination_slot_);
-        ops::gated_delta_net(q_recurrent, k_recurrent, vv, g, beta,
-                             static_cast<float>(1.0 / std::sqrt(static_cast<double>(
-                                                          config_.gdn->linear_key_head_dim))),
-                             /*normalize_qk=*/true, work_, recurrent_state_in, recurrent_state_out,
-                             o, ctx_.execution_view());
-    }
-
-    Tensor on = workspace::gdn_normalized_output(work_, config_, T)
-                    .view({dimension(config_.gdn->linear_value_head_dim),
-                           dimension(config_.gdn->linear_num_value_heads), T});
-    ops::gated_rmsnorm(o, p.norm, z, config_.rms_norm_eps, on, s);
-
-    ops::linear_add(on.view({dimension(config_.gdn->value_width()), T}), p.output.weight, x,
-                    p.output.policy, work_, s);
-}
-
-ops::SparseMoeHints TextContext::next_projection_hints(int layer) const {
-    const auto next = static_cast<std::size_t>(layer) + 1;
-    return next < parameters_.text.layers.size() ? parameters_.text.layers[next].projection_prefetch
-                                                 : ops::SparseMoeHints{};
-}
-
-void TextContext::mlp_tail(const BlockParameters& weights, Tensor& x, Phase,
-                           const ops::SparseMoeHints& hints) {
-    Tensor h = workspace::post_mixer_hidden(work_, config_, x.ne[1]);
-    ops::rmsnorm(x, weights.post_attention_norm, config_.rms_norm_eps, true, h, ctx_.stream);
-    ffn(h, weights.ffn, x, hints, work_, ctx_.stream);
-}
-
-template <class Tap>
-void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
-    const bool prefill = ph == Phase::Prefill;
-    for (std::size_t layer = 0; layer < parameters_.text.layers.size(); ++layer) {
-        const auto& block  = parameters_.text.layers[layer];
-        const bool full    = config_.layer_types[layer] == MixerKind::FullAttention;
-        const auto compact = dimension(config_.compact_layer_indices[layer]);
-        nvtx::ScopedRange layer_range(
-            full ? (prefill ? nvtx::Name::PrefillLayerFull : nvtx::Name::VerifyLayerFull)
-                 : (prefill ? nvtx::Name::PrefillLayerGdn : nvtx::Name::VerifyLayerGdn),
-            full ? nvtx::Category::Attention : nvtx::Category::Gdn, layer);
-        try {
-            {
-                nvtx::ScopedRange mixer_range(
-                    full ? (prefill ? nvtx::Name::PrefillAttention : nvtx::Name::VerifyAttention)
-                         : (prefill ? nvtx::Name::PrefillGdn : nvtx::Name::VerifyGdn),
-                    full ? nvtx::Category::Attention : nvtx::Category::Gdn, layer);
-                auto scope = work_.scope();
-                if (full) {
-                    attn_mix(block, x, compact, ph);
-                } else {
-                    gdn_mix(block, x, compact, ph);
-                }
-            }
-            {
-                nvtx::ScopedRange range(prefill ? nvtx::Name::PrefillPostMixer
-                                                : nvtx::Name::VerifyPostMixer,
-                                        nvtx::Category::PostMixer, layer);
-                auto scope = work_.scope();
-                mlp_tail(block, x, ph, next_projection_hints(static_cast<int>(layer)));
-            }
-            if constexpr (Tap::enabled) {
-                tap.capture_layer(static_cast<int>(layer), x, ctx_.stream);
-            }
-        } catch (const std::exception& error) {
-            throw std::runtime_error("text/layers/" + std::to_string(layer) +
-                                     (prefill ? " prefill" : " verify") +
-                                     " columns=" + std::to_string(x.ne[1]) + ": " + error.what());
-        }
-    }
-}
-
-void TextContext::run_layers(Tensor& x, Phase ph) {
-    NullTap tap;
-    run_layers(x, ph, tap);
-}
-
-template <class Tap>
-PrefillChunkResult
-TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_prefill,
-                          const MultimodalPrefill* multimodal, Tap& tap, bool finalize_at_end) {
-    if (qwen4()) {
-        if constexpr (Tap::enabled) {
-            throw std::logic_error("Qwen4Exp prefill publishes no speculative feature taps");
-        } else {
-            return qwen4_prefill(ids, text_prefill, multimodal, finalize_at_end);
-        }
-    }
-    runtime::ExecutionTimingRecorder timing;
-    if (ids.empty()) { throw std::invalid_argument("TextContext::prefill requires tokens"); }
-    if (ids.size() > static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max())) {
-        throw std::overflow_error("TextContext::prefill token count exceeds int32");
-    }
-    cudaStream_t s           = ctx_.stream;
-    const int T              = static_cast<int>(ids.size());
-    const int chunk          = static_cast<int>(prefill_chunk_);
-    const std::uint32_t base = text_kv_base_;
-
-    if (text_prefill != nullptr) {
-        if (multimodal != nullptr || base != text_prefill->begin ||
-            text_prefill->token_ids.size() < static_cast<std::size_t>(base) + ids.size()) {
-            throw std::invalid_argument("text prefill chunk does not match its full prompt");
-        }
-    }
-    if (multimodal != nullptr) {
-        if (base != multimodal->begin ||
-            multimodal->token_ids.size() < static_cast<std::size_t>(base) + ids.size()) {
-            throw std::invalid_argument("multimodal prefill suffix does not match its cache base");
-        }
-        if (multimodal->positions.size() != 3 * multimodal->token_ids.size()) {
-            throw std::invalid_argument("multimodal positions must have shape [3,T]");
-        }
-        if (multimodal->vision == nullptr) {
-            throw std::invalid_argument("multimodal prefill requires a Vision session");
-        }
-        rope_delta_ = multimodal->rope_delta;
-    } else if (text_kv_base_ == 0) {
-        rope_delta_ = 0;
-    }
-    ops::set_i32_scalar(io_.rope_delta, rope_delta_, s);
-
-    // Prefix-append prefill continues an existing cache: positions are absolute (start at the
-    // resident length) and KV/GDN state is not reset. For a reset prefill base == 0.
-    if (static_cast<std::uint64_t>(base) + static_cast<std::uint64_t>(T) >
-        static_cast<std::uint64_t>(std::numeric_limits<std::int32_t>::max())) {
-        throw std::overflow_error("TextContext::prefill absolute position exceeds int32");
-    }
-    const int base_i = static_cast<int>(base);
-
-    const std::int64_t base64    = static_cast<std::int64_t>(base);
-    const std::int64_t split_abs = prefill_split_frontier_;
-    const bool has_split = split_abs > base64 && split_abs <= base64 + static_cast<std::int64_t>(T);
-    const int split_rel  = has_split ? static_cast<int>(split_abs - base64) : -1;
-    const bool prepare_mtp_prompt = mtp_enabled() && io_.mtp.has_value();
-    if (prepare_mtp_prompt &&
-        mtp_proposal_extent_ > static_cast<std::uint32_t>(io_.mtp->draft_tokens.ne[0])) {
-        throw std::logic_error("MTP proposal extent exceeds the configured draft window");
-    }
-    int t0 = 0;
-    for (; t0 < T;) {
-        int len = std::min(chunk, T - t0);
-        if (split_rel > 0 && t0 < split_rel && t0 + len > split_rel) { len = split_rel - t0; }
-        work_.reset();
-
-        VisionChunk vision_chunk;
-        const std::uint32_t prompt_t0 = base + static_cast<std::uint32_t>(t0);
-        if (multimodal != nullptr) {
-            if (multimodal->vision == nullptr) {
-                throw std::logic_error("multimodal prefill has no Vision session");
-            }
-            vision_chunk =
-                multimodal->vision->prepare_chunk(prompt_t0, static_cast<std::uint32_t>(len));
-            len = vision_chunk.length;
-        }
-        const bool is_last = finalize_at_end && (t0 + len == T);
-        nvtx::ScopedRange chunk_range(nvtx::Name::PrefillChunk, nvtx::Category::Prefill,
-                                      static_cast<std::uint64_t>(len));
-
-        {
-            std::vector<std::int32_t> local_scatter_indices;
-            std::int32_t visual_begin = 0;
-            if (vision_chunk.control != nullptr) {
-                const auto scatter =
-                    std::span<const std::int32_t>(vision_chunk.control->scatter_indices);
-                const auto begin = std::lower_bound(scatter.begin(), scatter.end(), prompt_t0);
-                const auto end   = std::lower_bound(begin, scatter.end(), prompt_t0 + len);
-                const auto count = static_cast<std::int32_t>(end - begin);
-                visual_begin     = static_cast<std::int32_t>(begin - scatter.begin());
-                local_scatter_indices.resize(static_cast<std::size_t>(count));
-                for (std::int32_t i = 0; i < count; ++i) {
-                    local_scatter_indices[static_cast<std::size_t>(i)] =
-                        begin[i] - static_cast<std::int32_t>(prompt_t0);
-                }
-            }
-
-            const std::int32_t rope_axes = multimodal != nullptr ? 3 : (rope_delta_ != 0 ? 1 : 0);
-            const auto roots             = workspace::text_prefill_roots(
-                work_, config_, len, rope_axes,
-                static_cast<std::int32_t>(local_scatter_indices.size()));
-            Tensor ids_device = roots.ids;
-            copy_i32(ids.data() + t0, ids_device, s);
-
-            Tensor positions = roots.positions;
-            ops::fill_i32_positions(positions, base_i + t0, s);
-
-            Tensor rope_positions = positions;
-            std::vector<std::int32_t> rope_positions_host;
-            if (multimodal != nullptr) {
-                rope_positions = roots.rope_positions;
-                rope_positions_host.resize(static_cast<std::size_t>(3) * len);
-                const std::size_t prompt_tokens = multimodal->token_ids.size();
-                for (int axis = 0; axis < 3; ++axis) {
-                    const auto* src = multimodal->positions.data() +
-                                      static_cast<std::size_t>(axis) * prompt_tokens + prompt_t0;
-                    std::copy_n(src, len,
-                                rope_positions_host.data() + static_cast<std::size_t>(axis) * len);
-                }
-                copy_i32(rope_positions_host.data(), rope_positions, s);
-            } else if (rope_delta_ != 0) {
-                rope_positions = roots.rope_positions;
-                ops::offset_i32_positions(positions, io_.rope_delta, rope_positions, s);
-            }
-            ScopedPositions scoped_cache(active_cache_positions_, positions);
-            ScopedPositions scoped_rope(active_rope_positions_, rope_positions);
-            const auto visible = static_cast<std::uint32_t>(base_i + t0 + len);
-            const ops::CausalAttentionExecutionEnvelope chunk_envelope{visible, visible};
-            ScopedEnvelope scoped_envelope(active_causal_attention_envelope_, chunk_envelope);
-
-            Tensor x = roots.residual;
-            ops::embedding(ids_device, *embed_, x, s);
-            if (!local_scatter_indices.empty()) {
-                Tensor indices_device = roots.scatter_indices;
-                copy_i32(local_scatter_indices.data(), indices_device, s);
-                Tensor embeddings = vision_chunk.embeddings.slice(
-                    1, visual_begin, static_cast<std::int32_t>(local_scatter_indices.size()));
-                ops::scatter(embeddings, indices_device, x, s);
-            }
-            if constexpr (Tap::enabled) { tap.begin(x); }
-            run_layers(x, Phase::Prefill, tap);
-            if constexpr (requires { tap.capture_positions(positions, s); }) {
-                tap.capture_positions(positions, s);
-            }
-
-            Tensor xf = prefill_hidden_.data != nullptr
-                            ? matrix_window(prefill_hidden_, len)
-                            : work_.alloc(DType::BF16, {dimension(config_.hidden_size), len});
-            ops::rmsnorm(x, *final_norm_, config_.rms_norm_eps, true, xf, s);
-
-            if (is_last) {
-                Tensor last_xf = xf.slice(1, len - 1, 1);
-                Tensor logits  = matrix_window(io_.logits, 1);
-                project(last_xf, *lm_head_, logits, work_, s);
-                // Set io_.pos to the bonus token's absolute position (base + T) before picking so
-                // the sampler RNG is keyed by it (prefill purpose keeps it distinct from the first
-                // decode step, which reuses the same io_.pos).
-                ops::set_i32_scalar(io_.pos, base_i + T, s);
-                ops::set_i32_scalar(io_.rope_pos, base_i + T + rope_delta_, s);
-                if (sampling_config_ != nullptr) {
-                    ops::sample(logits, io_.token,
-                                dimension(parameters_.model.resources().public_token_count),
-                                sampling_config_, io_.pos, ops::kSamplePurposePrefill, work_, s);
-                } else {
-                    ops::argmax(logits, io_.token,
-                                dimension(parameters_.model.resources().public_token_count), s);
-                }
-            }
-
-            if (prepare_mtp_prompt) {
-                const std::uint32_t alignment_tokens =
-                    multimodal != nullptr ? static_cast<std::uint32_t>(multimodal->token_ids.size())
-                    : text_prefill != nullptr
-                        ? static_cast<std::uint32_t>(text_prefill->token_ids.size())
-                        : static_cast<std::uint32_t>(T);
-                const std::uint32_t alignment_begin =
-                    multimodal != nullptr || text_prefill != nullptr
-                        ? prompt_t0
-                        : static_cast<std::uint32_t>(t0);
-                const qwen3_5::MtpAlignmentWindow mtp_window = qwen3_5::plan_mtp_alignment_window(
-                    alignment_tokens, alignment_begin, static_cast<std::uint32_t>(len));
-                const std::span<const int> alignment_ids =
-                    multimodal != nullptr     ? multimodal->token_ids
-                    : text_prefill != nullptr ? text_prefill->token_ids
-                                              : ids;
-                const int prompt_columns =
-                    len - static_cast<int>(mtp_window.final_column_uses_generated_token);
-                Tensor mtp_ids = work_.alloc(DType::I32, {len});
-                if (prompt_columns != 0) {
-                    Tensor prompt_mtp_ids = mtp_ids.slice(0, 0, prompt_columns);
-                    copy_i32(alignment_ids.data() + mtp_window.shifted_embedding_begin,
-                             prompt_mtp_ids, s);
-                }
-                if (mtp_window.final_column_uses_generated_token) {
-                    Tensor generated_mtp_id = mtp_ids.slice(0, len - 1, 1);
-                    CUDA_CHECK(::ninfer::memcpy_device_async(generated_mtp_id.data, io_.token.data,
-                                                             sizeof(std::int32_t), s));
-                }
-
-                Tensor mtp_input_embeddings;
-                const Tensor* mtp_input_embeddings_ptr = nullptr;
-                if (multimodal != nullptr) {
-                    mtp_input_embeddings =
-                        work_.alloc(DType::BF16, {dimension(config_.hidden_size), len});
-                    ops::embedding(mtp_ids, *embed_, mtp_input_embeddings, s);
-                    if (vision_chunk.control != nullptr) {
-                        const qwen3_5::MtpVisualOverlap overlap = qwen3_5::shifted_visual_overlap(
-                            vision_chunk.control->scatter_indices, alignment_tokens, mtp_window);
-                        if (!overlap.empty()) {
-                            Tensor shifted_indices = workspace::visual_scatter_indices(
-                                work_, static_cast<std::int32_t>(overlap.size()));
-                            qwen3_5::detail::scatter_shifted_visual_embeddings(
-                                mtp_input_embeddings, vision_chunk.embeddings, overlap,
-                                shifted_indices, s);
-                        }
-                    }
-                    mtp_input_embeddings_ptr = &mtp_input_embeddings;
-                }
-                if (is_last && mtp_proposal_extent_ != 0) {
-                    Tensor logits = matrix_window(io_.logits, 1);
-                    Tensor draft0 = io_.mtp->draft_tokens.slice(0, 0, 1);
-                    mtp_prefill_chunk(mtp_ids, xf, mtp_input_embeddings_ptr, positions,
-                                      rope_positions, chunk_envelope, true, &io_.mtp->ar_hidden,
-                                      &logits, &draft0);
-
-                    Tensor ar_position = io_.mtp->position.slice(0, 0, 1);
-                    ops::set_i32_scalar(ar_position, base_i + T, s);
-                    for (int i = 1; i < static_cast<int>(mtp_proposal_extent_); ++i) {
-                        Tensor prev_token = io_.mtp->draft_tokens.slice(0, i - 1, 1);
-                        Tensor next_token = io_.mtp->draft_tokens.slice(0, i, 1);
-                        Tensor next_hidden =
-                            work_.alloc(DType::BF16, {dimension(config_.hidden_size), 1});
-                        const auto ar_visible = static_cast<std::uint32_t>(base_i + T + i);
-                        const ops::CausalAttentionExecutionEnvelope ar_envelope{ar_visible,
-                                                                                ar_visible};
-                        mtp_forward_ar_step(prev_token, io_.mtp->ar_hidden, ar_position,
-                                            ar_envelope, next_hidden, logits, next_token);
-                        CUDA_CHECK(::ninfer::memcpy_device_async(io_.mtp->ar_hidden.data,
-                                                                 next_hidden.data,
-                                                                 io_.mtp->ar_hidden.bytes(), s));
-                        ops::increment_i32_scalar(ar_position, s);
-                    }
-                } else {
-                    mtp_prefill_chunk(mtp_ids, xf, mtp_input_embeddings_ptr, positions,
-                                      rope_positions, chunk_envelope, false, nullptr, nullptr,
-                                      nullptr);
-                }
-            }
-
-            if (split_rel > 0 && t0 + len == split_rel &&
-                rewrite_checkpoint_hidden_output_ != nullptr) {
-                require_tensor_shape(*rewrite_checkpoint_hidden_output_, DType::BF16,
-                                     {dimension(config_.hidden_size), 1},
-                                     "rewrite checkpoint hidden output");
-                const Tensor checkpoint_hidden = xf.slice(1, len - 1, 1);
-                CUDA_CHECK(::ninfer::memcpy_device_async(rewrite_checkpoint_hidden_output_->data,
-                                                         checkpoint_hidden.data,
-                                                         checkpoint_hidden.bytes(), s));
-            }
-        }
-
-        if constexpr (requires { tap.consume_prefill_chunk(len, false); }) {
-            work_.reset();
-            tap.consume_prefill_chunk(len, split_rel > 0 && t0 + len == split_rel);
-        }
-
-        t0 += len;
-        break;
-    }
-
-    prefill_split_frontier_ = -1;
-
-    timing.begin_wait();
-    ctx_.synchronize();
-    timing.end_wait();
-    work_.reset();
-    return PrefillChunkResult{.processed_tokens = static_cast<std::uint32_t>(t0),
-                              .finalized        = finalize_at_end && t0 == T,
-                              .timing           = timing.finish()};
 }
 
 PrefillChunkResult TextContext::prefill_chunk(std::span<const int> full_ids, std::uint32_t begin,
@@ -1491,13 +846,8 @@ PrefillChunkResult TextContext::prefill_chunk(std::span<const int> full_ids, std
         throw std::invalid_argument("text prefill chunk is outside the prompt");
     }
     const TextPrefill text_prefill{full_ids, begin};
-    NullTap tap;
-    if (tp2()) {
-        return prefill_impl_tp2(full_ids.subspan(begin, nominal_length), &text_prefill, nullptr,
-                                tap, finalize_at_end);
-    }
-    return prefill_impl(full_ids.subspan(begin, nominal_length), &text_prefill, nullptr, tap,
-                        finalize_at_end);
+    return qwen4_prefill(full_ids.subspan(begin, nominal_length), &text_prefill, nullptr,
+                         finalize_at_end);
 }
 
 PrefillChunkResult TextContext::prefill_chunk(std::span<const int> full_ids, std::uint32_t begin,
@@ -1508,12 +858,8 @@ PrefillChunkResult TextContext::prefill_chunk(std::span<const int> full_ids, std
         throw std::invalid_argument("text prefill chunk is outside the prompt");
     }
     const TextPrefill text_prefill{full_ids, begin};
-    if (tp2()) {
-        return prefill_impl_tp2(full_ids.subspan(begin, nominal_length), &text_prefill, nullptr,
-                                sink, finalize_at_end);
-    }
-    return prefill_impl(full_ids.subspan(begin, nominal_length), &text_prefill, nullptr, sink,
-                        finalize_at_end);
+    return qwen4_prefill(full_ids.subspan(begin, nominal_length), &text_prefill, nullptr,
+                         finalize_at_end, &sink);
 }
 
 PrefillChunkResult TextContext::prefill_chunk(const qwen3_5::PreparedPromptData& input,
@@ -1525,13 +871,8 @@ PrefillChunkResult TextContext::prefill_chunk(const qwen3_5::PreparedPromptData&
     }
     const std::span<const int> tokens(input.token_ids);
     const MultimodalPrefill multimodal{tokens, input.positions, &vision, begin, input.rope_delta};
-    NullTap tap;
-    if (tp2()) {
-        return prefill_impl_tp2(tokens.subspan(begin, nominal_length), nullptr, &multimodal, tap,
-                                finalize_at_end);
-    }
-    return prefill_impl(tokens.subspan(begin, nominal_length), nullptr, &multimodal, tap,
-                        finalize_at_end);
+    return qwen4_prefill(tokens.subspan(begin, nominal_length), nullptr, &multimodal,
+                         finalize_at_end);
 }
 
 PrefillChunkResult TextContext::prefill_chunk(const qwen3_5::PreparedPromptData& input,
@@ -1544,12 +885,8 @@ PrefillChunkResult TextContext::prefill_chunk(const qwen3_5::PreparedPromptData&
     }
     const std::span<const int> tokens(input.token_ids);
     const MultimodalPrefill multimodal{tokens, input.positions, &vision, begin, input.rope_delta};
-    if (tp2()) {
-        return prefill_impl_tp2(tokens.subspan(begin, nominal_length), nullptr, &multimodal, sink,
-                                finalize_at_end);
-    }
-    return prefill_impl(tokens.subspan(begin, nominal_length), nullptr, &multimodal, sink,
-                        finalize_at_end);
+    return qwen4_prefill(tokens.subspan(begin, nominal_length), nullptr, &multimodal,
+                         finalize_at_end, &sink);
 }
 
 } // namespace ninfer::models::qwen3_5::execution

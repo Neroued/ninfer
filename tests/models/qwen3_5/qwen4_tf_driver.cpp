@@ -27,7 +27,7 @@
 //   (EngineOptions::elastic_kv).
 // Routed experts (both modes): [--experts offload|mapped] [--slots N] [--slot-headroom-mib N]
 //   [--cpu-threads N] [--insert-cap N] [--admit F] [--half-life F] [--evict-tau F] [--device-reads
-//   N] [--embedding-host]
+//   N] [--embedding-host] [--kv-ram-active]
 //   [--prefetch N] [--prefetch-min-score F] [--prefetch-first-layer L] [--prefetch-gbps G]
 //   [--warm-start | --no-warm-start] (T25; warm start is on by default).
 //   [--miss-split auto|off|<fraction>|count:<n>] [--split-path staged|zc] [--split-rank 0|1]
@@ -301,6 +301,8 @@ int main(int argc, char** argv) {
                 k       = {c[0], c[1], c[2], c[3], c[4], c[5], c[6]};
             } else if (arg == "--embedding-host") {
                 options.embedding_host = true;
+            } else if (arg == "--kv-ram-active") {
+                options.kv_ram_active = true;
             } else if (arg == "--elastic") {
                 // T64: elastic KV <-> expert slots (KV backed on demand, the cache shrinks/grows).
                 options.elastic_kv.enabled = true;

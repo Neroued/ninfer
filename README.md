@@ -14,11 +14,12 @@ Anthropic-compatible HTTP API, so agent tools such as Claude Code, Codex CLI and
   there are two). That is why Flash-Next needs a lot of RAM and a CPU with AVX2 or AVX-512.
 - **Qwen3.8-27B** is a dense model that runs entirely on the GPUs.
 - For agents: a prefix cache across turns, idle conversations moved to RAM (and optionally to disk) instead of being
-  recomputed, and the expert cache follows the conversation.
+  recomputed, and the expert cache follows the conversation. For long contexts Flash-Next can also keep the KV cache
+  of the conversation being generated in RAM (`--kv-ram-active`).
 
 capy-flash **is ninfer-tp2, renamed at v0.5.0**: the two-GPU tensor-parallel fork of
 [Neroued/ninfer](https://github.com/Neroued/ninfer) (v0.1-v0.4.9 under the old name); [NOTICE](NOTICE) lists every piece
-of prior work it builds on. Status: **v0.7.7**. Built, tested and measured on one machine ([below](#benchmarks));
+of prior work it builds on. Status: **v0.8.0**. Built, tested and measured on one machine ([below](#benchmarks));
 users report other setups. Not affiliated with Qwen or NVIDIA.
 
 ## Pick a model
@@ -124,6 +125,10 @@ order. `ninfer-serve --help` and [docs/serving.md](docs/serving.md#profiles) lis
 For the 64 GB edition on two GPUs add `--host-kv-mib 1024 --host-state-slots 2` to `--profile flash-next` (smaller RAM
 caches); `install.sh --model flash-next-64gb` prints that command.
 
+For long contexts on Flash-Next, add `--kv-ram-active` to either Flash-Next profile: the KV cache stays in pinned RAM
+(2.3 GiB per GPU at 262k tokens, 3.9 GiB on one GPU) and the VRAM it frees goes to expert slots. Same tokens; a few
+per cent slower on short contexts, faster on long ones ([costs](docs/maintainer/active-kv-in-ram.md#cost)).
+
 ### Docker
 [docker/Dockerfile.release](docker/Dockerfile.release) packs a release tarball (builds in about a minute; the root
 [Dockerfile](Dockerfile) compiles from source instead). It needs the NVIDIA Container Toolkit:
@@ -161,8 +166,9 @@ How the engine runs these models, every server flag, the RAM tiers, the chat tem
 ## Benchmarks
 
 Our machine: AMD Ryzen 9 9900X (12 cores), 96 GB DDR5-5600, 2x RTX 5070 Ti 16 GB on PCIe 5.0 x8 + x8 (no P2P),
-Ubuntu, CUDA 13.1, full clocks. Decode is the server-side rate. The agentic replay is
-[bench/capy_flash](bench/capy_flash): 3 synthetic coding-agent sessions, 53 turns, prompts growing to ~81k tokens with
+Ubuntu, CUDA 13.1, full clocks. Decode is the server-side rate. v0.8.0 runs at the speed of v0.7.7 (the
+[release notes](https://github.com/ValerioDolci/capy-flash/releases/tag/v0.8.0) have the comparison). The agentic
+replay is [bench/capy_flash](bench/capy_flash): 3 synthetic coding-agent sessions, 53 turns, prompts growing to ~81k tokens with
 ~90 % prefix reuse, 256 output tokens per turn, temperature 0. LocalMaxxing is the reasoning-v1 benchmark (short
 prompt, 512 tokens).
 
@@ -251,7 +257,8 @@ run (Strata 0.1.43 IQ3_S on the same tasks: 52.7k, 20/20; the GB300 reference: 2
 
 ## Known limits
 - Flash-Next is tested with one request at a time (`--max-concurrency 1`, as its profiles set) and only on the
-  machine above. The server accepts up to 8 (`--max-concurrency`); the 27B NVFP4 was measured at 1 to 8.
+  machine above; `--kv-ram-active` requires it. The server accepts up to 8 (`--max-concurrency`); the 27B NVFP4 was
+  measured at 1 to 8.
 - With several requests decoding, an answer that outgrows its KV window when the GPUs are full first moves idle cached
   conversations to RAM (or drops them without a RAM tier); only if that cannot free a page does it end early with
   `finish_reason: length` (the request log counts it). `--kv-lease-window 0` restores the full reservation of v0.5.3.
@@ -268,12 +275,29 @@ run (Strata 0.1.43 IQ3_S on the same tasks: 52.7k, 20/20; the GB300 reference: 2
 `ctest --test-dir build` runs the unit tests. The Engine integration tests run when their artifacts are set:
 `NINFER_TEST_QWEN4_ARTIFACT` (a small synthetic Flash-Next artifact with the real layer geometry, made by
 `tools/capy_flash/make_test_artifact.sh <checkpoint dir> <out dir>`, CPU only) and `NINFER_TEST_ARTIFACT` (a
-Qwen3.8-27B artifact, for the tests inherited from ninfer-tp2). For the 27B, `tools/tp2/gate.sh` is the reference run:
-it sets the artifacts, runs the two-device integration tests and excludes the seven single-GPU tests that need other
-artifact kinds (DFlash, MoE, vision workspace; `GATE_CTEST_EXCLUDE`), then checks golden ids, perplexity and greedy
-texts against a recorded reference ([tools/tp2/README.md](tools/tp2/README.md)).
+Qwen3.8-27B artifact, for the tests inherited from ninfer-tp2). `ctest -j4` is supported; tests that need a model too
+large for one 16 GB board skip with the sizes. For the 27B, `tools/tp2/gate.sh` is the reference run: it sets the
+artifacts, runs the integration tests (`GATE_CTEST_EXCLUDE` excludes more), then checks golden ids, perplexity and
+greedy texts against a recorded reference ([tools/tp2/README.md](tools/tp2/README.md)).
 
 ## What's new
+
+**v0.8.0** ([release notes](https://github.com/ValerioDolci/capy-flash/releases/tag/v0.8.0))
+- Before updating: Qwen3.5 MoE (Qwen3.6-35B-A3B) and DFlash v1 (`--spec dflash`) are no longer supported; stay on
+  v0.7.7 for them. Qwen3.8-27B (the dense Qwen3.5 architecture) and DFlash2 are not affected. As after every update,
+  conversations saved by the disk tier start cold; the request log is schema 28.
+- Tool calls the model gets almost right (undeclared or catalog-spelled names, missing closing tags, prose after the
+  calls) come back as calls instead of plain text ([PR #35](https://github.com/ValerioDolci/capy-flash/pull/35),
+  [PR #39](https://github.com/ValerioDolci/capy-flash/pull/39) by @omni326); correct output is unchanged.
+- `--kv-ram-active` for Flash-Next: the KV cache in RAM, its VRAM to expert slots, for long contexts
+  ([Profiles](#profiles)).
+- Preparation for Qwen4: a dense variant of Flash-Next's architecture runs, checked on synthetic checkpoints. The
+  released Qwen4 architecture is not known yet.
+- Fixed: a probable fix for replies cut with `output_limit`
+  ([#27](https://github.com/ValerioDolci/capy-flash/issues/27)); a two-GPU exchange that hangs while serving no
+  longer stops the server ([#20](https://github.com/ValerioDolci/capy-flash/issues/20)); Flash-Next MTP drafts no
+  longer depend on a race; a request near the maximum context no longer takes Flash-Next down.
+- The 27B now runs the same Text forward as Flash-Next, with the same tokens and speed as v0.7.7.
 
 **v0.7.7**
 - Two engine-wide failures fixed. Both could follow a reasoning-close retry (`--reasoning-close-retry`, on by default) when a later request repeated the prompt or restored from its turn anchor. The fixes are a continuation that no longer registers the chat prompt's capture points ([PR #36](https://github.com/ValerioDolci/capy-flash/pull/36) by @omni326), and a state fork closed before a shared prefix is promoted at the reuse point. Recommended for everyone.
@@ -340,5 +364,5 @@ Older releases: [GitHub releases](https://github.com/ValerioDolci/capy-flash/rel
 [development log](docs/capy-flash/development-log.md), which records the work behind the `Tnn` tags in the sources.
 
 ## License
-Apache License 2.0 ([LICENSE](LICENSE)); attribution in [NOTICE](NOTICE). The original ninfer-tp2 README is in
-[docs/README-ninfer-tp2.md](docs/README-ninfer-tp2.md) (historical).
+Apache License 2.0 ([LICENSE](LICENSE)); attribution in [NOTICE](NOTICE). The original ninfer-tp2 README is the one of
+[v0.4.9](https://github.com/ValerioDolci/capy-flash/blob/v0.4.9/README.md) (historical).

@@ -1,11 +1,21 @@
 #pragma once
 
 #include "ops/linear_attention/kernels/causal_conv.cuh"
+#include "ops/linear_attention/gated_delta_net/input_conv/operands.h"
 
 #include <cuda_bf16.h>
 #include <cstdint>
 
 namespace ninfer::ops::detail {
+
+inline SnapshotHistoryPublish
+make_snapshot_history_publish(const gdn_input::HistoryDestination& destination,
+                              std::int32_t channels) {
+    return {reinterpret_cast<__nv_bfloat16*>(static_cast<std::byte*>(destination.data) +
+                                             destination.field_offset),
+            destination.byte_offsets, destination.snapshot_bases,
+            static_cast<std::int64_t>(destination.snapshot_stride / 2), channels};
+}
 
 // Device-side implementation detail shared by exact packed projection kernels. Projection
 // accumulators stay in the route's existing private precision; Publish changes only the side
@@ -14,8 +24,7 @@ template <class Publish>
 struct GdnConvEpilogue {
     const __nv_bfloat16* conv_weight;
     const __nv_bfloat16* state_read;
-    std::int64_t slot_stride;
-    const std::int32_t* initial_slots;
+    const std::int64_t* source_offsets;
     const std::int32_t* valid_columns;
     __nv_bfloat16* query;
     __nv_bfloat16* key;
@@ -33,9 +42,8 @@ struct GdnConvEpilogue {
     __device__ __forceinline__ void store(std::int32_t local_row,
                                           const float (&projected)[Tokens]) const {
         static_assert(Tokens >= 1);
-        const std::int32_t row = global_row_offset + local_row;
-        const std::int64_t initial_base =
-            static_cast<std::int64_t>(initial_slots[batch_row]) * slot_stride;
+        const std::int32_t row          = global_row_offset + local_row;
+        const std::int64_t initial_base = source_offsets[batch_row] / 2;
         std::int32_t valid = valid_columns == nullptr ? Tokens : valid_columns[batch_row];
         valid              = valid < 0 ? 0 : (valid > Tokens ? Tokens : valid);
 

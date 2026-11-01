@@ -6,6 +6,8 @@
 
 namespace ninfer {
 
+inline constexpr std::size_t kDecisionRequestCapacity = 17;
+
 // Borrowed until score_branches returns, including cancellation cleanup. The complete predictor
 // is prefix || suffix. root_tokens marks the static prefix and trunk_tokens the context boundary.
 // Both are token counts inside prefix; zero disables that level of reuse.

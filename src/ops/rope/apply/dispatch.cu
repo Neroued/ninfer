@@ -1,6 +1,7 @@
 #include "ops/rope/apply/dispatch.h"
 #include "ops/common/host/operands.h"
 #include "ops/rope/apply/launch.cuh"
+#include "core/platform.h"
 
 #include <algorithm>
 
@@ -46,6 +47,12 @@ Selection select_rope(const RopeArguments& a, int multiprocessors) {
     const int first_heads  = a.first.ne[1];
     const int second_heads = a.second ? a.second->ne[1] : 0;
 
+    if (axes == 2 && a.rotary_dim == 64) {
+        if (tokens <= 2) return {launch_rope_axial64<2>, 32};
+        if ((tokens >= 32 && tokens <= 64) || tokens >= 8192) return {launch_rope_axial64<16>, 256};
+        return {launch_rope_axial64<8>, 128};
+    }
+
     if (axes == 1 && a.first.ne[0] == 128 && a.rotary_dim == 128 && a.theta == 1.0e7F) {
         if (first_heads == 32 && second_heads == 8) {
             if (tokens <= 16) return {launch_rope_split<5, 32, 8>, 160};
@@ -79,8 +86,18 @@ Selection select_rope(const RopeArguments& a, int multiprocessors) {
         }
     }
     if (axes == 2 && a.rotary_dim == 72 && a.theta == 10'000.0F && first_heads == 16) {
-        if (a.second && second_heads == 16)
+        if (a.second && second_heads == 16) {
+#if NINFER_TARGET_SPARK
+            if (tokens < 32) return {launch_rope_fixed<RopeKernelMode::AxialD72R72, 16, 16>, 512};
+            if (common::operand::aligned(a.first.data, 8) &&
+                common::operand::aligned(a.second->data, 8) && a.first.nb[2] % 8 == 0 &&
+                a.second->nb[2] % 8 == 0)
+                return {launch_rope_axial_vector<256>, 256};
+            return {launch_rope_fixed<RopeKernelMode::AxialD72R72, 16, 16>, 256};
+#else
             return select_fixed<RopeKernelMode::AxialD72R72, 16, 16>(tokens, multiprocessors);
+#endif
+        }
         if (!a.second)
             return select_fixed<RopeKernelMode::AxialD72R72, 16, 0>(tokens, multiprocessors);
     }

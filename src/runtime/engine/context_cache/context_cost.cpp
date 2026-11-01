@@ -16,7 +16,7 @@
 
 namespace ninfer::runtime {
 
-const std::array<ContextTransferCost, 3>& generic_context_transfer_cost();
+const std::array<ContextTransferCost, 4>& generic_context_transfer_cost();
 const ContextPrefillCost& generic_context_prefill_cost();
 const std::vector<ContextCostMachinePreset>& compiled_context_cost_defaults();
 
@@ -93,7 +93,7 @@ std::string require_nonempty_string(const Json& value, std::string_view context)
     return value.get<std::string>();
 }
 
-void validate_transfer(const std::array<ContextTransferCost, 3>& transfer,
+void validate_transfer(const std::array<ContextTransferCost, 4>& transfer,
                        std::string_view context) {
     for (std::size_t index = 0; index < transfer.size(); ++index) {
         const ContextTransferCost& value = transfer[index];
@@ -128,12 +128,13 @@ ContextTransferCost parse_transfer_direction(const Json& value, std::string_view
     return result;
 }
 
-std::array<ContextTransferCost, 3> parse_transfer(const Json& value, std::string_view context) {
-    require_exact_members(value, {"d2h", "h2d", "d2d"}, {}, context);
+std::array<ContextTransferCost, 4> parse_transfer(const Json& value, std::string_view context) {
+    require_exact_members(value, {"d2h", "h2d", "d2d", "h2h"}, {}, context);
     return {
         parse_transfer_direction(value.at("d2h"), std::string(context) + ".d2h"),
         parse_transfer_direction(value.at("h2d"), std::string(context) + ".h2d"),
         parse_transfer_direction(value.at("d2d"), std::string(context) + ".d2d"),
+        parse_transfer_direction(value.at("h2h"), std::string(context) + ".h2h"),
     };
 }
 
@@ -163,10 +164,11 @@ Json transfer_direction_json(const ContextTransferCost& value) {
                 {"ns_per_byte_q32", value.ns_per_byte_q32}};
 }
 
-Json transfer_json(const std::array<ContextTransferCost, 3>& value) {
+Json transfer_json(const std::array<ContextTransferCost, 4>& value) {
     return Json{{"d2h", transfer_direction_json(value[0])},
                 {"h2d", transfer_direction_json(value[1])},
-                {"d2d", transfer_direction_json(value[2])}};
+                {"d2d", transfer_direction_json(value[2])},
+                {"h2h", transfer_direction_json(value[3])}};
 }
 
 Json prefill_json(const ContextPrefillCost& value) {
@@ -321,14 +323,30 @@ void write_document_atomic(const std::filesystem::path& path, const Json& docume
 
 std::uint64_t ContextMachineCostModel::transfer_ns(ContextTransferDirection direction,
                                                    TransferWork work) const noexcept {
+    return try_transfer_ns(direction, work).value_or(std::numeric_limits<std::uint64_t>::max());
+}
+
+std::optional<std::uint64_t>
+ContextMachineCostModel::try_transfer_ns(ContextTransferDirection direction, TransferWork work,
+                                         std::optional<ContextPeerTransfer> peer) const noexcept {
     if (work.payload_bytes == 0 && work.copy_operations == 0) { return 0; }
-    const std::size_t index = direction_index(direction);
-    if (index >= transfer.size()) { return std::numeric_limits<std::uint64_t>::max(); }
-    const ContextTransferCost& cost = transfer[index];
-    const std::uint64_t operation_limited =
-        saturating_add(cost.batch_ns, saturating_product(cost.operation_ns, work.copy_operations));
+    const ContextTransferCost* cost = nullptr;
+    if (direction == ContextTransferDirection::PeerDeviceToDevice) {
+        if (!peer || peer->source_rank == peer->destination_rank) return {};
+        const auto found = std::find_if(peer_transfer.begin(), peer_transfer.end(),
+                                        [&](const auto& entry) { return entry.peer == *peer; });
+        if (found == peer_transfer.end()) return {};
+        cost = &found->cost;
+        if (!cost->batch_ns && !cost->operation_ns && !cost->ns_per_byte_q32) return {};
+    } else {
+        const std::size_t index = direction_index(direction);
+        if (peer || index >= transfer.size()) return {};
+        cost = &transfer[index];
+    }
+    const std::uint64_t operation_limited = saturating_add(
+        cost->batch_ns, saturating_product(cost->operation_ns, work.copy_operations));
     const std::uint64_t bandwidth_limited =
-        q32_product_ns(cost.ns_per_byte_q32, work.payload_bytes);
+        q32_product_ns(cost->ns_per_byte_q32, work.payload_bytes);
     return std::max(operation_limited, bandwidth_limited);
 }
 
@@ -346,29 +364,75 @@ std::uint64_t ContextMachineCostModel::prefill_ns(PrefillWork work) const noexce
 std::uint64_t price_context_transfer_requirements(
     const ContextMachineCostModel& model,
     std::span<const ContextTransferRequirement> requirements) noexcept {
-    std::array<TransferWork, 3> coalesced{};
-    for (const ContextTransferRequirement& requirement : requirements) {
-        const std::size_t index = direction_index(requirement.direction);
-        if (index >= coalesced.size()) { return std::numeric_limits<std::uint64_t>::max(); }
-        coalesced[index].payload_bytes =
-            saturating_add(coalesced[index].payload_bytes, requirement.work.payload_bytes);
-        const std::uint64_t operations =
-            static_cast<std::uint64_t>(coalesced[index].copy_operations) +
-            requirement.work.copy_operations;
-        coalesced[index].copy_operations = operations > std::numeric_limits<std::uint32_t>::max()
-                                               ? std::numeric_limits<std::uint32_t>::max()
-                                               : static_cast<std::uint32_t>(operations);
-    }
+    return try_price_context_transfer_requirements(model, requirements)
+        .value_or(std::numeric_limits<std::uint64_t>::max());
+}
+
+std::optional<std::uint64_t> try_price_context_transfer_requirements(
+    const ContextMachineCostModel& model,
+    std::span<const ContextTransferRequirement> requirements) noexcept {
     constexpr std::array directions{
         ContextTransferDirection::DeviceToHost,
         ContextTransferDirection::HostToDevice,
         ContextTransferDirection::DeviceToDevice,
+        ContextTransferDirection::HostToHost,
     };
-    std::uint64_t total = 0;
-    for (std::size_t index = 0; index < coalesced.size(); ++index) {
-        total = saturating_add(total, model.transfer_ns(directions[index], coalesced[index]));
+    std::uint64_t longest_rank = 0;
+    for (std::size_t first = 0; first < requirements.size(); ++first) {
+        const auto rank = requirements[first].rank;
+        if (std::any_of(requirements.begin(), requirements.begin() + first,
+                        [=](const auto& requirement) { return requirement.rank == rank; }))
+            continue;
+        std::array<TransferWork, directions.size()> coalesced{};
+        for (const auto& requirement : requirements) {
+            if (requirement.rank != rank) continue;
+            if (requirement.direction == ContextTransferDirection::PeerDeviceToDevice) continue;
+            const auto index = direction_index(requirement.direction);
+            if (requirement.peer || index >= coalesced.size()) return {};
+            auto& work         = coalesced[index];
+            work.payload_bytes = saturating_add(work.payload_bytes, requirement.work.payload_bytes);
+            const auto operations =
+                std::uint64_t(work.copy_operations) + requirement.work.copy_operations;
+            work.copy_operations = static_cast<std::uint32_t>(
+                std::min<std::uint64_t>(operations, std::numeric_limits<std::uint32_t>::max()));
+        }
+        std::uint64_t serial_work = 0;
+        for (std::size_t index = 0; index < coalesced.size(); ++index)
+            serial_work =
+                saturating_add(serial_work, model.transfer_ns(directions[index], coalesced[index]));
+        for (std::size_t peer_first = 0; peer_first < requirements.size(); ++peer_first) {
+            const auto& first_peer = requirements[peer_first];
+            if (first_peer.rank != rank ||
+                first_peer.direction != ContextTransferDirection::PeerDeviceToDevice)
+                continue;
+            if (!first_peer.peer ||
+                (rank != first_peer.peer->source_rank && rank != first_peer.peer->destination_rank))
+                return {};
+            if (std::any_of(requirements.begin(), requirements.begin() + peer_first,
+                            [&](const auto& prior) {
+                                return prior.rank == rank &&
+                                       prior.direction == first_peer.direction &&
+                                       prior.peer == first_peer.peer;
+                            }))
+                continue;
+            TransferWork work;
+            for (const auto& requirement : requirements) {
+                if (requirement.rank != rank || requirement.direction != first_peer.direction ||
+                    requirement.peer != first_peer.peer)
+                    continue;
+                work.payload_bytes =
+                    saturating_add(work.payload_bytes, requirement.work.payload_bytes);
+                work.copy_operations = static_cast<std::uint32_t>(std::min<std::uint64_t>(
+                    std::uint64_t(work.copy_operations) + requirement.work.copy_operations,
+                    std::numeric_limits<std::uint32_t>::max()));
+            }
+            const auto cost = model.try_transfer_ns(first_peer.direction, work, first_peer.peer);
+            if (!cost) return {};
+            serial_work = saturating_add(serial_work, *cost);
+        }
+        longest_rank = std::max(longest_rank, serial_work);
     }
-    return total;
+    return longest_rank;
 }
 
 std::string context_cost_hardware_class(std::string_view gpu_name, int major, int minor) {
@@ -501,6 +565,7 @@ resolve_context_machine_cost(const ContextCostIdentity& identity,
         }
     }
 
+    model.prefill_measured = prefill_source != ContextCostPresetSource::GenericDefault;
     return ResolvedContextMachineCost{
         .model = model,
         .summary =
@@ -516,7 +581,7 @@ resolve_context_machine_cost(const ContextCostIdentity& identity,
 
 void upsert_context_transfer_cost_atomic(const std::filesystem::path& path,
                                          std::string_view hardware_class,
-                                         const std::array<ContextTransferCost, 3>& transfer,
+                                         const std::array<ContextTransferCost, 4>& transfer,
                                          std::string_view provenance_json) {
     if (path.empty()) { throw std::invalid_argument("context-cost preset output is empty"); }
     if (hardware_class.empty()) {

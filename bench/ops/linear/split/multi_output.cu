@@ -1,6 +1,8 @@
 #include "core/weight.h"
 #include "core/buffer.h"
 #include "ninfer/ops/linear_split.h"
+#include "op_measurement.cuh"
+#include <span>
 
 #include "core/device.h"
 #include "direct_bf16_weight.cuh"
@@ -33,12 +35,25 @@ namespace {
 constexpr std::size_t kFlushBytes = std::size_t{256} << 20;
 
 
-enum class Format : std::uint8_t { Q4Q5, Q8Qgkv, Q8Qkv, Q8DFlash2Qkv, Bf16, Nvfp4, Fp8, All };
+enum class Format : std::uint8_t {
+    Q4Q5,
+    Q8Qgkv,
+    Q8Qkv,
+    Q8DFlash2Qkv,
+    Q8Segmented,
+    Bf16Segmented,
+    Bf16,
+    Nvfp4,
+    Fp8,
+    All
+};
 enum class CacheMode : std::uint8_t { Cold, Warm, Both };
 enum class CacheState : std::uint8_t { Cold, Warm };
 
 struct Options {
-    Format format                  = Format::All;
+    Format format = Format::All;
+    int n = 0, k = 0;
+    std::vector<int> rows;
     ops::LinearPolicy nvfp4_policy = ops::LinearPolicy::AllowA4;
     ops::LinearPolicy fp8_policy   = ops::LinearPolicy::AllowA8;
     CacheMode cache                = CacheMode::Cold;
@@ -51,7 +66,7 @@ struct Options {
 };
 
 struct Result {
-    const char* format;
+    std::string format;
     const char* policy;
     std::int32_t tokens;
     CacheState cache;
@@ -70,14 +85,18 @@ struct Measurement {
 };
 
 [[noreturn]] void usage(const char* message) {
-    std::fprintf(stderr,
-                 "error: %s\n"
-                 "usage: ninfer_linear_split_multi_output_bench "
-                 "[--format q4q5|q8-qgkv|q8-qkv|q8-dflash2-qkv|bf16|nvfp4|fp8|all] "
-                 "[--nvfp4-policy a16|a4] [--fp8-policy a16|a8] "
-                 "[--tokens T,...] [--cache cold|warm|both] [--execution eager|graph] "
-                 "[--warmup N] [--repeat N] [--profile] [--csv-out PATH]\n",
-                 message);
+    std::fprintf(
+        stderr,
+        "error: %s\n"
+        "usage: ninfer_linear_split_multi_output_bench "
+        "[--format "
+        "q4q5|q8-qgkv|q8-qkv|q8-dflash2-qkv|q8-segmented|bf16-segmented|bf16|nvfp4|fp8|all] "
+        "[--n N --k K --rows R1,R2,... (segmented)] "
+        "[--nvfp4-policy a16|a4] [--fp8-policy a16|a8] "
+        "[--tokens T,...] [--cache cold|warm|both] [--execution eager|graph] "
+        "Graph measurements time the captured GPU body. "
+        "[--warmup N] [--repeat N] [--profile] [--csv-out PATH]\n",
+        message);
     std::exit(2);
 }
 
@@ -127,6 +146,10 @@ Options parse_options(int argc, char** argv) {
                 options.format = Format::Q8Qkv;
             else if (value == "q8-dflash2-qkv")
                 options.format = Format::Q8DFlash2Qkv;
+            else if (value == "q8-segmented")
+                options.format = Format::Q8Segmented;
+            else if (value == "bf16-segmented")
+                options.format = Format::Bf16Segmented;
             else if (value == "bf16")
                 options.format = Format::Bf16;
             else if (value == "nvfp4")
@@ -136,7 +159,8 @@ Options parse_options(int argc, char** argv) {
             else if (value == "all")
                 options.format = Format::All;
             else
-                usage("--format expects q4q5, q8-qgkv, q8-qkv, q8-dflash2-qkv, bf16, nvfp4, "
+                usage("--format expects q4q5, q8-qgkv, q8-qkv, q8-dflash2-qkv, q8-segmented, bf16, "
+                      "nvfp4, "
                       "fp8, or all");
         } else if (argument == "--nvfp4-policy") {
             const std::string_view value(next("--nvfp4-policy requires a value"));
@@ -154,6 +178,12 @@ Options parse_options(int argc, char** argv) {
                 options.fp8_policy = ops::LinearPolicy::AllowA8;
             else
                 usage("--fp8-policy expects a16 or a8");
+        } else if (argument == "--n") {
+            options.n = parse_i32(next("--n"), 1, INT32_MAX, "--n");
+        } else if (argument == "--k") {
+            options.k = parse_i32(next("--k"), 1, INT32_MAX, "--k");
+        } else if (argument == "--rows") {
+            options.rows = parse_list(next("--rows"), "--rows");
         } else if (argument == "--tokens") {
             options.tokens = parse_list(next("--tokens requires a value"), "--tokens");
         } else if (argument == "--cache") {
@@ -188,6 +218,9 @@ Options parse_options(int argc, char** argv) {
                             options.cache == CacheMode::Both)) {
         usage("--profile requires one format, one T, and one cache state");
     }
+    if ((options.format == Format::Q8Segmented || options.format == Format::Bf16Segmented) &&
+        (!options.n || !options.k || options.rows.empty()))
+        usage("segmented requires --n, --k and --rows");
     return options;
 }
 
@@ -208,19 +241,13 @@ const char* policy_name(ops::LinearPolicy policy) {
 template <class Launch>
 Measurement measure_public(Launch&& launch, CacheState cache, bench::L2FlushBuffer& flush,
                            CudaExecutionView cuda, int warmup, int repeat, bool graph) {
-    if (graph) {
-        bench::TimedGraph captured;
-        captured.capture(cuda, launch);
-        return {cache == CacheState::Cold
-                    ? bench::measure_cold_graph(captured, flush, cuda, warmup, repeat)
-                    : bench::measure_graph(captured, cuda, warmup, repeat),
-                captured.nodes()};
-    }
-    return {
-        cache == CacheState::Cold
-            ? bench::measure_cold_launch(std::forward<Launch>(launch), flush, cuda, warmup, repeat)
-            : bench::measure_launch(std::forward<Launch>(launch), cuda, warmup, repeat),
-        0};
+    bench::measurement::Options options;
+    options.warmup    = warmup;
+    options.repeat    = repeat;
+    const auto result = bench::measurement::measure(
+        std::forward<Launch>(launch), [](auto) {}, flush, cuda, options, graph ? "graph" : "eager",
+        cache_name(cache));
+    return {result.gpu, graph ? result.nodes : 0};
 }
 
 template <class Launch>
@@ -259,7 +286,7 @@ void report(const Result& result) {
                 "graph_nodes=%zu T=%4d "
                 "workspace=%9zu capacity=%9zu peak=%9zu median=%9.3f us min=%9.3f us p95=%9.3f us "
                 "logical=%8.1f GB/s math=%8.2f TFLOP/s\n",
-                result.format, result.policy, cache_name(result.cache),
+                result.format.c_str(), result.policy, cache_name(result.cache),
                 result.graph_nodes ? "graph" : "eager", result.graph_nodes, result.tokens,
                 result.workspace_bytes, result.workspace_capacity_bytes,
                 result.workspace_peak_bytes, result.timing.median_us, result.timing.min_us,
@@ -452,6 +479,55 @@ void run_q8_qkv(const Options& options, const char* label, std::int32_t hidden,
     }
 }
 
+template <class Fixture>
+void run_segmented(const Options& options, const char* label, int hidden, int parent_rows,
+                   std::span<const int> rows, Fixture& weight, bench::L2FlushBuffer& flush,
+                   CudaExecutionView cuda, std::vector<Result>& results) {
+    const int max_tokens = *std::max_element(options.tokens.begin(), options.tokens.end());
+    const int min_tokens = *std::min_element(options.tokens.begin(), options.tokens.end());
+    const auto capacity  = ops::linear_split_workspace_capacity_bytes(
+        ops::SingleProjectionWeight{weight.weight, ops::LinearPolicy::A16Only}, rows, min_tokens,
+        max_tokens);
+    auto scratch = bench::make_buffer(std::max<std::size_t>(capacity, 1));
+    MemoryArena arena(scratch.span());
+    auto input = bench::make_bf16(std::size_t(hidden) * max_tokens, 103U);
+    std::vector<DeviceBuffer> storage;
+    for (int row : rows) storage.push_back(bench::make_buffer(std::size_t(row) * max_tokens * 2));
+    for (int tokens : options.tokens) {
+        Tensor x(input.span(), DType::BF16, {hidden, tokens});
+        std::vector<Tensor> outputs;
+        for (std::size_t i = 0; i < rows.size(); ++i)
+            outputs.emplace_back(storage[i].span(), DType::BF16,
+                                 std::initializer_list<std::int32_t>{rows[i], tokens});
+        const auto exact = ops::linear_split_workspace_capacity_bytes(
+            ops::SingleProjectionWeight{weight.weight, ops::LinearPolicy::A16Only}, rows, tokens,
+            tokens);
+        const auto launch = [&](CudaExecutionView c) {
+            ops::linear_split(
+                x, ops::SingleProjectionWeight{weight.weight, ops::LinearPolicy::A16Only}, outputs,
+                arena, c);
+        };
+        for (auto cache : {CacheState::Cold, CacheState::Warm}) {
+            if ((options.cache == CacheMode::Cold && cache != CacheState::Cold) ||
+                (options.cache == CacheMode::Warm && cache != CacheState::Warm))
+                continue;
+            if (options.profile) {
+                profile_public(launch, label, "a16", cache, flush, cuda, options.warmup,
+                               options.graph);
+                continue;
+            }
+            arena.reset_peak();
+            auto timing = measure_public(launch, cache, flush, cuda, options.warmup, options.repeat,
+                                         options.graph);
+            if (arena.used() != 0 || arena.peak_used() > exact)
+                throw std::runtime_error("segmented Linear workspace exceeded capacity");
+            append_result(results, label, "a16", tokens, cache, exact,
+                          weight.model_weight_bytes() + tensor_bytes(hidden + parent_rows, tokens),
+                          2.0 * parent_rows * hidden * tokens, timing, capacity, arena.peak_used());
+        }
+    }
+}
+
 void run_fp8(const Options& options, bench::L2FlushBuffer& flush, CudaExecutionView cuda,
              std::vector<Result>& results) {
     auto weight = bench::make_fp8_weight(14336, 5120);
@@ -493,7 +569,8 @@ int main(int argc, char** argv) {
             return 0;
         }
         const Options options = parse_options(argc, argv);
-        int device            = 0;
+
+        int device = 0;
         CUDA_CHECK(cudaGetDevice(&device));
         cudaDeviceProp props{};
         CUDA_CHECK(cudaGetDeviceProperties(&props, device));
@@ -517,6 +594,22 @@ int main(int argc, char** argv) {
         if (selected(options.format, Format::Q8DFlash2Qkv)) {
             run_q8_qkv(options, "q8-dflash2-qkv", 5120, flush, cuda, results);
         }
+        if (options.format == Format::Bf16Segmented || options.format == Format::Q8Segmented) {
+            std::string label = options.format == Format::Bf16Segmented ? "bf16" : "q8";
+            label += "_n" + std::to_string(options.n) + "_k" + std::to_string(options.k);
+            for (int row : options.rows) label += "_" + std::to_string(row);
+            if (options.format == Format::Bf16Segmented) {
+                auto weight = bench::make_direct_bf16_weight(options.n, options.k, 505U);
+                run_segmented(options, label.c_str(), options.k, options.n, options.rows, weight,
+                              flush, cuda, results);
+            } else {
+                auto weight = bench::make_row_split_weight(QType::Q8_G32_FP16, options.n, options.k,
+                                                           options.k, 505U);
+                run_segmented(options, label.c_str(), options.k, options.n, options.rows, weight,
+                              flush, cuda, results);
+            }
+        }
+
         if (selected(options.format, Format::Bf16)) {
             auto weight = bench::make_direct_bf16_weight(14336, 5120);
             run_four_output(options, "bf16", ops::LinearPolicy::A16Only, false, 5120, 6144, 1024,

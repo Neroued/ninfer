@@ -11,7 +11,7 @@ void bf16_kv_append_attention(const Tensor& q, const Tensor& k, const Tensor& v,
                               CausalAttentionExecutionEnvelope envelope, MemoryArena& workspace,
                               Tensor& out, CudaExecutionView execution);
 void bf16_kv_cached_attention(const Tensor& q, const Tensor& positions, float scale,
-                              const PagedKVLayerView& cache,
+                              const ConstPagedKVLayerView& cache,
                               CausalAttentionExecutionEnvelope envelope, MemoryArena& workspace,
                               Tensor& out, CudaExecutionView execution);
 

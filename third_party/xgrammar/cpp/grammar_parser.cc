@@ -747,6 +747,7 @@ class EBNFParser {
   int32_t ParseTokenTagDispatch();
   int32_t ParseRegexMacro();
   int32_t ParseSubstringMacro();
+  int32_t ParseByteFSMMacro();
 
   // Helper functions
 
@@ -800,6 +801,7 @@ const std::unordered_map<std::string, std::function<int32_t(EBNFParser*)>>
         {"TokenTagDispatch", [](EBNFParser* parser) { return parser->ParseTokenTagDispatch(); }},
         {"Regex", [](EBNFParser* parser) { return parser->ParseRegexMacro(); }},
         {"Substring", [](EBNFParser* parser) { return parser->ParseSubstringMacro(); }},
+        {"ByteFSM", [](EBNFParser* parser) { return parser->ParseByteFSMMacro(); }},
 };
 
 const EBNFParser::Token& EBNFParser::Peek(int delta) const { return *(current_token_ + delta); }
@@ -1329,6 +1331,25 @@ int32_t EBNFParser::ParseRegexMacro() {
     }
   }
   return builder_.AddRegex(pattern, json_string);
+}
+
+int32_t EBNFParser::ParseByteFSMMacro() {
+  Consume();
+  auto start = current_token_;
+  auto args = ParseMacroArguments();
+  auto delta = start - current_token_;
+  if (!args.named_arguments.empty()) ReportParseError("ByteFSM expects integer arguments", delta);
+  std::vector<int32_t> data;
+  for (const auto& argument : args.arguments) {
+    const auto* integer = std::get_if<MacroIR::IntegerNode>(argument.get());
+    if (!integer || integer->value < 0 || integer->value > INT32_MAX)
+      ReportParseError("ByteFSM expects nonnegative int32 arguments", delta);
+    data.push_back(static_cast<int32_t>(integer->value));
+  }
+  Grammar::Impl::GrammarExpr expression{Grammar::Impl::GrammarExprType::kByteFSM, data.data(),
+                                        static_cast<int32_t>(data.size())};
+  if (!Grammar::Impl::ValidByteFSM(expression)) ReportParseError("Invalid ByteFSM", delta);
+  return builder_.AddByteFSM(data);
 }
 
 int32_t EBNFParser::ParseSubstringMacro() {

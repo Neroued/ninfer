@@ -10,6 +10,8 @@ struct Nvfp4LinearShape {
     bool (*uses_a4)(std::int32_t min_tokens, std::int32_t max_tokens);
 };
 
+extern const Nvfp4LinearShape kNvfp4N12288K4096;
+extern const Nvfp4LinearShape kNvfp4N4096K6144;
 extern const Nvfp4LinearShape kNvfp4N14336K5120;
 extern const Nvfp4LinearShape kNvfp4N16384K5120;
 extern const Nvfp4LinearShape kNvfp4N34816K5120;

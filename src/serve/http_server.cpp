@@ -38,16 +38,17 @@ void ensure_http_request_id(const httplib::Request& request, httplib::Response& 
     } else if (is_openai_path(request.path) && !response.has_header("x-request-id")) {
         response.set_header("x-request-id", new_openai_request_id());
     }
-    if (request.path == "/v1/systemone" && !response.has_header("x-typesafe-request-id")) {
-        response.set_header("x-typesafe-request-id", response.get_header_value("x-request-id"));
-    }
 }
 
-ThroughputReport make_throughput_report(const ninfer::RuntimeStats& previous,
-                                        const ninfer::RuntimeStats& current,
+ThroughputReport make_throughput_report(const ninfer::EngineSnapshot& before,
+                                        const ninfer::EngineSnapshot& after,
                                         double interval_seconds) {
+    const auto& previous = before.runtime;
+    const auto& current  = after.runtime;
     return ThroughputReport{
-        .interval_seconds = interval_seconds,
+        .previous_execution = before.executions,
+        .current_execution  = after.executions,
+        .interval_seconds   = interval_seconds,
         .computed_prefill_tokens =
             current.computed_prefill_tokens - previous.computed_prefill_tokens,
         .committed_decode_tokens =
@@ -82,30 +83,25 @@ bool report_has_activity(const ThroughputReport& report) {
            report.current.context_transfers != report.previous.context_transfers ||
            report.current.pressure_spill_pages != report.previous.pressure_spill_pages ||
            report.current.partial_tail_cow_pages != report.previous.partial_tail_cow_pages ||
-           report.current.device_state_occupied_slots !=
-               report.previous.device_state_occupied_slots ||
-           report.current.host_state_occupied_slots != report.previous.host_state_occupied_slots ||
+           report.current.state_objects != report.previous.state_objects ||
+           report.current.history_objects != report.previous.history_objects ||
            report.current.kv_pools != report.previous.kv_pools ||
-           report.current.host_kv_occupied_bytes != report.previous.host_kv_occupied_bytes ||
-           report.current.host_context_occupied_bytes !=
-               report.previous.host_context_occupied_bytes ||
-           report.current.host_context_reserved_bytes !=
-               report.previous.host_context_reserved_bytes ||
+           report.current.context_pools != report.previous.context_pools ||
+           report.current.context_metadata != report.previous.context_metadata ||
            report.current.host_work.engine_boundary_ns !=
                report.previous.host_work.engine_boundary_ns ||
-           report.current.host_work.program_submit_ns !=
-               report.previous.host_work.program_submit_ns ||
-           report.current.host_work.program_post_ns != report.previous.host_work.program_post_ns ||
+           report.current.host_work.session_call_ns != report.previous.host_work.session_call_ns ||
+           report.current.host_work.executor_poll_ns !=
+               report.previous.host_work.executor_poll_ns ||
            report.current.host_work.engine_commit_output_ns !=
                report.previous.host_work.engine_commit_output_ns ||
            report.current.host_work.engine_maintenance_ns !=
                report.previous.host_work.engine_maintenance_ns ||
-           report.current.host_work.device_wait_ns != report.previous.host_work.device_wait_ns;
+           report.current.host_work.scheduler_yield_ns !=
+               report.previous.host_work.scheduler_yield_ns;
 }
 
 const char* endpoint_name(std::string_view path) noexcept {
-    if (path == "/v1/systemone") { return "systemone"; }
-    if (path == "/v1/decision" || path == "/decision") { return "decision"; }
     if (path == "/v1/chat/completions") { return "openai_chat_completions"; }
     if (path == "/v1/responses") { return "openai_responses"; }
     if (path == "/v1/responses/input_tokens") { return "openai_responses_input_tokens"; }
@@ -136,7 +132,7 @@ void write_anthropic_error(httplib::Response& response, const ApiError& api_erro
     response.set_content(make_anthropic_error_body(error, request_id), "application/json");
 }
 
-httplib::Server::HandlerResponse handle_unrendered_http_error(const ServeOptions& options,
+httplib::Server::HandlerResponse handle_unrendered_http_error(const product::ServeOptions& options,
                                                               const httplib::Request& request,
                                                               httplib::Response& response) {
     ensure_http_request_id(request, response);
@@ -194,12 +190,14 @@ bool matches_bearer_credential(std::string_view authorization, std::string_view 
     return authorization.substr(position, end - position) == api_key;
 }
 
-HttpServer::HttpServer(ServeOptions options, std::shared_ptr<spdlog::logger> logger)
+HttpServer::HttpServer(product::ServeOptions options, std::shared_ptr<spdlog::logger> logger)
     : options_(std::move(options)), openai_responses_store_(options_.response_store_max_records,
                                                             options_.response_store_max_bytes),
       operational_log_(logger),
-      request_jsonl_(options_.request_log_jsonl, options_.artifact_path, std::move(logger)) {
-    server_.new_task_queue = [options = options_] { return make_http_task_queue(options).release(); };
+      request_jsonl_(options_.launch.logging.request_jsonl.string(),
+                     options_.launch.engine.artifact_path.string(), std::move(logger)) {
+    request_jsonl_.write_startup_config(options_);
+    server_.new_task_queue = [this] { return make_http_task_queue(options_).release(); };
     server_.set_socket_options(configure_http_server_socket);
     server_.set_payload_max_length(options_.max_request_bytes);
     register_routes();
@@ -283,9 +281,9 @@ void HttpServer::record_throughput(const ThroughputReport& report) {
 
 void HttpServer::run_stats_reporter() {
     using Clock                     = std::chrono::steady_clock;
-    ninfer::RuntimeStats previous   = service_->runtime_stats();
+    ninfer::EngineSnapshot previous = service_->snapshot();
     Clock::time_point previous_time = Clock::now();
-    const auto interval             = std::chrono::milliseconds(options_.log_stats_interval_ms);
+    const auto interval = std::chrono::milliseconds(options_.launch.logging.stats_interval_ms);
     Clock::time_point next_deadline = previous_time + interval;
 
     for (;;) {
@@ -296,9 +294,9 @@ void HttpServer::run_stats_reporter() {
             }
         }
 
-        const ninfer::RuntimeStats current = service_->runtime_stats();
-        const Clock::time_point now        = Clock::now();
-        const ThroughputReport report      = make_throughput_report(
+        const ninfer::EngineSnapshot current = service_->snapshot();
+        const Clock::time_point now          = Clock::now();
+        const ThroughputReport report        = make_throughput_report(
             previous, current, std::chrono::duration<double>(now - previous_time).count());
         if (report_has_activity(report)) { record_throughput(report); }
         previous      = current;
@@ -308,9 +306,9 @@ void HttpServer::run_stats_reporter() {
         if (next_deadline <= after_write) { next_deadline = after_write + interval; }
     }
 
-    const ninfer::RuntimeStats current = service_->runtime_stats();
-    const Clock::time_point now        = Clock::now();
-    ThroughputReport tail              = make_throughput_report(
+    const ninfer::EngineSnapshot current = service_->snapshot();
+    const Clock::time_point now          = Clock::now();
+    ThroughputReport tail                = make_throughput_report(
         previous, current, std::chrono::duration<double>(now - previous_time).count());
     // The exact partial interval remains useful to measurement consumers. Pretty throughput is a
     // fixed-cadence operational record and deliberately has no irregular shutdown tail.
@@ -335,10 +333,10 @@ void HttpServer::register_routes() {
     if (options_.enable_cors) {
         server_.set_default_headers(
             {{"Access-Control-Allow-Origin", "*"},
-             {"Access-Control-Expose-Headers", "x-request-id, request-id, x-typesafe-request-id"},
+             {"Access-Control-Expose-Headers", "x-request-id, request-id"},
              {"Access-Control-Allow-Headers",
               "Authorization, Content-Type, X-API-Key, anthropic-version, anthropic-beta, "
-              "anthropic-user-profile-id, X-TypeSafe-SDK, X-TypeSafe-Runtime, X-TypeSafe-Retry-Count"},
+              "anthropic-user-profile-id"},
              {"Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS"}});
         // CORS preflight: browsers send OPTIONS with no credentials before the real
         // request; answer it without auth so the actual GET/POST can carry the key.
@@ -431,7 +429,7 @@ void HttpServer::register_routes() {
         handle_models(req, res);
     });
     server_.Get("/metrics", [this](const httplib::Request&, httplib::Response& res) {
-        const auto stats = service_->runtime_stats();
+        const auto stats = service_->snapshot();
         res.set_header("Cache-Control", "no-store");
         res.set_content(metrics_.render(stats, service_->is_available()),
                         "text/plain; version=0.0.4; charset=utf-8");
@@ -443,15 +441,15 @@ void HttpServer::register_routes() {
                  [this](const httplib::Request& req, httplib::Response& res) {
                      handle_chat_completions(req, res);
                  });
-    if (options_.jev) {
-        server_.Post("/v1/systemone", [this](const httplib::Request& req, httplib::Response& res) {
-            handle_systemone(req, res);
-        });
+    if (options_.launch.engine.enable_decisions) {
         server_.Post("/v1/decision", [this](const httplib::Request& req, httplib::Response& res) {
             handle_decision(req, res);
         });
         server_.Post("/decision", [this](const httplib::Request& req, httplib::Response& res) {
             handle_decision(req, res);
+        });
+        server_.Post("/v1/systemone", [this](const httplib::Request& req, httplib::Response& res) {
+            handle_systemone(req, res);
         });
     }
     server_.Post("/v1/responses", [this](const httplib::Request& req, httplib::Response& res) {
@@ -491,8 +489,9 @@ void HttpServer::register_routes() {
 }
 
 void HttpServer::handle_models(const httplib::Request&, httplib::Response& res) const {
-    res.set_content(make_models_list(public_model_id_, unix_time_now(), options_.max_context),
-                    "application/json");
+    res.set_content(
+        make_models_list(public_model_id_, unix_time_now(), options_.launch.engine.max_context),
+        "application/json");
 }
 
 void HttpServer::handle_model(const httplib::Request& req, httplib::Response& res) const {
@@ -506,8 +505,9 @@ void HttpServer::handle_model(const httplib::Request& req, httplib::Response& re
         write_openai_error(res, error);
         return;
     }
-    res.set_content(make_model_object(public_model_id_, unix_time_now(), options_.max_context),
-                    "application/json");
+    res.set_content(
+        make_model_object(public_model_id_, unix_time_now(), options_.launch.engine.max_context),
+        "application/json");
 }
 
 bool HttpServer::bind() { return server_.bind_to_port(options_.host, options_.port); }
@@ -516,15 +516,17 @@ void HttpServer::attach(GenerationService& service) {
     if (service_ != nullptr) {
         throw std::logic_error("HTTP generation service is already attached");
     }
-    const ninfer::LoadSummary load = service.load_summary();
-    // memory_summary waits for the completed worker boundary, including warmup publication.
-    const ninfer::MemorySummary memory  = service.memory_summary();
-    const ninfer::RuntimeStats baseline = service.runtime_stats();
-    public_model_id_                    = resolve_public_model_id(options_, load.model_name);
-    service_                            = &service;
-    metrics_.configure(public_model_id_, service.engine_options(), memory, baseline);
-    request_jsonl_.write_server_start(options_, service.engine_options(),
-                                      service.sampling_defaults(), public_model_id_, load, memory);
+    const ninfer::LoadSummary load = service.startup_report().load;
+    if (!options_.model_id_override && load.model_name.empty()) {
+        throw std::logic_error("loaded artifact model name must not be empty");
+    }
+    public_model_id_ = options_.model_id_override.value_or(load.model_name);
+    service_         = &service;
+    metrics_.configure(public_model_id_, service.engine_options(), service.description(),
+                       service.startup_report(), service.snapshot());
+    request_jsonl_.write_server_start(
+        options_, service.engine_options(), service.sampling_defaults(), public_model_id_,
+        service.description(), service.startup_report(), service.snapshot());
 }
 
 bool HttpServer::listen() {
@@ -532,7 +534,7 @@ bool HttpServer::listen() {
     if (public_model_id_.empty()) {
         throw std::logic_error("HTTP public model id is not resolved");
     }
-    if (options_.log_stats_interval_ms != 0) {
+    if (options_.launch.logging.stats_interval_ms != 0) {
         stats_stopping_ = false;
         stats_thread_   = std::thread([this] { run_stats_reporter(); });
     }

@@ -4,8 +4,7 @@
 
 namespace ninfer::models::qwen3_5 {
 
-StateImageDeviceLayout plan_state_image_device_pool(LayoutBuilder& backing,
-                                                    const StateImageSpec& spec) {
+StateImageDeviceLayout plan_state_image_layout(const StateImageSpec& spec) {
     StateImageBuilder builder;
     StateImageDeviceLayout layout;
     layout.linear              = plan_linear_attention_state(builder, spec.linear);
@@ -15,21 +14,25 @@ StateImageDeviceLayout plan_state_image_device_pool(LayoutBuilder& backing,
         layout.dflash_local = plan_cyclic_kv_cache(builder, local.layers, local.capacity,
                                                    local.kv_heads, local.head_dim);
     }
-    layout.images = builder.finish(backing, spec.slot_count);
+    layout.images = builder.finish();
     return layout;
 }
 
 StateImageViews::StateImageViews(MemorySpan backing, const StateImageDeviceLayout& layout)
     : storage_(backing, layout.images), linear_(storage_, layout.linear),
-      hidden_(storage_.field(layout.continuation_hidden)) {
+      hidden_(layout.continuation_hidden) {
     if (layout.dflash_local) {
         dflash_local_.emplace(storage_, *layout.dflash_local);
         dflash_group_ = layout.dflash_local->group;
     }
 }
 
-Tensor StateImageViews::continuation_hidden_slot(std::int32_t slot) const {
-    return hidden_.slice(1, slot, 1).view({hidden_.ne[0]});
+Tensor StateImageViews::continuation_hidden(std::int64_t offset) const {
+    return storage_.tensor(hidden_, offset);
+}
+
+StateFieldView StateImageViews::continuation_hidden(const Tensor& offsets) const {
+    return storage_.field(hidden_, offsets);
 }
 
 CyclicKVCacheView* StateImageViews::dflash_local() noexcept {

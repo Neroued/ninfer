@@ -11,7 +11,6 @@ namespace ninfer::ops {
 namespace {
 
 constexpr std::int32_t kTextHeadDim = 256;
-constexpr std::int32_t kVisionDim   = 72;
 
 int position_axes(const Tensor& positions, std::int32_t tokens) {
     if (positions.ne[0] != tokens || positions.ne[2] != 1 || positions.ne[3] != 1 ||
@@ -61,8 +60,9 @@ void require_positions_storage(const Tensor& positions) {
 
 void require_rotary_geometry(int axes, int rotary_dim, std::int32_t head_dim) {
     if (axes == 2) {
-        if (head_dim != kVisionDim || rotary_dim != kVisionDim) {
-            throw std::invalid_argument("rope: 2-D Vision mode requires head_dim=rotary_dim=72");
+        if ((head_dim != 64 && head_dim != 72) || rotary_dim != head_dim) {
+            throw std::invalid_argument(
+                "rope: 2-D Vision mode requires head_dim=rotary_dim=64 or 72");
         }
         return;
     }
@@ -88,7 +88,7 @@ void rope(const Tensor& positions, int rotary_dim, float theta, Tensor& q, Tenso
     (void)common::operand::numel(k, "rope");
     const std::int32_t tokens   = q.ne[2];
     const int axes              = position_axes(positions, tokens);
-    const std::int32_t head_dim = axes == 2 ? kVisionDim : q.ne[0];
+    const std::int32_t head_dim = q.ne[0];
     const std::int32_t q_heads  = q.ne[1];
     const std::int32_t k_heads  = k.ne[1];
     require_rotary_geometry(axes, rotary_dim, head_dim);
@@ -113,7 +113,7 @@ void rope(const Tensor& positions, int rotary_dim, float theta, Tensor& x,
     const std::int64_t x_numel  = common::operand::numel(x, "rope");
     const std::int32_t tokens   = x.ne[2];
     const int axes              = position_axes(positions, tokens);
-    const std::int32_t head_dim = axes == 2 ? kVisionDim : x.ne[0];
+    const std::int32_t head_dim = x.ne[0];
     const std::int32_t heads    = x.ne[1];
     require_rotary_geometry(axes, rotary_dim, head_dim);
     require_tensor_layout(x, "tensor", head_dim, heads, tokens);

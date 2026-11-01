@@ -35,6 +35,17 @@ void linear_split(const Tensor& x, const Weight& weight, std::span<const Tensor>
                   CudaExecutionView execution);
 
 /**
+ * Y_s[r,t] = sum_k W[begin_s+r,k] * X[k,t] + bias[begin_s+r].
+ *
+ * Single-parent BF16/A16 form with contiguous, naturally aligned BF16 bias [N].
+ * Bias is added before output rounding. Output mapping, alignment and disjointness
+ * follow linear_split; outputs also overlap no bias storage. Supports registered
+ * BF16 geometries/segmentations, without workspace or hidden allocations.
+ */
+void linear_split(const Tensor& x, const Weight& weight, const Tensor& bias,
+                  std::span<const Tensor> outputs, CudaExecutionView execution);
+
+/**
  * Minimum call-local capacity covering inclusive [min_columns,max_columns], both positive.
  * Output row counts select the same registered segmentation as execution. Inspects only
  * host-visible format, shape and activation permission; no device backing is required.

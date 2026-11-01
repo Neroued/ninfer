@@ -1,4 +1,5 @@
 #include "ninfer/engine.h"
+#include "context_budget.h"
 
 #include <nlohmann/json.hpp>
 #include <cstdlib>
@@ -61,17 +62,17 @@ void record(std::string_view name, const ninfer::GenerationResult& value, const 
                 {"schema", schema},
                 {"calls", Json::array()},
                 {"tokens", value.generated_token_ids.size()},
-                {"prepare_ms", value.timings.prepare_seconds * 1000},
-                {"prefill_ms", value.timings.prefill_seconds * 1000},
-                {"decode_ms", value.timings.decode_seconds * 1000},
-                {"rounds", value.speculative.rounds},
-                {"drafted", value.speculative.drafted_tokens},
-                {"accepted", value.speculative.accepted_tokens},
-                {"reused", value.reused_prompt_tokens},
+                {"prepare_ms", value.stats.timings.prepare_seconds * 1000},
+                {"prefill_ms", value.stats.timings.prefill_seconds * 1000},
+                {"decode_ms", value.stats.timings.decode_seconds * 1000},
+                {"rounds", value.stats.speculative.rounds},
+                {"drafted", value.stats.speculative.drafted_tokens},
+                {"accepted", value.stats.speculative.accepted_tokens},
+                {"reused", value.stats.reused_prompt_tokens},
                 {"prompt", value.prompt.prompt_tokens},
-                {"preemptions", value.scheduling.preemptions},
-                {"snapshot_restores", value.scheduling.snapshot_restores},
-                {"replay_restores", value.scheduling.replay_restores}};
+                {"preemptions", value.stats.scheduling.preemptions},
+                {"snapshot_restores", value.stats.scheduling.snapshot_restores},
+                {"replay_restores", value.stats.scheduling.replay_restores}};
     for (const auto& call : value.tool_calls)
         result["calls"].push_back(
             {{"name", call.name}, {"arguments", Json::parse(call.arguments_json)}});
@@ -94,6 +95,7 @@ void validate(const ninfer::GenerationResult& result, std::string_view name = "r
 
 struct Sink final : ninfer::OutputSink {
     std::string content;
+    std::vector<ninfer::GeneratedToolCall> calls;
 
     void start(ninfer::GenerationStart) override {}
 
@@ -101,8 +103,26 @@ struct Sink final : ninfer::OutputSink {
 
     void timing(ninfer::GenerationTimingObservation) override {}
 
-    void publish(ninfer::OutputDelta delta) override {
-        if (delta.channel == ninfer::OutputChannel::Content) content += delta.text;
+    void publish(ninfer::OutputEvent event) override {
+        std::visit(
+            [&](const auto& value) {
+                using T = std::decay_t<decltype(value)>;
+                if constexpr (std::is_same_v<T, ninfer::OutputDelta>) {
+                    if (value.channel == ninfer::OutputChannel::Content) content += value.text;
+                } else if constexpr (std::is_same_v<T, ninfer::ToolCallStart>) {
+                    require(value.index == calls.size(), "streamed tool index skipped or repeated");
+                    calls.push_back({value.name, {}, ninfer::ToolCallStatus::InProgress});
+                } else if constexpr (std::is_same_v<T, ninfer::ToolArgumentsDelta>) {
+                    require(calls.at(value.index).status == ninfer::ToolCallStatus::InProgress,
+                            "argument delta has no active call");
+                    calls[value.index].arguments_json += value.text;
+                } else {
+                    require(calls.at(value.index).status == ninfer::ToolCallStatus::InProgress,
+                            "tool end has no active call");
+                    calls[value.index].status = value.status;
+                }
+            },
+            event);
     }
 };
 
@@ -125,10 +145,12 @@ void exercise_basic(ninfer::Engine& engine, unsigned concurrency, bool speculati
     require(sink.content == result.content &&
                 result.content.find("<tool_call>") == std::string::npos,
             "default tool framing leaked into the text stream");
+    require(sink.calls == result.tool_calls, "streamed arguments differ from Engine result");
     for (const auto& call : result.tool_calls)
         require(call.name == "record" && Json::parse(call.arguments_json).is_object(),
                 "default tool output is not a callable argument object");
-    if (speculative) require(result.speculative.rounds > 0, "default tools bypassed speculation");
+    if (speculative)
+        require(result.stats.speculative.rounds > 0, "default tools bypassed speculation");
 
     // A root union also stays out of strict schema compilation. Preseed the first call's
     // open parameter to check that continuation shares the same broad argument language.
@@ -173,13 +195,15 @@ void composed_output(ninfer::Engine& engine) {
         R"({"type":"object","properties":{"answer":{"type":"string","enum":["ok <tool_call>","wrong"],"pattern":"^ok","maxLength":30}},"required":["answer"],"additionalProperties":false})");
     auto first = engine
                      .submit(engine.prepare(input), options, ninfer::OutputConsumerMode::Aggregate,
-                             {.phase_timings = true})
+                             {.constraint_timings = true})
                      .wait();
     validate(first);
-    require(first.constraint && first.constraint->complete && first.constraint->terminated &&
-                first.constraint->branch == ninfer::ConstraintOutputBranch::Tools &&
-                first.constraint->timings_collected && first.constraint->mask_positions > 0 &&
-                first.constraint->mask_upload_bytes > 0,
+    require(first.stats.constraint && first.stats.constraint->complete &&
+                first.stats.constraint->terminated &&
+                first.stats.constraint->branch == ninfer::ConstraintOutputBranch::Tools &&
+                first.stats.constraint->timings_collected &&
+                first.stats.constraint->mask_positions > 0 &&
+                first.stats.constraint->mask_upload_bytes > 0,
             "tool branch lost constraint state or work observations");
     input.messages.push_back(
         {.role       = ninfer::ChatRole::Assistant,
@@ -201,8 +225,8 @@ void composed_output(ninfer::Engine& engine) {
     require(second.finish_reason == ninfer::FinishReason::StopToken && second.tool_calls.empty() &&
                 sink.content == second.content &&
                 Json::parse("{\"answer\":" + second.content)["answer"] == "ok <tool_call>" &&
-                second.constraint && second.constraint->terminated &&
-                second.constraint->branch == ninfer::ConstraintOutputBranch::Content,
+                second.stats.constraint && second.stats.constraint->terminated &&
+                second.stats.constraint->branch == ninfer::ConstraintOutputBranch::Content,
             "tool-result JSON continuation lost schema, literal marker or stream bytes");
     std::cout << "tools + JSON: required call, result continuation, literal marker and "
                  "observations passed\n";
@@ -233,7 +257,7 @@ void exercise(ninfer::Engine& engine, unsigned concurrency, bool speculative) {
                     value["confidence"] <= 0.2,
                 "published tuple/number arguments violate their schema");
         if (speculative)
-            require(result.speculative.rounds > 0, "numeric tools bypassed speculation");
+            require(result.stats.speculative.rounds > 0, "numeric tools bypassed speculation");
         record("positional_numbers", result, coordinates);
     }
     const auto schema = parameters();
@@ -247,7 +271,7 @@ void exercise(ninfer::Engine& engine, unsigned concurrency, bool speculative) {
         require(sink.content == result.content && sink.content.empty(),
                 "tool framing leaked into text stream");
         if (speculative)
-            require(result.speculative.rounds > 0, "tools bypassed speculative backend");
+            require(result.stats.speculative.rounds > 0, "tools bypassed speculative backend");
         record(i == 0 ? "cold" : "warm", result, schema);
         first = std::move(result);
     }
@@ -284,7 +308,7 @@ void exercise(ninfer::Engine& engine, unsigned concurrency, bool speculative) {
          .tool_call_id = "cache_call"});
     const auto cache_hit = engine.generate(engine.prepare(cache_input), next);
     record("canonical_tool_result_reuse", cache_hit, cache_schema);
-    require(cache_hit.reused_prompt_tokens >=
+    require(cache_hit.stats.reused_prompt_tokens >=
                 cache_call.prompt.prompt_tokens + cache_call.generated_token_ids.size() - 3,
             "canonical tool history failed to reuse the generated call prefix");
 
@@ -302,7 +326,8 @@ void exercise(ninfer::Engine& engine, unsigned concurrency, bool speculative) {
     thought.execution.thinking.budget = 2;
     const auto result                 = engine.generate(engine.prepare(thinking), thought);
     validate(result);
-    require(result.thinking.injected_tokens > 0, "thinking fixture did not force control tokens");
+    require(result.stats.thinking.injected_tokens > 0,
+            "thinking fixture did not force control tokens");
     record("thinking", result, schema);
 
     auto limited                              = request();
@@ -332,7 +357,7 @@ void exercise(ninfer::Engine& engine, unsigned concurrency, bool speculative) {
     }
 }
 
-void pressure(ninfer::Engine& engine, bool snapshot, bool cancel) {
+void pressure(ninfer::Engine& engine, bool snapshot, bool cancel, std::uint32_t prompt_tokens) {
     const Json schema{{"type", "object"},
                       {"properties",
                        {{"message", {{"type", "string"}, {"pattern", "^(ab cd ){180}$"}}},
@@ -351,14 +376,24 @@ void pressure(ninfer::Engine& engine, bool snapshot, bool cancel) {
     auto first = prompt(schema), second = prompt(schema);
     first.messages[0].parts[0].text  = "Call record. First request.";
     second.messages[0].parts[0].text = "Call record. Second request.";
-    auto a                           = engine.submit(engine.prepare(first), options);
-    auto b                           = engine.submit(engine.prepare(second), options);
+    for (auto* input : {&first, &second}) {
+        const auto initial = engine.count_tokens(*input);
+        require(initial < prompt_tokens, "tool framing exceeds the pressure prompt target");
+        std::string padding;
+        for (std::uint32_t index = initial; index < prompt_tokens; ++index) padding += " A";
+        input->messages[0].parts[0].text.insert(0, padding + '\n');
+        const auto tokens = engine.count_tokens(*input);
+        require(tokens + 8 >= prompt_tokens && tokens <= prompt_tokens + 8,
+                "tool prompt padding missed the Context pressure interval");
+    }
+    auto a = engine.submit(engine.prepare(first), options);
+    auto b = engine.submit(engine.prepare(second), options);
     std::string expected;
     for (int i = 0; i < 180; ++i) expected += "ab cd ";
     if (cancel) {
         bool observed        = false;
         const auto stopped   = b.wait(nullptr, ninfer::CancellationView([&] {
-                                        observed |= engine.runtime_stats().paused_requests > 0;
+                                        observed |= engine.snapshot().runtime.paused_requests > 0;
                                         return observed;
                                     }));
         const auto completed = a.wait();
@@ -379,8 +414,8 @@ void pressure(ninfer::Engine& engine, bool snapshot, bool cancel) {
                     result.tool_calls.size() == 1 &&
                     Json::parse(result.tool_calls[0].arguments_json)["message"] == expected,
                 "recovery changed tool parser/matcher progress");
-        restores +=
-            snapshot ? result.scheduling.snapshot_restores : result.scheduling.replay_restores;
+        restores += snapshot ? result.stats.scheduling.snapshot_restores
+                             : result.stats.scheduling.replay_restores;
         record(snapshot ? "snapshot" : "replay", result, schema);
     }
     require(restores > 0, "pressure fixture did not restore a preempted request");
@@ -400,16 +435,13 @@ int main(int argc, char** argv) {
         require(pressure_mode || mode == "graph" || mode == "eager" || mode == "basic",
                 "unknown test mode");
         ninfer::EngineOptions options;
-        options.artifact_path   = artifact;
-        options.max_context     = pressure_mode ? 1024 : 1536;
-        options.max_concurrency = argc > 3 ? std::stoul(argv[3]) : 2;
-        options.kv_capacity     = ninfer::KvCapacityPolicy::explicit_capacity(
-            pressure_mode ? 1024 : options.max_concurrency * 1024);
+        options.artifact_path                     = artifact;
+        options.max_context                       = pressure_mode ? 1024 : 1536;
+        options.max_concurrency                   = argc > 3 ? std::stoul(argv[3]) : 2;
         options.prefill_chunk                     = 128;
-        options.kv_cache                          = ninfer::KvCacheStorage::Fp8E4M3Row256;
+        options.kv_cache                          = ninfer::KvCacheStorage::Fp8E4m3fnGroup128Ue8m0;
         options.use_cuda_graph                    = mode != "eager";
         options.context_cache.enabled             = !pressure_mode;
-        options.context_cache.device_state_slots  = pressure_mode ? 0 : 8;
         options.context_cache.host_capacity_bytes = mode == "replay" ? 0 : 512ULL << 20;
         if (backend == "mtp")
             options.speculative.backend = ninfer::SpeculativeBackend::Mtp;
@@ -423,9 +455,12 @@ int main(int argc, char** argv) {
             options.speculative.draft_tokens  = 3;
             options.speculative.proposal_head = ninfer::ProposalHead::Optimized;
         }
+        const auto pressure_prompt =
+            pressure_mode ? ninfer::test::qwen3_5::configure_two_request_pressure(options, 256) : 0;
+        if (!pressure_mode) ninfer::test::qwen3_5::set_context_capacity(options, 8);
         ninfer::Engine engine(options);
         if (pressure_mode)
-            pressure(engine, mode != "replay", mode == "cancel");
+            pressure(engine, mode != "replay", mode == "cancel", pressure_prompt);
         else if (mode == "basic")
             exercise_basic(engine, options.max_concurrency, backend != "none");
         else

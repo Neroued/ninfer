@@ -1,3 +1,6 @@
+#include "ops/suite.h"
+#include <map>
+#include <memory>
 #include "core/buffer.h"
 #include "ninfer/ops/moe.h"
 
@@ -373,10 +376,11 @@ void qualify(Fixture& f, CpuExecutor& executor, int tokens, int active, ops::Exp
           "CPU Op modified an input");
     if (capacity) {
         MemoryArena short_arena(scratch.span().subspan(0, capacity - 1));
-        rejects([&] {
+        try {
             ops::routed_swiglu(x, f.profile, weights, routes, subset, out, short_arena,
                                executor.execution_view());
-        });
+            check(false, "accepted insufficient workspace");
+        } catch (const std::bad_alloc&) {}
     }
     std::cout << "down_bits=" << f.experts[0].down.bits << " T=" << tokens << " active=" << active
               << " workers=" << executor.plan().worker_cpus.size()
@@ -565,8 +569,16 @@ void validation(Fixture& f, CpuExecutor& executor) {
     x.data            = original_x;
     const auto before = arena.used();
     (void)arena.alloc_bytes(1, 1);
-    rejects([&] { call(); });
-    check(arena.used() == before + 1, "rejected call changed the workspace cursor");
+    call();
+    check(arena.used() == before + 1 && arena.peak_used() == 512 + capacity,
+          "unaligned caller scratch was not aligned and scoped");
+    MemoryArena short_arena(storage.span().subspan(0, capacity + 511));
+    (void)short_arena.alloc_bytes(257, 1);
+    try {
+        ops::routed_swiglu(x, f.profile, weights, routes, {}, out, short_arena, view);
+        check(false, "workspace capacity omitted leading alignment");
+    } catch (const std::bad_alloc&) {}
+    check(short_arena.used() == 257, "failed allocation changed the caller cursor");
 
     // Empty contributions need no banks; None also needs no routes and no aligned scratch cursor.
     weights = {};
@@ -581,66 +593,113 @@ void validation(Fixture& f, CpuExecutor& executor) {
 }
 } // namespace
 
-int main() {
-    try {
-        CpuTopology topology;
-        const auto available = cpu_worker_order(topology.info()).size();
-        CpuExecutor single(topology, plan_cpu_team(topology.info(), 1));
-        const auto features = single.execution_view().features();
-        if (!features.has(CpuFeature::Avx2) || !features.has(CpuFeature::Fma) ||
-            !features.has(CpuFeature::F16c)) {
-            return 77;
-        }
-        std::cout << "CPU common_features=0x" << std::hex << features.bits << std::dec << '\n';
-        CpuExecutor team(topology,
-                         plan_cpu_team(topology.info(), std::min<std::size_t>(8, available)));
-        for (int down_bits : {5, 6}) {
-            Fixture fixture(down_bits);
+int main(int argc, char** argv) {
+    using namespace ninfer::test;
+    OpSuite suite(false);
+
+    struct Case {
+        int tokens, active, workers;
+        ops::ExpertSubsetKind subset;
+        bool overlap;
+        InputCase input;
+    };
+
+    for (int bits : {5, 6}) {
+        const std::string format = "q4_q" + std::to_string(bits);
+        std::vector<Case> cases;
+        std::vector<OpCase> catalogue;
+        const auto add = [&](int tokens, int active, ops::ExpertSubsetKind subset, bool overlap,
+                             InputCase input = InputCase::Random, int workers = 8) {
+            cases.push_back({tokens, active, workers, subset, overlap, input});
+            catalogue.push_back(
+                {"cpu_moe/" + format + "/t" + std::to_string(tokens) + "/active" +
+                     std::to_string(active) + "/subset" + std::to_string(int(subset)) + "/workers" +
+                     std::to_string(workers) + (overlap ? "/overlap" : "/disjoint") + "/input" +
+                     std::to_string(int(input)),
+                 {{"format", format}}});
+        };
+        using ops::ExpertSubsetKind;
+        add(1, 8, ExpertSubsetKind::All, false, InputCase::Random, 1);
+        for (int tokens : {1, 2, 3, 7, 8, 9, 17})
+            add(tokens, tokens % 3 == 0 ? 2 : 4,
+                tokens % 2 ? ExpertSubsetKind::MaskOnes : ExpertSubsetKind::MaskZeros,
+                tokens % 2 == 0);
+        add(8, 8, ExpertSubsetKind::All, true);
+        for (int tokens : {5, 6, 7, 9}) add(tokens, 2, ExpertSubsetKind::MaskOnes, true);
+        add(25, 4, ExpertSubsetKind::MaskOnes, false, InputCase::RaggedRoutes);
+        for (int tokens : {32, 64, 72}) add(tokens, 1, ExpertSubsetKind::MaskOnes, false);
+        add(1, 0, ExpertSubsetKind::MaskOnes, false);
+        add(9, 0, ExpertSubsetKind::None, false);
+        add(1, 8, ExpertSubsetKind::All, false, InputCase::ExpertCancellation);
+        add(3, 1, ExpertSubsetKind::MaskZeros, false, InputCase::Random, 3);
+        add(1, 8, ExpertSubsetKind::All, false, InputCase::Random, 16);
+        suite.add(std::move(catalogue), [=](auto selected) {
+            CpuTopology topology;
+            const auto available = cpu_worker_order(topology.info()).size();
+            std::map<int, std::unique_ptr<CpuExecutor>> executors;
+            const auto executor = [&](int workers) -> CpuExecutor& {
+                auto& value = executors[workers];
+                if (!value)
+                    value = std::make_unique<CpuExecutor>(
+                        topology,
+                        plan_cpu_team(topology.info(), std::min<std::size_t>(workers, available)));
+                return *value;
+            };
+            const auto features = executor(1).execution_view().features();
+            if (!features.has(CpuFeature::Avx2) || !features.has(CpuFeature::Fma) ||
+                !features.has(CpuFeature::F16c))
+                throw OpTestSkip("CPU requires AVX2, FMA and F16C");
+            Fixture fixture(bits);
             const auto initial_weights = weight_fingerprint(fixture);
-            validation(fixture, single);
-            qualify(fixture, single, 1, 8, ops::ExpertSubsetKind::All, false);
-            for (int tokens : {1, 2, 3, 7, 8, 9, 17}) {
-                qualify(fixture, team, tokens, tokens % 3 == 0 ? 2 : 4,
-                        tokens % 2 ? ops::ExpertSubsetKind::MaskOnes
-                                   : ops::ExpertSubsetKind::MaskZeros,
-                        tokens % 2 == 0);
-            }
-            qualify(fixture, team, 8, 8, ops::ExpertSubsetKind::All, true);
-            for (int tokens : {5, 6, 7, 9}) {
-                qualify(fixture, team, tokens, 2, ops::ExpertSubsetKind::MaskOnes, true);
-            }
-            qualify(fixture, team, 25, 4, ops::ExpertSubsetKind::MaskOnes, false,
-                    InputCase::RaggedRoutes);
-            for (int tokens : {32, 64, 72}) {
-                qualify(fixture, team, tokens, 1, ops::ExpertSubsetKind::MaskOnes, false);
-            }
-            qualify(fixture, team, 1, 0, ops::ExpertSubsetKind::MaskOnes, false);
-            qualify(fixture, team, 9, 0, ops::ExpertSubsetKind::None, false);
-            qualify(fixture, team, 1, 8, ops::ExpertSubsetKind::All, false,
-                    InputCase::ExpertCancellation);
-            {
-                CpuExecutor uneven(
-                    topology, plan_cpu_team(topology.info(), std::min<std::size_t>(3, available)));
-                qualify(fixture, uneven, 3, 1, ops::ExpertSubsetKind::MaskZeros, false);
-            }
-            {
-                CpuExecutor full(
-                    topology, plan_cpu_team(topology.info(), std::min<std::size_t>(16, available)));
-                qualify(fixture, full, 1, 8, ops::ExpertSubsetKind::All, false);
+            for (auto i : selected) {
+                const auto c = cases[i];
+                qualify(fixture, executor(c.workers), c.tokens, c.active, c.subset, c.overlap,
+                        c.input);
             }
             check(weight_fingerprint(fixture) == initial_weights,
                   "CPU Op modified immutable weights");
-            code_sweep(fixture, team);
-            Fixture corners(down_bits, true, true);
-            qualify(corners, team, 3, 1, ops::ExpertSubsetKind::MaskOnes, false,
-                    InputCase::LocalRoutes);
-            qualify(corners, team, 2, 4, ops::ExpertSubsetKind::MaskOnes, false);
-            tiny_cancellation(corners, team);
-            coherent_precision(corners, team);
-        }
-        std::cout << "CPU routed SwiGLU independent FP64 qualification passed\n";
-    } catch (const std::exception& e) {
-        std::cerr << e.what() << '\n';
-        return 1;
+            return 0;
+        });
+        enum class Recipe { Contract, CodeSweep, Corners, Tiny, Coherent };
+        for (auto [recipe, name] : {std::pair{Recipe::Contract, "contract"},
+                                    {Recipe::CodeSweep, "code_sweep"},
+                                    {Recipe::Corners, "corners"},
+                                    {Recipe::Tiny, "tiny"},
+                                    {Recipe::Coherent, "coherent"}})
+            suite.add(
+                "cpu_moe/" + format + "/" + name,
+                [=] {
+                    CpuTopology topology;
+                    CpuExecutor executor(
+                        topology,
+                        plan_cpu_team(topology.info(),
+                                      recipe == Recipe::Contract
+                                          ? 1
+                                          : std::min<std::size_t>(
+                                                8, cpu_worker_order(topology.info()).size())));
+                    const auto features = executor.execution_view().features();
+                    if (!features.has(CpuFeature::Avx2) || !features.has(CpuFeature::Fma) ||
+                        !features.has(CpuFeature::F16c))
+                        throw OpTestSkip("CPU requires AVX2, FMA and F16C");
+                    const bool corners = recipe == Recipe::Corners || recipe == Recipe::Tiny ||
+                                         recipe == Recipe::Coherent;
+                    Fixture fixture(bits, corners, corners);
+                    if (recipe == Recipe::Contract)
+                        validation(fixture, executor);
+                    else if (recipe == Recipe::CodeSweep)
+                        code_sweep(fixture, executor);
+                    else if (recipe == Recipe::Tiny)
+                        tiny_cancellation(fixture, executor);
+                    else if (recipe == Recipe::Coherent)
+                        coherent_precision(fixture, executor);
+                    else {
+                        qualify(fixture, executor, 3, 1, ExpertSubsetKind::MaskOnes, false,
+                                InputCase::LocalRoutes);
+                        qualify(fixture, executor, 2, 4, ExpertSubsetKind::MaskOnes, false);
+                    }
+                    return 0;
+                },
+                {{"format", format}});
     }
+    return suite.main(argc, argv);
 }

@@ -12,14 +12,15 @@ namespace ninfer::serve {
 // Fixed-size request aggregates. Runtime counters remain owned and published by Engine.
 class Metrics {
 public:
-    void configure(std::string model, const EngineOptions& options, const MemorySummary& memory,
-                   RuntimeStats baseline);
+    void configure(std::string model, const EngineOptions& options,
+                   const EngineDescription& description, const StartupReport& startup,
+                   EngineSnapshot baseline);
     void first_token(const GenerationFirstTokenObservation& observation);
     void done(const GenerationOutcome& outcome);
     void rejected();
     void failed(bool cancelled);
     void response_failed();
-    [[nodiscard]] std::string render(const RuntimeStats& runtime, bool ready) const;
+    [[nodiscard]] std::string render(const EngineSnapshot& snapshot, bool ready) const;
 
 private:
     struct Histogram {
@@ -49,8 +50,9 @@ private:
 
     std::string model_;
     EngineOptions options_;
-    MemorySummary memory_;
-    RuntimeStats baseline_;
+    EngineDescription description_;
+    StartupReport startup_;
+    EngineSnapshot baseline_;
     double start_seconds_ = 0.0;
     mutable std::mutex mutex_;
     Requests requests_;

@@ -56,6 +56,14 @@ const LookupParameters& Table::parameters() const noexcept { return impl_->param
 
 std::span<const io::FileView> Table::files() const noexcept { return impl_->backing.files(); }
 
-std::size_t Table::max_row_segments() const noexcept { return impl_->max_segments; }
+TableGeometry Table::geometry() const noexcept {
+    TableGeometry out{impl_->max_segments};
+    for (const auto file : files()) {
+        out.memory_alignment = std::max(out.memory_alignment, std::size_t(file.memory_alignment));
+        out.read_alignment   = std::max({out.read_alignment, std::size_t(file.offset_alignment),
+                                         std::size_t(file.memory_alignment)});
+    }
+    return out;
+}
 
 } // namespace ninfer::models::qwen4_exp::ple::disk

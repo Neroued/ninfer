@@ -161,11 +161,11 @@ int main() {
             }
             auto& spec = wrapped ? grid["schema"]["properties"]["n"] : grid["schema"]["n"];
             rejects([&] { (void)parse_request(grid); }, "large off-grid maximum rejects");
-            spec["maximum"] = 254000000000ULL;
+            spec["maximum"]  = 254000000000ULL;
             const auto exact = parse_request(grid).fields[0];
             expect(exact.values.size() == 255 && exact.values.back() == spec["maximum"],
                    "large aligned maximum remains included");
-            spec["maximum"] = 1.000000001;
+            spec["maximum"]                       = 1.000000001;
             spec[wrapped ? "multipleOf" : "step"] = 1;
             rejects([&] { (void)parse_request(grid); }, "small off-grid maximum rejects");
         }
@@ -173,38 +173,41 @@ int main() {
             "n":{"type":"number","description":"Decimal","minimum":1000000000000000.1,
                  "maximum":1000000000000001.1,"step":1}}})");
         for (const double sign : {1.0, -1.0}) {
-            auto& spec = decimal_grid["schema"]["n"];
-            spec["minimum"] = sign > 0 ? 1000000000000000.1 : -1000000000000001.1;
-            spec["maximum"] = sign > 0 ? 1000000000000001.1 : -1000000000000000.1;
+            auto& spec       = decimal_grid["schema"]["n"];
+            spec["minimum"]  = sign > 0 ? 1000000000000000.1 : -1000000000000001.1;
+            spec["maximum"]  = sign > 0 ? 1000000000000001.1 : -1000000000000000.1;
             const auto field = parse_request(decimal_grid).fields[0];
             expect(field.values.size() == 2 && field.values.front() == spec["minimum"] &&
                        field.values.back() == spec["maximum"],
                    "large fractional bounds round trip without becoming integers");
         }
-        auto& decimal_spec = decimal_grid["schema"]["n"];
+        auto& decimal_spec      = decimal_grid["schema"]["n"];
         decimal_spec["minimum"] = 10000000000.1;
         decimal_spec["maximum"] = 10000000000.3;
-        decimal_spec["step"] = .1;
+        decimal_spec["step"]    = .1;
         expect(parse_request(decimal_grid).fields[0].encoded ==
                    std::vector<std::string>({"10000000000.1", "10000000000.2", "10000000000.3"}),
                "decimal endpoints tolerate subtraction cancellation without losing values");
         decimal_spec["minimum"] = -.3;
         decimal_spec["maximum"] = 0;
-        expect(parse_request(decimal_grid).fields[0].values == std::vector<Json>({-.3, -.2, -.1, 0}),
+        expect(parse_request(decimal_grid).fields[0].values ==
+                   std::vector<Json>({-.3, -.2, -.1, 0}),
                "decimal cancellation at zero preserves the inclusive grid");
         decimal_spec["minimum"] = 1.0000000001;
         decimal_spec["maximum"] = 1.0000000001;
-        rejects([&] { (void)parse_request(decimal_grid); }, "tenth decimal place is not rounded away");
-        auto aligned = schema;
-        auto& aligned_spec = aligned["schema"]["properties"]["n"];
-        aligned_spec["minimum"] = 254000000001ULL;
-        aligned_spec["maximum"] = 255000000001ULL;
+        rejects([&] { (void)parse_request(decimal_grid); },
+                "tenth decimal place is not rounded away");
+        auto aligned               = schema;
+        auto& aligned_spec         = aligned["schema"]["properties"]["n"];
+        aligned_spec["minimum"]    = 254000000001ULL;
+        aligned_spec["maximum"]    = 255000000001ULL;
         aligned_spec["multipleOf"] = 1000000000;
         rejects([&] { (void)parse_request(aligned); }, "large off-grid multipleOf minimum rejects");
-        aligned_spec["minimum"] = 1000000000000000.1;
-        aligned_spec["maximum"] = 1000000000000001.1;
+        aligned_spec["minimum"]    = 1000000000000000.1;
+        aligned_spec["maximum"]    = 1000000000000001.1;
         aligned_spec["multipleOf"] = 1;
-        rejects([&] { (void)parse_request(aligned); }, "fractional minimum is not an integer multiple");
+        rejects([&] { (void)parse_request(aligned); },
+                "fractional minimum is not an integer multiple");
 
         CandidateTrie trie;
         trie.add({90, 80, 10, 30, 99});
@@ -249,7 +252,7 @@ int main() {
         expect(assemble({numeric.fields[0]}, {f})["decision"]["n"] == .3, "median aggregate");
 
         Backend backend;
-        std::size_t calls       = 0;
+        std::size_t calls = 0;
         std::vector<bool> cache_flags;
         backend.check_cancelled = [] {};
         backend.tokenize = [](const auto& system, const auto& context, const auto& continuation) {
@@ -320,10 +323,10 @@ int main() {
                    std::abs(exact["results"][1]["fields"]["pick"]["probability"].get<double>() -
                             .4) < 1e-7,
                "exact tree differs from greedy and preserves context order");
-        branching.mode = "greedy";
+        branching.mode         = "greedy";
         branching.cache_prompt = false;
         cache_flags.clear();
-        auto walked    = evaluate(branching, backend);
+        auto walked = evaluate(branching, backend);
         expect(cache_flags == std::vector<bool>({false, true}),
                "cache opt-out rebuilds once then shares later greedy rounds");
         expect(walked["results"][0]["decision"]["pick"] == "aa" &&

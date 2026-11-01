@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ops/rope/kernels/phase.cuh"
+#include "ops/common/numeric/convert.cuh"
 
 #include <cuda_bf16.h>
 
@@ -121,6 +122,49 @@ __global__ void rope_fixed_kernel(const std::int32_t* positions, __nv_bfloat16* 
     }
 }
 
+template <int Block>
+__global__ void rope_axial_vector_kernel(const std::int32_t* positions, __nv_bfloat16* q,
+                                         __nv_bfloat16* k, int tokens, std::int64_t q_token_stride,
+                                         std::int64_t k_token_stride) {
+    constexpr int Vectors = 32 * 18, Items = (Vectors + Block - 1) / Block;
+    const int token = blockIdx.x;
+    __shared__ float sine[36], cosine[36];
+    if (threadIdx.x < 36)
+        fixed_sincos<RopeKernelMode::AxialD72R72>(positions, tokens, token, threadIdx.x,
+                                                  &sine[threadIdx.x], &cosine[threadIdx.x]);
+    common::Bf16Vector<4> original[Items], partner[Items];
+#pragma unroll
+    for (int i = 0; i < Items; ++i) {
+        const int index = threadIdx.x + i * Block;
+        if (index < Vectors) {
+            const int head = index / 18, d = (index % 18) * 4;
+            const auto* data = (head < 16 ? q + token * q_token_stride + head * 72
+                                          : k + token * k_token_stride + (head - 16) * 72);
+            original[i]      = common::Bf16Vector<4>::load(data + d);
+            partner[i]       = common::Bf16Vector<4>::load(data + (d < 36 ? d + 36 : d - 36));
+        }
+    }
+    // Every rotation pair is resident before any thread overwrites an input.
+    __syncthreads();
+#pragma unroll
+    for (int i = 0; i < Items; ++i) {
+        const int index = threadIdx.x + i * Block;
+        if (index < Vectors) {
+            const int head = index / 18, d = (index % 18) * 4;
+            auto* data = (head < 16 ? q + token * q_token_stride + head * 72
+                                    : k + token * k_token_stride + (head - 16) * 72);
+            common::Bf16Vector<4> result;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const float c = cosine[d % 36 + j], s = sine[d % 36 + j] * (d < 36 ? -1.f : 1.f);
+                result.word[j] = __float2bfloat16_rn(__bfloat162float(original[i].word[j]) * c +
+                                                     __bfloat162float(partner[i].word[j]) * s);
+            }
+            result.store(data + d);
+        }
+    }
+}
+
 template <RopeKernelMode Mode, int QHeads, int KHeads, int HeadsPerBlock>
 __global__ void rope_fixed_split_kernel(const std::int32_t* positions, __nv_bfloat16* q,
                                         __nv_bfloat16* k, std::int32_t tokens,
@@ -162,10 +206,10 @@ __global__ void rope_fixed_split_kernel(const std::int32_t* positions, __nv_bflo
 
 __device__ __forceinline__ void generic_axis_frequency(int axes, int head_dim, int rotary_dim,
                                                        int pair, int* axis, float* exponent) {
-    if (axes == 2 && head_dim == 72 && rotary_dim == 72) {
-        *axis           = pair / 18;
-        const int local = pair % 18;
-        *exponent       = -2.0F * static_cast<float>(local) / 36.0F;
+    if (axes == 2) {
+        *axis           = pair / (head_dim / 4);
+        const int local = pair % (head_dim / 4);
+        *exponent       = -2.0F * static_cast<float>(local) / (head_dim / 2);
     } else {
         *axis     = axes == 3 ? pair % 3 : 0;
         *exponent = -2.0F * static_cast<float>(pair) / static_cast<float>(rotary_dim);

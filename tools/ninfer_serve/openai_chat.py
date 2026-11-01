@@ -91,8 +91,12 @@ class ChatStreamAdapter:
                 if isinstance(value, str) and value:
                     outputs.append(value)
             tool_calls = delta.get("tool_calls")
-            if isinstance(tool_calls, list) and tool_calls:
-                outputs.append(json.dumps(tool_calls, ensure_ascii=False, separators=(",", ":")))
+            if isinstance(tool_calls, list):
+                for call in tool_calls:
+                    function = call.get("function") if isinstance(call, dict) else None
+                    arguments = function.get("arguments") if isinstance(function, dict) else None
+                    if isinstance(arguments, str) and arguments:
+                        outputs.append(arguments)
             if outputs:
                 normalized.append(
                     ProtocolEvent(

@@ -9,6 +9,7 @@ namespace ninfer::bench::ple {
 struct Options {
     measurement::Options timing;
     std::string op = "conv-add-norm", valid = "dense", accepted = "dense";
+    std::string lookup_shards = "lower";
     std::vector<int> tokens{1};
     int batch = 1, offset = 0;
     bool inplace = false;
@@ -16,12 +17,13 @@ struct Options {
 
 inline Options parse_options(int argc, char** argv) {
     Options o;
-    bool explicit_tokens = false;
+    bool explicit_tokens = false, lookup_option = false;
     for (int i = 1; i < argc; ++i) {
         const std::string_view flag = argv[i];
         if (flag == "--help" || flag == "-h") {
-            std::cout << "PLE gate, convolution and state extraction benchmark\n"
-                         "  --op gate|conv-add|conv-add-norm|state-extract\n"
+            std::cout << "PLE lookup, gate, convolution and state extraction benchmark\n"
+                         "  --op lookup|gate|conv-add|conv-add-norm|state-extract\n"
+                         "  --lookup-shards lower|upper|alternating|all|none (lookup only)\n"
                          "  --tokens T[,T...] or --sweep START:END[:STEP] --batch B\n"
                          "  --valid dense|mixed|N[,N...] --offset N (gate/convolution)\n"
                          "  --accepted dense|mixed|N[,N...] (state extraction) --inplace\n"
@@ -49,13 +51,22 @@ inline Options parse_options(int argc, char** argv) {
             o.valid = value;
         else if (flag == "--accepted")
             o.accepted = value;
-        else if (!measurement::parse(o.timing, flag, value))
+        else if (flag == "--lookup-shards") {
+            o.lookup_shards = value;
+            lookup_option   = true;
+        } else if (!measurement::parse(o.timing, flag, value))
             throw std::invalid_argument("unknown option: " + std::string(flag));
     }
     if (o.batch > 8 || (o.op != "gate" && o.op != "conv-add" && o.op != "conv-add-norm" &&
-                        o.op != "state-extract"))
+                        o.op != "state-extract" && o.op != "lookup"))
         throw std::invalid_argument("unsupported Op/batch");
     if (o.op == "gate" && o.inplace) throw std::invalid_argument("gate has no in-place output");
+    if ((lookup_option && o.op != "lookup") ||
+        (o.op == "lookup" && (o.inplace || o.offset || o.accepted != "dense")))
+        throw std::invalid_argument("options do not belong to lookup");
+    if (o.lookup_shards != "lower" && o.lookup_shards != "upper" &&
+        o.lookup_shards != "alternating" && o.lookup_shards != "all" && o.lookup_shards != "none")
+        throw std::invalid_argument("invalid lookup shard placement");
     if ((o.op == "state-extract" && o.offset != 0) ||
         (o.op != "state-extract" && o.accepted != "dense"))
         throw std::invalid_argument(

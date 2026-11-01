@@ -5,24 +5,9 @@ can reuse an official conversion, change selected layers or projections, combine
 your own conversion method. The artifact contains the resulting configuration, encoded weights,
 logical bindings and frontend resources.
 
+Ready-to-use artifacts, including Flash Next and GLM, are listed in the
+[download table](../README.md#get-weights). Use this guide to create or customize weights.
 Run the commands below from the repository root.
-
-## Upgrade an existing v2 artifact
-
-The offline upgrade tool supports the official Qwen3.6/3.8-27B groupwise-int and NVFP4 artifacts,
-and Qwen3.6-35B-A3B groupwise-int. Update your checkout to the current `master` and
-[rebuild NInfer](../README.md#quick-start), then run with Python 3.11:
-
-```bash
-python3 tools/upgrade_ninfer_v2_to_v3.py \
-  models/qwen3_8_27b_nvfp4.ninfer \
-  models/qwen3_8_27b_nvfp4.v3.ninfer
-```
-
-The output must use a new path. After upgrading, use it directly or rename it to replace the
-original file. Stored weight values and formats are preserved. The upgrade also installs the
-matching template from `tools/chat_templates/`. Published SHA-256 checksums apply only to
-downloaded files.
 
 ## Start with an official recipe
 
@@ -44,8 +29,9 @@ python3 -m tools.convert \
 ```
 
 `--components` defaults to `text`. Include only the optional components you want to distribute.
-`--proposal` adds the indexed proposal head used by speculative decoding; it uses the repository's
-token ranking and defaults to 131,072 rows. The ordinary full-vocabulary output head is retained.
+`--proposal` adds the architecture's optimized proposal head. Qwen3.5-based models use the
+repository's token ranking and default to a 131,072-row shortlist; Qwen4Exp and GLM5Next keep the
+complete vocabulary and quantize an additional Q4 A16 head. The ordinary target output head is retained.
 
 The built-in recipes are ordinary Python functions in
 [`official_recipes.py`](../tools/convert/official_recipes.py):
@@ -57,7 +43,8 @@ The built-in recipes are ordinary Python functions in
 | `qwen3_6_35b_a3b` | Q4 experts, Q5/Q6 expert down, Q8 shared/projection weights | None |
 | `qwen3_6_27b_nvfp4` | Imported NVFP4, selected BF16 projections, Q8 vocabulary weights | `quantized` |
 | `qwen3_8_27b_nvfp4` | Imported NVFP4/FP8, FP8 embedding generated from BF16 | `quantized` |
-| `qwen3_8_flash_next` | Q8 main projections, NVIDIA NVFP4 expert banks, NVIDIA block-FP8 MTP experts, paged NF4 PLE, BF16 auxiliary projections/Vision | `nvidia` |
+| `qwen3_8_flash_next` | Q8 main projections, NVIDIA NVFP4 experts, block-FP8 MTP experts, NF4 PLE, BF16 auxiliary projections/Vision | `nvidia` |
+| `glm5next` | NVIDIA NVFP4 Main experts/dense MLP, Q8 KDA and MLA output/shared projections, block-FP8 MTP experts; BF16 Main head, embedding and Vision | None; NVIDIA checkpoint is the primary source |
 
 These names select conversion choices. Runtime execution is selected from the architecture,
 configuration and actual bindings stored in the artifact. `--name` sets the public model name;
@@ -83,15 +70,17 @@ as `--source dflash=PATH` or `--source dflash2=PATH`. An artifact may contain se
 components; the Engine loads only the ones selected at startup, including at most one speculative
 backend. Component availability and startup selection are independent.
 
+### Qwen3.8-Flash-Next
+
 For Qwen3.8-Flash-Next, select the complete NVIDIA checkpoint for Main experts and MTP:
 
 ```bash
-OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 python3 -m tools.convert \
+python3 -m tools.convert \
   --model /path/to/Qwen3.8-Flash-Next/base-hf-bf16 \
   --recipe qwen3_8_flash_next \
   --source nvidia=/path/to/Qwen3.8-Flash-Next/nvidia-nvfp4 \
   --components text,vision,mtp \
-  --rows-per-chunk 16384 \
+  --proposal \
   --name qwen3.8-flash-next \
   --out out/qwen3_8_flash_next.ninfer
 ```
@@ -100,17 +89,66 @@ The Qwen4Exp adapter selects the dedicated
 [`qwen3_8_flash_next.jinja`](../tools/chat_templates/qwen3_8_flash_next.jinja) by default;
 `--resource chat_template.jinja=PATH` explicitly replaces it. The 27B template is independent.
 
-The Qwen4Exp adapter and Engine support Text, Vision and native MTP. MTP uses the full shared head;
-omit `--proposal`. DFlash/DFlash2 and indexed proposal execution are unsupported for Qwen4Exp.
-CUDA self-quantization compiles
-the SM120 encoder on first use and requires a CUDA toolkit, C++ compiler and Ninja.
-PLE uses two bounded passes per shard, with no full-table materialization. The complete recipe
-contains about 100.67 GiB of weight/control payload, split by the existing V3 writer.
-Main experts use two NVFP4 banks per layer with independent matrix divisors. MTP uses two
-128×128 block-FP8 banks, preserving NVIDIA E4M3FN codes and BF16 multipliers; its other private
-parameters also come from the NVIDIA source. PLE alone uses the BF16-to-NF4 stored-scale method.
-See the [model and weight contract](maintainer/qwen4_exp-model.md) for layouts and precision, and
-the [execution reference](maintainer/qwen4_exp-execution.md) for runtime support and memory use.
+The Qwen4Exp adapter and Engine support Text, Vision and native MTP. For this architecture,
+`--proposal` converts an additional full-vocabulary Q4 head from the BF16 main head, with
+`A16Only` activation policy. It does not read the ranking or use `--proposal-rows`.
+Select it at startup with `--spec mtp --draft-tokens 3 --proposal-head optimized`.
+The default `--proposal-head full` shares the main BF16 head and leaves the Q4 object unloaded.
+DFlash/DFlash2 and indexed proposal execution are unsupported for Qwen4Exp.
+
+The recipe keeps imported NVFP4/block-FP8 codes and calibration values. PLE is converted from the
+BF16 source to NF4 with bounded batches. The complete recipe, including the optimized head,
+is written as a multi-part artifact.
+See the [Qwen4Exp architecture reference](maintainer/qwen4_exp-model.md) for its representation choices.
+
+### GLM-5.3-Flash
+
+Use the NVIDIA NVFP4 checkpoint as the primary source. It supplies the configuration, calibrated
+Main weights, remaining floating-point parameters, tokenizer/template and optional components:
+
+```bash
+python3 -m tools.convert \
+  --model /path/to/GLM-5.3-Flash-NVFP4 \
+  --recipe glm5next \
+  --components text,vision,mtp \
+  --proposal \
+  --name glm5.3-flash \
+  --out out/glm5_3_flash.ninfer
+```
+
+The recipe imports Main NVFP4 experts and dense MLP weights, converts KDA Q/K/V/O, MLA O and
+shared-expert projections to Q8, and converts MTP experts to block-FP8. Main head, embedding,
+Vision and other BF16 parameters remain BF16; source FP32 KDA controls retain their precision.
+`--proposal` adds a full-vocabulary Q4 A16 draft head without changing the BF16 Main head.
+`--ranking` and `--proposal-rows` do not crop the GLM or Flash Next draft vocabulary.
+
+GLM frontend resources come from the primary checkpoint; do not substitute a Qwen template.
+After conversion, keep the entry and every part together on both Sparks and use the
+[GLM deployment example](../examples/configs/spark2-glm5_3-flash.toml).
+The [GLM5Next reference](maintainer/glm5next-model.md) records the model's representation choices.
+
+## Conversion resources
+
+CUDA self-quantization compiles its encoder on first use and needs a CUDA toolkit, a C++ compiler
+and Ninja. Use a CUDA-enabled PyTorch build for the selected GPU architecture. The same converter
+runs on RTX 5090 and Spark; no inference service is needed.
+
+Built-in methods size batches by row width to target about 16 MiB of working input or output,
+with alignment where the encoding requires it. One reader prefetches the next source batch while
+the current batch is converted and written. CUDA conversion performs grouped-integer and
+row-FP8 quantization on the GPU; encoded NVFP4/block-FP8 imports retain their original codes/scales.
+
+| Option | Default | Behavior |
+|---|---:|---|
+| `--rows-per-chunk` | Automatic | Override row batching; methods align rows to their encoding boundaries. |
+| `--cpu-threads` | `1` | Set PyTorch CPU intra-op threads; the source reader is a separate worker. |
+| `--source-cache-mib` | `2048` | Maximum FP32 source size retained on the conversion device for one multi-pass object. Larger objects stream both passes; `0` disables this cache. |
+
+`stored_scale_mse` first finds the whole object's maximum, then selects stored scales/codes.
+Its cache avoids rereading eligible objects between these passes. CUDA candidate pruning uses
+conservative error bounds and retains the FP64 selection and tie rules defined in the
+[stored-scale implementation](../tools/convert/quantization/stored_scale.py).
+The conversion report records resource settings and per-object conversion times.
 
 ## Change part of a recipe
 
@@ -200,8 +238,8 @@ E4M3FN scales per G16 group using FP64 reconstruction error. NF4 uses the fixed 
 NVFP4 uses E2M1. The method provides no activation calibration. ModelOpt import preserves
 packed codes and scale bytes while converting FP32 global multipliers to stored reciprocals.
 
-The exact numeric and packing rules are in [numeric formats](maintainer/tensor-formats.md) and
-[storage layouts](maintainer/storage-layouts.md). Source format names alone do not establish
+The exact numeric and packing rules are in [numeric formats](../tools/artifact/formats.py) and
+[storage layouts](../src/core/weight_view.cpp). Source format names alone do not establish
 compatibility: scale direction, granularity, code meaning and axis order must also match.
 
 Activation permissions are independent of the stored weight format:
@@ -313,8 +351,9 @@ def configure(model, recipe, sources):
 
 Use this as an override. The NumPy file must already follow the logical row/column order. For an
 unfamiliar quantized source, its reader performs the corresponding decoding before returning
-values. To preserve existing compatible encoded words, also provide `read_encoded` returning
-`EncodedRows`, and the format's required divisor accessors. Their definitions are in
+values. To preserve existing compatible encoded words, also provide `encoded_format` (a format
+name or metadata-only resolver), `read_encoded` returning `EncodedRows`, and the format's required
+divisor accessors. Their definitions are in
 [`sources/logical.py`](../tools/convert/sources/logical.py).
 
 For a logical bank spread across several physical parents, `recipe.parent(parts, shape=...,
@@ -351,14 +390,14 @@ def clipped_grouped(request):
     ):
         raise ValueError("clipped_grouped requires a grouped-integer matrix")
     limit = float(request.parameters["clip"])
-    if not math.isfinite(limit) or limit <= 0 or request.rows_per_chunk <= 0:
-        raise ValueError("clip and rows_per_chunk must be positive")
+    if not math.isfinite(limit) or limit <= 0:
+        raise ValueError("clip must be positive and finite")
     n, k = request.target.shape
+    chunk = request.chunk_rows(k * 4)
 
     def produce(output):
-        for begin in range(0, n, request.rows_per_chunk):
-            end = min(n, begin + request.rows_per_chunk)
-            values = request.values(begin * k, end * k).reshape(end - begin, k)
+        for begin, end, values in request.read_chunks(request.values, n * k, chunk * k):
+            values = values.reshape((end - begin) // k, k)
             if not bool(torch.isfinite(values).all()):
                 raise ValueError("source contains non-finite values")
             encoded = quantize_matrix(
@@ -366,7 +405,7 @@ def clipped_grouped(request):
                 request.target.format,
                 device=request.device,
             )
-            output.write_codes(begin, encoded.codes, encoded.scales)
+            output.write_codes(begin // k, encoded.codes, encoded.scales)
 
     return request.job(produce=produce)
 
@@ -391,7 +430,7 @@ checks divisor consistency within that matrix; block-FP8 writes complete 128-row
 ## Resources, files and inspection
 
 Text includes `tokenizer.json`, `tokenizer_config.json`, `chat_template.jinja` and
-`generation_config.json`. Vision adds its image and video processor configs. Resources come from
+`generation_config.json`. Vision adds the processor resources used by that architecture. Resources come from
 `--model`, except that Qwen4Exp defaults to the maintained Flash Next chat template.
 `--resource ROLE=PATH` replaces a selected resource:
 
@@ -406,6 +445,7 @@ The official conversion examples select these maintained templates:
 | Qwen3.6 Dense/MoE | [qwen3_6.jinja](../tools/chat_templates/qwen3_6.jinja) | thinking on; closed-turn reasoning omitted |
 | Qwen3.8 27B | [qwen3_8.jinja](../tools/chat_templates/qwen3_8.jinja) | thinking on; effort `xhigh`; closed-turn reasoning retained |
 | Qwen3.8 Flash Next | [qwen3_8_flash_next.jinja](../tools/chat_templates/qwen3_8_flash_next.jinja) | thinking on; effort `xhigh`; closed-turn reasoning retained |
+| GLM-5.3-Flash | Primary checkpoint template | thinking enabled; effort and history defaults from that template |
 
 The Flash Next template maps `minimal` to `low`, `high`/`max` to `xhigh`, and `none` to disabled
 thinking. Final-assistant continuation preserves its content, including trailing whitespace.
@@ -435,3 +475,20 @@ support is checked by consumers during preparation, resource queries, warmup or 
 valid file may need additional Op support before its chosen combination can run. Exercise the
 phases and optional components you intend to use through the normal [CLI](cli.md) or
 [serving](serving.md) route.
+
+## Upgrade an existing v2 artifact
+
+The offline upgrade tool supports the official Qwen3.6/3.8-27B groupwise-int and NVFP4 artifacts,
+and Qwen3.6-35B-A3B groupwise-int. Update your checkout to the current `master` and
+[rebuild NInfer](../README.md#build), then run with Python 3.11:
+
+```bash
+python3 tools/upgrade_ninfer_v2_to_v3.py \
+  models/qwen3_8_27b_nvfp4.ninfer \
+  models/qwen3_8_27b_nvfp4.v3.ninfer
+```
+
+The output must use a new path. After upgrading, use it directly or rename it to replace the
+original file. Stored weight values and formats are preserved. The upgrade also installs the
+matching template from `tools/chat_templates/`. Published SHA-256 checksums apply only to
+downloaded files.

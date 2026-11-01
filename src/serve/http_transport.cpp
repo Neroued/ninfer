@@ -52,10 +52,11 @@ std::unique_ptr<httplib::TaskQueue> make_http_task_queue(std::size_t workers,
     return std::make_unique<HttpTaskQueue>(static_cast<std::uint32_t>(workers), queued_requests);
 }
 
-std::unique_ptr<httplib::TaskQueue> make_http_task_queue(const ServeOptions& options) {
+std::unique_ptr<httplib::TaskQueue> make_http_task_queue(const product::ServeOptions& options) {
     const std::size_t outstanding =
-        static_cast<std::size_t>(options.max_concurrency) + options.max_pending_requests +
-        (options.jev ? kDecisionRequestCapacity : 0);
+        static_cast<std::size_t>(options.launch.engine.max_concurrency) +
+        options.launch.engine.max_pending_requests +
+        (options.launch.engine.enable_decisions ? kDecisionRequestCapacity : 0);
     return make_http_task_queue(outstanding + 1, outstanding);
 }
 
@@ -113,14 +114,17 @@ bool SseTransport::poll(Clock::time_point now) {
 }
 
 void configure_http_server_socket(socket_t socket) noexcept {
-    httplib::default_socket_options(socket);
 #if defined(__linux__)
     const int enabled = 1;
+    // Reuse closed connections' addresses while keeping the active listener exclusive.
+    set_socket_option(socket, SOL_SOCKET, SO_REUSEADDR, enabled);
     set_socket_option(socket, SOL_SOCKET, SO_KEEPALIVE, enabled);
     set_socket_option(socket, IPPROTO_TCP, TCP_KEEPIDLE, kKeepAliveIdleSeconds);
     set_socket_option(socket, IPPROTO_TCP, TCP_KEEPINTVL, kKeepAliveIntervalSeconds);
     set_socket_option(socket, IPPROTO_TCP, TCP_KEEPCNT, kKeepAliveProbeCount);
     set_socket_option(socket, IPPROTO_TCP, TCP_USER_TIMEOUT, kTcpUserTimeoutMilliseconds);
+#else
+    httplib::default_socket_options(socket);
 #endif
 }
 

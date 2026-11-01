@@ -1,105 +1,146 @@
 #include "models/qwen4_exp/program/resources.h"
+#include "core/startup.h"
 #include "core/transfer.h"
+#include "ninfer/ops/sampling.h"
 
-#include <algorithm>
+#include <cstring>
 
 namespace ninfer::models::qwen4_exp {
 namespace {
-std::uint32_t count(std::uint64_t n) {
-    if (n > UINT32_MAX) throw std::overflow_error("Qwen4Exp context descriptors exceed uint32");
-    return static_cast<std::uint32_t>(n);
-}
-
 ExecutionPlan checked_plan(const execution::Parameters& p, ExecutionPlan plan) {
-    if (plan.profile != p.profile || !plan.moe ||
-        plan.capacity.runtime_reservation_bytes != plan.device_bytes())
+    if (plan.profile != p.profile ||
+        plan.capacity.runtime_reservation_bytes != plan.device_reservation_bytes())
         throw std::invalid_argument("Qwen4Exp resources require the finalized parameter plan");
     return plan;
 }
 } // namespace
 
-ContextPool::ContextPool(MemorySpan backing, const QsaCacheLayout& layout, std::size_t host_bytes,
-                         std::uint32_t history_count, context::HostKVExtentStore* host)
-    : cache(backing, layout),
-      pages(cache.pages(),
-            count(layout.pages.spec.page_group_count +
-                  host_bytes / plan_host_kv_page_layout(layout.pages.spec.geometry).page_stride)),
-      histories(pages, cache.tables(), history_count, layout.tables.spec.logical_page_capacity,
-                host) {}
-
-Resources::Resources(const execution::Parameters& p, ExecutionPlan input, DeviceContext& device)
+Resources::Resources(const execution::Parameters& p, ExecutionPlan input, DeviceContext& device,
+                     const StartupObserver& observer)
     : plan(checked_plan(p, std::move(input))), device_(device),
+      context_(device.device(), plan.capacity.device_bytes),
       persistent_(device.device(), plan.persistent.bytes),
       workspace_(device.device(), plan.workspace.bytes), ingress_(plan.pinned_io_bytes),
       egress_(plan.pinned_output_bytes), sampling_(plan.pinned_sampling_bytes),
-      mtp_ingress_(plan.pinned_mtp_bytes), ple_stream_(device),
+      ple_handoff_(plan.pinned_ple_handoff_bytes), compute_aux_(plan.pinned_aux_bytes()),
+      context_counts_(plan.pinned_context_counts_bytes()), ple_stream_(device),
       ple_transfer_(device.execution_view(ple_stream_.stream())),
       workspace(workspace_.span().subspan(0, plan.workspace.general_bytes)) {
-    const auto backing = persistent_.span();
-    states             = std::make_unique<StateViews>(backing, plan.persistent.state);
-    std::vector<HostKVPageLayout> layouts{
-        plan_host_kv_page_layout(plan.persistent.main.pages.spec.geometry)};
-    if (plan.persistent.mtp)
-        layouts.push_back(plan_host_kv_page_layout(plan.persistent.mtp->pages.spec.geometry));
-    auto minimum_kv = layouts.front().page_stride;
-    for (const auto& l : layouts) minimum_kv = std::min(minimum_kv, l.page_stride);
-    const auto image_bytes = states->storage().image_bytes();
-    const auto logical_states =
-        count(states->storage().slot_count() + plan.host_context_bytes / image_bytes);
-    const auto histories = count(4ULL * logical_states + 3ULL * plan.shape.max_concurrency + 2);
     if (plan.host_context_bytes) {
-        host_context       = std::make_unique<HostContextArena>(plan.host_context_bytes,
-                                                                std::min(minimum_kv, image_bytes));
-        host_kv            = std::make_unique<HostKVArena>(*host_context, layouts);
-        const auto extents = count(plan.host_context_bytes / minimum_kv);
-        if (extents) host_extents = std::make_unique<context::HostKVExtentStore>(*host_kv, extents);
+        StartupPhaseScope phase(observer, StartupPhase::HostContextPin, StartupProgressUnit::Bytes,
+                                plan.host_context_bytes);
+        host_context_ = PinnedHostBuffer(plan.host_context_bytes);
+        phase.complete(plan.host_context_bytes, plan.host_context_bytes);
     }
-    state_store = std::make_unique<context::StateImageStore>(states->storage(), host_context.get(),
-                                                             logical_states);
-    main = std::make_unique<ContextPool>(backing, plan.persistent.main, plan.host_context_bytes,
-                                         histories, host_extents.get());
+    if (plan.workspace.vision) vision.emplace(device, *plan.workspace.vision);
+    const auto backing = persistent_.span();
+    std::memset(ingress_.data(), 0, ingress_.size());
+    copy_bytes_async(plan.persistent.buffers.host_region.bind(backing), ingress_.span(),
+                     device.execution_view());
+    states = std::make_unique<StateViews>(context_.span(), plan.persistent.state);
+    main   = std::make_unique<QsaCache>(context_.span(), backing, plan.persistent.main);
     if (plan.persistent.mtp)
-        mtp = std::make_unique<ContextPool>(backing, *plan.persistent.mtp, plan.host_context_bytes,
-                                            histories, host_extents.get());
-    migration = std::make_unique<context::MigrationContext>(device, mtp ? 2 : 1);
+        mtp = std::make_unique<QsaCache>(context_.span(), backing, *plan.persistent.mtp);
+    std::vector<context::ContextTableStorage> pools;
+    for (std::uint32_t i = 0; i < pool_count(); ++i) pools.push_back({i, &pool(i).tables()});
+    context = std::make_unique<context::ContextStorage>(context_.span(), host_context_.span(),
+                                                        pools, p.profile->local.rank);
+    const auto mapping_elements = plan.pinned_context_bytes() / 2 / sizeof(std::int64_t);
+    compute_actions             = std::make_unique<context::ContextMigration>(
+        device, *context, device.execution_view(), mapping_elements);
+    context_actions =
+        std::make_unique<context::ContextMigration>(device, *context, mapping_elements);
     if (plan.persistent.buffers.gdn_records) {
         gdn_records.emplace(backing, *plan.persistent.buffers.gdn_records);
-        gdn_fold.emplace(*gdn_records, states->gdn().all_layers_view());
+        gdn_fold.emplace(*gdn_records, states->gdn().all_layers_view({}));
     }
-    std::vector<const moe::Parameters*> layers;
-    for (const auto& layer : p.text.layers) layers.push_back(&layer.moe);
-    experts =
-        std::make_unique<moe::Resources>(plan.moe, layers, p.model.expert_banks(), device,
-                                         plan.graph_probe ? moe::ResourcePurpose::GraphCalibration
-                                                          : moe::ResourcePurpose::Execution);
-    ple_upload  = std::make_unique<ple::UploadSlots>(device, plan.ple.max_positions, 2);
-    ple_prepare = std::make_unique<ple::disk::PrepareService>(
-        p.model.ple_table(), p.model.config().text.ple.eos, plan.ple, ple_upload->host_slots());
-    if (ple_prepare->memory_bytes() != plan.ple_prepare_bytes ||
-        ple_upload->memory().device_bytes != plan.ple_upload.device_bytes)
-        throw std::logic_error("PLE allocated capacity differs from the execution plan");
-    states->storage().clear_all(device.execution_view());
+    if (plan.moe) {
+        std::vector<const moe::Parameters*> layers;
+        for (const auto& layer : p.text.layers) layers.push_back(&layer.moe);
+        experts = plan.moe->create(layers, p.model.expert_banks(), device,
+                                   plan.graph_probe ? moe::ResourcePurpose::GraphCalibration
+                                                    : moe::ResourcePurpose::Execution);
+    }
+    if (const auto* table =
+            std::get_if<std::shared_ptr<const ple::disk::Table>>(&p.model.ple_table())) {
+        ple_upload  = std::make_unique<ple::UploadSlots>(device, plan.ple.max_positions, 2);
+        ple_prepare = std::make_unique<ple::disk::PrepareService>(
+            **table, p.profile->config.text.ple.eos, plan.ple, ple_upload->host_slots());
+        if (ple_prepare->memory_bytes() != plan.ple_prepare_bytes ||
+            ple_upload->memory().device_bytes != plan.ple_upload.device_bytes)
+            throw std::logic_error("PLE allocated capacity differs from the execution plan");
+    }
     if (plan.persistent.buffers.mtp) {
-        const auto& region = plan.persistent.buffers.mtp->row_indices;
-        auto* rows         = static_cast<std::int32_t*>(mtp_ingress_.data());
-        for (std::uint32_t i = 0; i < plan.shape.max_concurrency; ++i) rows[i] = i;
-        copy_bytes_async(region.region.bind(backing),
-                         mtp_ingress_.span().subspan(0, region.region.bytes),
-                         device.execution_view());
+        const auto& tail = *plan.persistent.buffers.mtp;
+        const auto& qsa  = plan.profile->config.text.qsa;
+        std::vector<std::int64_t> offsets(plan.shape.max_concurrency);
+        const auto upload_offsets = [&](const TensorRegion& target, std::size_t stride) {
+            for (std::size_t row = 0; row < offsets.size(); ++row) offsets[row] = row * stride;
+            copy_bytes(target.region.bind(backing),
+                       {offsets.data(), offsets.size() * sizeof(offsets.front()), Device::cpu()},
+                       device.execution_view());
+        };
+        upload_offsets(tail.tail_key_offsets,
+                       qsa.index_key_width() * (qsa.compression - 1) * sizeof(std::uint16_t));
+        upload_offsets(tail.tail_coordinate_offsets, 3 * sizeof(std::int32_t));
     }
     if (const auto& counts = plan.persistent.buffers.token_counts)
         CUDA_CHECK(
             cudaMemsetAsync(counts->bind(backing).data, 0, counts->region.bytes, device.stream()));
+    if (const auto& raw = plan.persistent.buffers.proposal_sampling) {
+        std::vector<ops::SamplingConfig> configs(plan.shape.max_concurrency);
+        for (auto& config : configs) config.temperature = 0;
+        copy_bytes(raw->region.bind(backing),
+                   {configs.data(), configs.size() * sizeof(configs.front()), Device::cpu()},
+                   device.execution_view());
+        const std::vector<std::int32_t> columns(plan.shape.max_concurrency, 1);
+        copy_bytes(plan.persistent.buffers.proposal_columns->region.bind(backing),
+                   {columns.data(), columns.size() * sizeof(columns.front()), Device::cpu()},
+                   device.execution_view());
+    }
     device.synchronize();
 }
 
 Resources::~Resources() {
+    ple_prepare.reset();
     try {
-        ple_prepare.reset();
-        ple_upload.reset();
-        if (experts) experts->synchronize();
-        device_.synchronize();
-    } catch (...) { std::terminate(); }
+        synchronize();
+    } catch (const std::logic_error&) { std::terminate(); } catch (...) {
+    }
+    ple_upload.reset();
+}
+
+void Resources::synchronize() const {
+    std::exception_ptr failure;
+    const auto attempt = [&](auto&& action) {
+        try {
+            action();
+        } catch (...) {
+            if (!failure) failure = std::current_exception();
+        }
+    };
+    if (compute_actions) attempt([&] { compute_actions->drain(); });
+    if (context_actions) attempt([&] { context_actions->drain(); });
+    if (experts) attempt([&] { experts->synchronize(); });
+    const auto wait_stream = [](cudaStream_t stream) {
+        const auto status = cudaStreamSynchronize(stream);
+        if (status != cudaSuccess)
+            throw std::runtime_error(std::string("Qwen4Exp stream drain: ") +
+                                     cudaGetErrorString(status));
+    };
+    attempt([&] { wait_stream(ple_transfer_.stream()); });
+    attempt([&] { wait_stream(device_.stream()); });
+    if (failure) std::rethrow_exception(failure);
+}
+
+QsaCache& Resources::pool(std::uint32_t index) {
+    if (index >= pool_count()) throw std::out_of_range("Qwen4Exp context pool");
+    return index == 0 ? *main : *mtp;
+}
+
+const QsaCache& Resources::pool(std::uint32_t index) const {
+    if (index >= pool_count()) throw std::out_of_range("Qwen4Exp context pool");
+    return index == 0 ? *main : *mtp;
 }
 
 Tensor Resources::tensor(const TensorRegion& region) { return region.bind(persistent()); }
@@ -114,17 +155,17 @@ Tensor Resources::packed(const TensorRegion& region, std::initializer_list<std::
 namespace {
 template <class Layout>
 execution::BatchView bind_batch(Resources& resources, const Layout& layout,
-                                const TensorRegion& tables, std::int32_t tokens, std::int32_t batch,
-                                std::uint32_t visible) {
+                                const TensorRegion& tables, const TensorRegion& ids,
+                                std::int32_t tokens, std::int32_t batch, std::uint32_t visible) {
     const auto row = [&](const TensorRegion& r) { return resources.tensor(r).slice(0, 0, batch); };
     return {tokens,
             batch,
-            resources.packed(layout.ids, {tokens, batch}),
+            resources.packed(ids, {tokens, batch}),
             resources.packed(layout.positions, {tokens, batch}),
             resources.packed(layout.rope_positions, {tokens, 3, batch}),
             row(layout.valid_columns),
-            row(layout.source_slots),
-            row(layout.destination_slots),
+            row(layout.source_offsets),
+            row(layout.destination_offsets),
             row(tables),
             row(layout.base_positions),
             row(layout.record_offsets),
@@ -133,22 +174,33 @@ execution::BatchView bind_batch(Resources& resources, const Layout& layout,
 } // namespace
 
 execution::BatchView Resources::main_batch(std::int32_t tokens, std::int32_t batch,
-                                           std::uint32_t visible) {
-    const auto& layout = plan.persistent.buffers.batch;
-    return bind_batch(*this, layout, layout.main_tables, tokens, batch, visible);
+                                           std::uint32_t visible, bool sequence) {
+    const auto& layout = sequence ? plan.persistent.buffers.batch : plan.persistent.buffers.decode;
+    const auto& ids =
+        !sequence && tokens > 1 ? plan.persistent.buffers.mtp->verify_ids : layout.ids;
+    return bind_batch(*this, layout, layout.main_tables, ids, tokens, batch, visible);
 }
 
 execution::BatchView Resources::mtp_batch(const MtpBatchLayout& layout, std::int32_t tokens,
                                           std::int32_t batch, std::uint32_t visible) {
-    return bind_batch(*this, layout, layout.table_rows, tokens, batch, visible);
+    return bind_batch(*this, layout, layout.table_rows, layout.ids, tokens, batch, visible);
 }
 
 ops::QsaTailStateView Resources::mtp_working_tail(std::uint32_t slot, std::int32_t batch) {
     const auto& frame = *plan.persistent.buffers.mtp;
     const auto& qsa   = plan.profile->config.text.qsa;
     const auto width = dimension(qsa.index_key_width()), history = dimension(qsa.compression - 1);
-    return {packed(frame.tail_keys, {width, history, batch, 3}).slice(3, slot, 1),
-            packed(frame.tail_coordinates, {3, batch, 3}).slice(2, slot, 1),
-            tensor(frame.row_indices).slice(0, 0, batch)};
+    const auto keys        = packed(frame.tail_keys, {width, history, batch, 3}).slice(3, slot, 1);
+    const auto coordinates = packed(frame.tail_coordinates, {3, batch, 3}).slice(2, slot, 1);
+    const auto field       = [&](const Tensor& values, const TensorRegion& offsets,
+                           std::array<std::int32_t, 4> shape, std::size_t bytes) {
+        return StateFieldView{
+                  {{values.data, values.bytes(), values.device}, tensor(offsets).slice(0, 0, batch)},
+                  {{{0, bytes, dtype_size(values.dtype)}, values.dtype, shape}, 1, bytes}};
+    };
+    return {
+        field(keys, frame.tail_key_offsets, {width, history, 1, 1},
+              std::size_t(width) * history * sizeof(std::uint16_t)),
+        field(coordinates, frame.tail_coordinate_offsets, {3, 1, 1, 1}, 3 * sizeof(std::int32_t))};
 }
 } // namespace ninfer::models::qwen4_exp

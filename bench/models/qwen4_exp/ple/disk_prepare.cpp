@@ -75,11 +75,12 @@ void write(std::ostream& out, const T& value) {
 void run(const Options& o) {
     artifact::Reader artifact(o.artifact);
     const auto& binding = artifact.directory().bindings.at("text/layers/1/ple/table");
-    disk::Table table(artifact,
-                      load_lookup_parameters(
-                          artifact, binding,
-                          artifact.directory().component("text").resources.at("ple_hash_controls"),
-                          {3, 8}));
+    disk::Table table(
+        artifact, load_lookup_parameters(
+                      artifact, binding,
+                      artifact.read_object(
+                          artifact.directory().component("text").resources.at("ple_hash_controls")),
+                      {3, 8}));
     const auto eos =
         artifact.directory().component("text").config.at("eos_token_id").get<std::int32_t>();
     std::uint32_t base_row = 0;
@@ -198,11 +199,13 @@ void run(const Options& o) {
         const auto host_ready = Clock::now();
         uploads.upload(service.embedding(*ticket), context.transfer_view());
         if (o.work) {
-            const auto e = uploads.embedding(*ticket, context.execution_view())
-                               .reshape({2560, std::int32_t(positions)});
+            const auto binding = uploads.acquire(*ticket, context.execution_view());
+            binding.ready.wait(context.stream());
+            const auto e = binding.values.reshape({2560, std::int32_t(positions)});
             exposed_time.record_stop();
             ops::linear(e, projection, y, context.execution_view());
-            uploads.record_consumed(*ticket, context.execution_view());
+            binding.consumed.record(context.stream());
+            uploads.consumer_submitted(*ticket, context.execution_view());
         }
         until([&] { return uploads.upload_complete(*ticket); });
         const auto device_ready = Clock::now();

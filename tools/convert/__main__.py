@@ -10,9 +10,13 @@ from pathlib import Path
 import sys
 from collections.abc import Mapping
 
+import torch
+
 from .official_recipes import RECIPES
+from .methods import SOURCE_CACHE_BYTES
 from .pipeline import convert
 from .proposal import DEFAULT_RANKING, add_official_proposal
+from .glm5next import build_model as build_glm5next
 from .qwen3_5 import build_model as build_qwen3_5
 from .qwen4_exp import build_model as build_qwen4_exp
 from .recipe import Recipe
@@ -134,16 +138,35 @@ def main(argv=None):
     parser.add_argument(
         "--proposal",
         action="store_true",
-        help="include the existing indexed proposal head",
+        help="include the architecture's optimized proposal head",
     )
     parser.add_argument("--proposal-rows", type=int, default=131072)
     parser.add_argument("--ranking", type=Path, default=DEFAULT_RANKING)
     parser.add_argument("--name", help="public instance name saved in metadata")
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--device", default="cuda")
-    parser.add_argument("--rows-per-chunk", type=int, default=512)
+    parser.add_argument(
+        "--rows-per-chunk",
+        type=int,
+        help="override row batching (default: bounded batches sized in bytes)",
+    )
+    parser.add_argument(
+        "--cpu-threads",
+        type=int,
+        default=1,
+        help="CPU tensor worker threads (default: 1)",
+    )
+    parser.add_argument(
+        "--source-cache-mib",
+        type=int,
+        default=SOURCE_CACHE_BYTES // (1024 * 1024),
+        help="maximum cached FP32 source for multi-pass methods; 0 streams both passes (default: %(default)s)",
+    )
     parser.add_argument("--max-file-bytes", type=int, default=32_000_000_000)
     args = parser.parse_args(argv)
+    if args.cpu_threads <= 0:
+        parser.error("--cpu-threads must be positive")
+    torch.set_num_threads(args.cpu_threads)
     components = tuple(args.components.split(","))
     if len(components) != len(set(components)):
         raise ValueError("components must not repeat")
@@ -158,13 +181,19 @@ def main(argv=None):
             key: sources[key] for key in ("dflash", "dflash2") if key in components
         }
         architectures = base.config.get("architectures", [])
-        qwen4_exp = architectures in (
-            ["Qwen4ExpForConditionalGeneration"],
-            ["Qwen4ExpForCausalLM"],
-        )
-        if qwen4_exp and args.proposal:
-            raise ValueError("Qwen4Exp does not have an indexed proposal head")
-        build_model = build_qwen4_exp if qwen4_exp else build_qwen3_5
+        adapters = {
+            "Glm5NextForCausalLM": build_glm5next,
+            "Glm5NextForConditionalGeneration": build_glm5next,
+            "Qwen3_5ForCausalLM": build_qwen3_5,
+            "Qwen3_5ForConditionalGeneration": build_qwen3_5,
+            "Qwen3_5MoeForCausalLM": build_qwen3_5,
+            "Qwen3_5MoeForConditionalGeneration": build_qwen3_5,
+            "Qwen4ExpForCausalLM": build_qwen4_exp,
+            "Qwen4ExpForConditionalGeneration": build_qwen4_exp,
+        }
+        if len(architectures) != 1 or architectures[0] not in adapters:
+            raise ValueError(f"unsupported source architectures: {architectures!r}")
+        build_model = adapters[architectures[0]]
         model = build_model(
             base,
             components=components,
@@ -174,7 +203,11 @@ def main(argv=None):
         recipe = Recipe(model)
         _function(args.recipe)(model, recipe, sources)
         if args.proposal:
-            add_official_proposal(recipe, ranking=args.ranking, rows=args.proposal_rows)
+            add_official_proposal(
+                recipe,
+                ranking=args.ranking,
+                rows=args.proposal_rows,
+            )
         if args.override:
             _function(args.override)(model, recipe, sources)
 
@@ -194,7 +227,10 @@ def main(argv=None):
         }
         if args.override:
             provenance["override"] = args.override
-        if args.proposal:
+        if (
+            args.proposal
+            and model.components["text"]["proposal"]["domain"] == "indexed"
+        ):
             provenance["ranking"] = str(args.ranking)
         report = convert(
             model,
@@ -204,6 +240,7 @@ def main(argv=None):
             provenance=provenance,
             device=args.device,
             rows_per_chunk=args.rows_per_chunk,
+            source_cache_bytes=args.source_cache_mib * 1024 * 1024,
             max_file_bytes=args.max_file_bytes,
             progress=progress,
         )

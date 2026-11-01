@@ -1,6 +1,7 @@
 #include "ops/softmax_attention/sliding_window/launch.h"
 
 #include "core/device.h"
+#include "ops/common/host/operands.h"
 #include "ops/softmax_attention/kernels/context_query/cyclic.cuh"
 
 #include <algorithm>
@@ -49,8 +50,7 @@ void dispatch_tokens(std::int32_t tokens, Launch&& launch) {
 
 void launch_sliding_window_attention(const Tensor& q, const Tensor& query_k, const Tensor& query_v,
                                      const Tensor& positions, const Tensor& valid_columns,
-                                     const Tensor& state_slots, float scale,
-                                     const CyclicKVCacheLayerView& context,
+                                     float scale, const ConstCyclicKVCacheLayerView& context,
                                      const SlidingWindowAttentionPlan& plan, Tensor& partial_acc,
                                      Tensor& partial_m, Tensor& partial_l, Tensor& out,
                                      cudaStream_t stream) {
@@ -76,11 +76,11 @@ void launch_sliding_window_attention(const Tensor& q, const Tensor& query_k, con
                     static_cast<const __nv_bfloat16*>(query_v.data),
                     static_cast<const std::int32_t*>(positions.data),
                     static_cast<const std::int32_t*>(valid_columns.data),
-                    static_cast<const std::int32_t*>(state_slots.data),
-                    static_cast<const __nv_bfloat16*>(context.k.data),
-                    static_cast<const __half*>(context.v.data),
-                    static_cast<int>(context.padded_capacity), context.k.nb[3] / 2,
-                    context.v.nb[3] / 2, plan.window - 1, plan.max_context,
+                    static_cast<const std::int64_t*>(context.k.records.byte_offsets.data),
+                    static_cast<const std::int64_t*>(context.v.records.byte_offsets.data),
+                    common::operand::state_field_base<const __nv_bfloat16>(context.k),
+                    common::operand::state_field_base<const __half>(context.v),
+                    static_cast<int>(context.padded_capacity), plan.window - 1, plan.max_context,
                     Direct ? 1 : plan.split_capacity, scale, static_cast<float*>(partial_acc.data),
                     static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data),
                     static_cast<__nv_bfloat16*>(out.data));

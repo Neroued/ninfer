@@ -2,8 +2,17 @@
 
 #include "core/memory.h"
 #include "core/weight_view.h"
+#include "core/layout.h"
 
 namespace ninfer {
+
+inline constexpr std::uint64_t kExpertAbsentOffset = UINT64_MAX;
+
+struct ExpertMatrixEntryLayout {
+    LayoutRegion codes, high, scales;
+    friend bool operator==(const ExpertMatrixEntryLayout&,
+                           const ExpertMatrixEntryLayout&) = default;
+};
 
 struct ExpertBankId {
     std::uint32_t index = UINT32_MAX;
@@ -88,6 +97,12 @@ struct ExpertBankDeviceView {
     std::uint32_t count = 0;
     Device device;
 };
+
+[[nodiscard]] ExpertMatrixEntryLayout plan_expert_matrix(LayoutBuilder&, const WeightBankLayout&);
+[[nodiscard]] ExpertMatrixDeviceView indexed_weight_matrix(const WeightParent&,
+                                                           const std::uint64_t* offsets,
+                                                           const float* divisors,
+                                                           ConstMemorySpan storage);
 
 [[nodiscard]] WeightBankLayout describe_weight_bank(const WeightGeometry& geometry,
                                                     const WeightBankRegion& region);

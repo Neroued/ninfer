@@ -147,7 +147,15 @@ bf16_finish_mma_tile(const Output& output, const Epilogue& epilogue, unsigned ch
                       epilogue.template finish_tile<Schedule, FullTokens>(
                           destination, scratch, accum, row_begin, token_begin, rows, tokens);
                   }) {
-        static_assert(!bf16_predicated_rows<Schedule>, "row-tail MMA requires a scalar epilogue");
+        static_assert(
+            !bf16_predicated_rows<Schedule> ||
+                [] {
+                    if constexpr (requires { Epilogue::kPredicatedRows; })
+                        return Epilogue::kPredicatedRows;
+                    else
+                        return false;
+                }(),
+            "row-tail collective epilogue must own its row predicates");
         // All staging reads must have finished before a collective consumer reuses scratch.
         __syncthreads();
         epilogue.template finish_tile<Schedule, FullTokens>(destination, scratch, accum, row_begin,

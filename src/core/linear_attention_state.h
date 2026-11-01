@@ -21,22 +21,19 @@ struct LinearAttentionStateLayout {
 };
 
 struct LinearAttentionStateAllLayersView {
-    Tensor conv_layer0;
-    Tensor recurrent_layer0;
-    std::int64_t conv_layer_stride_bytes      = 0;
-    std::int64_t recurrent_layer_stride_bytes = 0;
+    StateFieldView conv;
+    StateFieldView recurrent;
     LinearAttentionStateSpec spec;
 };
 
 struct LinearAttentionStateLayerView {
-    Tensor conv;
-    Tensor recurrent;
+    StateFieldView conv;
+    StateFieldView recurrent;
 };
 
 [[nodiscard]] LinearAttentionStateLayout
 plan_linear_attention_state(StateImageBuilder& builder, const LinearAttentionStateSpec& spec);
 
-// Typed consumers of StateImage fields; slot ownership and transfers belong to the image store.
 class LinearAttentionStateView {
 public:
     LinearAttentionStateView(const StateImageStorage& storage,
@@ -46,14 +43,13 @@ public:
 
     [[nodiscard]] std::uint32_t layer_count() const noexcept { return view_.spec.layers; }
 
-    [[nodiscard]] std::int32_t slot_count() const noexcept { return view_.conv_layer0.ne[2]; }
+    [[nodiscard]] LinearAttentionStateLayerView layer_view(std::uint32_t layer,
+                                                           const Tensor& byte_offsets) const;
+    [[nodiscard]] LinearAttentionStateAllLayersView
+    all_layers_view(const Tensor& byte_offsets = {}) const;
 
-    [[nodiscard]] LinearAttentionStateLayerView layer_view(std::uint32_t layer) const;
-
-    [[nodiscard]] LinearAttentionStateAllLayersView all_layers_view() const { return view_; }
-
-    [[nodiscard]] Tensor conv_slot(std::uint32_t layer, std::int32_t slot) const;
-    [[nodiscard]] Tensor recurrent_slot(std::uint32_t layer, std::int32_t slot) const;
+    [[nodiscard]] Tensor conv_tensor(std::uint32_t layer, std::int64_t byte_offset) const;
+    [[nodiscard]] Tensor recurrent_tensor(std::uint32_t layer, std::int64_t byte_offset) const;
 
 private:
     LinearAttentionStateAllLayersView view_;

@@ -9,10 +9,10 @@ __device__ __constant__ unsigned nf4_words[16] = {
 };
 __device__ __constant__ double e2m1[8] = {0., .5, 1., 1.5, 2., 3., 4., 6.};
 
-__device__ double scale_value(int word) {
+__device__ float scale_value(int word) {
     const int exponent = word >> 3;
-    return exponent ? double(__int_as_float(((exponent + 120) << 23) | ((word & 7) << 20)))
-                    : (word & 7) * (1. / 512.);
+    return exponent ? __int_as_float(((exponent + 120) << 23) | ((word & 7) << 20))
+                    : (word & 7) * (1.f / 512.f);
 }
 
 template <bool NF4>
@@ -50,6 +50,42 @@ __device__ double error(double x, double s, unsigned mask) {
 }
 
 template <bool NF4>
+__device__ float error_lower_bound(float x_low, float x_high, float scale, unsigned mask) {
+    // Bracket the closest reconstruction intervals using directed FP32 rounding.
+    // Their distance from [x_low,x_high] bounds the exact distance from below.
+    int low = 0, high = NF4 ? 15 : 7;
+#pragma unroll
+    for (int i = 0; i < (NF4 ? 4 : 3); ++i) {
+        const int mid = (low + high) / 2;
+        if (__fmul_ru(float(code_value<NF4>(mid)), scale) < x_low)
+            low = mid + 1;
+        else
+            high = mid;
+    }
+    const float value = float(code_value<NF4>(low));
+    float distance    = fmaxf(fmaxf(__fsub_rd(__fmul_rd(value, scale), x_high),
+                                    __fsub_rd(x_low, __fmul_ru(value, scale))),
+                              0.f);
+    if (low) {
+        const float left =
+            fmaxf(__fsub_rd(x_low, __fmul_ru(float(code_value<NF4>(low - 1)), scale)), 0.f);
+        distance = fminf(distance, left);
+    }
+    float sum = __fmul_rd(distance, distance);
+#pragma unroll
+    for (int offset = 8; offset; offset /= 2)
+        sum = __fadd_rd(sum, __shfl_xor_sync(mask, sum, offset, 16));
+    return __shfl_sync(mask, sum, 0, 16);
+}
+
+__device__ float incumbent_upper_bound(double error) {
+    // One outward FP32 ULP also covers the rounding of the FP64 squared-error
+    // calculation and its four reduction steps. Overflow disables pruning.
+    const float rounded = __double2float_ru(error);
+    return isfinite(rounded) ? __int_as_float(__float_as_int(rounded) + 1) : rounded;
+}
+
+template <bool NF4>
 __global__ void encode(const float* values, unsigned char* codes, unsigned char* scales,
                        int64_t groups, double divisor) {
     const int64_t index = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -66,7 +102,10 @@ __global__ void encode(const float* values, unsigned char* codes, unsigned char*
         maximum = fmax(maximum, __shfl_xor_sync(mask, maximum, offset, 16));
     int best_word = 0, code = NF4 ? 7 : 0;
     if (maximum != 0.) {
-        const double limit = NF4 ? 1. : 6.;
+        const double limit  = NF4 ? 1. : 6.;
+        const double target = NF4 ? x : fabs(x);
+        const float x_low = __double2float_rd(target), x_high = __double2float_ru(target);
+        const float maximum_low = __double2float_rd(maximum);
         int low = 1, high = 126;
         while (low < high) {
             const int mid = (low + high) / 2;
@@ -77,16 +116,17 @@ __global__ void encode(const float* values, unsigned char* codes, unsigned char*
         }
         best_word         = low;
         double best_error = error<NF4>(x, scale_value(best_word), mask);
+        float upper       = incumbent_upper_bound(best_error);
         for (int word = 1; word <= 126; ++word) {
-            const double s = scale_value(word);
-            // One maximum-magnitude element already exceeds the incumbent error:
-            // even endpoint clipping cannot improve this candidate.
-            const double clipped = fmax(maximum - limit * s, 0.);
-            if (clipped * clipped > best_error) continue;
+            const float s       = scale_value(word);
+            const float clipped = fmaxf(__fsub_rd(maximum_low, float(limit) * s), 0.f);
+            if (__fmul_rd(clipped, clipped) > upper) continue;
+            if (error_lower_bound<NF4>(x_low, x_high, s, mask) > upper) continue;
             const double candidate = error<NF4>(x, s, mask);
             if (candidate < best_error || (candidate == best_error && word < best_word)) {
                 best_error = candidate;
                 best_word  = word;
+                upper      = incumbent_upper_bound(best_error);
             }
         }
         code = nearest<NF4>(x, scale_value(best_word));

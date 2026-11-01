@@ -9,13 +9,6 @@
 
 namespace ninfer {
 
-struct ExpertMatrixEntryLayout {
-    LayoutRegion codes, high, scales;
-
-    friend bool operator==(const ExpertMatrixEntryLayout&,
-                           const ExpertMatrixEntryLayout&) = default;
-};
-
 struct ExpertBankCacheLayout {
     ExpertMatrixEntryLayout gate_up, down;
     std::size_t entry_bytes   = 0;
@@ -55,8 +48,6 @@ struct ExpertBankCacheSpec {
     WeightBankLayout gate_up, down;
     bool resident = false;
 };
-
-inline constexpr std::uint64_t kExpertAbsentOffset = UINT64_MAX;
 
 class ExpertCache;
 

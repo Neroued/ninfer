@@ -5,13 +5,14 @@
 
 namespace ninfer::bench::gdn_replay {
 struct Profile {
-    int layers = 36, value_heads = 48, conv_channels = 10240;
+    int layers = 36, qk_heads = 16, value_heads = 48, conv_channels = 10240;
 };
 
 struct Options {
     measurement::Options timing;
     Profile profile;
     std::string op = "fold", commits = "dense", valid = "dense";
+    std::string row_metadata = "host";
     std::vector<int> tokens{16};
     int batch = 1;
 };
@@ -22,12 +23,14 @@ inline Options parse_options(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
         const std::string_view flag = argv[i];
         if (flag == "--help" || flag == "-h") {
-            std::cout << "GDN Replay benchmark\n"
-                         "  --op fold|record --layers L --value-heads H --conv-channels C\n"
-                         "  --tokens T[,T...] or --sweep START:END[:STEP] --batch B\n"
-                         "  --commits dense|one|mixed|N[,N...] --valid dense|mixed|N[,N...]\n"
-                         "Q/K heads=16, head dimension=128, T=2..16, B=1..8.\n"
-                         "Fold times all specified layers; record times one recurrence layer.\n";
+            std::cout
+                << "GDN Replay benchmark\n"
+                   "  --op fold|record --layers L --qk-heads Q --value-heads H --conv-channels C\n"
+                   "  --tokens T[,T...] or --sweep START:END[:STEP] --batch B\n"
+                   "  --commits dense|one|mixed|N[,N...] --valid dense|mixed|N[,N...]\n"
+                   "  --row-metadata host|device (fold only, default host)\n"
+                   "Head dimension=128, T=2..16, B=1..8.\n"
+                   "Fold times all specified layers; record times one recurrence layer.\n";
             measurement::help();
             std::exit(0);
         }
@@ -36,6 +39,8 @@ inline Options parse_options(int argc, char** argv) {
             o.op = value;
         else if (flag == "--layers")
             o.profile.layers = measurement::integer(value);
+        else if (flag == "--qk-heads")
+            o.profile.qk_heads = measurement::integer(value);
         else if (flag == "--value-heads")
             o.profile.value_heads = measurement::integer(value);
         else if (flag == "--conv-channels")
@@ -54,10 +59,16 @@ inline Options parse_options(int argc, char** argv) {
             o.commits = value;
         else if (flag == "--valid")
             o.valid = value;
-        else if (!measurement::parse(o.timing, flag, value))
+        else if (flag == "--row-metadata") {
+            if (value != "host" && value != "device")
+                throw std::invalid_argument("row-metadata: host|device");
+            o.row_metadata = value;
+        } else if (!measurement::parse(o.timing, flag, value))
             throw std::invalid_argument("unknown option: " + std::string(flag));
     }
     if (o.op != "fold" && o.op != "record") throw std::invalid_argument("unknown Replay Op");
+    if (o.op != "fold" && o.row_metadata != "host")
+        throw std::invalid_argument("row-metadata applies to fold");
     if (o.batch > 8) throw std::invalid_argument("B must be <=8");
     for (int t : o.tokens)
         if (t < 2 || t > 16) throw std::invalid_argument("T must be in [2,16]");

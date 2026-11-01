@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import struct
 
-import torch
+import pytest
 from safetensors.torch import save_file
+import torch
 
 from tools.convert.sources.safetensors import SafetensorsSource
 from tools.convert.sources.compressed_tensors import (
@@ -12,6 +13,30 @@ from tools.convert.sources.compressed_tensors import (
 )
 from tools.convert.sources.logical import select_rows
 from tools.convert.sources.modelopt_nvfp4 import ModelOptNvfp4
+
+
+def test_source_failure_does_not_publish_conversion(tmp_path):
+    from tools.convert.model import Model, Parameter
+    from tools.convert.pipeline import convert
+    from tools.convert.recipe import Recipe
+    from tools.convert.sources.logical import LogicalSource
+
+    def read(begin, end):
+        if begin >= 32:
+            raise OSError("source read failed")
+        return torch.ones(end - begin, dtype=torch.bfloat16)
+
+    model = Model({"text": {"config": {}}})
+    model.add(Parameter("w", (8, 16), LogicalSource((8, 16), "fault", read)))
+    with pytest.raises(ValueError, match="source read failed"):
+        convert(
+            model,
+            Recipe(model),
+            tmp_path / "failed.ninfer",
+            device="cpu",
+            rows_per_chunk=2,
+        )
+    assert not list(tmp_path.iterdir())
 
 
 def test_nvfp4_source_preserves_words_and_decodes_independently(tmp_path):

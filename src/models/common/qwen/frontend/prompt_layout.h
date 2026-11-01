@@ -21,10 +21,5 @@ struct PromptLayout {
 };
 
 [[nodiscard]] PromptLayout inspect_prompt_layout(const text::TemplateOutput& rendered,
-                                                 std::span<const Modality> media);
-[[nodiscard]] std::optional<text::ByteSpan>
-unique_output_region(const text::TemplateOutput& rendered, std::uint32_t tag);
-[[nodiscard]] std::optional<std::size_t> source_boundary(const text::TemplateOutput& rendered,
-                                                         std::uint32_t tag, std::size_t offset);
-
+                                                 std::span<const models::frontend::Modality> media);
 } // namespace ninfer::models::qwen::frontend

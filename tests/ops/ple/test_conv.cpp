@@ -1,3 +1,4 @@
+#include "ops/suite.h"
 #include "conv_fixture.h"
 #include "core/decode_graph.h"
 
@@ -71,10 +72,11 @@ int split_window(DeviceContext& device, bool norm) {
     auto first_count   = to_device(std::vector<int>{5});
     auto second_count  = to_device(std::vector<int>{12});
     auto second_offset = to_device(std::vector<int>{5});
-    auto zero          = to_device(std::vector<int>{0});
+    auto zero          = to_device(std::vector<std::int64_t>{0});
     const Tensor first(first_count.span(), DType::I32, {1}),
         second(second_count.span(), DType::I32, {1});
-    const ops::PleConvStateView middle{intermediate.tensor, Tensor(zero.span(), DType::I32, {1})};
+    const ops::PleConvStateView middle{history_field(
+        intermediate.tensor, intermediate.device->span(), Tensor(zero.span(), DType::I64, {1}))};
     cuda_synchronize();
     const auto segment = [&](int start, int count, const Tensor& valid,
                              const ops::PleConvStateView& before, const Tensor& offsets) {
@@ -118,24 +120,25 @@ int split_window(DeviceContext& device, bool norm) {
 int output_in_history_gap(DeviceContext& device) {
     ConvFixture f(1, 1);
     f.prepare(0, false);
-    Words storage({D, 9, 1}, 0, {1, 2 * D, 18 * D, 18 * D});
+    Words storage({D, 9, 2});
     for (int j = 0; j < 9; ++j)
         for (int c = 0; c < D; ++c)
             storage.host[storage.index(c, j)] = f.history.host[f.history.index(c, j, f.source[0])];
     storage.upload();
-    auto slot = to_device(std::vector<int>{0});
-    f.y = Tensor(storage.device->span().subspan(std::size_t(D) * 2), DType::BF16, {H, C, 1, 1});
+    auto slot = to_device(std::vector<std::int64_t>{0});
+    f.y = Tensor(storage.device->span().subspan(std::size_t(D) * 9 * 2), DType::BF16, {H, C, 1, 1});
     cuda_synchronize();
     ops::ple_conv_add_norm(f.residual.tensor, f.gated.tensor, f.kernel.tensor, f.batch_view(),
-                           {storage.tensor, Tensor(slot.span(), DType::I32, {1})}, f.record_view(),
-                           f.norm.tensor, epsilon, f.y, f.normalized.tensor,
+                           {history_field(storage.tensor, storage.device->span(),
+                                          Tensor(slot.span(), DType::I64, {1}))},
+                           f.record_view(), f.norm.tensor, epsilon, f.y, f.normalized.tensor,
                            device.execution_view());
     device.synchronize();
     int failures  = f.verify(true, "PLE output in unused history gap");
     auto expected = storage.host;
     const auto y  = from_device<std::uint16_t>(f.y.data, D);
-    std::copy(y.begin(), y.end(), expected.begin() + D);
-    failures += verify_exact("PLE strided input regions preserved", storage.download(), expected);
+    std::copy(y.begin(), y.end(), expected.begin() + 9 * D);
+    failures += verify_exact("PLE other record regions preserved", storage.download(), expected);
     return failures + storage.device->verify_guards("PLE shared allocation");
 }
 
@@ -153,35 +156,45 @@ int short_record_view(DeviceContext& device, bool norm) {
 }
 } // namespace
 
-int main() {
-    if (cuda_unavailable()) return 77;
-    try {
-        DeviceContext device;
-        int failures = validation(device);
-        failures += output_in_history_gap(device);
-        for (bool norm : {false, true}) {
-            failures += short_record_view(device, norm);
-            failures += split_window(device, norm);
-            for (int t : {1, 2, 3, 4, 6, 8, 9, 10, 16, 17, 33})
-                failures +=
-                    run(device, t, t % 2 ? 1 : 8, 0, t % 3 == 0, norm, t == 1 || t == 9 || t == 16);
-            for (int layout : {1, 2}) failures += run(device, 13, 3, layout, true, norm, true);
-            for (float scale : {0.f, 1e-5f})
-                failures += run(device, 4, 2, 0, false, norm, true, scale);
-            failures += run(device, 1024, 1, 0, false, norm);
-            failures += run(device, 4097, 1, 0, true, norm);
-            if (norm) {
-                const int small = device.multiprocessor_count() / 2;
-                for (int t : {small - 1, small, small + 1, 1023, 1025, 2303, 2304, 2305})
-                    failures += run(device, t, 1, 0, true, true, t == small || t == 1025);
-            } else {
-                for (int t : {127, 128, 129}) failures += run(device, t, 1, 0, false, false);
-            }
+void add_ple_conv_cases(ninfer::test::OpSuite& suite) {
+    suite.add("ple_conv/contract", [] { return validation(cuda_environment().context); });
+    suite.add("ple_conv/history_gap",
+              [] { return output_in_history_gap(cuda_environment().context); });
+    const auto add = [&](int t, int b, int layout, bool inplace, bool norm, bool graph = false,
+                         float scale = 1.f) {
+        suite.add("ple_conv/t" + std::to_string(t) + "/b" + std::to_string(b) + "/layout" +
+                      std::to_string(layout) + (inplace ? "/alias" : "/disjoint") +
+                      (norm ? "/norm" : "/plain") + "/scale" + std::to_string(scale) +
+                      (graph ? "/graph" : "/eager"),
+                  [=] {
+                      return run(cuda_environment().context, t, b, layout, inplace, norm, graph,
+                                 scale);
+                  },
+                  {{"execution", graph ? "graph" : "eager"}});
+    };
+    for (bool norm : {false, true}) {
+        suite.add(std::string("ple_conv/short_record/") + (norm ? "norm" : "plain"),
+                  [=] { return short_record_view(cuda_environment().context, norm); });
+        suite.add(std::string("ple_conv/split_window/") + (norm ? "norm" : "plain"),
+                  [=] { return split_window(cuda_environment().context, norm); });
+        for (int t : {1, 2, 3, 4, 6, 8, 9, 10, 16, 17, 33})
+            add(t, t % 2 ? 1 : 8, 0, t % 3 == 0, norm, t == 1 || t == 9 || t == 16);
+        for (int layout : {1, 2}) add(13, 3, layout, true, norm, true);
+        for (float scale : {0.f, 1e-5f}) add(4, 2, 0, false, norm, true, scale);
+        add(1024, 1, 0, false, norm);
+        add(4097, 1, 0, true, norm);
+        if (norm) {
+            for (int delta : {-1, 0, 1})
+                suite.add("ple_conv/sm_boundary/" + std::to_string(delta),
+                          [=] {
+                              auto& device = cuda_environment().context;
+                              return run(device, device.multiprocessor_count() / 2 + delta, 1, 0,
+                                         true, true, delta == 0);
+                          },
+                          {{"execution", delta == 0 ? "graph" : "eager"}});
+            for (int t : {1023, 1025, 2303, 2304, 2305}) add(t, 1, 0, true, true, t == 1025);
+        } else {
+            for (int t : {127, 128, 129}) add(t, 1, 0, false, false);
         }
-        if (failures) return 1;
-        std::cout << "OK PLE convolution, BF16 residual seam, masks, strides and Graph replay\n";
-    } catch (const std::exception& e) {
-        std::cerr << e.what() << '\n';
-        return 1;
     }
 }

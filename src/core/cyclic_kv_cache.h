@@ -4,17 +4,38 @@
 
 namespace ninfer {
 
-// Absolute position p resides at p % capacity. Frontiers are supplied by each consumer.
-// Each slot's [head_dim, padded_capacity, num_kv_heads] is dense; slot stride is explicit.
+// Absolute position p resides at p % capacity. Each record contains dense [D,capacity,H] fields.
 struct CyclicKVCacheLayerView {
     [[nodiscard]] Device device() const;
-    Tensor k;
-    Tensor v;
+    StateFieldView k;
+    StateFieldView v;
     std::uint32_t capacity        = 0;
     std::uint32_t padded_capacity = 0;
     std::int32_t num_kv_heads     = 0;
     std::int32_t head_dim         = 0;
-    std::int32_t slot_count       = 0;
+};
+
+struct ConstCyclicKVCacheLayerView {
+    ConstStateFieldView k;
+    ConstStateFieldView v;
+    std::uint32_t capacity        = 0;
+    std::uint32_t padded_capacity = 0;
+    std::int32_t num_kv_heads     = 0;
+    std::int32_t head_dim         = 0;
+
+    ConstCyclicKVCacheLayerView() = default;
+
+    ConstCyclicKVCacheLayerView(ConstStateFieldView k, ConstStateFieldView v,
+                                std::uint32_t capacity, std::uint32_t padded_capacity,
+                                std::int32_t num_kv_heads, std::int32_t head_dim)
+        : k(k), v(v), capacity(capacity), padded_capacity(padded_capacity),
+          num_kv_heads(num_kv_heads), head_dim(head_dim) {}
+
+    ConstCyclicKVCacheLayerView(const CyclicKVCacheLayerView& view)
+        : k(view.k), v(view.v), capacity(view.capacity), padded_capacity(view.padded_capacity),
+          num_kv_heads(view.num_kv_heads), head_dim(view.head_dim) {}
+
+    [[nodiscard]] Device device() const;
 };
 
 struct CyclicKVCacheLayout {
@@ -39,19 +60,18 @@ public:
 
     [[nodiscard]] std::uint32_t layer_count() const noexcept { return layers_; }
 
-    [[nodiscard]] std::uint32_t capacity() const noexcept { return layer0_.capacity; }
+    [[nodiscard]] std::uint32_t capacity() const noexcept { return all_layers_.capacity; }
 
-    [[nodiscard]] std::uint32_t padded_capacity() const noexcept { return layer0_.padded_capacity; }
+    [[nodiscard]] std::uint32_t padded_capacity() const noexcept {
+        return all_layers_.padded_capacity;
+    }
 
-    [[nodiscard]] std::int32_t slot_count() const noexcept { return layer0_.slot_count; }
-
-    [[nodiscard]] CyclicKVCacheLayerView layer_view(std::uint32_t layer) const;
+    [[nodiscard]] CyclicKVCacheLayerView layer_view(std::uint32_t layer,
+                                                    const Tensor& byte_offsets) const;
 
 private:
-    CyclicKVCacheLayerView layer0_;
+    CyclicKVCacheLayerView all_layers_;
     std::uint32_t layers_;
-    std::int64_t k_layer_stride_;
-    std::int64_t v_layer_stride_;
 };
 
 } // namespace ninfer

@@ -1,6 +1,7 @@
 #pragma once
 
-#include "models/qwen3_5/program/text_graph.h"
+#include "models/common/moe/schedule.h"
+#include "models/common/graph_preparation.h"
 #include "ninfer/types.h"
 
 namespace ninfer::models::qwen3_5 {
@@ -8,7 +9,6 @@ namespace execution {
 class Parameters;
 }
 
-// Within one startup configuration, only MoE residency changes the required graph variants.
 struct GraphPreparationPlan {
     bool segmented = false;
     std::vector<moe::GraphPlan> layers_by_batch;
@@ -17,9 +17,7 @@ struct GraphPreparationPlan {
 
 struct GraphCalibration {
     GraphPreparationPlan plan;
-    std::size_t rebuild_bytes                = 0;
-    std::int64_t preparation_increment_bytes = 0;
-    std::int64_t retained_increment_bytes    = 0;
+    GraphMemorySummary memory;
 };
 
 [[nodiscard]] GraphPreparationPlan describe_graph_preparation(const EngineOptions&,

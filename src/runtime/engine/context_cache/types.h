@@ -11,7 +11,7 @@ struct CacheRetentionPriority {
     std::uint64_t last_demand = 0;
 };
 
-enum class ReclaimProgress : std::uint8_t { Blocked, Changed, Transferring };
+enum class ReclaimProgress : std::uint8_t { Blocked, Changed, Transferring, Deferred, Retry };
 
 enum class ReclaimPurpose : std::uint8_t { Execution, FreshAdmission, OptionalWrite };
 

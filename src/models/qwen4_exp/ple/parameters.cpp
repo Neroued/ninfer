@@ -10,7 +10,7 @@ namespace ninfer::models::qwen4_exp::ple {
 
 LookupParameters load_lookup_parameters(const artifact::Reader& reader,
                                         const artifact::Binding& table,
-                                        artifact::ObjectHandle controls,
+                                        std::span<const std::byte> controls,
                                         HashGeometry hash_geometry) {
     using namespace artifact;
     if (hash_geometry.ngram_size != 3 || hash_geometry.heads_per_ngram != kHeads / 2)
@@ -41,13 +41,9 @@ LookupParameters load_lookup_parameters(const artifact::Reader& reader,
         checked_mul(result.rows, kRowElements, "PLE elements") != table.elements) {
         throw ArtifactError("PLE table logical extent is inconsistent");
     }
-    const auto& resource = reader.directory().object(controls);
-    if (!std::holds_alternative<ResourceObject>(resource) || object_bytes(resource) != 280) {
-        throw ArtifactError("invalid PLE hash controls resource");
-    }
-    const auto bytes = reader.read_object(controls);
-    auto word        = [&](std::size_t i) {
-        return std::bit_cast<std::int64_t>(read_u64_le(bytes.data() + 8 * i));
+    if (controls.size() != 280) throw ArtifactError("invalid PLE hash controls resource");
+    auto word = [&](std::size_t i) {
+        return std::bit_cast<std::int64_t>(read_u64_le(controls.data() + 8 * i));
     };
     auto& hash = result.hash;
     for (std::size_t i = 0; i < 3; ++i) hash.multipliers[i] = word(i);

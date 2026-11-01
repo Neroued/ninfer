@@ -8,18 +8,13 @@ ninfer_add_test(ninfer_artifact_backing_test
 set_tests_properties(ninfer_artifact_backing_test PROPERTIES TIMEOUT 30)
 
 ninfer_add_test(ninfer_artifact_materialization_test
-  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_materialization.cpp" "${CMAKE_CURRENT_LIST_DIR}/materialization_cuda_errors.cpp"
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_materialization.cpp" "${CMAKE_CURRENT_LIST_DIR}/materialization_io.cpp"
+    "${CMAKE_CURRENT_LIST_DIR}/encoded_slice_checks.cpp"
   LIBRARIES ninfer_artifact)
 
-target_link_options(ninfer_artifact_materialization_test PRIVATE
-  "LINKER:--wrap=cudaMalloc"
-  "LINKER:--wrap=cudaMallocHost"
-  "LINKER:--wrap=cudaFree"
-  "LINKER:--wrap=cudaFreeHost"
-  "LINKER:--wrap=cudaEventCreateWithFlags"
-  "LINKER:--wrap=cudaEventRecord"
-  "LINKER:--wrap=cudaMemcpyAsync"
-  "LINKER:--wrap=cudaStreamSynchronize")
+ninfer_test_interpose(ninfer_artifact_materialization_test
+  cudaMalloc cudaMallocHost cudaFree cudaFreeHost cudaEventCreateWithFlags cudaEventRecord
+  cudaMemcpyAsync cudaStreamSynchronize statx)
 
 add_test(NAME ninfer_artifact_writer_interop_test
   COMMAND ${Python3_EXECUTABLE} -B "${CMAKE_CURRENT_LIST_DIR}/writer_interop.py"

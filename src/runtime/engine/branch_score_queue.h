@@ -26,6 +26,8 @@ struct BranchScoreQueue {
     const bool enabled;
     const bool cache_enabled;
     std::deque<std::shared_ptr<Job>> pending;
+    // Fatal failure is settled by fail_all only after native readers have drained.
+    std::shared_ptr<Job> active;
 };
 
 } // namespace ninfer::runtime

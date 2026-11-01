@@ -6,36 +6,69 @@
 #include <stdexcept>
 
 namespace ninfer::models::qwen {
+
+bool recovery_prefix_matches(const RecoveryIdentityView& earlier,
+                             const RecoveryIdentityView& later) {
+    const auto frontier = earlier.frontier;
+    if (frontier > later.frontier || earlier.domain != later.domain ||
+        earlier.digests.at(frontier) != later.digests.at(frontier))
+        return false;
+    if (earlier.backing && earlier.backing == later.backing) return true;
+    return std::equal(earlier.tokens.begin(), earlier.tokens.begin() + frontier,
+                      later.tokens.begin()) &&
+           earlier.positions.prefix_equals(later.positions, frontier);
+}
+
 namespace {
 
-bool same_grid(const VisionGrid& left, const VisionGrid& right) {
+void validate_generated(std::size_t begin, std::size_t count, std::int32_t rope_delta,
+                        std::optional<std::uint32_t> split) {
+    constexpr auto maximum = std::size_t(std::numeric_limits<std::int32_t>::max());
+    if (begin > maximum || count > maximum + 1 - begin)
+        throw std::overflow_error("generated prefix exceeds int32 positions");
+    if (count) {
+        const auto first = static_cast<std::int64_t>(begin) + rope_delta;
+        const auto last  = first + static_cast<std::int64_t>(count) - 1;
+        if (first < std::numeric_limits<std::int32_t>::min() ||
+            last > std::numeric_limits<std::int32_t>::max())
+            throw std::overflow_error("generated MRoPE position exceeds int32");
+    }
+    if (split && (!*split || *split > count))
+        throw std::invalid_argument("generated execution split is outside the appended span");
+}
+
+bool same_grid(const models::frontend::VisionGrid& left,
+               const models::frontend::VisionGrid& right) {
     return left.temporal == right.temporal && left.height == right.height &&
            left.width == right.width;
 }
 
-bool same_spans(const std::vector<TokenSpan>& left, const std::vector<TokenSpan>& right) {
-    return left.size() == right.size() && std::equal(left.begin(), left.end(), right.begin(),
-                                                     [](const TokenSpan& a, const TokenSpan& b) {
-                                                         return a.begin == b.begin &&
-                                                                a.count == b.count;
-                                                     });
+bool same_spans(const std::vector<models::frontend::TokenSpan>& left,
+                const std::vector<models::frontend::TokenSpan>& right) {
+    return left.size() == right.size() &&
+           std::equal(
+               left.begin(), left.end(), right.begin(),
+               [](const models::frontend::TokenSpan& a, const models::frontend::TokenSpan& b) {
+                   return a.begin == b.begin && a.count == b.count;
+               });
 }
 
-bool same_item(const VisionItem& left, const VisionItem& right) {
+bool same_item(const models::frontend::VisionItem& left,
+               const models::frontend::VisionItem& right) {
     return left.modality == right.modality && same_grid(left.grid, right.grid) &&
            left.patch_begin == right.patch_begin && left.patch_count == right.patch_count &&
            left.content_digest == right.content_digest && left.timestamps == right.timestamps &&
            same_spans(left.token_spans, right.token_spans);
 }
 
-bool prefix_item_count(const std::vector<VisionItem>& items, std::size_t tokens,
+bool prefix_item_count(const std::vector<models::frontend::VisionItem>& items, std::size_t tokens,
                        std::size_t* count) {
     *count          = 0;
     bool saw_suffix = false;
-    for (const VisionItem& item : items) {
+    for (const models::frontend::VisionItem& item : items) {
         if (item.token_spans.empty()) { return false; }
-        const TokenSpan& first = item.token_spans.front();
-        const TokenSpan& last  = item.token_spans.back();
+        const models::frontend::TokenSpan& first = item.token_spans.front();
+        const models::frontend::TokenSpan& last  = item.token_spans.back();
         if (first.count == 0 || last.count == 0 ||
             last.begin > std::numeric_limits<std::size_t>::max() - last.count) {
             return false;
@@ -73,7 +106,7 @@ void mix_digest(DigestPair& digest, std::uint64_t value) noexcept {
     }
 }
 
-void mix_vision_item(DigestPair& digest, const VisionItem& item) noexcept {
+void mix_vision_item(DigestPair& digest, const models::frontend::VisionItem& item) noexcept {
     mix_digest(digest, kVisionDigestDomain);
     mix_digest(digest, static_cast<std::uint8_t>(item.modality));
     mix_digest(digest, static_cast<std::uint32_t>(item.grid.temporal));
@@ -87,7 +120,7 @@ void mix_vision_item(DigestPair& digest, const VisionItem& item) noexcept {
         mix_digest(digest, std::bit_cast<std::uint64_t>(timestamp));
     }
     mix_digest(digest, item.token_spans.size());
-    for (const TokenSpan& span : item.token_spans) {
+    for (const models::frontend::TokenSpan& span : item.token_spans) {
         mix_digest(digest, span.begin);
         mix_digest(digest, span.count);
     }
@@ -115,12 +148,13 @@ void append_digest(std::vector<DigestPair>& digests, TokenId token, std::uint8_t
     digests.push_back(digest);
 }
 
-std::size_t checked_vision_end(const VisionItem& item, std::size_t prompt_tokens) {
+std::size_t checked_vision_end(const models::frontend::VisionItem& item,
+                               std::size_t prompt_tokens) {
     if (item.token_spans.empty()) {
         throw std::invalid_argument("Vision shortlist item has no token spans");
     }
     std::size_t previous_end = 0;
-    for (const TokenSpan& span : item.token_spans) {
+    for (const models::frontend::TokenSpan& span : item.token_spans) {
         if (span.count == 0 || span.begin > prompt_tokens ||
             span.count > prompt_tokens - span.begin || span.begin < previous_end) {
             throw std::invalid_argument("Vision shortlist item has invalid token spans");
@@ -135,6 +169,7 @@ std::size_t checked_vision_end(const VisionItem& item, std::size_t prompt_tokens
 void ResidentPrefixIdentity::reserve(std::size_t tokens) {
     token_types_.reserve(tokens);
     for (auto& axis : positions_) { axis.reserve(tokens); }
+    rewrite_execution_frontiers_.reserve(tokens);
 }
 
 void ResidentPrefixIdentity::clear() noexcept {
@@ -182,6 +217,15 @@ void ResidentPrefixIdentity::swap(ResidentPrefixIdentity& other) noexcept {
     rewrite_execution_frontiers_.swap(other.rewrite_execution_frontiers_);
     std::swap(regular_prefix_, other.regular_prefix_);
     position_origins_.swap(other.position_origins_);
+}
+
+void ResidentPrefixIdentity::prepare_generated(std::size_t count, std::int32_t rope_delta,
+                                               std::optional<std::uint32_t> split) {
+    validate_generated(size(), count, rope_delta, split);
+    if (split && !rewrite_execution_frontiers_.empty() &&
+        rewrite_execution_frontiers_.back() >= size() + *split)
+        throw std::logic_error("generated execution split is not a new ordered frontier");
+    reserve(size() + count);
 }
 
 void ResidentPrefixIdentity::append_generated(std::size_t count, std::int32_t rope_delta,
@@ -385,6 +429,14 @@ void PrefixShortlistDigests::assign(const PreparedPromptData& prompt) {
 
 void PrefixShortlistDigests::swap(PrefixShortlistDigests& other) noexcept {
     digests_.swap(other.digests_);
+}
+
+void PrefixShortlistDigests::prepare_generated(std::size_t count, std::int32_t rope_delta,
+                                               std::optional<std::uint32_t> split) {
+    if (digests_.empty())
+        throw std::logic_error("generated shortlist append has no resident prefix");
+    validate_generated(size(), count, rope_delta, split);
+    reserve(size() + count);
 }
 
 void PrefixShortlistDigests::append_generated(std::span<const TokenId> tokens,

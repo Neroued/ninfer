@@ -187,6 +187,27 @@ std::ostream& operator<<(std::ostream& os, const Grammar& grammar) {
   return os;
 }
 
+bool Grammar::Impl::ValidByteFSM(const GrammarExpr& e) {
+  if (e.size() < 3 || e[0] <= 0 || e[1] < 0 || e[1] >= e[0] || e[2] < 0 || e[2] > e.size() - 3 ||
+      (e.size() - 3 - e[2]) % 4 != 0)
+    return false;
+  for (int i = 3; i < 3 + e[2]; ++i)
+    if (e[i] < 0 || e[i] >= e[0]) return false;
+  for (int i = 3 + e[2]; i < e.size(); i += 4)
+    if (e[i] < 0 || e[i] >= e[0] || e[i + 1] < 0 || e[i + 1] >= e[0] || e[i + 2] < 0 ||
+        e[i + 2] > e[i + 3] || e[i + 3] > 255)
+      return false;
+  return true;
+}
+
+FSMWithStartEnd Grammar::Impl::GetByteFSM(const GrammarExpr& e) const {
+  XGRAMMAR_DCHECK(e.type == GrammarExprType::kByteFSM && ValidByteFSM(e));
+  FSM fsm;
+  for (int i = 0; i < e[0]; ++i) fsm.AddState();
+  for (int i = 3 + e[2]; i < e.size(); i += 4) fsm.AddEdge(e[i], e[i + 1], e[i + 2], e[i + 3]);
+  return FSMWithStartEnd(fsm, e[1], std::vector<int32_t>(e.begin() + 3, e.begin() + 3 + e[2]));
+}
+
 std::optional<std::string> Grammar::Impl::Validate() const {
   const int64_t num_rules = rules_.size();
   const int64_t num_exprs = grammar_expr_indptr_.size();
@@ -205,7 +226,7 @@ std::optional<std::string> Grammar::Impl::Validate() const {
     if (len < 0 || start + 2 + len > data_size) {
       return "The length of grammar expr " + std::to_string(expr_id) + " is out of range";
     }
-    if (type < 0 || type > static_cast<int64_t>(GrammarExprType::kSubstring)) {
+    if (type < 0 || type > static_cast<int64_t>(GrammarExprType::kByteFSM)) {
       return "Unknown type of grammar expr " + std::to_string(expr_id);
     }
   }
@@ -261,6 +282,9 @@ std::optional<std::string> Grammar::Impl::Validate() const {
         }
         break;
       }
+      case GrammarExprType::kByteFSM:
+        ok = ValidByteFSM(expr);
+        break;
       case GrammarExprType::kRegex:
         ok = size >= 1;
         break;

@@ -1,11 +1,11 @@
 #include "core/arena.h"
 #include "core/buffer.h"
-#include "core/cpu/executor.h"
 #include "core/layout.h"
 #include "core/transfer.h"
 
 #include <cstring>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <utility>
 
@@ -38,31 +38,6 @@ int main() {
         require(strided.device == Device::cpu() && strided.nb[0] == 32, "strided CPU view");
         require(*static_cast<float*>(strided.data) == 2, "CPU slice origin");
         require(matrix.reshape({32}).device == Device::cpu(), "reshape residency");
-
-        CpuTopology topology;
-        CpuExecutor executor(topology, plan_cpu_team(topology.info(), 1));
-        {
-            auto scope     = arena.scope();
-            Tensor scratch = arena.alloc(DType::FP32, {32});
-
-            struct Work {
-                float* input;
-                float* temporary;
-            } work{data, static_cast<float*>(scratch.data)};
-
-            executor.execution_view().run(
-                [](void* pointer, const CpuWorkerContext& worker) noexcept {
-                    auto& work       = *static_cast<Work*>(pointer);
-                    const auto range = worker.range(32);
-                    for (auto i = range.begin; i < range.end; ++i)
-                        work.temporary[i] = work.input[i] * 2;
-                    worker.barrier();
-                    for (auto i = range.begin; i < range.end; ++i)
-                        work.input[i] = work.temporary[31 - i];
-                },
-                &work);
-        }
-        for (int i = 0; i < 32; ++i) require(data[i] == 2.0F * (31 - i), "CPU tensor computation");
 
         const auto used = arena.used();
         {
@@ -100,6 +75,32 @@ int main() {
         const auto metadata = planned.alloc(DType::FP32, {8, 4});
         require(!metadata.data && metadata.device == Device{}, "planning has no residency");
         require(planned.peak_bytes(1) == matrix.bytes(), "planning and allocation agree");
+
+        const auto limit = std::numeric_limits<std::size_t>::max();
+        WorkspaceLayoutBuilder bytes;
+        (void)bytes.alloc_bytes(3, 1);
+        rejects<std::overflow_error>([&] { (void)bytes.alloc_bytes(limit, 8); });
+        require(bytes.peak_bytes(1) == 3, "failed byte layout changed the peak");
+        (void)bytes.alloc_bytes(1, 1);
+        require(bytes.peak_bytes(1) == 4, "failed byte layout retained alignment padding");
+        {
+            auto scope = bytes.scope();
+            (void)bytes.alloc_bytes(3, 8);
+            rejects<std::overflow_error>([&] { (void)bytes.alloc_bytes(limit, 16); });
+            require(bytes.peak_bytes(1) == 11, "failed scoped layout changed the peak");
+            (void)bytes.alloc_bytes(1, 1);
+            require(bytes.peak_bytes(1) == 12, "failed scoped layout changed the cursor");
+        }
+        (void)bytes.alloc_bytes(9, 1);
+        require(bytes.peak_bytes(1) == 13, "layout scope did not restore the saved cursor");
+
+        WorkspaceLayoutBuilder tensors;
+        (void)tensors.alloc_bytes(limit - 14, 1);
+        rejects<std::overflow_error>([&] { (void)tensors.alloc(DType::BF16, {2, 2}, 8); });
+        require(tensors.peak_bytes(1) == limit - 14, "failed tensor layout changed the peak");
+        (void)tensors.alloc_bytes(1, 1);
+        require(tensors.peak_bytes(1) == limit - 13,
+                "failed tensor layout retained alignment padding");
         std::cout << "OK memory\n";
         return 0;
     } catch (const std::exception& error) {

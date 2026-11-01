@@ -21,8 +21,16 @@ private:
     std::size_t requested_bytes_;
 };
 
+// Raw observations. available_bytes() is the platform's allocation-planning estimate.
 struct DeviceMemorySnapshot {
-    std::size_t free_bytes = 0, total_bytes = 0;
+    std::size_t cuda_free_bytes = 0, total_bytes = 0;
+    std::size_t system_available_bytes = 0, system_total_bytes = 0;
+    bool shared_physical_memory = false;
+
+    [[nodiscard]] std::size_t available_bytes() const noexcept {
+        if (!shared_physical_memory) return cuda_free_bytes;
+        return system_available_bytes < total_bytes ? system_available_bytes : total_bytes;
+    }
 };
 
 [[nodiscard]] DeviceMemorySnapshot device_memory_snapshot(Device);
@@ -160,6 +168,8 @@ public:
     // Only call during stream capture; this event must outlive every graph referencing it.
     void record_external(cudaStream_t stream);
     void wait(cudaStream_t stream) const;
+    // Capture an external dependency. Record the current producer generation before replay.
+    void wait_external(cudaStream_t stream) const;
     [[nodiscard]] bool ready() const;
     void synchronize() const;
 

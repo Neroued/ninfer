@@ -10,6 +10,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <vector>
+#include <set>
 
 using namespace ninfer;
 using namespace ninfer::bench;
@@ -19,7 +20,7 @@ namespace {
 constexpr int kD    = 1152;
 constexpr int kRows = 2304;
 
-void run(std::int32_t patches, bool profile_once) {
+void run(std::int32_t patches, bool profile_once, measurement::LogicalBenchmark& benchmark) {
     const std::size_t n = static_cast<std::size_t>(kD) * patches;
     DeviceBuffer table  = make_bf16(static_cast<std::size_t>(kD) * kRows, 101U);
     DeviceBuffer x      = make_bf16(n, 103U);
@@ -60,13 +61,11 @@ void run(std::int32_t patches, bool profile_once) {
         return;
     }
 
-    // Count x read/write, four BF16 table gathers, and per-patch indices/weights. Reused table
-    // rows may hit in cache, so logical throughput is not measured DRAM bandwidth.
-    const double logical_bytes = static_cast<double>(n) * 12.0 + patches * 32.0;
-    const Result result        = bench_loop_prepared(restore, launch, logical_bytes);
-    std::printf("embedding_interpolate_add [1152,%d] median=%8.2f us min=%8.2f us p95=%8.2f us "
-                "logical_bytes=%.0f logical=%8.1f GB/s\n",
-                patches, result.median_us, result.min_us, result.p95_us, logical_bytes, result.gbs);
+    const std::set<int> unique_rows(indices.begin(), indices.end());
+    const std::size_t bytes = n * 4 + unique_rows.size() * kD * 2 + patches * 32;
+    benchmark.run(
+        {.op = "interpolate-add", .format = "bf16", .n = kD, .k = kRows, .tokens = patches}, bytes,
+        launch, restore);
 }
 
 } // namespace
@@ -80,20 +79,29 @@ int main(int argc, char** argv) try {
 
     bool profile_once = false;
     std::vector<std::int32_t> patches;
+    measurement::Options timing;
     for (int i = 1; i < argc; ++i) {
+        const char* flag = argv[i];
         if (!std::strcmp(argv[i], "--profile-once")) {
             profile_once = true;
         } else if (!std::strcmp(argv[i], "--patch") && i + 1 < argc) {
             patches.push_back(measurement::integer(argv[++i]));
-        } else {
+        } else if (!std::strcmp(argv[i], "--help")) {
+            std::cout << "Position interpolation: --patch P (repeatable) --profile-once\n";
+            measurement::help();
+            return 0;
+        } else if (!measurement::parse(timing, flag, measurement::take(argc, argv, i))) {
             std::fprintf(stderr, "usage: %s [--patch P] [--profile-once]\n", argv[0]);
             return 2;
         }
     }
+    measurement::hardware();
+    measurement::LogicalBenchmark benchmark(timing);
+
     if (patches.empty()) {
         patches = {8, 256, 4096, 49152, 65536};
     }
-    for (const std::int32_t p : patches) { run(p, profile_once); }
+    for (const std::int32_t p : patches) { run(p, profile_once, benchmark); }
     return 0;
 } catch (const std::exception& error) {
 

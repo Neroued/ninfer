@@ -1,4 +1,4 @@
-#include "runner.h"
+#include "support.h"
 
 namespace ninfer::test::hc {
 namespace {

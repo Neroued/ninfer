@@ -8,33 +8,35 @@
 
 namespace ninfer::ops::detail::qsa {
 
-inline constexpr int kIndexerWindowQueries = 64;
-inline constexpr int kIndexerPartition     = 4096;
-static_assert(kIndexerWindowQueries <= kIndexerMaxWindowQueries);
+inline constexpr int kIndexerPartition = 4096;
 
 struct IndexerPlan {
     int window_tokens, columns, partitions;
 };
 
+int select_indexer_window_tokens(int tokens, int batch);
+
 inline IndexerPlan select_indexer_plan(int tokens, int batch, std::uint32_t visible_tokens) {
     const int blocks = visible_tokens / 4;
-    return {std::min(tokens, kIndexerWindowQueries / batch),
+    return {select_indexer_window_tokens(tokens, batch),
             (blocks + kIndexerKeyTile - 1) / kIndexerKeyTile * kIndexerKeyTile,
             (blocks + kIndexerPartition - 1) / kIndexerPartition};
 }
 
+enum class IndexerScore { Mma, Simt16, Simt8 };
+
 struct IndexerWindowPlan {
     int query_tile, score_workers, select_workers;
+    int stages             = 1;
+    IndexerScore score     = IndexerScore::Mma;
+    bool reverse_selection = false;
+    bool retain_keys       = false;
 };
 
-inline IndexerWindowPlan select_indexer_window(IndexerPlan plan, int width, int batch, int sms) {
-    const int tile         = width <= 4 ? 4 : width <= 8 ? 8 : width <= 16 ? 16 : 32;
-    const int tasks        = batch * ((width + tile - 1) / tile) * (plan.columns / kIndexerKeyTile);
-    const int score_waves  = width <= 2 || width > 32 ? 4 : 2;
-    const int select_waves = width > 32 ? 4 : 2;
-    return {tile, std::max(1, std::min(score_waves * sms, tasks)),
-            std::max(1, std::min(select_waves * sms, width * batch * plan.partitions))};
-}
+IndexerWindowPlan select_indexer_window(IndexerPlan plan, int width, int batch, int sms);
+
+void launch_indexer_window(IndexerArguments args, IndexerWindowPlan plan, bool vector_cache,
+                           CudaExecutionView execution);
 
 struct IndexerWorkspace {
     Tensor scores, candidates;
@@ -50,8 +52,8 @@ IndexerWorkspace allocate_indexer_workspace(Allocator& allocator, IndexerPlan pl
     return out;
 }
 
-void launch_indexer(const Tensor& query, const QsaIndexCacheView& cache, const QsaBatchView& batch,
-                    IndexerPlan plan, const IndexerWorkspace& scratch, QsaBlockSelection& out,
-                    CudaExecutionView execution);
+void launch_indexer(const Tensor& query, const ConstQsaIndexCacheView& cache,
+                    const QsaBatchView& batch, IndexerPlan plan, const IndexerWorkspace& scratch,
+                    QsaBlockSelection& out, CudaExecutionView execution);
 
 } // namespace ninfer::ops::detail::qsa

@@ -44,10 +44,9 @@ Json DecisionEngine::run(const Request& request, const PreparationControl& contr
         std::vector<BranchScoreRow> native;
         native.reserve(rows.size());
         for (const auto& row : rows) {
-            native.push_back(
-                {row.prefix, row.suffix, row.candidates,
-                 !row.cache_frontiers.empty() ? row.cache_frontiers.back() : 0,
-                 !row.cache_frontiers.empty() ? row.cache_frontiers.front() : 0});
+            native.push_back({row.prefix, row.suffix, row.candidates,
+                              !row.cache_frontiers.empty() ? row.cache_frontiers.back() : 0,
+                              !row.cache_frontiers.empty() ? row.cache_frontiers.front() : 0});
         }
         auto result = engine_.score_branches(native, control, reuse_prefix);
         return ScoreBatch{std::move(result.logits), result.computed_tokens, result.reused_tokens,

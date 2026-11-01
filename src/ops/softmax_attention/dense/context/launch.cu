@@ -50,7 +50,7 @@ void dispatch_tokens(std::int32_t tokens, Launch&& launch) {
 void launch_context_attention(const Tensor& q, const Tensor& query_k, const Tensor& query_v,
                               const Tensor& context_lengths, const Tensor& valid_columns,
                               const Tensor& table_rows, float scale,
-                              const PagedKVBatchLayerView& context,
+                              const ConstPagedKVBatchLayerView& context,
                               const ContextAttentionPlan& plan, Tensor& partial_acc,
                               Tensor& partial_m, Tensor& partial_l, Tensor& out,
                               cudaStream_t stream) {
@@ -76,11 +76,11 @@ void launch_context_attention(const Tensor& q, const Tensor& query_k, const Tens
                     static_cast<const std::int32_t*>(context_lengths.data),
                     static_cast<const std::int32_t*>(valid_columns.data),
                     static_cast<const std::int32_t*>(table_rows.data),
-                    static_cast<const __nv_bfloat16*>(context.k_pages.data),
-                    static_cast<const __half*>(context.v_pages.data),
-                    static_cast<const std::int32_t*>(context.block_tables.data),
-                    context.k_pages.ne[2], context.block_tables.ne[0],
-                    context.block_tables.ne[0] * kPagedKVPageSize, 1, scale,
+                    static_cast<const __nv_bfloat16*>(context.k_pages.data()),
+                    static_cast<const __half*>(context.v_pages.data()),
+                    static_cast<const std::int64_t*>(context.k_pages.records.page_offsets.data),
+                    context.k_pages.records.page_offsets.ne[0],
+                    context.k_pages.records.page_offsets.ne[0] * kPagedKVPageSize, 1, scale,
                     static_cast<__nv_bfloat16*>(partial_acc.data),
                     static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data),
                     static_cast<__nv_bfloat16*>(out.data));
@@ -104,12 +104,12 @@ void launch_context_attention(const Tensor& q, const Tensor& query_k, const Tens
                     static_cast<const std::int32_t*>(context_lengths.data),
                     static_cast<const std::int32_t*>(valid_columns.data),
                     static_cast<const std::int32_t*>(table_rows.data),
-                    static_cast<const __nv_bfloat16*>(context.k_pages.data),
-                    static_cast<const __half*>(context.v_pages.data),
-                    static_cast<const std::int32_t*>(context.block_tables.data),
-                    context.k_pages.ne[2], context.block_tables.ne[0],
-                    context.block_tables.ne[0] * kPagedKVPageSize, plan.split_capacity, scale,
-                    static_cast<__nv_bfloat16*>(partial_acc.data),
+                    static_cast<const __nv_bfloat16*>(context.k_pages.data()),
+                    static_cast<const __half*>(context.v_pages.data()),
+                    static_cast<const std::int64_t*>(context.k_pages.records.page_offsets.data),
+                    context.k_pages.records.page_offsets.ne[0],
+                    context.k_pages.records.page_offsets.ne[0] * kPagedKVPageSize,
+                    plan.split_capacity, scale, static_cast<__nv_bfloat16*>(partial_acc.data),
                     static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data),
                     static_cast<__nv_bfloat16*>(out.data));
             CUDA_CHECK(cudaGetLastError());
@@ -120,7 +120,7 @@ void launch_context_attention(const Tensor& q, const Tensor& query_k, const Tens
                 static_cast<const float*>(partial_l.data),
                 static_cast<const std::int32_t*>(context_lengths.data),
                 static_cast<const std::int32_t*>(valid_columns.data),
-                context.block_tables.ne[0] * kPagedKVPageSize, plan.split_capacity,
+                context.k_pages.records.page_offsets.ne[0] * kPagedKVPageSize, plan.split_capacity,
                 static_cast<__nv_bfloat16*>(out.data));
             CUDA_CHECK(cudaGetLastError());
         };

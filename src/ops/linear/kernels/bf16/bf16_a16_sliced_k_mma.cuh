@@ -55,18 +55,26 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_a16_s
         for (int item = tid; item < kWeightVectors; item += Schedule::kThreads) {
             const int row = item / (kBlockK / 8);
             const int k8  = item - row * (kBlockK / 8);
+            // A fused contraction may pair gate/up rows in the shared tile while retaining
+            // the immutable contiguous stored representation. Ordinary schedules are identity.
+            const int source_row = [&] {
+                if constexpr (requires { Schedule::weight_row(row0 + row); })
+                    return Schedule::weight_row(row0 + row);
+                else
+                    return row0 + row;
+            }();
             auto* dst = &weight_shared[row * kBlockK + bf16_mma_shared_col<Schedule>(row, k8 * 8)];
             if constexpr (bf16_predicated_rows<Schedule> || bf16_predicated_k<Schedule>) {
                 const bool valid = (!bf16_predicated_rows<Schedule> || row0 + row < rows) &&
                                    (!bf16_predicated_k<Schedule> || group_k0 + k8 * 8 < kHidden);
                 const auto source =
-                    valid ? static_cast<std::int64_t>(row0 + row) * kHidden + group_k0 + k8 * 8 : 0;
+                    valid ? static_cast<std::int64_t>(source_row) * kHidden + group_k0 + k8 * 8 : 0;
                 common::cp_async_zfill<16, Schedule::kWeightCache>(dst, weight + source,
                                                                    valid ? 16 : 0);
             } else {
                 common::cp_async<16, Schedule::kWeightCache>(
                     dst,
-                    &weight[static_cast<std::int64_t>(row0 + row) * kHidden + group_k0 + k8 * 8]);
+                    &weight[static_cast<std::int64_t>(source_row) * kHidden + group_k0 + k8 * 8]);
             }
         }
 

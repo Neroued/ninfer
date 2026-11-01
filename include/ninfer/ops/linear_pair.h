@@ -18,17 +18,14 @@ namespace ninfer::ops {
                                                                std::int32_t max_tokens);
 
 /**
- * first_out[:,t] = W_first * x[:,t]; second_out[:,t] = W_second * x[:,t].
- *
- * x [K,T] and both outputs [N,T] are contiguous, 16-byte-aligned BF16 matrices, T > 0.
- * Both weights use the same registered [N,K] geometry and Q8_G32_FP16 RowSplit encoding;
- * code and scale planes require 16-byte alignment.
- * The K=2048 geometry requires adjacent row views [4096,5120) and [5120,6144) of
- * the same [6144,2048] parent, including its code and scale planes.
- * Inputs, outputs and weight planes must be mutually non-overlapping.
- * Overwrites both outputs; requires no scratch and has no persistent state.
+ * Y0 = decode(W0) * X0; Y1 = decode(W1) * X1, using the linear A16 arithmetic contract.
+ * Inputs [K,T] and outputs [N,T] are contiguous, 16-byte-aligned BF16 matrices.
+ * Weights have identical registered geometry/encoding: BF16 Contiguous or Q8_G32_FP16 RowSplit.
+ * T is positive. Read-only inputs may alias. Outputs are disjoint from all operands.
+ * Overwrites both outputs, uses no scratch and has no persistent state.
  */
-void linear_pair(const Tensor& x, const Weight& first_weight, const Weight& second_weight,
-                 Tensor& first_out, Tensor& second_out, CudaExecutionView execution);
+void linear_pair(const Tensor& first_input, const Tensor& second_input, const Weight& first_weight,
+                 const Weight& second_weight, Tensor& first_out, Tensor& second_out,
+                 CudaExecutionView execution);
 
 } // namespace ninfer::ops

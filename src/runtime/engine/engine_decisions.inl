@@ -21,8 +21,7 @@ BranchScoreResult EngineCore<Instance>::score_branches(std::span<const BranchSco
             throw RequestError(RequestErrorKind::Unavailable, "inference engine is unavailable");
         }
         // Decision batches do not occupy generation lanes or its outstanding-request budget.
-        constexpr std::size_t kMaximumPendingDecisions = 16;
-        if (decisions_.pending.size() >= kMaximumPendingDecisions) {
+        if (decisions_.pending.size() >= kDecisionRequestCapacity - 1) {
             throw RequestError(RequestErrorKind::Overloaded, "decision request queue is full");
         }
         decisions_.pending.push_back(job);
@@ -34,20 +33,21 @@ BranchScoreResult EngineCore<Instance>::score_branches(std::span<const BranchSco
 
 template <class Instance>
 bool EngineCore<Instance>::progress_branch_job() {
-    if constexpr (!requires(typename ModelContract::Program& program,
+    if constexpr (!requires(typename ModelContract::Session& session,
                             std::span<const BranchScoreRow> rows,
                             const PreparationControl& control) {
-                      program.score_branches(rows, control, true);
+                      session.score_branches(rows, control, true);
                   }) {
         return false;
     } else {
-        if (instance_.program->has_context_operation()) { return false; }
+        if (!instance_.session->branch_scoring_available()) { return false; }
         std::shared_ptr<BranchScoreQueue::Job> job;
         {
             std::lock_guard lock(queue_mutex_);
             if (decisions_.pending.empty()) { return false; }
             job = std::move(decisions_.pending.front());
             decisions_.pending.pop_front();
+            decisions_.active = job;
         }
         try {
             if (Clock::now() >= job->pending_deadline) {
@@ -60,15 +60,20 @@ bool EngineCore<Instance>::progress_branch_job() {
                 std::lock_guard lock(queue_mutex_);
                 return stopping_;
             });
-            auto scored          = instance_.program->score_branches(
+            auto scored          = instance_.session->score_branches(
                 job->rows, control, job->reuse_prefix && decisions_.cache_enabled);
-            if (!decisions_.cache_enabled) { (void)instance_.program->release_branch_cache(); }
+            if (!decisions_.cache_enabled) { (void)instance_.session->release_branch_cache(); }
+            publish_runtime_stats();
             job->result.set_value(std::move(scored));
         } catch (const RequestError&) {
-            job->result.set_exception(std::current_exception());
-        } catch (...) {
-            job->result.set_exception(std::current_exception());
-            throw;
+            if (instance_.executor->failed()) throw;
+            const auto error = std::current_exception();
+            publish_runtime_stats();
+            job->result.set_exception(error);
+        }
+        {
+            std::lock_guard lock(queue_mutex_);
+            decisions_.active.reset();
         }
         return true;
     }
@@ -76,11 +81,12 @@ bool EngineCore<Instance>::progress_branch_job() {
 
 template <class Instance>
 bool EngineCore<Instance>::release_branch_workspace_before_chat() {
-    if constexpr (!requires(typename ModelContract::Program& program) {
-                      program.release_branch_cache();
+    if constexpr (!requires(typename ModelContract::Session& session) {
+                      session.release_branch_cache();
                   }) {
         return true;
     } else {
+        if (!instance_.session->branch_scoring_available()) return true;
         bool chat_pending;
         {
             std::lock_guard lock(queue_mutex_);
@@ -89,7 +95,7 @@ bool EngineCore<Instance>::release_branch_workspace_before_chat() {
         if (chat_pending || !resident_empty() || !paused_.empty() || materializing_ ||
             context_owner_) {
             // Return decision-owned KV pages and StateImage leases; chat cache policy is unchanged.
-            if (instance_.program->release_branch_cache()) {
+            if (instance_.session->release_branch_cache()) {
                 request_admission_check();
                 scheduler_.capacity_released();
             }

@@ -1,24 +1,24 @@
 #pragma once
 
-#include "models/common/moe/plan.h"
-#include "runtime/engine/kv_capacity.h"
+#include "runtime/engine/context_capacity.h"
 
 namespace ninfer::models {
 
-struct WeightPlacement {
-    std::optional<std::size_t> resident_bytes;
-    std::size_t fixed_bytes = 0;
-    std::optional<moe::Plan> offload;
-    std::vector<ExpertBankCacheSpec> banks;
+enum class WeightPlacement { Resident, HostExperts };
+
+struct WeightCandidate {
+    WeightPlacement placement;
+    std::size_t device_bytes;
+    std::size_t host_bytes;
 };
 
-template <class SequencePlan>
+template <class SequencePlan, class Preparation>
 struct ExecutionPlan {
     SequencePlan sequence;
-    runtime::KvCapacityResolution capacity;
-    bool host_experts   = false;
-    std::uint32_t chunk = 0;
-    std::shared_ptr<const moe::Plan> moe;
+    runtime::ContextCapacityResolution capacity;
+    WeightPlacement placement;
+    std::uint32_t chunk;
+    Preparation preparation;
 };
 
 } // namespace ninfer::models

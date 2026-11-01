@@ -17,7 +17,7 @@ __device__ __forceinline__ void
 write_nvfp4_row(const __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,
                 std::uint8_t* __restrict__ cache_k, std::uint8_t* __restrict__ cache_v,
                 std::uint8_t* __restrict__ scale_k, std::uint8_t* __restrict__ scale_v, int token,
-                int kv_head, int physical_page, int page_offset, int lane, float* scratch) {
+                int kv_head, std::int64_t record, int page_offset, int lane, float* scratch) {
     float values[8];
 #pragma unroll
     for (int r = 0; r < 8; ++r) {
@@ -30,12 +30,11 @@ write_nvfp4_row(const __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __rest
     __syncwarp();
     if (lane < kNvfp4Groups) {
         const auto quantized = common::quantize_nvfp4_group16_f32(scratch + lane * kNvfp4Group);
-        const std::int64_t code_offset = Nvfp4G16Layout<Geometry::KVHeads>::code_offset(
-            physical_page, kv_head, lane * kNvfp4Group, page_offset);
+        const std::int64_t code_offset =
+            Nvfp4G16Layout::code_offset(record, kv_head, lane * kNvfp4Group, page_offset);
         common::store_vec(cache_k + code_offset,
                           make_uint2(quantized.codes_lo, quantized.codes_hi));
-        scale_k[Nvfp4G16Layout<Geometry::KVHeads>::scale_offset(physical_page, kv_head, lane,
-                                                                page_offset)] = quantized.scale;
+        scale_k[Nvfp4G16Layout::scale_offset(record, kv_head, lane, page_offset)] = quantized.scale;
     }
     __syncwarp();
 
@@ -50,12 +49,11 @@ write_nvfp4_row(const __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __rest
     __syncwarp();
     if (lane < kNvfp4Groups) {
         const auto quantized = common::quantize_nvfp4_group16_f32(scratch + lane * kNvfp4Group);
-        const std::int64_t code_offset = Nvfp4G16Layout<Geometry::KVHeads>::code_offset(
-            physical_page, kv_head, lane * kNvfp4Group, page_offset);
+        const std::int64_t code_offset =
+            Nvfp4G16Layout::code_offset(record, kv_head, lane * kNvfp4Group, page_offset);
         common::store_vec(cache_v + code_offset,
                           make_uint2(quantized.codes_lo, quantized.codes_hi));
-        scale_v[Nvfp4G16Layout<Geometry::KVHeads>::scale_offset(physical_page, kv_head, lane,
-                                                                page_offset)] = quantized.scale;
+        scale_v[Nvfp4G16Layout::scale_offset(record, kv_head, lane, page_offset)] = quantized.scale;
     }
 }
 
@@ -89,11 +87,11 @@ __launch_bounds__(256) __global__
     const int kv_head               = unit % Geometry::KVHeads;
     const int token                 = unit / Geometry::KVHeads;
     const int position              = positions[0] + token;
-    const std::int32_t* block_table = metadata.block_table();
-    int physical_page               = lane == 0 ? lookup_page(block_table, position) : 0;
-    physical_page                   = __shfl_sync(FullMask, physical_page, 0);
-    write_nvfp4_row<Geometry>(k, v, cache_k, cache_v, scale_k, scale_v, token, kv_head,
-                              physical_page, position & kPageMask, lane, scratch[warp]);
+    const std::int64_t* block_table = metadata.block_table();
+    std::int64_t record             = lane == 0 ? lookup_page(block_table, position) : 0;
+    record                          = __shfl_sync(FullMask, record, 0);
+    write_nvfp4_row<Geometry>(k, v, cache_k, cache_v, scale_k, scale_v, token, kv_head, record,
+                              position & kPageMask, lane, scratch[warp]);
 }
 
 template <typename Geometry, typename Metadata>
@@ -120,12 +118,12 @@ __launch_bounds__(256) __global__
     const int token_end   = min(tokens, tile_position + TokensPerTile - base_position);
     const int token       = token_begin + warp;
     if (token >= token_end) return;
-    const std::int32_t* block_table = metadata.block_table();
-    int physical_page               = lane == 0 ? block_table[tile_position >> kPageShift] : 0;
-    physical_page                   = __shfl_sync(FullMask, physical_page, 0);
+    const std::int64_t* block_table = metadata.block_table();
+    std::int64_t record             = lane == 0 ? block_table[tile_position >> kPageShift] : 0;
+    record                          = __shfl_sync(FullMask, record, 0);
     const int position              = base_position + token;
-    write_nvfp4_row<Geometry>(k, v, cache_k, cache_v, scale_k, scale_v, token, kv_head,
-                              physical_page, position & kPageMask, lane, scratch[warp]);
+    write_nvfp4_row<Geometry>(k, v, cache_k, cache_v, scale_k, scale_v, token, kv_head, record,
+                              position & kPageMask, lane, scratch[warp]);
 }
 
 } // namespace ninfer::ops::detail::kv

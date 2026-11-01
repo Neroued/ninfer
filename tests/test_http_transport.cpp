@@ -2,6 +2,7 @@
 #include "serve/request.h"
 
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <condition_variable>
 #include <future>
@@ -34,18 +35,18 @@ int test_decision_transport_capacity() {
     using namespace std::chrono_literals;
     int failures = 0;
     for (const bool decisions : {false, true}) {
-        ninfer::serve::ServeOptions options;
-        options.max_concurrency      = 1;
-        options.max_pending_requests = 1;
-        options.jev                  = decisions;
-        const std::size_t outstanding = 2 + (decisions ? 17 : 0);
+        ninfer::product::ServeOptions options;
+        options.launch.engine.max_concurrency      = 1;
+        options.launch.engine.max_pending_requests = 1;
+        options.launch.engine.enable_decisions     = decisions;
+        const std::size_t outstanding              = 2 + (decisions ? 17 : 0);
         std::unique_ptr<httplib::TaskQueue> queue(ninfer::serve::make_http_task_queue(options));
         std::mutex mutex;
         std::condition_variable changed;
-        std::size_t started = 0;
+        std::size_t started  = 0;
         std::size_t finished = 0;
         bool release         = false;
-        const auto hold = [&] {
+        const auto hold      = [&] {
             std::unique_lock lock(mutex);
             ++started;
             changed.notify_all();
@@ -55,7 +56,10 @@ int test_decision_transport_capacity() {
         bool ready = true;
         // Occupy every generation and decision lifetime, including response delivery.
         for (std::size_t i = 0; i < outstanding; ++i) {
-            if (!queue->enqueue(hold)) { ready = false; break; }
+            if (!queue->enqueue(hold)) {
+                ready = false;
+                break;
+            }
             std::unique_lock lock(mutex);
             if (!changed.wait_for(lock, 2s, [&] { return started == i + 1; })) {
                 ready = false;
@@ -78,8 +82,8 @@ int test_decision_transport_capacity() {
             failures += check(ready, "transport lost its spare handler");
             if (ready) {
                 for (std::size_t i = 0; i < outstanding; ++i) {
-                    failures += check(queue->enqueue(hold),
-                                      "transport queue omitted admission capacity");
+                    failures +=
+                        check(queue->enqueue(hold), "transport queue omitted admission capacity");
                 }
                 failures += check(!queue->enqueue(hold), "transport queue is unbounded");
             }
@@ -319,6 +323,81 @@ int test_inherited_socket_liveness() {
         "accepted HTTP socket did not inherit TCP_USER_TIMEOUT");
     return failures;
 }
+
+using SocketSetup = void (*)(socket_t);
+
+void reuse_address_only(socket_t socket) {
+    const int enabled = 1;
+    (void)::setsockopt(socket, SOL_SOCKET, SO_REUSEADDR, &enabled, sizeof(enabled));
+}
+
+sockaddr_in listen_on_loopback(socket_t listener, SocketSetup setup) {
+    if (listener < 0) { return {}; }
+    setup(listener);
+    sockaddr_in address{};
+    address.sin_family      = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    socklen_t size          = sizeof(address);
+    if (::bind(listener, reinterpret_cast<const sockaddr*>(&address), size) != 0 ||
+        ::listen(listener, 1) != 0 ||
+        ::getsockname(listener, reinterpret_cast<sockaddr*>(&address), &size) != 0) {
+        return {};
+    }
+    return address;
+}
+
+sockaddr_in leave_server_time_wait(SocketSetup setup) {
+    Socket listener(::socket(AF_INET, SOCK_STREAM, 0));
+    const auto address = listen_on_loopback(listener.get(), setup);
+    if (address.sin_port == 0) { return {}; }
+    Socket client(::socket(AF_INET, SOCK_STREAM, 0));
+    if (client.get() < 0 || ::connect(client.get(), reinterpret_cast<const sockaddr*>(&address),
+                                      sizeof(address)) != 0) {
+        return {};
+    }
+    Socket accepted(::accept(listener.get(), nullptr, nullptr));
+    // Complete the FIN handshake with the server closing first, before releasing its listener.
+    char byte = 0;
+    if (accepted.get() < 0 || ::shutdown(accepted.get(), SHUT_WR) != 0 ||
+        ::recv(client.get(), &byte, 1, 0) != 0 || ::shutdown(client.get(), SHUT_WR) != 0 ||
+        ::recv(accepted.get(), &byte, 1, 0) != 0) {
+        return {};
+    }
+    return address;
+}
+
+int test_listener_reuse() {
+    const auto configure = ninfer::serve::configure_http_server_socket;
+
+    struct Case {
+        SocketSetup previous, next;
+    };
+
+    int failures = 0;
+    for (const Case c : {Case{configure, reuse_address_only}, Case{reuse_address_only, configure},
+                         Case{configure, configure}}) {
+        const auto address = leave_server_time_wait(c.previous);
+        if (address.sin_port == 0) {
+            failures += check(false, "failed to establish a closed HTTP connection");
+            continue;
+        }
+        Socket successor(::socket(AF_INET, SOCK_STREAM, 0));
+        c.next(successor.get());
+        failures += check(::bind(successor.get(), reinterpret_cast<const sockaddr*>(&address),
+                                 sizeof(address)) == 0,
+                          "closed listener prevented immediate port reuse");
+    }
+    Socket listener(::socket(AF_INET, SOCK_STREAM, 0));
+    const auto address = listen_on_loopback(listener.get(), configure);
+    if (address.sin_port == 0) { return failures + check(false, "failed to bind active listener"); }
+    Socket duplicate(::socket(AF_INET, SOCK_STREAM, 0));
+    configure(duplicate.get());
+    const int result =
+        ::bind(duplicate.get(), reinterpret_cast<const sockaddr*>(&address), sizeof(address));
+    failures += check(result == -1 && errno == EADDRINUSE,
+                      "HTTP listener allowed another server to share its active port");
+    return failures;
+}
 #endif
 
 } // namespace
@@ -329,6 +408,7 @@ int main() {
                    test_decision_transport_capacity() + test_task_queue();
 #if defined(__linux__)
     failures += test_inherited_socket_liveness();
+    failures += test_listener_reuse();
 #endif
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;

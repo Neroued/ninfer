@@ -1,4 +1,6 @@
 target_sources(ninfer_ops PRIVATE
+  "${CMAKE_CURRENT_LIST_DIR}/vocabulary/selection.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/vocabulary/decision.cu"
   "${CMAKE_CURRENT_LIST_DIR}/sample/entry.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/sample/launch.cu"
   "${CMAKE_CURRENT_LIST_DIR}/acceptance/greedy_drafts/entry.cpp"

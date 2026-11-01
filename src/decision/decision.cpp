@@ -82,9 +82,7 @@ int decimal_places(double value) {
     for (int digits = 0; digits <= 9; ++digits) {
         // Relative epsilon can exceed a whole unit for large fractional bounds.
         // Choose a decimal spelling only when it preserves the represented value.
-        if (Json::parse(fixed_decimal(value, digits)).get<double>() == value) {
-            return digits;
-        }
+        if (Json::parse(fixed_decimal(value, digits)).get<double>() == value) { return digits; }
     }
     throw std::invalid_argument("number grids support at most nine decimal places");
 }
@@ -172,9 +170,8 @@ Field compile_field(const std::string& name, const Json& spec, bool json_schema)
                 "number grid must include both bounds and define 1-255 values");
         if (json_schema) {
             const auto multiples = std::round(lo / step);
-            require(std::isfinite(multiples) &&
-                        grid_endpoint(lo, multiples * step, digits,
-                                      std::abs(multiples) * ulp_size(step)),
+            require(std::isfinite(multiples) && grid_endpoint(lo, multiples * step, digits,
+                                                              std::abs(multiples) * ulp_size(step)),
                     "minimum must be on the multipleOf grid");
         }
         for (int index = 0; index <= static_cast<int>(count); ++index) {
@@ -438,7 +435,7 @@ Json assemble(const std::vector<Field>& fields, const std::vector<FieldResult>& 
             }
             detail["probabilities"] = result.probabilities;
         }
-        details[field.name]    = std::move(detail);
+        details[field.name] = std::move(detail);
     }
     return {{"decision", std::move(values)}, {"fields", std::move(details)}};
 }
@@ -456,7 +453,7 @@ Json evaluate(const Request& request, const Backend& backend) {
     const auto started     = std::chrono::steady_clock::now();
     Json results           = Json::array();
     std::uint64_t computed = 0, reused = 0, rows = 0, rounds = 0, context_tokens = 0;
-    double prefill_ms = 0;
+    double prefill_ms                   = 0;
     std::uint64_t forward_batches       = 0;
     std::uint32_t largest_batch         = 0;
     constexpr std::size_t context_batch = 8;
@@ -465,16 +462,17 @@ Json evaluate(const Request& request, const Backend& backend) {
     // changing state. Keep that rubric before the state, like ordinary decisions,
     // so the retained root is reusable between requests, not just within one.
     const bool single_question = fields == 1 && !request.fields.front().isolated_question.empty();
-    const auto system = single_question
-        ? request.system + "\n\nQuestion:\n" + request.fields.front().isolated_question
-        : request.system;
-    const auto static_prompt = backend.tokenize(system, "", "{\n");
-    const bool isolated_state = request.contexts.size() == 1 &&
-        !single_question &&
+    const auto system          = single_question ? request.system + "\n\nQuestion:\n" +
+                                                       request.fields.front().isolated_question
+                                                 : request.system;
+    const auto static_prompt   = backend.tokenize(system, "", "{\n");
+    const bool isolated_state =
+        request.contexts.size() == 1 && !single_question &&
         std::all_of(request.fields.begin(), request.fields.end(),
                     [](const Field& field) { return !field.isolated_question.empty(); });
-    const auto state_prompt = isolated_state
-        ? backend.tokenize(request.system, request.contexts.front(), "{\n") : Tokens{};
+    const auto state_prompt =
+        isolated_state ? backend.tokenize(request.system, request.contexts.front(), "{\n")
+                       : Tokens{};
     bool reuse_prefix = request.cache_prompt;
     for (std::size_t begin = 0; begin < request.contexts.size(); begin += context_batch) {
         backend.check_cancelled();
@@ -488,15 +486,16 @@ Json evaluate(const Request& request, const Backend& backend) {
             for (std::size_t f = 0; f < fields; ++f) {
                 const auto index  = c * fields + f;
                 const auto& field = request.fields[f];
-                const auto context = field.isolated_question.empty() || single_question
-                    ? request.contexts[begin + c]
-                    : request.contexts[begin + c] + "\n\nQuestion:\n" + field.isolated_question;
-                const auto key = field.isolated_question.empty() ? field.name : std::string("answer");
+                const auto context =
+                    field.isolated_question.empty() || single_question
+                        ? request.contexts[begin + c]
+                        : request.contexts[begin + c] + "\n\nQuestion:\n" + field.isolated_question;
+                const auto key =
+                    field.isolated_question.empty() ? field.name : std::string("answer");
                 for (const auto& value : field.encoded) {
                     backend.check_cancelled();
-                    tries[index].add(
-                        backend.tokenize(system, context,
-                                         "{\n  " + Json(key).dump() + ": " + value + "\n}"));
+                    tries[index].add(backend.tokenize(
+                        system, context, "{\n  " + Json(key).dump() + ": " + value + "\n}"));
                 }
                 tries[index].build();
                 answers[index].tree =
@@ -555,7 +554,7 @@ Json evaluate(const Request& request, const Backend& backend) {
             if (pending.empty()) { break; }
             backend.check_cancelled();
             const auto scored = backend.score(std::move(pending), reuse_prefix);
-            reuse_prefix = true; // Later rounds/cohorts may reuse this request's rebuilt root.
+            reuse_prefix      = true; // Later rounds/cohorts may reuse this request's rebuilt root.
             if (scored.logits.size() != locations.size()) {
                 throw std::logic_error("decision batch size mismatch");
             }

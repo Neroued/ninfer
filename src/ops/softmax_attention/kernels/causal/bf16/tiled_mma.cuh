@@ -50,7 +50,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
         return;
     }
     const int base_pos              = positions[0];
-    const std::int32_t* block_table = metadata.block_table();
+    const std::int64_t* block_table = metadata.block_table();
 
     const int gid = lane >> 2;
     const int lid = lane & 3;
@@ -126,26 +126,26 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
 
     // Fold softmax_scale into the exp2 (FA-style): scores stay raw, so the
     // per-element "* scale" multiply drops out of the QK epilogue entirely.
-    const float scale_l2 = scale * common::kLog2E;
-    int physical_page    = block_table[0];
+    const float scale_l2       = scale * common::kLog2E;
+    std::int64_t record_offset = block_table[0];
 
     // Prologue: commit Q, then kick off K(0). The loop's wait<0> below drains both.
     common::cp_commit();
-    bf16_kv_stage_tile<Geometry, Schedule>(k_s, cache_k, kv_head, 0, max_query_abs, physical_page,
+    bf16_kv_stage_tile<Geometry, Schedule>(k_s, cache_k, kv_head, 0, max_query_abs, record_offset,
                                            tid);
     common::cp_commit();
 
     const auto step = [&]<bool FullTile>(int kb) {
         const int k0 = kb * Bc;
-        const int next_physical_page =
-            (kb + 1 < n_block_max) ? block_table[((kb + 1) * Bc) >> kv::kPageShift] : physical_page;
+        const std::int64_t next_record_offset =
+            (kb + 1 < n_block_max) ? block_table[((kb + 1) * Bc) >> kv::kPageShift] : record_offset;
 
         common::cp_wait<0>(); // K(kb) landed (also publishes q_s / prev PV done)
         __syncthreads();
 
         // Preserve the global FP16 V load/QK overlap.
         bf16_kv_stage_tile<Geometry, Schedule>(v_s, cache_v, kv_head, k0, max_query_abs,
-                                               physical_page, tid);
+                                               record_offset, tid);
         common::cp_commit();
 
         // S = Q Kᵀ for this warp's 16 rows over all Bc keys, in registers.
@@ -200,9 +200,9 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
 
         // Prefetch K(kb+1) into the (now-free) K buffer, overlapping the PV MMA.
         if (kb + 1 < n_block_max) {
-            physical_page = next_physical_page;
+            record_offset = next_record_offset;
             bf16_kv_stage_tile<Geometry, Schedule>(k_s, cache_k, kv_head, (kb + 1) * Bc,
-                                                   max_query_abs, physical_page, tid);
+                                                   max_query_abs, record_offset, tid);
             common::cp_commit();
         }
 

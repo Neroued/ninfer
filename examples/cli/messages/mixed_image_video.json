@@ -8,7 +8,7 @@
       },
       {
         "type": "image",
-        "image": "examples/cli/media/visual_chart.png"
+        "image": "../media/visual_chart.png"
       },
       {
         "type": "text",
@@ -16,7 +16,7 @@
       },
       {
         "type": "video",
-        "video": "examples/cli/media/temporal_events.mp4"
+        "video": "../media/temporal_events.mp4"
       },
       {
         "type": "text",

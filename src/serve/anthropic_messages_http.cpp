@@ -41,7 +41,7 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
     AnthropicMessagesRequest request;
     try {
         RequestLimits limits;
-        limits.default_max_tokens = options_.default_max_tokens;
+        limits.default_max_tokens = options_.launch.generation.max_tokens;
         request                   = parse_anthropic_messages_request(parse_json_body(req), limits);
     } catch (const ApiException& exception) {
         write_anthropic_error(res, exception.error(), request_id);
@@ -67,9 +67,9 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
         prepared = service_->prepare(
             request.generation,
             request.stream ? GenerationConsumerMode::Streaming : GenerationConsumerMode::Aggregate,
-            {.phase_timings = true,
-             .scheduling    = scheduling_observer(req_id, metadata.http_request_id),
-             .first_token   = first_token_observer()},
+            {.constraint_timings = true,
+             .scheduling         = scheduling_observer(req_id, metadata.http_request_id),
+             .first_token        = first_token_observer()},
             [&req] { return client_disconnected(req); });
     } catch (const ApiException& exception) {
         const ApiError error = normalize_anthropic_error(exception.error());
@@ -96,27 +96,33 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
     auto lifecycle = begin_request(make_request_log_context(
         req_id, "anthropic_messages", request.generation, metadata, prepared));
 
-    if (!request.stream) {
-        GenerationOutcome outcome;
-        try {
-            outcome = service_->run(prepared, nullptr, [&req] { return client_disconnected(req); });
-        } catch (const ApiException& exception) {
-            const ApiError error = normalize_anthropic_error(exception.error());
-            lifecycle->failure(make_generation_request_failure(error));
-            write_anthropic_error(res, error, request_id);
-            return;
-        } catch (const std::exception& exception) {
-            lifecycle->failure(
-                make_internal_request_failure(RequestFailurePhase::Generation, exception.what()));
-            ApiError error;
-            error.status  = 500;
-            error.message = exception.what();
-            write_anthropic_error(res, error, request_id);
-            return;
+    GenerationOutcome aggregate;
+    try {
+        if (request.stream) {
+            service_->wait_for_admission(prepared, [&req] { return client_disconnected(req); });
+        } else {
+            aggregate =
+                service_->run(prepared, nullptr, [&req] { return client_disconnected(req); });
         }
-        lifecycle->done(outcome);
+    } catch (const ApiException& exception) {
+        const ApiError error = normalize_anthropic_error(exception.error());
+        lifecycle->failure(make_generation_request_failure(error));
+        write_anthropic_error(res, error, request_id);
+        return;
+    } catch (const std::exception& exception) {
+        lifecycle->failure(
+            make_internal_request_failure(RequestFailurePhase::Generation, exception.what()));
+        ApiError error;
+        error.status  = 500;
+        error.message = exception.what();
+        write_anthropic_error(res, error, request_id);
+        return;
+    }
+
+    if (!request.stream) {
+        lifecycle->done(aggregate);
         try {
-            set_owned_json_content(res, make_anthropic_messages_response(identity, outcome),
+            set_owned_json_content(res, make_anthropic_messages_response(identity, aggregate),
                                    prepared.lifetime);
         } catch (const ApiException& exception) {
             const ApiError error = normalize_anthropic_error(exception.error());
@@ -136,7 +142,8 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
 
     try {
         auto stream  = std::make_shared<HttpGenerationStream>(std::move(prepared));
-        auto encoder = std::make_shared<AnthropicMessagesStream>(identity, input_tokens);
+        auto encoder = std::make_shared<AnthropicMessagesStream>(identity, input_tokens,
+                                                                 request.eager_tool_inputs);
 
         prepare_sse_response(res);
         res.set_chunked_content_provider(
@@ -177,6 +184,15 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
                     };
                     output.on_content = [&](const std::string& text) {
                         render_and_write(transport, [&] { return encoder->content_delta(text); });
+                    };
+                    output.on_tool_start = [&](const ninfer::ToolCallStart& event) {
+                        render_and_write(transport, [&] { return encoder->tool_start(event); });
+                    };
+                    output.on_tool_arguments = [&](const ninfer::ToolArgumentsDelta& event) {
+                        render_and_write(transport, [&] { return encoder->tool_arguments(event); });
+                    };
+                    output.on_tool_end = [&](const ninfer::ToolCallEnd& event) {
+                        render_and_write(transport, [&] { return encoder->tool_end(event); });
                     };
                     output.is_cancelled = [&] { return transport.poll(); };
 

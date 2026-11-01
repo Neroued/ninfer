@@ -4,7 +4,7 @@
     "content": [
       {
         "type": "image",
-        "image": "examples/cli/media/natural_scene.png"
+        "image": "../media/natural_scene.png"
       },
       {
         "type": "text",

@@ -321,8 +321,9 @@ class StructureNormalizerImpl : public GrammarMutator {
       case GrammarExprType::kRegex:
         XGRAMMAR_LOG(FATAL) << "Regex should not be in lookahead assertion";
         XGRAMMAR_UNREACHABLE();
+      case GrammarExprType::kByteFSM:
       case GrammarExprType::kSubstring:
-        XGRAMMAR_LOG(FATAL) << "Substring should not be in lookahead assertion";
+        XGRAMMAR_LOG(FATAL) << "Terminal automata should not be in lookahead assertion";
         XGRAMMAR_UNREACHABLE();
       case GrammarExprType::kByteString:
       case GrammarExprType::kCharacterClass:
@@ -366,6 +367,7 @@ class StructureNormalizerImpl : public GrammarMutator {
         return builder_->AddChoices({builder_->AddSequence({builder_->AddRuleRef(new_rule_id)})});
       }
       case GrammarExprType::kRegex:
+      case GrammarExprType::kByteFSM:
       case GrammarExprType::kSubstring:
         // A regex or substring is kept as the direct body of the rule, like a tag dispatch.
         return builder_->AddGrammarExpr(grammar_expr);
@@ -418,6 +420,7 @@ class StructureNormalizerImpl : public GrammarMutator {
           break;
         }
         case GrammarExprType::kRegex:
+        case GrammarExprType::kByteFSM:
         case GrammarExprType::kSubstring: {
           auto leaf_expr_id = builder_->AddGrammarExpr(choice_expr);
           auto new_rule_id = builder_->AddRuleWithHint(cur_rule_name_, leaf_expr_id);
@@ -512,6 +515,7 @@ class StructureNormalizerImpl : public GrammarMutator {
           break;
         }
         case GrammarExprType::kRegex:
+        case GrammarExprType::kByteFSM:
         case GrammarExprType::kSubstring: {
           auto leaf_expr_id = builder_->AddGrammarExpr(element_expr);
           auto new_rule_id = builder_->AddRuleWithHint(cur_rule_name_, leaf_expr_id);
@@ -991,7 +995,8 @@ class LookaheadAssertionAnalyzerImpl : public GrammarMutator {
     if (root_grammar_expr.type == GrammarExprType::kTagDispatch ||
         root_grammar_expr.type == GrammarExprType::kTokenTagDispatch ||
         root_grammar_expr.type == GrammarExprType::kRegex ||
-        root_grammar_expr.type == GrammarExprType::kSubstring) {
+        root_grammar_expr.type == GrammarExprType::kSubstring ||
+        root_grammar_expr.type == GrammarExprType::kByteFSM) {
       return grammar;
     }
     BuildRuleLookaheadInfo();
@@ -1059,7 +1064,8 @@ class LookaheadAssertionAnalyzerImpl : public GrammarMutator {
         continue;
       }
       if (grammar_expr.type == GrammarExprType::kRegex ||
-          grammar_expr.type == GrammarExprType::kSubstring) {
+          grammar_expr.type == GrammarExprType::kSubstring ||
+          grammar_expr.type == GrammarExprType::kByteFSM) {
         // A regex or substring rule is a leaf: it references no other rules.
         continue;
       }
@@ -1182,6 +1188,12 @@ class AllowEmptyRuleAnalyzerImpl : public GrammarVisitor<std::vector<int32_t>> {
         continue;
       }
 
+      if (grammar_expr.type == GrammarExprType::kByteFSM) {
+        if (std::find(grammar_expr.begin() + 3, grammar_expr.begin() + 3 + grammar_expr[2],
+                      grammar_expr[1]) != grammar_expr.begin() + 3 + grammar_expr[2])
+          empty_rule_id_set->insert(i);
+        continue;
+      }
       if (grammar_expr.type == GrammarExprType::kSubstring) {
         // A substring automaton always accepts the empty string: every state is accepting.
         empty_rule_id_set->insert(i);
@@ -1645,6 +1657,15 @@ void GrammarFSMBuilderImpl::BuildExpression(
           start_state,
           end_states
       );
+    case ExprType::kByteFSM: {
+      auto fsm = grammar->GetByteFSM(expr);
+      std::vector<int> mapping;
+      target_fsm_.AddFSM(fsm.GetFsm(), &mapping);
+      target_fsm_.AddEpsilonEdge(start_state, mapping[fsm.GetStart()]);
+      end_states->clear();
+      for (int end : fsm.GetEnds()) end_states->push_back(mapping[end]);
+      return;
+    }
     case ExprType::kSubstring:
       return BuildSubstring(grammar->GetSubstringChunks(expr), start_state, end_states);
     case ExprType::kTagDispatch:
@@ -2085,6 +2106,8 @@ class RegularGrammarFSMBuilder {
       case ExprType::kCharacterClass:
       case ExprType::kCharacterClassStar:
         return Append(GrammarFSMBuilderImpl::CharacterClass(expr), start, end);
+      case ExprType::kByteFSM:
+        return Append(grammar_->GetByteFSM(expr), start, end);
       case ExprType::kRuleRef:
         if (expr[0] == rule_id) {
           if (!tail) {
@@ -2647,7 +2670,8 @@ class LazyBodyFlattenerImpl : public GrammarMutator {
  private:
   int32_t BuildFlattenedLazyBody(int32_t body_expr_id) {
     auto body_type = base_grammar_->GetGrammarExpr(body_expr_id).type;
-    if (body_type == GrammarExprType::kRegex || body_type == GrammarExprType::kSubstring) {
+    if (body_type == GrammarExprType::kRegex || body_type == GrammarExprType::kSubstring ||
+        body_type == GrammarExprType::kByteFSM) {
       return VisitExpr(body_expr_id);
     }
     // Unwrap chains of single rule references (r ::= (x), x ::= (y), ...) produced by regex
@@ -3172,7 +3196,8 @@ class GrammarOptimizerImpl {
       }
       const auto& body = grammar->GetGrammarExpr(rule.body_expr_id);
       if (body.type == Grammar::Impl::GrammarExprType::kRegex ||
-          body.type == Grammar::Impl::GrammarExprType::kSubstring) {
+          body.type == Grammar::Impl::GrammarExprType::kSubstring ||
+          body.type == Grammar::Impl::GrammarExprType::kByteFSM) {
         continue;
       }
       XGRAMMAR_CHECK(body.type == Grammar::Impl::GrammarExprType::kChoices)
@@ -3778,6 +3803,7 @@ std::optional<uint64_t> GrammarFSMHasherImpl::HashSequence(
         return std::nullopt;
       }
       case (GrammarExprType::kRegex):
+      case (GrammarExprType::kByteFSM):
       case (GrammarExprType::kSubstring): {
         // Hash the content, like a byte string.
         for (const auto& element : expr) {

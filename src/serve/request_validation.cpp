@@ -164,16 +164,6 @@ void parse_structured_outputs(const RequestJson& body, GenerationRequest& reques
             bad_request("unknown structured_outputs option: " + kind, param);
         }
     }
-    if (request.constraint && !request.stop_strings.empty())
-        bad_request("output constraints require model EOS and cannot use custom stops",
-                    request.constraint_param);
-    if (request.constraint && request.uses_tools() &&
-        request.constraint->kind != OutputConstraintKind::JsonObject &&
-        request.constraint->kind != OutputConstraintKind::JsonSchema)
-        bad_request("active tools can be combined with JSON output constraints",
-                    request.constraint_param);
-    if (request.constrains_tools() && !request.stop_strings.empty())
-        bad_request("constrained tools require model EOS and cannot use custom stops", "stop");
 }
 
 [[noreturn]] void bad_request(std::string message, std::string param, std::string code) {

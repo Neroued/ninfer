@@ -1,8 +1,11 @@
+#include "ops/moe/kernels/cuda/block_scaled/grouping.cuh"
 #include "ops/moe/kernels/cuda/block_scaled/nvfp4/launch.h"
 #include "ops/moe/kernels/cuda/block_scaled/fp8/launch.h"
 #include "ops/moe/kernels/cuda/block_scaled/output.cuh"
 
 #include <algorithm>
+#include <climits>
+#include <stdexcept>
 
 namespace ninfer::ops::detail::moe_cuda::block_scaled {
 namespace {
@@ -31,7 +34,8 @@ __global__ void scan_assignments(Groups g, int columns) {
     __shared__ int scan[kExperts];
     const int e     = threadIdx.x;
     const int count = g.counts[e];
-    scan[e]         = count;
+    publish_load_range<kExperts>(g.load_range, count);
+    scan[e] = count;
     __syncthreads();
 #pragma unroll
     for (int delta = 1; delta < kExperts; delta *= 2) {
@@ -62,6 +66,11 @@ __global__ void scan_assignments(Groups g, int columns) {
     if (e == kExperts - 1) { *g.jobs = scan[e]; }
 }
 
+__device__ __forceinline__ bool fully_covered_groups(Groups groups, int assignments) {
+    const int tokens = assignments / kTopK;
+    return groups.load_range && groups.load_range[0] == tokens && groups.load_range[1] == tokens;
+}
+
 __global__ void index_assignments(const int* ids, ExpertSubsetKind kind, const int* mask, Groups g,
                                   int assignments) {
     const int a = blockIdx.x * blockDim.x + threadIdx.x;
@@ -71,7 +80,8 @@ __global__ void index_assignments(const int* ids, ExpertSubsetKind kind, const i
         if (g.inverse) { g.inverse[a] = -1; }
         return;
     }
-    const int packed      = atomicAdd(g.cursors + expert, 1);
+    const int packed      = fully_covered_groups(g, assignments) ? g.offsets[expert] + a / kTopK
+                                                                 : atomicAdd(g.cursors + expert, 1);
     g.assignments[packed] = a;
     if (g.inverse) { g.inverse[a] = packed; }
 }
@@ -88,7 +98,8 @@ __global__ void group_small(const int* ids, ExpertSubsetKind kind, const int* ma
     }
     __syncthreads();
     const int count = counts[tid];
-    scan[tid]       = count;
+    publish_load_range<kExperts>(g.load_range, count);
+    scan[tid] = count;
     __syncthreads();
 #pragma unroll
     for (int delta = 1; delta < kExperts; delta *= 2) {
@@ -117,8 +128,10 @@ __global__ void group_small(const int* ids, ExpertSubsetKind kind, const int* ma
         g.job_columns[first + j] = j * columns;
     }
     if (tid == kExperts - 1) { *g.jobs = scan[tid]; }
+    const bool ordered = fully_covered_groups(g, assignments);
     for (int a = tid; a < assignments; a += kExperts) {
-        const int packed = ranks[a] >= 0 ? g.offsets[ids[a]] + ranks[a] : -1;
+        const int packed =
+            ranks[a] >= 0 ? g.offsets[ids[a]] + (ordered ? a / kTopK : ranks[a]) : -1;
         if (g.inverse) { g.inverse[a] = packed; }
         if (packed >= 0) { g.assignments[packed] = a; }
     }
@@ -133,20 +146,97 @@ __global__ void reduce(Storage storage, const float* coefficients, Output output
     }
 }
 
+// One 512-thread CTA emits column layer j across all experts. Its first output
+// index is sum_e min(j, jobs_e), followed by the prefix of experts with jobs_e > j.
+// Only the job metadata changes; packed assignments and GU products keep their offsets.
+template <bool PreserveBalanced>
+__global__ void order_jobs(Groups g, int columns) {
+    __shared__ int warp_offsets[16], warp_before[16], base;
+    const int e = threadIdx.x, lane = e & 31, warp = e >> 5;
+    const int jobs = (g.counts[e] + columns - 1) / columns;
+    const int j    = blockIdx.x;
+    if constexpr (PreserveBalanced) {
+        int maximum = jobs;
+#pragma unroll
+        for (int d = 16; d; d /= 2)
+            maximum = max(maximum, __shfl_down_sync(0xffffffff, maximum, d));
+        if (!lane) warp_before[warp] = maximum;
+        __syncthreads();
+        if (!warp) {
+            int total = lane < 16 ? warp_before[lane] : 0;
+#pragma unroll
+            for (int d = 16; d; d /= 2) total = max(total, __shfl_down_sync(0xffffffff, total, d));
+            if (!lane) base = total;
+        }
+        __syncthreads();
+        // GU consumed expert-major jobs. Keeping adjacent pairs reuses their
+        // weights; larger hotspot groups retain column ordering for scheduling.
+        // The predicate is uniform and derived solely from Device group counts.
+        if (base <= 2) return;
+    }
+    const int value = int(jobs > j);
+    int prefix = value, before = min(j, jobs);
+#pragma unroll
+    for (int d = 1; d < 32; d *= 2) {
+        const int preceding = __shfl_up_sync(0xffffffff, prefix, d);
+        if (lane >= d) { prefix += preceding; }
+    }
+#pragma unroll
+    for (int d = 16; d; d /= 2) { before += __shfl_down_sync(0xffffffff, before, d); }
+    if (lane == 31) { warp_offsets[warp] = prefix; }
+    if (!lane) { warp_before[warp] = before; }
+    __syncthreads();
+    if (!warp) {
+        int total     = lane < 16 ? warp_offsets[lane] : 0;
+        const int own = total;
+#pragma unroll
+        for (int d = 1; d < 32; d *= 2) {
+            const int preceding = __shfl_up_sync(0xffffffff, total, d);
+            if (lane >= d) { total += preceding; }
+        }
+        if (lane < 16) { warp_offsets[lane] = total - own; }
+        int sum = lane < 16 ? warp_before[lane] : 0;
+#pragma unroll
+        for (int d = 16; d; d /= 2) { sum += __shfl_down_sync(0xffffffff, sum, d); }
+        if (!lane) { base = sum; }
+    }
+    __syncthreads();
+    if (value) {
+        const int index      = base + warp_offsets[warp] + prefix - 1;
+        g.job_experts[index] = e;
+        g.job_columns[index] = j * columns;
+    }
+}
+
 } // namespace
+
+void launch_column_jobs(Groups groups, int tokens, int columns, bool preserve_balanced,
+                        CudaExecutionView execution) {
+    // Stream ordering is the lifetime boundary: GU must finish reading the
+    // expert-major metadata before this launch overwrites it for down.
+    if (tokens <= columns) { return; }
+    if (!groups.counts) { throw std::logic_error("job ordering requires counted groups"); }
+    if (preserve_balanced)
+        order_jobs<true><<<(tokens + columns - 1) / columns, kExperts, 0, execution.stream()>>>(
+            groups, columns);
+    else
+        order_jobs<false><<<(tokens + columns - 1) / columns, kExperts, 0, execution.stream()>>>(
+            groups, columns);
+    CUDA_CHECK(cudaGetLastError());
+}
 
 void launch(const Tensor& x, const CudaSwiGLUExperts& experts, const ExpertRoutes& routes,
             ExpertSubset subset, const ScaledSwiGLUTerm* shared, MoeEpilogue mode,
             Tensor& destination, const Plan& plan, const Storage& s, CudaExecutionView execution,
-            bool shared_prepared) {
+            Preparation prepared) {
     const auto stream = execution.stream();
     if (subset.kind != ExpertSubsetKind::None && plan.vector) {
         if (plan.format == QType::NVFP4) {
             nvfp4::launch_vector(x, experts, routes, subset, shared != nullptr, mode, destination,
-                                 s, execution);
+                                 s, plan, execution);
         } else {
             fp8::launch_vector(x, experts, routes, subset, shared != nullptr, mode, destination, s,
-                               execution);
+                               plan, execution);
         }
         if (!shared) { return; }
     } else if (subset.kind != ExpertSubsetKind::None) {
@@ -154,16 +244,16 @@ void launch(const Tensor& x, const CudaSwiGLUExperts& experts, const ExpertRoute
         const auto* ids       = static_cast<const int*>(routes.ids.data);
         const auto* mask      = static_cast<const int*>(subset.mask.data);
         if (plan.format == QType::NVFP4) {
-            nvfp4::launch_input(x, experts, s, execution, !shared_prepared);
+            nvfp4::launch_input(x, experts, s, execution, !prepared.route_counts);
         } else {
-            fp8::launch_input(x, experts, s, execution, !shared_prepared);
+            fp8::launch_input(x, experts, s, execution, !prepared.route_counts);
         }
         if (plan.single_block_grouping) {
             group_small<<<1, kExperts, 0, stream>>>(ids, subset.kind, mask, s.groups, assignments,
                                                     plan.job_columns());
             CUDA_CHECK(cudaGetLastError());
         } else {
-            if (!shared_prepared) {
+            if (!prepared.route_counts) {
                 count_assignments<<<(assignments + 255) / 256, 256, 0, stream>>>(
                     ids, subset.kind, mask, s.groups.counts, assignments);
                 CUDA_CHECK(cudaGetLastError());
@@ -181,7 +271,8 @@ void launch(const Tensor& x, const CudaSwiGLUExperts& experts, const ExpertRoute
         }
     }
     if (shared) {
-        launch_shared(x, *shared, routes, mode, destination, s, plan, execution, shared_prepared);
+        launch_shared(x, *shared, routes, mode, destination, s, plan, execution,
+                      prepared.shared_activation);
     } else {
         with_output(destination, mode, [&](auto output) {
             const int elements = x.ne[1] * kHidden;

@@ -2,16 +2,70 @@
 
 #include "core/device.h"
 #include "core/tensor.h"
+#include "core/record_view.h"
+
+#include <array>
+#include <span>
 
 namespace ninfer::ops {
+
+struct NgramHashParameters {
+    std::array<std::uint64_t, 3> multipliers{};
+    std::array<std::uint32_t, 16> vocab_sizes{}, offsets{};
+};
+
+struct NgramTokenTailView {
+    ConstStateFieldView token_ids; // I32 [2] per record, oldest first; missing history is EOS.
+};
+
+struct Nf4EmbeddingShard {
+    ConstMemorySpan pages;
+    Tensor decode; // Contiguous BF16 [16,128], indexed by code then E4M3 scale byte.
+    std::uint32_t row_begin = 0, rows = 0;
+};
+
+/**
+ * Concatenate sixteen exact NF4 row lookups into BF16 embedding [2560,T,B].
+ * For each live (t,b), x=token_ids[t,b], p is the preceding ID and o the ID before p;
+ * IDs before t=0 come from before.token_ids[b][:]. If p==eos, replace o by eos.
+ * All products/XOR use U64 wrap. Let u=x*m[0] XOR p*m[1], extended by XOR o*m[2] for heads
+ * 8..15. Head h selects offsets[h] + positive_mod(signed_I64_bits(u), vocab_sizes[h]).
+ * Each head contributes 160 features, in head order. A row absent from shards contributes
+ * exact +0 words. Shards are a Host descriptor list of up to 128 disjoint, sorted global row
+ * ranges; they may cover only part of the table. Each positive vocabulary and its offset fit
+ * the U32 row domain. eos and the consumed token IDs are nonnegative I32.
+ *
+ * Shard pages retain RowPagedG16_4K encoding: 45 rows per 4096-byte page, each row holding
+ * 80 low-even NF4 code bytes followed by ten nonnegative E4M3 scale bytes (0..126).
+ * decode supplies the exact BF16 words for that shard, as prepared by make_nf4_bf16_lut().
+ * The Op indexes these supplied words without floating-point arithmetic, preserving signed
+ * zero. Exclusive row ownership permits combining partial outputs as packed I32/U32 words;
+ * the Op itself performs no communication.
+ *
+ * T>0, B=1..8. token_ids is Device I32 [T,B] with contiguous dimension zero and a
+ * non-overlapping, naturally aligned outer stride. before.token_ids selects dense I32 [2]
+ * records with contiguous Device I64 [B] byte offsets. valid_columns is Device I32 [B].
+ * For n=valid_columns[b], 0<=n<=T; live rows select valid, naturally aligned records. Output is
+ * contiguous, 16-byte-aligned BF16 [2560,T,B]. Columns t>=n are exact +0 and read no token IDs or
+ * tail. All storage belongs to execution.device(); pages cover ceil(rows/45)*4096 bytes and decode
+ * is naturally aligned. Output overlaps no addressed input, page span or decode table. Inputs are
+ * preserved. No state, frontier or count is changed. No workspace, hidden allocation or Host
+ * readback is required. CUDA Graph replay consumes current Device IDs, tails and metadata;
+ * descriptor and hash values are captured by value, and their referenced storage outlives every
+ * consumer.
+ */
+void ngram_embedding_lookup(const Tensor& token_ids, const Tensor& valid_columns,
+                            const NgramTokenTailView& before, const NgramHashParameters& hash,
+                            std::int32_t eos, std::span<const Nf4EmbeddingShard> shards,
+                            Tensor& embedding, CudaExecutionView execution);
 
 /**
  * Shared PLE domain and view conventions:
  *
  * H=2560 features per stream, C=4 streams, D=H*C=10240 channels. Channel c=d+H*s
  * identifies feature d of stream s. B is in [1,8]; T (physical columns per batch row), R
- * (record columns) and each pool's S (state slots) are positive. Every positive T representable
- * by the views and available storage is supported. Matching axes agree across operands.
+ * (record columns) are positive. Every positive T representable by the views and available
+ * storage is supported. Matching axes agree across operands.
  *
  * All tensors refer to Device storage. Tensor dimension zero is fastest; nb[] contains byte
  * strides. Residual, gated_value, updated_residual and normalized are contiguous BF16
@@ -21,8 +75,9 @@ namespace ninfer::ops {
  * and positive, element-aligned strides over their used axes, with no overlapping elements:
  *   - key [H,C,T,B] has contiguous feature/stream axes; value [H,T,B] has a contiguous
  *     feature axis. Their token/batch strides are explicit, including packed-parent gaps.
- *   - history [D,9,S] and records [D,R,B] have contiguous features; column and slot/batch
- *     strides can retain gaps from pool slices. History columns are ordered oldest to newest.
+ *   - history selects dense BF16 [D,9] fields with contiguous Device I64 [B] byte offsets.
+ *     Each selected field satisfies its declared alignment. Columns are oldest to newest.
+ *   - records [D,R,B] have contiguous features and positive column/batch strides.
  *
  * Every view is non-owning. Constness of a Tensor descriptor does not grant write access to
  * its data; each Op below specifies the writable regions. Host-visible shape, dtype, stride,
@@ -62,8 +117,17 @@ struct PleGateParameters {
 };
 
 struct PleConvStateView {
-    Tensor history; // BF16 [D,9,S], nine preceding normalized columns, oldest first.
-    Tensor slots;   // I32 [B], selects a slot in this history pool for each row.
+    StateFieldView history; // BF16 [D,9] per record, nine preceding normalized columns.
+};
+
+struct ConstPleConvStateView {
+    ConstStateFieldView history;
+
+    ConstPleConvStateView() = default;
+
+    ConstPleConvStateView(ConstStateFieldView history) : history(history) {}
+
+    ConstPleConvStateView(const PleConvStateView& view) : history(view.history) {}
 };
 
 struct PleConvRecordWindowView {
@@ -110,10 +174,10 @@ void ple_gate(const PleProjectionView& projected, const Tensor& residual,
 /**
  * Dilated causal convolution, SiLU and residual addition, optionally followed by norm.
  *
- * For each active row b, before.history[:,0..8,before.slots[b]] holds the nine columns
+ * For each active row b, before.history[b][:,0..8] holds the nine columns
  * immediately preceding local t=0; current.offsets[b] selects the first current N column.
  * Define the represented BF16 input to convolution as
- *   N[c,k,b] = before.history[c,9+k,before.slots[b]]             for -9<=k<0,
+ *   N[c,k,b] = before.history[b][c,9+k]                          for -9<=k<0,
  *              current.values[c,current.offsets[b]+k,b]        for 0<=k<n[b].
  * For 0<=t<n[b], c=d+H*s:
  *   v[c,t,b] = sum_{j=0..3} kernel[c,j] * N[c,t-9+3*j,b]
@@ -126,7 +190,7 @@ void ple_gate(const PleProjectionView& projected, const Tensor& residual,
  * Shared domain applies. residual, gated_value and each output are BF16 [H,C,T,B];
  * kernel is BF16 [D,4]; next_hc_norm_weight is BF16 [H,C]. For every row,
  *   0<=current.offsets[b] and current.offsets[b]+n[b]<=R.
- * For n[b]>0, before.slots[b] is in [0,S). Rows with n[b]=0 need no valid slot index.
+ * For n[b]>0, before.history selects a valid record. Rows with n[b]=0 need no valid offset.
  * Every required N word must be ready before this call; current is read-only.
  *
  * There is no public intermediate rounding between convolution, SiLU and the residual sum.
@@ -140,12 +204,12 @@ void ple_gate(const PleProjectionView& projected, const Tensor& residual,
  * Shared workspace/execution rules apply.
  */
 void ple_conv_add(const Tensor& residual, const Tensor& gated_value, const Tensor& kernel,
-                  const PleBatchView& batch, const PleConvStateView& before,
+                  const PleBatchView& batch, const ConstPleConvStateView& before,
                   const PleConvRecordWindowView& current, Tensor& updated_residual,
                   CudaExecutionView execution);
 
 void ple_conv_add_norm(const Tensor& residual, const Tensor& gated_value, const Tensor& kernel,
-                       const PleBatchView& batch, const PleConvStateView& before,
+                       const PleBatchView& batch, const ConstPleConvStateView& before,
                        const PleConvRecordWindowView& current, const Tensor& next_hc_norm_weight,
                        float next_hc_epsilon, Tensor& updated_residual, Tensor& normalized,
                        CudaExecutionView execution);
@@ -153,30 +217,28 @@ void ple_conv_add_norm(const Tensor& residual, const Tensor& gated_value, const 
 /**
  * Extract the trailing nine columns after an accepted prefix.
  *
- * For row b, let a=accepted_columns[b], src=before.slots[b], dst=after.slots[b]. For every
- * channel c and j in [0,9), let k=a-9+j and copy the BF16 word
- *   after.history[c,j,dst] = before.history[c,9+k,src]  if k<0,
- *                            records.values[c,k,b]     otherwise.
- * Record column zero is the first column after the nine-column before history. a=0 copies
- * the complete before history to after, including when source and destination are distinct;
+ * For row b, let a=accepted_columns[b]. For every channel c and j in [0,9), let k=a-9+j and copy
+ * the BF16 word after.history[b][c,j] = before.history[b][c,9+k]  if k<0, records.values[c,k,b]
+ * otherwise. Record column zero is the first column after the nine-column before history. a=0
+ * copies the complete before history to after, including when source and destination are distinct;
  * a>=9 uses only the trailing nine words of the accepted record prefix.
  *
- * Shared view rules apply. before/after may use different pools and positive slot counts.
+ * Shared view rules apply. before/after may use different backing arenas.
  * accepted_columns is contiguous Device I32 [B]. For each b, 0<=a<=records.valid_columns[b]<=R.
- * Every source/destination index is valid in its respective pool, including for a=0.
+ * Every source/destination byte offset selects a valid field, including for a=0.
  *
  * This is exact BF16 word copying, preserving every bit including zero signs. No numerical
  * evaluation or finite-value requirement is imposed on the copied words. Only the nine columns
- * in the selected destination slots are written; unselected slots, records and metadata remain
+ * in the selected destination records are written; other records and metadata remain
  * unchanged. Destinations are mutually disjoint and cannot overlap another row's source.
- * Read-only source slots may be shared. A row's destination may exactly alias its own source
+ * Read-only source records may be shared. A row's destination may exactly alias its own source
  * region with identical layout; it must otherwise be disjoint from every source, records and
  * metadata. When in-place, the result uses the original source words, not earlier writes of
  * this call. Aliasing is defined on addressed regions even when pool descriptors differ.
  * The Op changes no counts/offsets and does not adopt or publish the new state.
  * Shared workspace/execution rules apply.
  */
-void ple_state_extract(const PleConvStateView& before, const PleConvRecordReadView& records,
+void ple_state_extract(const ConstPleConvStateView& before, const PleConvRecordReadView& records,
                        const Tensor& accepted_columns, PleConvStateView after,
                        CudaExecutionView execution);
 

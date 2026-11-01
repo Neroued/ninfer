@@ -63,20 +63,20 @@ bool EngineCore<Instance>::current_decode_contains(std::uint32_t lane) const noe
 
 template <class Instance>
 void EngineCore<Instance>::add_class_host_time(std::uint64_t host_ns,
-                                               std::uint64_t device_wait_ns) noexcept {
+                                               std::uint64_t scheduler_yield_ns) noexcept {
     RuntimeHostWorkStats& stats = cumulative_stats_.host_work;
     switch (current_host_work_class_) {
     case HostWorkClass::Decode:
         stats.decode_host_ns += host_ns;
-        stats.decode_device_wait_ns += device_wait_ns;
+        stats.decode_scheduler_yield_ns += scheduler_yield_ns;
         break;
     case HostWorkClass::Prefill:
         stats.prefill_host_ns += host_ns;
-        stats.prefill_device_wait_ns += device_wait_ns;
+        stats.prefill_scheduler_yield_ns += scheduler_yield_ns;
         break;
     case HostWorkClass::Control:
         stats.control_host_ns += host_ns;
-        stats.control_device_wait_ns += device_wait_ns;
+        stats.control_scheduler_yield_ns += scheduler_yield_ns;
         break;
     }
 }
@@ -118,31 +118,41 @@ void EngineCore<Instance>::finish_engine_phase(const HostPhaseMeasurement& measu
 }
 
 template <class Instance>
-void EngineCore<Instance>::record_program_timing(runtime::ExecutionTiming timing,
-                                                 const ActiveExposureSet& exposed) noexcept {
-    RuntimeHostWorkStats& stats = cumulative_stats_.host_work;
-    stats.program_submit_ns += timing.submit_host_ns;
-    stats.program_post_ns += timing.post_host_ns;
-    stats.device_wait_ns += timing.device_wait_ns;
-    stats.constraint_draft_wait_ns += timing.constraint_draft_wait_ns;
-    add_class_host_time(timing.host_ns(), timing.device_wait_ns);
-    for (std::size_t i = 0; i < exposed.size; ++i) {
-        const ActiveExposure& exposure = exposed.entries[i];
-        RequestHostTiming& request     = exposure.request->host_timing;
-        request.expose_program(timing, current_host_work_class_ == HostWorkClass::Decode &&
-                                           current_decode_contains(exposure.lane));
+void EngineCore<Instance>::record_coordinator_call(CoordinatorCall call, std::uint64_t elapsed,
+                                                   const ActiveExposureSet& exposed) noexcept {
+    auto& stats = cumulative_stats_.host_work;
+    switch (call) {
+    case CoordinatorCall::Session:
+        stats.session_call_ns += elapsed;
+        break;
+    case CoordinatorCall::Poll:
+        stats.executor_poll_ns += elapsed;
+        break;
+    case CoordinatorCall::Flush:
+        stats.executor_flush_ns += elapsed;
+        break;
+    case CoordinatorCall::Yield:
+        stats.scheduler_yield_ns += elapsed;
+        break;
     }
-    worker_accounted_elapsed_ns_ += timing.elapsed_ns();
+    const bool yielding = call == CoordinatorCall::Yield;
+    add_class_host_time(yielding ? 0 : elapsed, yielding ? elapsed : 0);
+    for (std::size_t i = 0; i < exposed.size; ++i) {
+        const auto& exposure = exposed.entries[i];
+        exposure.request->host_timing.expose_call(call, elapsed,
+                                                  current_host_work_class_ ==
+                                                          HostWorkClass::Decode &&
+                                                      current_decode_contains(exposure.lane));
+    }
+    worker_accounted_elapsed_ns_ += elapsed;
 }
 
 template <class Instance>
-void EngineCore<Instance>::finish_program_call(const HostPhaseMeasurement& measurement,
-                                               runtime::ExecutionTiming timing) noexcept {
-    const std::uint64_t wall     = elapsed_ns(measurement.started, Clock::now());
-    const std::uint64_t nested   = worker_accounted_elapsed_ns_ - measurement.accounted_before;
-    const std::uint64_t observed = timing.elapsed_ns() + nested;
-    if (wall > observed) { timing.submit_host_ns += wall - observed; }
-    record_program_timing(timing, measurement.exposed);
+void EngineCore<Instance>::finish_execution_call(const HostPhaseMeasurement& measurement,
+                                                 CoordinatorCall call) noexcept {
+    const auto wall   = elapsed_ns(measurement.started, Clock::now());
+    const auto nested = worker_accounted_elapsed_ns_ - measurement.accounted_before;
+    record_coordinator_call(call, wall > nested ? wall - nested : 0, measurement.exposed);
 }
 
 template <class Instance>
@@ -162,28 +172,28 @@ void EngineCore<Instance>::publish_runtime_stats() {
     const Clock::time_point detail_started = Clock::now();
     std::optional<nvtx::ScopedRange> detail_range;
     detail_range.emplace(nvtx::Name::StatsPublication, nvtx::Category::Control);
-    auto& snapshot                       = stats_snapshot_;
-    snapshot                             = cumulative_stats_;
-    const auto physical                  = instance_.program->physical_usage();
-    snapshot.device_state_occupied_slots = physical.occupied.state_slots;
+    auto& snapshot             = stats_snapshot_;
+    snapshot                   = cumulative_stats_;
+    const auto& executions     = instance_.executor->execution_statistics();
+    snapshot.decode_rounds     = executions[static_cast<std::size_t>(ExecutionKind::Decode)].units;
+    snapshot.decode_row_rounds = executions[static_cast<std::size_t>(ExecutionKind::Decode)].rows;
+    const auto physical        = instance_.session->physical_usage();
+    snapshot.context_pools     = physical.pools;
+    snapshot.context_metadata  = physical.metadata;
+    snapshot.state_objects     = physical.state_objects;
+    snapshot.history_objects   = physical.history_objects;
     for (auto& pool : snapshot.kv_pools) {
-        pool.occupied_page_groups = physical.occupied.kv_page_groups[pool.id];
-        pool.capacity_page_groups = physical.capacity.kv_page_groups[pool.id];
+        pool.occupied_page_groups = physical.kv_page_groups.at(pool.id);
     }
 
     {
         std::lock_guard lock(queue_mutex_);
         snapshot.waiting_requests = static_cast<std::uint32_t>(pending_.size());
     }
-    snapshot.prefilling_requests              = 0;
-    snapshot.paused_requests                  = static_cast<std::uint32_t>(paused_.size());
-    snapshot.replaying_requests               = 0;
-    snapshot.host_context_occupied_bytes      = physical.occupied.host_bytes;
-    snapshot.host_state_occupied_slots        = physical.host_state_slots;
-    snapshot.host_kv_occupied_bytes           = physical.host_kv_bytes;
-    snapshot.host_context_reserved_bytes      = physical.host_reserved_bytes;
-    snapshot.host_context_peak_occupied_bytes = physical.host_peak_occupied_bytes;
-    snapshot.materializing_requests           = materializing_.has_value() ? 1U : 0U;
+    snapshot.prefilling_requests    = 0;
+    snapshot.paused_requests        = static_cast<std::uint32_t>(paused_.size());
+    snapshot.replaying_requests     = 0;
+    snapshot.materializing_requests = materializing_.has_value() ? 1U : 0U;
     for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
         if (slots_[lane] == nullptr) { continue; }
         ++snapshot.running_requests;
@@ -199,8 +209,16 @@ void EngineCore<Instance>::publish_runtime_stats() {
     phase_range.reset();
     finish_engine_phase(measurement, EngineHostPhase::Maintenance);
     snapshot.host_work = cumulative_stats_.host_work;
+    snapshot.host_work.prefill_units =
+        executions[static_cast<std::size_t>(ExecutionKind::Prefill)].units;
+    snapshot.host_work.control_units =
+        executions[static_cast<std::size_t>(ExecutionKind::Control)].units;
     std::lock_guard lock(stats_mutex_);
-    published_stats_ = snapshot;
+    published_snapshot_.stamp   = {published_snapshot_.stamp.sequence + 1, observation_time_ns()};
+    published_snapshot_.runtime = snapshot;
+    published_snapshot_.executions = instance_.executor->execution_statistics();
+    const auto ranks               = instance_.executor->observations();
+    published_snapshot_.ranks.assign(ranks.begin(), ranks.end());
 }
 
 template <class Instance>
@@ -222,21 +240,12 @@ void EngineCore<Instance>::record_context_work(
             transfer.resource.is_state()
                 ? cumulative_stats_.context_transfers.state
                 : cumulative_stats_.context_transfers.kv.at(transfer.resource.pool->index);
-        auto& total           = series.at(direction);
-        const auto accumulate = [&](GenerationTransferTiming& timing) {
-            timing.bytes += transfer.work.payload_bytes;
-            timing.seconds += transfer.elapsed_ns * 1.0e-9;
-            timing.images += transfer.image_count;
-            timing.page_groups += transfer.page_groups;
-            timing.copy_operations += transfer.work.copy_operations;
-        };
-        accumulate(total);
-        cumulative_stats_.actual_context_transfer_seconds += transfer.elapsed_ns * 1.0e-9;
+        accumulate_context_transfer(series.at(direction), transfer);
         if (owner) {
             if (!owner->first_output_timing) {
                 auto& observed =
                     owner->context_transfers.at(transfer.resource.index()).at(direction);
-                accumulate(observed);
+                accumulate_context_transfer(observed, transfer);
             }
             if (transfer.direction == ContextTransferDirection::DeviceToHost) {
                 owner->device_to_host_bytes += transfer.work.payload_bytes;
@@ -246,6 +255,21 @@ void EngineCore<Instance>::record_context_work(
             }
         }
     }
+    std::uint64_t longest_rank_ns = 0;
+    for (std::size_t first = 0; first < progress.transfers.size(); ++first) {
+        const auto rank = progress.transfers[first].rank;
+        if (std::any_of(progress.transfers.begin(), progress.transfers.begin() + first,
+                        [=](const auto& transfer) { return transfer.rank == rank; }))
+            continue;
+        std::uint64_t rank_ns = 0;
+        for (const auto& transfer : progress.transfers) {
+            if (transfer.rank != rank) continue;
+            rank_ns = transfer.elapsed_ns > UINT64_MAX - rank_ns ? UINT64_MAX
+                                                                 : rank_ns + transfer.elapsed_ns;
+        }
+        longest_rank_ns = std::max(longest_rank_ns, rank_ns);
+    }
+    cumulative_stats_.actual_context_transfer_seconds += longest_rank_ns * 1.0e-9;
 }
 
 template <class Instance>
@@ -255,32 +279,24 @@ void EngineCore<Instance>::record_first_output(const std::shared_ptr<Request>& r
     snapshot.elapsed_seconds         = elapsed_ns(request->submitted, now) * 1.0e-9;
     snapshot.initial_binding_seconds = request->initial_binding_ns * 1.0e-9;
     snapshot.engine                  = request->host_timing.public_snapshot();
-    snapshot.prefill                 = request->prefill_work;
-    snapshot.replay                  = request->replay_work;
-    snapshot.scheduling              = {
-                     .preemptions       = request->preemption_count,
-                     .snapshot_restores = request->snapshot_restores,
-                     .replay_restores   = request->replay_restores,
-                     .replayed_tokens   = request->replayed_tokens,
-                     .paused_ns =
+    snapshot.prefill = request->executions[static_cast<std::size_t>(ExecutionKind::Prefill)];
+    snapshot.replay  = request->executions[static_cast<std::size_t>(ExecutionKind::Replay)];
+    snapshot.pending_execution = request->pending_execution;
+    snapshot.scheduling        = {
+               .preemptions       = request->preemption_count,
+               .snapshot_restores = request->snapshot_restores,
+               .replay_restores   = request->replay_restores,
+               .replayed_tokens   = request->replayed_tokens,
+               .paused_ns =
             request->paused_ns + (request->paused_at ? elapsed_ns(*request->paused_at, now) : 0),
-                     .device_to_host_bytes = request->device_to_host_bytes,
-                     .host_to_device_bytes = request->host_to_device_bytes,
+               .device_to_host_bytes = request->device_to_host_bytes,
+               .host_to_device_bytes = request->host_to_device_bytes,
     };
     snapshot.computed_prefill_tokens = request->computed_prompt_tokens;
     snapshot.context_transfers.state = request->context_transfers[0];
     snapshot.context_transfers.kv.assign(request->context_transfers.begin() + 1,
                                          request->context_transfers.begin() + 1 +
-                                             instance_.program->kv_pools().size());
-}
-
-template <class Instance>
-void EngineCore<Instance>::record_execution_work(GenerationWorkTiming& work,
-                                                 ExecutionTiming timing) noexcept {
-    work.submit_seconds += timing.submit_host_ns * 1.0e-9;
-    work.wait_seconds += timing.device_wait_ns * 1.0e-9;
-    work.post_seconds += timing.post_host_ns * 1.0e-9;
-    work.gpu_seconds += timing.gpu_elapsed_ns * 1.0e-9;
+                                             instance_.session->kv_pools().size());
 }
 
 } // namespace ninfer::runtime

@@ -1,13 +1,13 @@
 #pragma once
 
 #include "ninfer/ops/attention_geometry.h"
+#include "ops/suite.h"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <limits>
 #include <stdexcept>
-#include <thread>
 #include <vector>
 
 namespace ninfer::test {
@@ -22,9 +22,8 @@ template <typename QueryValue, typename KeyValue, typename ValueValue, typename 
 void naive_dense_softmax_attention(ops::AttentionHeadGeometry geometry, int query_tokens,
                                    int key_tokens, double scale, QueryValue query_value,
                                    KeyValue key_value, ValueValue value_value, Visible visible,
-                                   Store store, int worker_limit = 1) {
-    if (!ops::valid_attention_head_geometry(geometry) || query_tokens < 0 || key_tokens < 0 ||
-        worker_limit < 1) {
+                                   Store store, bool parallel = false) {
+    if (!ops::valid_attention_head_geometry(geometry) || query_tokens < 0 || key_tokens < 0) {
         throw std::invalid_argument("invalid naive Softmax Attention geometry");
     }
     const int group         = geometry.query_heads / geometry.kv_heads;
@@ -80,13 +79,9 @@ void naive_dense_softmax_attention(ops::AttentionHeadGeometry geometry, int quer
             }
         }
     };
-    const int workers = static_cast<int>(std::min<std::int64_t>(worker_limit, rows));
-    if (workers == 1) return run_rows(0, rows);
-    std::vector<std::jthread> threads;
-    threads.reserve(workers - 1);
-    for (int worker = 1; worker < workers; ++worker)
-        threads.emplace_back(run_rows, rows * worker / workers, rows * (worker + 1) / workers);
-    run_rows(0, rows / workers);
+    if (!parallel) return run_rows(0, rows);
+    parallel_rows(static_cast<int>(rows), std::uint64_t(rows) * key_tokens * geometry.head_dim,
+                  run_rows);
 }
 
 } // namespace ninfer::test

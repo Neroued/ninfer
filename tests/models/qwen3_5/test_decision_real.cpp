@@ -65,10 +65,9 @@ int main() {
         ninfer::EngineOptions options;
         options.artifact_path    = artifact;
         options.max_context      = 4096;
-        options.kv_capacity      = ninfer::KvCapacityPolicy::explicit_capacity(4096);
+        options.context_capacity = ninfer::ContextCapacityPolicy::explicit_capacity(2ULL << 30);
         options.max_concurrency  = 2;
         options.enable_decisions = true;
-        options.context_cache.device_state_slots  = 4;
         options.context_cache.host_capacity_bytes = 0;
         const auto* spec_env                      = std::getenv("NINFER_DECISION_TEST_SPEC");
         const std::string spec                    = spec_env ? spec_env : "none";
@@ -90,7 +89,8 @@ int main() {
         ninfer::BranchScoreResult scored;
         std::size_t decision_kv_bytes = 0;
         double worst                  = 0;
-        ninfer::MemorySummary native_memory;
+        ninfer::MemoryAllocations native_memory;
+        ninfer::RankMemoryBudget native_budget;
         ninfer::RequestOptions generation;
         generation.execution.requested_output_tokens    = 8;
         generation.execution.allow_prefix_reuse         = false;
@@ -102,38 +102,33 @@ int main() {
             auto native_options             = options;
             native_options.enable_decisions = false;
             ninfer::Engine native(native_options);
-            native_memory = native.memory_summary();
+            native_memory = native.snapshot().ranks.at(0).memory.allocations;
+            native_budget = native.startup_report().ranks.at(0);
             native_output = native.generate(native.prepare(chat()), generation).generated_token_ids;
         }
         {
             ninfer::Engine engine(options);
-            const auto enabled_memory = engine.memory_summary();
-            decision_kv_bytes         = enabled_memory.kv_payload_bytes;
-            expect(enabled_memory.minimum_runtime_reservation_bytes ==
-                           native_memory.minimum_runtime_reservation_bytes &&
-                       enabled_memory.runtime_reservation_bytes ==
-                           native_memory.runtime_reservation_bytes &&
-                       enabled_memory.kv_capacity_increment_bytes ==
-                           native_memory.kv_capacity_increment_bytes &&
-                       enabled_memory.kv_payload_bytes == native_memory.kv_payload_bytes &&
-                       enabled_memory.sequence.capacity_bytes ==
-                           native_memory.sequence.capacity_bytes &&
-                       enabled_memory.workspace.capacity_bytes ==
-                           native_memory.workspace.capacity_bytes &&
-                       enabled_memory.cuda_graph.has_value() == native_memory.cuda_graph.has_value() &&
-                       (!enabled_memory.cuda_graph ||
-                        enabled_memory.cuda_graph->rebuild_estimate_bytes ==
-                            native_memory.cuda_graph->rebuild_estimate_bytes),
+            const auto enabled_memory = engine.snapshot().ranks.at(0).memory.allocations;
+            const auto& budget        = engine.startup_report().ranks.at(0);
+            decision_kv_bytes         = enabled_memory.context_device_bytes;
+            expect(budget.minimum_context_capacity_bytes ==
+                           native_budget.minimum_context_capacity_bytes &&
+                       budget.context_capacity_bytes == native_budget.context_capacity_bytes &&
+                       enabled_memory.context_device_bytes == native_memory.context_device_bytes &&
+                       enabled_memory.persistent_device_bytes ==
+                           native_memory.persistent_device_bytes &&
+                       enabled_memory.workspace_device_bytes ==
+                           native_memory.workspace_device_bytes &&
+                       enabled_memory.device_bytes() == native_memory.device_bytes() &&
+                       budget.graphs.has_value() == native_budget.graphs.has_value() &&
+                       (!budget.graphs || budget.graphs->rebuild_estimate_bytes ==
+                                              native_budget.graphs->rebuild_estimate_bytes),
                    "enabling decisions changed the native startup resource plan");
             const auto baseline = engine.generate(engine.prepare(chat()), generation);
             expect(!baseline.generated_token_ids.empty(), "empty ordinary generation");
             expect(baseline.generated_token_ids == native_output,
                    "enabling decisions changed ordinary generation");
-            const auto state_occupancy = [&] {
-                // Wait for the worker's publication boundary after its scoring promise resolves.
-                (void)engine.memory_summary();
-                return engine.runtime_stats().device_state_occupied_slots;
-            };
+            const auto state_occupancy  = [&] { return engine.snapshot().runtime.state_objects; };
             const auto chat_state_slots = state_occupancy();
 
             auto candidates = engine.tokenize_text("true false");
@@ -159,7 +154,7 @@ int main() {
             }
             const auto batch = rows(cases, true);
             scored           = engine.score_branches(batch);
-            expect(state_occupancy() >= chat_state_slots + 3,
+            expect(state_occupancy() == chat_state_slots + 1,
                    "decision state was not reserved through the native pool");
             expect(scored.largest_batch >= 1 && scored.largest_batch <= 8 &&
                        scored.reused_tokens > 0,
@@ -237,7 +232,7 @@ int main() {
                 if (!cache) {
                     const auto repeated = decisions.run(request);
                     expect(response.at("usage").at("computed_tokens") ==
-                               repeated.at("usage").at("computed_tokens") &&
+                                   repeated.at("usage").at("computed_tokens") &&
                                response.at("usage").at("cached_tokens").get<std::uint64_t>() > 0,
                            "cache opt-out must rebuild once while sharing current-request work");
                 }
@@ -273,8 +268,7 @@ int main() {
             expect(first.computed_tokens == scored.computed_tokens &&
                        again.computed_tokens == first.computed_tokens && first.reused_tokens > 0,
                    "global cache opt-out disabled sharing or reused a retained root");
-            (void)engine.memory_summary();
-            expect(engine.runtime_stats().device_state_occupied_slots == 0,
+            expect(engine.snapshot().runtime.state_objects == 0,
                    "global cache opt-out retained decision state");
             for (std::size_t i = 0; i < cases.size(); ++i) {
                 worst = std::max(worst, compare(scored.logits[i], again.logits[i]));
@@ -289,7 +283,8 @@ int main() {
         options.context_cache.enabled = false;
         ninfer::Engine reference(options);
         if (spec == "none") {
-            expect(reference.memory_summary().kv_payload_bytes == decision_kv_bytes,
+            expect(reference.snapshot().ranks.at(0).memory.allocations.context_device_bytes ==
+                       decision_kv_bytes,
                    "decision mode reserved a duplicate KV payload");
         }
         for (std::size_t i = 0; i < cases.size(); ++i) {

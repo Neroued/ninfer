@@ -1,54 +1,62 @@
 #pragma once
 
-#include "ninfer/branch_score.h"
 #include "core/gdn_replay_records.h"
-#include "core/linear_attention_state.h"
+#include "core/layout.h"
+#include "core/arena.h"
+#include "models/common/context/transfer.h"
 #include "models/qwen3_5/state/decoder_state.h"
-#include "models/common/context/kv_history.h"
-#include "models/qwen3_5/state/state_image.h"
 #include "ninfer/ops/gdn_replay.h"
+#include "ninfer/types.h"
 
-namespace ninfer::models::qwen3_5::detail {
+#include <cstdint>
+#include <array>
+#include <optional>
+#include <vector>
 
-inline constexpr std::int32_t kBranchBatch = 8;
-inline constexpr std::int32_t kBranchWidth = 16;
+namespace ninfer::models::qwen3_5 {
 
+inline constexpr std::uint32_t kBranchBatch = 8;
+inline constexpr std::uint32_t kBranchWidth = 16;
+
+// A non-owning overlay of the general workspace; Context records remain Session-owned.
 struct BranchLayout {
-    std::int32_t batch_capacity = 0;
-    std::uint32_t prefill_chunk = 0;
+    std::uint32_t batch_capacity = 0;
+    std::uint32_t prefill_chunk  = 0;
     KVExecutionTableLayout tables;
     GdnReplayRecordLayout records;
-    TensorRegion ids, positions, counts, rows, slots, hidden, tails, logits;
+    TensorRegion ids, positions, counts, rows, offsets, hidden, tails, logits;
     LayoutRegion scratch;
     std::size_t bytes = 0;
-};
 
-// Temporary workspace overlay plus leases from the Program's existing StateImage store.
-// Released before generation resumes; no weights or device allocation of its own.
-// Local slots 0, 1..B and B+1..2B map to reserved physical root/trunk/branch slots.
-struct BranchStorage {
-    qwen3_5::PagedKVCache kv;
-    const std::int32_t batch_capacity;
-    LinearAttentionStateView& states;
-    GdnReplayRecords records;
-    ops::GdnReplayFoldPlan fold;
-    context::KVHistoryStore addresses;
-    Tensor ids, positions, counts, rows, slots, hidden, tails, logits;
-    MemoryArena work;
-    std::vector<TokenId> cached_prefix;
-    std::optional<context::KVHistory> cached_address;
-    StateImageStore& state_store;
-    std::vector<StateImageHandle> state_handles;
-
-    BranchStorage(MemorySpan backing, const BranchLayout& layout, qwen3_5::PagedKVCache& kv,
-                  context::LogicalKVPageStore& pages, qwen3_5::StateImageViews& images,
-                  StateImageStore& store, std::int32_t batch, CudaExecutionView execution);
-    ~BranchStorage();
-    void release_cache();
-
-    [[nodiscard]] std::int32_t state_slot(std::int32_t local) const {
-        return state_store.physical_slot(state_handles.at(local));
+    [[nodiscard]] std::size_t pinned_bytes() const noexcept {
+        return std::size_t(tables.spec.logical_page_capacity) * tables.spec.table_rows *
+               sizeof(std::int64_t);
     }
 };
 
-} // namespace ninfer::models::qwen3_5::detail
+namespace detail {
+// Borrows the native Context payload, with separate tables inside the idle general workspace.
+// Mappings survive individual BranchWork frames; each newly bound history republishes its row.
+struct BranchWorkspace {
+    BranchWorkspace(MemorySpan, const BranchLayout&, PagedKVCache&, MemorySpan, DeviceContext&);
+    PagedKVCache cache;
+    context::ContextStorage storage;
+    context::ContextMigration actions;
+};
+
+struct BranchExecution {
+    BranchExecution(MemorySpan, const BranchLayout&, LinearAttentionStateView&);
+    GdnReplayRecords records;
+    std::optional<ops::GdnReplayFoldPlan> fold;
+    Tensor ids, positions, counts, rows, offsets, hidden, tails, logits;
+    MemoryArena work;
+    std::vector<std::vector<std::uint16_t>> readback;
+    std::vector<TokenId> lows;
+    std::array<TokenId, kBranchWidth * kBranchBatch> host_ids{};
+    std::array<std::int32_t, kBranchWidth * kBranchBatch> host_positions{};
+    std::array<std::int32_t, kBranchBatch> host_counts{}, host_rows{};
+    std::array<std::int64_t, kBranchBatch> host_offsets{};
+};
+} // namespace detail
+
+} // namespace ninfer::models::qwen3_5

@@ -32,7 +32,7 @@ struct Sample {
     std::vector<std::byte> bytes;
 };
 
-void check_selection(const q35::LoadPlan& plan, const LoadOptions& options) {
+void check_selection(const q35::ModelDefinition& plan, const LoadOptions& options) {
     const auto& weights = plan.weights();
     require(weights.vision.has_value() == options.vision,
             "Vision demand differs from startup selection");
@@ -75,7 +75,7 @@ void check_placement(const q35::ResolvedLoadPlan& plan) {
         std::set<std::size_t> parents;
         std::uint64_t end = 0;
         for (const auto& item : objects) {
-            require(parents.insert(item.object.index).second,
+            require(parents.insert(item.storage.index).second,
                     "parent was planned twice at one location");
             require(item.region.offset >= end && item.region.offset % item.region.alignment == 0,
                     "weight placement overlaps or is unaligned");
@@ -93,7 +93,7 @@ void check_placement(const q35::ResolvedLoadPlan& plan) {
 }
 
 // Exercise native grouping after Reader destruction, independently of Program selection.
-void check_native_inputs(const q35::Model& model) {
+void check_native_inputs(const q35::ModelShard& model) {
     const auto split = [](std::span<const ops::WeightInput> inputs, bool two_outputs) {
         const auto weights = ops::prepare_projection_weights(inputs);
         std::vector<std::int32_t> rows;
@@ -168,15 +168,16 @@ void check_native_inputs(const q35::Model& model) {
             const ops::MoeProfile profile{
                 ops::routed_swiglu_profile(
                     bank.gate_up, bank.down,
-                    std::get<q35::MoeConfig>(model.config().text.ffn).num_experts_per_tok,
+                    std::get<q35::MoeConfig>(model.definition().config().text.ffn)
+                        .num_experts_per_tok,
                     model.input(moe.experts.front().gate).policy,
                     model.input(moe.experts.front().down).policy),
                 ops::swiglu_profile(shared)};
             (void)ops::topk_softmax_swiglu_moe_workspace_capacity_bytes(
-                profile, ops::MoeEpilogue::AddResidual, 1, 1);
+                profile, ops::ExpertSubsetKind::All, ops::MoeEpilogue::AddResidual, 1, 1);
         }
     };
-    const auto& weights = model.weights();
+    const auto& weights = model.definition().weights();
     (void)native_weight(model.weight(weights.text.token_embedding).view);
     (void)ops::prepare_linear_weight(model.input(weights.text.output_head_use));
     for (const auto& layer : weights.text.layers) { block(layer); }
@@ -283,21 +284,22 @@ int main(int argc, char** argv) {
             return 77;
         }
         std::unique_ptr<DeviceContext> device;
-        std::unique_ptr<q35::Model> model;
+        std::unique_ptr<q35::ModelShard> model;
+        std::shared_ptr<const q35::ModelDefinition> definition;
         std::map<std::string, std::vector<Sample>> samples;
         std::uint64_t expected_h2d = 0;
         {
             artifact::Reader reader(path);
-            auto logical = q35::plan_load(reader, options);
-            check_selection(logical, options);
+            definition = q35::read_definition(reader, options);
+            check_selection(*definition, options);
             auto plan =
-                q35::resolve_load(std::move(logical), Device::cuda(0),
+                q35::resolve_load(reader, definition, Device::cuda(0),
                                   host_experts ? std::optional(Device::cpu()) : std::nullopt);
             check_placement(plan);
             if (host_only) {
                 std::cout << path.filename().string() << ": Host binding passed, architecture="
-                          << architecture_name(plan.logical().config().text.architecture)
-                          << " V=" << plan.logical().resources().public_token_count
+                          << architecture_name(plan.definition().config().text.architecture)
+                          << " V=" << plan.definition().resources().text.public_token_count
                           << " device_bytes=" << plan.materialization().device_capacity_bytes
                           << '\n';
                 return 0;
@@ -310,8 +312,9 @@ int main(int argc, char** argv) {
             parents.insert(parents.end(), placement.registered_host_objects.begin(),
                            placement.registered_host_objects.end());
             for (const auto& item : parents) {
-                const auto& object   = reader.directory().tensor(item.object);
-                const auto& geometry = reader.geometry(item.object);
+                const auto& object = reader.directory().tensor(
+                    placement.tensors.at(item.storage.index).whole_object.value());
+                const auto& geometry = placement.tensors.at(item.storage.index).geometry;
 
                 const auto size = std::min<std::uint64_t>(64, object.bytes);
                 std::set<std::uint64_t> offsets{0, (object.bytes - size) / 2, object.bytes - size};
@@ -351,10 +354,10 @@ int main(int argc, char** argv) {
         require(visited.size() == samples.size(),
                 "some resident parents are not reachable from model weights");
         check_native_inputs(*model);
-        const auto ids = model->resources().tokenizer->encode("Hello");
-        require(model->resources().tokenizer->decode(ids) == "Hello",
+        const auto ids = definition->resources().text.tokenizer->encode("Hello");
+        require(definition->resources().text.tokenizer->decode(ids) == "Hello",
                 "tokenizer did not survive Reader destruction");
-        require(!model->resources().chat_template_jinja.empty(),
+        require(!definition->resources().text.chat_template_jinja.empty(),
                 "template bytes were lost after loading");
         rusage usage{};
         getrusage(RUSAGE_SELF, &usage);
@@ -365,9 +368,12 @@ int main(int argc, char** argv) {
                   << " h2d_bytes=" << model->storage_stats().h2d_bytes
                   << " materialization_seconds=" << model->storage_stats().upload_seconds
                   << " peak_rss_kib=" << usage.ru_maxrss
-                  << " V=" << model->resources().public_token_count << '\n';
+                  << " V=" << definition->resources().text.public_token_count << '\n';
         model.reset();
         device->synchronize();
+        require(definition->resources().text.tokenizer->decode(ids) == "Hello" &&
+                    !definition->resources().text.chat_template_jinja.empty(),
+                "definition resources did not survive local weight release");
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

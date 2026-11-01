@@ -10,6 +10,7 @@ namespace {
 
 std::size_t estimate_turn_bytes(const ChatTurn& turn) {
     std::size_t bytes = sizeof(ChatTurn) + turn.tool_call_id.size() + turn.reasoning_content.size();
+    bytes += turn.content_boundaries.size() * sizeof(MessageContentBoundary);
     if (turn.tool_result_name) { bytes += turn.tool_result_name->size(); }
     for (const ContentPart& part : turn.content) {
         bytes += sizeof(ContentPart) + part.text.size() + part.type_raw.size() +

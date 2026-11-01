@@ -30,8 +30,7 @@ inline std::size_t capacity(int token_domain, int max_columns) {
 
 void launch(const Tensor& target_tokens, const Tensor& logits, const Tensor& drafts,
             const Tensor& candidate_ids, const Tensor& proposal_q, const Tensor& current_extents,
-            Tensor& round_lengths, Tensor& round_anchors, Tensor& licensed_tokens,
-            Tensor& licensed_counts, Tensor& accepted_drafts, std::int32_t token_domain,
-            const SamplingConfig* configs, const Plan& plan, MemorySpan workspace,
-            cudaStream_t stream);
+            const Tensor& base_positions, Tensor& licensed_tokens, Tensor& licensed_counts,
+            std::int32_t token_domain, const SamplingConfig* configs, const Plan& plan,
+            MemorySpan workspace, cudaStream_t stream);
 } // namespace ninfer::ops::sparse_drafts_detail

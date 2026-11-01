@@ -1,143 +1,74 @@
-# Build system
+# 构建系统
 
-NInfer builds from its source tree with CMake 3.28+ and C++/CUDA 20.
-The supported architecture is `sm_120a`; CUDA 13.4 is the validated development toolkit.
-Product commands and prerequisites are in the
-[README](../../README.md#quick-start); test and measurement workflows live in
-[tests](../../tests/README.md) and [benchmarks](../../bench/README.md).
+构建按执行目标选择源码，数学接口和模型语义保持独立。当前目标为 RTX 5090 与 DGX Spark。
+用户安装与运行入口见[README](../../README.md)，本文件说明编译归属和维护边界。
 
-## Configuration
+## 编译目标
 
-The root `CMakeLists.txt` owns language/toolchain constraints, build options and top-level
-composition. Architecture selection and validation happen before `project()` detects CUDA.
-The default configuration is Release. Ninja links and archives share the single-slot
-`ninfer_link` pool; compilation uses the build command's parallelism.
+`NINFER_TARGET` 为每个 build directory 选择一个目标：
 
-| Cache option | Default | Scope |
+| 目标 | 系统 | CUDA architecture |
 |---|---|---|
-| `NINFER_BUILD_APPS` | ON | CLI, HTTP server and perplexity evaluator |
-| `BUILD_TESTING` | OFF | C++ tests and registered Python interoperability tests |
-| `NINFER_BUILD_BENCHMARKS` | OFF | Op, model, Engine and context-cost benchmarks |
+| `rtx5090` | Linux x86-64 | 120a |
+| `dgx_spark` | Linux AArch64 | 121a |
 
-Apps or tests enable the internal product support components: media acquisition, prompt input,
-logging and serving. This is one derived condition, not a separate user option. FFmpeg belongs
-to model media decoding and remains required when apps are disabled. Curl and spdlog are needed
-only for product support. A Python 3 interpreter is found when tests are configured. The larger Python
-pytest suites and conversion/evaluation scripts run separately from CMake and CTest.
+平台配置在 CUDA toolchain 检测前解析，验证系统、架构和 build directory 一致性。
+修改编译目标或 compiler 使用独立构建目录。维护入口为
+[NinferPlatform.cmake](../../cmake/NinferPlatform.cmake)与
+[CMakePresets.json](../../CMakePresets.json)。
 
-CUDA 13.4 and Python 3.11 describe the maintained environment, not configuration version gates.
-CMake also discovers FFmpeg without imposing library version floors. Actual language/API support
-is exercised by compilation and tests. CPU facilities target Linux x86-64 and use hwloc >= 2.5
-for topology discovery without changing the caller's binding. The internal `ninfer_cpu` target
-is ordinary C++, links hwloc/Threads, and can run its tests without CUDA initialization or linkage.
-Core direct-file I/O uses liburing >= 2.5, discovered through pkg-config. Its registered files and
-buffers are owned by the read queue's caller; the queue creates no CUDA resources or worker threads.
-The libcurl 7.85 minimum has a concrete API basis:
-media acquisition uses `CURLOPT_PROTOCOLS_STR` and `CURLOPT_REDIR_PROTOCOLS_STR`, introduced in
-[that release](https://curl.se/libcurl/c/CURLOPT_PROTOCOLS_STR.html).
+生成的内部 platform header 区分 target identity 与 capabilities。
+`NINFER_TARGET_RTX5090` / `NINFER_TARGET_SPARK` 对称表达目标；共享物理内存和 CPU expert 能力
+通过独立 capability 转发。小型差异可使用这些宏，完整实现目录由 CMake 选择。
+模型不据此复制 Op 支持判断，硬件 roofline 参照归 bench。
 
-The checked-in `CMakePresets.json` provides:
+## 源码与依赖归属
 
-- `release`: Release product binaries, tests and benchmarks disabled;
-- `dev`: Release products, tests and benchmarks enabled;
-- matching build presets and a `dev` test preset with failure output enabled.
+小组件直接列源文件，大组件使用明确的 `sources.cmake`。每个实现一个编译 owner，
+新增文件显式注册；不递归扫描目录或自动发现 shape。Manifest 按 `CMAKE_CURRENT_LIST_DIR`
+定位文件，新增 manifest 不自动要求新增 library。
 
-Both configure presets use `build/`. Switching between them explicitly resets all three build
-options; it does not create independent build trees. Build with `cmake --build build -j`.
-For a separate configuration, override the binary directory with `-B build-<name>` and use that
-directory in subsequent build/test commands.
+可共享源码注册一次，target-private route 由各自 manifest 选择。
+AVX CPU executor/MoE 只进入 x86 目标；Spark 不编译这些对象。
+Op 自己保留 format/shape 分派和调优，CMake 不成为另一套 runtime registry。
 
-Keep machine paths in the ignored `CMakeUserPresets.json`. For example, replacing the interpreter
-placeholder with the interpreter from the selected environment:
+配置选项与实际 target 以 [根 CMake](../../CMakeLists.txt)、
+[src](../../src/CMakeLists.txt)和[依赖声明](../../cmake/Dependencies.cmake)为准。
+模型加载、控制与设备执行保持不同依赖边界；runtime 通过 contracts/support 组织它们，
+不让通用 Core/Artifact 依赖模型或 Ops。
 
-```json
-{
-  "version": 6,
-  "configurePresets": [
-    {
-      "name": "local",
-      "inherits": "dev",
-      "cacheVariables": {
-        "Python3_EXECUTABLE": "/path/to/python3"
-      }
-    }
-  ]
-}
+`NINFER_ENABLE_DISTRIBUTED` 独立控制执行组和 NCCL 依赖，关闭时不发现或链接 NCCL。
+系统库正常安装，vendor 源码固定在仓库；配置阶段不下载依赖。
+编译器、Python 和本地依赖路径放入忽略的 `CMakeUserPresets.json`。
+
+## 共享库与 CUDA
+
+产品、测试和 benchmark 共用内部 Core/Ops/CPU shared libraries，输出位于 `<build-dir>/lib/`。
+相对 RPATH 保持 build tree 可运行，移动产物需保留相应目录关系。模型、artifact 和专用测试支持
+按实际依赖保持 static；不提供安装或导出的 SDK/版本化 ABI。
+
+CUDA shared library 各自拥有 device link 与 registration，不跨库暴露 device symbols，
+调用边界使用 Host 函数。非 RDC archive 用于有实际指令或寄存器要求的独立 CUDA 单元，
+通过 Host launcher 接入。Consumers 不重复嵌入整个 Ops fatbin。
+
+源码整理必须保留 CUDA architecture、RDC、numerical compiler options 和唯一 device-link owner。
+拆 manifest 不等于减少实例化，不能因此合并全部 shape translation units 或启用 unity build。
+具体 compile policy 在 [NinferTargets.cmake](../../cmake/NinferTargets.cmake)与所属 family。
+
+## 开发构建
+
+`*-release` 构建产品，`*-dev` 加入 tests/benchmarks，`*-ops` 只构建相应基础与 Op。
+例如：
+
+```bash
+cmake --preset rtx5090-dev
+cmake --build build/rtx5090-dev -j
 ```
 
-Configure that environment with `cmake --preset local`. Compiler paths may also be supplied here;
-changing compilers requires a fresh build directory. There is no tools option, installed SDK,
-package export or configure-time dependency download.
+Spark 使用 `dgx-spark-*`；分布式另启用对应选项。独立 build tree 防止目标、缓存和产物混用。
+具体选项默认值直接查 CMake，测试与测量命令分别见
+[tests](../../tests/README.md)和[bench](../../bench/README.md)。
 
-## Targets and dependencies
-
-[`cmake/Dependencies.cmake`](../../cmake/Dependencies.cmake) owns system dependency discovery,
-repository-pinned third-party targets and their product-support conditions. External include
-requirements follow their consuming targets.
-[`cmake/NinferTargets.cmake`](../../cmake/NinferTargets.cmake) provides private project includes
-and the two CUDA archive policies.
-
-[`src/CMakeLists.txt`](../../src/CMakeLists.txt) explicitly enters the component directories.
-Each component's `CMakeLists.txt` owns its targets, dependency visibility and compile properties;
-those files provide the current target and dependency inventory.
-
-Component declaration order is not the execution dependency graph: CMake resolves named target
-links during generation. Model runtime can refer to the runtime support target declared later;
-support links core, while Engine links model runtime. The ownership and dependency contracts are
-defined by [Engine architecture](engine-architecture.md) and [Op development](op-development.md).
-
-## Explicit source ownership
-
-Small components list their sources directly. Larger components include local `sources.cmake`
-manifests which use `target_sources(<owner> PRIVATE ...)`. Included manifests anchor file paths
-with `CMAKE_CURRENT_LIST_DIR`; `include()` does not change `CMAKE_CURRENT_SOURCE_DIR`.
-
-- Every implementation under `src/` has one target owner and one explicit registration.
-- Ops register implementations through their owning family manifests. Shared weight-input
-  preparation and compile policy are owned by `src/ops/CMakeLists.txt`.
-- Linear separates shared kernel and projection manifests. Format manifests list explicit sources
-  and shape filenames with their actual `.cpp`/`.cu` extensions.
-- Models retain distinct immutable-loading and mutable-runtime targets. Native loading, execution
-  and Program manifests own architecture code; `common/qwen/sources.cmake` owns shared Frontend
-  and Vision sources. Shared bindings and context/MoE mechanisms have explicit target entries.
-  Runtime startup orchestration links model runtime; native startup planners only depend on
-  runtime support/contracts. Checkpoints/recipes do not define additional compile owners.
-- New files require an explicit manifest edit. New families require an explicit parent include.
-  There is no recursive glob, directory discovery or generated shape/dispatch registry.
-
-Adding a source manifest does not require another library. Add a target only for a meaningful
-dependency, reuse or compilation boundary. Shape semantics, supported domains and finite
-dispatch remain in C++; CMake only selects translation units.
-
-## CUDA compilation boundaries
-
-`ninfer_core` and `ninfer_ops` enable separable compilation (RDC) and resolve device symbols in
-the static archive build. Keep this device-link boundary explicit.
-
-`ninfer_nvfp4_non_rdc` disables separable compilation and device-symbol resolution. It contains
-the warp-specialized Linear, LinearSwiGLU and causal-attention NVFP4 sources that depend on
-`setmaxnreg` register transfer. Their owning family manifests register these sources into the
-non-RDC target; host launchers connect them to the normal Ops. All three CUDA archive targets
-retain `-lineinfo`.
-
-Source-list maintenance must preserve language, architecture, RDC mode, device-link ownership
-and numerical compiler options. Splitting a manifest does not reduce kernel instantiation work
-or justify combining shape translation units or enabling unity builds.
-
-## Consumers and verification
-
-`apps/CMakeLists.txt` explicitly defines the three product executables. Tests and benchmarks
-include their domain registrations without creating new CMake subdirectories, preserving
-`build/tests/`, `build/bench/` and CTest working directories. The helpers are local to those
-consumers. Tests explicitly name their linked libraries; public-header and pure-host checks keep
-their isolated include/link requirements.
-
-Tests can reuse compiled support libraries. Oracle options apply to the libraries containing
-oracle code as well as the test executables. Test variants, skip return codes,
-interop commands and special linker options belong with the affected registrations.
-
-For build-organization changes, compare configured target/source ownership, compile flags,
-device links and CTest commands/properties; check the relevant option combinations, build the
-affected targets and run their behavioral tests. A shape-source edit should rebuild its own
-translation unit plus necessary downstream links. Build-time or inference-speed claims require
-measurements at that scope.
+测试可以共享编译支持，但独立数值 oracle 的编译选项必须作用到实际包含 oracle 的 library。
+失败注入仅在测试 executable 内通过现有 interpose 机制实现，不增加生产 fault hooks。
+构建组织变化检查源码归属、compile/device-link flags 与受影响行为。

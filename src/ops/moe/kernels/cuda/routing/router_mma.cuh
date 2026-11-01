@@ -13,12 +13,15 @@ using common::mma_bf16;
 using common::ldmatrix_x2;
 using common::ldmatrix_x4;
 
-template <class Shape>
-__global__ __launch_bounds__(256,
+template <class Shape, int Rows = 16>
+__global__ __launch_bounds__(Rows == 16 ? 256 : 128,
                              2) void router_mma_kernel(const __nv_bfloat16* __restrict__ x,
                                                        const __nv_bfloat16* __restrict__ weight,
                                                        float* __restrict__ scores, int tokens) {
-    constexpr int BM = 16, BN = 64, BK = 64, Stages = 2, Threads = 256;
+    static_assert(Rows == 16 || Rows == 64);
+    constexpr int BM = Rows, BN = 64, BK = 64, Stages = 2, Threads = Rows == 16 ? 256 : 128;
+    constexpr int WarpRows = Rows == 16 ? 1 : 2, WarpColumns = Threads / 32 / WarpRows;
+    constexpr int MT = BM / (16 * WarpRows), NT = BN / (8 * WarpColumns);
     __shared__ __align__(16) __nv_bfloat16 Ws[Stages][BM * BK];
     __shared__ __align__(16) __nv_bfloat16 Xs[Stages][BN * BK];
 
@@ -28,7 +31,8 @@ __global__ __launch_bounds__(256,
     const int row0   = static_cast<int>(blockIdx.x) * BM;
     const int token0 = static_cast<int>(blockIdx.y) * BN;
 
-    float acc[4] = {};
+    const int wm = warp % WarpRows, wn = warp / WarpRows;
+    float acc[MT][NT][4] = {};
 
     auto stage_inputs = [&](int stage, int kt) {
         const int k0 = kt * BK;
@@ -75,17 +79,25 @@ __global__ __launch_bounds__(256,
 
 #pragma unroll
         for (int ki = 0; ki < BK / 16; ++ki) {
-            unsigned af[4];
-            unsigned bf[2];
-            const int arow = a_rowoff;
-            const int acol = ki * 16 + a_coloff;
-            const int brow = warp * 8 + b_rin;
-            const int bcol = ki * 16 + b_koff;
-            ldmatrix_x4(af[0], af[1], af[2], af[3],
-                        smem_addr(&Ws[stage][arow * BK + common::swizzle_xor_64(arow, acol)]));
-            ldmatrix_x2(bf[0], bf[1],
-                        smem_addr(&Xs[stage][brow * BK + common::swizzle_xor_64(brow, bcol)]));
-            mma_bf16(acc[0], acc[1], acc[2], acc[3], af[0], af[1], af[2], af[3], bf[0], bf[1]);
+            unsigned af[MT][4];
+#pragma unroll
+            for (int m = 0; m < MT; ++m) {
+                const int row = (wm * MT + m) * 16 + a_rowoff, col = ki * 16 + a_coloff;
+                ldmatrix_x4(af[m][0], af[m][1], af[m][2], af[m][3],
+                            smem_addr(&Ws[stage][row * BK + common::swizzle_xor_64(row, col)]));
+            }
+#pragma unroll
+            for (int n = 0; n < NT; ++n) {
+                unsigned bf[2];
+                const int row = (wn * NT + n) * 8 + b_rin, col = ki * 16 + b_koff;
+                ldmatrix_x2(bf[0], bf[1],
+                            smem_addr(&Xs[stage][row * BK + common::swizzle_xor_64(row, col)]));
+#pragma unroll
+                for (int m = 0; m < MT; ++m) {
+                    mma_bf16(acc[m][n][0], acc[m][n][1], acc[m][n][2], acc[m][n][3], af[m][0],
+                             af[m][1], af[m][2], af[m][3], bf[0], bf[1]);
+                }
+            }
         }
 
         __syncthreads();
@@ -95,23 +107,19 @@ __global__ __launch_bounds__(256,
     }
     cp_wait<0>();
 
-    const int gid = lane >> 2;
-    const int lid = lane & 3;
-    const int r0  = row0 + gid;
-    const int r1  = r0 + 8;
-    const int c0  = token0 + warp * 8 + 2 * lid;
-    const int c1  = c0 + 1;
-    if (r0 < Shape::control_rows && c0 < tokens) {
-        scores[static_cast<std::int64_t>(c0) * Shape::score_rows + r0] = acc[0];
-    }
-    if (r0 < Shape::control_rows && c1 < tokens) {
-        scores[static_cast<std::int64_t>(c1) * Shape::score_rows + r0] = acc[1];
-    }
-    if (r1 < Shape::control_rows && c0 < tokens) {
-        scores[static_cast<std::int64_t>(c0) * Shape::score_rows + r1] = acc[2];
-    }
-    if (r1 < Shape::control_rows && c1 < tokens) {
-        scores[static_cast<std::int64_t>(c1) * Shape::score_rows + r1] = acc[3];
+#pragma unroll
+    for (int m = 0; m < MT; ++m) {
+#pragma unroll
+        for (int n = 0; n < NT; ++n) {
+#pragma unroll
+            for (int v = 0; v < 4; ++v) {
+                const int row = row0 + (wm * MT + m) * 16 + (lane >> 2) + (v / 2) * 8;
+                const int col = token0 + (wn * NT + n) * 8 + (lane & 3) * 2 + (v & 1);
+                if (row < Shape::control_rows && col < tokens) {
+                    scores[static_cast<std::int64_t>(col) * Shape::score_rows + row] = acc[m][n][v];
+                }
+            }
+        }
     }
 }
 

@@ -109,17 +109,17 @@ struct ProposalParameters {
 };
 
 // Cold native preparation for the fixed model implementation. This owner is stable before
-// startup sizing, execution, or Graph capture; all weight addresses borrow the source Model.
+// startup sizing, execution, or Graph capture; all weight addresses borrow the source ModelShard.
 // Shape-dependent kernel selection and scratch remain with the calling implementation and Op.
 class Parameters {
 public:
-    explicit Parameters(const Model& source, std::shared_ptr<const ModelProfile> profile = {});
+    explicit Parameters(const ModelShard& source, std::shared_ptr<const ModelProfile> profile);
     Parameters(const Parameters&)            = delete;
     Parameters& operator=(const Parameters&) = delete;
     Parameters(Parameters&&)                 = delete;
     Parameters& operator=(Parameters&&)      = delete;
 
-    const Model& model;
+    const ModelShard& model;
     const std::shared_ptr<const ModelProfile> profile;
     TextParameters text;
     std::optional<MtpParameters> mtp;

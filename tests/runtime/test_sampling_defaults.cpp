@@ -63,10 +63,10 @@ int main() {
                           same_preset(moe.non_thinking, dense_non_thinking),
                       "MoE mode defaults mismatch");
 
-    const ninfer::ResolvedSamplingParameters thinking = ninfer::runtime::resolve_sampling(
-        dense, ninfer::SamplingMode::Thinking, ninfer::SamplingOverrides{});
-    const ninfer::ResolvedSamplingParameters non_thinking = ninfer::runtime::resolve_sampling(
-        dense, ninfer::SamplingMode::NonThinking, ninfer::SamplingOverrides{});
+    const ninfer::ResolvedSamplingParameters thinking =
+        ninfer::runtime::resolve_sampling(dense.thinking, ninfer::SamplingOverrides{});
+    const ninfer::ResolvedSamplingParameters non_thinking =
+        ninfer::runtime::resolve_sampling(dense.non_thinking, ninfer::SamplingOverrides{});
     failures += check(thinking.temperature == 1.0F && thinking.top_p == 0.95F &&
                           thinking.presence_penalty == 0.0F && thinking.seed == 0,
                       "omitted overrides did not select Dense thinking defaults");
@@ -83,26 +83,22 @@ int main() {
     overrides.frequency_penalty = -1.0F;
     overrides.seed              = 123;
     const ninfer::ResolvedSamplingParameters overridden =
-        ninfer::runtime::resolve_sampling(dense, ninfer::SamplingMode::NonThinking, overrides);
+        ninfer::runtime::resolve_sampling(dense.non_thinking, overrides);
     failures += check(overridden.temperature == 0.0F && overridden.top_k == 20 &&
                           overridden.top_p == 0.0F && overridden.presence_penalty == 0.0F &&
                           overridden.frequency_penalty == -1.0F && overridden.seed == 123,
                       "explicit zero sampling overrides were not normalized to the target cap");
 
     overrides.top_k = 21;
-    failures += check(throws_invalid([&] {
-                          (void)ninfer::runtime::resolve_sampling(
-                              dense, ninfer::SamplingMode::Thinking, overrides);
-                      }),
-                      "top_k beyond the executable candidate domain was accepted");
+    failures += check(
+        throws_invalid([&] { (void)ninfer::runtime::resolve_sampling(dense.thinking, overrides); }),
+        "top_k beyond the executable candidate domain was accepted");
     overrides.top_k = 0;
 
     overrides.temperature = std::numeric_limits<float>::quiet_NaN();
-    failures += check(throws_invalid([&] {
-                          (void)ninfer::runtime::resolve_sampling(
-                              dense, ninfer::SamplingMode::Thinking, overrides);
-                      }),
-                      "non-finite sampling override was accepted");
+    failures += check(
+        throws_invalid([&] { (void)ninfer::runtime::resolve_sampling(dense.thinking, overrides); }),
+        "non-finite sampling override was accepted");
 
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;

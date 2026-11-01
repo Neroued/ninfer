@@ -1,7 +1,7 @@
 #pragma once
 
 #include "core/dtype.h"
-#include "ninfer/types.h"
+#include "ninfer/kv_cache_format.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -55,40 +55,43 @@ struct PagedKVStorageLayout {
     friend bool operator==(const PagedKVStorageLayout&, const PagedKVStorageLayout&) = default;
 };
 
+[[nodiscard]] inline PagedKVVectorLayout paged_kv_vector_layout(KvCacheVectorFormat format,
+                                                                std::int32_t dim) {
+    const auto info = kv_cache_format_info(format);
+    if (dim <= 0 || (info.group_size && dim % info.group_size))
+        throw std::invalid_argument("unsupported KV-cache vector geometry");
+    DType data;
+    switch (format) {
+    case KvCacheVectorFormat::BFloat16:
+        data = DType::BF16;
+        break;
+    case KvCacheVectorFormat::Float16:
+        data = DType::FP16;
+        break;
+    case KvCacheVectorFormat::Int8Group64F16:
+        data = DType::I8;
+        break;
+    case KvCacheVectorFormat::Fp8E4m3fnGroup128Ue8m0:
+        data = DType::FP8_E4M3FN;
+        break;
+    case KvCacheVectorFormat::Nvfp4Group16Ue4m3:
+        data = DType::U8;
+        break;
+    default:
+        throw std::invalid_argument("unknown KV-cache vector format");
+    }
+    return {data, info.value_bits == 4 ? dim / 2 : dim,
+            info.scale == KvCacheScaleFormat::Float16 ? DType::FP16 : DType::U8,
+            info.group_size ? dim / info.group_size : 0};
+}
+
 [[nodiscard]] inline PagedKVStorageLayout paged_kv_storage_layout(KvCacheStorage storage,
                                                                   std::int32_t head_dim) {
-    if (head_dim <= 0) { throw std::invalid_argument("KV-cache head dimension must be positive"); }
-
-    const auto symmetric = [=](PagedKVVectorLayout vector) {
-        return PagedKVStorageLayout{storage, head_dim, vector, vector};
-    };
-    switch (storage) {
-    case KvCacheStorage::BFloat16:
-        return {storage,
-                head_dim,
-                {DType::BF16, head_dim, DType::U8, 0},
-                {DType::FP16, head_dim, DType::U8, 0}};
-    case KvCacheStorage::Int8Group64:
-        if (head_dim == kD256KVCacheHeadDim) { return symmetric({DType::I8, 256, DType::FP16, 4}); }
-        break;
-    case KvCacheStorage::Fp8E4M3Row256:
-        if (head_dim == kD256KVCacheHeadDim) {
-            return symmetric({DType::FP8_E4M3FN, 256, DType::FP16, 1});
-        }
-        break;
-    case KvCacheStorage::Nvfp4Group16:
-        if (head_dim == kD256KVCacheHeadDim) { return symmetric({DType::U8, 128, DType::U8, 16}); }
-        break;
-    case KvCacheStorage::Fp8KeyNvfp4Value:
-        if (head_dim == kD256KVCacheHeadDim) {
-            return {storage,
-                    head_dim,
-                    {DType::FP8_E4M3FN, 256, DType::FP16, 1},
-                    {DType::U8, 128, DType::U8, 16}};
-        }
-        break;
-    }
-    throw std::invalid_argument("unsupported paged KV-cache storage geometry");
+    const auto profile = kv_cache_profile_info(storage);
+    if (head_dim <= 0 || (storage != KvCacheStorage::BFloat16 && head_dim != kD256KVCacheHeadDim))
+        throw std::invalid_argument("unsupported paged KV-cache storage geometry");
+    return {storage, head_dim, paged_kv_vector_layout(profile.key, head_dim),
+            paged_kv_vector_layout(profile.value, head_dim)};
 }
 
 } // namespace ninfer

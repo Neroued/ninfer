@@ -17,6 +17,33 @@
 namespace ninfer::ops::sampling_detail {
 using namespace common;
 
+struct TokenRow {
+    const std::int32_t* data = nullptr;
+    std::int64_t stride      = 1;
+
+    __host__ __device__ TokenRow() = default;
+
+    __host__ __device__ TokenRow(const std::int32_t* data, std::int64_t stride = 1)
+        : data(data), stride(stride) {}
+
+    __device__ std::int32_t operator[](int column) const { return data[column * stride]; }
+
+    __device__ explicit operator bool() const { return data != nullptr; }
+};
+
+struct TokenRows {
+    const std::int32_t* data   = nullptr;
+    std::int64_t column_stride = 1, row_stride = 0;
+
+    __device__ TokenRow operator[](int row) const {
+        return {data ? data + row * row_stride : nullptr, column_stride};
+    }
+};
+
+inline TokenRows token_rows(const Tensor& tensor) {
+    return {static_cast<const std::int32_t*>(tensor.data), tensor.nb[0] / 4, tensor.nb[1] / 4};
+}
+
 template <class S>
 using SamplingPartialSort =
     cub::BlockMergeSort<unsigned long long, S::kSamplerBlock, S::kSamplerItemsPerThread>;
@@ -173,8 +200,8 @@ __device__ __forceinline__ int sampling_dist_offset(int col, int j) {
 // Non-speculative callers pass no overlay. The scan is bounded by k and
 // only runs when penalties are active, so it is free on the no-penalty path.
 __device__ __forceinline__ float sampling_adjusted_logit(float raw, int v, const SamplingConfig& c,
-                                                         const std::int32_t* overlay = nullptr,
-                                                         int overlay_len             = 0) {
+                                                         TokenRow overlay = {},
+                                                         int overlay_len  = 0) {
     if (c.mask.words && !(c.mask.words[overlay_len * c.mask.stride + v / 32] & (1u << (v % 32)))) {
         return -CUDART_INF_F;
     }
@@ -279,7 +306,7 @@ __device__ inline void
 sampling_build_truncated_small(const __nv_bfloat16* logits, std::int64_t base, std::int32_t vocab,
                                const SamplingConfig& cfg, float* tile_val, int* tile_idx,
                                float* cand_val, int* cand_idx, float* prob, int* n_support,
-                               const std::int32_t* overlay = nullptr, int overlay_len = 0) {
+                               TokenRow overlay = {}, int overlay_len = 0) {
     const int tid = threadIdx.x;
     const int cap = sampling_candidate_cap(cfg, vocab);
     if (tid < S::kSamplerTileItems) {
@@ -306,10 +333,11 @@ sampling_build_truncated_small(const __nv_bfloat16* logits, std::int64_t base, s
 // Single-block fallback for large columns when the finite multi-block workspace
 // route cannot represent the launch. It still reads each vocab entry once and
 // keeps a bounded per-thread top-20, so it avoids a top_k*vocab global reread.
-__device__ inline void sampling_build_truncated_block_fast(
-    const __nv_bfloat16* logits, std::int64_t base, std::int32_t vocab, const SamplingConfig& cfg,
-    float* merge_val, int* merge_idx, float* cand_val, int* cand_idx, float* prob, int* n_support,
-    const std::int32_t* overlay = nullptr, int overlay_len = 0) {
+__device__ inline void
+sampling_build_truncated_block_fast(const __nv_bfloat16* logits, std::int64_t base,
+                                    std::int32_t vocab, const SamplingConfig& cfg, float* merge_val,
+                                    int* merge_idx, float* cand_val, int* cand_idx, float* prob,
+                                    int* n_support, TokenRow overlay = {}, int overlay_len = 0) {
     const int tid = threadIdx.x;
     const int cap = sampling_candidate_cap(cfg, vocab); // always <= kSamplerFastCandidates
 

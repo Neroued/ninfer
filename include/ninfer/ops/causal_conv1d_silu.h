@@ -2,6 +2,7 @@
 
 #include "core/device.h"
 #include "core/tensor.h"
+#include "core/record_view.h"
 
 namespace ninfer::ops {
 
@@ -30,7 +31,8 @@ void causal_conv1d_silu(const Tensor& x, const Tensor& weight, const Tensor& con
 // Split-output form. `ideal` is unchanged; its rows are written to three destinations instead of
 // one, partitioned in row order as out0, out1, out2. Every destination is contiguous BF16 with the
 // column count of x, and every operand is four-byte aligned. The supported row profiles are
-// (2048, 2048, 4096) over C = 8192 and (2048, 2048, 6144) over C = 10240; any other profile is
+// (1024, 1024, 3072) over C = 5120, (2048, 2048, 4096) over C = 8192, and
+// (2048, 2048, 6144) over C = 10240; any other profile is
 // rejected. conv_state_in and conv_state_out follow the family rule above: disjoint or exactly the
 // same storage. No destination may overlap another, x, weight, or either state.
 void causal_conv1d_silu_split(const Tensor& x, const Tensor& weight, const Tensor& conv_state_in,
@@ -39,20 +41,23 @@ void causal_conv1d_silu_split(const Tensor& x, const Tensor& weight, const Tenso
 
 /**
  * Snapshot form for B independent sequences. `x` and `out` are contiguous BF16 [C,W,B],
- * `conv_states` is BF16 [C,3,Slots] with dense [C,3] and an explicit BF16-aligned nb[2], and
- * `initial_state_slots` and `snapshot_base_slots` are contiguous I32 [B]. `valid_columns` is either
+ * `source` selects a BF16 [C,3] field with device I64 [B] arena-relative byte offsets.
+ * `snapshots` is contiguous BF16 [C,3,N], and `snapshot_base_slots` is contiguous I32 [B].
+ * `valid_columns` is either
  * contiguous I32 [B], with every value in [1,W], or an empty Tensor meaning every row has W valid
  * columns. B=1 accepts every positive W; B=2..8 accepts W=1..16.
  *
- * Row b starts from the window selected by initial_state_slots[b]. After valid column j, the new
- * window is written to snapshot_base_slots[b]+j. Invalid-tail output columns are exact BF16 zero
- * and do not mutate state. The caller reserves the complete [base,base+W) interval for every row;
- * all row reservations are disjoint and no row overwrites another row's initial slot. A row's own
- * initial slot may lie in its destination reservation. `conv_states` is the only persistent state
- * mutated and must not overlap x, weight, metadata, or out.
+ * Row b starts from the window selected by source.records.byte_offsets[b]. After valid column j,
+ * the new window is written to snapshot_base_slots[b]+j. Invalid-tail output columns are exact BF16
+ * zero and do not mutate state. The caller reserves the complete [base,base+W) interval for every
+ * row; all row reservations are disjoint and no row overwrites another row's source field.
+ * Each source field is disjoint from snapshots or exactly aliases one complete [C,3] row in its
+ * own reservation; partial overlap is not allowed. Only snapshots are mutated; accessed source
+ * fields and snapshots must not overlap x, weight, metadata, or out. Valid byte offsets and
+ * cross-row alias relationships are caller promises.
  */
-void causal_conv1d_silu_snapshot(const Tensor& x, const Tensor& weight, Tensor& conv_states,
-                                 const Tensor& valid_columns, const Tensor& initial_state_slots,
+void causal_conv1d_silu_snapshot(const Tensor& x, const Tensor& weight, ConstStateFieldView source,
+                                 Tensor& snapshots, const Tensor& valid_columns,
                                  const Tensor& snapshot_base_slots, Tensor& out,
                                  CudaExecutionView execution);
 

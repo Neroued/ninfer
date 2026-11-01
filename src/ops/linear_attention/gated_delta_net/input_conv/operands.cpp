@@ -1,3 +1,4 @@
+#include "core/platform.h"
 #include "ops/linear_attention/gated_delta_net/input_conv/operands.h"
 #include "ops/common/host/operands.h"
 
@@ -50,6 +51,9 @@ WeightProfile describe_profile(const ProjectionProfile& weights) {
     if (w.qtype == QType::Q8_G32_FP16) {
         if (w.n == 12288 && w.k == 2048) return {Format::Q8, {2048, 4096}, w.policy};
         if (w.n == 16384 && w.k == 2560) return {Format::Q8, {2560, 6144}, w.policy};
+#if NINFER_TARGET_SPARK
+        if (w.n == 8192 && w.k == 2560) return {Format::Q8, {2560, 3072, 1024, 1024}, w.policy};
+#endif
     }
     if (w.n == 16384 && w.k == 5120) {
         if (w.qtype == QType::FP8_E4M3FN_ROW_BF16) return {Format::Fp8, {5120, 6144}, w.policy};
@@ -98,20 +102,18 @@ void validate_batch_interval(Publication publication, std::int32_t batch, std::i
 }
 
 Batch validate_convolution(const Tensor& x, const WeightOperands& weights,
-                           const Tensor& convolution, const Tensor& history,
-                           const Tensor& source_slots, const Tensor& valid_columns,
-                           const GdnConvOutputs& outputs, Publication publication,
-                           const Tensor& destination) {
+                           const Tensor& convolution, const ConstStateFieldView& history,
+                           const Tensor& valid_columns, const GdnConvOutputs& outputs,
+                           Publication publication, const Tensor& destination) {
     const Batch batch{x.ne[1], x.ne[2]};
     validate_batch_interval(publication, batch.rows, batch.tokens, batch.tokens);
     const auto& g = weights.geometry;
     require_tensor(x, DType::BF16, g.input_rows, batch.tokens, batch.rows, 16, "x");
     require_tensor(convolution, DType::BF16, g.channels(), 4, 1, 16, "convolution weight");
-    if (history.ne[2] < (publication == Publication::Snapshot ? batch.columns() : 1))
-        throw std::invalid_argument("GDN convolution: insufficient history slots");
-    common::operand::slotted_tensor(history, DType::BF16, {g.channels(), 3, history.ne[2]}, 2, 16,
-                                    "GDN convolution", "history", x.device);
-    require_selector(source_slots, batch.rows, "source slots");
+    common::operand::state_field(history, DType::BF16, {g.channels(), 3}, 16, "GDN convolution",
+                                 "history", x.device);
+    if (history.field.layers != 1 || history.records.byte_offsets.ne[0] != batch.rows)
+        throw std::invalid_argument("GDN convolution: source row count differs from batch");
     if (valid_columns.data) require_selector(valid_columns, batch.rows, "valid columns");
     require_tensor(outputs.query, DType::BF16, g.query_rows, batch.tokens, batch.rows, 16, "query");
     require_tensor(outputs.key, DType::BF16, g.key_rows, batch.tokens, batch.rows, 16, "key");
@@ -119,7 +121,7 @@ Batch validate_convolution(const Tensor& x, const WeightOperands& weights,
     require_tensor(outputs.z, DType::BF16, g.value_rows, batch.tokens, batch.rows, 16, "z");
     if (publication == Publication::Snapshot)
         require_selector(destination, batch.rows, "snapshot bases");
-    else
+    else if (publication == Publication::Record)
         require_tensor(destination, DType::BF16, g.channels(), batch.tokens, batch.rows, 16,
                        "convolution record");
     return batch;

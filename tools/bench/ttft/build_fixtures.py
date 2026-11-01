@@ -355,7 +355,7 @@ def _write_images() -> list[Path]:
 
 def _many_image_messages(paths: Sequence[Path], prompt: str) -> list[dict[str, Any]]:
     content: list[dict[str, str]] = [
-        {"type": "image", "image": _relative(path)} for path in paths
+        {"type": "image", "image": f"../media/{path.name}"} for path in paths
     ]
     content.append({"type": "text", "text": prompt})
     return [{"role": "user", "content": content}]

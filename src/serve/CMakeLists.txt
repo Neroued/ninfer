@@ -18,16 +18,15 @@ add_library(ninfer_serve STATIC
   openai_responses_store.cpp
   translate.cpp
   generation_service.cpp
+  decision_http.cpp
   request_events.cpp
   operational_log.cpp
   request_log.cpp
   metrics.cpp
   http_server.cpp
-  decision_http.cpp
   openai_responses_http.cpp
-  serve_options.cpp
 )
 ninfer_internal_includes(ninfer_serve)
 target_link_libraries(ninfer_serve
-  PUBLIC ninfer_engine ninfer_decision ninfer_systemone Threads::Threads ninfer::json ninfer::httplib
+  PUBLIC ninfer_engine ninfer_decision ninfer_systemone Threads::Threads ninfer::json ninfer::httplib ninfer_product_config
   PRIVATE ninfer_media_acquire ninfer_product_logging ninfer_grammar CUDA::cudart)

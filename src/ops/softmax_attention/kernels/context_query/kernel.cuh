@@ -64,9 +64,9 @@ template <typename ContextPolicy, int KeyBlock, int Threads>
 __device__ __forceinline__ void
 context_query_stage_tile(__nv_bfloat16* dst, const __nv_bfloat16* context,
                          const __nv_bfloat16* query, int key0, int valid_keys, bool query_tile,
-                         int kv_head, int physical_page, ContextPolicy& policy, int tid) {
+                         int kv_head, std::int64_t record_offset, ContextPolicy& policy, int tid) {
     constexpr int VecsPerRow        = kContextQueryHeadDim / 8;
-    const std::int64_t context_tile = policy.context_tile(kv_head, key0, physical_page);
+    const std::int64_t context_tile = policy.context_tile(kv_head, key0, record_offset);
     for (int chunk = tid; chunk < KeyBlock * VecsPerRow; chunk += Threads) {
         const int row      = chunk / VecsPerRow;
         const int d        = (chunk - row * VecsPerRow) * 8;
@@ -84,7 +84,7 @@ context_query_stage_tile(__nv_bfloat16* dst, const __nv_bfloat16* context,
 template <typename ContextPolicy, int KeyBlock, int Threads>
 __device__ __forceinline__ void
 context_query_stage_v_tile(__half* dst, const __half* context, const __nv_bfloat16* query, int key0,
-                           int valid_keys, bool query_tile, int kv_head, int physical_page,
+                           int valid_keys, bool query_tile, int kv_head, std::int64_t record_offset,
                            ContextPolicy& policy, int tid) {
     constexpr int VecsPerRow = kContextQueryHeadDim / 8;
     if (query_tile) {
@@ -102,7 +102,7 @@ context_query_stage_v_tile(__half* dst, const __half* context, const __nv_bfloat
         return;
     }
 
-    const std::int64_t context_tile = policy.context_tile(kv_head, key0, physical_page);
+    const std::int64_t context_tile = policy.context_tile(kv_head, key0, record_offset);
     for (int chunk = tid; chunk < KeyBlock * VecsPerRow; chunk += Threads) {
         const int row      = chunk / VecsPerRow;
         const int d        = (chunk - row * VecsPerRow) * 8;
@@ -281,14 +281,14 @@ __device__ __forceinline__ void context_query_split_partial_body(
     int current_key0      = 0;
     int current_valid     = 0;
     tile_metadata(0, current_is_query, current_key0, current_valid);
-    int current_page = 0;
+    std::int64_t current_record_offset = 0;
     if constexpr (ContextPolicy::PageMapped) {
-        current_page =
+        current_record_offset =
             current_is_query ? 0 : policy.template page<Tokens>(current_key0, lane, FullMask);
     }
     context_query_stage_tile<ContextPolicy, KeyBlock, Threads>(
         k_s, context_k, query_k, current_key0, current_valid, current_is_query, kv_head,
-        current_page, policy, tid);
+        current_record_offset, policy, tid);
     common::cp_commit();
 
     for (int iteration = 0; iteration < iterations; ++iteration) {
@@ -297,7 +297,7 @@ __device__ __forceinline__ void context_query_split_partial_body(
 
         context_query_stage_v_tile<ContextPolicy, KeyBlock, Threads>(
             v_s, context_v, query_v, current_key0, current_valid, current_is_query, kv_head,
-            current_page, policy, tid);
+            current_record_offset, policy, tid);
         common::cp_commit();
 
         float score[QKNt][4];
@@ -320,22 +320,22 @@ __device__ __forceinline__ void context_query_split_partial_body(
         common::cp_wait<0>();
         __syncthreads();
 
-        bool next_is_query = false;
-        int next_key0      = 0;
-        int next_valid     = 0;
-        int next_page      = 0;
+        bool next_is_query              = false;
+        int next_key0                   = 0;
+        int next_valid                  = 0;
+        std::int64_t next_record_offset = 0;
         if (iteration + 1 < iterations) {
             tile_metadata(iteration + 1, next_is_query, next_key0, next_valid);
             if constexpr (ContextPolicy::PageMapped) {
-                next_page = next_is_query
-                                ? 0
-                                : (!current_is_query && (next_key0 >> 6) == (current_key0 >> 6)
-                                       ? current_page
-                                       : policy.template page<Tokens>(next_key0, lane, FullMask));
+                next_record_offset =
+                    next_is_query ? 0
+                                  : (!current_is_query && (next_key0 >> 6) == (current_key0 >> 6)
+                                         ? current_record_offset
+                                         : policy.template page<Tokens>(next_key0, lane, FullMask));
             }
             context_query_stage_tile<ContextPolicy, KeyBlock, Threads>(
-                k_s, context_k, query_k, next_key0, next_valid, next_is_query, kv_head, next_page,
-                policy, tid);
+                k_s, context_k, query_k, next_key0, next_valid, next_is_query, kv_head,
+                next_record_offset, policy, tid);
             common::cp_commit();
         }
 
@@ -448,10 +448,10 @@ __device__ __forceinline__ void context_query_split_partial_body(
             }
         }
 
-        current_is_query = next_is_query;
-        current_key0     = next_key0;
-        current_valid    = next_valid;
-        current_page     = next_page;
+        current_is_query      = next_is_query;
+        current_key0          = next_key0;
+        current_valid         = next_valid;
+        current_record_offset = next_record_offset;
     }
 
     if constexpr (!DirectOutput) {

@@ -25,6 +25,8 @@ Isa select_isa(CpuFeatures features) {
 
 const ShapePolicy& shape_dispatch(const RoutedSwiGLUProfile& profile) {
     const auto& ffn = profile.ffn;
+    if (ffn.clamp_limit)
+        throw std::invalid_argument("routed_swiglu CPU: clamped profile is not registered");
     if (!valid_linear_policy(ffn.gate_up_policy) || !valid_linear_policy(ffn.down_policy)) {
         throw std::invalid_argument("routed_swiglu CPU: invalid linear policy");
     }

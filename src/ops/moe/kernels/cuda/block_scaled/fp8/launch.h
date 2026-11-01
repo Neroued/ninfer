@@ -10,5 +10,5 @@ void launch_experts(const Tensor& x, const CudaSwiGLUExperts& experts, const Exp
                     const Plan& plan, const Storage& storage, CudaExecutionView execution);
 void launch_vector(const Tensor& x, const CudaSwiGLUExperts& experts, const ExpertRoutes& routes,
                    ExpertSubset subset, bool shared, MoeEpilogue mode, Tensor& destination,
-                   const Storage& storage, CudaExecutionView execution);
+                   const Storage& storage, const Plan& plan, CudaExecutionView execution);
 } // namespace ninfer::ops::detail::moe_cuda::block_scaled::fp8

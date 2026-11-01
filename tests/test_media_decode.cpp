@@ -1,10 +1,13 @@
 #include "media/decode/decode.h"
+#include "fixtures/media/jpeg.h"
 
 #include <array>
 #include <cctype>
 #include <cstdint>
 #include <iostream>
+#include <span>
 #include <stdexcept>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -125,10 +128,12 @@ void test_issue_20_unaligned_jpeg() {
     expect_pixel(image, 299, 199, blue, 3);
     expect_pixel(image, 150, 100, yellow, 4);
 
+    const ninfer::media::decode::VideoSelection selection{
+        ninfer::media::decode::probe_video(encoded, {}), {0}, 1};
     const ninfer::media::decode::VideoInfo video_info =
-        ninfer::media::decode::inspect_video(encoded, {}, 2.0, 4, 16);
+        ninfer::media::decode::inspect_video(encoded, {}, selection);
     const ninfer::media::decode::Video video =
-        ninfer::media::decode::decode_video(encoded, {}, 2.0, 4, 16);
+        ninfer::media::decode::decode_video(encoded, {}, selection);
     if (video_info.width != video.width || video_info.height != video.height ||
         video_info.sampled_frames != static_cast<int>(video.frames.size()) ||
         video_info.indices != video.indices) {
@@ -136,11 +141,122 @@ void test_issue_20_unaligned_jpeg() {
     }
 }
 
+void expect_image(std::span<const std::uint8_t> encoded, int width, int height,
+                  std::span<const std::uint8_t> expected, std::string_view name) {
+    const auto info  = ninfer::media::decode::inspect_image(encoded, {});
+    const auto image = ninfer::media::decode::decode_image(encoded, {});
+    if (info.width != width || info.height != height || image.width != width ||
+        image.height != height || image.rgb.size() != expected.size()) {
+        throw std::runtime_error(std::string(name) + ": JPEG geometry mismatch");
+    }
+    for (std::size_t i = 0; i < expected.size(); ++i) {
+        if (image.rgb[i] != expected[i]) {
+            throw std::runtime_error(std::string(name) + ": JPEG RGB mismatch at byte " +
+                                     std::to_string(i));
+        }
+    }
+}
+
+void test_jpeg_references() {
+    for (const auto& fixture : jpeg_fixtures::cases) {
+        const auto encoded  = decode_base64(fixture.encoded);
+        const auto expected = decode_base64(fixture.rgb);
+        expect_image(encoded, fixture.width, fixture.height, expected, fixture.name);
+    }
+}
+
+void test_jpeg_orientation() {
+    const auto& fixture = jpeg_fixtures::cases[2];
+    const auto encoded  = decode_base64(fixture.encoded);
+    for (int orientation = 1; orientation <= 8; ++orientation) {
+        // EXIF IFD0 with one SHORT Orientation entry, little endian.
+        std::array<std::uint8_t, 36> exif = {
+            0xff, 0xe1, 0x00, 0x22, 'E', 'x', 'i', 'f', 0, 0, 'I', 'I', 42, 0, 8, 0, 0, 0,
+            1,    0,    0x12, 0x01, 3,   0,   1,   0,   0, 0, 1,   0,   0,  0, 0, 0, 0, 0};
+        exif[28]      = static_cast<std::uint8_t>(orientation);
+        auto oriented = encoded;
+        oriented.insert(oriented.begin() + 2, exif.begin(), exif.end());
+        const auto expected = decode_base64(jpeg_fixtures::orientation_rgb[orientation - 1]);
+        const bool swap     = orientation >= 5;
+        expect_image(oriented, swap ? fixture.height : fixture.width,
+                     swap ? fixture.width : fixture.height, expected,
+                     "EXIF orientation " + std::to_string(orientation));
+    }
+}
+
+void test_ffmpeg_odd_width() {
+    const auto& fixture = jpeg_fixtures::cases[0];
+    const auto encoded  = decode_base64(fixture.encoded);
+    const auto video    = ninfer::media::decode::decode_video(
+        encoded, {}, {ninfer::media::decode::probe_video(encoded, {}), {0}, 1});
+    if (video.frames.size() != 1 || video.width != fixture.width ||
+        video.height != fixture.height) {
+        throw std::runtime_error("odd-width JPEG video geometry mismatch");
+    }
+    for (int y = 0; y < fixture.height; ++y) {
+        expect_pixel(video.frames[0], fixture.width - 1, y, {29, 120, 199}, 3);
+    }
+}
+
+void expect_error(std::span<const std::uint8_t> encoded,
+                  const ninfer::media::decode::Policy& policy,
+                  ninfer::media::decode::ErrorKind kind) {
+    for (const bool inspect : {false, true}) {
+        try {
+            if (inspect) {
+                (void)ninfer::media::decode::inspect_image(encoded, policy);
+            } else {
+                (void)ninfer::media::decode::decode_image(encoded, policy);
+            }
+        } catch (const ninfer::media::decode::Error& error) {
+            if (error.kind() == kind) { continue; }
+            throw std::runtime_error("incorrect media error category");
+        }
+        throw std::runtime_error("invalid or over-budget JPEG was accepted");
+    }
+}
+
+void test_jpeg_errors() {
+    using namespace ninfer::media::decode;
+    const auto& fixture = jpeg_fixtures::cases[0];
+    const auto encoded  = decode_base64(fixture.encoded);
+    expect_error(std::span(encoded).first(encoded.size() - 2), {}, ErrorKind::InvalidInput);
+    expect_error(std::span(encoded).first(encoded.size() - 16), {}, ErrorKind::InvalidInput);
+    expect_error(std::span(encoded).first(8), {}, ErrorKind::InvalidInput);
+    expect_error(encoded, {.max_bytes = encoded.size() - 1}, ErrorKind::BudgetExceeded);
+    expect_error(
+        encoded,
+        {.max_decoded_pixels = static_cast<std::uint64_t>(fixture.width) * fixture.height - 1},
+        ErrorKind::BudgetExceeded);
+
+    struct Cancelled {};
+
+    for (const bool inspect : {false, true}) {
+        int checkpoints = 0;
+        Policy policy{.checkpoint = [&] {
+            if (++checkpoints == 3) { throw Cancelled{}; }
+        }};
+        try {
+            if (inspect) {
+                (void)inspect_image(encoded, policy);
+            } else {
+                (void)decode_image(encoded, policy);
+            }
+            throw std::runtime_error("JPEG cancellation was ignored");
+        } catch (const Cancelled&) {}
+    }
+    expect_image(encoded, fixture.width, fixture.height, decode_base64(fixture.rgb), fixture.name);
+}
+
 } // namespace
 
 int main() {
     try {
         test_issue_20_unaligned_jpeg();
+        test_jpeg_references();
+        test_jpeg_orientation();
+        test_ffmpeg_odd_width();
+        test_jpeg_errors();
         std::cout << "ok\n";
         return 0;
     } catch (const std::exception& error) {

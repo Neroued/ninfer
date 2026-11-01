@@ -224,7 +224,7 @@ int main() {
         prompts.clear();
         scored_prefixes.clear();
         scored_frontiers.clear();
-        const auto cached = ninfer::decision::evaluate(branching.decision, backend);
+        const auto cached         = ninfer::decision::evaluate(branching.decision, backend);
         const auto single_prompts = prompts;
         expect(scored_frontiers.size() == 3, "multi-token labels exercise three divergences");
         expect(scored_frontiers[0] == scored_frontiers[1] &&
@@ -239,19 +239,20 @@ int main() {
                    root_text.find("Fourth") != std::string::npos &&
                    root_text.find("state text") == std::string::npos,
                "retained root includes the complete rubric but not the changing state");
-        auto renamed = branching;
+        auto renamed                    = branching;
         renamed.decision.fields[0].name = "never-inject-this-id";
         prompts.clear();
         (void)ninfer::decision::evaluate(renamed.decision, backend);
         expect(prompts == single_prompts, "single-question ID renaming changes model input");
-        auto next_state = branching;
+        auto next_state                 = branching;
         next_state.decision.contexts[0] = "State:\na completely different message";
         scored_prefixes.clear();
         scored_frontiers.clear();
         (void)ninfer::decision::evaluate(next_state.decision, backend);
-        expect(scored_frontiers.front().front() == root_size &&
-                   std::equal(rubric_root.begin(), rubric_root.end(), scored_prefixes.front().begin()),
-               "new messages reuse identical rubric root tokens");
+        expect(
+            scored_frontiers.front().front() == root_size &&
+                std::equal(rubric_root.begin(), rubric_root.end(), scored_prefixes.front().begin()),
+            "new messages reuse identical rubric root tokens");
         next_state.decision.fields[0].isolated_question += " Changed instructions.";
         scored_prefixes.clear();
         scored_frontiers.clear();

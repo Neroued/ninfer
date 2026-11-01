@@ -26,10 +26,11 @@ void run(const char* path) {
             begin += reader.geometry(part.object).shape[0];
         }
         return disk::Table(
-            reader,
-            load_lookup_parameters(
-                reader, binding,
-                reader.directory().component("text").resources.at("ple_hash_controls"), {3, 8}));
+            reader, load_lookup_parameters(
+                        reader, binding,
+                        reader.read_object(
+                            reader.directory().component("text").resources.at("ple_hash_controls")),
+                        {3, 8}));
     }();
     // Reader is gone. Preserve a borrowed row/LUT across an owner move.
     const auto first = source.row(0);
@@ -43,7 +44,7 @@ void run(const char* path) {
     write(static_cast<std::uint32_t>(starts.size()));
     for (auto row : starts) write(*table.row(row).lut);
 
-    std::vector<ReadSegment> segments(table.max_row_segments());
+    std::vector<ReadSegment> segments(table.geometry().max_row_segments);
     std::vector<io::DirectReadWindow> windows(segments.size());
     HostBuffer slab(4096 * segments.size(), 4096);
     std::vector<MemorySpan> buffers;

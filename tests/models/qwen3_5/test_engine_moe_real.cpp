@@ -1,11 +1,14 @@
 #include "ninfer/engine.h"
+#include "context_budget.h"
 
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -15,7 +18,6 @@ ninfer::EngineOptions engine_options(const char* artifact) {
     ninfer::EngineOptions options;
     options.artifact_path                     = artifact;
     options.max_context                       = 4096;
-    options.kv_capacity                       = ninfer::KvCapacityPolicy::explicit_capacity(4096);
     options.kv_cache                          = ninfer::KvCacheStorage::Int8Group64;
     options.speculative.backend               = ninfer::SpeculativeBackend::Mtp;
     options.speculative.draft_tokens          = 3;
@@ -23,16 +25,17 @@ ninfer::EngineOptions engine_options(const char* artifact) {
     options.enable_vision                     = true;
     options.use_cuda_graph                    = std::getenv("NINFER_TEST_EAGER") == nullptr;
     options.context_cache.host_capacity_bytes = 0;
+    ninfer::test::qwen3_5::set_context_capacity(options);
     return options;
 }
 
 ninfer::EngineOptions maximum_engine_options(const char* artifact) {
     ninfer::EngineOptions options     = engine_options(artifact);
     options.max_context               = 262144;
-    options.kv_capacity               = ninfer::KvCapacityPolicy::explicit_capacity(262144);
     options.speculative.backend       = ninfer::SpeculativeBackend::Mtp;
     options.speculative.draft_tokens  = 5;
     options.speculative.proposal_head = ninfer::ProposalHead::Optimized;
+    ninfer::test::qwen3_5::set_context_capacity(options);
     return options;
 }
 
@@ -59,7 +62,7 @@ std::vector<std::uint8_t> gradient_ppm() {
 }
 
 int verify_loaded_product(const ninfer::Engine& engine) {
-    const ninfer::LoadSummary load = engine.load_summary();
+    const ninfer::LoadSummary load = engine.startup_report().load;
     if (load.architecture != "Qwen3_5MoeForCausalLM" || load.model_name.empty() ||
         load.host_to_device_bytes == 0 || load.artifact_bytes_read < load.host_to_device_bytes) {
         std::cerr << "35B Engine construction has an invalid load summary: target="
@@ -67,23 +70,36 @@ int verify_loaded_product(const ninfer::Engine& engine) {
         return 1;
     }
 
-    const ninfer::MemorySummary memory = engine.memory_summary();
-    const auto* vision = memory.vision_workspace ? &*memory.vision_workspace : nullptr;
-    if (memory.weights.capacity_bytes == 0 || memory.weights.used_bytes == 0 ||
-        memory.weights.used_bytes > memory.weights.capacity_bytes ||
-        memory.sequence.capacity_bytes == 0 || memory.sequence.used_bytes == 0 ||
-        memory.sequence.used_bytes > memory.sequence.capacity_bytes ||
-        memory.workspace.capacity_bytes == 0 || vision == nullptr ||
-        vision->aggregate_prompt_tokens != 4096 || vision->max_item_tokens != 4096 ||
-        vision->general_capacity_bytes == 0 || vision->encode_peak_bytes == 0 ||
-        vision->handoff_offset_bytes > memory.workspace.capacity_bytes ||
-        vision->handoff_capacity_bytes == 0 ||
-        vision->handoff_capacity_bytes >
-            memory.workspace.capacity_bytes - vision->handoff_offset_bytes ||
-        vision->handoff_active_bytes != 0 || vision->handoff_peak_bytes != 0 ||
-        memory.workspace_logical_peak_bytes != 0 ||
-        (memory.cuda_graph.has_value()) != engine.options().use_cuda_graph) {
-        std::cerr << "35B Engine construction has an invalid memory summary\n";
+    const auto memory  = engine.snapshot().ranks.at(0).memory;
+    const auto* vision = memory.vision ? &*memory.vision : nullptr;
+    if (memory.allocations.device_weights_bytes == 0 ||
+
+        memory.allocations.persistent_device_bytes == 0 ||
+        memory.allocations.workspace_device_bytes == 0 || vision == nullptr ||
+        vision->max_window_features == 0 || vision->max_window_features > 4096 ||
+        vision->encoder_workspace_bytes == 0 || vision->output_capacity_bytes == 0 ||
+        vision->encoder_workspace_bytes + vision->output_capacity_bytes > vision->budget_bytes ||
+        vision->output_capacity_bytes > memory.allocations.persistent_device_bytes ||
+        vision->output_active_bytes != 0 || vision->output_peak_bytes != 0 ||
+        memory.workspace.measurement_peak_bytes != 0 ||
+        (engine.startup_report().ranks.at(0).graphs.has_value()) !=
+            engine.options().use_cuda_graph) {
+        std::cerr << "35B Engine construction has an invalid memory summary: weights="
+                  << memory.allocations.device_weights_bytes
+                  << " sequence=" << memory.allocations.persistent_device_bytes
+                  << " workspace=" << memory.allocations.workspace_device_bytes
+                  << " logical_peak=" << memory.workspace.measurement_peak_bytes
+                  << " graph=" << engine.startup_report().ranks.at(0).graphs.has_value()
+                  << " expected_graph=" << engine.options().use_cuda_graph << '\n';
+        if (vision)
+            std::cerr << "vision: window_features=" << vision->max_window_features
+                      << " budget=" << vision->budget_bytes
+                      << " encoder=" << vision->encoder_workspace_bytes
+                      << " output=" << vision->output_capacity_bytes
+                      << " active=" << vision->output_active_bytes
+                      << " peak=" << vision->output_peak_bytes << '\n';
+        else
+            std::cerr << "vision workspace is absent\n";
         return 1;
     }
     return 0;
@@ -94,8 +110,8 @@ int exercise_text_mtp_and_prefix(ninfer::Engine& engine) {
     const ninfer::GenerationResult first =
         engine.generate(engine.prepare_tokens(prompt), greedy_options(5, true));
     if (first.generated_token_ids.size() != 5 ||
-        first.speculative.backend != ninfer::SpeculativeBackend::Mtp ||
-        first.speculative.rounds == 0) {
+        first.stats.speculative.backend != ninfer::SpeculativeBackend::Mtp ||
+        first.stats.speculative.rounds == 0) {
         std::cerr << "35B fixed prompt did not complete through MTP: outputs="
                   << first.generated_token_ids.size() << '\n';
         return 1;
@@ -110,9 +126,10 @@ int exercise_text_mtp_and_prefix(ninfer::Engine& engine) {
         engine.generate(engine.prepare_tokens(continuation), greedy_options(2, true));
     const std::uint32_t expected_reuse =
         static_cast<std::uint32_t>(prompt.size() + first.generated_token_ids.size() - 1);
-    if (reused.reused_prompt_tokens != expected_reuse || reused.generated_token_ids.size() != 2) {
-        std::cerr << "35B append/prefix reuse is incorrect: reused=" << reused.reused_prompt_tokens
-                  << " expected=" << expected_reuse
+    if (reused.stats.reused_prompt_tokens != expected_reuse ||
+        reused.generated_token_ids.size() != 2) {
+        std::cerr << "35B append/prefix reuse is incorrect: reused="
+                  << reused.stats.reused_prompt_tokens << " expected=" << expected_reuse
                   << " outputs=" << reused.generated_token_ids.size() << '\n';
         return 1;
     }
@@ -129,7 +146,7 @@ int exercise_text_mtp_and_prefix(ninfer::Engine& engine) {
     const ninfer::GenerationResult stopped =
         engine.generate(engine.prepare_tokens(prompt), stop_options);
     if (stopped.finish_reason != ninfer::FinishReason::StopToken ||
-        stopped.generated_token_ids.empty() || stopped.speculative.rounds == 0 ||
+        stopped.generated_token_ids.empty() || stopped.stats.speculative.rounds == 0 ||
         stopped.generated_token_ids.back() != stop_options.stop.token_ids.front()) {
         std::cerr << "35B custom stop did not terminate inside an MTP round\n";
         return 1;
@@ -151,11 +168,11 @@ int exercise_text_mtp_and_prefix(ninfer::Engine& engine) {
 }
 
 int exercise_vision(ninfer::Engine& engine) {
-    engine.reset_memory_peaks();
-    const ninfer::MemorySummary before = engine.memory_summary();
-    if (!before.vision_workspace || before.vision_workspace->handoff_active_bytes != 0 ||
-        before.vision_workspace->handoff_peak_bytes != 0) {
-        std::cerr << "35B Vision handoff peak did not reset before Vision\n";
+    engine.reset_measurement_peaks();
+    const auto before = engine.snapshot().ranks.at(0).memory;
+    if (!before.vision || before.vision->output_active_bytes != 0 ||
+        before.vision->output_peak_bytes != 0) {
+        std::cerr << "35B Vision output peak did not reset before Vision\n";
         return 1;
     }
     ninfer::MessagePart image;
@@ -182,19 +199,17 @@ int exercise_vision(ninfer::Engine& engine) {
         std::cerr << "35B Vision request did not complete through the public Engine\n";
         return 1;
     }
-    const ninfer::MemorySummary after = engine.memory_summary();
-    if (!after.vision_workspace ||
-        after.vision_workspace->handoff_offset_bytes !=
-            before.vision_workspace->handoff_offset_bytes ||
-        after.vision_workspace->handoff_capacity_bytes !=
-            before.vision_workspace->handoff_capacity_bytes ||
-        after.vision_workspace->handoff_active_bytes != 0 ||
-        after.vision_workspace->handoff_peak_bytes == 0 ||
-        after.vision_workspace->handoff_peak_bytes >
-            after.vision_workspace->handoff_capacity_bytes ||
-        after.workspace_logical_peak_bytes == 0 ||
-        after.workspace_logical_peak_bytes > after.workspace.capacity_bytes) {
-        std::cerr << "35B Vision request did not use the startup-frozen workspace handoff\n";
+    // Read a sample published after the short Vision request, rather than the reset snapshot.
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    (void)engine.generate(engine.prepare_tokens({198}), greedy_options(1, false));
+    const auto after = engine.snapshot().ranks.at(0).memory;
+    if (!after.vision ||
+        after.vision->output_capacity_bytes != before.vision->output_capacity_bytes ||
+        after.vision->output_active_bytes != 0 || after.vision->output_peak_bytes == 0 ||
+        after.vision->output_peak_bytes > after.vision->output_capacity_bytes ||
+        after.workspace.measurement_peak_bytes == 0 ||
+        after.workspace.measurement_peak_bytes > after.allocations.workspace_device_bytes) {
+        std::cerr << "35B Vision request did not use the startup-frozen output window\n";
         return 1;
     }
     return 0;
@@ -202,22 +217,22 @@ int exercise_vision(ninfer::Engine& engine) {
 
 int exercise_maximum_configuration(const char* artifact) {
     ninfer::Engine engine(maximum_engine_options(artifact));
-    const ninfer::MemorySummary memory = engine.memory_summary();
-    const auto* vision = memory.vision_workspace ? &*memory.vision_workspace : nullptr;
-    if (memory.max_context != 262144 || memory.kv_cache != ninfer::KvCacheStorage::Int8Group64 ||
-        memory.kv_payload_bytes == 0 || memory.sequence.capacity_bytes == 0 ||
-        memory.sequence.used_bytes == 0 ||
-        memory.sequence.used_bytes > memory.sequence.capacity_bytes ||
-        memory.workspace.capacity_bytes == 0 || vision == nullptr ||
-        vision->handoff_offset_bytes > memory.workspace.capacity_bytes ||
-        vision->handoff_capacity_bytes == 0 ||
-        vision->handoff_capacity_bytes >
-            memory.workspace.capacity_bytes - vision->handoff_offset_bytes ||
-        vision->handoff_active_bytes != 0 || !memory.cuda_graph.has_value()) {
+    const auto memory  = engine.snapshot().ranks.at(0).memory;
+    const auto* vision = memory.vision ? &*memory.vision : nullptr;
+    if (engine.description().max_context != 262144 ||
+        engine.description().kv_cache != ninfer::KvCacheStorage::Int8Group64 ||
+        memory.allocations.context_device_bytes == 0 ||
+        memory.allocations.persistent_device_bytes == 0 ||
+        memory.allocations.workspace_device_bytes == 0 || vision == nullptr ||
+        vision->output_capacity_bytes == 0 ||
+        vision->output_capacity_bytes > memory.allocations.persistent_device_bytes ||
+        vision->output_active_bytes != 0 ||
+        !engine.startup_report().ranks.at(0).graphs.has_value()) {
         std::cerr << "35B maximum configuration does not match the planned 256K layout: context="
-                  << memory.max_context << " kv_payload=" << memory.kv_payload_bytes
-                  << " sequence=" << memory.sequence.capacity_bytes
-                  << " workspace=" << memory.workspace.capacity_bytes << '\n';
+                  << engine.description().max_context
+                  << " context=" << memory.allocations.context_device_bytes
+                  << " sequence=" << memory.allocations.persistent_device_bytes
+                  << " workspace=" << memory.allocations.workspace_device_bytes << '\n';
         return 1;
     }
 
@@ -241,9 +256,9 @@ int exercise_maximum_configuration(const char* artifact) {
         std::cerr << "35B Engine was unusable after rejecting an over-capacity request\n";
         return 1;
     }
-    const ninfer::MemorySummary after = engine.memory_summary();
-    if (after.workspace_logical_peak_bytes == 0 ||
-        after.workspace_logical_peak_bytes > after.workspace.capacity_bytes) {
+    const auto after = engine.snapshot().ranks.at(0).memory;
+    if (after.workspace.measurement_peak_bytes == 0 ||
+        after.workspace.measurement_peak_bytes > after.allocations.workspace_device_bytes) {
         std::cerr << "35B maximum configuration did not report its executed workspace phase\n";
         return 1;
     }
@@ -263,12 +278,13 @@ int exercise_expert_priority(const char* artifact) {
             priority[layer].push_back((255 - e + layer) % 256);
         }
     }
+    ninfer::test::qwen3_5::set_context_capacity(options);
     ninfer::Engine engine(options);
-    const auto before = engine.memory_summary();
-    if (engine.options().prefill_chunk != 2048 || before.prefill_chunk != 2048) {
+    const auto before = engine.snapshot().ranks.at(0).memory;
+    if (engine.options().prefill_chunk != 2048 || engine.description().prefill_chunk != 2048) {
         throw std::runtime_error("explicit prefill chunk changed during offload startup");
     }
-    if (!before.moe || before.moe->target_experts_per_layer.size() != priority.size()) {
+    if (!before.experts || before.experts->target_experts_per_layer.size() != priority.size()) {
         throw std::runtime_error("expert priority cache was not materialized");
     }
     std::vector<ninfer::GenerationHandle> calls;
@@ -282,15 +298,16 @@ int exercise_expert_priority(const char* artifact) {
             throw std::runtime_error("priority cache lost a compact batch row");
         }
     }
-    const auto warmed = engine.memory_summary().moe;
-    if (warmed->ready_bytes != before.moe->ready_bytes ||
-        warmed->uploaded_bytes != before.moe->uploaded_bytes) {
+    const auto warmed = engine.snapshot().ranks.at(0).memory.experts;
+    if (warmed->ready_bytes != before.experts->ready_bytes ||
+        warmed->uploaded_bytes != before.experts->uploaded_bytes) {
         throw std::runtime_error("stable small-T execution changed its expert replicas");
     }
     const auto result = engine.generate(
         engine.prepare_tokens(std::vector<ninfer::TokenId>(128, 198)), greedy_options(2, false));
     if (result.generated_token_ids.size() != 2 ||
-        engine.memory_summary().moe->uploaded_bytes <= before.moe->uploaded_bytes) {
+        engine.snapshot().ranks.at(0).memory.experts->uploaded_bytes <=
+            before.experts->uploaded_bytes) {
         throw std::runtime_error("priority cache did not stream its missing experts");
     }
     return 0;
@@ -312,14 +329,14 @@ int main(int argc, char** argv) {
         {
             ninfer::Engine engine(engine_options(artifact));
             if (const int result = verify_loaded_product(engine); result != 0) { return result; }
-            const auto before         = engine.memory_summary();
+            const auto before         = engine.snapshot().ranks.at(0).memory;
             const auto expected_chunk = offload ? 4096U : 1024U;
             if (engine.options().prefill_chunk != expected_chunk ||
-                before.prefill_chunk != expected_chunk) {
+                engine.description().prefill_chunk != expected_chunk) {
                 throw std::runtime_error(
                     "Engine did not resolve the expected default prefill chunk");
             }
-            if (before.moe.has_value() != offload) {
+            if (before.experts.has_value() != offload) {
                 throw std::runtime_error("MoE test did not select the requested residency");
             }
             if (const int result = exercise_text_mtp_and_prefix(engine); result != 0) {

@@ -4,7 +4,7 @@
     "content": [
       {
         "type": "image",
-        "image": "examples/cli/media/visual_chart.png"
+        "image": "../media/visual_chart.png"
       },
       {
         "type": "text",

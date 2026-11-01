@@ -1,13 +1,19 @@
 #include "ops/linear/projection/nvfp4/nvfp4_dispatch.h"
 #include "ops/common/host/operands.h"
 #include "ops/linear/projection/nvfp4/nvfp4_shapes.h"
+#include "core/platform.h"
 #include <array>
 #include <stdexcept>
 
 namespace ninfer::ops::detail {
 namespace {
-const std::array kShapes{&kNvfp4N14336K5120, &kNvfp4N16384K5120, &kNvfp4N34816K5120,
-                         &kNvfp4N5120K6144, &kNvfp4N5120K17408};
+const std::array kShapes{
+#if NINFER_TARGET_SPARK
+    &kNvfp4N12288K4096, &kNvfp4N4096K6144,
+#endif
+    &kNvfp4N14336K5120, &kNvfp4N16384K5120, &kNvfp4N34816K5120,
+    &kNvfp4N5120K6144,  &kNvfp4N5120K17408,
+};
 
 const Nvfp4LinearShape& resolve_shape(std::int32_t n, std::int32_t k, LinearPolicy policy) {
     if (!valid_linear_policy(policy))

@@ -41,6 +41,20 @@ __device__ __forceinline__ void cp_async_zfill(void* smem_dst, const void* gmem_
     }
 }
 
+template <Cache Policy>
+__device__ __forceinline__ void cp_async_cache_hint(void* destination, const void* source,
+                                                    int valid_bytes, std::uint64_t policy) {
+    if constexpr (Policy == Cache::cg) {
+        asm volatile("cp.async.cg.shared.global.L2::cache_hint [%0], [%1], 16, %2, %3;"
+                     :
+                     : "r"(smem_addr(destination)), "l"(source), "r"(valid_bytes), "l"(policy));
+    } else {
+        asm volatile("cp.async.ca.shared.global.L2::cache_hint [%0], [%1], 16, %2, %3;"
+                     :
+                     : "r"(smem_addr(destination)), "l"(source), "r"(valid_bytes), "l"(policy));
+    }
+}
+
 __device__ __forceinline__ void cp_commit() { asm volatile("cp.async.commit_group;\n"); }
 
 template <int Groups>

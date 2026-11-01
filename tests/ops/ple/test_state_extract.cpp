@@ -1,3 +1,4 @@
+#include "ops/suite.h"
 #include "fixture.h"
 #include "cuda_fixture.h"
 #include "core/buffer.h"
@@ -12,21 +13,24 @@ namespace {
 int run(DeviceContext& device, int batch, int layout, bool inplace, bool sliced) {
     constexpr int capacity = 19;
     const int slots        = batch + 3;
-    Words source({D, 9, slots}, layout == 1, column_strides(9, slots, layout));
-    Words destination({D, 9, batch + 1}, layout == 1, column_strides(9, batch + 1, layout));
+    Words source({D, 9, slots}, layout == 1, history_strides(slots, layout));
+    Words destination({D, 9, batch + 1}, layout == 1, history_strides(batch + 1, layout));
     Words records({D, capacity, batch}, layout == 1, column_strides(capacity, batch, layout));
     source.fill(211, 1.f, true);
     destination.fill(223, 1.f, true);
     records.fill(227, 1.f, true);
     std::vector<int> sources(batch), destinations(batch), accepted(batch), valid(batch, capacity);
-    DeviceBuffer ds(ninfer::test::cuda_environment().context.device(), batch * 4);
-    DeviceBuffer dd(ninfer::test::cuda_environment().context.device(), batch * 4);
+    DeviceBuffer ds(ninfer::test::cuda_environment().context.device(), batch * 8);
+    DeviceBuffer dd(ninfer::test::cuda_environment().context.device(), batch * 8);
     DeviceBuffer da(ninfer::test::cuda_environment().context.device(), batch * 4);
     DeviceBuffer dv = to_device(valid);
     Tensor before = source.tensor, after = inplace ? source.tensor : destination.tensor;
     if (sliced) after = before.slice(2, 2, slots - 2);
-    ops::PleConvStateView input{before, Tensor(ds.span(), DType::I32, {batch})};
-    ops::PleConvStateView output{after, Tensor(dd.span(), DType::I32, {batch})};
+    ops::PleConvStateView input{
+        history_field(before, source.device->span(), Tensor(ds.span(), DType::I64, {batch}))};
+    ops::PleConvStateView output{
+        history_field(after, inplace ? source.device->span() : destination.device->span(),
+                      Tensor(dd.span(), DType::I64, {batch}))};
     ops::PleConvRecordReadView read{records.tensor, Tensor(dv.span(), DType::I32, {batch})};
     Tensor counts(da.span(), DType::I32, {batch});
     DecodeGraphDefinition definition;
@@ -41,8 +45,8 @@ int run(DeviceContext& device, int batch, int layout, bool inplace, bool sliced)
             destinations[b] = inplace ? (sliced ? b : b + 2) : batch - b;
             accepted[b]     = (extent + b) % (capacity + 1);
         }
-        upload_i32(ds, sources);
-        upload_i32(dd, destinations);
+        upload_offsets(ds, before, sources);
+        upload_offsets(dd, after, destinations);
         upload_i32(da, accepted);
         auto expected = inplace ? source.host : destination.host;
         for (int b = 0; b < batch; ++b)
@@ -80,31 +84,29 @@ int run(DeviceContext& device, int batch, int layout, bool inplace, bool sliced)
         if (!inplace) failures += source.preserved("extract preserves source");
         failures += source.device->verify_guards(label) + destination.device->verify_guards(label);
         failures += verify_exact("accepted preserved", from_device<int>(da, batch), accepted);
-        failures += verify_exact("source slots preserved", from_device<int>(ds, batch), sources);
+        failures += verify_exact("source slots preserved", from_device<std::int64_t>(ds, batch),
+                                 history_offsets(before, sources));
         failures +=
-            verify_exact("destination slots preserved", from_device<int>(dd, batch), destinations);
+            verify_exact("destination slots preserved", from_device<std::int64_t>(dd, batch),
+                         history_offsets(after, destinations));
         failures += verify_exact("valid preserved", from_device<int>(dv, batch), valid);
     }
     return failures;
 }
 } // namespace
 
-int main() {
-    if (cuda_unavailable()) return 77;
-    try {
-        DeviceContext device;
-        int failures = 0;
-        for (int layout : {0, 1, 2}) {
-            failures += run(device, 1, layout, false, false);
-            failures += run(device, 8, layout, false, false);
-            failures += run(device, 3, layout, true, false);
-            failures += run(device, 8, layout, true, true);
-        }
-        if (failures) return 1;
-        std::cout << "OK PLE exact state extraction for every accepted prefix, strides and Graph "
-                     "metadata\n";
-    } catch (const std::exception& e) {
-        std::cerr << e.what() << '\n';
-        return 1;
+void add_ple_state_extract_cases(ninfer::test::OpSuite& suite) {
+    const auto add = [&](int batch, int layout, bool inplace, bool sliced) {
+        suite.add("ple_state_extract/b" + std::to_string(batch) + "/layout" +
+                      std::to_string(layout) + (inplace ? "/alias" : "/disjoint") +
+                      (sliced ? "/sliced" : "/full"),
+                  [=] { return run(cuda_environment().context, batch, layout, inplace, sliced); },
+                  {{"execution", "graph"}});
+    };
+    for (int layout : {0, 1, 2}) {
+        add(1, layout, false, false);
+        add(8, layout, false, false);
+        add(3, layout, true, false);
+        add(8, layout, true, true);
     }
 }

@@ -139,6 +139,27 @@ def test_fragmented_utf8_and_multiple_frames_keep_completion_timestamp():
     assert result["output_gap_ns"] == [0]
 
 
+def test_tool_identity_is_metadata_and_only_argument_bytes_are_output():
+    decoder = SseDecoder()
+    adapter = ChatStreamAdapter()
+
+    def consume(call, when):
+        payload = {"id": "chatcmpl_tool", "choices": [{"index": 0, "delta": {"tool_calls": [call]}}]}
+        wire = ("data: " + json.dumps(payload) + "\n\n").encode()
+        return [event for frame in decoder.feed(wire, when) for event in adapter.consume(frame)]
+
+    start = consume({"index": 0, "id": "call_1", "type": "function",
+                     "function": {"name": "write", "arguments": ""}}, 3_000_000)
+    assert [event.kind for event in start] == ["metadata"]
+    first = consume({"index": 0, "function": {"arguments": '{"content":"'}}, 5_000_000)
+    second = consume({"index": 0, "function": {"arguments": "<html>"}}, 8_000_000)
+    assert first[0].output == '{"content":"'
+    assert second[0].output == "<html>"
+    result = record([*start, *first, *second, ProtocolEvent("terminal", "done", 15_000_000)])
+    assert result["ttft_ns"] == 4_000_000
+    assert result["output_gap_ns"] == [3_000_000]
+
+
 def campaign(tmp_path: Path, records, *, notes=None, constructed=True):
     raw = tmp_path / "run.json"
     raw.write_text("{}")
@@ -223,7 +244,7 @@ def logged_campaign(tmp_path, records, events, *, required=()):
 
 def done_event(service_id, wire_id, response_id, *, preemptions=0, replay=0):
     return {
-        "artifact_type": "ninfer_serve_request_log", "schema_version": 29,
+        "artifact_type": "ninfer_serve_request_log", "schema_version": 31,
         "event": "request_done", "server_instance_id": "serve-test",
         "request": {"request_id": service_id, "http_request_id": wire_id,
                     "response_id": response_id},
@@ -296,19 +317,22 @@ def test_mechanism_not_observed_keeps_valid_performance(tmp_path):
     assert summary["ttft_groups"][0]["median_ttft_ns"] == 4_000_000
 
 
-def runtime_interval(*, schema=29, final=None, state_bytes=0, main_bytes=0,
+def runtime_interval(*, schema=31, final=None, state_bytes=0, main_bytes=0,
                      host_seconds=0.0, occupied=0, peak=None):
-    occupancy = {"device_state_slots": 1, "host_state_slots": 1,
-                 "host_kv_bytes": occupied, "host_context_occupied_bytes": occupied,
-                 "host_context_reserved_bytes": 0}
+    pool = {"rank": 0, "domain": "host", "capacity_bytes": 2048, "block_bytes": 256,
+            "live_bytes": occupied, "reserved_bytes": 0, "pending_retirement_bytes": 0,
+            "relocation_bytes": 0, "future_reserved_bytes": 0, "padding_bytes": 0,
+            "assigned_free_bytes": 0, "unassigned_free_bytes": 2048 - occupied, "tail_bytes": 0}
     if peak is not None:
-        occupancy["host_context_peak_occupied_bytes"] = peak
+        pool["peak_occupied_bytes"] = peak
+    occupancy = {"state_objects": 2, "history_objects": 3, "pools": [pool],
+                 "metadata": {"budget_bytes": 4096, "allocated_bytes": 1024, "reserved_bytes": 128}}
     event = {
         "artifact_type": "ninfer_serve_request_log", "schema_version": schema,
         "event": "throughput", "server_instance_id": "serve-test",
         "interval_seconds": 0.125 if final else 1.0,
         "host_work": {"elapsed_seconds": {"total": host_seconds},
-                      "device_wait_seconds": 0.25},
+                      "scheduler_yield_seconds": 0.25},
         "context_cache": {"occupancy": occupancy},
     }
     if final is not None:
@@ -317,7 +341,7 @@ def runtime_interval(*, schema=29, final=None, state_bytes=0, main_bytes=0,
         return {direction: {"bytes": amount if direction == "d2h" else 0,
                             "seconds": 0.001 if direction == "d2h" else 0.0,
                             "images": 1, "page_groups": 1, "copy_operations": 1}
-                for direction in ("d2h", "h2d", "d2d")}
+                for direction in ("d2h", "h2d", "d2d", "h2h", "peer_d2d")}
     event["context_cache"]["state_transfers"] = transfers(state_bytes)
     event["context_cache"]["kv_pools"] = [
         {"pool_id": 0, "occupied_page_groups": 8, "transfers": transfers(main_bytes)},
@@ -342,9 +366,12 @@ def test_global_intervals_include_unowned_demotion_and_shutdown_tail(tmp_path):
     assert global_work["transfers"]["kv_pools"]["0"]["d2h"]["bytes"] == 150
     assert global_work["transfers"]["state"]["d2h"]["bytes"] == 25
     assert global_work["host_work"]["elapsed_seconds"]["total"] == pytest.approx(0.12)
-    assert global_work["host_work"]["device_wait_seconds"] == 0.5
-    assert global_work["occupancy"]["host_context_occupied_bytes"] == {"sampled_max": 800, "last": 200}
-    assert global_work["host_context_peak_occupied_bytes"] == 1000
+    assert global_work["host_work"]["scheduler_yield_seconds"] == 0.5
+    pool = global_work["occupancy"]["pools"][0]
+    assert (pool["rank"], pool["domain"], pool["observations"]) == (0, "host", 2)
+    assert pool["live_bytes"] == {"sampled_max": 800, "last": 200}
+    assert pool["peak_occupied_bytes"] == 1000
+    assert global_work["transfers"]["state"]["h2h"]["bytes"] == 0
     assert summary["stream_observations"][0]["device_to_host_bytes"] == 0
     markdown = render_markdown(summary)
     assert "Global runtime costs" in markdown and "Sampled max" in markdown
@@ -358,10 +385,33 @@ def test_missing_runtime_fields_remain_explicit(tmp_path):
     global_work = summary["global_runtime_observations"][0]
     assert global_work["status"] == "available"
     assert global_work["shutdown_tail"] == "unconfirmed"
-    assert global_work["host_context_peak_occupied_bytes"] is None
+    assert global_work["occupancy"]["pools"][0]["peak_occupied_bytes"] is None
     assert global_work["transfers"]["kv_pools"]["0"]["d2h"]["bytes"] == 100
     assert global_work["transfers"]["kv_pools"]["1"]["h2d"]["seconds"] is None
     assert summary["stream_observations"][0]["preemptions"] is None
+
+
+def test_context_domains_are_matched_by_rank_and_domain(tmp_path):
+    first = runtime_interval(occupied=800, peak=900)
+    second = runtime_interval(final=True, occupied=200, peak=1000)
+    device = {**first["context_cache"]["occupancy"]["pools"][0], "rank": 1, "domain": "device",
+              "live_bytes": 400, "peak_occupied_bytes": 450}
+    first["context_cache"]["occupancy"]["pools"].append(device)
+    second["context_cache"]["occupancy"]["pools"].insert(
+        0, {**device, "live_bytes": 500, "peak_occupied_bytes": 600},
+    )
+    second["context_cache"]["state_transfers"]["h2h"].update(bytes=64, seconds=0.002)
+    second["context_cache"]["state_transfers"]["peer_d2d"].update(bytes=128, seconds=0.003)
+    summary = summarize_campaign(logged_campaign(tmp_path, [], [first, second]))
+    observed = summary["global_runtime_observations"][0]
+    pools = {(pool["rank"], pool["domain"]): pool for pool in observed["occupancy"]["pools"]}
+    assert pools[(0, "host")]["live_bytes"] == {"sampled_max": 800, "last": 200}
+    assert pools[(1, "device")]["live_bytes"] == {"sampled_max": 500, "last": 500}
+    assert pools[(1, "device")]["peak_occupied_bytes"] == 600
+    assert observed["transfers"]["state"]["h2h"]["bytes"] == 64
+    assert observed["transfers"]["state"]["h2h"]["seconds"] == pytest.approx(0.002)
+    assert observed["transfers"]["state"]["peer_d2d"]["bytes"] == 128
+    assert observed["transfers"]["state"]["peer_d2d"]["seconds"] == pytest.approx(0.003)
 
 
 def test_unsupported_runtime_schema_is_unavailable(tmp_path):
@@ -436,14 +486,14 @@ def first_output_event():
         "elapsed_seconds": 0.070, "initial_binding_seconds": 0.010,
         "engine": {"queue_wait_seconds": 0.030,
                    "host_exposed_seconds": {"engine_boundary": 0.003, "total": 0.004},
-                   "device_wait_exposed_seconds": 0.011},
+                   "scheduler_yield_exposed_seconds": 0.011},
         "scheduling": {"paused_ns": 5_000_000, "preemptions": 1, "snapshot_restores": 1,
                        "replay_restores": 0, "replayed_tokens": 0},
         "computed_prefill_tokens": 20,
-        "prefill": {"submit_seconds": 0.002, "wait_seconds": 0.006,
-                    "post_seconds": 0.001, "gpu_seconds": 0.007},
-        "replay": {"submit_seconds": 0, "wait_seconds": 0,
-                   "post_seconds": 0, "gpu_seconds": 0},
+        "prefill": {"result": {"count": 1, "total_ns": 2_000_000},
+                    "total": {"count": 1, "total_ns": 9_000_000}},
+        "replay": {"total": {"count": 0, "total_ns": 0}},
+        "pending_execution": {"result_ns": 7_000_000},
         "context_transfers": {"kv_pools": [{"pool_id": 0, "transfers": {"h2d": {"bytes": 1024, "seconds": 0.008}}}]},
     }
     return event
@@ -480,8 +530,8 @@ def test_first_output_partition_preserves_terminal_and_overlapping_work(tmp_path
     assert row["http_residual_ms"] == pytest.approx(10)
     assert sum(row[f"{stage}_pct"] for stage in
                ("prepare", "queue", "initial_binding", "paused", "resident", "http_residual")) == pytest.approx(100)
-    assert row["prefill_program_ms"] == 9
-    assert row["prefill_gpu_ms"] == 7
+    assert row["prefill_total_ms"] == 9
+    assert row["pending_result_ms"] == 7
     assert row["kv_pool_0_h2d_ms"] == 8
     assert row["state_d2h_ms"] is None
     assert row["preemptions_before_first"] == 1
@@ -628,7 +678,7 @@ def test_replay_progress_uses_engine_interval_and_subtracts_self(tmp_path, other
     done = done_event(1, "req_wire", "response-a", preemptions=1, replay=1)
     def transition(name, at, replayed, decoded):
         return {
-            "artifact_type": "ninfer_serve_request_log", "schema_version": 29,
+            "artifact_type": "ninfer_serve_request_log", "schema_version": 31,
             "event": "request_scheduling", "server_instance_id": "serve-test",
             "request": {"request_id": 1, "http_request_id": "req_wire"},
             "engine_request_id": 11, "preemption_index": 1, "route": "replay",
@@ -673,7 +723,7 @@ def test_replay_evidence_missing_events_cannot_prove_no_other_progress(tmp_path,
     measured["response_id"] = "response-a"
     done = done_event(1, "req_wire", "response-a", preemptions=1, replay=1)
     event = {
-        "artifact_type": "ninfer_serve_request_log", "schema_version": 29,
+        "artifact_type": "ninfer_serve_request_log", "schema_version": 31,
         "event": "request_scheduling", "server_instance_id": "serve-test",
         "request": {"request_id": 1, "http_request_id": "req_wire"},
         "engine_request_id": 11, "preemption_index": 1, "route": "replay",

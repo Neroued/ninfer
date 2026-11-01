@@ -132,9 +132,7 @@ class EvalScopeBackendTest(unittest.TestCase):
 
     def test_normalizes_ifbench_official_metrics(self):
         backend = EvalScopeBackend()
-        job = JobConfig(
-            "ifbench", "evalscope", "ifbench", "api", 2, None, 1, {}, {}
-        )
+        job = JobConfig("ifbench", "evalscope", "ifbench", "api", 2, None, 1, {}, {})
         scores = {
             "prompt_level_strict": 0.51,
             "inst_level_strict": 0.61,
@@ -276,6 +274,64 @@ class EvalScopeBackendTest(unittest.TestCase):
             )
             self.assertEqual(result.counts.completed, 1)
             self.assertEqual(result.counts.failed, 1)
+            self.assertEqual(result.status, "failed")
+
+    def test_short_report_is_partial_and_keeps_original_accuracy(self):
+        backend = EvalScopeBackend()
+        job = JobConfig("aime", "evalscope", "aime26", "api", 8, None, 32, {}, {})
+        with tempfile.TemporaryDirectory() as tmp:
+            context = RunContext(
+                "run", job, Path(tmp), None, 8, threading.Event(), False, WorkPlan(960)
+            )
+            result = backend.normalize(
+                context, BackendRun(0, 1, {"aime26": {"score": 0.75, "num": 900}})
+            )
+            self.assertEqual(result.status, "partial")
+            self.assertEqual(result.metrics["accuracy"], 0.75)
+            self.assertEqual(result.counts.scored, 900)
+
+    def test_dataset_seed_does_not_become_request_seed(self):
+        from ninfer_eval.config import RequestConfig, TargetConfig
+        from ninfer_eval.secrets import ResolvedTarget
+
+        job = JobConfig(
+            "aime",
+            "evalscope",
+            "aime26",
+            "api",
+            8,
+            None,
+            32,
+            {"temperature": 1.0},
+            {"seed": 123},
+        )
+        target = ResolvedTarget(
+            TargetConfig(
+                "api",
+                "openai_chat",
+                "http://localhost/v1",
+                "m",
+                None,
+                8,
+                RequestConfig(),
+            ),
+            None,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            context = RunContext(
+                "run",
+                job,
+                Path(tmp),
+                target,
+                8,
+                threading.Event(),
+                False,
+                WorkPlan(960),
+            )
+            task = EvalScopeBackend()._task_dict(context)
+        self.assertEqual(task["seed"], 123)
+        self.assertEqual(task["repeats"], 32)
+        self.assertNotIn("seed", task["generation_config"])
 
     def test_bfcl_task_snapshot_does_not_contain_serpapi_secret(self):
         backend = EvalScopeBackend()

@@ -6,11 +6,10 @@ namespace ninfer::ops::sampling_detail {
 
 template <class S>
 __launch_bounds__(S::kSamplerBlock) __global__ void speculative_accept_greedy_drafts_kernel(
-    const std::int32_t* target_tokens, const __nv_bfloat16* logits, const std::int32_t* drafts,
-    const std::int32_t* current_extents, std::int32_t* lengths, std::int32_t* anchors,
-    std::int32_t* licensed_tokens, std::int32_t* licensed_counts, std::int32_t* accepted,
-    const SamplingConfig* configs, std::int32_t token_domain, std::int32_t physical_rows,
-    std::int32_t k) {
+    const std::int32_t* target_tokens, const __nv_bfloat16* logits, TokenRows drafts,
+    const std::int32_t* current_extents, const std::int32_t* base_positions,
+    std::int32_t* licensed_tokens, std::int32_t* licensed_counts, const SamplingConfig* configs,
+    std::int32_t token_domain, std::int32_t physical_rows, std::int32_t k) {
     const int tid                   = threadIdx.x;
     const int row                   = static_cast<int>(blockIdx.x);
     const int cols                  = k + 1;
@@ -18,7 +17,7 @@ __launch_bounds__(S::kSamplerBlock) __global__ void speculative_accept_greedy_dr
     extent                          = extent < 0 ? 0 : (extent > k ? k : extent);
     const SamplingConfig cfg        = configs[row];
     const std::int32_t* row_targets = target_tokens + row * cols;
-    const std::int32_t* row_drafts  = drafts + row * k;
+    const auto row_drafts           = drafts[row];
     std::int32_t* row_tokens        = licensed_tokens + row * cols;
     const __nv_bfloat16* row_logits =
         logits + static_cast<std::int64_t>(row) * cols * physical_rows;
@@ -29,8 +28,8 @@ __launch_bounds__(S::kSamplerBlock) __global__ void speculative_accept_greedy_dr
             int a = 0;
             while (a < extent && row_targets[a] == row_drafts[a]) { ++a; }
             const int t_star = row_targets[a];
-            speculative_store_accept_result<true>(row_drafts, k, row, a, t_star, lengths, anchors,
-                                                  row_tokens, licensed_counts, accepted, &cfg);
+            speculative_store_accept_result(row_drafts, k, row, a, t_star, row_tokens,
+                                            licensed_counts);
         }
         return;
     }
@@ -52,7 +51,7 @@ __launch_bounds__(S::kSamplerBlock) __global__ void speculative_accept_greedy_dr
         a_sh     = 0;
         done_sh  = 0;
         tstar_sh = 0;
-        L_sh     = lengths[row];
+        L_sh     = base_positions[row];
     }
     __syncthreads();
 
@@ -97,8 +96,8 @@ __launch_bounds__(S::kSamplerBlock) __global__ void speculative_accept_greedy_dr
         if (tid == 0) {
             const int a     = a_sh;
             const int tstar = tstar_sh;
-            speculative_store_accept_result<true>(row_drafts, k, row, a, tstar, lengths, anchors,
-                                                  row_tokens, licensed_counts, accepted, &cfg);
+            speculative_store_accept_result(row_drafts, k, row, a, tstar, row_tokens,
+                                            licensed_counts);
         }
         return;
     }
@@ -151,8 +150,7 @@ __launch_bounds__(S::kSamplerBlock) __global__ void speculative_accept_greedy_dr
     if (tid == 0) {
         const int a     = a_sh;
         const int tstar = tstar_sh;
-        speculative_store_accept_result<true>(row_drafts, k, row, a, tstar, lengths, anchors,
-                                              row_tokens, licensed_counts, accepted, &cfg);
+        speculative_store_accept_result(row_drafts, k, row, a, tstar, row_tokens, licensed_counts);
     }
 }
 

@@ -36,12 +36,12 @@ struct ContextKVMaterializeExecutionEnvelope {
  * Materialize one normalized context block into five layer-local cyclic K/V caches.
  *
  * context is contiguous BF16 [5120,W,B], positions is contiguous device I32 [W,B], and counts
- * and state_slots are contiguous device I32 [B]. The registered domains are context blocks
- * W=1..16,B=1..8 and single-request prefill B=1,W=1..2048. W is the physical context width,
- * independent of the draft width and the device-selected committed prefix. Each of the five layer
- * views contains independent RowSplit Q8_G32_FP16 key/value weights [1024,5120], a BF16 key norm
- * weight [128], and a capacity-2048 D128/H8 cyclic cache with BF16 K and FP16 V. All five caches
- * share padded capacity and lane capacity.
+ * are contiguous device I32 [B]. Each cache field uses device I64 record byte offsets [B]. The
+ * registered domains are context blocks W=1..16,B=1..8 and single-request prefill B=1,W=1..2048. W
+ * is the physical context width, independent of the draft width and the device-selected committed
+ * prefix. Each of the five layer views contains independent RowSplit Q8_G32_FP16 key/value weights
+ * [1024,5120], a BF16 key norm weight [128], and a capacity-2048 D128/H8 cyclic cache with BF16 K
+ * and FP16 V. All five caches share padded capacity, backing arena and record offset table.
  *
  * For every layer l, row b, and i in [0,counts[b]), the complete operation is
  *
@@ -54,23 +54,23 @@ struct ContextKVMaterializeExecutionEnvelope {
  *   k[j+64]  = n[j+64] * cos(angle(j)) + n[j]    * sin(angle(j))
  *
  * K is stored as BF16 and V as FP16_RNE from represented BF16 v_raw at absolute position
- * positions[i,b] modulo 2048 in lane state_slots[b]. Columns i>=counts[b] have no state effect.
- * Existing cache values outside the addressed rows and all read-only inputs are unchanged. The Op
- * emits no raw K/V and owns no logical frontier, commit, rollback, request identity, or persistent
- * allocation.
+ * positions[i,b] modulo 2048 in the selected State record for row b. Columns i>=counts[b] have no
+ * state effect. Existing cache values outside the addressed rows and all read-only inputs are
+ * unchanged. The Op emits no raw K/V and owns no logical frontier, commit, rollback, request
+ * identity, or persistent allocation.
  *
  * The caller guarantees min_count <= counts[b] <= max_count <= W, sequential nonnegative live
- * positions, in-range state slots for live rows, and disjoint live destinations. Each selected
- * state slot's old live interval ends immediately before positions[0,b], and advancing it by
- * counts[b] makes every overwritten ring slot dead. Cache K/V have dense [128,padded_capacity,8]
- * inside each state slot with explicit 16-byte-aligned slot strides nb[3]. Inputs, weights, live
- * workspace, and all cache planes are mutually non-overlapping. Raw K has no semantic storage cast.
- * Reduction association, projection staging precision, and intermediate arithmetic are
- * implementation details. The Op is safe for CUDA Graph capture and replay over the complete
+ * positions, materialized State records for live rows, and disjoint live destinations. Each
+ * selected State record's old live interval ends immediately before positions[0,b], and advancing
+ * it by counts[b] makes every overwritten ring slot dead. Cache K/V have dense
+ * [128,padded_capacity,8] inside each State record with 16-byte-aligned field offsets. Inputs,
+ * weights, live workspace, and all cache planes are mutually non-overlapping. Raw K has no semantic
+ * storage cast. Reduction association, projection staging precision, and intermediate arithmetic
+ * are implementation details. The Op is safe for CUDA Graph capture and replay over the complete
  * envelope.
  */
 void context_kv_materialize(
-    const Tensor& context, const Tensor& positions, const Tensor& counts, const Tensor& state_slots,
+    const Tensor& context, const Tensor& positions, const Tensor& counts,
     const std::array<ContextKVMaterializeLayerView, kContextKVMaterializeLayers>& layers,
     ContextKVMaterializeExecutionEnvelope envelope, MemoryArena& workspace,
     CudaExecutionView execution);

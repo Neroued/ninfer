@@ -323,13 +323,13 @@ bool EngineCore<Instance>::prepare_completion(const std::shared_ptr<Request>& re
 
 template <class Instance>
 void EngineCore<Instance>::release_request(const std::shared_ptr<Request>& request) noexcept {
+    scheduler_.finished(request->id);
+    request_admission_check();
     if (request->lane) {
         const auto lane = request->lane->value;
         capture_decisions_[lane].reset();
         reserved_units_[lane].reset();
         slots_[lane].reset();
-        request_admission_check();
-        scheduler_.capacity_released();
     }
     request->sequence.reset();
     request->lane.reset();

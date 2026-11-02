@@ -383,6 +383,10 @@ void EngineCore<Instance>::record_context_work(
         }
         longest_rank_ns = std::max(longest_rank_ns, rank_ns);
     }
+    if (owner && materializing_ && materializing_->resumed &&
+        progress.kind == decltype(progress.kind)::Bind)
+        scheduler_.recovery_work(owner->id, longest_rank_ns);
+
     cumulative_stats_.actual_context_transfer_seconds += longest_rank_ns * 1.0e-9;
 }
 

@@ -20,6 +20,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <deque>
 #include <exception>
 #include <future>
@@ -339,6 +340,9 @@ private:
         std::vector<ResidencyId> residencies;
         std::vector<std::uint32_t> lanes;
         std::vector<bool> cancelled;
+        std::array<bool, kMaximumConcurrency> progressed{};
+        std::optional<std::uint64_t> retired_ns;
+        bool service_accounted = false;
         std::vector<TokenId> control_tokens;
         std::uint32_t control_stride = 0;
         std::vector<std::size_t> generated_sizes;
@@ -564,8 +568,6 @@ private:
 
     [[nodiscard]] bool resident_empty() const noexcept;
 
-    [[nodiscard]] bool has_older_resident(std::uint64_t ticket) const noexcept;
-
     void record_context_work(const typename ModelContract::ContextProgress& progress,
                              const std::shared_ptr<Request>& owner);
 
@@ -574,13 +576,11 @@ private:
 
     ReclaimProgress reclaim(const ContextAssessment& assessment, bool allow_pause,
                             std::span<const Checkpoint> excluded               = {},
-                            typename ResourceManagement::ReclaimCursor* cursor = nullptr,
-                            std::optional<std::uint64_t> priority_ticket       = std::nullopt);
+                            typename ResourceManagement::ReclaimCursor* cursor = nullptr);
 
-    bool pause_reclaim_victim(std::optional<std::uint64_t> priority_ticket,
-                              const ContextAssessment&);
+    bool pause_reclaim_victim(const ContextAssessment&);
 
-    enum class PauseGoal { YieldLane, ReleaseCapacity, RecoverCapacity, RelocateOnly };
+    enum class PauseGoal { YieldLane, ReleaseCapacity, RelocateOnly };
     bool pause_resident(std::uint32_t lane, PauseGoal goal = PauseGoal::YieldLane,
                         const ContextAssessment* pressure = nullptr);
 
@@ -624,7 +624,7 @@ private:
 
     [[nodiscard]] bool start_control(const ControlMembership& membership);
 
-    void resolve_control(const ComputeFlight& flight);
+    void resolve_control(ComputeFlight& flight);
 
     void supply_decision(ExecutionTicket ticket, const DecisionRequest& decision);
 
@@ -636,6 +636,8 @@ private:
 
     [[nodiscard]] bool compute_pending() const noexcept;
 
+    void record_service(ComputeFlight& flight) noexcept;
+    void log_worker_failure(std::exception_ptr error) const noexcept;
     void fail_all(std::exception_ptr error) noexcept;
 
     void begin_cycle(HostPhaseMeasurement& boundary);

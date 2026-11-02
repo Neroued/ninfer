@@ -202,6 +202,7 @@ void EngineCore<Instance>::commit_pending(PendingBatch&& pending, ComputeFlight 
             continue;
         }
         if (!cancelled[row]) {
+            flight.progressed[row] = accepted != 0;
             request->budget->commit(accepted);
             request->placement_tokens = instance_.session->load_tokens(*request->sequence);
         }
@@ -247,6 +248,7 @@ void EngineCore<Instance>::commit_pending(PendingBatch&& pending, ComputeFlight 
         }
     }
     phase.finish();
+    record_service(flight);
     retiring_.emplace(std::move(flight));
 }
 
@@ -271,6 +273,8 @@ void EngineCore<Instance>::resolve_prefill_progress(
     }
     const auto computed_begin = begin.reused_prompt_tokens + request->computed_prompt_tokens;
     request->computed_prompt_tokens += progress.processed_prompt_tokens;
+    flight.progressed.front() = progress.processed_prompt_tokens != 0;
+    record_service(flight);
     if (!request->cancelled.load(std::memory_order_acquire)) {
         resources_.observe_committed(*request->base_plan, request->id, computed_begin,
                                      computed_begin + progress.processed_prompt_tokens,
@@ -432,7 +436,7 @@ template <class Instance>
 }
 
 template <class Instance>
-void EngineCore<Instance>::resolve_control(const ComputeFlight& flight) {
+void EngineCore<Instance>::resolve_control(ComputeFlight& flight) {
     EnginePhaseScope phase(*this, EngineHostPhase::CommitOutput);
     cumulative_stats_.committed_decode_tokens += flight.requests.size() * flight.control_stride;
     cumulative_stats_.injected_control_tokens += flight.requests.size() * flight.control_stride;
@@ -442,6 +446,7 @@ void EngineCore<Instance>::resolve_control(const ComputeFlight& flight) {
         request->committed_decode_tokens += flight.control_stride;
         request->injected_control_tokens += flight.control_stride;
         request->budget->commit(flight.control_stride);
+        flight.progressed[row]    = flight.control_stride != 0;
         request->placement_tokens = instance_.session->load_tokens(*request->sequence);
         auto timing               = record_committed_output(request, flight.control_stride);
         append_output(request, request->output.commit_preview(), std::move(timing), &phase);
@@ -449,6 +454,7 @@ void EngineCore<Instance>::resolve_control(const ComputeFlight& flight) {
         update_recovery(request);
         request->model_state = EngineRequestState::DecodeReady;
     }
+    record_service(flight);
 }
 
 template <class Instance>
@@ -546,6 +552,8 @@ template <class Instance>
                 accumulate_gpu(request->max_rank_gpu, complete->sample.max_rank_gpu);
                 request->pending_execution.reset();
             }
+            flight->retired_ns = complete->sample.latency.total_ns;
+            record_service(*flight);
             if (retiring) retiring_.reset();
             continue;
         }
@@ -588,7 +596,6 @@ template <class Instance>
         }
     }
     if (context_was_pending && !instance_.session->has_context_operation()) {
-        scheduler_.capacity_released();
         request_admission_check();
         progressed = true;
     }
@@ -608,6 +615,52 @@ bool EngineCore<Instance>::compute_pending() const noexcept {
         return request && request->sequence &&
                instance_.session->execution_pending(*request->sequence);
     });
+}
+
+template <class Instance>
+void EngineCore<Instance>::record_service(ComputeFlight& flight) noexcept {
+    if (!flight.retired_ns || flight.service_accounted) return;
+    if (flight.kind == UnitKind::Replay) {
+        for (const auto& request : flight.requests)
+            scheduler_.recovery_work(request->id, *flight.retired_ns);
+        flight.service_accounted = true;
+        return;
+    }
+    bool progressed = false;
+    for (std::size_t row = 0; row < flight.requests.size(); ++row) {
+        if (!flight.progressed[row]) continue;
+        scheduler_.served(flight.requests[row]->id, *flight.retired_ns);
+        progressed = true;
+    }
+    flight.service_accounted = progressed;
+}
+
+template <class Instance>
+void EngineCore<Instance>::log_worker_failure(std::exception_ptr error) const noexcept {
+    // Preserve the first cause before cleanup mutates membership or drains the executor.
+    // Do not depend on a product-specific logger, or throw from the failure handler.
+    const auto report = [&](const char* reason) {
+        std::fprintf(stderr,
+                     "NInfer worker failed: %s | cycle=%u progress_owner=%llu paused=%zu "
+                     "context=%d compute=%d retiring=%d\n",
+                     reason, static_cast<unsigned>(cycle_step_),
+                     static_cast<unsigned long long>(scheduler_.progress_owner().value_or(0)),
+                     paused_.size(), instance_.session->has_context_operation(),
+                     compute_.has_value(), retiring_.has_value());
+        for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+            const auto& request = slots_[lane];
+            if (request)
+                std::fprintf(stderr, "  request=%llu lane=%u state=%u recovery=%d\n",
+                             static_cast<unsigned long long>(request->id), lane,
+                             static_cast<unsigned>(request->model_state),
+                             request->recovery_pending);
+        }
+    };
+    try {
+        std::rethrow_exception(error);
+    } catch (const std::exception& cause) { report(cause.what()); } catch (...) {
+        report("non-standard exception");
+    }
 }
 
 template <class Instance>

@@ -123,7 +123,9 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
     if (!request.stream) {
         lifecycle->done(aggregate);
         try {
-            set_owned_json_content(res, make_anthropic_messages_response(identity, aggregate),
+            set_owned_json_content(res,
+                                   make_anthropic_messages_response(identity, aggregate,
+                                                                    request.thinking_display),
                                    prepared.lifetime);
         } catch (const ApiException& exception) {
             const ApiError error = normalize_anthropic_error(exception.error());
@@ -144,7 +146,8 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
     try {
         auto stream  = std::make_shared<HttpGenerationStream>(std::move(prepared));
         auto encoder = std::make_shared<AnthropicMessagesStream>(identity, input_tokens,
-                                                                 request.eager_tool_inputs);
+                                                                 request.eager_tool_inputs,
+                                                                 request.thinking_display);
 
         prepare_sse_response(res);
         res.set_chunked_content_provider(

@@ -823,6 +823,11 @@ Thinking is returned with an opaque compatibility signature; SSE emits its `sign
 before closing the block. Request lowering reconstructs the local prompt from the visible
 `thinking` text and treats `signature` as non-semantic transport metadata, so retained history
 remains usable across serve restarts.
+`display:"updates"` is accepted as Anthropic presentation semantics: NInfer has no local
+progress-update source, so the Thinking block keeps its envelope and signature while the
+reasoning body is withheld — reasoning text is never served as progress, aggregate
+`thinking_tokens` still count the withheld reasoning, and `display:"updates"` combined with
+`preserve_thinking:true` is rejected as an explicit conflict.
 `display:"omitted"` is rejected because NInfer cannot provide Anthropic's
 encrypted hidden-reasoning restore semantics. `preserve_thinking` remains a NInfer extension for
 closed-turn reasoning history. `output_config.effort` passes its protocol-validated value to the

@@ -148,7 +148,7 @@ struct Layer {
             if (uses.size() != 1) {
                 throw std::invalid_argument("benchmark requires one fixed weight Use");
             }
-            return ops::WeightInput{views[i], uses[0].policy, uses[0].activation_input_divisor};
+            return ops::WeightInput{views[i], uses[0].policy, uses[0].calibration_view()};
         };
         const std::array control{input(0), input(1)};
         parameters.control = ops::prepare_linear_weight(control).weight;
@@ -246,7 +246,7 @@ void serial(const Tensor& x, const model_moe::Parameters& p, offload::PartitionV
         host.partial_ready.record(host.transfer.stream());
         host.partial_ready.wait(execution.cuda.stream());
     }
-    ops::routed_swiglu(x, p.profile.routed, {bank, p.activation_divisors}, frame.gpu_routes,
+    ops::routed_swiglu(x, p.profile.routed, {bank, p.activation_calibration}, frame.gpu_routes,
                        partition.gpu(), {p.shared, frame.shared}, ops::MoeEpilogue::Write,
                        frame.gpu_device, work, execution.cuda);
     if (cpu_work) {

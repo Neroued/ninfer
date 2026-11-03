@@ -240,8 +240,8 @@ static int run_profile(std::string_view label, const Profile& profile,
     }
     quantized_weight::PatternedWeightOptions weight_options;
     if (profile.qtype == QType::NVFP4) {
-        weight_options.weight_scale_divisor = 0.125F;
-        weight_options.input_scale_divisor  = 3.5F;
+        weight_options.weight_scale = 0.125F;
+        weight_options.input_scale  = 3.5F;
     }
     quantized_weight::PackedWeight host_weight =
         profile.qtype == QType::BF16

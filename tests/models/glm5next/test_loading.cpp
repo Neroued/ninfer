@@ -131,7 +131,7 @@ void selection_and_planning(const std::filesystem::path& directory) {
                         QType::Q8_G32_FP16,
                 "official recipe formats differ");
         require(full->uses(m.gate).front().policy == ops::LinearPolicy::AllowA4 &&
-                    full->uses(m.gate).front().activation_input_divisor == 0.5F &&
+                    full->uses(m.gate).front().calibration_view().scalar_divisor() == 0.5F &&
                     full->uses(w.mtp->moe.gate).front().policy == ops::LinearPolicy::AllowA8,
                 "expert use policy or activation divisor lost");
         source_words(reader, *full, directory);
@@ -241,7 +241,7 @@ void matrix_words(const BoundWeight& weight, const Encoded& expected, std::uint6
                   scale_offset(e, erow + row, column_start / group + i),
                   a.format == QType::NVFP4 ? 1 : 2);
     }
-    if (a.format == QType::NVFP4) equal(a.divisor_offset, e.divisor_offset, 4);
+    if (a.format == QType::NVFP4) equal(a.matrix_scale_offset, e.matrix_scale_offset, 4);
 }
 
 void materialization(const std::filesystem::path& directory, DeviceContext& device,
@@ -360,7 +360,7 @@ void materialization(const std::filesystem::path& directory, DeviceContext& devi
     for (const auto& e : expert_words) {
         const auto& bank = model->experts({e.bank}).view();
         require(bank.count == 2, "local EP bank lost the global routing domain");
-        const auto& matrix = e.down ? bank.down : bank.gate_up;
+        const auto& matrix      = e.down ? bank.down : bank.gate_up;
         const auto& description = model->expert_data()[e.bank];
         const auto& g           = e.down ? description.down : description.gate_up;
         const auto rows = g.shape[g.shape.size() - 2], columns = g.shape.back();
@@ -411,7 +411,7 @@ void materialization(const std::filesystem::path& directory, DeviceContext& devi
         }
         if (e.bank == 0) {
             float divisor = 0;
-            CUDA_CHECK(cudaMemcpy(&divisor, matrix.divisors + e.expert, sizeof(float),
+            CUDA_CHECK(cudaMemcpy(&divisor, matrix.matrix_scales + e.expert, sizeof(float),
                                   cudaMemcpyDeviceToHost));
             require(divisor == e.divisor, "resident expert divisor lost global-ID addressing");
         }

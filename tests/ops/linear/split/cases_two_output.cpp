@@ -50,15 +50,13 @@ void add_two_output_cases(Suite& suite) {
         add_profile(suite, profile, std::move(calls));
     }
     {
-        Profile profile{5120,
-                        {{QType::NVFP4,
-                          16384,
-                          607U,
-                          {.weight_scale_divisor = 0.125F, .input_scale_divisor = 3.5F}}},
-                        {10240, 6144},
-                        {{0, 2048}, {2048, 2048}, {4096, 6144}, {10240, 6144}},
-                        paired_a16,
-                        4.0e-3};
+        Profile profile{
+            5120,
+            {{QType::NVFP4, 16384, 607U, {.weight_scale = 0.125F, .input_scale = 3.5F}}},
+            {10240, 6144},
+            {{0, 2048}, {2048, 2048}, {4096, 6144}, {10240, 6144}},
+            paired_a16,
+            4.0e-3};
         std::vector<Invocation> calls{
             {.t = 1, .input_seed = 601U, .columns = Columns::Seven},
             {.t = 4, .policy = Policy::AllowA8, .input_seed = 601U, .columns = Columns::Seven}};

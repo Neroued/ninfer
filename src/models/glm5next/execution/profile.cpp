@@ -76,8 +76,7 @@ public:
                  routed,
                  dense(w.shared, c.swiglu_limit).math},
                 w.bank,
-                {gate_up.activation_divisor(bank.gate_up.format),
-                 down.activation_divisor(bank.down.format)},
+                {gate_up.calibration(bank.gate_up.format), down.calibration(bank.down.format)},
                 bank.subset};
     }
 

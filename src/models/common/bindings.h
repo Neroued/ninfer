@@ -23,7 +23,7 @@ public:
                                      std::vector<std::string> inputs   = {},
                                      std::optional<QType> exact_format = {});
     [[nodiscard]] WeightId direct(std::string name, artifact::Shape shape,
-                                  QType format = QType::BF16);
+                                  std::optional<QType> format = QType::BF16);
 
     [[nodiscard]] const PendingWeight& at(WeightId id) const { return weights.at(id.index); }
 

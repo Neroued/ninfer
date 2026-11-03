@@ -7,8 +7,8 @@ namespace {
 
 MhcWeights mhc(Bindings& b, const TextConfig& c, const std::string& p) {
     const auto rows = c.mhc.coefficient_width();
-    return {b.direct(p + "projection", {rows, c.residual_width()}), b.direct(p + "base", {rows}),
-            b.direct(p + "scale", {3})};
+    return {b.direct(p + "projection", {rows, c.residual_width()}),
+            b.direct(p + "base", {rows}, std::nullopt), b.direct(p + "scale", {3}, std::nullopt)};
 }
 
 KdaWeights kda(Bindings& b, const TextConfig& c, const std::string& layer) {
@@ -26,7 +26,7 @@ KdaWeights kda(Bindings& b, const TextConfig& c, const std::string& layer) {
             b.parameter(p + "forget_b", {k.width(), k.gate_lowrank}, {p + "forget_lowrank"}),
             projection("gate_a", k.gate_lowrank),
             b.parameter(p + "gate_b", {k.width(), k.gate_lowrank}, {p + "gate_lowrank"}),
-            b.direct(p + "convolution", {k.conv_width, k.conv_channels()}, QType::FP32),
+            b.direct(p + "convolution", {k.conv_width, k.conv_channels()}, std::nullopt),
             b.direct(p + "a_log", {k.heads}, QType::FP32),
             b.direct(p + "dt_bias", {k.width()}, QType::FP32),
             b.direct(p + "norm", {k.head_dim})};
@@ -46,8 +46,8 @@ MlaWeights mla(Bindings& b, const TextConfig& c, const std::string& layer) {
             b.parameter(p + "query_b", {m.query_width(), m.query_lowrank}, {p + "query_lowrank"}),
             b.parameter(p + "index_query", {m.index_query_width(), m.query_lowrank},
                         {p + "query_lowrank"}),
-            b.direct(p + "key_up", {m.heads, m.query_dim, m.latent_dim}),
-            b.direct(p + "value_up", {m.heads, m.value_dim, m.latent_dim}),
+            b.parameter(p + "key_up", {m.heads, m.query_dim, m.latent_dim}),
+            b.parameter(p + "value_up", {m.heads, m.value_dim, m.latent_dim}),
             b.parameter(p + "output", {c.hidden, m.output_width()}, {p + "output_heads"}),
             b.direct(p + "query_norm", {m.query_lowrank}),
             b.direct(p + "latent_norm", {m.latent_dim}),
@@ -95,15 +95,14 @@ void require_shared(const artifact::ParameterReference& parameter,
 TextWeights bind_text(Bindings& b, const TextConfig& c) {
     TextWeights out;
     out.embedding = b.direct("text/token_embedding", {c.vocabulary, c.hidden});
-    out.head      = b.parameter("text/output_head", {c.vocabulary, c.hidden}, {"text/final_hidden"},
-                                QType::BF16);
-    out.final_norm = b.direct("text/final_norm", {c.hidden});
+    out.head = b.parameter("text/output_head", {c.vocabulary, c.hidden}, {"text/final_hidden"});
+    out.final_norm = b.direct("text/final_norm", {c.hidden}, std::nullopt);
     out.layers.reserve(c.layers.size());
     for (std::size_t i = 0; i < c.layers.size(); ++i) {
         const auto p = "text/layers/" + std::to_string(i) + "/";
         BlockWeights layer;
         layer.input_norm          = b.direct(p + "input_norm", {c.hidden});
-        layer.post_attention_norm = b.direct(p + "post_attention_norm", {c.hidden});
+        layer.post_attention_norm = b.direct(p + "post_attention_norm", {c.hidden}, std::nullopt);
         layer.attention_hc        = mhc(b, c, p + "attention_hc/");
         layer.mlp_hc              = mhc(b, c, p + "mlp_hc/");
         if (c.layers[i].mixer == MixerKind::Kda)
@@ -124,7 +123,7 @@ MtpWeights bind_mtp(Bindings& b, const TextConfig& c, const TextWeights& main,
     MtpWeights out;
     out.embedding = b.direct("mtp/token_embedding", {c.vocabulary, c.hidden});
     require_shared(b.at(out.embedding).reference, b.at(main.embedding).reference);
-    require_shared(b.binder.parameter("mtp/output_head", {c.vocabulary, c.hidden}, QType::BF16),
+    require_shared(b.binder.parameter("mtp/output_head", {c.vocabulary, c.hidden}),
                    b.at(main.head).reference);
     if (proposal_head == ProposalHead::Optimized) {
         const auto& proposal = b.binder.reader().directory().component("text").proposal;
@@ -133,8 +132,7 @@ MtpWeights bind_mtp(Bindings& b, const TextConfig& c, const TextWeights& main,
         out.head = b.parameter("proposal/head", {c.vocabulary, c.hidden}, {"mtp/final_hidden"},
                                QType::Q4_G64_FP16);
     } else if (proposal_head == ProposalHead::Full) {
-        out.head = b.parameter("mtp/output_head", {c.vocabulary, c.hidden}, {"mtp/final_hidden"},
-                               QType::BF16);
+        out.head = b.parameter("mtp/output_head", {c.vocabulary, c.hidden}, {"mtp/final_hidden"});
     } else {
         throw artifact::ArtifactError("invalid GLM5Next proposal head selection");
     }

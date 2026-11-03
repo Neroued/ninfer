@@ -218,7 +218,7 @@ void parse_objects(Directory& out, const Json& objects) {
         const auto kind = require_id(value.at("kind"), "object kind");
         if (kind == "tensor") {
             require_members(value, {"id", "kind", "shape", "format", "layout", "offset", "bytes"},
-                            {}, "tensor");
+                            {"layout_parameters"}, "tensor");
         } else if (kind == "resource") {
             require_members(value, {"id", "kind", "encoding", "offset", "bytes"}, {}, "resource");
         } else {
@@ -236,9 +236,15 @@ void parse_objects(Directory& out, const Json& objects) {
         }
         previous_end = end;
         if (kind == "tensor") {
+            std::optional<std::uint64_t> exception_count;
+            if (value.contains("layout_parameters")) {
+                const auto& parameters = value.at("layout_parameters");
+                require_members(parameters, {"exception_count"}, {}, "tensor layout parameters");
+                exception_count = require_u64(parameters.at("exception_count"), id);
+            }
             out.objects.emplace_back(TensorObject{
                 id, parse_shape(value.at("shape"), id), require_id(value.at("format"), id),
-                require_id(value.at("layout"), id), offset, bytes});
+                require_id(value.at("layout"), id), offset, bytes, exception_count});
         } else {
             out.objects.emplace_back(
                 ResourceObject{id, require_id(value.at("encoding"), id), offset, bytes});

@@ -212,10 +212,10 @@ inline PackedQuantizedWeight make_row_split_weight(QType qtype, std::int32_t n, 
                                               : static_cast<const std::uint8_t*>(result.storage.data()) +
                                          result.high_offset;
     weight.scales = static_cast<const std::uint8_t*>(result.storage.data()) + result.scale_offset;
-    weight.n           = n;
-    weight.k           = k;
-    weight.group       = geometry.group_size;
-    weight.layout      = QuantLayout::RowSplit;
+    weight.n      = n;
+    weight.k      = k;
+    weight.group  = geometry.group_size;
+    weight.layout = QuantLayout::RowSplit;
     weight.scale_dtype = DType::FP16;
     return result;
 }
@@ -231,10 +231,10 @@ inline PackedQuantizedWeight make_nvfp4_weight(std::int32_t n, std::int32_t k,
     const std::uint64_t code_bytes   = elements / 2;
     const std::uint64_t scale_offset = detail::align_up(code_bytes, 256);
     const std::uint64_t scale_bytes  = elements / 16;
-    const std::uint64_t divisor_offset =
+    const std::uint64_t matrix_scale_offset =
         detail::checked_add(scale_offset, scale_bytes, "benchmark NVFP4 divisor offset overflow");
-    const std::uint64_t payload_bytes =
-        detail::checked_add(divisor_offset, sizeof(float), "benchmark NVFP4 payload size overflow");
+    const std::uint64_t payload_bytes = detail::checked_add(
+        matrix_scale_offset, sizeof(float), "benchmark NVFP4 payload size overflow");
     if (payload_bytes > std::numeric_limits<std::size_t>::max()) {
         throw std::overflow_error("benchmark NVFP4 payload does not fit size_t");
     }
@@ -257,30 +257,30 @@ inline PackedQuantizedWeight make_nvfp4_weight(std::int32_t n, std::int32_t k,
         kWeightDivisor);
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
-    CUDA_CHECK(cudaMemcpy(static_cast<std::uint8_t*>(result.storage.data()) + divisor_offset,
+    CUDA_CHECK(cudaMemcpy(static_cast<std::uint8_t*>(result.storage.data()) + matrix_scale_offset,
                           &kWeightDivisor, sizeof(kWeightDivisor), cudaMemcpyHostToDevice));
 
-    Weight& weight              = result.weight;
-    weight.device               = result.storage.device();
-    weight.payload              = result.storage.data();
-    weight.payload_bytes        = payload_bytes;
-    weight.qtype                = QType::NVFP4;
-    weight.layout               = QuantLayout::BlockScaleK16M128x4;
-    weight.scale_dtype          = DType::FP8_E4M3FN;
-    weight.group_size           = 16;
-    weight.group                = 16;
-    weight.ndim                 = 2;
-    weight.shape[0]             = n;
-    weight.shape[1]             = k;
-    weight.padded_shape[0]      = n;
-    weight.padded_shape[1]      = k;
-    weight.qdata                = result.storage.data();
-    weight.qhigh                = nullptr;
-    weight.scales               = static_cast<std::uint8_t*>(result.storage.data()) + scale_offset;
-    weight.n                    = n;
-    weight.k                    = k;
-    weight.weight_scale_divisor = kWeightDivisor;
-    weight.input_scale_divisor  = 3.5F;
+    Weight& weight         = result.weight;
+    weight.device          = result.storage.device();
+    weight.payload         = result.storage.data();
+    weight.payload_bytes   = payload_bytes;
+    weight.qtype           = QType::NVFP4;
+    weight.layout          = QuantLayout::BlockScaleK16M128x4;
+    weight.scale_dtype     = DType::FP8_E4M3FN;
+    weight.group_size      = 16;
+    weight.group           = 16;
+    weight.ndim            = 2;
+    weight.shape[0]        = n;
+    weight.shape[1]        = k;
+    weight.padded_shape[0] = n;
+    weight.padded_shape[1] = k;
+    weight.qdata           = result.storage.data();
+    weight.qhigh           = nullptr;
+    weight.scales          = static_cast<std::uint8_t*>(result.storage.data()) + scale_offset;
+    weight.n               = n;
+    weight.k               = k;
+    weight.weight_scale    = kWeightDivisor;
+    weight.input_scale     = 3.5F;
     return result;
 }
 

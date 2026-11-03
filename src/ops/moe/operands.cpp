@@ -204,28 +204,32 @@ void MoeOperands::experts(const CudaSwiGLUExperts& w, const RoutedSwiGLUProfile&
     require(w.bank.count == std::uint32_t(p.experts) &&
                 bool(w.bank.gate_up.offsets) == bool(w.bank.down.offsets),
             "MoE: expert bank count or addressing differs");
-    for (const auto divisor : {w.activation_divisors.gate_up, w.activation_divisors.down}) {
-        require(!divisor || (std::isfinite(*divisor) && *divisor > 0),
-                "MoE: activation divisor must be finite and positive");
+    for (const auto& calibration :
+         {w.activation_calibration.gate_up, w.activation_calibration.down}) {
+        for (const auto value : calibration.values())
+            require(std::isfinite(value) && value > 0,
+                    "MoE: activation scale must be finite and positive");
     }
     if (p.ffn.gate_up_type == QType::NVFP4) {
-        require(w.activation_divisors.gate_up && w.activation_divisors.down,
-                "MoE: NVFP4 A4 requires both activation divisors");
+        (void)w.activation_calibration.gate_up.scalar_divisor();
+        (void)w.activation_calibration.down.scalar_divisor();
     } else if (p.ffn.gate_up_type == QType::FP8_E4M3FN_BLOCK128X128_BF16 ||
                p.ffn.gate_up_type == QType::FP8_E4M3FN_BLOCK64X64_BF16) {
-        require(!w.activation_divisors.gate_up && !w.activation_divisors.down,
+        require(w.activation_calibration.gate_up.empty() && w.activation_calibration.down.empty(),
                 "MoE: block FP8 has no activation divisors");
     }
     const auto matrix = [&](const ExpertMatrixDeviceView& view, QType type, QuantLayout layout,
                             int n, int k) {
         const auto bytes = matrix_bytes(type, layout, n, k);
         if (type == QType::NVFP4) {
-            require(operand::aligned(view.divisors, alignof(float)) &&
-                        view.divisor_stride <= (SIZE_MAX / sizeof(float) - 1) / (p.experts - 1),
+            require(operand::aligned(view.matrix_scales, alignof(float)) &&
+                        view.matrix_scale_stride <=
+                            (SIZE_MAX / sizeof(float) - 1) / (p.experts - 1),
                     "MoE: invalid NVFP4 matrix divisors");
-            read(view.divisors, ((p.experts - 1) * view.divisor_stride + 1) * sizeof(float));
+            read(view.matrix_scales,
+                 ((p.experts - 1) * view.matrix_scale_stride + 1) * sizeof(float));
         } else {
-            require(!view.divisors && view.divisor_stride == 0,
+            require(!view.matrix_scales && view.matrix_scale_stride == 0,
                     "MoE: this weight format has no matrix divisors");
         }
         if (view.offsets) {

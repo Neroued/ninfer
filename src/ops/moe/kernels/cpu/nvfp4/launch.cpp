@@ -22,7 +22,8 @@ Matrix matrix(const WeightBankView& bank, int expert) noexcept {
     const auto* base   = reinterpret_cast<const std::uint8_t*>(bank.parent->data);
     return {base + layout.codes.offset + expert * layout.codes.expert_stride,
             base + layout.scales.offset + expert * layout.scales.expert_stride,
-            bank.parent->weight_divisors[layout.divisor_begin + expert * layout.divisor_stride]};
+            bank.parent
+                ->matrix_scales[layout.matrix_scale_begin + expert * layout.matrix_scale_stride]};
 }
 } // namespace
 

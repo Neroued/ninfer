@@ -316,8 +316,8 @@ enum class RowSplitCodePattern : std::uint8_t {
 struct PatternedWeightOptions {
     RowSplitScalePattern row_split_scale = RowSplitScalePattern::Unit;
     RowSplitCodePattern row_split_codes  = RowSplitCodePattern::Coordinate;
-    float weight_scale_divisor           = 0.0F;
-    float input_scale_divisor            = 0.0F;
+    float weight_scale                   = 0.0F;
+    float input_scale                    = 0.0F;
 };
 
 // Builds a deterministic full-shape payload without allocating a source or dequantized matrix.
@@ -328,7 +328,7 @@ inline PackedWeight make_patterned_weight(QType qtype, std::int32_t n, std::int3
         throw std::invalid_argument("quantized-weight fixture: shape must be positive");
     }
     if (qtype == QType::FP8_E4M3FN_ROW_BF16) {
-        if (options.weight_scale_divisor != 0.0F || options.input_scale_divisor != 0.0F) {
+        if (options.weight_scale != 0.0F || options.input_scale != 0.0F) {
             throw std::invalid_argument(
                 "quantized-weight fixture: divisors do not belong to FP8 weights");
         }
@@ -404,8 +404,8 @@ inline PackedWeight make_patterned_weight(QType qtype, std::int32_t n, std::int3
             throw std::invalid_argument(
                 "quantized-weight fixture: row-split patterns do not apply to NVFP4");
         }
-        if (!std::isfinite(options.weight_scale_divisor) || options.weight_scale_divisor <= 0.0F ||
-            !std::isfinite(options.input_scale_divisor) || options.input_scale_divisor <= 0.0F) {
+        if (!std::isfinite(options.weight_scale) || options.weight_scale <= 0.0F ||
+            !std::isfinite(options.input_scale) || options.input_scale <= 0.0F) {
             throw std::invalid_argument(
                 "quantized-weight fixture: NVFP4 divisors must be finite and positive");
         }
@@ -463,36 +463,36 @@ inline PackedWeight make_patterned_weight(QType qtype, std::int32_t n, std::int3
             }
         }
         detail::store_u32_le(packed.payload, packed.weight_divisor_offset,
-                             detail::float_bits(options.weight_scale_divisor));
+                             detail::float_bits(options.weight_scale));
 
-        packed.weight.qtype                = QType::NVFP4;
-        packed.weight.layout               = QuantLayout::BlockScaleK16M128x4;
-        packed.weight.scale_dtype          = DType::FP8_E4M3FN;
-        packed.weight.device               = Device::cpu();
-        packed.weight.payload              = packed.payload.data();
-        packed.weight.payload_bytes        = packed.payload.size();
-        packed.weight.high_plane_bytes     = 0;
-        packed.weight.qdata                = packed.payload.data();
-        packed.weight.qhigh                = nullptr;
-        packed.weight.scales               = packed.payload.data() + packed.scale_plane_offset;
-        packed.weight.group_size           = 16;
-        packed.weight.group                = 16;
-        packed.weight.ndim                 = 2;
-        packed.weight.shape[0]             = n;
-        packed.weight.shape[1]             = k;
-        packed.weight.shape[2]             = 1;
-        packed.weight.shape[3]             = 1;
-        packed.weight.padded_shape[0]      = n;
-        packed.weight.padded_shape[1]      = k;
-        packed.weight.padded_shape[2]      = 1;
-        packed.weight.padded_shape[3]      = 1;
-        packed.weight.n                    = n;
-        packed.weight.k                    = k;
-        packed.weight.weight_scale_divisor = options.weight_scale_divisor;
-        packed.weight.input_scale_divisor  = options.input_scale_divisor;
+        packed.weight.qtype            = QType::NVFP4;
+        packed.weight.layout           = QuantLayout::BlockScaleK16M128x4;
+        packed.weight.scale_dtype      = DType::FP8_E4M3FN;
+        packed.weight.device           = Device::cpu();
+        packed.weight.payload          = packed.payload.data();
+        packed.weight.payload_bytes    = packed.payload.size();
+        packed.weight.high_plane_bytes = 0;
+        packed.weight.qdata            = packed.payload.data();
+        packed.weight.qhigh            = nullptr;
+        packed.weight.scales           = packed.payload.data() + packed.scale_plane_offset;
+        packed.weight.group_size       = 16;
+        packed.weight.group            = 16;
+        packed.weight.ndim             = 2;
+        packed.weight.shape[0]         = n;
+        packed.weight.shape[1]         = k;
+        packed.weight.shape[2]         = 1;
+        packed.weight.shape[3]         = 1;
+        packed.weight.padded_shape[0]  = n;
+        packed.weight.padded_shape[1]  = k;
+        packed.weight.padded_shape[2]  = 1;
+        packed.weight.padded_shape[3]  = 1;
+        packed.weight.n                = n;
+        packed.weight.k                = k;
+        packed.weight.weight_scale     = options.weight_scale;
+        packed.weight.input_scale      = options.input_scale;
         return packed;
     }
-    if (options.weight_scale_divisor != 0.0F || options.input_scale_divisor != 0.0F) {
+    if (options.weight_scale != 0.0F || options.input_scale != 0.0F) {
         throw std::invalid_argument(
             "quantized-weight fixture: divisors are defined only for NVFP4");
     }
@@ -680,7 +680,7 @@ inline double logical_weight_fp64(const PackedWeight& packed, std::int32_t row,
     if (weight.qtype == QType::NVFP4) {
         if (weight.layout != QuantLayout::BlockScaleK16M128x4 ||
             weight.scale_dtype != DType::FP8_E4M3FN || weight.group != 16 ||
-            !std::isfinite(weight.weight_scale_divisor) || weight.weight_scale_divisor <= 0.0F) {
+            !std::isfinite(weight.weight_scale) || weight.weight_scale <= 0.0F) {
             throw std::invalid_argument("quantized-weight fixture: invalid NVFP4 metadata");
         }
         const std::size_t code_offset =
@@ -701,7 +701,7 @@ inline double logical_weight_fp64(const PackedWeight& packed, std::int32_t row,
             static_cast<std::size_t>(row_inner / 32) * 4U + static_cast<std::size_t>(scale_lane);
         const double decoded = detail::decode_e2m1(code) *
                                detail::decode_e4m3fn(packed.payload[scale_offset]) /
-                               static_cast<double>(weight.weight_scale_divisor);
+                               static_cast<double>(weight.weight_scale);
         return static_cast<double>(static_cast<float>(decoded));
     }
 

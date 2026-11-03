@@ -28,7 +28,7 @@ using Oracle = ninfer::test::swiglu::Oracle;
 
 qw::PackedWeight make_weight(int n, int k, unsigned seed, float dw, float dx) {
     auto p = qw::make_patterned_weight(QType::NVFP4, n, k, seed,
-                                       {.weight_scale_divisor = dw, .input_scale_divisor = dx});
+                                       {.weight_scale = dw, .input_scale = dx});
     // Coordinate-dependent native codes remove the small repeated-row pattern of the basic packer.
     for (std::size_t b = 0; b < p.code_plane_bytes; ++b)
         p.payload[b] = std::uint8_t(qw::detail::mix64(b + std::uint64_t(seed) * 998123));
@@ -128,10 +128,10 @@ int run(std::span<const Call> calls) {
 }
 
 int cancellation() {
-    auto gu         = qw::make_patterned_weight(QType::NVFP4, 2 * I, H, 2241,
-                                                {.weight_scale_divisor = 1, .input_scale_divisor = 6});
-    auto dn         = qw::make_patterned_weight(QType::NVFP4, H, I, 2243,
-                                                {.weight_scale_divisor = 1, .input_scale_divisor = 3});
+    auto gu = qw::make_patterned_weight(QType::NVFP4, 2 * I, H, 2241,
+                                        {.weight_scale = 1, .input_scale = 6});
+    auto dn =
+        qw::make_patterned_weight(QType::NVFP4, H, I, 2243, {.weight_scale = 1, .input_scale = 3});
     const auto zero = [](auto& w) {
         std::fill(w.payload.begin(), w.payload.end(), 0);
         const float one = 1;
@@ -263,9 +263,9 @@ int broadcast_check(const std::vector<double>& actual, const std::vector<double>
 
 int tail_clamp(int recipe) {
     auto gu         = qw::make_patterned_weight(QType::NVFP4, 2 * I, H, 2301 + recipe,
-                                                {.weight_scale_divisor = 1, .input_scale_divisor = 6});
+                                                {.weight_scale = 1, .input_scale = 6});
     auto dn         = qw::make_patterned_weight(QType::NVFP4, H, I, 2307 + recipe,
-                                                {.weight_scale_divisor = 1, .input_scale_divisor = 24});
+                                                {.weight_scale = 1, .input_scale = 24});
     const auto zero = [](auto& w) {
         std::fill(w.payload.begin(), w.payload.end(), 0);
         const float one = 1;
@@ -327,8 +327,8 @@ int tail_clamp(int recipe) {
             auto bad        = weights;
             bad.down.policy = ops::LinearPolicy::A16Only;
             rejected([&] { ops::swiglu(x, p, bad, y, ws, cuda_environment().default_execution); });
-            bad                                 = weights;
-            bad.down.weight.input_scale_divisor = std::numeric_limits<float>::quiet_NaN();
+            bad                         = weights;
+            bad.down.weight.input_scale = std::numeric_limits<float>::quiet_NaN();
             rejected([&] { ops::swiglu(x, p, bad, y, ws, cuda_environment().default_execution); });
             Tensor alias(input.span(), DType::BF16, {H, 1});
             rejected([&] {

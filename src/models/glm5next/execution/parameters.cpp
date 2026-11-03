@@ -80,7 +80,7 @@ public:
         const auto& bank = model_.experts(w.bank);
         return {{linear({w.router}).weight,
                  tensor(w.correction_bias),
-                 {bank.view(), profile.activation_divisors},
+                 {bank.view(), profile.activation_calibration},
                  dense(w.shared)},
                 bank.subset()};
     }

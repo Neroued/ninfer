@@ -60,11 +60,11 @@ ExpertCacheRequirements describe_expert_cache(std::span<const ExpertBankCacheSpe
         layout.first_entry = out.entry_count;
         if (!layout.resident) {
             layout.offsets = offsets.add(layout.count * sizeof(std::uint64_t), 8, "expert offsets");
-            if (bank.gate_up.has_divisors) {
+            if (bank.gate_up.has_matrix_scales) {
                 layout.gate_up_divisors =
                     divisors.add(layout.count * sizeof(float), 4, "GU divisors");
             }
-            if (bank.down.has_divisors) {
+            if (bank.down.has_matrix_scales) {
                 layout.down_divisors =
                     divisors.add(layout.count * sizeof(float), 4, "down divisors");
             }
@@ -220,6 +220,8 @@ struct ExpertCache::Impl {
                     return device_weight_bank(matrix);
                 }
                 ExpertMatrixDeviceView view;
+                view.format      = matrix.layout.format;
+                view.layout      = matrix.layout.layout;
                 const auto plane = [&](const LayoutRegion& region) -> const std::byte* {
                     return pool.data() && region.bytes
                                ? static_cast<const std::byte*>(pool.data()) + region.offset
@@ -234,13 +236,13 @@ struct ExpertCache::Impl {
                 if (divisor_region.bytes) {
                     std::vector<float> values(layout.count);
                     for (std::uint32_t e = 0; e < layout.count; ++e) {
-                        values[e] = matrix.divisor(e);
+                        values[e] = matrix.matrix_scale(e);
                     }
                     divisors.copy_from_host(values.data(), divisor_region.bytes,
                                             divisor_region.offset);
-                    view.divisors =
+                    view.matrix_scales =
                         static_cast<const float*>(divisor_region.bind(divisors.span()).data);
-                    view.divisor_stride = 1;
+                    view.matrix_scale_stride = 1;
                 }
                 return view;
             };

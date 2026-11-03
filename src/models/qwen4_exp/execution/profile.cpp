@@ -87,12 +87,12 @@ public:
                                              down.policy())
                 : moe::describe_experts(experts_[m.bank.index], source_.config().text.moe.top_k,
                                         gu.policy(), down.policy());
-        out.moe = {{routed, ops::swiglu_profile(linear({m.shared_gate, m.shared_up}),
-                                                linear({m.shared_down}))},
-                   m.bank,
-                   {gu.activation_divisor(routed.ffn.gate_up_type),
-                    down.activation_divisor(routed.ffn.down_type)},
-                   experts_.empty() ? ops::ExpertSubsetKind::All : experts_[m.bank.index].subset};
+        out.moe = {
+            {routed,
+             ops::swiglu_profile(linear({m.shared_gate, m.shared_up}), linear({m.shared_down}))},
+            m.bank,
+            {gu.calibration(routed.ffn.gate_up_type), down.calibration(routed.ffn.down_type)},
+            experts_.empty() ? ops::ExpertSubsetKind::All : experts_[m.bank.index].subset};
         return out;
     }
 private:

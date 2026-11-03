@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from math import prod
-from typing import Callable
+from typing import Callable, Mapping
 
 import torch
 
@@ -14,7 +14,17 @@ class EncodedRows:
     format: str
     codes: torch.Tensor
     scales: torch.Tensor
-    weight_divisor: bytes | None = None
+    weight_scale: bytes | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class EncodedPlanes:
+    """Native matrix planes; ranges and lengths are bytes, without numerical decoding."""
+
+    layout: str
+    sizes: Mapping[str, int]
+    read: Callable[[str, int, int], torch.Tensor]
+    exception_count: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -25,9 +35,11 @@ class LogicalSource:
     label: str
     read_values: Callable[[int, int], torch.Tensor]
     read_encoded: Callable[[int, int], EncodedRows] | None = None
-    weight_divisor: Callable[[], bytes] | None = None
-    input_divisor: Callable[[], bytes] | None = None
+    weight_scale: Callable[[], bytes] | None = None
+    activation_scale: Callable[[], bytes] | None = None
     encoded_format: str | Callable[[], str | None] | None = None
+    native_planes: EncodedPlanes | None = None
+    matrix_sources: tuple[LogicalSource, ...] = ()
 
     def encoding(self) -> str | None:
         """Describe encoded input without reading its weight rows."""
@@ -55,6 +67,15 @@ class LogicalSource:
             raise ValueError(f"{self.label}: row access requires a matrix")
         k = self.shape[1]
         return self.values(begin * k, end * k).reshape(end - begin, k)
+
+    def reshape(self, shape: tuple[int, ...]) -> LogicalSource:
+        if prod(shape) != prod(self.shape):
+            raise ValueError(f"{self.label}: reshape changes the logical element count")
+        if self.encoding() is not None and shape[-1:] != self.shape[-1:]:
+            raise ValueError(
+                f"{self.label}: encoded reshape must preserve matrix columns"
+            )
+        return replace(self, shape=shape)
 
 
 def array_source(values: torch.Tensor, label: str) -> LogicalSource:
@@ -90,6 +111,12 @@ def select_rows(
         if not 0 <= begin < end <= n:
             raise ValueError(f"{source.label}: invalid selected rows [{begin},{end})")
     rows = sum(end - begin for begin, end in ranges)
+    if source.native_planes is not None:
+        if ranges == ((0, n),):
+            return source
+        raise ValueError(
+            f"{source.label}: native plane selection requires complete matrices"
+        )
 
     def spans(begin: int, end: int):
         cursor = 0
@@ -114,7 +141,7 @@ def select_rows(
         ]
         first = pieces[0]
         if any(
-            (part.format, part.weight_divisor) != (first.format, first.weight_divisor)
+            (part.format, part.weight_scale) != (first.format, first.weight_scale)
             for part in pieces
         ):
             raise ValueError(f"{source.label}: incompatible encoded row groups")
@@ -122,7 +149,7 @@ def select_rows(
             first.format,
             torch.cat([p.codes for p in pieces]),
             torch.cat([p.scales for p in pieces]),
-            first.weight_divisor,
+            first.weight_scale,
         )
 
     return LogicalSource(
@@ -130,8 +157,8 @@ def select_rows(
         f"rows({source.label}, {len(ranges)} spans, {rows} rows)",
         read,
         encoded if source.read_encoded is not None else None,
-        source.weight_divisor,
-        source.input_divisor,
+        source.weight_scale,
+        source.activation_scale,
         encoded_format=source.encoded_format,
     )
 

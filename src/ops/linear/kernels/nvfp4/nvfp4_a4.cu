@@ -34,13 +34,11 @@ void launch_quantize_exact(const Tensor& x, const Weight& weight, Nvfp4A4Workspa
             if (layout == Nvfp4ScaleLayout::Tiled128) {
                 nvfp4_a4_quantize_kernel<ActivationGeometry, kThreads, Nvfp4ScaleLayout::Tiled128>
                     <<<blocks, kThreads, 0, stream>>>(input, workspace.codes, workspace.scales,
-                                                      tokens, written_tokens,
-                                                      weight.input_scale_divisor);
+                                                      tokens, written_tokens, weight.input_scale);
             } else {
                 nvfp4_a4_quantize_kernel<ActivationGeometry, kThreads, Nvfp4ScaleLayout::Tiled256>
                     <<<blocks, kThreads, 0, stream>>>(input, workspace.codes, workspace.scales,
-                                                      tokens, written_tokens,
-                                                      weight.input_scale_divisor);
+                                                      tokens, written_tokens, weight.input_scale);
             }
             CUDA_CHECK(cudaGetLastError());
             return;
@@ -50,7 +48,7 @@ void launch_quantize_exact(const Tensor& x, const Weight& weight, Nvfp4A4Workspa
     }
     nvfp4_a4_quantize_kernel<ActivationGeometry, kThreads, Nvfp4ScaleLayout::RowMajor>
         <<<blocks, kThreads, 0, stream>>>(input, workspace.codes, workspace.scales, tokens,
-                                          written_tokens, weight.input_scale_divisor);
+                                          written_tokens, weight.input_scale);
     CUDA_CHECK(cudaGetLastError());
 }
 

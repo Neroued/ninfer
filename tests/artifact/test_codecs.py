@@ -155,7 +155,7 @@ def test_nvfp4_known_vector_geometry_swizzle_tail_and_round_trip():
         geometry.code_plane_bytes,
         geometry.scale_plane_offset,
         geometry.scale_plane_bytes,
-        geometry.weight_divisor_offset,
+        geometry.matrix_scale_offset,
         geometry.payload_bytes,
     ) == (4096, 4096, 512, 4608, 4612)
 
@@ -180,7 +180,7 @@ def test_nvfp4_known_vector_geometry_swizzle_tail_and_round_trip():
     for row, lane in ((0, 0), (31, 3), (32, 0), (127, 3)):
         offset = geometry.scale_plane_offset + (row % 32) * 16 + (row // 32) * 4 + lane
         assert payload[offset] == int(scales[row, lane])
-    assert payload[geometry.weight_divisor_offset :] == divisor
+    assert payload[geometry.matrix_scale_offset :] == divisor
 
     decoded_packed, decoded_scales, decoded_divisor = decode_nvfp4_words(payload, shape)
     assert torch.equal(decoded_packed, packed)

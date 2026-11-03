@@ -236,16 +236,21 @@ int metadata(bool fp8) {
         auto bad = w.experts();
         if (field == 0) {
             if (fp8)
-                bad.activation_divisors.gate_up = 1;
+                bad.activation_calibration.gate_up = ops::ActivationCalibrationView::broadcast(
+                    ops::ActivationScaleOperation::Divide, 1);
             else
-                bad.activation_divisors.gate_up.reset();
+                bad.activation_calibration.gate_up = {};
         }
-        if (field == 1) bad.activation_divisors.down = 0;
-        if (field == 2) bad.activation_divisors.gate_up = std::numeric_limits<float>::quiet_NaN();
+        if (field == 1)
+            bad.activation_calibration.down =
+                ops::ActivationCalibrationView::broadcast(ops::ActivationScaleOperation::Divide, 0);
+        if (field == 2)
+            bad.activation_calibration.gate_up = ops::ActivationCalibrationView::broadcast(
+                ops::ActivationScaleOperation::Divide, std::numeric_limits<float>::quiet_NaN());
         if (field == 3) --bad.bank.count;
         if (field == 4) bad.bank.down.offsets = nullptr;
         if (field == 5)
-            bad.bank.gate_up.divisors =
+            bad.bank.gate_up.matrix_scales =
                 fp8 ? reinterpret_cast<const float*>(bad.bank.gate_up.codes) : nullptr;
         if (field == 6) bad.bank.down.indexed_storage.bytes = 0;
         if (field == 7) bad.bank.device = Device::cpu();

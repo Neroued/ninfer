@@ -6,7 +6,7 @@ VisionWeights bind_vision(Bindings& b, const VisionConfig& c) {
     const auto h      = c.hidden;
     const auto linear = [&](const std::string& name, std::uint64_t output, std::uint64_t input,
                             const std::string& use) {
-        return b.parameter(name, {output, input}, {use}, QType::BF16);
+        return b.parameter(name, {output, input}, {use});
     };
 
     VisionWeights out;

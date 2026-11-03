@@ -30,7 +30,7 @@ struct DenseProfile {
 struct MoeProfile {
     ops::SigmoidMoeProfile math;
     ExpertBankId bank;
-    ops::ExpertActivationDivisors activation_divisors;
+    ops::ExpertActivationCalibration activation_calibration;
     ops::ExpertSubsetKind subset = ops::ExpertSubsetKind::All;
 };
 

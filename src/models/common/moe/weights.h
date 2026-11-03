@@ -46,6 +46,9 @@ class ResidentExpertBank {
 public:
     ResidentExpertBank(std::span<const ResidentExpertEntry>, std::uint32_t global_count, Device);
     ResidentExpertBank(const WeightParent& gate_up, const WeightParent& down);
+    ResidentExpertBank(const WeightParent& gate_up, const WeightParent& down,
+                       std::span<const std::uint32_t> logical_ids, std::uint32_t global_count,
+                       Device device);
 
     [[nodiscard]] const ExpertBankDeviceView& view() const { return view_; }
 

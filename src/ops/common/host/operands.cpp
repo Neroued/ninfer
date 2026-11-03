@@ -82,8 +82,8 @@ Nvfp4WeightGeometry validate_nvfp4_weight(const Weight& weight, const char* oper
         weight.payload == nullptr || weight.qdata == nullptr || weight.scales == nullptr ||
         weight.qhigh != nullptr || weight.high_plane_bytes != 0 ||
         weight.payload_bytes < geometry.required_payload_bytes ||
-        !std::isfinite(weight.weight_scale_divisor) || weight.weight_scale_divisor <= 0.0F ||
-        !std::isfinite(weight.input_scale_divisor) || weight.input_scale_divisor <= 0.0F ||
+        !std::isfinite(weight.weight_scale) || weight.weight_scale <= 0.0F ||
+        !std::isfinite(weight.input_scale) || weight.input_scale <= 0.0F ||
         !operand::aligned(weight.qdata, 16) || !operand::aligned(weight.scales, 16)) {
         throw std::invalid_argument(std::string(operation) + ": invalid NVFP4 weight");
     }

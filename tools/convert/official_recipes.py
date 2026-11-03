@@ -324,7 +324,9 @@ def qwen3_8_flash_next(model, recipe, sources):
                 activation_policy="AllowA4",
                 auxiliaries={
                     "activation_input_divisor": AuxiliaryReference(
-                        "expert_activation_divisors", 2 * layer + int(role == "down")
+                        "expert_activation_divisors",
+                        2 * layer + int(role == "down"),
+                        2 * layer + int(role == "down") + 1,
                     )
                 },
             )
@@ -494,6 +496,7 @@ def glm5next(model, recipe, sources):
                         "activation_input_divisor": AuxiliaryReference(
                             "expert_activation_divisors",
                             2 * ordinal + int(role == "down"),
+                            2 * ordinal + int(role == "down") + 1,
                         )
                     },
                 )
@@ -533,8 +536,139 @@ def glm5next(model, recipe, sources):
             )
 
 
+def glm5next_fp4_local(model, recipe, sources):
+    """Preserve native FP4-Local encodings and their calibrated activation contracts."""
+    if model.config["architectures"] != ["Glm5NextForCausalLM"]:
+        raise ValueError("glm5next_fp4_local requires GLM5Next mathematics")
+    cfg = model.config
+    recipe.provenance.update(
+        mapping="glm5next",
+        source_representation="modelopt_native",
+        convolution_order="tap_then_qkv_channels",
+    )
+    for name, parameter in model.parameters.items():
+        format = parameter.source.encoding()
+        if format is None:
+            continue
+        if format not in ("nvfp4_mul", "mxfp8", "fp8_e4m3fn_block128x128_fp32"):
+            raise ValueError(f"{name}: expected a native FP4-Local source")
+        policy = "AllowA8" if format == "mxfp8" else "A16Only"
+        if format == "nvfp4_mul" and name.startswith("text/"):
+            policy = "AllowA4"
+        recipe.assign(
+            name, format=format, method=import_encoded, activation_policy=policy
+        )
+    recipe.place("text/*", (0,))
+    for component, order in (("vision", 1), ("mtp", 2)):
+        if component in model.components:
+            recipe.place(component + "/*", (order, 0))
+
+    for layer, kind in enumerate(cfg["layer_types"]):
+        if kind != "deepseek_sparse_attention":
+            continue
+        p = f"text/layers/{layer}/attention/"
+        recipe.group(tuple(p + role for role in ("latent", "query_a")))
+        recipe.group(
+            tuple(p + role for role in ("index_key", "pool_gate", "index_weight"))
+        )
+        recipe.separate((p + "query_b", p + "index_query"))
+    if "mtp" in model.components:
+        p = "mtp/layers/0/attention/"
+        recipe.group(
+            tuple(
+                p + role for role in ("latent", "index_key", "query_a", "index_weight")
+            )
+        )
+        recipe.separate(p + "pool_gate")
+        for role in ("token_embedding", "output_head"):
+            recipe.share("mtp/" + role, "text/" + role)
+
+    h, intermediate, experts = (
+        cfg[key] for key in ("hidden_size", "moe_intermediate_size", "n_routed_experts")
+    )
+    main_layers = [
+        layer for layer, kind in enumerate(cfg["mlp_layer_types"]) if kind == "sparse"
+    ]
+    layers = [
+        (f"text/layers/{layer}/moe/experts/", (3, layer), True) for layer in main_layers
+    ]
+    if "mtp" in model.components:
+        layers.append(("mtp/layers/0/moe/experts/", (2, 1), False))
+    controls = []
+    for p, placement, calibrated in layers:
+        matrices = {
+            role: model.parameters[p + role].source.matrix_sources
+            for role in ("gate", "up", "down")
+        }
+        if any(len(values) != experts for values in matrices.values()):
+            raise ValueError(
+                f"{p}: native expert bank must retain individual matrix sources"
+            )
+        gu, down, inputs = [], [], [[], []]
+        for expert in range(experts):
+            first, last = expert * intermediate * h, (expert + 1) * intermediate * h
+            gate, up = matrices["gate"][expert], matrices["up"][expert]
+            if gate.weight_scale() != up.weight_scale():
+                raise ValueError(f"{p}{expert}: gate/up weight multipliers differ")
+            for role in ("gate", "up"):
+                gu.append((p + role, first, last, matrices[role][expert]))
+            down.append((p + "down", first, last, matrices["down"][expert]))
+            if calibrated:
+                value = matrices["down"][expert]
+                if any(source.activation_scale is None for source in (gate, up, value)):
+                    raise ValueError(
+                        f"{p}{expert}: missing native activation multiplier"
+                    )
+                if gate.activation_scale() != up.activation_scale():
+                    raise ValueError(
+                        f"{p}{expert}: gate/up activation multipliers differ"
+                    )
+                inputs[0].append(gate.activation_scale())
+                inputs[1].append(value.activation_scale())
+        if calibrated:
+            controls.extend(inputs[0] + inputs[1])
+        for parts, shape, order in (
+            (gu, (experts, 2 * intermediate, h), 0),
+            (down, (experts, h, intermediate), 1),
+        ):
+            native = parts[0][3].native_planes
+            layout = (
+                native.layout
+                if native is not None
+                else "batched_block_scale_k16_m128x4_v1"
+            )
+            recipe.parent(
+                parts,
+                shape=shape,
+                format="nvfp4_mul",
+                method=import_encoded,
+                layout=layout,
+                order=(*placement, order),
+            )
+    if main_layers:
+        recipe.auxiliary_tensor(
+            "expert_activation_multipliers",
+            AuxiliaryValue("fp32", (len(main_layers), 2, experts), b"".join(controls)),
+        )
+        for ordinal, layer in enumerate(main_layers):
+            for role in ("gate", "up", "down"):
+                name = f"text/layers/{layer}/moe/experts/{role}"
+                begin = (2 * ordinal + int(role == "down")) * experts
+                recipe.use(
+                    name,
+                    model.parameters[name].inputs[0],
+                    activation_policy="AllowA4",
+                    auxiliaries={
+                        "activation_input_multiplier": AuxiliaryReference(
+                            "expert_activation_multipliers", begin, begin + experts
+                        )
+                    },
+                )
+
+
 RECIPES = {
     "glm5next": glm5next,
+    "glm5next_fp4_local": glm5next_fp4_local,
     "qwen3_6_27b": qwen3_6_27b,
     "qwen3_6_27b_nvfp4": qwen3_6_27b_nvfp4,
     "qwen3_8_27b": qwen3_8_27b,

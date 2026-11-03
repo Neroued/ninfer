@@ -35,32 +35,31 @@ struct RoutedSwiGLUProfile {
     std::int32_t experts = 0, top_k = 0;
 };
 
-// NVFP4 A4 calibration divisors for x and the FP32 SiLU(gate)*up product, respectively.
-// Matrix divisors remain independently addressed by logical expert in the bank.
-// Block-FP8 weights and their dynamic activation groups have no tensor divisors.
-struct ExpertActivationDivisors {
-    std::optional<float> gate_up, down;
+// Calibration for x and the FP32 activation(gate)*up product, by logical expert ID.
+// Weight scales belong to the bank. Dynamic block-FP8 activation scales are not calibration.
+struct ExpertActivationCalibration {
+    ActivationCalibrationView gate_up, down;
 };
 
 // Combines activation permissions and calibration across Uses evaluated by one expert call.
-// NVFP4 A4 requires the same positive divisor for every included input.
+// Fused Uses must agree on the calibration of each logical matrix when A4 is allowed.
 class ExpertInputUsage {
 public:
     void include(const WeightInput&);
 
     [[nodiscard]] LinearPolicy policy() const noexcept { return policy_; }
 
-    [[nodiscard]] std::optional<float> activation_divisor(QType format) const;
+    [[nodiscard]] ActivationCalibrationView calibration(QType format) const;
 
 private:
     LinearPolicy policy_ = LinearPolicy::AllowA4;
-    std::optional<float> divisor_;
-    bool missing_divisor_ = false, unequal_divisors_ = false;
+    ActivationCalibrationView calibration_;
+    bool missing_calibration_ = false, unequal_calibrations_ = false;
 };
 
 struct CudaSwiGLUExperts {
     ExpertBankDeviceView bank;
-    ExpertActivationDivisors activation_divisors;
+    ExpertActivationCalibration activation_calibration;
 };
 
 struct CpuSwiGLUExperts {

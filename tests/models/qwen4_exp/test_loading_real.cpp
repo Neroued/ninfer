@@ -183,8 +183,8 @@ void check_parameters(const q4::ModelShard& model, const q4::execution::Paramete
             const auto down = matrix_weight(source.down, e);
             require(gu.n == 1280 && gu.k == 2560 && down.n == 2560 && down.k == 640,
                     "expert native geometry");
-            require(gu.weight_scale_divisor == source.gate_up.divisor(e) &&
-                        down.weight_scale_divisor == source.down.divisor(e),
+            require(gu.weight_scale == source.gate_up.matrix_scale(e) &&
+                        down.weight_scale == source.down.matrix_scale(e),
                     "expert divisor addressing");
         }
     }
@@ -240,7 +240,7 @@ int main(int argc, char** argv) {
     try {
         DeviceContext device;
         bool materialize = false, host = false;
-        int rank = -1;
+        int rank         = -1;
         std::uint32_t ep = 2;
         for (int i = 2; i < argc; ++i) {
             const std::string_view arg(argv[i]);

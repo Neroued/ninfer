@@ -51,7 +51,7 @@ struct Matrix {
         }
         if (nv) {
             for (unsigned e = 0; e < count; ++e) { divisors.push_back(seed + e + 1.0F); }
-            std::memcpy(data + g.divisor_offset, divisors.data(), count * 4);
+            std::memcpy(data + g.matrix_scale_offset, divisors.data(), count * 4);
         }
         parent = {g, Device::cpu(), data, divisors};
     }
@@ -123,10 +123,12 @@ __global__ void gather(ExpertBankDeviceView bank, unsigned expert, Sizes sizes,
         start += sizes.bytes[p];
     }
     if (!i) {
-        const float gu =
-            bank.gate_up.divisors ? bank.gate_up.divisors[expert * bank.gate_up.divisor_stride] : 1;
-        const float dn =
-            bank.down.divisors ? bank.down.divisors[expert * bank.down.divisor_stride] : 1;
+        const float gu = bank.gate_up.matrix_scales
+                             ? bank.gate_up.matrix_scales[expert * bank.gate_up.matrix_scale_stride]
+                             : 1;
+        const float dn = bank.down.matrix_scales
+                             ? bank.down.matrix_scales[expert * bank.down.matrix_scale_stride]
+                             : 1;
         // The byte output need not be aligned for typed stores.
         for (int b = 0; b < 4; ++b) {
             out[start + b]     = reinterpret_cast<const unsigned char*>(&gu)[b];
@@ -154,7 +156,7 @@ std::vector<std::byte> expected(const ExpertBankSource& source, unsigned expert)
         }
     }
     for (const auto* matrix : {&source.gate_up, &source.down}) {
-        const auto value  = matrix->divisor(expert);
+        const auto value  = matrix->matrix_scale(expert);
         const auto* bytes = reinterpret_cast<const std::byte*>(&value);
         out.insert(out.end(), bytes, bytes + 4);
     }

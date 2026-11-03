@@ -105,7 +105,7 @@ __device__ __forceinline__ std::uint8_t quantize_nvfp4_activation_pair(float2 va
 // BF16 input, group size 16, explicit tensor divisor. Codes use the rounded E4M3
 // group scale; a scale that rounds to zero produces zero codes.
 __device__ __forceinline__ Nvfp4QuantizedK16 quantize_nvfp4_k16(const __nv_bfloat16* source,
-                                                                float input_scale_divisor) {
+                                                                float input_scale) {
     const uint4 packed0                = load_vec<uint4>(source);
     const uint4 packed1                = load_vec<uint4>(source + 8);
     const std::uint32_t represented[8] = {
@@ -122,13 +122,13 @@ __device__ __forceinline__ Nvfp4QuantizedK16 quantize_nvfp4_k16(const __nv_bfloa
     }
 
     Nvfp4QuantizedK16 result{};
-    result.scale = nvfp4_activation_scale(max_abs, input_scale_divisor);
+    result.scale = nvfp4_activation_scale(max_abs, input_scale);
     if (result.scale == 0) { return result; }
 
     const float decoded_scale = decode_e4m3(result.scale);
 #pragma unroll
     for (int pair = 0; pair < 8; ++pair) {
-        values[pair] = nvfp4_activation_values(values[pair], input_scale_divisor, decoded_scale);
+        values[pair] = nvfp4_activation_values(values[pair], input_scale, decoded_scale);
     }
     pack_nvfp4_e2m1x16(values, result.codes_lo, result.codes_hi);
     return result;

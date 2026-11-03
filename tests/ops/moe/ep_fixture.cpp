@@ -40,7 +40,7 @@ struct Matrix {
             base.payload.resize(base.scale_plane_offset + base.scale_plane_bytes);
         } else {
             base = q::make_patterned_weight(QType::NVFP4, n, k, seed,
-                                            {.weight_scale_divisor = 1, .input_scale_divisor = 1});
+                                            {.weight_scale = 1, .input_scale = 1});
             base.dequant.clear();
             base.dequant.shrink_to_fit();
             // Indexed banks address divisors separately from native code/scale planes.
@@ -87,12 +87,12 @@ struct Matrix {
 
     ExpertMatrixDeviceView view() const {
         ExpertMatrixDeviceView v;
-        v.codes           = static_cast<const std::byte*>(storage.data()) + Guard;
-        v.scales          = v.codes + scale_offset;
-        v.offsets         = static_cast<const std::uint64_t*>(indices.data());
-        v.divisors        = static_cast<const float*>(divisors.data());
-        v.divisor_stride  = fp8 ? 0 : 1;
-        v.indexed_storage = storage.span().subspan(Guard, Local * stride);
+        v.codes               = static_cast<const std::byte*>(storage.data()) + Guard;
+        v.scales              = v.codes + scale_offset;
+        v.offsets             = static_cast<const std::uint64_t*>(indices.data());
+        v.matrix_scales       = static_cast<const float*>(divisors.data());
+        v.matrix_scale_stride = fp8 ? 0 : 1;
+        v.indexed_storage     = storage.span().subspan(Guard, Local * stride);
         return v;
     }
 
@@ -201,8 +201,12 @@ ops::RoutedSwiGLUProfile Weights::profile() const {
 
 ops::CudaSwiGLUExperts Weights::experts() const {
     return {{impl_->gu.view(), impl_->down.view(), E, impl_->device},
-            impl_->fp8 ? ops::ExpertActivationDivisors{}
-                       : ops::ExpertActivationDivisors{719.7991333F, 313.927002F}};
+            impl_->fp8 ? ops::ExpertActivationCalibration{}
+                       : ops::ExpertActivationCalibration{
+                             ops::ActivationCalibrationView::broadcast(
+                                 ops::ActivationScaleOperation::Divide, 719.7991333F),
+                             ops::ActivationCalibrationView::broadcast(
+                                 ops::ActivationScaleOperation::Divide, 313.927002F)}};
 }
 
 ops::ExpertSubset Weights::subset() const {

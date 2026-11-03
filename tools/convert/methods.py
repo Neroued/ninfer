@@ -51,10 +51,10 @@ class AuxiliaryValue:
     data: bytes
 
     @classmethod
-    def activation_divisor(cls, value: bytes | float) -> AuxiliaryValue:
+    def activation_scale(cls, value: bytes | float) -> AuxiliaryValue:
         raw = value if isinstance(value, bytes) else struct.pack("<f", value)
         if len(raw) != 4 or not valid_positive_fp32_word(struct.unpack("<I", raw)[0]):
-            raise ValueError("activation input divisor must be positive finite FP32")
+            raise ValueError("activation scale must be positive finite FP32")
         return cls("fp32", (), raw)
 
 
@@ -162,17 +162,17 @@ class PrepareRequest:
             index += 1
         first = pieces[0]
         if any(
-            (p.format, p.weight_divisor) != (first.format, first.weight_divisor)
+            (p.format, p.weight_scale) != (first.format, first.weight_scale)
             for p in pieces
         ):
-            raise ValueError("encoded inputs cannot share one parent format/divisor")
+            raise ValueError("encoded inputs cannot share one parent format/scale")
         if len(pieces) == 1:
             return first
         return EncodedRows(
             first.format,
             torch.cat([p.codes for p in pieces]),
             torch.cat([p.scales for p in pieces]),
-            first.weight_divisor,
+            first.weight_scale,
         )
 
 
@@ -314,11 +314,25 @@ def fp8_block_maxabs(request: PrepareRequest) -> PreparedMethod:
 
 
 def import_encoded(request: PrepareRequest) -> PreparedMethod:
-    """Preserve FP8/NVFP4 words, with independent divisors for bank matrices."""
-    block_fp8 = request.target.format == "fp8_e4m3fn_block128x128_bf16"
+    """Preserve published words, with independent scales for bank matrices."""
+    if request.target.layout == "csf_32x2_v1":
+        from .methods_csf import import_csf
+
+        return import_csf(request)
+    block_fp8 = request.target.format in (
+        "fp8_e4m3fn_block128x128_bf16",
+        "fp8_e4m3fn_block128x128_fp32",
+    )
     if (
         request.target.format
-        not in ("nvfp4", "fp8_e4m3fn_row_bf16", "fp8_e4m3fn_block128x128_bf16")
+        not in (
+            "nvfp4",
+            "nvfp4_mul",
+            "mxfp8",
+            "fp8_e4m3fn_row_bf16",
+            "fp8_e4m3fn_block128x128_bf16",
+            "fp8_e4m3fn_block128x128_fp32",
+        )
         or len(request.target.shape) not in (2, 3)
         or (
             len(request.target.shape) == 3
@@ -330,7 +344,7 @@ def import_encoded(request: PrepareRequest) -> PreparedMethod:
     n, k = request.target.shape[-2:]
     matrices = request.target.shape[0] if len(request.target.shape) == 3 else 1
     auxiliaries = {}
-    divisors = {}
+    matrix_scales = {}
     cursor = 0
     for item in request.inputs:
         source = item.source
@@ -349,36 +363,42 @@ def import_encoded(request: PrepareRequest) -> PreparedMethod:
             raise ValueError(
                 f"{item.parameter}: source {encoding} differs from target {request.target.format}"
             )
-        if encoding == "nvfp4":
-            if source.weight_divisor is None:
-                raise ValueError(
-                    f"{item.parameter}: NVFP4 source needs a weight divisor"
-                )
-            divisor = source.weight_divisor()
+        if encoding in ("nvfp4", "nvfp4_mul"):
+            if source.weight_scale is None:
+                raise ValueError(f"{item.parameter}: NVFP4 source needs a weight scale")
+            scale = source.weight_scale()
             for matrix in range(cursor // n, (cursor + source.shape[0] - 1) // n + 1):
-                if matrix in divisors and divisors[matrix] != divisor:
-                    raise ValueError("NVFP4 weight divisors differ within one matrix")
-                divisors[matrix] = divisor
+                if matrix in matrix_scales and matrix_scales[matrix] != scale:
+                    raise ValueError("NVFP4 weight scales differ within one matrix")
+                matrix_scales[matrix] = scale
             for parameter, input_name in item.uses:
-                key = (parameter, input_name, "activation_input_divisor")
+                role = (
+                    "activation_input_multiplier"
+                    if encoding == "nvfp4_mul"
+                    else "activation_input_divisor"
+                )
+                key = (parameter, input_name, role)
                 if key in request.auxiliary_overrides:
                     value = request.auxiliary_overrides[key]
                 elif request.policies[(parameter, input_name)] == "AllowA4":
-                    if source.input_divisor is None:
+                    if source.activation_scale is None:
                         raise ValueError(
-                            f"{parameter}: supply an activation divisor for AllowA4"
+                            f"{parameter}: supply an activation scale for AllowA4"
                         )
-                    value = AuxiliaryValue.activation_divisor(source.input_divisor())
+                    value = AuxiliaryValue.activation_scale(source.activation_scale())
                 else:
                     continue
                 if key in auxiliaries and auxiliaries[key] != value:
                     raise ValueError(
-                        f"{parameter}: activation divisors differ within one Use"
+                        f"{parameter}: activation scales differ within one Use"
                     )
                 auxiliaries[key] = value
         cursor += source.shape[0]
     chunk = request.chunk_rows(
-        k, alignment=128 if request.target.format == "nvfp4" or block_fp8 else 1
+        k,
+        alignment=(
+            128 if request.target.format in ("nvfp4", "nvfp4_mul") or block_fp8 else 1
+        ),
     )
 
     def produce(output):
@@ -391,7 +411,7 @@ def import_encoded(request: PrepareRequest) -> PreparedMethod:
                     begin,
                     words.codes,
                     words.scales,
-                    words.weight_divisor,
+                    words.weight_scale,
                     matrix=matrix,
                 )
 

@@ -172,6 +172,7 @@ void materialization_alignment_checks(std::optional<CudaExecutionView> execution
         fixture.write();
         Reader reader(fixture.entry);
         const auto matrix = reader.find("q5"), divisors = reader.find("divisors");
+        (void)reader.read_object(matrix);
         std::vector<PlacementRequest> requests{{matrix, Device::cpu()}, {divisors, Device::cpu()}};
         if (execution) requests.push_back({matrix, execution->device()});
         const auto backing = materialize(reader, plan_materialization(reader, requests), execution);

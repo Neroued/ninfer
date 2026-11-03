@@ -73,8 +73,9 @@ void launch_mma(const Tensor& x, const CudaSwiGLUExperts& experts, const ExpertR
         Gate ? s.input_codes : s.product_codes,
         static_cast<const std::uint8_t*>(Gate ? s.input_scales : s.product_scales),
         Gate ? experts.bank.gate_up : experts.bank.down,
-        Gate ? *experts.activation_divisors.gate_up : *experts.activation_divisors.down,
-        *experts.activation_divisors.down, s.groups, s.product_codes,
+        Gate ? experts.activation_calibration.gate_up.scalar_divisor()
+             : experts.activation_calibration.down.scalar_divisor(),
+        experts.activation_calibration.down.scalar_divisor(), s.groups, s.product_codes,
         static_cast<std::uint8_t*>(s.product_scales), s.contributions,
         static_cast<const float*>(routes.coefficients.data), s.routed_sum,
         std::countr_zero(unsigned(subtiles)), plan.clamp_limit, plan.nvfp4.down_row_window,
@@ -144,8 +145,9 @@ void launch_input(const Tensor& x, const CudaSwiGLUExperts& experts, const Exper
     const auto stream = execution.stream();
     quantize_input<<<(std::max(x.ne[1] * (kHidden / 16), kExperts) + 255) / 256, 256, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(x.data), s.input_codes,
-        static_cast<std::uint8_t*>(s.input_scales), *experts.activation_divisors.gate_up, x.ne[1],
-        s.groups.counts, s.routed_sum, clear_counts, static_cast<const int*>(routes.ids.data),
+        static_cast<std::uint8_t*>(s.input_scales),
+        experts.activation_calibration.gate_up.scalar_divisor(), x.ne[1], s.groups.counts,
+        s.routed_sum, clear_counts, static_cast<const int*>(routes.ids.data),
         static_cast<const int*>(subset.mask.data), subset.kind, s.active_tokens);
     CUDA_CHECK(cudaGetLastError());
 }
@@ -205,8 +207,8 @@ void launch_experts_impl(const Tensor& x, const CudaSwiGLUExperts& experts,
                 const int blocks = std::min(tasks, execution.multiprocessor_count() * 3);
                 dense_token_down<C><<<blocks, Schedule<C, false>::threads, 0, execution.stream()>>>(
                     s.product_codes, static_cast<const std::uint8_t*>(s.product_scales),
-                    experts.bank.down, *experts.activation_divisors.down, s.groups,
-                    static_cast<const int*>(routes.ids.data),
+                    experts.bank.down, experts.activation_calibration.down.scalar_divisor(),
+                    s.groups, static_cast<const int*>(routes.ids.data),
                     static_cast<const float*>(routes.coefficients.data), s.routed_sum, x.ne[1],
                     plan.pool_expert_limit, plan.pool_min_experts);
                 CUDA_CHECK(cudaGetLastError());
@@ -238,9 +240,9 @@ void launch_experts_impl(const Tensor& x, const CudaSwiGLUExperts& experts,
             if (plan.pool_columns != 128)
                 throw std::logic_error("invalid clamped expert pool column tile");
             launch_pool_down<kHidden, kExperts, kTopK, 128>(
-                PoolContraction<128>{s.product_codes,
-                                     static_cast<const std::uint8_t*>(s.product_scales),
-                                     experts.bank.down, *experts.activation_divisors.down},
+                PoolContraction<128>{
+                    s.product_codes, static_cast<const std::uint8_t*>(s.product_scales),
+                    experts.bank.down, experts.activation_calibration.down.scalar_divisor()},
                 s.groups, static_cast<const int*>(routes.ids.data),
                 static_cast<const float*>(routes.coefficients.data), s.routed_sum, x.ne[1],
                 plan.pool_min_experts, plan.pool_expert_limit, plan.pool_row_window,

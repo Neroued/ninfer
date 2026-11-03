@@ -156,7 +156,7 @@ ops::ProjectionWeights prepare(const Profile& profile, const Invocation& call,
         const auto weight = source->view();
         const std::array shape{std::uint64_t(weight.n), std::uint64_t(weight.k)};
         const auto divisors = weight.qtype == QType::NVFP4
-                                  ? std::span(&source->host.weight.weight_scale_divisor, 1)
+                                  ? std::span(&source->host.weight.weight_scale, 1)
                                   : std::span<const float>{};
         parents.push_back({weight_geometry(weight.qtype, weight.layout, shape), weight.device,
                            static_cast<const std::byte*>(weight.payload), divisors});
@@ -178,14 +178,18 @@ ops::ProjectionWeights prepare(const Profile& profile, const Invocation& call,
     for (std::size_t i = 0; i < views.size(); ++i) {
         std::optional<float> divisor;
         if (profile.binding == Binding::Nvfp4Inputs && !call.omit_divisors)
-            divisor = weights[0]->view().input_scale_divisor +
+            divisor = weights[0]->view().input_scale +
                       (call.policy == ops::LinearPolicy::AllowA4 ? 0.0F : float(i));
-        inputs.push_back({views[i], call.policy, divisor});
+        inputs.push_back({views[i], call.policy,
+                          divisor ? ops::ActivationCalibrationView::broadcast(
+                                        ops::ActivationScaleOperation::Divide, *divisor)
+                                  : ops::ActivationCalibrationView{}});
     }
     if (profile.binding == Binding::Nvfp4Inputs && call.policy == ops::LinearPolicy::AllowA8) {
         auto mixed = inputs;
         for (std::size_t i = 0; i < mixed.size(); ++i)
-            mixed[i].activation_input_divisor = weights[0]->view().input_scale_divisor + float(i);
+            mixed[i].calibration = ops::ActivationCalibrationView::broadcast(
+                ops::ActivationScaleOperation::Divide, weights[0]->view().input_scale + float(i));
         mixed[0].policy = ops::LinearPolicy::AllowA4;
         if (std::get<ops::SingleProjectionWeight>(ops::prepare_projection_weights(mixed)).policy !=
             call.policy)

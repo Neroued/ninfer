@@ -13,7 +13,7 @@ WeightGeometry bank_geometry(int n, int k) {
 
 BankFixture::BankFixture(int n, int k)
     : packed(quantized_weight::make_patterned_weight(
-          QType::NVFP4, n, k, 701U, {.weight_scale_divisor = 128.0F, .input_scale_divisor = 1.0F})),
+          QType::NVFP4, n, k, 701U, {.weight_scale = 128.0F, .input_scale = 1.0F})),
       bytes(bank_geometry(n, k).bytes), storage(bytes.size()) {
     const auto geometry     = bank_geometry(n, k);
     const auto first_row    = geometry.shape[1] + 128;
@@ -23,7 +23,7 @@ BankFixture::BankFixture(int n, int k)
     std::memcpy(bytes.data() + scale_offset, packed.payload.data() + packed.scale_plane_offset,
                 packed.scale_plane_bytes);
     const std::array divisors{64.0F, 128.0F};
-    std::memcpy(bytes.data() + geometry.divisor_offset, divisors.data(), sizeof(divisors));
+    std::memcpy(bytes.data() + geometry.matrix_scale_offset, divisors.data(), sizeof(divisors));
     storage.copy_from_host(bytes.data(), bytes.size());
     const WeightParent parent{geometry, storage.device(),
                               static_cast<const std::byte*>(storage.data()), divisors};
@@ -68,8 +68,8 @@ quantized_weight::PackedWeight make_q8_g32_fp16_weight(std::int32_t n, std::int3
 quantized_weight::PackedWeight make_nvfp4_weight(std::int32_t n, std::int32_t k,
                                                  std::uint32_t seed) {
     quantized_weight::PatternedWeightOptions options;
-    options.weight_scale_divisor = 0.125F;
-    options.input_scale_divisor  = 3.5F;
+    options.weight_scale = 0.125F;
+    options.input_scale  = 3.5F;
     return quantized_weight::make_patterned_weight(QType::NVFP4, n, k, seed, options);
 }
 

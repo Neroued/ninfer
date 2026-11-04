@@ -52,4 +52,35 @@ void mxfp8_linear_tma(const Tensor& x, const Weight& w, Tensor& out, Mxfp8A8Work
                            LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), w.n}, Epilogue{},
                            stream);
 }
+
+struct Mxfp8LinearStreamingVectorOutput : LinearBf16Output {
+    __device__ __forceinline__ void store_vector(int row, int token, uint4 values) const {
+        asm volatile("st.global.cs.v4.u32 [%0], {%1,%2,%3,%4};" ::"l"(at(row, token)),
+                     "r"(values.x), "r"(values.y), "r"(values.z), "r"(values.w)
+                     : "memory");
+    }
+};
+
+struct Mxfp8LinearVectorEpilogue : Bf16TmaVectorEpilogue {
+    template <class S, bool Full, class Output>
+    __device__ __forceinline__ void finish_tile(const Output& output, unsigned char* scratch,
+                                                float (&accum)[S::kMmaRows][S::kMmaTokens][4],
+                                                int row_begin, int token_begin, int rows,
+                                                int tokens) const {
+        // MXFP8's Full specialization covers both axes of the output tile.
+        Bf16TmaVectorEpilogue::template finish_tile<S, Full, !Full>(
+            output, scratch, accum, row_begin, token_begin, rows, tokens);
+    }
+};
+
+template <class S>
+void mxfp8_linear_tma_vector(const Tensor& x, const Weight& w, Tensor& out,
+                             Mxfp8A8Workspace workspace, cudaStream_t stream) {
+    launch_mxfp8_a8_quantize(static_cast<const __nv_bfloat16*>(x.data), w.k, x.ne[1], workspace,
+                             stream);
+    launch_mxfp8_a8_tma<S>(
+        mxfp8_a8_operands(w, workspace, x.ne[1]),
+        Mxfp8LinearStreamingVectorOutput{{static_cast<__nv_bfloat16*>(out.data), w.n}},
+        Mxfp8LinearVectorEpilogue{}, stream);
+}
 } // namespace ninfer::ops::detail

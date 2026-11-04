@@ -176,7 +176,7 @@ void add_native_cases(Suite& suite) {
             for (int t : {1, 4, 8, 32, 64, 96, 128, 192, 256, 257, 384, 512, 1024, 1152, 2048,
                           3072})
                 calls.push_back({t, CallForm::Policy, ops::LinearPolicy::AllowA8});
-            for (int t : {2, 65, 385, 1025, 1153, 2049, 3073, 4096})
+            for (int t : {2, 65, 129, 385, 1025, 1153, 2049, 3073, 4096})
                 calls.push_back({t, CallForm::Policy, ops::LinearPolicy::AllowA8, true});
         }
         if (n == 1024 && k == 1024) {

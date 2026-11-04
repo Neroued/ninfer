@@ -22,7 +22,7 @@ constexpr std::array<Mxfp8LinearRoute, 11> a8{{
      Mxfp8LinearCompute::A8},
     mxfp8_linear_padded_tma_route<
         Static<Mxfp8A8TmaSchedule<64, 64, 256, 32, 16, 2, 1, 2>>>(128),
-    {256, mxfp8_linear_tma<Static<Mxfp8A8TmaSchedule<64, 64, 128, 32, 16, 2, 1, 2, false, 2>>, true>,
+    {256, mxfp8_linear_tma<Static<Mxfp8A8TmaSchedule<128, 128, 128, 64, 32, 2>>, true>,
      Mxfp8LinearCompute::A8},
     {384, mxfp8_linear_tma<Static<Mxfp8A8TmaSchedule<192, 128, 128, 48, 64, 2, 1, 16, true, 1>>, true>,
      Mxfp8LinearCompute::A8},

@@ -50,6 +50,44 @@ __device__ __forceinline__ void native_fp8_tile(int linear, int rows, int tokens
                                                 int& token_tile) {
     const int row_tiles   = (rows + S::kBlockRows - 1) / S::kBlockRows;
     const int token_tiles = (tokens + S::kBlockTokens - 1) / S::kBlockTokens;
+    if constexpr (requires { S::kRasterGroupTokens; }) {
+        if constexpr (S::kRasterGroupTokens > 0) {
+            constexpr int width = S::kRasterGroupTokens;
+            int token_first, active_tokens, local;
+            // Avoid a final panel with only one column of CTAs.
+            if (token_tiles > width && token_tiles % width == 1) {
+                const int panels = (token_tiles + width - 1) / width;
+                const int base = token_tiles / panels, extra = token_tiles % panels;
+                const int big_span = row_tiles * (base + 1);
+                if (linear < extra * big_span) {
+                    const int panel = linear / big_span;
+                    token_first = panel * (base + 1);
+                    active_tokens = base + 1;
+                    local = linear - panel * big_span;
+                } else {
+                    const int tail = linear - extra * big_span;
+                    const int panel_span = row_tiles * base;
+                    const int panel = tail / panel_span;
+                    token_first = extra * (base + 1) + panel * base;
+                    active_tokens = base;
+                    local = tail - panel * panel_span;
+                }
+            } else {
+                const int panel_span = row_tiles * width;
+                const int panel = linear / panel_span;
+                token_first = panel * width;
+                active_tokens = min(width, token_tiles - token_first);
+                local = linear - panel * panel_span;
+            }
+            const int span = S::kRasterGroupRows * active_tokens;
+            const int group = local / span, first = group * S::kRasterGroupRows;
+            const int active = min(S::kRasterGroupRows, row_tiles - first);
+            const int within = local - group * span;
+            row_tile = first + within % active;
+            token_tile = token_first + within / active;
+            return;
+        }
+    }
     const int span        = S::kRasterGroupRows * token_tiles;
     const int group       = linear / span;
     const int first       = group * S::kRasterGroupRows;

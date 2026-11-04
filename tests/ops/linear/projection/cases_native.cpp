@@ -162,6 +162,14 @@ void add_native_cases(Suite& suite) {
             for (int t : {2, 9, 65, 385, 641, 769, 1025, 3713, 4096})
                 calls.push_back({t, CallForm::Policy, ops::LinearPolicy::AllowA8, true});
         }
+        if (n == 4096 && k == 16384) {
+            add_workspace_cases(suite, QType::MXFP8, n, k);
+            for (int t : {1, 2, 4, 8, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512, 640,
+                          768, 1024, 1152, 1280, 1536, 2048, 3072})
+                calls.push_back({t, CallForm::Policy, ops::LinearPolicy::AllowA8});
+            for (int t : {9, 49, 65, 385, 641, 769, 1025, 1153, 1281, 1537, 2049, 3073, 4096})
+                calls.push_back({t, CallForm::Policy, ops::LinearPolicy::AllowA8, true});
+        }
         add_shape(suite, QType::MXFP8, ActivationRecipe::Hashed, native_weight<QType::MXFP8>,
                   {n, k, 1451U, Comparison::Sampled, true, calls});
     }

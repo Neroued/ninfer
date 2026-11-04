@@ -21,7 +21,7 @@ struct Mxfp8TmaStageStorage {
 
 template <int BlockRows, int BlockTokens, int BlockK = 128, int WarpRows = 32, int WarpTokens = 32,
           int Stages = 2, int MinBlocksPerSm = 1, int RasterGroupRows = 8, bool TmaScales = false,
-          int FragmentStages = 2>
+          int FragmentStages = 2, int RasterGroupTokens = 0>
 struct Mxfp8A8TmaSchedule
     : NativeFp8MmaSchedule<BlockRows, BlockTokens, BlockK, WarpRows, WarpTokens, Stages,
                            MinBlocksPerSm, RasterGroupRows>,
@@ -32,6 +32,7 @@ struct Mxfp8A8TmaSchedule
     static constexpr int kThreads         = kConsumerThreads + kProducerThreads;
     static constexpr bool kTmaScales      = TmaScales;
     static constexpr int kFragmentStages  = FragmentStages;
+    static constexpr int kRasterGroupTokens = RasterGroupTokens;
     static_assert(BlockK == 128 || BlockK == 256);
     static_assert(BlockRows <= 256 && BlockTokens <= 256);
     static_assert(kThreads <= 1024 && (FragmentStages == 1 || FragmentStages == 2));

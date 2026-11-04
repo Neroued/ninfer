@@ -43,7 +43,7 @@ std::size_t mxfp8_linear_workspace_capacity_bytes(int n, int k, LinearPolicy pol
     for (const auto& route : routes) {
         const int last = std::min(route.last_tokens, max_tokens);
         if (route.compute == Mxfp8LinearCompute::A8 && first <= max_tokens && last >= min_tokens)
-            peak = std::max(peak, mxfp8_a8_workspace_capacity_bytes(last, k));
+            peak = std::max(peak, mxfp8_a8_workspace_capacity_bytes(last, k, route.code_tokens(last)));
         if (route.last_tokens >= max_tokens) break;
         first = route.last_tokens + 1;
     }
@@ -58,10 +58,12 @@ void mxfp8_dispatch(const Tensor& x, const Weight& weight, Tensor& out, LinearPo
     if (!workspace) throw std::invalid_argument("MXFP8 A8 requires caller workspace");
     auto scope = workspace->scope();
     const auto backing =
-        workspace->alloc_bytes(mxfp8_a8_workspace_capacity_bytes(x.ne[1], weight.k), 256);
+        workspace->alloc_bytes(
+            mxfp8_a8_workspace_capacity_bytes(x.ne[1], weight.k, route.code_tokens(x.ne[1])), 256);
     validate_projection_scratch(x, weight, {&out, 1}, nullptr, backing, "MXFP8 linear");
     MemoryArena local(backing);
-    const auto scratch = allocate_mxfp8_a8_workspace(local, x.ne[1], weight.k);
+    const auto scratch =
+        allocate_mxfp8_a8_workspace(local, x.ne[1], weight.k, route.code_tokens(x.ne[1]));
     route.launch(x, weight, out, scratch, stream);
 }
 } // namespace ninfer::ops::detail

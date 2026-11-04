@@ -738,12 +738,16 @@ Result make_result(const BenchPoint& point, const LinearBenchWeight& weight,
     const std::uint64_t out_bytes   = checked_mul(out_elements, 2, "output bytes");
     const std::uint64_t model_bytes = checked_add(
         checked_add(weight.model_weight_bytes(), x_bytes, "model bytes"), out_bytes, "model bytes");
-    const std::uint64_t scratch_traffic =
-        point.qtype == QType::MXFP8 &&
-                ops::detail::select_mxfp8_linear_route(point.n, point.k, point.t, point.policy)
-                        .compute == ops::detail::Mxfp8LinearCompute::A8
-            ? 2 * x_elements + 2 * x_elements / 32
-            : 0;
+    std::uint64_t scratch_traffic = 0;
+    if (point.qtype == QType::MXFP8) {
+        const auto& route = ops::detail::select_mxfp8_linear_route(
+            point.n, point.k, point.t, point.policy);
+        if (route.compute == ops::detail::Mxfp8LinearCompute::A8) {
+            const auto code_elements = checked_mul(static_cast<std::uint64_t>(point.k),
+                                                   route.code_tokens(point.t), "code elements");
+            scratch_traffic = 2 * code_elements + 2 * x_elements / 32;
+        }
+    }
     const auto required_bytes = checked_add(model_bytes, scratch_traffic, "required traffic");
     const double useful_flops = 2.0 * static_cast<double>(point.n) * static_cast<double>(point.k) *
                                 static_cast<double>(point.t);

@@ -6,11 +6,19 @@
 
 namespace ninfer::ops::detail {
 
-template <class Input>
-__global__ void mxfp8_a8_quantize_kernel(const Input* x, Mxfp8A8Workspace out, int groups) {
+template <class Input, bool PadCodes>
+__global__ void mxfp8_a8_quantize_kernel(const Input* x, Mxfp8A8Workspace out, int groups,
+                                        int valid_groups) {
     const int group = (blockIdx.x * blockDim.x + threadIdx.x) / 4;
     const int part  = threadIdx.x & 3;
     if (group >= groups) return;
+    if constexpr (PadCodes) {
+        if (group >= valid_groups) {
+            common::store_vec(out.codes + static_cast<std::int64_t>(group) * 32 + part * 8,
+                              make_uint2(0, 0));
+            return;
+        }
+    }
     const auto* source = x + static_cast<std::int64_t>(group) * 32 + part * 8;
     float values[8];
     if constexpr (std::is_same_v<Input, __nv_bfloat16>) {
@@ -50,11 +58,13 @@ __global__ void mxfp8_a8_quantize_kernel(const Input* x, Mxfp8A8Workspace out, i
     if (part == 0) out.scales[group] = scale.scale;
 }
 
-template <class Input>
+template <class Input, bool PadCodes = false>
 void launch_mxfp8_a8_quantize(const Input* x, int k, int tokens, Mxfp8A8Workspace out,
-                              cudaStream_t stream) {
-    const int groups = k / 32 * tokens;
-    mxfp8_a8_quantize_kernel<<<common::div_up(groups, 64), 256, 0, stream>>>(x, out, groups);
+                              cudaStream_t stream, int code_tokens = 0) {
+    const int valid_groups = k / 32 * tokens;
+    const int groups = PadCodes ? k / 32 * code_tokens : valid_groups;
+    mxfp8_a8_quantize_kernel<Input, PadCodes><<<common::div_up(groups, 64), 256, 0, stream>>>(
+        x, out, groups, valid_groups);
     CUDA_CHECK(cudaGetLastError());
 }
 

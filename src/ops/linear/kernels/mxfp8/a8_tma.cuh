@@ -3,6 +3,7 @@
 #include "ops/linear/kernels/fp8/fp8_a8_tma_mma.cuh"
 #include "ops/linear/kernels/fp8/native_common.cuh"
 #include "ops/linear/kernels/mxfp8/operands.h"
+#include "ops/linear/kernels/mxfp8/a8_plan.h"
 #include "ops/linear/kernels/fp8/native_schedule.cuh"
 
 namespace ninfer::ops::detail {
@@ -323,7 +324,7 @@ __global__ __launch_bounds__(S::kThreads, S::kMinBlocksPerSm) void mxfp8_a8_tma_
                                       p.rows, p.tokens);
 }
 
-template <class S, class Output, class Epilogue, class Rows = Fp8IdentityRows>
+template <class S, bool PaddedCodes = false, class Output, class Epilogue, class Rows = Fp8IdentityRows>
 void launch_mxfp8_a8_tma(const Mxfp8A8Operands& p, Output output, Epilogue epilogue,
                          cudaStream_t stream, Rows rows = {}) {
     constexpr int panel = mxfp8_tma_panel_rows<S, Rows>;
@@ -339,7 +340,9 @@ void launch_mxfp8_a8_tma(const Mxfp8A8Operands& p, Output output, Epilogue epilo
     if (blocks > 2147483647LL) throw std::invalid_argument("MXFP8 TMA grid exceeds CUDA grid.x");
     const auto launch = [&]<bool TmaScales, bool Full>() {
         const auto maps = [&] {
-            const auto xmap = fp8_tma_map(p.x, p.tokens, p.k, S::kBlockTokens, 128);
+            const int code_tokens = PaddedCodes ? mxfp8_a8_padded_tokens(p.tokens, S::kBlockTokens)
+                                                : p.tokens;
+            const auto xmap = fp8_tma_map(p.x, code_tokens, p.k, S::kBlockTokens, 128);
             const auto wmap = fp8_tma_map(p.codes, p.rows, p.k, panel, 128);
             if constexpr (TmaScales)
                 return Mxfp8ScaledTmaDescriptors{

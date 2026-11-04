@@ -12,6 +12,11 @@ struct Mxfp8LinearRoute {
     int last_tokens;
     Mxfp8LinearLaunch launch;
     Mxfp8LinearCompute compute;
+    int code_token_alignment = 1;
+
+    int code_tokens(int tokens) const {
+        return mxfp8_a8_padded_tokens(tokens, code_token_alignment);
+    }
 };
 
 struct Mxfp8LinearShape {

@@ -23,10 +23,10 @@ constexpr std::array<Mxfp8LinearRoute, 7> a16{{
      mxfp8_linear_mma<Static<NativeFp8MmaSchedule<64, 128, 128, 32, 32, 2>>>,
      Mxfp8LinearCompute::A16},
 }};
-constexpr std::array<Mxfp8LinearRoute, 11> a8{{
+constexpr std::array<Mxfp8LinearRoute, 13> a8{{
     {4, mxfp8_linear_sliced<Static<NativeFp8A16SlicedKSchedule<8, 2, 8, 256, 2>>>,
      Mxfp8LinearCompute::A16},
-    {16, mxfp8_linear_sliced<Static<NativeFp8A16SlicedKSchedule<16, 8, 8, 128, 1>>>,
+    {8, mxfp8_linear_sliced<Static<NativeFp8A16SlicedKSchedule<8, 8, 8, 128, 1>>>,
      Mxfp8LinearCompute::A16},
     {32, mxfp8_linear_sliced<Static<NativeFp8A16SlicedKSchedule<16, 16, 4, 128, 2>>>,
      Mxfp8LinearCompute::A16},
@@ -44,6 +44,11 @@ constexpr std::array<Mxfp8LinearRoute, 11> a8{{
      mxfp8_linear_tma<Static<Mxfp8A8TmaSchedule<192, 128, 128, 48, 64, 2, 1, 2, true, 1>>, true>,
      Mxfp8LinearCompute::A8},
     {768, mxfp8_linear_tma<Static<Mxfp8A8TmaSchedule<128, 128, 128, 64, 32, 2, 1, 2, true>>, true>,
+     Mxfp8LinearCompute::A8},
+    {1024,
+     mxfp8_linear_tma<Static<Mxfp8A8TmaSchedule<192, 128, 128, 48, 64, 2, 1, 2, true, 1>>, true>,
+     Mxfp8LinearCompute::A8},
+    {1536, mxfp8_linear_tma<Static<Mxfp8A8TmaSchedule<128, 128, 128, 64, 32, 2, 1, 2, true>>, true>,
      Mxfp8LinearCompute::A8},
     {std::numeric_limits<int>::max(),
      mxfp8_linear_tma<Static<Mxfp8A8TmaSchedule<192, 128, 128, 48, 64, 2, 1, 2, true, 1>>, true>,

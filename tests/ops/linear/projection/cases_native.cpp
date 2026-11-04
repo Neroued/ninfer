@@ -113,9 +113,10 @@ void add_native_cases(Suite& suite) {
         }
         if (n == 2048 && k == 4096) {
             add_workspace_cases(suite, QType::MXFP8, n, k);
-            for (int t : {1, 4, 8, 16, 32, 48, 49, 64, 128, 192, 193, 256, 257, 384, 512, 768})
+            for (int t : {1, 4, 8, 16, 32, 48, 49, 64, 128, 192, 193, 256, 257, 384, 512, 768,
+                          1024, 1536})
                 calls.push_back({t, CallForm::Policy, ops::LinearPolicy::AllowA8});
-            for (int t : {2, 9, 65, 385, 769, 4096})
+            for (int t : {2, 9, 65, 385, 769, 1025, 1537, 4096})
                 calls.push_back({t, CallForm::Policy, ops::LinearPolicy::AllowA8, true});
         }
         if (n == 4096 && k == 1024) {

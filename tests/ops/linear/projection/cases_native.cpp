@@ -68,10 +68,17 @@ void add_native_cases(Suite& suite) {
                                        {48, CallForm::Policy, ops::LinearPolicy::AllowA8},
                                        {64, CallForm::Policy, ops::LinearPolicy::AllowA8},
                                        {65, CallForm::Policy, ops::LinearPolicy::AllowA8, true},
+                                       {128, CallForm::Policy, ops::LinearPolicy::AllowA8},
+                                       {192, CallForm::Policy, ops::LinearPolicy::AllowA8},
+                                       {193, CallForm::Policy, ops::LinearPolicy::AllowA8},
                                        {257, CallForm::Policy, ops::LinearPolicy::AllowA8, true},
+                                       {320, CallForm::Policy, ops::LinearPolicy::AllowA8},
+                                       {321, CallForm::Policy, ops::LinearPolicy::AllowA8, true},
                                        {4096, CallForm::Policy, ops::LinearPolicy::AllowA8, true}});
-            const std::array<Invocation, 2> unaligned_calls{
-                {{512, CallForm::Policy, ops::LinearPolicy::AllowA8},
+            const std::array<Invocation, 4> unaligned_calls{
+                {{129, CallForm::Policy, ops::LinearPolicy::AllowA8},
+                 {257, CallForm::Policy, ops::LinearPolicy::AllowA8, true},
+                 {512, CallForm::Policy, ops::LinearPolicy::AllowA8},
                  {513, CallForm::Policy, ops::LinearPolicy::AllowA8, true}}};
             add_shape(suite, QType::MXFP8, ActivationRecipe::Hashed, mxfp8_four_byte_scales,
                       {n, k, 1461U, Comparison::Sampled, true, unaligned_calls});

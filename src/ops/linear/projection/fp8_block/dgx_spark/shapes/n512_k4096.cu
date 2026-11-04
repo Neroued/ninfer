@@ -21,14 +21,35 @@ Fp8BlockLinearRoute select(int tokens, LinearPolicy) {
     if (tokens <= 32)
         return {fp8_block_linear_sliced<Static<NativeFp8A16SlicedKSchedule<16, 8, 4, 128, 2>>>,
                 true};
+    if (tokens <= 48)
+        return {fp8_block_linear_sliced<Static<NativeFp8A16SlicedKSchedule<16, 16, 4, 128, 2>>>,
+                true};
+    if (tokens <= 64)
+        return {
+            fp8_block_linear_mma<
+                RegisterWeights<Static<NativeFp8MmaSchedule<16, 16, 128, 16, 8, 2, 2, 2>>>, true>,
+            true};
+    if (tokens <= 96)
+        return {
+            fp8_block_linear_mma<
+                RegisterWeights<Static<NativeFp8MmaSchedule<32, 16, 128, 16, 8, 2, 2, 2>>>, true>,
+            true};
     if (tokens <= 128)
-        return {fp8_block_linear_mma<Static<NativeFp8MmaSchedule<32, 32, 128, 16, 16, 2>>>, true};
-    if (tokens <= 1024)
+        return {
+            fp8_block_linear_mma<
+                RegisterWeights<Static<NativeFp8MmaSchedule<16, 32, 128, 16, 16, 2, 2, 2>>>, true>,
+            true};
+    if (tokens <= 192)
+        return {
+            fp8_block_linear_mma<
+                RegisterWeights<Static<NativeFp8MmaSchedule<32, 32, 128, 16, 16, 2, 2, 2>>>, true>,
+            true};
+    if (tokens <= 384)
         return {fp8_block_linear_mma<
                     RegisterWeights<Static<NativeFp8MmaSchedule<64, 64, 128, 16, 32, 2, 2>>>>,
                 true};
     return {fp8_block_linear_mma<
-                RegisterWeights<Static<NativeFp8MmaSchedule<128, 64, 128, 32, 32, 1, 2>>>, true>,
+                RegisterWeights<Static<NativeFp8MmaSchedule<64, 64, 128, 32, 32, 2, 2, 8>>>, true>,
             true};
 }
 } // namespace

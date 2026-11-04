@@ -205,6 +205,12 @@ void add_native_cases(Suite& suite) {
             for (int t : {2, 65, 129, 193, 257, 385, 641, 769, 897, 961, 1025})
                 calls.push_back({t, CallForm::Policy, ops::LinearPolicy::A16Only, true});
         }
+        if (n == 512 && k == 4096) {
+            for (int t : {4, 8, 16, 32, 48, 64, 96, 128, 192, 256, 384, 512, 1024, 2048, 4096})
+                calls.push_back({t, CallForm::Policy, ops::LinearPolicy::A16Only});
+            for (int t : {49, 65, 97, 129, 193, 385, 513, 1025})
+                calls.push_back({t, CallForm::Policy, ops::LinearPolicy::A16Only, true});
+        }
         add_shape(suite, QType::FP8_E4M3FN_BLOCK128X128_FP32, ActivationRecipe::Hashed,
                   native_weight<QType::FP8_E4M3FN_BLOCK128X128_FP32>,
                   {n, k, 1457U, Comparison::Sampled, true, calls});

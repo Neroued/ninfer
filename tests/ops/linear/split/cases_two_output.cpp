@@ -1,4 +1,5 @@
 #include "ops/linear/split/runner.h"
+#include "core/platform.h"
 
 namespace ninfer::test::linear_split {
 
@@ -6,6 +7,69 @@ void add_two_output_cases(Suite& suite) {
     using Policy = ops::LinearPolicy;
     constexpr ReductionCriterion paired_a16{3.0e-3, 4.0e-3, 3.5e-3};
     constexpr ReductionCriterion a16{1.0 / 256.0, 1.0 / 256.0, 2.0 / 256.0};
+#if NINFER_TARGET_SPARK
+    {
+        Profile profile{
+            1536,
+            {{QType::FP8_E4M3FN_BLOCK128X128_FP32, 16384, 1201U}, {QType::BF16, 4096, 1203U}},
+            {16384, 4096},
+            {{0, 16384}, {16384, 4096}},
+            a16};
+        std::vector<Invocation> calls;
+        for (int t : {1, 4, 5, 33, 129, 257})
+            calls.push_back({.t = t, .input_seed = 1207U, .columns = Columns::Seven});
+        calls.push_back({.t            = 17,
+                         .graph        = true,
+                         .input_seed   = 1207U,
+                         .changed_seed = 1213U,
+                         .columns      = Columns::Seven});
+        add_profile(suite, profile, std::move(calls));
+    }
+    {
+        Profile profile{
+            1536, {{QType::MXFP8, 20480, 1223U}}, {16384, 4096}, {{0, 16384}, {16384, 4096}}, a16};
+        std::vector<Invocation> calls;
+        for (int t : {1, 4, 5, 33, 129})
+            calls.push_back({.t          = t,
+                             .policy     = Policy::AllowA8,
+                             .input_seed = 1229U,
+                             .columns    = Columns::Seven});
+        for (int t : {5, 129})
+            calls.push_back({.t = t, .input_seed = 1229U, .columns = Columns::Seven});
+        calls.push_back({.t            = 17,
+                         .policy       = Policy::AllowA8,
+                         .graph        = true,
+                         .input_seed   = 1229U,
+                         .changed_seed = 1231U,
+                         .columns      = Columns::Seven});
+        calls.push_back({.t = 0, .policy = Policy::AllowA8, .workspace_intervals = true});
+        add_profile(suite, profile, std::move(calls));
+    }
+    {
+        Profile profile{1024,
+                        {{QType::MXFP8, 3072, 1237U}},
+                        {1024, 1024, 1024},
+                        {{0, 1024}, {1024, 1024}, {2048, 1024}},
+                        a16};
+        profile.bias = true;
+        std::vector<Invocation> calls;
+        for (int t : {1, 4, 5, 33, 129})
+            calls.push_back({.t          = t,
+                             .policy     = Policy::AllowA8,
+                             .input_seed = 1249U,
+                             .columns    = Columns::Seven});
+        for (int t : {5, 129})
+            calls.push_back({.t = t, .input_seed = 1249U, .columns = Columns::Seven});
+        calls.push_back({.t            = 17,
+                         .policy       = Policy::AllowA8,
+                         .graph        = true,
+                         .input_seed   = 1249U,
+                         .changed_seed = 1259U,
+                         .columns      = Columns::Seven});
+        calls.push_back({.t = 0, .policy = Policy::AllowA8, .workspace_intervals = true});
+        add_profile(suite, profile, std::move(calls));
+    }
+#endif
     {
         Profile profile{5120,
                         {{QType::Q4_G64_FP16, 4096, 409U}, {QType::Q5_G64_FP16, 12288, 419U}},

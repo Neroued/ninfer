@@ -707,14 +707,14 @@ int run_record_fold_rounds(bool q8 = false, bool local = false) {
                  ops::SingleProjectionWeight{qk_parent.view(), ops::LinearPolicy::A16Only}, 1,
                  kWidth, kWidth)
            : ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
-                 ops::PairedProjectionWeights{qk_parent.view(), vz_parent->view()}, 1, kWidth,
+                 ops::PairedProjectionWeights{{qk_parent.view()}, {vz_parent->view()}}, 1, kWidth,
                  kWidth);
     const std::size_t record_workspace_bytes =
         q8 ? ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
                  ops::SingleProjectionWeight{qk_parent.view(), ops::LinearPolicy::A16Only}, 1,
                  kWidth, kWidth)
            : ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
-                 ops::PairedProjectionWeights{qk_parent.view(), vz_parent->view()}, 1, kWidth,
+                 ops::PairedProjectionWeights{{qk_parent.view()}, {vz_parent->view()}}, 1, kWidth,
                  kWidth);
     ninfer::DeviceBuffer snapshot_workspace_storage(
         ninfer::test::cuda_environment().context.device(),
@@ -764,12 +764,12 @@ int run_record_fold_rounds(bool q8 = false, bool local = false) {
                     record_workspace, ninfer::test::cuda_environment().default_execution);
             } else {
                 ops::gdn_input_proj_conv_snapshot(
-                    x, ops::PairedProjectionWeights{qk_parent.view(), vz_parent->view()},
+                    x, ops::PairedProjectionWeights{{qk_parent.view()}, {vz_parent->view()}},
                     conv_weight, {conv_states, snapshots, snapshot_selector}, valid,
                     {snapshot_query, snapshot_key, snapshot_value, snapshot_z_tensor},
                     snapshot_workspace, ninfer::test::cuda_environment().default_execution);
                 ops::gdn_input_proj_conv_record(
-                    x, ops::PairedProjectionWeights{qk_parent.view(), vz_parent->view()},
+                    x, ops::PairedProjectionWeights{{qk_parent.view()}, {vz_parent->view()}},
                     conv_weight, conv_states, valid,
                     {record_query, record_key, record_value, record_z_tensor}, layer_records.conv,
                     record_workspace, ninfer::test::cuda_environment().default_execution);

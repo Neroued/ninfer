@@ -181,7 +181,6 @@ LinearProfile describe_linear_weight(std::span<const WeightInput> rows) {
 ProjectionProfile describe_projection_weights(std::span<const WeightInput> rows) {
     auto banks = projection_regions(rows, describe_single);
     if (banks.size() == 1) return {banks[0], {}};
-    banks[0].policy = banks[1].policy = LinearPolicy::A16Only;
     return {banks[0], banks[1]};
 }
 
@@ -191,7 +190,7 @@ ProjectionWeights prepare_projection_weights(std::span<const WeightInput> rows) 
             return single(view, inputs);
         });
     if (banks.size() == 1) return banks[0];
-    return PairedProjectionWeights{banks[0].weight, banks[1].weight};
+    return PairedProjectionWeights{banks[0], banks[1]};
 }
 
 ProjectionWeights prepare_gdn_control_proj_weights(const WeightInput& a, const WeightInput& b) {
@@ -213,7 +212,7 @@ ProjectionWeights prepare_gdn_control_proj_weights(const WeightInput& a, const W
     const auto second = prepare_linear_weight(b);
     require(first.weight.qtype == QType::BF16 && second.weight.qtype == QType::BF16,
             "GDN control requires BF16 weights");
-    return PairedProjectionWeights{first.weight, second.weight};
+    return PairedProjectionWeights{first, second};
 }
 
 SingleProjectionWeight prepare_linear_swiglu_weight(const WeightInput& gate,

@@ -14,6 +14,8 @@ target_sources(ninfer_ops PRIVATE "${CMAKE_CURRENT_LIST_DIR}/${NINFER_TARGET}/se
 
 if(NINFER_TARGET STREQUAL "dgx_spark")
   target_sources(ninfer_ops_non_rdc PRIVATE "${CMAKE_CURRENT_LIST_DIR}/dgx_spark/input_conv.cu")
+  target_sources(ninfer_ops_non_rdc PRIVATE "${CMAKE_CURRENT_LIST_DIR}/dgx_spark/mxfp8_input_conv.cu")
 else()
   target_sources(ninfer_ops PRIVATE "${CMAKE_CURRENT_LIST_DIR}/input_conv/launch.cu")
+  target_sources(ninfer_ops_non_rdc PRIVATE "${CMAKE_CURRENT_LIST_DIR}/input_conv/mxfp8.cu")
 endif()

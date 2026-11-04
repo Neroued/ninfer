@@ -9,6 +9,7 @@ struct Traffic {
     std::uint64_t read = 0, write = 0, state_read = 0, state_write = 0, record_read = 0,
                   record_write = 0;
     double projection_flops    = 0;
+    bool mxfp8_reference       = false;
 
     std::string csv(double us) const {
         const auto bytes = read + write;
@@ -18,6 +19,9 @@ struct Traffic {
           << kRoofline.sustained_read_gbs << ',' << bytes / (kRoofline.sustained_read_gbs * 1000)
           << ',' << projection_flops << ',';
         if (projection_flops) s << projection_flops / (kRoofline.bf16_f32_tflops * 1e6);
+        s << ',';
+        if (mxfp8_reference && projection_flops)
+            s << projection_flops / (kRoofline.mxfp8_f32_tflops * 1e6);
         return s.str();
     }
 
@@ -25,7 +29,7 @@ struct Traffic {
         "logical_read_bytes,logical_write_bytes,state_read_bytes,state_write_bytes,record_read_"
         "bytes,record_write_bytes,logical_GBps,"
         "memory_roofline_GBps,streaming_memory_reference_us,projection_flops,bf16_projection_"
-        "reference_us";
+        "reference_us,mxfp8_projection_reference_us";
 };
 
 inline Traffic traffic(Fixture& f, const std::string& op) {
@@ -52,10 +56,12 @@ inline Traffic traffic(Fixture& f, const std::string& op) {
         out.state_read   = 6ULL * f.channels * f.b;
         out.state_write  = op == "input-update" ? out.state_read : 0;
         out.record_write = op == "input-record" ? 2ULL * f.channels * n : 0;
-        out.read = f.weight.model_weight_bytes() + 2ULL * 4096 * f.t * f.b + 16ULL * f.channels +
-                   out.state_read;
+        out.read =
+            f.weight.model_weight_bytes() + 2ULL * 4096 * n + f.conv_weight.size() + out.state_read;
         out.write            = 2ULL * f.channels * f.t * f.b + out.state_write + out.record_write;
-        out.projection_flops = 2.0 * 12288 * 4096 * f.t * f.b;
+        out.projection_flops = 2.0 * 12288 * 4096 * n;
+        out.mxfp8_reference =
+            f.weight.weight.qtype == QType::MXFP8 && f.input_policy() == ops::LinearPolicy::AllowA8;
     } else if (op == "chain") {
         auto input = traffic(f, "input-record"), rec = traffic(f, "record"),
              fold = traffic(f, "fold");
@@ -67,6 +73,7 @@ inline Traffic traffic(Fixture& f, const std::string& op) {
         out.record_read      = fold.record_read;
         out.record_write     = input.record_write + rec.record_write;
         out.projection_flops = input.projection_flops;
+        out.mxfp8_reference  = input.mxfp8_reference;
     } else {
         out.state_read    = state;
         out.state_write   = op == "record" ? 0 : state;

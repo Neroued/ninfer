@@ -8,10 +8,11 @@
 
 namespace ninfer::ops::detail {
 template <class Schedule, class Output, class Epilogue>
-__global__
-__launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_a16_sliced_k_mma_kernel(
-    const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ weight, Output output,
-    Epilogue epilogue, int rows, int input_rows, int tokens, int token_offset) {
+__device__ __forceinline__ void
+bf16_a16_sliced_k_mma_body(const __nv_bfloat16* __restrict__ x,
+                           const __nv_bfloat16* __restrict__ weight, Output output,
+                           Epilogue epilogue, int rows, int input_rows, int tokens, int row_tile,
+                           int token0, unsigned char* shared_raw) {
     const int kHidden          = Schedule::kStaticK ? Schedule::kStaticK : input_rows;
     constexpr int kMmaRows     = Schedule::kBlockRows;
     constexpr int kMmaK        = Schedule::kWarpK;
@@ -22,7 +23,6 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_a16_s
     const int kGroups = kHidden / kBlockK + (bf16_predicated_k<Schedule> && kHidden % kBlockK != 0);
     static_assert((kMmaK % 16) == 0);
 
-    extern __shared__ __align__(16) unsigned char shared_raw[];
     auto* staging = reinterpret_cast<__nv_bfloat16*>(shared_raw);
     auto* partial = reinterpret_cast<float*>(shared_raw);
 
@@ -31,8 +31,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_a16_s
     const int lane         = tid & 31;
     const int gid          = lane >> 2;
     const int lid          = lane & 3;
-    const int row0         = static_cast<int>(blockIdx.x) * Schedule::kBlockRows;
-    const int token0       = token_offset + static_cast<int>(blockIdx.y) * kBlockTokens;
+    const int row0         = row_tile * Schedule::kBlockRows;
     const auto destination = linear_output_tile<Schedule::kBlockRows>(output, row0);
 
     const int a_matrix     = lane >> 3;
@@ -207,10 +206,21 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_a16_s
             }
             const int mi = fragment / kTokenMmas, ni = fragment % kTokenMmas;
             const int token = token0 + ni * 8 + 2 * lid;
-            bf16_finish_fragment<false, decltype(destination), Epilogue,
-                                 !bf16_predicated_rows<Schedule>>(
+            linear_finish_mma_fragment<false, decltype(destination), Epilogue,
+                                       !bf16_predicated_rows<Schedule>>(
                 destination, epilogue, row0 + mi * 16 + gid, token, sum, rows, tokens);
         }
     }
+}
+
+template <class Schedule, class Output, class Epilogue>
+__global__
+__launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_a16_sliced_k_mma_kernel(
+    const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ weight, Output output,
+    Epilogue epilogue, int rows, int input_rows, int tokens, int token_offset) {
+    extern __shared__ __align__(16) unsigned char shared_raw[];
+    bf16_a16_sliced_k_mma_body<Schedule>(
+        x, weight, output, epilogue, rows, input_rows, tokens, blockIdx.x,
+        token_offset + blockIdx.y * Schedule::kBlockTokens, shared_raw);
 }
 } // namespace ninfer::ops::detail

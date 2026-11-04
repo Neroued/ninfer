@@ -5,6 +5,7 @@ namespace ninfer::bench::kda {
 struct Options {
     measurement::Options timing;
     std::string op = "record", valid = "dense", commits = "dense";
+    std::string format = "q8", policy = "default";
     std::vector<int> tokens{4};
     int heads = 32, qk_heads = 32, batch = 1, layers = 34;
     bool alias_records = true;
@@ -20,6 +21,8 @@ inline Options parse(int argc, char** argv) {
                          "  --tokens T[,T...] --batch B --layers L --qk-heads H --value-heads H\n"
                          "  --valid dense|N[,N...] --commits dense|N[,N...]\n"
                          "  --kv-records alias|copy (record only; default alias)\n"
+                         "  --format q8|mxfp8 --policy a16|a8 (input projection; default follows "
+                         "format)\n"
                          "core is single sequence; update is T=1; fold measures all layers.\n"
                          "chain measures one input-record, recurrence-record and one-layer fold.\n";
             measurement::help();
@@ -42,7 +45,13 @@ inline Options parse(int argc, char** argv) {
             o.valid = value;
         else if (flag == "--commits")
             o.commits = value;
-        else if (flag == "--kv-records") {
+        else if (flag == "--format") {
+            if (value != "q8" && value != "mxfp8") throw std::invalid_argument("format: q8|mxfp8");
+            o.format = value;
+        } else if (flag == "--policy") {
+            if (value != "a16" && value != "a8") throw std::invalid_argument("policy: a16|a8");
+            o.policy = value;
+        } else if (flag == "--kv-records") {
             if (value != "alias" && value != "copy")
                 throw std::invalid_argument("kv-records: alias|copy");
             o.alias_records = value == "alias";

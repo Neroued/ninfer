@@ -12,8 +12,11 @@ constexpr int channels   = detail::kda_input::kProjectionFeatures;
 constexpr int hidden     = detail::kda_input::kInputFeatures;
 
 void validate_profile(const LinearProfile& p) {
-    if (p.qtype != QType::Q8_G32_FP16 || p.layout != QuantLayout::RowSplit || p.n != channels ||
-        p.k != hidden || p.policy != LinearPolicy::A16Only)
+    const bool q8 = p.qtype == QType::Q8_G32_FP16 && p.layout == QuantLayout::RowSplit &&
+                    p.policy == LinearPolicy::A16Only;
+    const bool mx = p.qtype == QType::MXFP8 && p.layout == QuantLayout::RowGroupScale &&
+                    (p.policy == LinearPolicy::A16Only || p.policy == LinearPolicy::AllowA8);
+    if ((!q8 && !mx) || p.n != channels || p.k != hidden)
         throw std::invalid_argument("KDA input: unsupported projection profile");
 }
 
@@ -21,9 +24,11 @@ std::size_t capacity(const LinearProfile& p, int batch, int first, int last, boo
     validate_profile(p);
     if (batch < 1 || batch > 8 || first < 1 || last < first)
         throw std::invalid_argument("KDA input: invalid batch or token interval");
-    if (last > std::numeric_limits<int>::max() / batch)
+    if (p.qtype != QType::MXFP8 && last > std::numeric_limits<int>::max() / batch)
         throw std::overflow_error("KDA input: flattened token extent exceeds int32");
-    return detail::kda_input::workspace_capacity(batch, first, last, update);
+    return p.qtype == QType::MXFP8
+               ? detail::kda_input::mxfp8_workspace_capacity(batch, first, last, update, p.policy)
+               : detail::kda_input::workspace_capacity(batch, first, last, update);
 }
 
 void execute(const Tensor& x, const SingleProjectionWeight& qkv, const Tensor& weights,
@@ -32,16 +37,25 @@ void execute(const Tensor& x, const SingleProjectionWeight& qkv, const Tensor& w
     const int width = x.ne[1], batch = x.ne[2];
     const auto bytes = capacity(linear_profile(qkv), batch, width, width, !records.data);
     const auto& w    = qkv.weight;
+    const bool mx    = w.qtype == QType::MXFP8;
     common::operand::device(w.device, cuda.device(), op, "weight");
     common::operand::device(workspace.device(), cuda.device(), op, "workspace");
-    if (w.ndim != 2 || w.group_size != 32 || w.group != 32 || w.scale_dtype != DType::FP16 ||
-        w.shape[0] != channels || w.shape[1] != hidden || w.padded_shape[0] != channels ||
-        w.padded_shape[1] != hidden || w.qhigh || w.high_plane_bytes)
-        throw std::invalid_argument("KDA input: invalid RowSplit weights");
+    if (!mx &&
+        (w.ndim != 2 || w.group_size != 32 || w.group != 32 || w.scale_dtype != DType::FP16 ||
+         w.shape[0] != channels || w.shape[1] != hidden || w.padded_shape[0] != channels ||
+         w.padded_shape[1] != hidden || w.qhigh || w.high_plane_bytes))
+        throw std::invalid_argument("KDA input: invalid projection weight geometry");
     common::operand::tensor(x, DType::BF16, {hidden, width, batch}, 16, op, "input", cuda.device());
-    detail::validate_q8_operands(detail::q8_linear_operands(x.view({hidden, width * batch}), w));
-    common::operand::tensor(weights, DType::FP32, {channels, 4}, 16, op, "convolution weights",
-                            cuda.device());
+    if (mx) {
+        (void)common::validate_mxfp8_weight(w, op);
+    } else {
+        detail::validate_q8_operands(
+            detail::q8_linear_operands(x.view({hidden, width * batch}), w));
+    }
+    const auto code_bytes  = std::size_t(channels) * hidden;
+    const auto scale_bytes = code_bytes / (mx ? 32 : 16);
+    common::operand::tensor(weights, mx ? DType::BF16 : DType::FP32, {channels, 4}, 16, op,
+                            "convolution weights", cuda.device());
     common::operand::state_field(source, DType::BF16, {channels, 3}, 16, op, "source",
                                  cuda.device());
     if (source.field.layers != 1)
@@ -75,13 +89,11 @@ void execute(const Tensor& x, const SingleProjectionWeight& qkv, const Tensor& w
         for (const auto* input : inputs)
             if (input->data)
                 common::operand::disjoint(range, common::operand::range(*input, op), op);
-        common::operand::disjoint(
-            range, common::operand::range(w.qdata, std::size_t(channels) * hidden, op), op);
-        common::operand::disjoint(
-            range, common::operand::range(w.scales, std::size_t(channels) * hidden / 16, op), op);
+        common::operand::disjoint(range, common::operand::range(w.qdata, code_bytes, op), op);
+        common::operand::disjoint(range, common::operand::range(w.scales, scale_bytes, op), op);
     }
-    auto scope          = workspace.scope();
-    float* scratch_data = bytes ? static_cast<float*>(workspace.alloc_bytes(bytes).data) : nullptr;
+    auto scope         = workspace.scope();
+    void* scratch_data = bytes ? workspace.alloc_bytes(bytes).data : nullptr;
     if (scratch_data) {
         const auto scratch = common::operand::range(scratch_data, bytes, op);
         for (const auto* tensor : inputs)
@@ -90,13 +102,11 @@ void execute(const Tensor& x, const SingleProjectionWeight& qkv, const Tensor& w
         for (const auto* tensor : outputs)
             if (tensor->data)
                 common::operand::disjoint(scratch, common::operand::range(*tensor, op), op);
-        common::operand::disjoint(
-            scratch, common::operand::range(w.qdata, std::size_t(channels) * hidden, op), op);
-        common::operand::disjoint(
-            scratch, common::operand::range(w.scales, std::size_t(channels) * hidden / 16, op), op);
+        common::operand::disjoint(scratch, common::operand::range(w.qdata, code_bytes, op), op);
+        common::operand::disjoint(scratch, common::operand::range(w.scales, scale_bytes, op), op);
     }
     const detail::kda_input::Arguments a{
-        static_cast<const float*>(weights.data),
+        weights.data,
         common::operand::state_field_base<const __nv_bfloat16>(source),
         records.data ? nullptr : common::operand::state_field_base<__nv_bfloat16>(destination),
         static_cast<const std::int64_t*>(source.records.byte_offsets.data),
@@ -108,7 +118,10 @@ void execute(const Tensor& x, const SingleProjectionWeight& qkv, const Tensor& w
         static_cast<__nv_bfloat16*>(records.data),
         width,
         batch};
-    detail::kda_input::launch(x, w, a, scratch_data, cuda.stream());
+    if (mx)
+        detail::kda_input::launch_mxfp8(x, w, qkv.policy, a, scratch_data, cuda.stream());
+    else
+        detail::kda_input::launch(x, w, a, static_cast<float*>(scratch_data), cuda.stream());
 }
 } // namespace
 

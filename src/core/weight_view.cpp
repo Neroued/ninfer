@@ -77,13 +77,12 @@ std::uint64_t weight_element_count(std::span<const std::uint64_t> shape) {
     return count;
 }
 
-WeightGeometry weight_geometry(QType format, QuantLayout layout,
-                               std::span<const std::uint64_t> shape,
-                               WeightLayoutParameters parameters) {
-    WeightGeometry out;
-    out.format = format;
-    out.layout = layout;
-    out.shape.assign(shape.begin(), shape.end());
+WeightStorageGeometry weight_storage_geometry(QType format, QuantLayout layout,
+                                              std::span<const std::uint64_t> shape,
+                                              WeightLayoutParameters parameters) {
+    WeightStorageGeometry out;
+    out.format   = format;
+    out.layout   = layout;
     out.elements = weight_element_count(shape);
     if (parameters.exception_count.has_value() != (layout == QuantLayout::Csf32)) {
         throw std::invalid_argument("CSF layout requires its exception count exclusively");
@@ -251,6 +250,13 @@ WeightGeometry weight_geometry(QType format, QuantLayout layout,
         out.bytes               = add(out.bytes, mul(matrices, 4));
     }
     return out;
+}
+
+WeightGeometry weight_geometry(QType format, QuantLayout layout,
+                               std::span<const std::uint64_t> shape,
+                               WeightLayoutParameters parameters) {
+    return {weight_storage_geometry(format, layout, shape, parameters),
+            {shape.begin(), shape.end()}};
 }
 
 Csf32Block csf32_block(const WeightGeometry& g, std::uint64_t ordinal) {

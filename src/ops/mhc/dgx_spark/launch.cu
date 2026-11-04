@@ -73,18 +73,19 @@ void launch_cluster_tiles(Operands o, CudaExecutionView e) {
     }
 }
 
-template <Form F>
+template <class Gamma, Form F>
 void launch_cluster(Operands o, CudaExecutionView e) {
     if constexpr (F == Form::ExpandPre) {
-        launch_cluster_tiles<ExpandClusterTile<512, 128>, expand_cluster_kernel<512, 128>>(o, e);
+        launch_cluster_tiles<ExpandClusterTile<512, 128>, expand_cluster_kernel<Gamma, 512, 128>>(
+            o, e);
     } else {
         constexpr int BK = F == Form::Pre ? 128 : 64, Stages = F == Form::Pre ? 2 : 4;
         launch_cluster_tiles<ClusterPreTile<8, 8, BK, Stages>,
-                             pre_cluster_kernel<F, 8, 8, BK, Stages>, F == Form::Pre>(o, e);
+                             pre_cluster_kernel<Gamma, F, 8, 8, BK, Stages>, F == Form::Pre>(o, e);
     }
 }
 
-template <Form F>
+template <class Gamma, Form F>
 void launch_pre(Operands o, Plan p, float* scratch, CudaExecutionView e) {
     if (p.method == Method::VectorProjection) {
         if constexpr (F == Form::Pre || F == Form::ExpandPre) {
@@ -93,10 +94,10 @@ void launch_pre(Operands o, Plan p, float* scratch, CudaExecutionView e) {
                 <<<dim3(Parts, kRows), Threads, 0, e.stream()>>>(o, scratch);
             CUDA_CHECK(cudaGetLastError());
             if constexpr (F == Form::Pre)
-                launch_dependent_finish<544, pre_finish_kernel<544, 8, Parts, true, true>>(
+                launch_dependent_finish<544, pre_finish_kernel<Gamma, 544, 8, Parts, true, true>>(
                     o.columns, e, o, scratch, Parts);
             else
-                launch_dependent_finish<544, expand_finish_kernel<544, 8, Parts, true>>(
+                launch_dependent_finish<544, expand_finish_kernel<Gamma, 544, 8, Parts, true>>(
                     o.columns, e, o, scratch, Parts);
         } else {
             throw std::logic_error("mhc: invalid vector projection plan");
@@ -113,52 +114,57 @@ void launch_pre(Operands o, Plan p, float* scratch, CudaExecutionView e) {
         throw std::logic_error("mhc: invalid post-pre projection plan");
     if constexpr (F == Form::ExpandPre) {
         if (p.output_threads == 288)
-            launch_dependent_finish<288, expand_finish_kernel<288, 16, 64, true>>(o.columns, e, o,
-                                                                                  scratch, 64);
+            launch_dependent_finish<288, expand_finish_kernel<Gamma, 288, 16, 64, true>>(
+                o.columns, e, o, scratch, 64);
         else if (p.output_threads == 128)
-            expand_finish_kernel<128><<<o.columns, 128, 0, e.stream()>>>(o, scratch, p.partials);
+            expand_finish_kernel<Gamma, 128>
+                <<<o.columns, 128, 0, e.stream()>>>(o, scratch, p.partials);
         else
-            expand_finish_kernel<256><<<o.columns, 256, 0, e.stream()>>>(o, scratch, p.partials);
+            expand_finish_kernel<Gamma, 256>
+                <<<o.columns, 256, 0, e.stream()>>>(o, scratch, p.partials);
     } else {
         if constexpr (F == Form::PostPre) o.residual = o.updated;
         if (p.output_threads == 544)
-            launch_dependent_finish<544, pre_finish_kernel<544, 8, 64, true, F == Form::Pre>>(
+            launch_dependent_finish<544,
+                                    pre_finish_kernel<Gamma, 544, 8, 64, true, F == Form::Pre>>(
                 o.columns, e, o, scratch, 64);
         else if (p.output_threads == 288)
-            launch_dependent_finish<288, pre_finish_kernel<288, 16, 64, true, F == Form::Pre>>(
+            launch_dependent_finish<288,
+                                    pre_finish_kernel<Gamma, 288, 16, 64, true, F == Form::Pre>>(
                 o.columns, e, o, scratch, 64);
         else if (p.output_threads == 128)
-            pre_finish_kernel<128, 8, 0, false, false, true>
+            pre_finish_kernel<Gamma, 128, 8, 0, false, false, true>
                 <<<o.columns, 128, 0, e.stream()>>>(o, scratch, p.partials);
         else if (p.output_threads == 512)
-            pre_finish_kernel<512, 4><<<o.columns, 512, 0, e.stream()>>>(o, scratch, p.partials);
+            pre_finish_kernel<Gamma, 512, 4>
+                <<<o.columns, 512, 0, e.stream()>>>(o, scratch, p.partials);
         else
             throw std::logic_error("mhc: invalid pre finish plan");
     }
     CUDA_CHECK(cudaGetLastError());
 }
-} // namespace
 
-void launch(Form form, Operands o, Plan p, void* scratch, CudaExecutionView e) {
+template <class Gamma>
+void launch_typed(Form form, Operands o, Plan p, void* scratch, CudaExecutionView e) {
     auto* partial = static_cast<float*>(scratch);
     switch (form) {
     case Form::Pre:
         if (p.method == Method::ClusterProjection)
-            launch_cluster<Form::Pre>(o, e);
+            launch_cluster<Gamma, Form::Pre>(o, e);
         else
-            launch_pre<Form::Pre>(o, p, partial, e);
+            launch_pre<Gamma, Form::Pre>(o, p, partial, e);
         return;
     case Form::ExpandPre:
         if (p.method == Method::ClusterProjection)
-            launch_cluster<Form::ExpandPre>(o, e);
+            launch_cluster<Gamma, Form::ExpandPre>(o, e);
         else
-            launch_pre<Form::ExpandPre>(o, p, partial, e);
+            launch_pre<Gamma, Form::ExpandPre>(o, p, partial, e);
         return;
     case Form::PostPre:
         if (p.method == Method::ClusterProjection) {
-            launch_cluster<Form::PostPre>(o, e);
+            launch_cluster<Gamma, Form::PostPre>(o, e);
         } else {
-            launch_pre<Form::PostPre>(o, p, partial, e);
+            launch_pre<Gamma, Form::PostPre>(o, p, partial, e);
         }
         return;
     case Form::PostMeanNorm:
@@ -167,21 +173,22 @@ void launch(Form form, Operands o, Plan p, void* scratch, CudaExecutionView e) {
                 post_mean_norm_partial_kernel<128, 1>
                     <<<o.columns * 32, 128, 0, e.stream()>>>(o, partial);
                 CUDA_CHECK(cudaGetLastError());
-                post_mean_norm_finish_kernel<32, 128, 4>
+                post_mean_norm_finish_kernel<Gamma, 32, 128, 4>
                     <<<o.columns * 8, 128, 0, e.stream()>>>(o, partial);
             } else {
                 post_mean_norm_partial_kernel<128, 2>
                     <<<o.columns * 16, 128, 0, e.stream()>>>(o, partial);
                 CUDA_CHECK(cudaGetLastError());
-                post_mean_norm_finish_kernel<16, 128, 4>
+                post_mean_norm_finish_kernel<Gamma, 16, 128, 4>
                     <<<o.columns * 8, 128, 0, e.stream()>>>(o, partial);
             }
         } else if (p.method == Method::ClusterMean) {
-            post_mean_norm_cluster_kernel<4, 128, 4><<<o.columns * 4, 128, 0, e.stream()>>>(o);
+            post_mean_norm_cluster_kernel<Gamma, 4, 128, 4>
+                <<<o.columns * 4, 128, 0, e.stream()>>>(o);
         } else if (p.output_threads == 256) {
-            post_mean_norm_vector_kernel<256, 8><<<o.columns, 256, 0, e.stream()>>>(o);
+            post_mean_norm_vector_kernel<Gamma, 256, 8><<<o.columns, 256, 0, e.stream()>>>(o);
         } else {
-            post_mean_norm_vector_kernel<1024, 4><<<o.columns, 1024, 0, e.stream()>>>(o);
+            post_mean_norm_vector_kernel<Gamma, 1024, 4><<<o.columns, 1024, 0, e.stream()>>>(o);
         }
         CUDA_CHECK(cudaGetLastError());
         return;
@@ -204,5 +211,14 @@ void launch(Form form, Operands o, Plan p, void* scratch, CudaExecutionView e) {
             CUDA_CHECK(cudaGetLastError());
         }
     }
+}
+
+} // namespace
+
+void launch(Form form, Operands o, Plan p, void* scratch, CudaExecutionView e) {
+    if (o.gamma_type == DType::FP32)
+        launch_typed<float>(form, o, p, scratch, e);
+    else
+        launch_typed<__nv_bfloat16>(form, o, p, scratch, e);
 }
 } // namespace ninfer::ops::detail::mhc

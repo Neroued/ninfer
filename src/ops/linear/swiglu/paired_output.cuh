@@ -48,6 +48,18 @@ struct SwiGluBranchRows {
     }
 };
 
+template <int RowsPerBranch>
+struct SwiGluInterleavedRows {
+    static_assert(RowsPerBranch == 8);
+    static constexpr bool kPaired         = true;
+    static constexpr int kTmaRowsPerPanel = RowsPerBranch;
+
+    __device__ __forceinline__ int weight_row(int begin, int row, int rows) const {
+        return begin + (row / (2 * RowsPerBranch)) * RowsPerBranch + row % RowsPerBranch +
+               ((row & RowsPerBranch) ? rows / 2 : 0);
+    }
+};
+
 struct SwiGluPairEpilogue {
     template <class Output>
     __device__ __forceinline__ void apply_pair(Output output, int row, int token, float gate,

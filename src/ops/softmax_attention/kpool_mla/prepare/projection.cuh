@@ -5,25 +5,53 @@
 
 namespace ninfer::ops::detail::kpool {
 
+struct ProjectionRowMap {
+    int begin[5]{}, end[5]{}, destination[5]{};
+
+    __device__ __forceinline__ int operator()(int row) const {
+#pragma unroll
+        for (int i = 0; i < 5; ++i)
+            if (row >= begin[i] && row < end[i]) return destination[i] + row - begin[i];
+        return -1;
+    }
+};
+
+inline ProjectionRowMap projection_row_map(const KpoolMlaProjectionLayout& rows, int parent) {
+    const KpoolProjectionRows roles[]{rows.latent, rows.index_key, rows.pool_gate, rows.query,
+                                      rows.coefficients};
+    constexpr int destinations[]{0, 512, 640, 768, 2304};
+    ProjectionRowMap out;
+    for (int i = 0; i < 5; ++i)
+        if (roles[i].rows && roles[i].parent == parent) {
+            out.begin[i]       = roles[i].row_begin;
+            out.end[i]         = roles[i].row_begin + roles[i].rows;
+            out.destination[i] = destinations[i];
+        }
+    return out;
+}
+
 struct ProjectionPartialOutput {
     float* data;
     int rows, columns;
+    ProjectionRowMap mapping;
 
     __device__ __forceinline__ void store(int row, int column, float value) const {
-        data[(std::int64_t(blockIdx.z) * columns + column) * rows + row] = value;
+        data[(std::int64_t(blockIdx.z) * columns + column) * rows + mapping(row)] = value;
     }
 
     __device__ __forceinline__ void store4(int row, int column, float4 value) const {
         *reinterpret_cast<float4*>(data + (std::int64_t(blockIdx.z) * columns + column) * rows +
-                                   row) = value;
+                                   mapping(row)) = value;
     }
 };
 
 struct ProjectionOutput {
     PrepareArguments args;
     std::int64_t begin;
+    ProjectionRowMap mapping;
 
     __device__ __forceinline__ void store(int row, int column, float value) const {
+        row          = mapping(row);
         const auto m = begin + column;
         int b, t;
         coordinate(args, column, b, t);
@@ -49,6 +77,7 @@ struct ProjectionOutput {
     }
 
     __device__ __forceinline__ void store4(int row, int column, float4 value) const {
+        row          = mapping(row);
         const auto m = begin + column;
         int b, t;
         coordinate(args, column, b, t);
@@ -79,7 +108,7 @@ struct ProjectionOutput {
 
 // Retired operand staging is reused to transpose FP32 accumulators. Unlike the Linear BF16
 // vector epilogue this preserves the complete accumulator through normalization.
-struct ProjectionTmaEpilogue {
+struct ProjectionTileEpilogue {
     static constexpr bool kTmaCollective  = true;
     static constexpr bool kPredicatedRows = true;
     template <class S>
@@ -91,10 +120,16 @@ struct ProjectionTmaEpilogue {
                                                 int row_begin, int token_begin, int rows,
                                                 int tokens) const {
         constexpr int BR = S::kBlockRows, BT = S::kBlockTokens, PR = (BR + 63) / 64 * 64;
+        constexpr int Producers = [] {
+            if constexpr (requires { S::kProducerThreads; })
+                return S::kProducerThreads;
+            else
+                return 0;
+        }();
         auto* tile    = reinterpret_cast<float*>(scratch);
         const auto at = [&](int r, int t) { return tile + t * PR + (r ^ ((t & 7) << 3)); };
-        if (threadIdx.x >= S::kProducerThreads) {
-            const int tid = threadIdx.x - S::kProducerThreads, warp = tid / 32, lane = tid & 31;
+        if (threadIdx.x >= Producers) {
+            const int tid = threadIdx.x - Producers, warp = tid / 32, lane = tid & 31;
             const int wm = warp / S::kWarpsTokens, wn = warp % S::kWarpsTokens;
 #pragma unroll
             for (int mi = 0; mi < S::kMmaRows; ++mi) {

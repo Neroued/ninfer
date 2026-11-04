@@ -17,8 +17,8 @@ int main(int argc, char** argv) {
             measurement::Row row;
             row.op = o.op;
             if (o.op.starts_with("input-") || o.op == "chain") {
-                row.format = "q8_g32_fp16";
-                row.policy = "a16";
+                row.format = o.format == "mxfp8" ? "mxfp8" : "q8_g32_fp16";
+                row.policy = f.input_policy() == ops::LinearPolicy::AllowA8 ? "a8" : "a16";
                 row.n      = 12288;
                 row.k      = 4096;
             }

@@ -129,9 +129,10 @@ public:
 
     ops::MoeExecutionHints prefetch(const ops::ProjectionWeights& projection,
                                     WeightId query) const {
-        const auto* single = std::get_if<LinearParameters>(&projection);
-        const auto& weight =
-            single ? single->weight : std::get<ops::PairedProjectionWeights>(projection).first;
+        const auto* single   = std::get_if<LinearParameters>(&projection);
+        const auto& weight   = single
+                                   ? single->weight
+                                   : std::get<ops::PairedProjectionWeights>(projection).first.weight;
         const auto& geometry = model_.weight(query).view.parts.front().parent->geometry;
         const auto row_bytes = geometry.layout == QuantLayout::Contiguous
                                    ? std::uint64_t(weight.k) * dtype_size(DType::BF16)

@@ -49,7 +49,7 @@ Weights::Weights(Profile p, bool record) : profile(p), first(make_first(p, recor
 }
 
 ops::ProjectionWeights Weights::projection(ops::LinearPolicy policy) const {
-    if (second) return ops::PairedProjectionWeights{first.view(), second->view()};
+    if (second) return ops::PairedProjectionWeights{{first.view()}, {second->view()}};
     return ops::SingleProjectionWeight{first.view(), policy};
 }
 

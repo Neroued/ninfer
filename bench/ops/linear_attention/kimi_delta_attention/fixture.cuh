@@ -104,11 +104,14 @@ struct Fixture {
             capacity = ops::kimi_delta_attention_workspace_capacity_bytes(qh, h, t, t);
         if (o.op.starts_with("input-") || o.op == "chain") {
             if (qh != 32 || h != 32) throw std::invalid_argument("input geometry is Hq=Hv=32");
-            weight      = make_row_split_weight(QType::Q8_G32_FP16, 12288, 4096, 4096, 101);
+            weight      = o.format == "mxfp8"
+                              ? make_mxfp8_weight(12288, 4096, 101)
+                              : make_row_split_weight(QType::Q8_G32_FP16, 12288, 4096, 4096, 101);
             input       = make_bf16(std::size_t(4096) * t * b, 103, -0.01F, 0.01F);
-            conv_weight = make_f32(12288 * 4, 105, -0.1F, 0.1F);
-            const ops::LinearProfile profile{QType::Q8_G32_FP16, 12288, 4096,
-                                             ops::LinearPolicy::A16Only, QuantLayout::RowSplit};
+            conv_weight = o.format == "mxfp8" ? make_bf16(12288 * 4, 105, -0.1F, 0.1F)
+                                              : make_f32(12288 * 4, 105, -0.1F, 0.1F);
+            const ops::LinearProfile profile{weight.weight.qtype, 12288, 4096, input_policy(),
+                                             weight.weight.layout};
             capacity =
                 o.op == "input-update"
                     ? ops::kda_input_proj_conv_update_workspace_capacity_bytes(profile, b, t, t)
@@ -128,6 +131,12 @@ struct Fixture {
     Tensor vt() { return Tensor(valid.span(), DType::I32, {b}); }
 
     Tensor ct() { return Tensor(commits.span(), DType::I32, {b}); }
+
+    ops::LinearPolicy input_policy() const {
+        return o.policy == "a8" || (o.policy == "default" && o.format == "mxfp8")
+                   ? ops::LinearPolicy::AllowA8
+                   : ops::LinearPolicy::A16Only;
+    }
 
     Tensor vector(DeviceBuffer& x, int heads) {
         return Tensor(x.span(), DType::BF16, {128, heads, t, b});
@@ -150,13 +159,14 @@ struct Fixture {
     }
 
     void input_call(bool record_mode, CudaExecutionView cuda) {
-        auto x           = Tensor(input.span(), DType::BF16, {4096, t, b}),
-             w           = Tensor(conv_weight.span(), DType::FP32, {12288, 4});
-        const auto key   = o.op == "chain" ? records.layer(0, b).key : vector(k, qh);
+        auto x         = Tensor(input.span(), DType::BF16, {4096, t, b}),
+             w         = Tensor(conv_weight.span(), o.format == "mxfp8" ? DType::BF16 : DType::FP32,
+                                {12288, 4});
+        const auto key = o.op == "chain" ? records.layer(0, b).key : vector(k, qh);
         const auto value = o.op == "chain" ? records.layer(0, b).value : vector(v, h);
         const ops::KdaConvOutputs outputs{vector(q, qh).view({4096, t, b}), key.view({4096, t, b}),
                                           value.view({4096, t, b})};
-        const ops::SingleProjectionWeight qw{weight.weight, ops::LinearPolicy::A16Only};
+        const ops::SingleProjectionWeight qw{weight.weight, input_policy()};
         if (record_mode) {
             auto rr = records.layer(0, b);
             ops::kda_input_proj_conv_record(x, qw, w, {states->layer_view(0, st()).conv}, vt(),

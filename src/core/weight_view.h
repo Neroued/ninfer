@@ -42,12 +42,10 @@ struct Csf32Geometry {
     friend bool operator==(const Csf32Geometry&, const Csf32Geometry&) = default;
 };
 
-// Geometry describes one complete encoded parent. Regions address its logical elements;
-// padding and scale words do not belong to that element domain.
-struct WeightGeometry {
-    QType format       = QType::BF16;
-    QuantLayout layout = QuantLayout::Contiguous;
-    std::vector<std::uint64_t> shape;
+// Fixed storage facts can be queried without retaining or allocating a logical shape.
+struct WeightStorageGeometry {
+    QType format                      = QType::BF16;
+    QuantLayout layout                = QuantLayout::Contiguous;
     std::uint64_t elements            = 0;
     std::uint64_t bytes               = 0;
     std::uint64_t alignment           = 256;
@@ -71,6 +69,15 @@ struct WeightGeometry {
     Csf32Geometry csf;
 };
 
+// Geometry describes one complete encoded parent. Regions address its logical elements;
+// padding and scale words do not belong to that element domain.
+struct WeightGeometry : WeightStorageGeometry {
+    std::vector<std::uint64_t> shape;
+};
+
+[[nodiscard]] WeightStorageGeometry weight_storage_geometry(QType format, QuantLayout layout,
+                                                            std::span<const std::uint64_t> shape,
+                                                            WeightLayoutParameters parameters = {});
 [[nodiscard]] WeightGeometry weight_geometry(QType format, QuantLayout layout,
                                              std::span<const std::uint64_t> shape,
                                              WeightLayoutParameters parameters = {});

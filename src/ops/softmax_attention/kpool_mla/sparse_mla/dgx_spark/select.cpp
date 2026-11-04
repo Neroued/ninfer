@@ -9,6 +9,9 @@ void sparse_mla_geometry(const KpoolSparseMlaProfile& p, KpoolMlaStorage storage
     require(p.query_heads == 64 && p.query_dim == 256 && p.value_dim == 256 &&
                 p.latent_dim == 512 && p.pool_size == 4 && p.selected_pools == 512,
             "unsupported Sparse MLA profile");
+    require((p.key_format == QType::BF16 || p.key_format == QType::MXFP8) &&
+                (p.value_format == QType::BF16 || p.value_format == QType::MXFP8),
+            "unsupported Sparse MLA factor format");
     require(storage == KpoolMlaStorage::BFloat16 ||
                 storage == KpoolMlaStorage::Fp8E4m3fnGroup128Ue8m0,
             "unsupported Sparse MLA latent format");
@@ -16,8 +19,8 @@ void sparse_mla_geometry(const KpoolSparseMlaProfile& p, KpoolMlaStorage storage
     require(envelope.max_visible_tokens <= kKpoolMaxVisibleTokens, "Sparse MLA context limit");
 }
 
-SparseMlaPlan sparse_mla_plan(KpoolMlaStorage storage, int columns, int batch,
-                              KpoolExecutionEnvelope envelope, int sms) {
+SparseMlaPlan sparse_mla_plan(const KpoolSparseMlaProfile& profile, KpoolMlaStorage storage,
+                              int columns, int batch, KpoolExecutionEnvelope envelope, int sms) {
     const bool fp8  = storage == KpoolMlaStorage::Fp8E4m3fnGroup128Ue8m0;
     const int bound = std::min(envelope.max_visible_tokens, 2051u);
     SparseMlaPlan p{};
@@ -42,7 +45,11 @@ SparseMlaPlan sparse_mla_plan(KpoolMlaStorage storage, int columns, int batch,
                                    ? MlaAttentionSchedule::Small
                                    : MlaAttentionSchedule::Bulk;
     }
-    p.tile   = p.attention == MlaAttentionSchedule::Small ? 16 : fp8 && columns >= 64 ? 64 : 32;
+    const bool native_factors =
+        profile.key_format == QType::MXFP8 && profile.value_format == QType::MXFP8;
+    p.tile   = p.attention == MlaAttentionSchedule::Small     ? 16
+               : fp8 && columns >= (native_factors ? 49 : 64) ? 64
+                                                              : 32;
     p.direct = bound <= 1;
     p.splits = 1;
     if (p.direct) return p;
@@ -79,17 +86,18 @@ SparseMlaPlan sparse_mla_plan(KpoolMlaStorage storage, int columns, int batch,
     return p;
 }
 
-std::size_t sparse_mla_capacity(KpoolMlaStorage storage, int lo, int hi, int batch,
-                                KpoolExecutionEnvelope e, int sms) {
+std::size_t sparse_mla_capacity(const KpoolSparseMlaProfile& profile, KpoolMlaStorage storage,
+                                int lo, int hi, int batch, KpoolExecutionEnvelope e, int sms) {
     std::size_t peak = 0;
     if (std::int64_t(hi) * batch >= kMlaWindow)
-        peak = sparse_mla_plan(storage, kMlaWindow, batch, e, sms).bytes;
+        peak = sparse_mla_plan(profile, storage, kMlaWindow, batch, e, sms).bytes;
     // Full windows are fixed. Tail widths repeat every window/gcd(window,B) values of T.
     const int period = kMlaWindow / std::gcd(kMlaWindow, batch);
     const auto stop  = std::min<std::int64_t>(hi, std::int64_t(lo) + period - 1);
     for (std::int64_t t = lo; t <= stop; ++t) {
         const int tail = t * batch % kMlaWindow;
-        if (tail) peak = std::max(peak, sparse_mla_plan(storage, tail, batch, e, sms).bytes);
+        if (tail)
+            peak = std::max(peak, sparse_mla_plan(profile, storage, tail, batch, e, sms).bytes);
     }
     return peak;
 }

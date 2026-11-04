@@ -6,18 +6,36 @@
 namespace ninfer::ops {
 using namespace detail::kpool;
 
+KpoolSparseMlaProfile kpool_sparse_mla_profile(const KpoolMlaFactors& factors, int heads) {
+    require(heads > 0 && factors.key_up.n % heads == 0 && factors.value_up.n % heads == 0 &&
+                factors.key_up.k == factors.value_up.k,
+            "MLA factor dimensions");
+    return {heads,
+            factors.key_up.n / heads,
+            factors.value_up.n / heads,
+            factors.key_up.k,
+            kKpoolPoolSize,
+            kKpoolSelectedPools,
+            factors.key_up.qtype,
+            factors.value_up.qtype};
+}
+
 KpoolGraphProfile kpool_sparse_mla_graph_profile(const KpoolSparseMlaProfile& profile,
                                                  KpoolMlaStorage storage,
                                                  KpoolExecutionEnvelope envelope, int batch,
                                                  int tokens, int sms) {
     sparse_mla_geometry(profile, storage, envelope, batch, tokens, tokens, sms);
     KpoolGraphProfile key;
-    key.words_        = {std::uint64_t(tokens), std::uint64_t(batch), std::uint64_t(sms),
-                         std::uint64_t(storage)};
-    std::size_t at    = 4;
+    key.words_        = {std::uint64_t(tokens),
+                         std::uint64_t(batch),
+                         std::uint64_t(sms),
+                         std::uint64_t(storage),
+                         std::uint64_t(profile.key_format),
+                         std::uint64_t(profile.value_format)};
+    std::size_t at    = 6;
     const auto append = [&](int columns) {
         if (!columns) return;
-        const auto p = sparse_mla_plan(storage, columns, batch, envelope, sms);
+        const auto p = sparse_mla_plan(profile, storage, columns, batch, envelope, sms);
         for (const auto word :
              {std::uint64_t(p.factor), std::uint64_t(p.attention), std::uint64_t(p.splits),
               std::uint64_t(p.tile), std::uint64_t(p.direct), std::uint64_t(p.merge_value),
@@ -36,7 +54,7 @@ std::size_t kpool_sparse_mla_workspace_capacity_bytes(const KpoolSparseMlaProfil
                                                       std::int32_t batch, std::int32_t lo,
                                                       std::int32_t hi, std::int32_t sms) {
     sparse_mla_geometry(profile, storage, envelope, batch, lo, hi, sms);
-    return sparse_mla_capacity(storage, lo, hi, batch, envelope, sms);
+    return sparse_mla_capacity(profile, storage, lo, hi, batch, envelope, sms);
 }
 
 void kpool_sparse_mla(const Tensor& query, const KpoolMlaFactors& factors,
@@ -45,11 +63,11 @@ void kpool_sparse_mla(const Tensor& query, const KpoolMlaFactors& factors,
                       float attention_scale, KpoolExecutionEnvelope envelope,
                       MemoryArena& workspace, Tensor& out, CudaExecutionView execution) {
     const int T = query.ne[2], B = query.ne[3], sms = execution.multiprocessor_count();
-    sparse_mla_geometry({query.ne[1], query.ne[0], out.ne[0], factors.key_up.ne[0]}, cache.storage,
-                        envelope, B, T, T, sms);
+    const auto profile = kpool_sparse_mla_profile(factors, query.ne[1]);
+    sparse_mla_geometry(profile, cache.storage, envelope, B, T, T, sms);
     require(std::isfinite(attention_scale) && attention_scale > 0, "Sparse MLA scale");
     const auto device = execution.device();
-    std::array<operand::Range, 10> inputs;
+    std::array<operand::Range, 14> inputs{};
     int n            = 0;
     const auto input = [&](const Tensor& t, DType type, std::initializer_list<int> shape,
                            int alignment, const char* name) {
@@ -57,8 +75,9 @@ void kpool_sparse_mla(const Tensor& query, const KpoolMlaFactors& factors,
         inputs[n++] = operand::range(t, kOperation);
     };
     input(query, DType::BF16, {256, 64, T, B}, 16, "MLA query");
-    input(factors.key_up, DType::BF16, {512, 256, 64}, 16, "U_K");
-    input(factors.value_up, DType::BF16, {512, 256, 64}, 16, "U_V");
+    for (const auto* factor : {&factors.key_up, &factors.value_up})
+        for (const auto plane : weight_operands(*factor, 16384, 512, device))
+            if (plane.begin != plane.end) inputs[n++] = plane;
     input(batch.positions, DType::I32, {T, B}, 4, "positions");
     input(batch.valid_columns, DType::I32, {B}, 4, "valid columns");
     input(batch.table_rows, DType::I32, {B}, 4, "table rows");
@@ -73,13 +92,17 @@ void kpool_sparse_mla(const Tensor& query, const KpoolMlaFactors& factors,
     const auto table_blocks = operand::blocks(table, kOperation);
     operand::tensor(out, DType::BF16, {256, 64, T, B}, 16, kOperation, "MLA output", device);
     const auto output = operand::range(out, kOperation);
-    for (const auto& src : inputs) operand::disjoint(output, src, kOperation);
+    for (int i = 0; i < n; ++i) operand::disjoint(output, inputs[i], kOperation);
     require(!operand::overlaps(table_blocks, output), "output overlaps page table");
     operand::device(workspace.device(), device, kOperation, "workspace");
     SparseMlaArguments a{};
-    a.query    = static_cast<const __nv_bfloat16*>(query.data);
-    a.key_up   = static_cast<const __nv_bfloat16*>(factors.key_up.data);
-    a.value_up = static_cast<const __nv_bfloat16*>(factors.value_up.data);
+    a.query        = static_cast<const __nv_bfloat16*>(query.data);
+    a.key_up       = factors.key_up.qdata;
+    a.value_up     = factors.value_up.qdata;
+    a.key_scales   = static_cast<const std::uint8_t*>(factors.key_up.scales);
+    a.value_scales = static_cast<const std::uint8_t*>(factors.value_up.scales);
+    a.key_mxfp8    = factors.key_up.qtype == QType::MXFP8;
+    a.value_mxfp8  = factors.value_up.qtype == QType::MXFP8;
     if (cache.storage == KpoolMlaStorage::BFloat16)
         a.latent = static_cast<const __nv_bfloat16*>(cache.data.data());
     else {
@@ -100,15 +123,15 @@ void kpool_sparse_mla(const Tensor& query, const KpoolMlaFactors& factors,
     a.batch          = B;
     a.scale          = attention_scale;
     auto scope       = workspace.scope();
-    const auto bytes = sparse_mla_capacity(cache.storage, T, T, B, envelope, sms);
+    const auto bytes = sparse_mla_capacity(profile, cache.storage, T, T, B, envelope, sms);
     MemorySpan scratch{};
     if (bytes) {
         scratch          = workspace.alloc_bytes(bytes, 256);
         const auto range = operand::range(scratch.data, scratch.bytes, kOperation);
-        for (const auto& src : inputs) operand::disjoint(range, src, kOperation);
+        for (int i = 0; i < n; ++i) operand::disjoint(range, inputs[i], kOperation);
         operand::disjoint(range, output, kOperation);
         require(!operand::overlaps(table_blocks, range), "workspace overlaps page table");
     }
-    launch_sparse_mla(a, scratch, cache.storage, envelope, sms, execution.stream());
+    launch_sparse_mla(a, scratch, profile, cache.storage, envelope, sms, execution.stream());
 }
 } // namespace ninfer::ops

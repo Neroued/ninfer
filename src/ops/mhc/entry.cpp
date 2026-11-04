@@ -32,6 +32,13 @@ struct Validation {
         inputs[input_count++] = tensor(t, type, dims, name);
     }
 
+    void parameter(const Tensor& t, std::initializer_list<int> dims, const char* name) {
+        if (t.dtype != DType::BF16 && t.dtype != DType::FP32)
+            throw std::invalid_argument(std::string(kOp) + ": " + name +
+                                        " requires BF16 or FP32 storage");
+        input(t, t.dtype, dims, name);
+    }
+
     void output(const Tensor& t, DType type, std::initializer_list<int> dims, const char* name,
                 bool residual_alias = false) {
         auto range = tensor(t, type, dims, name);
@@ -61,9 +68,9 @@ struct Validation {
                     operand::aligned(f.qdata, 16),
                 "projection requires compact BF16 [24,16384]");
         inputs[input_count++] = operand::range(f.qdata, std::size_t(kRows) * kWidth * 2, kOp);
-        input(w.base, DType::BF16, {kRows}, "base");
-        input(w.scale, DType::BF16, {3}, "scale");
-        input(w.gamma, DType::BF16, {kHidden}, "gamma");
+        parameter(w.base, {kRows}, "base");
+        parameter(w.scale, {3}, "scale");
+        parameter(w.gamma, {kHidden}, "gamma");
     }
 };
 
@@ -109,6 +116,9 @@ void execute(Form form, const Tensor& x, const Tensor* block, const MhcCoefficie
         o.base       = weights->base.data;
         o.scale      = weights->scale.data;
         o.gamma      = weights->gamma.data;
+        o.base_type  = weights->base.dtype;
+        o.scale_type = weights->scale.dtype;
+        o.gamma_type = weights->gamma.dtype;
         o.parameters = *p;
     }
     if (updated) {
@@ -129,9 +139,10 @@ void execute(Form form, const Tensor& x, const Tensor* block, const MhcCoefficie
     if (final_gamma) {
         require(final_epsilon > 0 && std::isfinite(final_epsilon),
                 "final epsilon must be positive and finite");
-        v.input(*final_gamma, DType::BF16, {kHidden}, "final gamma");
+        v.parameter(*final_gamma, {kHidden}, "final gamma");
         v.output(*hidden, DType::BF16, {kHidden, m}, "hidden");
         o.gamma                     = final_gamma->data;
+        o.gamma_type                = final_gamma->dtype;
         o.output                    = hidden->data;
         o.parameters.branch_epsilon = final_epsilon;
     }

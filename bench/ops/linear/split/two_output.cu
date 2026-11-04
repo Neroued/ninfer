@@ -72,7 +72,8 @@ int main(int argc, char** argv) {
         if (options.format == "q4q5") {
             first   = make_row_split_weight(QType::Q4_G64_FP16, 4096, options.k, options.k, 501U);
             second  = make_row_split_weight(QType::Q5_G64_FP16, 12288, options.k, options.k, 503U);
-            weights = ops::PairedProjectionWeights{first.weight, second.weight};
+            weights = ops::PairedProjectionWeights{{first.weight, ops::LinearPolicy::A16Only},
+                                                   {second.weight, ops::LinearPolicy::A16Only}};
         } else {
             if (options.format == "q8")
                 first = make_row_split_weight(QType::Q8_G32_FP16, options.n, options.k, options.k,

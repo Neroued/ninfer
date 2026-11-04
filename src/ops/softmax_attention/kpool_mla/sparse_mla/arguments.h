@@ -13,7 +13,10 @@ struct MlaWork {
 };
 
 struct SparseMlaArguments {
-    const __nv_bfloat16 *query, *key_up, *value_up, *latent;
+    const __nv_bfloat16 *query, *latent;
+    const void *key_up, *value_up;
+    const std::uint8_t *key_scales, *value_scales;
+    bool key_mxfp8 = false, value_mxfp8 = false;
     const std::uint8_t *latent_fp8, *latent_scales;
     std::uint8_t *query_fp8, *query_scales;
     const std::int32_t *valid, *table_rows, *selection_rows, *ids, *counts, *ends;

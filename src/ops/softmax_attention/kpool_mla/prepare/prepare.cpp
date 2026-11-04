@@ -25,20 +25,14 @@ void execute(const Tensor& x, const KpoolMlaPrepareParameters& p, const KpoolMla
              KpoolRawRecordWriteView records, KpoolTailStateView after, KpoolMlaPrepareOutputs out,
              bool update, MemoryArena& arena, CudaExecutionView execution) {
     const int T = x.ne[1], B = x.ne[2];
-    const auto device = execution.device();
-    const KpoolMlaPrepareProfile profile{p.projection,
-                                         x.ne[0],
-                                         cache.latent.data.plane.tensor.shape[0],
-                                         cache.index.keys.plane.tensor.shape[0],
-                                         p.query_norm.data ? p.query_norm.ne[0] : 0,
-                                         out.head_coeff.data ? out.head_coeff.ne[0] : 0,
-                                         4};
+    const auto device   = execution.device();
+    const auto profile  = kpool_mla_prepare_profile(p);
     const auto geometry = prepare_geometry(profile, cache.latent.storage, cache.index.format, B, T,
                                            T, execution.multiprocessor_count());
     require(p.rms_epsilon > 0 && std::isfinite(p.rms_epsilon) && p.index_epsilon > 0 &&
                 std::isfinite(p.index_epsilon),
             "norm epsilons");
-    std::array<operand::Range, 20> inputs{};
+    std::array<operand::Range, 24> inputs{};
     int input_count  = 0;
     const auto input = [&](const Tensor& t, DType type, std::initializer_list<int> dims,
                            std::size_t alignment, const char* name) {
@@ -73,22 +67,21 @@ void execute(const Tensor& x, const KpoolMlaPrepareParameters& p, const KpoolMla
             require(cr.offset + cr.bytes <= ir.offset || ir.offset + ir.bytes <= cr.offset,
                     "cache planes overlap");
         }
-    const auto& w = p.a_projection;
-    operand::device(w.device, device, kOperation, "projection weight");
-    const auto weight_bytes = std::size_t(geometry.rows) * 4096 * 2;
-    require(w.qtype == QType::BF16 && w.layout == QuantLayout::Contiguous && w.ndim == 2 &&
-                w.n == geometry.rows && w.k == 4096 && w.shape[0] == w.n && w.shape[1] == w.k &&
-                w.shape[2] == 1 && w.shape[3] == 1 &&
-                std::equal(w.shape, w.shape + 4, w.padded_shape) && !w.qhigh && !w.scales &&
-                w.high_plane_bytes == 0 && w.group_size == 0 && w.group == 0 &&
-                w.payload_bytes >= weight_bytes && operand::aligned(w.qdata, 16),
-            "contiguous BF16 projection weight");
-    require(w.payload, "projection weight backing");
-    const auto payload      = operand::range(w.payload, w.payload_bytes, kOperation);
-    const auto weight_range = operand::range(w.qdata, weight_bytes, kOperation);
-    require(weight_range.begin >= payload.begin && weight_range.end <= payload.end,
-            "projection weight exceeds backing");
-    inputs[input_count++] = weight_range;
+    const auto input_weight = [&](const SingleProjectionWeight& weight) {
+        for (const auto plane : weight_operands(weight.weight, weight.weight.n, 4096, device))
+            if (plane.begin != plane.end) inputs[input_count++] = plane;
+    };
+    const auto& first = std::visit(
+        [](const auto& w) -> const SingleProjectionWeight& {
+            if constexpr (std::is_same_v<std::decay_t<decltype(w)>, SingleProjectionWeight>)
+                return w;
+            else
+                return w.first;
+        },
+        p.weights);
+    input_weight(first);
+    const auto* paired = std::get_if<PairedProjectionWeights>(&p.weights);
+    if (paired) input_weight(paired->second);
     std::array<operand::Range, 2> outputs{};
     int output_count  = 0;
     const auto output = [&](const Tensor& t, DType type, std::initializer_list<int> dims) {
@@ -127,8 +120,18 @@ void execute(const Tensor& x, const KpoolMlaPrepareParameters& p, const KpoolMla
     for (int i = 0; i < input_count; ++i) operand::disjoint(scratch_range, inputs[i], kOperation);
     for (int i = 0; i < output_count; ++i) operand::disjoint(scratch_range, outputs[i], kOperation);
     PrepareArguments a{};
-    a.x              = static_cast<const __nv_bfloat16*>(x.data);
-    a.weight         = static_cast<const __nv_bfloat16*>(w.qdata);
+    a.x                    = static_cast<const __nv_bfloat16*>(x.data);
+    const auto bind_weight = [](const SingleProjectionWeight& w) {
+        return PrepareWeight{w.weight.qdata, w.weight.scales, w.weight.qtype, w.policy, w.weight.n};
+    };
+    a.weights[0] = bind_weight(first);
+    if (paired) a.weights[1] = bind_weight(paired->second);
+    a.mapping = p.rows;
+    if (layout.activation_codes.region.bytes) {
+        a.activation_codes = static_cast<std::uint8_t*>(layout.activation_codes.bind(scratch).data);
+        a.activation_scales =
+            static_cast<std::uint8_t*>(layout.activation_scales.bind(scratch).data);
+    }
     a.latent_norm    = static_cast<const __nv_bfloat16*>(p.latent_norm.data);
     a.query_norm     = static_cast<const __nv_bfloat16*>(p.query_norm.data);
     a.key_norm       = static_cast<const __nv_bfloat16*>(p.index_norm.data);
@@ -140,7 +143,7 @@ void execute(const Tensor& x, const KpoolMlaPrepareParameters& p, const KpoolMla
     a.record_offsets = static_cast<const int*>(records.offsets.data);
     a.page_offsets = static_cast<const std::int64_t*>(cache.latent.data.records.page_offsets.data);
     a.table_stride = cache.latent.data.records.page_offsets.nb[1] / 8;
-    a.fp8_latent     = cache.latent.storage == KpoolMlaStorage::Fp8E4m3fnGroup128Ue8m0;
+    a.fp8_latent   = cache.latent.storage == KpoolMlaStorage::Fp8E4m3fnGroup128Ue8m0;
     if (a.fp8_latent) {
         a.latent_fp8    = static_cast<std::uint8_t*>(cache.latent.data.data());
         a.latent_scales = static_cast<std::uint8_t*>(cache.latent.scales.data());
@@ -175,7 +178,7 @@ void execute(const Tensor& x, const KpoolMlaPrepareParameters& p, const KpoolMla
     a.rms_epsilon = p.rms_epsilon;
     a.key_epsilon = p.index_epsilon;
     a.update      = update;
-    launch_prepare(a, layout.columns, execution.stream());
+    launch_prepare(a, geometry, layout.columns, execution.stream());
 }
 } // namespace
 

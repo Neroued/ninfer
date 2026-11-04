@@ -19,7 +19,7 @@ struct ExpandClusterTile {
 // Fold native weights on chip into a high/low BF16 pair, accumulate both products
 // in FP32, and retain the embedding until the expanded residual and branch output
 // are published. Projection, coefficient reduction and output share one cluster allocation.
-template <int Threads, int BK>
+template <class Gamma, int Threads, int BK>
 __global__ __launch_bounds__(Threads, 3) void __cluster_dims__(8, 1, 1)
     expand_cluster_kernel(Operands o, std::int64_t tile_offset) {
     constexpr int H = 512, Tokens = 8, KParts = ExpandClusterTile<Threads, BK>::KParts;
@@ -135,13 +135,14 @@ __global__ __launch_bounds__(Threads, 3) void __cluster_dims__(8, 1, 1)
     } else {
         for (int i = (tid - 32) * 8; i < Tokens * H; i += (Threads - 32) * 8) {
             int t = i / H, d = i % H;
-            common::Bf16Vector<8> v, gamma;
+            common::Bf16Vector<8> v;
+            GammaVector<Gamma, 8> gamma;
             if (m0 + t < o.columns) {
                 // Expansion is independent of the coefficients. Stream these large
                 // residual writes while the owner finishes the branch gain.
-                v     = common::Bf16Vector<8>::load(x + t * H + projection_shared_column(t, d));
-                gamma = common::Bf16Vector<8>::load(static_cast<const __nv_bfloat16*>(o.gamma) +
-                                                    rank * H + d);
+                v = common::Bf16Vector<8>::load(x + t * H + projection_shared_column(t, d));
+                gamma =
+                    GammaVector<Gamma, 8>::load(static_cast<const Gamma*>(o.gamma) + rank * H + d);
                 const auto bits = common::load_vec<uint4>(&v);
 #pragma unroll
                 for (int s = 0; s < 4; ++s) {
@@ -159,7 +160,7 @@ __global__ __launch_bounds__(Threads, 3) void __cluster_dims__(8, 1, 1)
 #pragma unroll
                 for (int j = 0; j < 8; ++j)
                     out.word[j] = __float2bfloat16_rn(__bfloat162float(v.word[j]) *
-                                                      __bfloat162float(gamma.word[j]) * factor);
+                                                      float(gamma.word[j]) * factor);
                 out.store(static_cast<__nv_bfloat16*>(o.output) + (m0 + t) * kHidden + rank * H +
                           d);
             }

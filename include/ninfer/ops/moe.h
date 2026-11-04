@@ -77,8 +77,6 @@ struct SwiGLUWeights {
 // rounding boundary, residual, routes or coefficient tensor. Writes every destination cell.
 // Capacity covers the inclusive extent interval.
 // No hidden allocation/transfer/readback; enqueues on execution and supports Graph replay.
-// Supports registered BF16, Q8-G32/FP16 and NVFP4 profiles with an explicit finite positive clamp
-// limit.
 [[nodiscard]] std::size_t swiglu_workspace_capacity_bytes(const SwiGLUProfile& profile,
                                                           std::int32_t min_tokens,
                                                           std::int32_t max_tokens);
@@ -180,8 +178,6 @@ struct SigmoidMoeWeights {
 
 // Complete local contribution: routed_swiglu(topk_sigmoid_route(x),subset,x)+shared(x).
 // Shared is unscaled, exactly once, including zero routed hits. Only final output is BF16.
-// Supports registered block-scaled routed and native BF16 or Q8-G32/FP16 shared profiles,
-// both with explicit finite positive clamp limits.
 // Destination is contiguous BF16[H,T], Write; no residual, rank, communication or shared gate.
 // Router, native bank/subset and shared semantics follow the profiles above; all matrices and
 // control inputs are immutable and disjoint from output/live caller scratch. Graph replay may
@@ -199,8 +195,9 @@ void topk_sigmoid_swiglu_moe(const Tensor&, const SigmoidMoeProfile&, const Sigm
 // Sum coefficient[j,t]*F_ids[j,t](x[:,t]) over subset. Registered clamped block-scaled
 // geometries support Write to BF16 or FP32, without a scaled shared term.
 // The shared overload adds coefficients[t]*F_shared(x[:,t]) exactly once, including for None.
-// x is contiguous BF16 [H,T], destination is contiguous FP32 or BF16 [H,T], T>0. Both,
-// routes and encoded planes are 16-byte aligned; mask/shared coefficients are 4-byte aligned.
+// x is contiguous BF16 [H,T], destination is contiguous FP32 or BF16 [H,T], T>0. Both
+// and routes are 16-byte aligned; encoded planes follow their layout alignment, and
+// mask/shared coefficients are 4-byte aligned.
 // Write reads no old destination; AddResidual requires BF16 and adds its old value before
 // final rounding. None writes zero without accessing routed weights/routes (or computes shared).
 // Route IDs are in [0,E); unselected weights and index entries are never read. Callers publish

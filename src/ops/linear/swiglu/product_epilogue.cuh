@@ -3,6 +3,42 @@
 
 namespace ninfer::ops::detail {
 template <class Product>
+struct BasicSwiGluInterleavedMmaEpilogue {
+    Product product;
+
+    template <class S>
+    static constexpr int kSharedBytes = 0;
+
+    template <class Output>
+    __device__ __forceinline__ void apply_pair(Output out, int row, int token, float gate,
+                                               float up) const {
+        out.store(row, token, swiglu_product(product, row, gate, up));
+    }
+
+    template <class S, bool Full, class Output>
+    __device__ void finish_tile(Output out, unsigned char*,
+                                float (&acc)[S::kMmaRows][S::kMmaTokens][4], int row_begin,
+                                int token_begin, int rows, int tokens) const {
+        const int warp = threadIdx.x / 32, lane = threadIdx.x & 31;
+        const int wr = warp / S::kWarpsTokens, wt = warp % S::kWarpsTokens;
+#pragma unroll
+        for (int mi = 0; mi < S::kMmaRows; ++mi) {
+            const int row = row_begin + wr * (S::kWarpRows / 2) + mi * 8 + (lane >> 2);
+#pragma unroll
+            for (int ni = 0; ni < S::kMmaTokens; ++ni) {
+                const int token = token_begin + wt * S::kWarpTokens + ni * 8 + (lane & 3) * 2;
+                if (row < rows / 2 && (Full || token < tokens))
+                    out.store(row, token,
+                              swiglu_product(product, row, acc[mi][ni][0], acc[mi][ni][2]));
+                if (row < rows / 2 && (Full || token + 1 < tokens))
+                    out.store(row, token + 1,
+                              swiglu_product(product, row, acc[mi][ni][1], acc[mi][ni][3]));
+            }
+        }
+    }
+};
+
+template <class Product>
 struct BasicSwiGluRowMajorMmaEpilogue {
     Product product{};
     template <class Schedule>

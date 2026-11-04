@@ -11,6 +11,10 @@
 #include <numeric>
 using namespace ninfer;
 
+namespace ninfer::test::swiglu {
+void add_fp8_cases(OpSuite&);
+}
+
 namespace {
 using namespace ninfer::test;
 namespace qw    = quantized_weight;
@@ -135,7 +139,7 @@ int cancellation() {
     const auto zero = [](auto& w) {
         std::fill(w.payload.begin(), w.payload.end(), 0);
         const float one = 1;
-        std::memcpy(w.payload.data() + w.weight_divisor_offset, &one, 4);
+        std::memcpy(w.payload.data() + w.matrix_scale_offset, &one, 4);
     };
     zero(gu);
     zero(dn);
@@ -269,7 +273,7 @@ int tail_clamp(int recipe) {
     const auto zero = [](auto& w) {
         std::fill(w.payload.begin(), w.payload.end(), 0);
         const float one = 1;
-        std::memcpy(w.payload.data() + w.weight_divisor_offset, &one, 4);
+        std::memcpy(w.payload.data() + w.matrix_scale_offset, &one, 4);
     };
     zero(gu);
     zero(dn);
@@ -428,6 +432,7 @@ int main(int argc, char** argv) {
     suite.filter("t");
     ninfer::test::swiglu::add_bf16_cases(suite);
     ninfer::test::swiglu::add_q8_cases(suite);
+    ninfer::test::swiglu::add_fp8_cases(suite);
 #if NINFER_TARGET_SPARK
     std::vector<Call> calls;
     for (int t : {1,  2,   3,   6,   8,   16,  17,  24,   32,   33,   64,  65,

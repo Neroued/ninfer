@@ -1,0 +1,50 @@
+#include "ops/moe/topk_sigmoid_swiglu_moe/dispatch.h"
+
+namespace ninfer::ops::detail::moe_sigmoid {
+namespace {
+moe_cuda::block_scaled::clamped::Plan select_native(const SwiGLUProfile& ffn, int tokens) {
+    using namespace moe_cuda::block_scaled;
+    clamped::Plan p;
+    p.format       = ffn.gate_up_type;
+    p.arithmetic   = allows_a4(ffn.gate_up_policy) ? clamped::Nvfp4Arithmetic::MultiplyA4
+                                                   : clamped::Nvfp4Arithmetic::MultiplyA16;
+    p.intermediate = ffn.intermediate;
+    p.gate_columns = p.down_columns = tokens <= 8 ? 8 : 16;
+    p.atomic_output                 = true;
+    p.single_block_grouping         = tokens <= 64;
+    p.token_ordered_groups          = true;
+    p.clamp_limit                   = *ffn.clamp_limit;
+    p.nvfp4                         = {Nvfp4Pipeline::K128, Nvfp4CachePolicy::Cached, 0};
+    if (tokens > 16 && p.arithmetic == clamped::Nvfp4Arithmetic::MultiplyA4) {
+        p.gate_columns = p.down_columns = 64;
+        p.small_expert_limit            = 64;
+        p.group_columns                 = 128;
+        p.dense = {.gate_columns = 128, .down_columns = 128, .queued_ctas_per_sm = 2};
+    }
+    if (p.arithmetic == clamped::Nvfp4Arithmetic::MultiplyA4 && tokens >= 128)
+        p.dense_down_columns = 128;
+    if (p.arithmetic == clamped::Nvfp4Arithmetic::MultiplyA16) {
+        p.gate_columns = p.down_columns = 8;
+        p.group_columns                 = 128;
+        p.small_expert_limit            = 8;
+        p.medium                        = {.gate_columns = 32, .down_columns = 32, .max_load = 32};
+        p.dense                         = {.gate_columns = 64, .down_columns = 64, .max_load = 128};
+        p.broad                         = {.gate_columns = 64, .down_columns = 64};
+        p.a16.vector_max_load           = 2;
+        p.a16.small                     = tokens <= 8 ? clamped::Nvfp4A16Tile{64, 64, 128, 2}
+                                                      : clamped::Nvfp4A16Tile{128, 128, 128, 1};
+        p.a16.medium                    = {128, 128, 128, 1};
+        p.a16.dense                     = {128, 128, 128, 1};
+        p.a16.hot                       = {128, 128, 64, 1};
+    }
+    return p;
+}
+} // namespace
+
+const ShapePolicy& nvfp4_mul_h4096_i2048_e288_k8() {
+    static constexpr int boundaries[]{9, 17, 65, 128};
+    static const ShapePolicy policy{
+        .select = select_native, .allocation_boundaries = boundaries, .slice_tokens = 4096};
+    return policy;
+}
+} // namespace ninfer::ops::detail::moe_sigmoid

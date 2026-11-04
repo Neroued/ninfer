@@ -20,7 +20,7 @@ __device__ __forceinline__ void load_residual_words(Operands o, std::int64_t m, 
     }
 }
 
-template <int Threads, int Vector, int StaticParts = 0, bool Dependent = false,
+template <class Gamma, int Threads, int Vector, int StaticParts = 0, bool Dependent = false,
           bool PreloadResidual = false, bool StreamingOutput = false>
 __global__ void pre_finish_kernel(Operands o, const float* partial, int parts) {
     static_assert(Threads >= 64 && Threads <= 1024 && Threads % 32 == 0);
@@ -117,12 +117,12 @@ __global__ void pre_finish_kernel(Operands o, const float* partial, int parts) {
 #pragma unroll
                 for (int c = 0; c < Vector / Chunk; ++c) {
                     // Tensor bases promise 16-byte alignment, including wide worker tiles.
-                    const auto gamma = common::Bf16Vector<Chunk>::load(
-                        static_cast<const __nv_bfloat16*>(o.gamma) + d + c * Chunk);
+                    const auto gamma = GammaVector<Gamma, Chunk>::load(
+                        static_cast<const Gamma*>(o.gamma) + d + c * Chunk);
                     common::Bf16Vector<Chunk> out;
 #pragma unroll
                     for (int v = 0; v < Chunk; ++v)
-                        out.word[v] = __float2bfloat16_rn(__bfloat162float(gamma.word[v]) *
+                        out.word[v] = __float2bfloat16_rn(float(gamma.word[v]) *
                                                           values[group][c * Chunk + v] * inverse);
                     auto* target =
                         static_cast<__nv_bfloat16*>(o.output) + m * kHidden + d + c * Chunk;

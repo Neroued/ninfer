@@ -14,8 +14,9 @@ struct KdaParameters {
 
 struct MlaParameters {
     std::array<ops::KpoolMlaPrepareParameters, 3> prepare;
-    LinearParameters query_index, query, output;
-    Tensor key_up, value_up;
+    ops::ProjectionWeights query_index;
+    LinearParameters query, output;
+    ops::KpoolMlaFactors factors;
 };
 
 struct MoeParameters {

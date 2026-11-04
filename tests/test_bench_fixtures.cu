@@ -26,14 +26,14 @@ std::vector<std::uint8_t> download(const DeviceBuffer& buffer) {
 
 oracle::PackedWeight host_weight(const qb::PackedQuantizedWeight& source) {
     oracle::PackedWeight host;
-    host.payload               = download(source.storage);
-    host.weight                = source.weight;
-    host.code_plane_bytes      = source.low_bytes;
-    host.high_plane_offset     = source.high_offset;
-    host.high_plane_bytes      = source.high_bytes;
-    host.scale_plane_offset    = source.scale_offset;
-    host.scale_plane_bytes     = source.scale_bytes;
-    host.weight_divisor_offset = source.scale_offset + source.scale_bytes;
+    host.payload             = download(source.storage);
+    host.weight              = source.weight;
+    host.code_plane_bytes    = source.low_bytes;
+    host.high_plane_offset   = source.high_offset;
+    host.high_plane_bytes    = source.high_bytes;
+    host.scale_plane_offset  = source.scale_offset;
+    host.scale_plane_bytes   = source.scale_bytes;
+    host.matrix_scale_offset = source.scale_offset + source.scale_bytes;
     return host;
 }
 

@@ -48,8 +48,8 @@ void mla(WorkspaceLayoutBuilder& a, const ModelProfile& p, const MlaProfile& m,
             if (reuse)
                 scratch(a, linear(m.query, minimum, columns));
             else {
-                scratch(a, ops::linear_split_workspace_capacity_bytes(
-                               {m.query_index, {}}, m.query_rows, minimum, columns));
+                scratch(a, ops::linear_split_workspace_capacity_bytes(m.query_index, m.query_rows,
+                                                                      minimum, columns));
                 scratch(a, ops::kpool_indexer_workspace_capacity_bytes(m.indexer, s.index_format,
                                                                        {s.max_context}, local,
                                                                        first, last, sm_count));

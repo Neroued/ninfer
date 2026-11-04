@@ -1,6 +1,7 @@
 #pragma once
 
 #include "kpool_fixture.h"
+#include "kpool_weight_fixture.h"
 #include "kpool_fp8_fixture.h"
 #include "paged_kv_fixture.h"
 #include "ninfer/ops/kpool_mla_layout.h"
@@ -30,6 +31,7 @@ struct SparseMlaFixture {
     std::unique_ptr<MemoryArena> workspace;
     std::size_t workspace_bytes;
     float scale = 1.F / 16;
+    std::unique_ptr<EncodedWeight> key_encoded, value_encoded;
 
     SparseMlaFixture(CudaExecutionView cuda, int tokens, int batch, int end, int cap = 512,
                      int layer_count = 11, bool ragged = false, bool frozen = false,
@@ -167,8 +169,31 @@ struct SparseMlaFixture {
         return latent.data() + physical_token(b, token) * 512;
     }
 
+    void encode_factors(CudaExecutionView cuda) {
+        std::vector<float> values(key_up.host.size());
+        for (std::size_t i = 0; i < values.size(); ++i)
+            values[i] = std::ldexp(decode(key_up.host[i]), int((i / 512 + i / 32) % 5) - 2);
+        key_encoded =
+            std::make_unique<EncodedWeight>(query.view.device, QType::MXFP8, 16384, 512, values);
+        for (std::size_t i = 0; i < values.size(); ++i)
+            values[i] = std::ldexp(decode(value_up.host[i]), int((i / 512 + i / 32) % 5) - 2);
+        value_encoded =
+            std::make_unique<EncodedWeight>(query.view.device, QType::MXFP8, 16384, 512, values);
+        workspace_bytes = ops::kpool_sparse_mla_workspace_capacity_bytes(
+            ops::kpool_sparse_mla_profile(factors(), 64), cache.storage, envelope, B, 1, T,
+            cuda.multiprocessor_count());
+        scratch = DeviceBuffer(cuda.device(), workspace_bytes + 512);
+        scratch.fill(0xa5);
+        workspace = std::make_unique<MemoryArena>(scratch.span().subspan(256, workspace_bytes));
+    }
+
+    ops::KpoolMlaFactors factors() const {
+        return {key_encoded ? key_encoded->weight : dense_weight(key_up.view, 16384, 512),
+                value_encoded ? value_encoded->weight : dense_weight(value_up.view, 16384, 512)};
+    }
+
     void launch(CudaExecutionView cuda) {
-        ops::kpool_sparse_mla(query.view, {key_up.view, value_up.view}, cache,
+        ops::kpool_sparse_mla(query.view, factors(), cache,
                               {positions.view, valid.view, selectors.view},
                               {ids.view, counts.view, ends.view}, selection_rows.view, scale,
                               envelope, *workspace, output.view, cuda);

@@ -1,5 +1,7 @@
 #include "ops/moe/kernels/cuda/block_scaled/grouping.cuh"
 #include "ops/moe/kernels/cuda/block_scaled/clamped/nvfp4/launch.h"
+#include "ops/moe/kernels/cuda/block_scaled/clamped/nvfp4/mul.h"
+#include "ops/moe/kernels/cuda/block_scaled/clamped/nvfp4/a16.h"
 #include "ops/moe/kernels/cuda/block_scaled/clamped/fp8/launch.h"
 #include "ops/moe/kernels/cuda/block_scaled/clamped/output.cuh"
 
@@ -281,7 +283,9 @@ void launch(const Tensor& x, const CudaSwiGLUExperts& experts, const ExpertRoute
     const int assignments = x.ne[1] * kTopK;
     const auto* ids       = static_cast<const int*>(routes.ids.data);
     const auto* mask      = static_cast<const int*>(subset.mask.data);
-    if (plan.format == QType::NVFP4)
+    if (plan.format == QType::NVFP4_MUL)
+        nvfp4::launch_mul_input(x, experts, routes, subset, plan, s, execution);
+    else if (plan.format == QType::NVFP4)
         nvfp4::launch_input(x, experts, routes, subset, s, execution, true);
     else
         fp8::launch_input(x, experts, routes, subset, s, execution, true);
@@ -300,7 +304,12 @@ void launch(const Tensor& x, const CudaSwiGLUExperts& experts, const ExpertRoute
             plan.format == QType::FP8_E4M3FN_BLOCK128X128_BF16, plan.token_ordered_groups);
         CUDA_CHECK(cudaGetLastError());
     }
-    if (plan.format == QType::NVFP4)
+    if (plan.format == QType::NVFP4_MUL) {
+        if (plan.arithmetic == Nvfp4Arithmetic::MultiplyA4)
+            nvfp4::launch_mul_experts(x, experts, routes, plan, s, execution);
+        else
+            nvfp4::launch_a16_experts(x, experts, routes, plan, s, execution);
+    } else if (plan.format == QType::NVFP4)
         nvfp4::launch_experts(x, experts, routes, plan, s, execution);
     else
         fp8::launch_experts(x, experts, routes, plan, s, execution);

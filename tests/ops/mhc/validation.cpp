@@ -51,6 +51,12 @@ int validate(Form form, CudaExecutionView e) {
         f.weights.projection.layout = QuantLayout::RowSplit;
         rejects([&] { f.invoke(e); });
         f.weights = w;
+        for (auto* parameter : {&f.weights.base, &f.weights.scale, &f.weights.gamma}) {
+            const auto saved_parameter = *parameter;
+            parameter->dtype           = DType::I32;
+            rejects([&] { f.invoke(e); });
+            *parameter = saved_parameter;
+        }
     }
     if (f.capacity > 0) {
         MemoryArena tiny({f.scratch.data(), f.capacity - 1, e.device()});
@@ -95,6 +101,9 @@ int validate(Form form, CudaExecutionView e) {
         f.final_epsilon       = 1.e-5F;
         const auto gamma      = f.weights.gamma;
         f.weights.gamma.ne[0] = D - 1;
+        rejects([&] { f.invoke(e); });
+        f.weights.gamma       = gamma;
+        f.weights.gamma.dtype = DType::I32;
         rejects([&] { f.invoke(e); });
         f.weights.gamma = gamma;
     }

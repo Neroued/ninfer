@@ -73,10 +73,10 @@ void launch_mma(const Tensor& x, const CudaSwiGLUExperts& experts, const ExpertR
         Gate ? s.input_codes : s.product_codes,
         static_cast<const std::uint8_t*>(Gate ? s.input_scales : s.product_scales),
         Gate ? experts.bank.gate_up : experts.bank.down,
-        Gate ? experts.activation_calibration.gate_up.scalar_divisor()
-             : experts.activation_calibration.down.scalar_divisor(),
-        experts.activation_calibration.down.scalar_divisor(), s.groups, s.product_codes,
-        static_cast<std::uint8_t*>(s.product_scales), s.contributions,
+        ActivationScale{nullptr, Gate ? experts.activation_calibration.gate_up.scalar_divisor()
+                                      : experts.activation_calibration.down.scalar_divisor()},
+        ActivationScale{nullptr, experts.activation_calibration.down.scalar_divisor()}, s.groups,
+        s.product_codes, static_cast<std::uint8_t*>(s.product_scales), s.contributions,
         static_cast<const float*>(routes.coefficients.data), s.routed_sum,
         std::countr_zero(unsigned(subtiles)), plan.clamp_limit, plan.nvfp4.down_row_window,
         static_cast<int>(plan.nvfp4.cache), minimum_expert_count, maximum_expert_count, regime,
@@ -207,7 +207,8 @@ void launch_experts_impl(const Tensor& x, const CudaSwiGLUExperts& experts,
                 const int blocks = std::min(tasks, execution.multiprocessor_count() * 3);
                 dense_token_down<C><<<blocks, Schedule<C, false>::threads, 0, execution.stream()>>>(
                     s.product_codes, static_cast<const std::uint8_t*>(s.product_scales),
-                    experts.bank.down, experts.activation_calibration.down.scalar_divisor(),
+                    experts.bank.down,
+                    ActivationScale{nullptr, experts.activation_calibration.down.scalar_divisor()},
                     s.groups, static_cast<const int*>(routes.ids.data),
                     static_cast<const float*>(routes.coefficients.data), s.routed_sum, x.ne[1],
                     plan.pool_expert_limit, plan.pool_min_experts);
@@ -242,7 +243,8 @@ void launch_experts_impl(const Tensor& x, const CudaSwiGLUExperts& experts,
             launch_pool_down<kHidden, kExperts, kTopK, 128>(
                 PoolContraction<128>{
                     s.product_codes, static_cast<const std::uint8_t*>(s.product_scales),
-                    experts.bank.down, experts.activation_calibration.down.scalar_divisor()},
+                    experts.bank.down,
+                    ActivationScale{nullptr, experts.activation_calibration.down.scalar_divisor()}},
                 s.groups, static_cast<const int*>(routes.ids.data),
                 static_cast<const float*>(routes.coefficients.data), s.routed_sum, x.ne[1],
                 plan.pool_min_experts, plan.pool_expert_limit, plan.pool_row_window,

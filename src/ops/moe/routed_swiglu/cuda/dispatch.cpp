@@ -7,12 +7,21 @@ namespace ninfer::ops::detail::moe_routed {
 const ShapePolicy& shape_dispatch(const RoutedSwiGLUProfile& profile) {
     validate_expert_profile(profile);
 #if NINFER_TARGET_SPARK
-    if (profile.ffn.hidden == 4096)
-        return profile.ffn.down_type == QType::NVFP4
-                   ? (profile.ffn.intermediate == 1024 ? nvfp4_h4096_i1024_e288_k8()
-                                                       : nvfp4_h4096_i2048_e288_k8())
-                   : (profile.ffn.intermediate == 1024 ? fp8_h4096_i1024_e288_k8()
-                                                       : fp8_h4096_i2048_e288_k8());
+    if (profile.ffn.hidden == 4096) {
+        switch (profile.ffn.down_type) {
+        case QType::NVFP4:
+            return profile.ffn.intermediate == 1024 ? nvfp4_h4096_i1024_e288_k8()
+                                                    : nvfp4_h4096_i2048_e288_k8();
+        case QType::NVFP4_MUL:
+            return profile.ffn.intermediate == 1024 ? nvfp4_mul_h4096_i1024_e288_k8()
+                                                    : nvfp4_mul_h4096_i2048_e288_k8();
+        case QType::FP8_E4M3FN_BLOCK128X128_BF16:
+            return profile.ffn.intermediate == 1024 ? fp8_h4096_i1024_e288_k8()
+                                                    : fp8_h4096_i2048_e288_k8();
+        default:
+            throw std::invalid_argument("unsupported clamped MoE expert format");
+        }
+    }
     if (profile.ffn.intermediate == 320)
         return profile.ffn.down_type == QType::NVFP4 ? nvfp4_h2560_i320_e512_k10()
                                                      : fp8_h2560_i320_e512_k10();

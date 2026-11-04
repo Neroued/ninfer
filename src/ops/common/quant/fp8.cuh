@@ -135,4 +135,51 @@ __device__ __forceinline__ unsigned fp8_dequant_bf16x2(std::uint16_t codes, std:
     return load_vec<unsigned>(&value);
 }
 
+__device__ __forceinline__ float2 mxfp8_dequant_f32x2(std::uint16_t codes, std::uint8_t scale) {
+    const auto values  = fp8_code2_to_float2(codes);
+    const float factor = ue8m0_to_float(scale);
+    return make_float2(values.x * factor, values.y * factor);
+}
+
+struct alignas(16) Mxfp8QuantizedK32 {
+    uint4 codes_lo, codes_hi;
+    std::uint8_t scale;
+};
+
+// Thirty-two consecutive E4M3 codes and one UE8M0 scale, without an MMA-specific swizzle.
+// Finite input uses the smallest representable power-of-two scale covering amax/448.
+__device__ __forceinline__ Mxfp8QuantizedK32 quantize_mxfp8_k32(const float2 (&values)[16]) {
+    float maximum = 0.0F;
+#pragma unroll
+    for (int pair = 0; pair < 16; ++pair)
+        maximum = fmaxf(maximum, fmaxf(fabsf(values[pair].x), fabsf(values[pair].y)));
+    const auto quantization = fp8_ue8m0_scale(maximum);
+    unsigned words[8];
+#pragma unroll
+    for (int word = 0; word < 8; ++word) {
+        const auto lo =
+            fp8_quant_code2(values[word * 2].x, values[word * 2].y, quantization.inverse_scale);
+        const auto hi = fp8_quant_code2(values[word * 2 + 1].x, values[word * 2 + 1].y,
+                                        quantization.inverse_scale);
+        words[word]   = unsigned(lo) | (unsigned(hi) << 16);
+    }
+    return {make_uint4(words[0], words[1], words[2], words[3]),
+            make_uint4(words[4], words[5], words[6], words[7]), quantization.scale};
+}
+
+__device__ __forceinline__ Mxfp8QuantizedK32 quantize_mxfp8_k32(const __nv_bfloat16* source) {
+    float2 values[16];
+#pragma unroll
+    for (int pair = 0; pair < 16; ++pair)
+        values[pair] = __bfloat1622float2(load_vec<__nv_bfloat162>(source + pair * 2));
+    return quantize_mxfp8_k32(values);
+}
+
+__device__ __forceinline__ Mxfp8QuantizedK32 quantize_mxfp8_k32(const float* source) {
+    float2 values[16];
+#pragma unroll
+    for (int pair = 0; pair < 16; ++pair) values[pair] = load_vec<float2>(source + pair * 2);
+    return quantize_mxfp8_k32(values);
+}
+
 } // namespace ninfer::ops::common

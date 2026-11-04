@@ -8,6 +8,7 @@ namespace ninfer::ops::detail::moe_cuda::block_scaled::clamped {
 inline constexpr int kHidden = 4096, kIntermediate = 2048, kExperts = 288, kTopK = 8;
 
 enum class ExpertLoadRegime { All, ExcludeBroad, OnlyBroad, DenseWhenBroad };
+enum class Nvfp4Arithmetic { DivideA4, MultiplyA4, MultiplyA16 };
 
 struct Fp8PopulationTuning {
     static constexpr int kWideDownColumns = 256;
@@ -23,11 +24,22 @@ struct Fp8PopulationTuning {
     int large_gate_columns = 0, large_down_columns = 0;
 };
 
+struct Nvfp4A16Tile {
+    int gate_rows = 64, down_rows = 64;
+    int k_step = 128, stages = 2;
+};
+
+struct Nvfp4A16Tuning {
+    Nvfp4A16Tile small, medium, dense, hot;
+    int vector_max_load = 0;
+};
+
 struct Plan {
     // Policies select these widths from slice M, but each tile covers assignments
     // belonging to one expert. The entry policy owns the maximum slice size.
-    QType format     = QType::NVFP4;
-    int intermediate = kIntermediate;
+    QType format               = QType::NVFP4;
+    Nvfp4Arithmetic arithmetic = Nvfp4Arithmetic::DivideA4;
+    int intermediate           = kIntermediate;
     int gate_columns = 0, down_columns = 0;
     int dense_down_columns     = 0;
     bool direct_assignments    = false;
@@ -49,6 +61,7 @@ struct Plan {
 
     Fp8PopulationTuning fp8;
     Nvfp4Tuning nvfp4;
+    Nvfp4A16Tuning a16;
     int group_columns = 0, small_expert_limit = 0;
     Nvfp4LoadSchedule medium, dense, broad;
     int broad_short_limit = 0, broad_long_limit = 0;
@@ -79,6 +92,12 @@ struct Groups {
     int* load_range;
 };
 
+// BF16 planes [assignment,I]: high=RN(x), low=RN(x-high).
+struct CompensatedProduct {
+    std::uint16_t* high = nullptr;
+    std::uint16_t* low  = nullptr;
+};
+
 struct Storage {
     bool partial_output         = false;
     std::uint8_t* input_codes   = nullptr;
@@ -87,8 +106,9 @@ struct Storage {
     void* product_scales        = nullptr;
     float* contributions        = nullptr;
     float* direct_product       = nullptr;
-    float* routed_sum           = nullptr;
-    int* active_tokens          = nullptr;
+    CompensatedProduct compensated_product;
+    float* routed_sum  = nullptr;
+    int* active_tokens = nullptr;
     Groups groups{};
 };
 

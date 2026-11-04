@@ -5,47 +5,54 @@
 namespace ninfer::ops::detail::kda_input {
 constexpr int channels = kProjectionFeatures, hidden = kInputFeatures;
 
-__device__ void store_output(const Arguments& a, int c, int t, int b, float value) {
+__device__ inline void store_output(const Arguments& a, int c, int t, int b, float value) {
     auto* out = c < hidden ? a.q : c < 2 * hidden ? a.k : a.v;
     out[(static_cast<std::int64_t>(b) * a.width + t) * hidden + c % hidden] =
         __float2bfloat16_rn(value);
 }
 
-__device__ float convolution(const float* w, int c, float s0, float s1, float s2, float p) {
-    float value = w[c] * s0;
-    value       = fmaf(w[channels + c], s1, value);
-    value       = fmaf(w[2 * channels + c], s2, value);
-    return common::silu(fmaf(w[3 * channels + c], p, value));
+template <class ConvWeight>
+__device__ float convolution(const void* data, int c, float s0, float s1, float s2, float p) {
+    const auto* w = static_cast<const ConvWeight*>(data);
+    float value   = static_cast<float>(w[c]) * s0;
+    value         = fmaf(static_cast<float>(w[channels + c]), s1, value);
+    value         = fmaf(static_cast<float>(w[2 * channels + c]), s2, value);
+    return common::silu(fmaf(static_cast<float>(w[3 * channels + c]), p, value));
 }
 
-template <int Width>
+template <int Width, class ConvWeight = float>
 struct WindowEpilogue {
     Arguments a;
 
     template <class Output, int Columns>
     __device__ void apply_row(const Output&, int c, int first, const float (&p)[Columns],
                               int live) const {
+        // Width zero consumes one request whose physical extent is part of this tile.
+        constexpr int window = Width ? Width : Columns;
+        const int stride     = Width ? Width : a.width;
 #pragma unroll
-        for (int begin = 0; begin + Width <= Columns; begin += Width) {
-            if (begin + Width > live) break;
-            const int b       = (first + begin) / Width;
-            const int n       = a.valid ? a.valid[b] : Width;
+        for (int begin = 0; begin + window <= Columns; begin += window) {
+            if constexpr (Width > 0)
+                if (begin + Width > live) break;
+            const int b       = Width ? (first + begin) / window : 0;
+            const int n       = a.valid ? a.valid[b] : stride;
             const auto source = a.source_offsets[b] / 2 + c;
             float h0          = __bfloat162float(a.source[source]);
             float h1          = __bfloat162float(a.source[source + channels]);
             float h2          = __bfloat162float(a.source[source + 2 * channels]);
 #pragma unroll
-            for (int t = 0; t < Width; ++t) {
+            for (int t = 0; t < window; ++t) {
                 if (t < n) {
                     const float value = p[begin + t];
-                    store_output(a, c, t, b, convolution(a.weights, c, h0, h1, h2, value));
+                    store_output(a, c, t, b,
+                                 convolution<ConvWeight>(a.weights, c, h0, h1, h2, value));
                     if (a.records)
-                        a.records[(static_cast<std::int64_t>(b) * Width + t) * channels + c] =
+                        a.records[(static_cast<std::int64_t>(b) * stride + t) * channels + c] =
                             __float2bfloat16_rn(value);
                     h0 = h1;
                     h1 = h2;
                     h2 = value;
-                } else
+                } else if (Width > 0 || t < a.width)
                     store_output(a, c, t, b, 0.0F);
             }
             if (a.destination) {
@@ -66,6 +73,7 @@ struct FloatOutput {
     }
 };
 
+template <class ConvWeight = float>
 __global__ void conv_kernel(Arguments a, const float* projected) {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     const int b = blockIdx.z;
@@ -84,7 +92,7 @@ __global__ void conv_kernel(Arguments a, const float* projected) {
                 const int t = t0 + i;
                 if (t < n) {
                     const float p = load(t);
-                    store_output(a, c, t, b, convolution(a.weights, c, h0, h1, h2, p));
+                    store_output(a, c, t, b, convolution<ConvWeight>(a.weights, c, h0, h1, h2, p));
                     if (a.records)
                         a.records[(static_cast<std::int64_t>(b) * a.width + t) * channels + c] =
                             __float2bfloat16_rn(p);
@@ -102,7 +110,7 @@ __global__ void conv_kernel(Arguments a, const float* projected) {
     }
 }
 
-__global__ void history_kernel(Arguments a, const float* projected) {
+static __global__ void history_kernel(Arguments a, const float* projected) {
     const int c = blockIdx.x * blockDim.x + threadIdx.x, b = blockIdx.y;
     const int n = a.valid ? a.valid[b] : a.width;
     __nv_bfloat16 tail[3];

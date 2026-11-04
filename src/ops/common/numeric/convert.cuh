@@ -20,6 +20,17 @@ struct alignas(2 * Width) Bf16Vector {
     __device__ void store(__nv_bfloat16* p) const { *reinterpret_cast<Bf16Vector*>(p) = *this; }
 };
 
+template <int Width>
+struct alignas(Width < 4 ? 4 * Width : 16) F32Vector {
+    float word[Width];
+
+    __device__ static F32Vector load(const float* p) {
+        return *reinterpret_cast<const F32Vector*>(p);
+    }
+
+    __device__ void store(float* p) const { *reinterpret_cast<F32Vector*>(p) = *this; }
+};
+
 template <int Pairs>
 struct alignas(Pairs* static_cast<int>(sizeof(__nv_bfloat162))) Bf16PairPack {
     static_assert(Pairs == 1 || Pairs == 2 || Pairs == 4);

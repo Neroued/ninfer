@@ -5,15 +5,38 @@
 #include "ops/float_codec.h"
 #include "ops/fp8_cache_reference.h"
 #include "ninfer/kv_cache_format.h"
+#include "../../../../tools/support/kpool_weight_fixture.h"
 #include "../../../../tools/support/kpool_fixture.h"
 
 #include <cmath>
+#include <cstring>
+#include <type_traits>
 #include <iostream>
 #include <numeric>
 #include <set>
 
 namespace ninfer::test {
 namespace kp = ninfer::tool::kpool;
+
+inline double represented_weight(const kp::EncodedWeight& weight, int row, int column) {
+    const auto& g   = weight.geometry;
+    const int k     = g.shape.back();
+    const auto code = std::to_integer<std::uint8_t>(weight.host[std::size_t(row) * k + column]);
+    double scale;
+    if (g.format == QType::MXFP8) {
+        const auto exponent = std::to_integer<std::uint8_t>(
+            weight.host[g.scale_offset + std::size_t(row) * (k / 32) + column / 32]);
+        scale = std::ldexp(1., int(exponent) - 127);
+    } else {
+        float value;
+        std::memcpy(&value,
+                    weight.host.data() + g.scale_offset +
+                        (std::size_t(row / 128) * (k / 128) + column / 128) * 4,
+                    sizeof(value));
+        scale = value;
+    }
+    return float_codec::decode_e4m3fn(code) * scale;
+}
 
 inline constexpr ReductionCriterion kPreparedBf16Criterion{.0041, 1e-4, .012};
 // E4M3's <=1/16 normal rounding budget plus FP32 projection/norm error.
@@ -196,10 +219,16 @@ int verify_selection(Fixture& f, bool exact = false) {
 }
 
 // FP64 formula from represented public inputs; no private A16 intermediate seams.
-inline std::vector<double> mla_reference_values(const std::uint16_t* query,
-                                                const std::uint16_t* key_up,
-                                                const std::uint16_t* value_up,
+template <class Factor>
+inline std::vector<double> mla_reference_values(const std::uint16_t* query, const Factor* key_up,
+                                                const Factor* value_up,
                                                 const std::vector<double>& c, float scale) {
+    const auto factor_value = [](Factor value) -> double {
+        if constexpr (std::is_same_v<Factor, std::uint16_t>)
+            return kp::decode(value);
+        else
+            return value;
+    };
     const auto count = c.size() / 512;
     std::vector<double> result(64 * 256);
     if (!count) return result;
@@ -209,7 +238,7 @@ inline std::vector<double> mla_reference_values(const std::uint16_t* query,
             for (int k = 0; k < 256; ++k) {
                 const double x = kp::decode(query[h * 256 + k]);
                 for (int d = 0; d < 512; ++d)
-                    q[d] += x * kp::decode(key_up[(h * 256 + k) * 512 + d]);
+                    q[d] += x * factor_value(key_up[(h * 256 + k) * 512 + d]);
             }
             std::vector<double> logits(count);
             double maximum = -INFINITY;
@@ -228,7 +257,7 @@ inline std::vector<double> mla_reference_values(const std::uint16_t* query,
                 for (int d = 0; d < 512; ++d) u[d] += logits[j] / denominator * c[j * 512 + d];
             for (int v = 0; v < 256; ++v)
                 for (int d = 0; d < 512; ++d)
-                    result[h * 256 + v] += kp::decode(value_up[(h * 256 + v) * 512 + d]) * u[d];
+                    result[h * 256 + v] += factor_value(value_up[(h * 256 + v) * 512 + d]) * u[d];
         }
     });
     return result;

@@ -54,8 +54,9 @@ void launch(const Tensor& x, const Weight& w, const Arguments& a, float* project
         launch_q8_a16_mma<Schedule>(operands, FloatOutput{projected}, LinearIdentityEpilogue{},
                                     stream);
     }
-    conv_kernel<<<dim3(channels / 128, std::min<std::int64_t>((a.width + 3LL) / 4, 65535), a.batch),
-                  128, 0, stream>>>(a, projected);
+    conv_kernel<float>
+        <<<dim3(channels / 128, std::min<std::int64_t>((a.width + 3LL) / 4, 65535), a.batch), 128,
+           0, stream>>>(a, projected);
     CUDA_CHECK(cudaGetLastError());
     if (a.destination) {
         history_kernel<<<dim3(channels / 128, a.batch), 128, 0, stream>>>(a, projected);

@@ -4,6 +4,9 @@
 
 #include "ops/linear/swiglu/fp8/dispatch.h"
 #include "ops/linear/swiglu/nvfp4/dispatch.h"
+#include "ops/linear/swiglu/fp8_block/dispatch.h"
+#include "ops/linear/swiglu/mxfp8/dispatch.h"
+#include "ops/linear/swiglu/nvfp4_mul/dispatch.h"
 #include "ops/linear/swiglu/dispatch.h"
 #include "ops/linear/common/operands.h"
 #include "ops/common/host/operands.h"
@@ -38,6 +41,15 @@ std::size_t linear_swiglu_workspace_capacity_bytes(QType qtype, std::int32_t gat
     detail::validate_swiglu_geometry(qtype, gate_up_rows, input_rows);
     if (qtype == QType::BF16) return 0;
     if (qtype == QType::Q8_G32_FP16) return 0;
+    if (qtype == QType::MXFP8)
+        return detail::mxfp8_swiglu_workspace_capacity_bytes(gate_up_rows, input_rows, policy,
+                                                             min_tokens, max_tokens);
+    if (qtype == QType::FP8_E4M3FN_BLOCK128X128_FP32)
+        return detail::fp8_block_swiglu_workspace_capacity_bytes(gate_up_rows, input_rows, policy,
+                                                                 min_tokens, max_tokens);
+    if (qtype == QType::NVFP4_MUL)
+        return detail::nvfp4_mul_swiglu_workspace_capacity_bytes(gate_up_rows, input_rows, policy,
+                                                                 min_tokens, max_tokens);
     if (qtype == QType::Q4_G64_FP16) {
         return detail::q4_linear_swiglu_capacity_workspace_bytes(gate_up_rows, input_rows,
                                                                  min_tokens, max_tokens);
@@ -86,6 +98,21 @@ static void execute_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor
     if (!x.is_contiguous() || !out.is_contiguous() || !common::operand::aligned(x.data, 16) ||
         !common::operand::aligned(out.data, 16))
         throw std::invalid_argument("linear_swiglu: x/out must be contiguous and 16-byte aligned");
+
+    if (w.qtype == QType::MXFP8 || w.qtype == QType::FP8_E4M3FN_BLOCK128X128_FP32 ||
+        w.qtype == QType::NVFP4_MUL) {
+        detail::validate_projection_operands(x, w, {&out, 1}, nullptr, execution, "linear_swiglu");
+        if (w.qtype == QType::MXFP8)
+            detail::mxfp8_swiglu_dispatch(x, w, out, limit, clamped, policy, ws,
+                                          execution.stream());
+        else if (w.qtype == QType::FP8_E4M3FN_BLOCK128X128_FP32)
+            detail::fp8_block_swiglu_dispatch(x, w, out, limit, clamped, policy,
+                                              execution.stream());
+        else
+            detail::nvfp4_mul_swiglu_dispatch(x, w, nullptr, out, limit, clamped, policy,
+                                              execution.stream());
+        return;
+    }
 
 #if NINFER_TARGET_SPARK
     if (w.qtype == QType::BF16) {

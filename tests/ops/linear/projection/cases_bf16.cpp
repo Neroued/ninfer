@@ -340,6 +340,12 @@ void run_new_bf16_geometry(Suite& suite, const Geometry& shape) {
 #if NINFER_TARGET_SPARK
 void run_bf16_extensions(Suite& suite) {
     using namespace ninfer::test::linear;
+    const std::array native_calls{
+        Invocation{1, CallForm::A16Convenience}, Invocation{8}, Invocation{129}, Invocation{4096},
+        Invocation{33, CallForm::Policy, ops::LinearPolicy::A16Only, true}};
+    for (auto [n, k] : std::array<std::array<int, 2>, 3>{{{128, 4096}, {256, 4096}, {4096, 1536}}})
+        add_shape(suite, QType::BF16, ActivationRecipe::TokenBlocks, make_bf16_weight,
+                  {n, k, 1973U, Comparison::Sampled, true, native_calls});
     const std::array geometries{
         Geometry{20480, 1536, {16, 32, 64, 128, 256, 1024}},
         Geometry{16384, 1536, {16, 32, 64, 128, 256, 1024}},

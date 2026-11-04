@@ -89,8 +89,9 @@ int verify(const Fixture& f, const std::string& label) {
 
 namespace {
 int run(Form form, int m, Pattern pattern, bool alias, bool captured, CudaExecutionView e,
-        std::size_t tensor_guard_bytes = 256) {
-    Fixture f(form, m, alias, tensor_guard_bytes);
+        std::size_t tensor_guard_bytes = 256, DType base = DType::BF16, DType scale = DType::BF16,
+        DType gamma = DType::BF16) {
+    Fixture f(form, m, alias, tensor_guard_bytes, base, scale, gamma);
     f.set(pattern);
     f.upload(e.stream());
     DecodeGraphDefinition definition;
@@ -166,6 +167,32 @@ void add_cases(OpSuite& suite) {
         }
         suite.add(std::string(name(form)) + "/contract",
                   [=] { return validate(form, cuda_environment().context.execution_view()); });
+    }
+    for (auto form : {Form::Pre, Form::ExpandPre, Form::PostPre, Form::PostMeanNorm}) {
+        const std::vector<int> columns = form == Form::PostMeanNorm
+                                             ? std::vector<int>{1, 7, 16, 17, 513}
+                                             : std::vector<int>{1, 7, 17, 129, 609};
+        for (auto gamma : {DType::BF16, DType::FP32})
+            for (const int m : columns) {
+                const auto id = std::string(name(form)) + "/fp32-parameters/" +
+                                (gamma == DType::FP32 ? "fp32-gamma" : "bf16-gamma") + "/m" +
+                                std::to_string(m);
+                suite.add(id, [=] {
+                    return run(form, m, Pattern::General, form == Form::PostPre, m == 7,
+                               cuda_environment().context.execution_view(), 272, DType::FP32,
+                               DType::FP32, gamma);
+                });
+            }
+    }
+    for (auto base : {DType::BF16, DType::FP32}) {
+        const auto scale = base == DType::BF16 ? DType::FP32 : DType::BF16;
+        suite.add(std::string("pre/mixed-parameters/") +
+                      (base == DType::BF16 ? "bf16-base" : "fp32-base"),
+                  [=] {
+                      return run(Form::Pre, 7, Pattern::General, false, false,
+                                 cuda_environment().context.execution_view(), 256, base, scale,
+                                 DType::FP32);
+                  });
     }
 }
 } // namespace ninfer::test::mhc

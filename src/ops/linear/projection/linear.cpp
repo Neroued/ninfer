@@ -8,6 +8,9 @@
 #include "ops/linear/projection/q5/q5_dispatch.h"
 #include "ops/linear/projection/q6/q6_dispatch.h"
 #include "ops/linear/projection/q8/q8_dispatch.h"
+#include "ops/linear/projection/mxfp8/dispatch.h"
+#include "ops/linear/projection/fp8_block/dispatch.h"
+#include "ops/linear/projection/nvfp4_mul/dispatch.h"
 
 #include <cstdint>
 #include <limits>
@@ -102,6 +105,15 @@ void dispatch_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy
     case QType::FP8_E4M3FN_ROW_BF16:
         detail::fp8_dispatch(x, w, out, policy, workspace, stream);
         return;
+    case QType::MXFP8:
+        detail::mxfp8_dispatch(x, w, out, policy, workspace, stream);
+        return;
+    case QType::FP8_E4M3FN_BLOCK128X128_FP32:
+        detail::fp8_block_dispatch(x, w, out, policy, workspace, stream);
+        return;
+    case QType::NVFP4_MUL:
+        detail::nvfp4_mul_dispatch(x, w, out, policy, stream);
+        return;
     case QType::FP32:
     case QType::INT32:
         break;
@@ -146,6 +158,15 @@ std::size_t linear_workspace_capacity_bytes(QType qtype, std::int32_t output_row
     case QType::FP8_E4M3FN_ROW_BF16:
         return detail::fp8_linear_workspace_capacity_bytes(output_rows, input_rows, policy,
                                                            min_tokens, max_tokens);
+    case QType::MXFP8:
+        return detail::mxfp8_linear_workspace_capacity_bytes(output_rows, input_rows, policy,
+                                                             min_tokens, max_tokens);
+    case QType::FP8_E4M3FN_BLOCK128X128_FP32:
+        return detail::fp8_block_linear_workspace_capacity_bytes(output_rows, input_rows, policy,
+                                                                 min_tokens, max_tokens);
+    case QType::NVFP4_MUL:
+        return detail::nvfp4_mul_linear_workspace_capacity_bytes(output_rows, input_rows, policy,
+                                                                 min_tokens, max_tokens);
     case QType::FP32:
     case QType::INT32:
         break;

@@ -17,7 +17,7 @@ struct ClusterPreTile {
 // A cluster owns complete token columns and partitions their hidden dimension.
 // Each CTA retains its rounded residual words until collapse, so the complete
 // pre/post-pre needs neither a residual reread nor global projection/norm scratch.
-template <Form F, int Tokens, int Cluster, int BK, int Stages>
+template <class Gamma, Form F, int Tokens, int Cluster, int BK, int Stages>
 __global__ __launch_bounds__(Tokens == 8 ? 512 : 256, 2) void __cluster_dims__(Cluster, 1, 1)
     pre_cluster_kernel(Operands o, std::int64_t tile_offset) {
     constexpr int H       = kHidden / Cluster;
@@ -192,9 +192,9 @@ __global__ __launch_bounds__(Tokens == 8 ? 512 : 256, 2) void __cluster_dims__(C
 #pragma unroll
             for (int g = 0; g < Groups; ++g) {
                 int d = (g * Wpt * 32 + local * 32 + lane) * V;
-                common::Bf16Vector<V> gamma;
+                GammaVector<Gamma, V> gamma;
                 if constexpr (F == Form::Pre)
-                    gamma = common::Bf16Vector<V>::load(static_cast<const __nv_bfloat16*>(o.gamma) +
+                    gamma = GammaVector<Gamma, V>::load(static_cast<const Gamma*>(o.gamma) +
                                                         rank * H + d);
 #pragma unroll
                 for (int v = 0; v < V; ++v) {
@@ -210,7 +210,7 @@ __global__ __launch_bounds__(Tokens == 8 ? 512 : 256, 2) void __cluster_dims__(C
                         square = fmaf(value, value, square);
                     }
                     if constexpr (F == Form::Pre)
-                        values[g][v] = value * __bfloat162float(gamma.word[v]);
+                        values[g][v] = value * float(gamma.word[v]);
                     else
                         values[g][v] = value;
                 }
@@ -257,15 +257,15 @@ __global__ __launch_bounds__(Tokens == 8 ? 512 : 256, 2) void __cluster_dims__(C
                 for (int g = 0; g < Groups; ++g) {
                     int d = (g * Wpt * 32 + local * 32 + lane) * V;
                     if (d < H) {
-                        common::Bf16Vector<V> gamma;
+                        GammaVector<Gamma, V> gamma;
                         if constexpr (F != Form::Pre)
-                            gamma = common::Bf16Vector<V>::load(
-                                static_cast<const __nv_bfloat16*>(o.gamma) + rank * H + d);
+                            gamma = GammaVector<Gamma, V>::load(static_cast<const Gamma*>(o.gamma) +
+                                                                rank * H + d);
                         common::Bf16Vector<V> output;
 #pragma unroll
                         for (int v = 0; v < V; ++v) {
                             float value = values[g][v];
-                            if constexpr (F != Form::Pre) value *= __bfloat162float(gamma.word[v]);
+                            if constexpr (F != Form::Pre) value *= float(gamma.word[v]);
                             output.word[v] = __float2bfloat16_rn(value * inverse);
                         }
                         output.store(static_cast<__nv_bfloat16*>(o.output) +

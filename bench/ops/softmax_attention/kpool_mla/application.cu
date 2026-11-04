@@ -78,8 +78,8 @@ static Json admission(CudaExecutionView cuda, const Json& c) {
                   ops::kpool_sparse_mla_workspace_capacity_bytes(
                       {64, 256, 256, 512}, storage, envelope, B, 1, T, cuda.multiprocessor_count()),
                   ops::kpool_mla_prepare_record_workspace_capacity_bytes(
-                      {kp::Projection::Full, 4096, 512, 128, 1536, 32, 4}, storage, index_format, B,
-                      1, T, cuda.multiprocessor_count()),
+                      kp::bf16_prepare_profile(kp::Projection::Full), storage, index_format, B, 1,
+                      T, cuda.multiprocessor_count()),
                   ops::linear_workspace_capacity_bytes(QType::Q8_G32_FP16, 4096, 16384,
                                                        ops::LinearPolicy::A16Only, B, T * B)});
     std::size_t free = 0, total = 0;

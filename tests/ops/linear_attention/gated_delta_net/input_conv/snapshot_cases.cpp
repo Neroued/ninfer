@@ -105,8 +105,8 @@ std::vector<SnapshotCase> cases(Profile p) {
 namespace ninfer::test::gdn_input_conv {
 int snapshot_capacity_contract() {
     const ops::PairedProjectionWeights q4_q5_capacity_weights{
-        capacity_weight(QType::Q4_G64_FP16, 4096, 5120),
-        capacity_weight(QType::Q5_G64_FP16, 12288, 5120)};
+        {capacity_weight(QType::Q4_G64_FP16, 4096, 5120)},
+        {capacity_weight(QType::Q5_G64_FP16, 12288, 5120)}};
     const ops::SingleProjectionWeight q8_capacity_weights{
         capacity_weight(QType::Q8_G32_FP16, 12288, 2048)};
 

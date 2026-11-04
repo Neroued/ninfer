@@ -23,13 +23,27 @@ int verify(kp::Fixture& f) {
     const bool fp8        = f.cache.index.format == KvCacheVectorFormat::Fp8E4m3fnGroup128Ue8m0;
     const bool fp8_latent = f.cache.latent.storage == ops::KpoolMlaStorage::Fp8E4m3fnGroup128Ue8m0;
     const int patterns = std::min(f.T, 7), count = patterns * f.B;
+    const auto weight_value = [&](int row, int k) {
+        if (!w.encoded) return double(kp::decode(w.weight.at(k, row)));
+        const auto& map = w.params.rows;
+        const std::array roles{map.latent, map.index_key, map.pool_gate, map.query,
+                               map.coefficients};
+        constexpr int origins[]{0, 512, 640, 768, 2304};
+        for (int i = 0; i < 5; ++i)
+            if (row >= origins[i] && row < origins[i] + roles[i].rows) {
+                const int physical_row = roles[i].row_begin + row - origins[i];
+                return roles[i].parent == 0 ? represented_weight(*w.encoded, physical_row, k)
+                                            : double(kp::decode(w.auxiliary->at(k, physical_row)));
+            }
+        throw std::logic_error("missing reference projection role");
+    };
     std::vector<std::vector<double>> projected(count, std::vector<double>(w.rows));
     parallel_rows(count * w.rows, std::uint64_t(count) * w.rows * 4096, [&](int lo, int hi) {
         for (int i = lo; i < hi; ++i) {
             const int row = i % w.rows, m = i / w.rows, b = m / patterns, t = m % patterns;
             double value = 0;
             for (int k = 0; k < 4096; ++k)
-                value += double(kp::decode(w.weight.at(k, row))) * kp::decode(f.x.at(k, t, b));
+                value += weight_value(row, k) * kp::decode(f.x.at(k, t, b));
             projected[m][row] = value;
         }
     });
@@ -182,21 +196,30 @@ int verify(kp::Fixture& f) {
                     }
         }
     }
-    failures +=
-        latent.check("latent", fp8_latent ? kPreparedFp8LatentCriterion : kPreparedBf16Criterion) +
-        query.check("query", kPreparedBf16Criterion) +
-        raw_key.check("raw key", kPreparedBf16Criterion) +
-        raw_gate.check("raw gate", kPreparedBf16Criterion);
+    const bool a8 =
+        w.encoded &&
+        ops::allows_a8(std::get<ops::PairedProjectionWeights>(w.params.weights).first.policy);
+    const ReductionCriterion prepared_a8{.045, 1e-4, .075};
+    const ReductionCriterion encoded_a8{.085, 1e-4, .13};
+    const auto prepared = a8 ? prepared_a8 : kPreparedBf16Criterion;
+    failures += latent.check("latent", fp8_latent ? (a8 ? encoded_a8 : kPreparedFp8LatentCriterion)
+                                                  : prepared) +
+                query.check("query", prepared) + raw_key.check("raw key", prepared) +
+                raw_gate.check("raw gate", kPreparedBf16Criterion);
     // Record exposes the actual raw operands; update's reference includes their encoding.
-    failures += pooled.check("pool", fp8        ? kPooledFp8Criterion
-                                     : f.update ? kPooledBf16Criterion
-                                                : kPreparedBf16Criterion) +
-                coeff.check("coeff", kCoefficientCriterion) +
-                tail.check("tail", kPreparedBf16Criterion);
+    failures +=
+        pooled.check("pool", a8         ? (fp8 ? encoded_a8 : prepared_a8)
+                             : fp8      ? kPooledFp8Criterion
+                             : f.update ? kPooledBf16Criterion
+                                        : kPreparedBf16Criterion) +
+        coeff.check("coeff", a8 ? ReductionCriterion{.04, 1e-6, .06} : kCoefficientCriterion) +
+        tail.check("tail", prepared);
     failures += exact(cache, expected_cache, "cache") + exact(state, expected_state, "state") +
                 exact(actual_k, expected_k, "raw keys") + exact(actual_g, expected_g, "raw gates");
     for (const auto* v : {&f.x, &f.q, &f.keys, &f.gates}) failures += !v->guards();
     failures += !f.coeff.guards() || !f.tables.guards();
+    if (w.encoded)
+        failures += !w.encoded->unchanged() || w.auxiliary->download() != w.auxiliary->host;
     const auto capacity = f.update ? ops::kpool_mla_prepare_update_workspace_capacity_bytes
                                    : ops::kpool_mla_prepare_record_workspace_capacity_bytes;
     failures +=
@@ -208,9 +231,13 @@ int verify(kp::Fixture& f) {
 }
 
 int run(kp::Projection mode, int T, int B, bool update, bool graph, int phase, bool fp8 = false,
-        bool fp8_latent = false) {
+        bool fp8_latent = false, kp::ProjectionFormat format = kp::ProjectionFormat::BFloat16,
+        bool a16_only = false) {
     auto& device = cuda_environment().context;
-    kp::Weights weights(device.device(), mode);
+    kp::Weights weights(device.device(), mode, format);
+    if (a16_only)
+        std::get<ops::PairedProjectionWeights>(weights.params.weights).first.policy =
+            ops::LinearPolicy::A16Only;
     kp::Fixture f(weights, device.execution_view(), T, B, update, true, true, update, phase,
                   fp8 ? KvCacheVectorFormat::Fp8E4m3fnGroup128Ue8m0 : KvCacheVectorFormat::BFloat16,
                   fp8_latent ? ops::KpoolMlaStorage::Fp8E4m3fnGroup128Ue8m0
@@ -379,5 +406,39 @@ int main(int argc, char** argv) {
                         {{"format", "fp8"}, {"execution", T == 513 ? "graph" : "eager"}});
         }
     }
+    for (auto format : {kp::ProjectionFormat::BlockFp8, kp::ProjectionFormat::Mxfp8})
+        for (auto mode :
+             {kp::Projection::Full, kp::Projection::QueryAndHistory, kp::Projection::History})
+            for (bool update : {false, true}) {
+                const int T = update ? 17 : mode == kp::Projection::Full ? 1 : 9;
+                suite.add(
+                    std::string("kpool_prepare/native/") + kp::name(format) + "/" + kp::name(mode) +
+                        (update ? "/update" : "/record"),
+                    [=] { return run(mode, T, 3, update, update, 3, update, !update, format); },
+                    {{"format", kp::name(format)}, {"execution", update ? "graph" : "eager"}});
+            }
+    for (auto format : {kp::ProjectionFormat::BlockFp8, kp::ProjectionFormat::Mxfp8})
+        suite.add(
+            std::string("kpool_prepare/native/") + kp::name(format) + "/window",
+            [=] { return run(kp::Projection::Full, 1025, 1, true, false, 3, true, true, format); },
+            {{"format", kp::name(format)}});
+    for (auto format : {kp::ProjectionFormat::BlockFp8, kp::ProjectionFormat::Mxfp8})
+        suite.add(
+            std::string("kpool_prepare/native/") + kp::name(format) + "/history_short",
+            [=] { return run(kp::Projection::History, 4, 1, false, false, 3, true, true, format); },
+            {{"format", kp::name(format)}});
+    for (auto mode : {kp::Projection::QueryAndHistory, kp::Projection::History})
+        suite.add(std::string("kpool_prepare/native/mxfp8/tiles/") + kp::name(mode),
+                  [=] {
+                      return run(mode, 256, 1, true, false, 3, true, true,
+                                 kp::ProjectionFormat::Mxfp8);
+                  },
+                  {{"format", "mxfp8"}});
+    suite.add("kpool_prepare/native/mxfp8/a16",
+              [] {
+                  return run(kp::Projection::Full, 65, 1, true, false, 3, false, false,
+                             kp::ProjectionFormat::Mxfp8, true);
+              },
+              {{"format", "mxfp8"}});
     return suite.main(argc, argv);
 }

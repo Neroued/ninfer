@@ -302,12 +302,15 @@ void materialization(const std::filesystem::path& directory, DeviceContext& devi
         std::get<glm::execution::MlaParameters>(parameters.text.layers[1].mixer);
     const auto& mla_config  = model->definition().config().text.mla;
     const auto history_rows = mla_config.latent_dim + 2 * mla_config.index_dim;
-    require(prepared_mla.prepare[0].a_projection.qdata ==
-                    prepared_mla.prepare[1].a_projection.qdata &&
-                prepared_mla.prepare[0].a_projection.qdata ==
-                    prepared_mla.prepare[2].a_projection.qdata &&
-                prepared_mla.prepare[2].a_projection.n == history_rows &&
-                prepared_mla.prepare[1].a_projection.n == history_rows + mla_config.query_lowrank,
+    const auto& full =
+        std::get<ops::SingleProjectionWeight>(prepared_mla.prepare[0].weights).weight;
+    const auto& query_history =
+        std::get<ops::SingleProjectionWeight>(prepared_mla.prepare[1].weights).weight;
+    const auto& history =
+        std::get<ops::SingleProjectionWeight>(prepared_mla.prepare[2].weights).weight;
+    require(full.qdata == query_history.qdata && full.qdata == history.qdata &&
+                history.n == history_rows &&
+                query_history.n == history_rows + mla_config.query_lowrank,
             "MLA preparation did not bind continuous history/query prefixes");
     require(parameters.text.embedding.qdata == parameters.mtp->embedding.qdata &&
                 (!optimized ? parameters.text.head.weight.qdata == parameters.mtp->head.weight.qdata

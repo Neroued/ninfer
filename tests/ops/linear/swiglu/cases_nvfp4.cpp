@@ -18,7 +18,7 @@ ninfer::test::quantized_weight::PackedWeight make_negative_gate_weight() {
     std::fill(packed.payload.begin(), packed.payload.end(), 0);
     // Preserve the scalar metadata, while constructing the two independently scaled groups.
     const float divisor = 1.0f;
-    std::memcpy(packed.payload.data() + packed.weight_divisor_offset, &divisor, 4);
+    std::memcpy(packed.payload.data() + packed.matrix_scale_offset, &divisor, 4);
     const auto scale_offset = [&](int row, int group) {
         return packed.scale_plane_offset +
                static_cast<std::size_t>((row / 128) * (k / 64) + group / 4) * 512 +
@@ -48,7 +48,7 @@ ninfer::test::quantized_weight::PackedWeight make_clamp_weight(int recipe) {
                                             {.weight_scale = 1.0f, .input_scale = 6.0f});
     std::fill(packed.payload.begin(), packed.payload.end(), 0);
     const float divisor = 1.0f;
-    std::memcpy(packed.payload.data() + packed.weight_divisor_offset, &divisor, 4);
+    std::memcpy(packed.payload.data() + packed.matrix_scale_offset, &divisor, 4);
     for (int row = 0; row < n; ++row) {
         const bool gate = row < n / 2;
         // -10.5 is exactly represented: -6 * 1.75. 20 = 4 * 5.

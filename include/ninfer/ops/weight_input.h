@@ -13,7 +13,8 @@ namespace ninfer::ops {
 enum class ActivationScaleOperation { Divide, Multiply };
 
 // A scalar broadcasts to all logical matrices. A vector is indexed by logical matrix ID.
-// Vector storage and optional CUDA storage are immutable and owned by the caller.
+// Values are positive and finite. Vector storage and its matching optional CUDA copy are
+// immutable and owned by the caller; execution does not rescan vector contents.
 class ActivationCalibrationView {
 public:
     ActivationScaleOperation operation = ActivationScaleOperation::Divide;
@@ -74,7 +75,7 @@ struct WeightInput {
 // Row order is supplied by the calling implementation, for example a Vision Q/K/V bank.
 [[nodiscard]] SingleProjectionWeight prepare_linear_weight(std::span<const WeightInput> rows);
 // Logical row concatenation backed by one or two consecutive native parent regions.
-// Paired regions use A16; the consuming Op owns format/shape/segmentation admission.
+// Each region preserves its own activation permission; the Op admits format/shape/segmentation.
 [[nodiscard]] ProjectionWeights prepare_projection_weights(std::span<const WeightInput> rows);
 [[nodiscard]] ProjectionWeights prepare_gdn_control_proj_weights(const WeightInput& a,
                                                                  const WeightInput& b);

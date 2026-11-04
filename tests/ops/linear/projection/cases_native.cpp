@@ -83,6 +83,20 @@ void add_native_cases(Suite& suite) {
             add_shape(suite, QType::MXFP8, ActivationRecipe::Hashed, mxfp8_four_byte_scales,
                       {n, k, 1461U, Comparison::Sampled, true, unaligned_calls});
         }
+        if (n == 4096 && k == 4096) {
+            add_workspace_cases(suite, QType::MXFP8, n, k);
+            calls.insert(calls.end(), {{1, CallForm::Policy, ops::LinearPolicy::AllowA8},
+                                       {2, CallForm::Policy, ops::LinearPolicy::AllowA8, true},
+                                       {4, CallForm::Policy, ops::LinearPolicy::AllowA8},
+                                       {64, CallForm::Policy, ops::LinearPolicy::AllowA8},
+                                       {65, CallForm::Policy, ops::LinearPolicy::AllowA8, true},
+                                       {128, CallForm::Policy, ops::LinearPolicy::AllowA8},
+                                       {256, CallForm::Policy, ops::LinearPolicy::AllowA8},
+                                       {257, CallForm::Policy, ops::LinearPolicy::AllowA8},
+                                       {384, CallForm::Policy, ops::LinearPolicy::AllowA8},
+                                       {385, CallForm::Policy, ops::LinearPolicy::AllowA8, true},
+                                       {4096, CallForm::Policy, ops::LinearPolicy::AllowA8, true}});
+        }
         add_shape(suite, QType::MXFP8, ActivationRecipe::Hashed, native_weight<QType::MXFP8>,
                   {n, k, 1451U, Comparison::Sampled, true, calls});
     }

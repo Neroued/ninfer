@@ -169,6 +169,10 @@ struct Result {
     double tensor_peak_pct               = std::numeric_limits<double>::quiet_NaN();
     double memory_floor_us               = 0.0;
     double memory_floor_pct              = 0.0;
+    double sustained_memory_floor_us     = std::numeric_limits<double>::quiet_NaN();
+    double compute_floor_us              = std::numeric_limits<double>::quiet_NaN();
+    double roofline_floor_us             = std::numeric_limits<double>::quiet_NaN();
+    double roofline_pct                  = std::numeric_limits<double>::quiet_NaN();
     double t1_linear_extrapolation       = std::numeric_limits<double>::quiet_NaN();
     double delta_pct                     = std::numeric_limits<double>::quiet_NaN();
     int warmup                           = 0;
@@ -772,6 +776,17 @@ Result make_result(const BenchPoint& point, const LinearBenchWeight& weight,
     result.tensor_peak_tflops = registered_tensor_peak_tflops(point, result.tensor_profile);
     if (std::isfinite(result.tensor_peak_tflops)) {
         result.tensor_peak_pct = result.useful_tflops / result.tensor_peak_tflops * 100.0;
+        result.compute_floor_us = useful_flops / (result.tensor_peak_tflops * 1.0e6);
+    }
+    if (opt.cold && opt.graph_calls == 1 &&
+        std::isfinite(bench::kRoofline.sustained_read_gbs)) {
+        result.sustained_memory_floor_us =
+            static_cast<double>(required_bytes) / (bench::kRoofline.sustained_read_gbs * 1.0e3);
+        if (std::isfinite(result.compute_floor_us)) {
+            result.roofline_floor_us =
+                std::max(result.sustained_memory_floor_us, result.compute_floor_us);
+            result.roofline_pct = result.roofline_floor_us / timing.median_us * 100.0;
+        }
     }
     result.memory_floor_us  = memory_floor_us;
     result.memory_floor_pct = memory_floor_us / timing.median_us * 100.0;
@@ -1006,7 +1021,8 @@ void write_csv(const std::filesystem::path& path, const std::vector<Result>& res
            "tensor_peak_tflops,tensor_peak_pct,memory_floor_us,memory_floor_pct,"
            "t1_linear_extrapolation,delta_pct,"
            "warmup,repeat,flush_bytes,execution,graph_nodes,graph_calls,cache,timer_scope,"
-           "workspace_capacity_bytes,scratch_traffic_bytes\n";
+           "workspace_capacity_bytes,scratch_traffic_bytes,sustained_memory_floor_us,"
+           "compute_floor_us,roofline_floor_us,roofline_pct\n";
     for (const Result& result : results) {
         out << csv_quote(result.labels) << ',' << result.qtype_name << ',' << result.policy_name
             << ',' << result.n << ',' << result.k << ',' << result.t << ',' << result.weight_bytes
@@ -1031,7 +1047,11 @@ void write_csv(const std::filesystem::path& path, const std::vector<Result>& res
             << result.execution << ',';
         if (result.graph_nodes) out << result.graph_nodes;
         out << ',' << result.graph_calls << ',' << result.cache << ',' << result.timer_scope << ','
-            << result.workspace_capacity_bytes << ',' << result.scratch_traffic_bytes << '\n';
+            << result.workspace_capacity_bytes << ',' << result.scratch_traffic_bytes << ','
+            << bench::format_metric(result.sustained_memory_floor_us, 6, "") << ','
+            << bench::format_metric(result.compute_floor_us, 6, "") << ','
+            << bench::format_metric(result.roofline_floor_us, 6, "") << ','
+            << bench::format_metric(result.roofline_pct, 6, "") << '\n';
     }
 }
 

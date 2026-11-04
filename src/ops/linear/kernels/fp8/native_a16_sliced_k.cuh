@@ -27,10 +27,12 @@ struct NativeFp8A16SlicedKSchedule {
     static constexpr int kStages         = Stages;
     static constexpr int kThreads        = KWarps * 32;
     static constexpr int kMinBlocksPerSm = MinBlocksPerSm;
-    static constexpr int kMmaRows        = BlockRows / 16;
-    static constexpr int kMmaTokens      = BlockTokens / 8;
-    static_assert(BlockRows == 16 || BlockRows == 32);
-    static_assert(BlockTokens > 0 && BlockTokens <= 32 && BlockTokens % 8 == 0);
+    static constexpr int kMmaRows        = (BlockRows + 15) / 16;
+    static constexpr int kMmaTokens      = (BlockTokens + 7) / 8;
+    static_assert(BlockRows == 8 || BlockRows == 16 || BlockRows == 32);
+    static_assert(BlockTokens > 0 && BlockTokens <= 32 &&
+                  (BlockTokens % 8 == 0 || BlockTokens == 1 || BlockTokens == 2 ||
+                   BlockTokens == 4));
     static_assert(KWarps == 2 || KWarps == 4 || KWarps == 8 || KWarps == 16);
     static_assert(WarpK == 128 || WarpK == 256);
     static_assert(Stages == 1 || Stages == 2);
@@ -45,8 +47,9 @@ struct NativeFp8SlicedKStorage {
     static constexpr int kScales =
         std::is_same_v<Scale, std::uint8_t> ? S::kStages * S::kBlockRows * (S::kBlockK / 32) : 0;
     static constexpr int kStaging = kCodes + kActivation + kScales;
-    static constexpr int kPartial = S::kKWarps * S::kBlockRows * S::kBlockTokens * sizeof(float);
-    static constexpr int kBytes   = kStaging > kPartial ? kStaging : kPartial;
+    static constexpr int kPartial =
+        S::kKWarps * S::kMmaRows * 16 * S::kMmaTokens * 8 * sizeof(float);
+    static constexpr int kBytes = kStaging > kPartial ? kStaging : kPartial;
 };
 
 template <class Epilogue, class Output, int Tokens, class = void>
@@ -152,6 +155,8 @@ native_fp8_a16_sliced_k_body(const Input* __restrict__ x, const std::uint8_t* __
         const int warp_k = group * BK + warp * WK;
         const auto* xs   = activation + (slot * KW * planes + warp * planes) * BT * WK;
         const auto pair  = [&](int lr, int col, unsigned scale_word) {
+            if constexpr (BR < 16)
+                if (lr >= BR) return 0u;
             const int column = warp * WK + col;
             const int byte   = ((column / 16) ^ (lr & 7)) * 16 + (column & 15);
             const auto bits =
@@ -174,7 +179,8 @@ native_fp8_a16_sliced_k_body(const Input* __restrict__ x, const std::uint8_t* __
                     const auto* source = scale_shared + slot * BR * (BK / 32) + lr * (BK / 32) +
                                          warp * (WK / 32) + scale_group / 32;
                     packed_scales[mi][0] = common::load_vec<unsigned>(source);
-                    packed_scales[mi][1] = common::load_vec<unsigned>(source + 8 * (BK / 32));
+                    if constexpr (BR >= 16)
+                        packed_scales[mi][1] = common::load_vec<unsigned>(source + 8 * (BK / 32));
                 }
             }
             float partial[MR][MT][4]{};
@@ -194,7 +200,9 @@ native_fp8_a16_sliced_k_body(const Input* __restrict__ x, const std::uint8_t* __
                     unsigned bf[MT][2];
 #pragma unroll
                     for (int ni = 0; ni < MT; ++ni) {
-                        const int lt  = ni * 8 + (lane & 7);
+                        // Narrow tiles repeat valid activation rows for unused MMA columns.
+                        // Only the logical BT columns are stored by the epilogue.
+                        const int lt  = ni * 8 + (lane & 7) % BT;
                         const int col = kk + ((lane >> 3) & 1) * 8;
                         common::ldmatrix_x2(bf[ni][0], bf[ni][1],
                                             common::smem_addr(xs + plane * BT * WK + lt * WK +
@@ -276,23 +284,27 @@ native_fp8_a16_sliced_k_body(const Input* __restrict__ x, const std::uint8_t* __
                 }
                 const int lr = mi * 16 + gid, lt = ni * 8 + 2 * lid;
                 if constexpr (Rows::kPaired || row_consumer) {
-                    partial[lr * BT + lt]           = a[0];
-                    partial[lr * BT + lt + 1]       = a[1];
-                    partial[(lr + 8) * BT + lt]     = a[2];
-                    partial[(lr + 8) * BT + lt + 1] = a[3];
+                    if (lt < BT) {
+                        partial[lr * BT + lt] = a[0];
+                        if constexpr (BR >= 16) partial[(lr + 8) * BT + lt] = a[2];
+                    }
+                    if (lt + 1 < BT) {
+                        partial[lr * BT + lt + 1] = a[1];
+                        if constexpr (BR >= 16) partial[(lr + 8) * BT + lt + 1] = a[3];
+                    }
                 } else {
                     const int row0 = rows.weight_row(row_begin, lr, n);
                     const int row1 = rows.weight_row(row_begin, lr + 8, n);
-                    if (row0 < n && token_begin + lt < tokens)
+                    if (lt < BT && row0 < n && token_begin + lt < tokens)
                         output.store(row0, token_begin + lt,
                                      epilogue.apply(row0, token_begin + lt, a[0]));
-                    if (row0 < n && token_begin + lt + 1 < tokens)
+                    if (lt + 1 < BT && row0 < n && token_begin + lt + 1 < tokens)
                         output.store(row0, token_begin + lt + 1,
                                      epilogue.apply(row0, token_begin + lt + 1, a[1]));
-                    if (row1 < n && token_begin + lt < tokens)
+                    if (lr + 8 < BR && lt < BT && row1 < n && token_begin + lt < tokens)
                         output.store(row1, token_begin + lt,
                                      epilogue.apply(row1, token_begin + lt, a[2]));
-                    if (row1 < n && token_begin + lt + 1 < tokens)
+                    if (lr + 8 < BR && lt + 1 < BT && row1 < n && token_begin + lt + 1 < tokens)
                         output.store(row1, token_begin + lt + 1,
                                      epilogue.apply(row1, token_begin + lt + 1, a[3]));
                 }

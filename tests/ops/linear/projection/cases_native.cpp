@@ -12,6 +12,20 @@ quantized_weight::PackedWeight native_weight(int n, int k, std::uint32_t seed) {
     else
         return quantized_weight::make_patterned_weight(Format, n, k, seed);
 }
+
+#if NINFER_TARGET_SPARK
+quantized_weight::PackedWeight mxfp8_four_byte_scales(int n, int k, std::uint32_t seed) {
+    auto weight = native_weight<QType::MXFP8>(n, k, seed);
+    // The public format permits a scale plane aligned to four bytes, independently of codes.
+    weight.payload.insert(weight.payload.begin() + weight.geometry.scale_offset, 4, 0xa5);
+    weight.geometry.scale_offset += 4;
+    weight.geometry.bytes += 4;
+    weight.scale_plane_offset += 4;
+    weight.weight =
+        weight.device_weight({weight.payload.data(), weight.payload.size(), Device::cpu()});
+    return weight;
+}
+#endif
 } // namespace
 
 void add_native_cases(Suite& suite) {
@@ -37,9 +51,34 @@ void add_native_cases(Suite& suite) {
                                                         {4096, 16384},
                                                         {3072, 1024},
                                                         {1024, 1024}}};
-    for (auto [n, k] : mx_shapes)
+    for (auto [n, k] : mx_shapes) {
+        std::vector<Invocation> calls(mx_calls.begin(), mx_calls.end());
+        if (n == 12288 && k == 4096) {
+            add_workspace_cases(suite, QType::MXFP8, n, k);
+            // Complete and partial tiles and the transition to quantized activation workspace.
+            calls.insert(calls.end(), {{1, CallForm::Policy, ops::LinearPolicy::AllowA8},
+                                       {2, CallForm::Policy, ops::LinearPolicy::AllowA8, true},
+                                       {3, CallForm::Policy, ops::LinearPolicy::AllowA8},
+                                       {4, CallForm::Policy, ops::LinearPolicy::AllowA8, true},
+                                       {7, CallForm::Policy, ops::LinearPolicy::AllowA8},
+                                       {8, CallForm::Policy, ops::LinearPolicy::AllowA8},
+                                       {9, CallForm::Policy, ops::LinearPolicy::AllowA8, true},
+                                       {16, CallForm::Policy, ops::LinearPolicy::AllowA8},
+                                       {31, CallForm::Policy, ops::LinearPolicy::AllowA8},
+                                       {48, CallForm::Policy, ops::LinearPolicy::AllowA8},
+                                       {64, CallForm::Policy, ops::LinearPolicy::AllowA8},
+                                       {65, CallForm::Policy, ops::LinearPolicy::AllowA8, true},
+                                       {257, CallForm::Policy, ops::LinearPolicy::AllowA8, true},
+                                       {4096, CallForm::Policy, ops::LinearPolicy::AllowA8, true}});
+            const std::array<Invocation, 2> unaligned_calls{
+                {{512, CallForm::Policy, ops::LinearPolicy::AllowA8},
+                 {513, CallForm::Policy, ops::LinearPolicy::AllowA8, true}}};
+            add_shape(suite, QType::MXFP8, ActivationRecipe::Hashed, mxfp8_four_byte_scales,
+                      {n, k, 1461U, Comparison::Sampled, true, unaligned_calls});
+        }
         add_shape(suite, QType::MXFP8, ActivationRecipe::Hashed, native_weight<QType::MXFP8>,
-                  {n, k, 1451U, Comparison::Sampled, true, mx_calls});
+                  {n, k, 1451U, Comparison::Sampled, true, calls});
+    }
     const std::array<Invocation, 5> a16_calls{
         {{1, CallForm::A16Convenience},
          {5},

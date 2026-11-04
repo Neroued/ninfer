@@ -196,10 +196,19 @@ void add_native_cases(Suite& suite) {
          {513},
          {33, CallForm::Policy, ops::LinearPolicy::A16Only, true}}};
     for (auto [n, k] : std::array<std::array<int, 2>, 5>{
-             {{2048, 4096}, {512, 4096}, {16384, 1536}, {4096, 16384}, {4096, 1024}}})
+             {{2048, 4096}, {512, 4096}, {16384, 1536}, {4096, 16384}, {4096, 1024}}}) {
+        std::vector<Invocation> calls(a16_calls.begin(), a16_calls.end());
+        if (n == 2048 && k == 4096) {
+            for (int t : {3, 4, 8, 16, 32, 64, 96, 128, 192, 256, 384, 512, 640, 768, 896, 960, 1024,
+                          2048, 4096})
+                calls.push_back({t, CallForm::Policy, ops::LinearPolicy::A16Only});
+            for (int t : {2, 65, 129, 193, 257, 385, 641, 769, 897, 961, 1025})
+                calls.push_back({t, CallForm::Policy, ops::LinearPolicy::A16Only, true});
+        }
         add_shape(suite, QType::FP8_E4M3FN_BLOCK128X128_FP32, ActivationRecipe::Hashed,
                   native_weight<QType::FP8_E4M3FN_BLOCK128X128_FP32>,
-                  {n, k, 1457U, Comparison::Sampled, true, a16_calls});
+                  {n, k, 1457U, Comparison::Sampled, true, calls});
+    }
     const std::array<Invocation, 12> short_k_calls{
         {{1, CallForm::A16Convenience}, {2}, {4}, {5}, {16}, {17}, {32},
          {33, CallForm::Policy, ops::LinearPolicy::A16Only, true},

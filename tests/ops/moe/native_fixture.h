@@ -2,8 +2,10 @@
 
 #include "core/buffer.h"
 #include "ninfer/ops/moe.h"
+#include "ops/quantized_weight.h"
 
 #include <memory>
+#include <optional>
 #include <span>
 #include <string_view>
 #include <vector>
@@ -15,6 +17,11 @@ namespace native_moe {
 
 enum class Profile { MainTp, MainEp, MtpTp, MtpEp };
 enum class ScalePattern { Typical, Stress };
+
+struct WeightBanks {
+    quantized_weight::PackedWeightBank gate_up, down;
+};
+
 Profile parse_profile(std::string_view);
 std::string_view profile_name(Profile);
 
@@ -22,7 +29,7 @@ class Fixture {
 public:
     static constexpr int hidden = 4096, experts_count = 288, top_k = 8, shared_intermediate = 1024;
     Fixture(CudaExecutionView, Profile, int max_tokens, int rank = 0,
-            ScalePattern = ScalePattern::Typical);
+            ScalePattern = ScalePattern::Typical, std::optional<WeightBanks> = {});
     ~Fixture();
     Fixture(const Fixture&)            = delete;
     Fixture& operator=(const Fixture&) = delete;
@@ -33,7 +40,7 @@ public:
     bool main() const;
     bool ep() const;
     void input(int tokens, std::string_view distribution, int phase = 0, bool dense = false,
-               std::string_view locality = "mixed");
+               std::string_view locality = "mixed", int expert_offset = 0);
     void publish_routes(bool signed_coefficients = false);
     void release_host_weights();
     Tensor x(int tokens) const;

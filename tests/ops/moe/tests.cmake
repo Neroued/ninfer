@@ -64,8 +64,9 @@ if(NINFER_TARGET STREQUAL "dgx_spark")
             "${CMAKE_CURRENT_LIST_DIR}/tp2_fixture.cu"
             "${CMAKE_CURRENT_LIST_DIR}/tp2_oracle.cpp"
             "${CMAKE_CURRENT_LIST_DIR}/native_fixture.cpp"
+            "${CMAKE_CURRENT_LIST_DIR}/native_artifact.cpp"
             "${CMAKE_CURRENT_LIST_DIR}/test_native.cpp"
-    LIBRARIES ninfer_ops)
+    LIBRARIES ninfer_ops ninfer_artifact)
   ninfer_add_op_test(ninfer_swiglu_test
     SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_swiglu.cpp"
             "${CMAKE_CURRENT_LIST_DIR}/test_swiglu_bf16.cpp"

@@ -94,20 +94,6 @@ __global__ void scan_assignments(Groups g, int columns, bool density) {
     if (e == kExperts - 1) { *g.jobs = scan[e]; }
 }
 
-__device__ bool fully_covered_groups(Groups g, int assignments, bool density, bool ordered) {
-    if (!ordered) return false;
-    if (!density) {
-        // Distinct route IDs give at most one assignment per expert and token.
-        // Equal nonempty counts at T therefore cover every token in each group.
-        const int tokens = assignments / kTopK;
-        return g.load_range && g.load_range[0] == tokens && g.load_range[1] == tokens;
-    }
-    // Distinct IDs bound every expert's count by T. Reaching active*T means
-    // every active expert covers every token, independent of route-slot order.
-    const int active = g.jobs[2];
-    return active > 0 && g.offsets[kExperts] == active * (assignments / kTopK);
-}
-
 __global__ void index_assignments(const int* ids, ExpertSubsetKind kind, const int* mask, Groups g,
                                   int assignments, bool density, bool ordered) {
     const int a = blockIdx.x * blockDim.x + threadIdx.x;
@@ -117,7 +103,7 @@ __global__ void index_assignments(const int* ids, ExpertSubsetKind kind, const i
         if (g.inverse) { g.inverse[a] = -1; }
         return;
     }
-    const int packed      = fully_covered_groups(g, assignments, density, ordered)
+    const int packed      = fully_covered_groups<kExperts, kTopK>(g, assignments, density, ordered)
                                 ? g.offsets[expert] + a / kTopK
                                 : atomicAdd(g.cursors + expert, 1);
     g.assignments[packed] = a;
@@ -168,7 +154,8 @@ __global__ void group_small(const int* ids, ExpertSubsetKind kind, const int* ma
         g.job_columns[first + j] = j * columns;
     }
     if (tid == kExperts - 1) { *g.jobs = scan[tid]; }
-    const bool ordered_groups = fully_covered_groups(g, assignments, density, ordered);
+    const bool ordered_groups =
+        fully_covered_groups<kExperts, kTopK>(g, assignments, density, ordered);
     for (int a = tid; a < assignments; a += kExperts) {
         const int packed =
             ranks[a] >= 0 ? g.offsets[ids[a]] + (ordered_groups ? a / kTopK : ranks[a]) : -1;
@@ -290,18 +277,25 @@ void launch(const Tensor& x, const CudaSwiGLUExperts& experts, const ExpertRoute
     else
         fp8::launch_input(x, experts, routes, subset, s, execution, true);
     if (plan.single_block_grouping) {
-        group_small<<<1, kExperts, 0, stream>>>(
-            ids, subset.kind, mask, s.groups, assignments, plan.job_columns(),
-            plan.format == QType::FP8_E4M3FN_BLOCK128X128_BF16, plan.token_ordered_groups);
-        CUDA_CHECK(cudaGetLastError());
+        if (plan.format != QType::NVFP4_MUL) {
+            group_small<<<1, kExperts, 0, stream>>>(
+                ids, subset.kind, mask, s.groups, assignments, plan.job_columns(),
+                plan.format == QType::FP8_E4M3FN_BLOCK128X128_BF16, plan.token_ordered_groups);
+            CUDA_CHECK(cudaGetLastError());
+        }
+        if (plan.native_a4_grouped_input)
+            nvfp4::launch_mul_grouped_input(x, experts, routes, subset, plan, s, execution);
     } else {
         count_assignments<<<(assignments + 255) / 256, 256, 0, stream>>>(
             ids, subset.kind, mask, s.groups.counts, assignments);
         scan_assignments<<<1, kExperts, 0, stream>>>(
             s.groups, plan.job_columns(), plan.format == QType::FP8_E4M3FN_BLOCK128X128_BF16);
-        index_assignments<<<(assignments + 255) / 256, 256, 0, stream>>>(
-            ids, subset.kind, mask, s.groups, assignments,
-            plan.format == QType::FP8_E4M3FN_BLOCK128X128_BF16, plan.token_ordered_groups);
+        if (plan.native_a4_grouped_input)
+            nvfp4::launch_mul_grouped_input(x, experts, routes, subset, plan, s, execution);
+        else
+            index_assignments<<<(assignments + 255) / 256, 256, 0, stream>>>(
+                ids, subset.kind, mask, s.groups, assignments,
+                plan.format == QType::FP8_E4M3FN_BLOCK128X128_BF16, plan.token_ordered_groups);
         CUDA_CHECK(cudaGetLastError());
     }
     if (plan.format == QType::NVFP4_MUL) {

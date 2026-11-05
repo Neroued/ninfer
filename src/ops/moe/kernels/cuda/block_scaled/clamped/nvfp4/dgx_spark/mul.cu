@@ -1,6 +1,10 @@
 #include "ops/moe/kernels/cuda/block_scaled/clamped/nvfp4/mul.h"
 #include "ops/moe/kernels/cuda/block_scaled/clamped/nvfp4/compute.cuh"
+#include "ops/moe/kernels/cuda/block_scaled/clamped/nvfp4/grouped_tma.cuh"
+#include "ops/moe/kernels/cuda/block_scaled/clamped/nvfp4/grouped_scale_cache.cuh"
+#include "ops/moe/kernels/cuda/block_scaled/clamped/nvfp4/short_expert.cuh"
 #include "ops/moe/kernels/cuda/block_scaled/pool_down.cuh"
+#include "ops/moe/kernels/cuda/block_scaled/grouping.cuh"
 
 #include <algorithm>
 #include <bit>
@@ -14,11 +18,72 @@ ActivationScale calibration(const ActivationCalibrationView& view) {
     return {static_cast<const float*>(view.device_values.data), 1};
 }
 
-template <bool Quantize>
+// Small native batches publish grouping in the input launch. Counts and job
+// prefixes fit in separate 16-bit fields for at most 256*8 assignments.
+__device__ void group_decode(const int* ids, ExpertSubsetKind kind, const int* mask, Groups g,
+                             int tokens, int columns, bool ordered) {
+    constexpr int warps = kExperts / 32;
+    __shared__ int counts[kExperts], ranks[kTopK * 256];
+    __shared__ unsigned prefixes[warps];
+    const int tid = threadIdx.x, lane = tid % 32, warp = tid / 32;
+    counts[tid] = 0;
+    __syncthreads();
+    for (int a = tid; a < tokens * kTopK; a += kExperts) {
+        const int expert = ids[a];
+        ranks[a]         = includes(kind, mask, expert) ? atomicAdd(counts + expert, 1) : -1;
+    }
+    __syncthreads();
+    const int count = counts[tid], jobs = (count + columns - 1) / columns;
+    publish_load_range<kExperts>(g.load_range, count);
+    unsigned prefix = unsigned(count) | (unsigned(jobs) << 16);
+#pragma unroll
+    for (int d = 1; d < 32; d *= 2) {
+        const unsigned preceding = __shfl_up_sync(0xffffffff, prefix, d);
+        if (lane >= d) prefix += preceding;
+    }
+    if (lane == 31) prefixes[warp] = prefix;
+    __syncthreads();
+    if (warp == 0) {
+        unsigned total = lane < warps ? prefixes[lane] : 0;
+#pragma unroll
+        for (int d = 1; d < 32; d *= 2) {
+            const unsigned preceding = __shfl_up_sync(0xffffffff, total, d);
+            if (lane >= d) total += preceding;
+        }
+        if (lane < warps) prefixes[lane] = total;
+    }
+    __syncthreads();
+    prefix += warp ? prefixes[warp - 1] : 0;
+    const int begin = int(prefix & 65535) - count, first = int(prefix >> 16) - jobs;
+    g.offsets[tid] = begin;
+    for (int j = 0; j < jobs; ++j) {
+        g.job_experts[first + j] = tid;
+        g.job_columns[first + j] = j * columns;
+    }
+    if (tid == kExperts - 1) {
+        g.offsets[kExperts] = prefix & 65535;
+        *g.jobs             = prefix >> 16;
+    }
+    __syncthreads();
+    const bool token_order =
+        fully_covered_groups<kExperts, kTopK>(g, tokens * kTopK, false, ordered);
+    for (int a = tid; a < tokens * kTopK; a += kExperts) {
+        const int packed =
+            ranks[a] >= 0 ? g.offsets[ids[a]] + (token_order ? a / kTopK : ranks[a]) : -1;
+        if (g.inverse) g.inverse[a] = packed;
+        if (packed >= 0) g.assignments[packed] = a;
+    }
+}
+
+template <bool Quantize, bool Group>
 __global__ void prepare_input(const __nv_bfloat16* x, std::uint8_t* codes, std::uint8_t* scales,
                               ActivationScale input_scale, const int* ids, int tokens,
                               ExpertSubsetKind kind, const int* mask, int* counts,
-                              float* routed_sum, int* active_tokens) {
+                              float* routed_sum, int* active_tokens, Groups groups, int columns,
+                              bool ordered) {
+    if constexpr (Group) {
+        if (blockIdx.x == 0) group_decode(ids, kind, mask, groups, tokens, columns, ordered);
+    }
     const int index = blockIdx.x * blockDim.x + threadIdx.x;
     if (counts && index < kExperts) counts[index] = 0;
     const int assignment = blockIdx.x;
@@ -37,6 +102,7 @@ __global__ void prepare_input(const __nv_bfloat16* x, std::uint8_t* codes, std::
                 routed_sum[std::int64_t(token) * kHidden + row] = 0;
     }
     if constexpr (Quantize) {
+        if (threadIdx.x >= kHidden / 16) return;
         const int expert = ids[assignment];
         if (!includes(kind, mask, expert)) return;
         const int group    = threadIdx.x;
@@ -48,12 +114,65 @@ __global__ void prepare_input(const __nv_bfloat16* x, std::uint8_t* codes, std::
     }
 }
 
-template <int I, bool Gate, int Columns>
+template <bool Index>
+__global__ void
+quantize_grouped_input(const __nv_bfloat16* x, const int* ids, ExpertSubsetKind kind,
+                       const int* mask, Groups groups, int tokens, bool ordered,
+                       ActivationScale calibration, std::uint8_t* codes, std::uint8_t* scales,
+                       std::uint8_t* product, std::uint8_t* product_scales, int intermediate) {
+    const int tid = threadIdx.x;
+    // TMA fetches complete column tiles. Only the final partial tile can reach
+    // unowned rows; initialize its in-bounds tail without another allocation or
+    // launch. The map itself supplies zero for rows beyond the allocation.
+    const int live = groups.offsets[kExperts], tail = min(255, tokens * kTopK - live);
+    if (blockIdx.x < tail) {
+        const int row = live + blockIdx.x;
+        *reinterpret_cast<uint2*>(codes + std::int64_t(row) * (kHidden / 2) + tid * 8) =
+            make_uint2(0, 0);
+        scales[std::int64_t(row) * (kHidden / 16) + tid] = 0;
+        if (tid < intermediate / 16) {
+            *reinterpret_cast<uint2*>(product + std::int64_t(row) * (intermediate / 2) + tid * 8) =
+                make_uint2(0, 0);
+            product_scales[std::int64_t(row) * (intermediate / 16) + tid] = 0;
+        }
+    }
+    int assignment;
+    __shared__ int packed;
+    if constexpr (Index) {
+        assignment       = blockIdx.x;
+        const int expert = ids[assignment];
+        if (!includes(kind, mask, expert)) {
+            if (!tid && groups.inverse) groups.inverse[assignment] = -1;
+            return;
+        }
+        if (!tid) {
+            packed = fully_covered_groups<kExperts, kTopK>(groups, tokens * kTopK, false, ordered)
+                         ? groups.offsets[expert] + assignment / kTopK
+                         : atomicAdd(groups.cursors + expert, 1);
+            groups.assignments[packed] = assignment;
+            if (groups.inverse) groups.inverse[assignment] = packed;
+        }
+        __syncthreads();
+    } else {
+        if (blockIdx.x >= groups.offsets[kExperts]) return;
+        assignment = groups.assignments[blockIdx.x];
+        if (!tid) packed = blockIdx.x;
+        __syncthreads();
+    }
+    const int expert = ids[assignment], token = assignment / kTopK;
+    const auto encoded = common::quantize_nvfp4_mul_k16(
+        x + std::int64_t(token) * kHidden + tid * 16, calibration.get(expert));
+    *reinterpret_cast<uint2*>(codes + std::int64_t(packed) * (kHidden / 2) + tid * 8) =
+        make_uint2(encoded.codes_lo, encoded.codes_hi);
+    scales[std::int64_t(packed) * (kHidden / 16) + tid] = encoded.scale;
+}
+
+template <int I, bool Gate, int Columns, bool Csf>
 void launch_columns(const Tensor& x, const CudaSwiGLUExperts& experts, const ExpertRoutes& routes,
                     const Plan& plan, const Storage& storage, CudaExecutionView execution,
                     int minimum_load, int maximum_load) {
-    using S               = Schedule<Columns, Gate, 2, 128, 0, I, true>;
-    constexpr auto kernel = grouped_mma<Columns, Gate, true, 2, 128, 0, true, false, I, true>;
+    using S               = Schedule<Columns, Gate, 2, 128, 0, I, true, Csf>;
+    constexpr auto kernel = grouped_mma<Columns, Gate, true, 2, 128, 0, true, false, I, true, Csf>;
     const int assignments = kTopK * x.ne[1];
     const int covered     = std::min({plan.job_columns(), maximum_load, x.ne[1]});
     const int subtiles    = std::bit_ceil(unsigned((covered + Columns - 1) / Columns));
@@ -79,33 +198,90 @@ void launch_columns(const Tensor& x, const CudaSwiGLUExperts& experts, const Exp
         static_cast<const float*>(routes.coefficients.data), storage.routed_sum,
         std::countr_zero(unsigned(subtiles)), plan.clamp_limit, 0, 0, minimum_load, maximum_load,
         ExpertLoadRegime::All, 0, 0, 0, x.ne[1], plan.dense_down_columns != 0,
-        plan.pool_expert_limit, plan.pool_min_experts);
+        plan.pool_expert_limit, plan.pool_min_experts, plan.native_a4_grouped_input);
     CUDA_CHECK(cudaGetLastError());
 }
 
-template <int I>
+template <int I, bool Csf>
 void launch_bank(const Tensor& x, const CudaSwiGLUExperts& experts, const ExpertRoutes& routes,
                  const Plan& plan, const Storage& storage, CudaExecutionView execution) {
     const auto phase = [&]<bool Gate>() {
+        const int vector_limit = plan.native_a4_vector_max_load;
+        if constexpr (Csf) {
+            if (vector_limit) {
+                if (vector_limit != 2) throw std::logic_error("invalid native A4 vector load");
+                const auto short_kernel = [&]<int Columns>() {
+                    using V = short_expert::Shape<I, Gate, Columns>;
+                    const int blocks =
+                        std::min(kTopK * x.ne[1] * ((Gate ? I : kHidden) / V::features),
+                                 execution.multiprocessor_count() * 8);
+                    short_expert::contract<I, Gate, Columns>
+                        <<<blocks, V::threads, 0, execution.stream()>>>(
+                            Gate ? storage.input_codes : storage.product_codes,
+                            static_cast<const std::uint8_t*>(Gate ? storage.input_scales
+                                                                  : storage.product_scales),
+                            Gate ? experts.bank.gate_up : experts.bank.down,
+                            calibration(Gate ? experts.activation_calibration.gate_up
+                                             : experts.activation_calibration.down),
+                            calibration(experts.activation_calibration.down), storage.groups,
+                            storage.product_codes,
+                            static_cast<std::uint8_t*>(storage.product_scales),
+                            static_cast<const float*>(routes.coefficients.data), storage.routed_sum,
+                            plan.clamp_limit, plan.pool_min_experts, plan.pool_expert_limit,
+                            plan.native_a4_grouped_input);
+                    CUDA_CHECK(cudaGetLastError());
+                };
+                short_kernel.template operator()<2>();
+            }
+        }
+        if (x.ne[1] <= vector_limit) return;
+        if constexpr (I == 1024) {
+            const auto bank = Gate ? experts.bank.gate_up : experts.bank.down;
+            constexpr int k = Gate ? kHidden : I;
+            if (plan.native_a4_grouped_input && !bank.offsets && bank.code_stride % (k / 2) == 0) {
+                const auto run_tma = [&]<int C>(int first, int last) {
+                    if (x.ne[1] <= first) return;
+                    if constexpr (Gate && C == 256) {
+                        grouped_scale_cache::launch<I, Gate, C, Csf>(
+                            x, experts, routes, plan, storage, execution,
+                            std::max(first, vector_limit), last);
+                    } else {
+                        grouped_tma::launch<I, Gate, C, Csf>(x, experts, routes, plan, storage,
+                                                             execution,
+                                                             std::max(first, vector_limit), last);
+                    }
+                };
+                run_tma.template operator()<16>(0, 16);
+                run_tma.template operator()<64>(16, 64);
+                run_tma.template operator()<128>(64, 512);
+                run_tma.template operator()<256>(512, INT_MAX);
+                return;
+            }
+        }
         const auto run = [&](const Plan& selected, int first, int last) {
             if (x.ne[1] <= first) return;
             const int columns = Gate ? selected.gate_columns : selected.down_columns;
             switch (columns) {
             case 8:
-                return launch_columns<I, Gate, 8>(x, experts, routes, selected, storage, execution,
-                                                  first, last);
+                return launch_columns<I, Gate, 8, Csf>(x, experts, routes, selected, storage,
+                                                       execution, std::max(vector_limit, first),
+                                                       last);
             case 16:
-                return launch_columns<I, Gate, 16>(x, experts, routes, selected, storage, execution,
-                                                   first, last);
+                return launch_columns<I, Gate, 16, Csf>(x, experts, routes, selected, storage,
+                                                        execution, std::max(vector_limit, first),
+                                                        last);
             case 32:
-                return launch_columns<I, Gate, 32>(x, experts, routes, selected, storage, execution,
-                                                   first, last);
+                return launch_columns<I, Gate, 32, Csf>(x, experts, routes, selected, storage,
+                                                        execution, std::max(vector_limit, first),
+                                                        last);
             case 64:
-                return launch_columns<I, Gate, 64>(x, experts, routes, selected, storage, execution,
-                                                   first, last);
+                return launch_columns<I, Gate, 64, Csf>(x, experts, routes, selected, storage,
+                                                        execution, std::max(vector_limit, first),
+                                                        last);
             case 128:
-                return launch_columns<I, Gate, 128>(x, experts, routes, selected, storage,
-                                                    execution, first, last);
+                return launch_columns<I, Gate, 128, Csf>(x, experts, routes, selected, storage,
+                                                         execution, std::max(vector_limit, first),
+                                                         last);
             default:
                 throw std::logic_error("invalid native NVFP4 column tile");
             }
@@ -135,7 +311,7 @@ void launch_bank(const Tensor& x, const CudaSwiGLUExperts& experts, const Expert
         const auto run = [&]<int C>() {
             const int blocks = std::min((kHidden / 128) * ((x.ne[1] + C - 1) / C),
                                         execution.multiprocessor_count() * 3);
-            dense_token_down<C, I, true>
+            dense_token_down<C, I, true, Csf>
                 <<<blocks, Schedule<C, false>::threads, 0, execution.stream()>>>(
                     storage.product_codes, static_cast<const std::uint8_t*>(storage.product_scales),
                     experts.bank.down, calibration(experts.activation_calibration.down),
@@ -165,7 +341,7 @@ void launch_bank(const Tensor& x, const CudaSwiGLUExperts& experts, const Expert
         if (plan.pool_columns != 128)
             throw std::logic_error("invalid native expert pool column tile");
         launch_pool_down<kHidden, kExperts, kTopK, 128>(
-            PoolContraction<128, I, true>{
+            PoolContraction<128, I, true, Csf>{
                 storage.product_codes, static_cast<const std::uint8_t*>(storage.product_scales),
                 experts.bank.down, calibration(experts.activation_calibration.down)},
             storage.groups, static_cast<const int*>(routes.ids.data),
@@ -183,17 +359,26 @@ void launch_bank(const Tensor& x, const CudaSwiGLUExperts& experts, const Expert
 void launch_mul_input(const Tensor& x, const CudaSwiGLUExperts& experts, const ExpertRoutes& routes,
                       ExpertSubset subset, const Plan& plan, const Storage& storage,
                       CudaExecutionView execution) {
-    const bool quantize = plan.arithmetic == Nvfp4Arithmetic::MultiplyA4;
-    const auto launch   = [&]<bool Quantize>() {
-        const int count = x.ne[1] * (Quantize ? kTopK : 1);
-        prepare_input<Quantize>
-            <<<std::max(count, (kExperts + 255) / 256), 256, 0, execution.stream()>>>(
+    const bool quantize =
+        plan.arithmetic == Nvfp4Arithmetic::MultiplyA4 && !plan.native_a4_grouped_input;
+    const auto launch = [&]<bool Quantize>() {
+        const auto run = [&]<bool Group>() {
+            constexpr int threads = Group ? kExperts : 256;
+            const int count       = x.ne[1] * (Quantize ? kTopK : 1);
+            prepare_input<Quantize, Group><<<std::max(count, (kExperts + threads - 1) / threads),
+                                             threads, 0, execution.stream()>>>(
                 static_cast<const __nv_bfloat16*>(x.data), storage.input_codes,
                 static_cast<std::uint8_t*>(storage.input_scales),
                 Quantize ? calibration(experts.activation_calibration.gate_up) : ActivationScale{},
                 static_cast<const int*>(routes.ids.data), x.ne[1], subset.kind,
                 static_cast<const int*>(subset.mask.data), storage.groups.counts,
-                storage.routed_sum, storage.active_tokens);
+                storage.routed_sum, storage.active_tokens, storage.groups, plan.job_columns(),
+                plan.token_ordered_groups);
+        };
+        if (plan.single_block_grouping)
+            run.template operator()<true>();
+        else
+            run.template operator()<false>();
     };
     if (quantize)
         launch.template operator()<true>();
@@ -202,12 +387,37 @@ void launch_mul_input(const Tensor& x, const CudaSwiGLUExperts& experts, const E
     CUDA_CHECK(cudaGetLastError());
 }
 
+void launch_mul_grouped_input(const Tensor& x, const CudaSwiGLUExperts& experts,
+                              const ExpertRoutes& routes, ExpertSubset subset, const Plan& plan,
+                              const Storage& storage, CudaExecutionView execution) {
+    const auto run = [&]<bool Index>() {
+        quantize_grouped_input<Index><<<kTopK * x.ne[1], kHidden / 16, 0, execution.stream()>>>(
+            static_cast<const __nv_bfloat16*>(x.data), static_cast<const int*>(routes.ids.data),
+            subset.kind, static_cast<const int*>(subset.mask.data), storage.groups, x.ne[1],
+            plan.token_ordered_groups, calibration(experts.activation_calibration.gate_up),
+            storage.input_codes, static_cast<std::uint8_t*>(storage.input_scales),
+            storage.product_codes, static_cast<std::uint8_t*>(storage.product_scales),
+            plan.intermediate);
+    };
+    if (plan.single_block_grouping)
+        run.template operator()<false>();
+    else
+        run.template operator()<true>();
+    CUDA_CHECK(cudaGetLastError());
+}
+
 void launch_mul_experts(const Tensor& x, const CudaSwiGLUExperts& experts,
                         const ExpertRoutes& routes, const Plan& plan, const Storage& storage,
                         CudaExecutionView execution) {
-    if (plan.intermediate == 1024)
-        launch_bank<1024>(x, experts, routes, plan, storage, execution);
+    const auto launch = [&]<bool Csf>() {
+        if (plan.intermediate == 1024)
+            launch_bank<1024, Csf>(x, experts, routes, plan, storage, execution);
+        else
+            launch_bank<2048, Csf>(x, experts, routes, plan, storage, execution);
+    };
+    if (experts.bank.gate_up.layout == QuantLayout::Csf32)
+        launch.template operator()<true>();
     else
-        launch_bank<2048>(x, experts, routes, plan, storage, execution);
+        launch.template operator()<false>();
 }
 } // namespace ninfer::ops::detail::moe_cuda::block_scaled::clamped::nvfp4

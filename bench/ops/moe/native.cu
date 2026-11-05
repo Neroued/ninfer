@@ -1,6 +1,8 @@
 #include "ops/moe/native_fixture.h"
+#include "ops/moe/native_artifact.h"
 #include "op_measurement.cuh"
 #include "common/roofline.h"
+#include "ops/moe/routed_swiglu/cuda/dispatch.h"
 
 #include <numeric>
 #include <sstream>
@@ -16,7 +18,9 @@ struct Options {
     native::Profile profile            = native::Profile::MainTp;
     native::ScalePattern scale_pattern = native::ScalePattern::Typical;
     std::string distribution = "all", entry = "both", locality = "mixed";
-    int rank = 0;
+    std::string artifact;
+    int expert_offset = 0;
+    int rank = 0, layer = 3;
 
     Options() {
         for (int t = 1; t <= 256; ++t) tokens.push_back(t);
@@ -33,12 +37,14 @@ Options parse(int argc, char** argv) {
                 << "Native FP4Local MoE, complete public entries.\n"
                    "  --profile-id main-tp|main-ep|mtp-tp|mtp-ep --entry routed|complete|both\n"
                    "  --distribution reuse|pool|tail|spread|all --locality local|mixed|remote\n"
+                   "  --expert-offset N (rotate expert pool within locality domain)\n"
                    "  --scale-pattern typical|stress (CSF; default typical)\n"
+                   "  --artifact PATH --layer N (real expert payloads; Main default layer 3)\n"
                    "  --rank 0|1 --tokens T[,T...] --sweep FIRST:LAST[:STEP]\n"
                    "Defaults: every T=1..256, then 512,1024,2048,4096; warm and cold.\n"
                    "Bytes count distinct encoded weights and public operands, not measured DRAM.\n"
-                   "Compute bounds use allowed arithmetic; they do not identify the selected "
-                   "kernel.\n";
+                   "Allowed compute bounds are policy references; routed matched bounds use "
+                   "the selected SIMT/Tensor partitions.\n";
             measurement::help();
             std::exit(0);
         }
@@ -46,6 +52,10 @@ Options parse(int argc, char** argv) {
         if (measurement::parse(o.timing, flag, value)) continue;
         if (flag == "--profile-id")
             o.profile = native::parse_profile(value);
+        else if (flag == "--artifact")
+            o.artifact = value;
+        else if (flag == "--layer")
+            o.layer = measurement::integer(value, 0, 1000);
         else if (flag == "--scale-pattern") {
             if (value == "typical")
                 o.scale_pattern = native::ScalePattern::Typical;
@@ -57,6 +67,8 @@ Options parse(int argc, char** argv) {
             o.entry = value;
         else if (flag == "--distribution")
             o.distribution = value;
+        else if (flag == "--expert-offset")
+            o.expert_offset = measurement::integer(value, 0, 287);
         else if (flag == "--locality")
             o.locality = value;
         else if (flag == "--rank")
@@ -79,7 +91,10 @@ Options parse(int argc, char** argv) {
 void run(const Options& o) {
     const auto cuda    = device_context().execution_view();
     const auto maximum = *std::max_element(o.tokens.begin(), o.tokens.end());
-    native::Fixture fixture(cuda, o.profile, maximum, o.rank, o.scale_pattern);
+    native::Fixture fixture(cuda, o.profile, maximum, o.rank, o.scale_pattern,
+                            o.artifact.empty() ? std::nullopt
+                                               : std::optional(native::read_artifact_weights(
+                                                     o.artifact, o.profile, o.rank, o.layer)));
     const auto routed          = fixture.routed_profile();
     const auto complete        = fixture.complete_profile();
     const auto experts         = fixture.expert_weights();
@@ -110,7 +125,12 @@ void run(const Options& o) {
         "memory_bound_us,routed_allowed_compute_bound_us,shared_allowed_compute_bound_us,"
         "router_allowed_compute_bound_us,allowed_compute_bound_us,roofline_bound_us,"
         "latency_above_bound_us,allowed_arithmetic,interval_workspace_bytes,bandwidth_limited,"
-        "cold_bandwidth_235gbs");
+        "cold_bandwidth_235gbs,expert_weight_source,source_layer,useful_tflops,bandwidth_peak_pct,"
+        "allowed_compute_peak_pct,roofline_efficiency_pct,aggregate_roofline_bound_us,expert_"
+        "offset,"
+        "routed_executed_arithmetic,routed_simt_flops,routed_tensor_flops,"
+        "routed_matched_compute_bound_us,routed_matched_roofline_bound_us,"
+        "routed_matched_compute_peak_pct,fp32_reference_tflops");
     const auto distributions = o.distribution == "all"
                                    ? std::vector<std::string>{"reuse", "pool", "tail", "spread"}
                                    : std::vector<std::string>{o.distribution};
@@ -120,7 +140,7 @@ void run(const Options& o) {
               << " sustained_read_gbs=" << kRoofline.sustained_read_gbs << '\n';
     for (const auto& distribution : distributions)
         for (int tokens : o.tokens) {
-            fixture.input(tokens, distribution, 0, true, o.locality);
+            fixture.input(tokens, distribution, 0, true, o.locality, o.expert_offset);
             fixture.publish_routes();
             const auto counts = fixture.local_counts();
             const int active  = std::accumulate(counts.begin(), counts.end(), 0);
@@ -152,6 +172,38 @@ void run(const Options& o) {
                 const double router_flops =
                     full ? 2.0 * tokens * native::Fixture::hidden * native::Fixture::experts_count
                          : 0;
+                const auto selected = ops::detail::moe_routed::shape_dispatch(routed).select(
+                    routed.ffn, tokens, full ? native::Fixture::shared_intermediate : 0);
+                const auto& plan = selected.clamped;
+                const int vector_limit =
+                    fixture.main() ? plan.native_a4_vector_max_load : plan.a16.vector_max_load;
+                const bool pooled = plan.pool_expert_limit && unique > plan.pool_min_experts &&
+                                    unique <= plan.pool_expert_limit;
+                std::uint64_t vector_assignments = 0;
+                int least = tokens, greatest = 0;
+                for (int count : counts)
+                    if (count) {
+                        least    = std::min(least, count);
+                        greatest = std::max(greatest, count);
+                    }
+                const bool promoted = fixture.main() && plan.native_a4_grouped_input &&
+                                      greatest - least <= 1 && greatest > vector_limit;
+                if (!promoted) {
+                    for (int count : counts)
+                        if (count <= vector_limit) vector_assignments += count;
+                }
+                // Pool down owns all experts. Its short tails still use vector GU.
+                const double simt_flops = (pooled ? 4.0 : 6.0) * vector_assignments *
+                                          native::Fixture::hidden * fixture.intermediate;
+                const double tensor_flops = routed_flops - simt_flops;
+                const double matched_compute =
+                    simt_flops / (1e6 * kRoofline.fp32_f32_tflops) +
+                    tensor_flops / (1e6 * (fixture.main() ? kRoofline.nvfp4_f32_tflops
+                                                          : kRoofline.bf16_f32_tflops));
+                const std::string executed = simt_flops == 0 ? (fixture.main() ? "NVFP4" : "BF16")
+                                             : tensor_flops == 0 ? "FP32"
+                                             : fixture.main()    ? "FP32+NVFP4"
+                                                                 : "FP32+BF16";
                 const double routed_compute =
                     routed_flops / (1e6 * (fixture.main() ? kRoofline.nvfp4_f32_tflops
                                                           : kRoofline.bf16_f32_tflops));
@@ -220,6 +272,18 @@ void run(const Options& o) {
                               << ',' << (full ? full_bytes : routed_bytes) << ',' << memory_limited
                               << ',';
                         if (cache == "cold" && memory_limited) extra << (bandwidth >= 235);
+                        extra << ',' << (o.artifact.empty() ? "synthetic" : o.artifact) << ','
+                              << (fixture.main() ? o.layer : 0) << ','
+                              << (routed_flops + shared_flops + router_flops) /
+                                     (1e6 * result.gpu.median_us)
+                              << ',' << bandwidth / kRoofline.sustained_read_gbs * 100 << ','
+                              << compute / result.gpu.median_us * 100 << ','
+                              << std::max(memory, compute) / result.gpu.median_us * 100 << ','
+                              << std::max(memory, compute) << ',' << o.expert_offset << ','
+                              << executed << ',' << simt_flops << ',' << tensor_flops << ','
+                              << matched_compute << ',' << std::max(routed_memory, matched_compute)
+                              << ',' << matched_compute / result.gpu.median_us * 100 << ','
+                              << kRoofline.fp32_f32_tflops;
                         csv.write(row, result, execution, cache, extra.str());
                     }
             }

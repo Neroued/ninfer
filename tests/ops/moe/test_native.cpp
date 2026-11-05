@@ -1,4 +1,6 @@
 #include "ops/moe/native_fixture.h"
+#include "ops/moe/native_artifact.h"
+#include <cstdlib>
 #include "ops/op_tester.h"
 #include "ops/suite.h"
 #include "core/decode_graph.h"
@@ -62,7 +64,8 @@ int run(Fixture& f, const Case& c, CudaExecutionView cuda) {
             ops::routed_swiglu(x, profile, experts, routes, subset, c.epilogue, y, workspace, cuda);
     };
     const auto prepare = [&](int phase) {
-        f.input(c.tokens, c.distribution, phase, false, c.locality);
+        const auto* offset = std::getenv("NINFER_NATIVE_MOE_EXPERT_OFFSET");
+        f.input(c.tokens, c.distribution, phase, false, c.locality, offset ? std::atoi(offset) : 0);
         f.publish_routes(!c.complete);
         for (int e = 0; e < Fixture::experts_count; ++e)
             mask[e] = !(f.resident(e) && (phase ? e % 3 != 1 : e % 4 != 2));
@@ -155,8 +158,13 @@ void add_native_cases(OpSuite& suite) {
             calls.push_back({129, true, true, DType::BF16, ops::MoeEpilogue::Write, "pool"});
             calls.push_back({1025, false, false, DType::BF16, ops::MoeEpilogue::Write, "reuse"});
         }
-        if (profile == Profile::MainTp)
+        if (profile == Profile::MainTp) {
+            calls.push_back({129, false, true, DType::FP32, ops::MoeEpilogue::Write, "pool"});
+            calls.push_back({513, true, true, DType::BF16, ops::MoeEpilogue::Write, "reuse"});
             calls.push_back({2049, true, true, DType::BF16, ops::MoeEpilogue::Write, "pool"});
+            calls.push_back(
+                {2049, false, true, DType::BF16, ops::MoeEpilogue::AddResidual, "skewpool"});
+        }
         if (profile == Profile::MainEp || profile == Profile::MtpEp) {
             calls.push_back(
                 {2, false, true, DType::BF16, ops::MoeEpilogue::Write, "reuse", "remote"});
@@ -178,7 +186,12 @@ void add_native_cases(OpSuite& suite) {
             const auto cuda = cuda_environment().context.execution_view();
             int maximum     = 1;
             for (auto i : selected) maximum = std::max(maximum, calls[i].tokens);
-            Fixture fixture(cuda, profile, maximum, 0, ScalePattern::Stress);
+            const char* artifact = std::getenv("NINFER_NATIVE_MOE_ARTIFACT");
+            const char* layer    = std::getenv("NINFER_NATIVE_MOE_LAYER");
+            Fixture fixture(cuda, profile, maximum, 0, ScalePattern::Stress,
+                            artifact ? std::optional(read_artifact_weights(
+                                           artifact, profile, 0, layer ? std::stoi(layer) : 3))
+                                     : std::nullopt);
             int failures = 0;
             for (auto i : selected) {
                 try {

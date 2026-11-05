@@ -5,6 +5,22 @@
 
 namespace ninfer::ops::detail::moe_cuda::block_scaled {
 
+template <int Experts, int TopK, class Group>
+__device__ __forceinline__ bool fully_covered_groups(Group g, int assignments, bool density,
+                                                     bool ordered) {
+    if (!ordered) return false;
+    if (!density) {
+        // Distinct route IDs give at most one assignment per expert and token.
+        // Equal nonempty counts at T therefore cover every token in each group.
+        const int tokens = assignments / TopK;
+        return g.load_range && g.load_range[0] == tokens && g.load_range[1] == tokens;
+    }
+    // Distinct IDs bound every expert's count by T. Reaching active*T means
+    // every active expert covers every token, independent of route-slot order.
+    const int active = g.jobs[2];
+    return active > 0 && g.offsets[Experts] == active * (assignments / TopK);
+}
+
 // Publish [minimum nonempty load, maximum load, active experts].
 // An empty selection produces [INT_MAX, 0, 0].
 template <int Experts>

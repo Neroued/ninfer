@@ -65,6 +65,10 @@ struct Plan {
     int group_columns = 0, small_expert_limit = 0;
     Nvfp4LoadSchedule medium, dense, broad;
     int broad_short_limit = 0, broad_long_limit = 0;
+    int native_a4_vector_max_load = 0;
+    // Quantize directly into expert-major rows after grouping. Both code and
+    // scale planes use the packed assignment index consumed by contractions.
+    bool native_a4_grouped_input = false;
 
     int job_columns() const {
         int columns = gate_columns > down_columns ? gate_columns : down_columns;

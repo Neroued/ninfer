@@ -82,7 +82,7 @@ void launch_mma(const Tensor& x, const CudaSwiGLUExperts& experts, const ExpertR
         static_cast<int>(plan.nvfp4.cache), minimum_expert_count, maximum_expert_count, regime,
         plan.broad_short_limit, plan.broad_long_limit, plan.broad.max_load, x.ne[1],
         Intermediate == 1024 && plan.dense_down_columns != 0, plan.pool_expert_limit,
-        plan.pool_min_experts);
+        plan.pool_min_experts, false);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -211,7 +211,7 @@ void launch_experts_impl(const Tensor& x, const CudaSwiGLUExperts& experts,
                     ActivationScale{nullptr, experts.activation_calibration.down.scalar_divisor()},
                     s.groups, static_cast<const int*>(routes.ids.data),
                     static_cast<const float*>(routes.coefficients.data), s.routed_sum, x.ne[1],
-                    plan.pool_expert_limit, plan.pool_min_experts);
+        plan.pool_expert_limit, plan.pool_min_experts);
                 CUDA_CHECK(cudaGetLastError());
             };
             switch (plan.dense_down_columns) {

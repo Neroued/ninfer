@@ -32,7 +32,7 @@ qw::PatternedWeightOptions bank_options(bool main, ScalePattern pattern) {
             o.csf_dense_exception_block = true;
             o.outlier_expert_period     = 67;
         } else {
-            // The source checkpoint's 36,288 matrices have a mean exception rate of 0.2832%.
+            // The source checkpoint's scale-count-weighted exception rate is 0.2832%.
             o.csf_exception_period = 353;
         }
     }
@@ -45,9 +45,10 @@ struct Bank {
     ExpertMatrixDeviceView view;
 
     Bank(Device device, bool main, bool indexed, ScalePattern pattern, int n, int k,
-         std::span<const std::uint32_t> ids, std::uint32_t seed)
-        : host(qw::make_patterned_bank(QType::NVFP4_MUL, n, k, ids, Fixture::experts_count, seed,
-                                       bank_options(main, pattern))) {
+         std::span<const std::uint32_t> ids, std::uint32_t seed, qw::PackedWeightBank* source)
+        : host(source ? std::move(*source)
+                      : qw::make_patterned_bank(QType::NVFP4_MUL, n, k, ids, Fixture::experts_count,
+                                                seed, bank_options(main, pattern))) {
         if (indexed) {
             const std::array<std::uint64_t, 2> shape{std::uint64_t(n), std::uint64_t(k)};
             const auto matrix =
@@ -138,12 +139,12 @@ struct Fixture::Impl {
     DeviceBuffer input;
     DeviceBuffer route_ids, route_coefficients, mask, control, bias_device;
 
-    Impl(CudaExecutionView cuda, const Fixture& f)
+    Impl(CudaExecutionView cuda, const Fixture& f, std::optional<WeightBanks>& source)
         : device(cuda.device()), logical(logical_ids(f.ep(), f.rank)),
           gu(device, f.main(), f.ep() && !f.main(), f.scale_pattern, 2 * f.intermediate, hidden,
-             logical, 113),
+             logical, 113, source ? &source->gate_up : nullptr),
           down(device, f.main(), f.ep() && !f.main(), f.scale_pattern, hidden, f.intermediate,
-               logical, 719),
+               logical, 719, source ? &source->down : nullptr),
           shared_gu(device, f.main() ? QType::FP8_E4M3FN_BLOCK128X128_FP32 : QType::MXFP8,
                     2 * shared_intermediate, hidden, 1711),
           shared_down(device, f.main() ? QType::FP8_E4M3FN_BLOCK128X128_FP32 : QType::MXFP8, hidden,
@@ -164,23 +165,24 @@ struct Fixture::Impl {
     }
 };
 
-Fixture::Fixture(CudaExecutionView cuda, Profile p, int maximum, int r, ScalePattern pattern)
+Fixture::Fixture(CudaExecutionView cuda, Profile p, int maximum, int r, ScalePattern pattern,
+                 std::optional<WeightBanks> source)
     : profile(p), scale_pattern(pattern),
       intermediate((p == Profile::MainEp || p == Profile::MtpEp) ? 2048 : 1024), rank(r),
       max_tokens(maximum) {
     if (maximum <= 0 || r < 0 || r > 1)
         throw std::invalid_argument("invalid native MoE fixture extent");
-    impl_ = std::make_unique<Impl>(cuda, *this);
+    impl_ = std::make_unique<Impl>(cuda, *this, source);
 }
 
 Fixture::~Fixture() = default;
 
 void Fixture::input(int tokens, std::string_view distribution, int phase, bool dense,
-                    std::string_view locality) {
+                    std::string_view locality, int expert_offset) {
     if (tokens < 1 || tokens > max_tokens)
         throw std::out_of_range("native MoE input exceeds fixture");
     if (distribution != "reuse" && distribution != "pool" && distribution != "tail" &&
-        distribution != "spread")
+        distribution != "spread" && distribution != "skewpool")
         throw std::invalid_argument("unknown expert distribution");
     if (locality != "mixed" && locality != "local" && locality != "remote")
         throw std::invalid_argument("unknown expert locality");
@@ -200,11 +202,15 @@ void Fixture::input(int tokens, std::string_view distribution, int phase, bool d
             x[k] = f32_to_bf16(word * (dense ? .015625f : .125f));
         }
         for (int j = 0; j < top_k; ++j) {
-            int e = distribution == "reuse"  ? j
-                    : distribution == "pool" ? (t * 7 + phase * 3 + j) % 16
+            int e = distribution == "reuse"      ? j
+                    : distribution == "skewpool" ? (j < 7   ? j
+                                                    : t < 9 ? 8 + (t + phase) % 8
+                                                            : 7)
+                    : distribution == "pool"     ? (t * top_k + phase * 3 + j) % 16
                     : distribution == "tail"
                         ? (j < 4 ? j : 4 + (t * 4 + phase * 11 + j - 4) % (domain - 4))
                         : (t * top_k + phase * 17 + j) % domain;
+            e     = (107 * ((e + expert_offset) % domain) + 19) % domain;
             if (ep() && locality != "mixed") e = 2 * e + (locality == "local" ? rank : 1 - rank);
             x[e] = f32_to_bf16(.32f - j * .02f);
         }

@@ -395,7 +395,7 @@ struct CsfTileQuery {
     std::uint32_t column, destination_column;
 };
 
-template <bool Static, int Rows, int Columns>
+template <bool Static, int Rows, int Columns, bool LinearRows = false, int RowBlocks = 4>
 __global__ void read_csf_tile(Csf32ScaleView view, const CsfTileQuery* queries,
                               std::uint8_t* output, int offsets_stride, int pages_stride) {
     const auto query = queries[blockIdx.x];
@@ -410,29 +410,50 @@ __global__ void read_csf_tile(Csf32ScaleView view, const CsfTileQuery* queries,
     for (int i = threadIdx.x; i < 1024; i += blockDim.x) tile[i] = 0xa5;
     __syncthreads();
     if (threadIdx.x < 32) {
-        codec::csf32_copy_row_bases_async(view, query.rows, row_bases);
+        codec::csf32_copy_row_bases_async<RowBlocks>(view, query.rows, row_bases);
         if constexpr (Static)
-            codec::csf32_copy_tile128x4_async<Rows, Columns>(view, query.rows, query.column,
-                                                             encoded);
+            codec::csf32_copy_tile128x4_async<Rows, Columns, RowBlocks>(view, query.rows,
+                                                                        query.column, encoded);
         else
-            codec::csf32_copy_tile128x4_async(view, query.rows, query.column, encoded);
+            codec::csf32_copy_tile128x4_async<0, 0, RowBlocks>(view, query.rows, query.column,
+                                                               encoded);
         codec::cp_commit();
         codec::cp_wait<0>();
     }
     __syncthreads();
-    for (unsigned block = threadIdx.x / 32; block < 8; block += 4) {
-        const unsigned row = block / 2, pair = block % 2;
-        if constexpr (Static)
-            codec::csf32_decode_block<128, Rows, Columns>(view, query.rows, query.column, row_bases,
-                                                          encoded, row, pair, tile, row * 32,
-                                                          query.destination_column + pair * 2);
-        else
-            codec::csf32_decode_block<128>(view, query.rows, query.column, row_bases, encoded, row,
-                                           pair, tile, row * 32,
-                                           query.destination_column + pair * 2);
+    if constexpr (LinearRows) {
+        const unsigned row = threadIdx.x / 32;
+        if (row < RowBlocks) {
+            if constexpr (Static) {
+                codec::csf32_decode_word<128, Rows, Columns, true>(
+                    view, query.rows, query.column, row_bases, encoded, row, tile, row * 32,
+                    query.destination_column);
+            } else {
+                codec::csf32_decode_word<128, 0, 0, true>(view, query.rows, query.column, row_bases,
+                                                          encoded, row, tile, row * 32,
+                                                          query.destination_column);
+            }
+        }
+    } else {
+        for (unsigned block = threadIdx.x / 32; block < RowBlocks * 2; block += 4) {
+            const unsigned row = block / 2, pair = block % 2;
+            if constexpr (Static)
+                codec::csf32_decode_block<128, Rows, Columns, LinearRows>(
+                    view, query.rows, query.column, row_bases, encoded, row, pair, tile, row * 32,
+                    query.destination_column + pair * 2);
+            else
+                codec::csf32_decode_block<128, 0, 0, LinearRows>(
+                    view, query.rows, query.column, row_bases, encoded, row, pair, tile, row * 32,
+                    query.destination_column + pair * 2);
+        }
     }
     __syncthreads();
-    for (int i = threadIdx.x; i < 1024; i += blockDim.x) output[blockIdx.x * 1024 + i] = tile[i];
+    for (int i = threadIdx.x; i < 1024; i += blockDim.x) {
+        // Read each represented row/column into the test's established native layout.
+        const int source =
+            LinearRows ? i / 512 * 512 + ((i % 16) / 4 * 32 + i % 512 / 16) * 4 + i % 4 : i;
+        output[blockIdx.x * 1024 + i] = tile[source];
+    }
 }
 
 template <int Rows, int Columns>
@@ -496,32 +517,52 @@ void csf_decode(bool no_exceptions) {
             require(std::memcmp(expected.data(), actual.data() + i * 1024, 1024) == 0,
                     "CSF native scale staging or untouched bytes differ at " + std::to_string(i));
         }
-        if (use_static)
-            read_csf_tile<true, Rows, Columns><<<tile_queries.size(), 128, 0, device.stream()>>>(
-                view, static_cast<const CsfTileQuery*>(tile_query_storage.data()),
-                static_cast<std::uint8_t*>(tiles.data()), source.offsets.size() / 2,
-                source.page_bases.size() / 2);
-        else
-            read_csf_tile<false, Rows, Columns><<<tile_queries.size(), 128, 0, device.stream()>>>(
-                view, static_cast<const CsfTileQuery*>(tile_query_storage.data()),
-                static_cast<std::uint8_t*>(tiles.data()), source.offsets.size() / 2,
-                source.page_bases.size() / 2);
-        CUDA_CHECK(cudaGetLastError());
-        const auto actual_tiles = download<std::uint8_t>(tiles, device);
-        for (std::size_t i = 0; i < tile_queries.size(); ++i) {
-            const auto& q = tile_queries[i];
-            const std::array rows{q.rows.x, q.rows.y, q.rows.z, q.rows.w};
-            std::array<std::uint8_t, 1024> expected;
-            expected.fill(0xa5);
-            for (int block = 0; block < 4; ++block)
-                for (int lane = 0; lane < 32; ++lane)
-                    for (int column = 0; column < 4; ++column) {
-                        const auto source_row = q.matrix * Rows + q.origin + rows[block] + lane;
-                        expected[q.destination_column / 4 * 512 + lane * 16 + block * 4 + column] =
-                            source.values[source_row * Columns + q.column + column];
-                    }
-            require(std::memcmp(expected.data(), actual_tiles.data() + i * 1024, 1024) == 0,
-                    "CSF async block staging/guard differs at " + std::to_string(i));
+        for (int row_blocks : {2, 4}) {
+            for (bool linear_rows : {false, true}) {
+                const auto launch_tile = [&]<bool LinearRows, int RowBlocks>() {
+                    if (use_static)
+                        read_csf_tile<true, Rows, Columns, LinearRows, RowBlocks>
+                            <<<tile_queries.size(), 128, 0, device.stream()>>>(
+                                view, static_cast<const CsfTileQuery*>(tile_query_storage.data()),
+                                static_cast<std::uint8_t*>(tiles.data()), source.offsets.size() / 2,
+                                source.page_bases.size() / 2);
+                    else
+                        read_csf_tile<false, Rows, Columns, LinearRows, RowBlocks>
+                            <<<tile_queries.size(), 128, 0, device.stream()>>>(
+                                view, static_cast<const CsfTileQuery*>(tile_query_storage.data()),
+                                static_cast<std::uint8_t*>(tiles.data()), source.offsets.size() / 2,
+                                source.page_bases.size() / 2);
+                };
+                const auto launch_rows = [&]<int RowBlocks>() {
+                    if (linear_rows)
+                        launch_tile.template operator()<true, RowBlocks>();
+                    else
+                        launch_tile.template operator()<false, RowBlocks>();
+                };
+                if (row_blocks == 2)
+                    launch_rows.template operator()<2>();
+                else
+                    launch_rows.template operator()<4>();
+                CUDA_CHECK(cudaGetLastError());
+                const auto actual_tiles = download<std::uint8_t>(tiles, device);
+                for (std::size_t i = 0; i < tile_queries.size(); ++i) {
+                    const auto& q = tile_queries[i];
+                    const std::array rows{q.rows.x, q.rows.y, q.rows.z, q.rows.w};
+                    std::array<std::uint8_t, 1024> expected;
+                    expected.fill(0xa5);
+                    for (int block = 0; block < row_blocks; ++block)
+                        for (int lane = 0; lane < 32; ++lane)
+                            for (int column = 0; column < 4; ++column) {
+                                const auto source_row =
+                                    q.matrix * Rows + q.origin + rows[block] + lane;
+                                expected[q.destination_column / 4 * 512 + lane * 16 + block * 4 +
+                                         column] =
+                                    source.values[source_row * Columns + q.column + column];
+                            }
+                    require(std::memcmp(expected.data(), actual_tiles.data() + i * 1024, 1024) == 0,
+                            "CSF async block staging/guard differs at " + std::to_string(i));
+                }
+            }
         }
     }
 }

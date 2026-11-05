@@ -51,7 +51,7 @@ Storage allocate(Arena& arena, const Plan& plan, int tokens, bool routed, bool p
         g.job_experts      = integers(max_jobs);
         g.job_columns      = integers(max_jobs);
         g.jobs             = integers(fp8 ? 4 : 2);
-        if (a16 || plan.dense.gate_columns || plan.dense_down_columns ||
+        if (plan.format == QType::NVFP4_MUL || plan.dense.gate_columns || plan.dense_down_columns ||
             (fp8 && plan.fp8.k_step == 0) || plan.pool_expert_limit)
             g.load_range = integers(3);
         g.assignments = integers(assignments);

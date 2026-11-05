@@ -63,8 +63,10 @@ if(NINFER_TARGET STREQUAL "dgx_spark")
   target_include_directories(ninfer_moe_tp2_bench PRIVATE "${PROJECT_SOURCE_DIR}/tests")
   ninfer_add_op_bench(ninfer_moe_native_bench
     SOURCES "${CMAKE_CURRENT_LIST_DIR}/moe/native.cu"
+            "${PROJECT_SOURCE_DIR}/tests/ops/moe/native_artifact.cpp"
             "${PROJECT_SOURCE_DIR}/tests/ops/moe/native_fixture.cpp")
   target_include_directories(ninfer_moe_native_bench PRIVATE "${PROJECT_SOURCE_DIR}/tests")
+  target_link_libraries(ninfer_moe_native_bench PRIVATE ninfer_artifact)
 endif()
 if(NINFER_TARGET STREQUAL "rtx5090")
   ninfer_add_op_bench(ninfer_moe_cpu_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/moe/cpu.cpp")

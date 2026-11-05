@@ -258,6 +258,20 @@ void add_native_cases(Suite& suite) {
             add_shape(suite, QType::FP8_E4M3FN_BLOCK128X128_FP32, ActivationRecipe::Hashed,
                       native_weight<QType::FP8_E4M3FN_BLOCK128X128_FP32>, borrowed);
         }
+        if (n == 4096 && k == 1024) {
+            for (int t :
+                 {2, 4, 8, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 2048, 4096})
+                calls.push_back({t, CallForm::Policy, ops::LinearPolicy::A16Only});
+            for (int t : {3, 9, 17, 65, 97, 129, 193, 257, 385, 513, 769, 1025})
+                calls.push_back({t, CallForm::Policy, ops::LinearPolicy::A16Only, true});
+            const std::array<Invocation, 2> unaligned_calls{{
+                {129, CallForm::Policy, ops::LinearPolicy::A16Only, true},
+                {257, CallForm::Policy, ops::LinearPolicy::A16Only, true},
+            }};
+            add_shape(suite, QType::FP8_E4M3FN_BLOCK128X128_FP32, ActivationRecipe::Hashed,
+                      native_four_byte_scales<QType::FP8_E4M3FN_BLOCK128X128_FP32>,
+                      {n, k, 1477U, Comparison::Sampled, true, unaligned_calls});
+        }
         add_shape(suite, QType::FP8_E4M3FN_BLOCK128X128_FP32, ActivationRecipe::Hashed,
                   native_weight<QType::FP8_E4M3FN_BLOCK128X128_FP32>,
                   {n, k, 1457U, Comparison::Sampled, true, calls});

@@ -33,10 +33,11 @@ inline constexpr int fp8_block_tma_scratch_bytes = [] {
     return (bytes + 127) / 128 * 128;
 }();
 
-template <class S, bool Full, class O, class E>
-__global__ __launch_bounds__(S::kThreads, S::kMinBlocksPerSm) void fp8_block_a16_tma_kernel(
-    const __grid_constant__ Fp8TmaDescriptors maps, Fp8BlockA16Operands<> p, O output, E epilogue,
-    int token_offset) {
+template <class S, bool Full, bool Partial, class O, class E>
+__device__ __forceinline__ void
+fp8_block_a16_tma_body(const Fp8TmaDescriptors& maps, Fp8BlockA16Operands<> p, O output, E epilogue,
+                       int token_offset, int tile_idx, int first_k_tile, int tiles,
+                       float* partials) {
     constexpr int BR = S::kBlockRows, BT = S::kBlockTokens, BK = S::kBlockK, ST = S::kStages;
     extern __shared__ __align__(128) unsigned char raw[];
     auto* weights = raw;
@@ -44,9 +45,8 @@ __global__ __launch_bounds__(S::kThreads, S::kMinBlocksPerSm) void fp8_block_a16
     auto* full    = reinterpret_cast<std::uint64_t*>(raw + fp8_block_tma_scratch_bytes<S, E>);
     auto* empty   = full + ST;
     int ri, ti;
-    native_fp8_tile<S>(blockIdx.x, p.rows, p.tokens, ri, ti);
-    const int rb = ri * BR, tb = token_offset + ti * BT, K = S::kStaticK ? S::kStaticK : p.k,
-              tiles = K / BK;
+    native_fp8_tile<S>(tile_idx, p.rows, p.tokens, ri, ti);
+    const int rb = ri * BR, tb = token_offset + ti * BT, K = S::kStaticK ? S::kStaticK : p.k;
     const int tid = threadIdx.x, lane = tid & 31;
     const bool producer = tid >= S::kConsumerThreads;
     if (tid == 0) {
@@ -66,10 +66,10 @@ __global__ __launch_bounds__(S::kThreads, S::kMinBlocksPerSm) void fp8_block_a16
             common::cta_mbarrier_wait(empty + slot, 1U ^ ((kt / ST) & 1U));
             if (lane == 0) {
                 common::cta_mbarrier_arrive_expect_tx(full + slot, (BR + 2 * BT) * BK);
-                common::tma_load_2d(weights + slot * BR * BK, &maps.weight, kt * BK, rb,
-                                    full + slot);
-                common::tma_load_3d(inputs + slot * BT * BK, &maps.activation, 0, kt * (BK / 64),
-                                    tb, full + slot);
+                common::tma_load_2d(weights + slot * BR * BK, &maps.weight,
+                                    (kt + first_k_tile) * BK, rb, full + slot);
+                common::tma_load_3d(inputs + slot * BT * BK, &maps.activation, 0,
+                                    (kt + first_k_tile) * (BK / 64), tb, full + slot);
             }
         }
     } else {
@@ -122,7 +122,8 @@ __global__ __launch_bounds__(S::kThreads, S::kMinBlocksPerSm) void fp8_block_a16
             }
             if ((kt + 1) % (128 / BK) == 0) {
                 // One uniform scalar per K128 group; keep the tiny scale plane in cache.
-                const float scale = p.scales[std::int64_t(rb / 128) * (K / 128) + kt * BK / 128];
+                const float scale =
+                    p.scales[std::int64_t(rb / 128) * (K / 128) + (kt + first_k_tile) * BK / 128];
 #pragma unroll
                 for (int r = 0; r < S::kMmaRows; ++r) {
 #pragma unroll
@@ -142,25 +143,53 @@ __global__ __launch_bounds__(S::kThreads, S::kMinBlocksPerSm) void fp8_block_a16
     }
     __syncthreads();
     if (producer) return;
-    native_fp8_finish<Fp8BlockTmaConsumerSchedule<S>, Full>(output, epilogue, raw, accum, rb, tb,
-                                                            p.rows, token_offset + p.tokens);
+    if constexpr (Partial) {
+#pragma unroll
+        for (int r = 0; r < S::kMmaRows; ++r)
+#pragma unroll
+            for (int t = 0; t < S::kMmaTokens; ++t)
+#pragma unroll
+                for (int j = 0; j < 4; ++j)
+                    partials[((r * S::kMmaTokens + t) * 4 + j) * S::kConsumerThreads + tid] =
+                        accum[r][t][j];
+    } else {
+        native_fp8_finish<Fp8BlockTmaConsumerSchedule<S>, Full>(
+            output, epilogue, raw, accum, rb, tb, p.rows, token_offset + p.tokens);
+    }
 }
 
-// Descriptors and scratch are launch-owned. Transfer slices cannot split a K128 scale group.
-template <class S, class O, class E>
-void launch_fp8_block_a16_tma(const Fp8BlockA16Operands<>& p, O output, E epilogue,
-                              cudaStream_t stream) {
+template <class S, bool Full, class O, class E>
+__global__ __launch_bounds__(S::kThreads, S::kMinBlocksPerSm) void fp8_block_a16_tma_kernel(
+    const __grid_constant__ Fp8TmaDescriptors maps, Fp8BlockA16Operands<> p, O output, E epilogue,
+    int token_offset) {
+    const int k = S::kStaticK ? S::kStaticK : p.k;
+    fp8_block_a16_tma_body<S, Full, false>(maps, p, output, epilogue, token_offset, int(blockIdx.x),
+                                           0, k / S::kBlockK, nullptr);
+}
+
+template <class S>
+Fp8TmaDescriptors fp8_block_a16_tma_descriptors(const Fp8BlockA16Operands<>& p) {
     validate_native_fp8<S>(p);
     if (p.rows % 128 || reinterpret_cast<std::uintptr_t>(p.x) % 16 ||
         reinterpret_cast<std::uintptr_t>(p.codes) % 16 ||
         reinterpret_cast<std::uintptr_t>(p.scales) % 4)
         throw std::invalid_argument(
             "FP8 block TMA requires N128, aligned codes/activations and FP32 scales");
-    constexpr int bytes =
-        fp8_block_tma_scratch_bytes<S, E> + 2 * S::kStages * sizeof(std::uint64_t);
+    return Fp8TmaDescriptors{bf16_tma_map<S>(p.x, p.tokens, p.k, S::kBlockTokens, S::kBlockK),
+                             fp8_tma_map(p.codes, p.rows, p.k, S::kBlockRows, S::kBlockK)};
+}
+
+template <class S, class E>
+inline constexpr int fp8_block_a16_tma_bytes =
+    fp8_block_tma_scratch_bytes<S, E> + 2 * S::kStages * sizeof(std::uint64_t);
+
+// Descriptors and scratch are launch-owned. Transfer slices cannot split a K128 scale group.
+template <class S, class O, class E>
+void launch_fp8_block_a16_tma(const Fp8BlockA16Operands<>& p, O output, E epilogue,
+                              cudaStream_t stream) {
+    const auto maps     = fp8_block_a16_tma_descriptors<S>(p);
+    constexpr int bytes = fp8_block_a16_tma_bytes<S, E>;
     static_assert(bytes <= 99 * 1024);
-    const Fp8TmaDescriptors maps{bf16_tma_map<S>(p.x, p.tokens, p.k, S::kBlockTokens, S::kBlockK),
-                                 fp8_tma_map(p.codes, p.rows, p.k, S::kBlockRows, S::kBlockK)};
     common::for_each_token_slice(p.tokens, S::kBlockTokens, [&](int offset, int count) {
         auto slice        = p;
         slice.tokens      = count;

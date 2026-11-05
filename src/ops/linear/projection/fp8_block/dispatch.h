@@ -2,16 +2,22 @@
 #include "ninfer/ops/linear.h"
 
 namespace ninfer::ops::detail {
-using Fp8BlockLinearLaunch = void (*)(const Tensor&, const Weight&, Tensor&, cudaStream_t);
+using Fp8BlockLinearLaunch          = void (*)(const Tensor&, const Weight&, Tensor&, cudaStream_t);
+using Fp8BlockLinearWorkspaceLaunch = void (*)(const Tensor&, const Weight&, Tensor&, MemorySpan,
+                                               cudaStream_t);
 
 struct Fp8BlockLinearRoute {
     Fp8BlockLinearLaunch launch;
     bool tensor_core;
+    Fp8BlockLinearWorkspaceLaunch workspace_launch = nullptr;
+    std::size_t workspace_bytes                    = 0;
+    std::size_t scratch_traffic_bytes              = 0;
 };
 
 struct Fp8BlockLinearShape {
     int n, k;
     Fp8BlockLinearRoute (*select)(int, LinearPolicy);
+    std::size_t (*workspace_capacity)(int, int) = nullptr;
 };
 
 Fp8BlockLinearRoute select_fp8_block_linear_route(int n, int k, int tokens, LinearPolicy policy);

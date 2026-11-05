@@ -228,6 +228,36 @@ void add_native_cases(Suite& suite) {
                       native_four_byte_scales<QType::FP8_E4M3FN_BLOCK128X128_FP32>,
                       {n, k, 1471U, Comparison::Sampled, true, unaligned_calls});
         }
+        if (n == 4096 && k == 16384) {
+            add_workspace_cases(suite, QType::FP8_E4M3FN_BLOCK128X128_FP32, n, k);
+            for (int t : {4, 8, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024,
+                          2048, 4096})
+                calls.push_back({t, CallForm::Policy, ops::LinearPolicy::A16Only});
+            for (int t : {17, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 2049})
+                calls.push_back({t, CallForm::Policy, ops::LinearPolicy::A16Only, true});
+            for (int t : {2, 104, 640, 897, 1281, 1408})
+                calls.push_back({t, CallForm::Policy, ops::LinearPolicy::A16Only, true});
+            for (int t : {641, 1409})
+                calls.push_back({t, CallForm::Policy, ops::LinearPolicy::A16Only});
+            for (int t : {640, 1408})
+                calls.push_back({t, CallForm::A16Convenience});
+            const std::array<Invocation, 3> unaligned_calls{{
+                {257, CallForm::Policy, ops::LinearPolicy::A16Only, true},
+                {640, CallForm::Policy, ops::LinearPolicy::A16Only, true},
+                {4096, CallForm::Policy, ops::LinearPolicy::A16Only},
+            }};
+            add_shape(suite, QType::FP8_E4M3FN_BLOCK128X128_FP32, ActivationRecipe::Hashed,
+                      native_four_byte_scales<QType::FP8_E4M3FN_BLOCK128X128_FP32>,
+                      {n, k, 1473U, Comparison::Sampled, true, unaligned_calls});
+            const std::array<Invocation, 2> borrowed_calls{{
+                {640, CallForm::Policy, ops::LinearPolicy::A16Only},
+                {1408, CallForm::Policy, ops::LinearPolicy::A16Only, true},
+            }};
+            ShapeCase borrowed{n, k, 1475U, Comparison::Sampled, true, borrowed_calls};
+            borrowed.workspace_prefix = 17;
+            add_shape(suite, QType::FP8_E4M3FN_BLOCK128X128_FP32, ActivationRecipe::Hashed,
+                      native_weight<QType::FP8_E4M3FN_BLOCK128X128_FP32>, borrowed);
+        }
         add_shape(suite, QType::FP8_E4M3FN_BLOCK128X128_FP32, ActivationRecipe::Hashed,
                   native_weight<QType::FP8_E4M3FN_BLOCK128X128_FP32>,
                   {n, k, 1457U, Comparison::Sampled, true, calls});

@@ -747,6 +747,10 @@ Result make_result(const BenchPoint& point, const LinearBenchWeight& weight,
                                                    route.code_tokens(point.t), "code elements");
             scratch_traffic = 2 * code_elements + 2 * x_elements / 32;
         }
+    } else if (point.qtype == QType::FP8_E4M3FN_BLOCK128X128_FP32) {
+        scratch_traffic = ops::detail::select_fp8_block_linear_route(
+                              point.n, point.k, point.t, point.policy)
+                              .scratch_traffic_bytes;
     }
     const auto required_bytes = checked_add(model_bytes, scratch_traffic, "required traffic");
     const double useful_flops = 2.0 * static_cast<double>(point.n) * static_cast<double>(point.k) *

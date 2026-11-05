@@ -378,7 +378,7 @@ void run_bf16_extensions(Suite& suite) {
     const std::array geometries{
         Geometry{20480, 1536, {16, 32, 64, 128, 256, 1024}},
         Geometry{16384, 1536, {16, 32, 64, 128, 256, 1024}},
-        Geometry{4096, 8192, {1, 8, 32, 128, 256, 512, 1024}},
+        Geometry{4096, 8192, {1, 8, 16, 32, 128, 192, 256, 384, 512, 576, 640, 768, 1024, 1536, 2048}},
         Geometry{1024, 1176, {1, 16, 32, 128, 192, 256, 512, 1536, 2304}},
         Geometry{3072, 1024, {1, 16, 32, 64, 128, 256, 2048}},
         Geometry{1024, 1024, {1, 8, 16, 32, 64, 256, 384, 768, 1536, 2304}},
@@ -397,6 +397,13 @@ void run_bf16_extensions(Suite& suite) {
         for (int t : points) calls.push_back({t});
         for (int t : {1, 17, 129, 4097})
             calls.push_back({t, CallForm::Policy, ops::LinearPolicy::A16Only, true});
+        if (geometry.n == 4096 && geometry.k == 8192) {
+            for (int t : {2, 4, 8, 16, 24, 64, 128, 160, 193, 258, 272, 288, 320, 383,
+                          513, 640, 767, 1025, 1152, 1280, 1535, 2048})
+                calls.push_back({t});
+            for (int t : {3, 9, 193, 257, 258, 383, 385, 511, 513, 575, 577, 641, 767, 1025, 1153, 1535})
+                calls.push_back({t, CallForm::Policy, ops::LinearPolicy::A16Only, true});
+        }
         if ((geometry.n == 20480 || geometry.n == 16384) && geometry.k == 1536)
             calls.push_back({1025, CallForm::Policy, ops::LinearPolicy::A16Only, true});
         calls.push_back({8, CallForm::A16Convenience});

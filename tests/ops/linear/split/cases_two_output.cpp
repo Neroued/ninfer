@@ -39,19 +39,26 @@ void add_two_output_cases(Suite& suite) {
         Profile profile{
             1536, {{QType::MXFP8, 20480, 1223U}}, {16384, 4096}, {{0, 16384}, {16384, 4096}}, a16};
         std::vector<Invocation> calls;
-        for (int t : {1, 4, 5, 33, 129})
+        for (int t :
+             {1,    2,    3,    4,    7,    8,    9,    16,   24,   31,   32,   33,   63,   64,
+              65,   96,   127,  128,  129,  191,  192,  193,  255,  256,  257,  383,  384,  385,
+              511,  512,  513,  639,  640,  641,  767,  768,  769,  1023, 1024, 1025, 1536, 2047,
+              2048, 2049, 3071, 3072, 3073, 3328, 3584, 3840, 4095, 4096, 4097})
             calls.push_back({.t          = t,
                              .policy     = Policy::AllowA8,
                              .input_seed = 1229U,
-                             .columns    = Columns::Seven});
+                             .columns    = Columns::HeadBoundaries,
+                             .full_rows  = t <= 8 || t == 33 || t == 65 || t == 129});
         for (int t : {5, 129})
             calls.push_back({.t = t, .input_seed = 1229U, .columns = Columns::Seven});
-        calls.push_back({.t            = 17,
-                         .policy       = Policy::AllowA8,
-                         .graph        = true,
-                         .input_seed   = 1229U,
-                         .changed_seed = 1231U,
-                         .columns      = Columns::Seven});
+        for (int t : {2, 8, 17, 33, 65, 129, 385, 513, 641, 1025, 1537, 3073, 4097})
+            calls.push_back({.t             = t,
+                             .policy        = Policy::AllowA8,
+                             .graph         = true,
+                             .input_seed    = 1229U,
+                             .changed_seed  = 1231U,
+                             .columns       = Columns::HeadBoundaries,
+                             .shared_output = true});
         calls.push_back({.t = 0, .policy = Policy::AllowA8, .workspace_intervals = true});
         add_profile(suite, profile, std::move(calls));
     }

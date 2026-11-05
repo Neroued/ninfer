@@ -600,7 +600,9 @@ void run_native(const Options& options, Format format, bench::L2FlushBuffer& flu
             else
                 ops::linear_split(x, weights, outputs, arena, c);
         };
-        const auto quantized_io = exact ? 2 * std::uint64_t(tokens) * k * 33 / 32 : 0;
+        // These native K1024/K1536 workspaces contain codes and scales without
+        // inter-plane padding. Include initialized code rows beyond logical T.
+        const auto quantized_io = 2 * std::uint64_t(exact);
         const auto logical =
             first.model_weight_bytes() + (paired ? second.model_weight_bytes() : 0) +
             (biased ? std::uint64_t(n) * 2 : 0) + tensor_bytes(k + n, tokens) + quantized_io;

@@ -327,7 +327,8 @@ int run(const Profile& profile, std::span<const Invocation> calls) {
                                       prepared, profile.outputs, first, last);
         };
         if (call.workspace_intervals) {
-            for (auto [first, last] : {std::pair{1, 48}, std::pair{1, 128}, std::pair{1, 1024}}) {
+            for (auto [first, last] : {std::pair{1, 48}, std::pair{1, 128}, std::pair{33, 129},
+                                       std::pair{513, 1025}, std::pair{1, 4097}}) {
                 const auto capacity = workspace_capacity(first, last);
                 for (int t = first; t <= last; ++t)
                     if (workspace_capacity(t, t) > capacity) ++failures;

@@ -70,19 +70,25 @@ void add_two_output_cases(Suite& suite) {
                         a16};
         profile.bias = true;
         std::vector<Invocation> calls;
-        for (int t : {1, 4, 5, 33, 129})
+        for (int t : {1,    2,    3,    4,    5,    7,    8,    9,    16,   24,   31,   32,
+                      33,   48,   63,   64,   65,   96,   127,  128,  129,  192,  255,  256,
+                      257,  383,  384,  385,  511,  512,  513,  767,  768,  769,  1023, 1024,
+                      1025, 1151, 1152, 1153, 2048, 2049, 3071, 3072, 3073, 4095, 4096, 4097})
             calls.push_back({.t          = t,
                              .policy     = Policy::AllowA8,
                              .input_seed = 1249U,
-                             .columns    = Columns::Seven});
+                             .columns    = Columns::HeadBoundaries,
+                             .full_rows  = t <= 33 || t == 65 || t == 129 || t == 257});
         for (int t : {5, 129})
             calls.push_back({.t = t, .input_seed = 1249U, .columns = Columns::Seven});
-        calls.push_back({.t            = 17,
-                         .policy       = Policy::AllowA8,
-                         .graph        = true,
-                         .input_seed   = 1249U,
-                         .changed_seed = 1259U,
-                         .columns      = Columns::Seven});
+        for (int t : {1, 3, 9, 33, 65, 129, 257, 385, 513, 769, 1025, 1153, 3073, 4097})
+            calls.push_back({.t             = t,
+                             .policy        = Policy::AllowA8,
+                             .graph         = true,
+                             .input_seed    = 1249U,
+                             .changed_seed  = 1259U,
+                             .columns       = Columns::HeadBoundaries,
+                             .shared_output = true});
         calls.push_back({.t = 0, .policy = Policy::AllowA8, .workspace_intervals = true});
         add_profile(suite, profile, std::move(calls));
     }

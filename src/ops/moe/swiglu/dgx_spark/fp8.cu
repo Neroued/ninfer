@@ -37,7 +37,7 @@ void gate_up_a16(const Operands& p, Output out, float limit, cudaStream_t stream
         return vector.template operator()<4, 1>();
     } else {
         if constexpr (std::is_same_v<typename Operands::ScaleType, float>) {
-            if (p.tokens >= 128) {
+            if (p.tokens >= 33) {
                 using S = RegisterWeightSchedule<NativeFp8ScheduleInstance<
                     NativeFp8MmaSchedule<64, 64, 128, 16, 32, 2, 2>, 4096>>;
                 return launch_native_fp8_a16_mma<S>(p, out, product, stream,
@@ -74,7 +74,7 @@ void down_a16(const Operands& p, Output out, cudaStream_t stream) {
         return vector.template operator()<4, 4>();
     } else {
         if constexpr (std::is_same_v<typename Operands::ScaleType, float>) {
-            if (p.tokens >= 128) {
+            if (p.tokens >= 33) {
                 using S = RegisterWeightSchedule<NativeFp8ScheduleInstance<
                     NativeFp8MmaSchedule<128, 64, 128, 32, 32, 1, 2>, Intermediate>>;
                 return launch_native_fp8_a16_mma<S>(p, out, LinearIdentityEpilogue{}, stream,

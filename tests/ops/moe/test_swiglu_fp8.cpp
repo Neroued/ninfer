@@ -128,12 +128,14 @@ void add_fp8_cases(OpSuite& suite) {
           Profile{"mxfp8-shared", QType::MXFP8, 1024, ops::LinearPolicy::AllowA8},
           Profile{"fp8-block-fp32", QType::FP8_E4M3FN_BLOCK128X128_FP32, 1024,
                   ops::LinearPolicy::A16Only}}) {
-        const std::vector<int> tokens = profile.format == QType::FP8_E4M3FN_BLOCK128X128_FP32
-                                            ? std::vector<int>{1, 2, 3, 5, 9, 17, 33, 129, 4096}
-                                            : std::vector<int>{1, 2, 3, 5, 65, 128, 129, 4096};
+        const std::vector<int> tokens =
+            profile.format == QType::FP8_E4M3FN_BLOCK128X128_FP32
+                ? std::vector<int>{1, 2, 3, 5, 9, 17, 33, 64, 65, 127, 128, 129, 4096}
+                : std::vector<int>{1, 2, 3, 5, 65, 128, 129, 4096};
         std::vector<Call> calls;
         for (int t : tokens) calls.push_back({t, false});
         calls.push_back({129, true});
+        if (profile.format == QType::FP8_E4M3FN_BLOCK128X128_FP32) calls.push_back({127, true});
         std::vector<OpCase> cases;
         for (const auto& call : calls)
             cases.push_back(

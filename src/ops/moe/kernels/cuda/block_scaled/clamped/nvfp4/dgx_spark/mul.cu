@@ -75,7 +75,7 @@ __device__ void group_decode(const int* ids, ExpertSubsetKind kind, const int* m
     }
 }
 
-template <bool Quantize, bool Group>
+template <bool Quantize, bool Group, bool SkipInactive>
 __global__ void prepare_input(const __nv_bfloat16* x, std::uint8_t* codes, std::uint8_t* scales,
                               ActivationScale input_scale, const int* ids, int tokens,
                               ExpertSubsetKind kind, const int* mask, int* counts,
@@ -90,14 +90,16 @@ __global__ void prepare_input(const __nv_bfloat16* x, std::uint8_t* codes, std::
     const int token      = Quantize ? assignment / kTopK : assignment;
     if (token >= tokens) return;
     if (!Quantize || assignment % kTopK == 0) {
-        if (threadIdx.x < 32) {
-            bool live = false;
-            if (threadIdx.x < kTopK)
-                live = includes(kind, mask, ids[std::int64_t(token) * kTopK + threadIdx.x]);
+        bool clear = true;
+        if (SkipInactive || threadIdx.x < 32) {
+            bool live      = false;
+            const int lane = threadIdx.x % 32;
+            if (lane < kTopK) live = includes(kind, mask, ids[std::int64_t(token) * kTopK + lane]);
             const auto bits = __ballot_sync(0xffffffff, live);
             if (!threadIdx.x && active_tokens) active_tokens[token] = bits != 0;
+            if constexpr (SkipInactive) clear = bits != 0 || !active_tokens;
         }
-        if (routed_sum)
+        if (routed_sum && clear)
             for (int row = threadIdx.x; row < kHidden; row += blockDim.x)
                 routed_sum[std::int64_t(token) * kHidden + row] = 0;
     }
@@ -114,57 +116,77 @@ __global__ void prepare_input(const __nv_bfloat16* x, std::uint8_t* codes, std::
     }
 }
 
-template <bool Index>
+template <bool Index, bool Persistent>
 __global__ void
 quantize_grouped_input(const __nv_bfloat16* x, const int* ids, ExpertSubsetKind kind,
                        const int* mask, Groups groups, int tokens, bool ordered,
                        ActivationScale calibration, std::uint8_t* codes, std::uint8_t* scales,
                        std::uint8_t* product, std::uint8_t* product_scales, int intermediate) {
     const int tid = threadIdx.x;
-    // TMA fetches complete column tiles. Only the final partial tile can reach
-    // unowned rows; initialize its in-bounds tail without another allocation or
-    // launch. The map itself supplies zero for rows beyond the allocation.
-    const int live = groups.offsets[kExperts], tail = min(255, tokens * kTopK - live);
-    if (blockIdx.x < tail) {
-        const int row = live + blockIdx.x;
-        *reinterpret_cast<uint2*>(codes + std::int64_t(row) * (kHidden / 2) + tid * 8) =
-            make_uint2(0, 0);
-        scales[std::int64_t(row) * (kHidden / 16) + tid] = 0;
-        if (tid < intermediate / 16) {
-            *reinterpret_cast<uint2*>(product + std::int64_t(row) * (intermediate / 2) + tid * 8) =
-                make_uint2(0, 0);
-            product_scales[std::int64_t(row) * (intermediate / 16) + tid] = 0;
-        }
-    }
-    int assignment;
-    __shared__ int packed;
-    if constexpr (Index) {
-        assignment       = blockIdx.x;
-        const int expert = ids[assignment];
-        if (!includes(kind, mask, expert)) {
-            if (!tid && groups.inverse) groups.inverse[assignment] = -1;
+    if constexpr (Persistent) {
+        if (!*groups.jobs) {
+            if constexpr (Index) {
+                if (!tid && groups.inverse)
+                    for (int a = blockIdx.x; a < tokens * kTopK; a += gridDim.x)
+                        groups.inverse[a] = -1;
+            }
             return;
         }
-        if (!tid) {
-            packed = fully_covered_groups<kExperts, kTopK>(groups, tokens * kTopK, false, ordered)
-                         ? groups.offsets[expert] + assignment / kTopK
-                         : atomicAdd(groups.cursors + expert, 1);
-            groups.assignments[packed] = assignment;
-            if (groups.inverse) groups.inverse[assignment] = packed;
-        }
-        __syncthreads();
-    } else {
-        if (blockIdx.x >= groups.offsets[kExperts]) return;
-        assignment = groups.assignments[blockIdx.x];
-        if (!tid) packed = blockIdx.x;
-        __syncthreads();
     }
-    const int expert = ids[assignment], token = assignment / kTopK;
-    const auto encoded = common::quantize_nvfp4_mul_k16(
-        x + std::int64_t(token) * kHidden + tid * 16, calibration.get(expert));
-    *reinterpret_cast<uint2*>(codes + std::int64_t(packed) * (kHidden / 2) + tid * 8) =
-        make_uint2(encoded.codes_lo, encoded.codes_hi);
-    scales[std::int64_t(packed) * (kHidden / 16) + tid] = encoded.scale;
+    for (int task = blockIdx.x; !Persistent || task < tokens * kTopK; task += gridDim.x) {
+        // TMA fetches complete column tiles. Only the final partial tile can reach
+        // unowned rows; initialize its in-bounds tail without another allocation or
+        // launch. The map itself supplies zero for rows beyond the allocation.
+        const int live = groups.offsets[kExperts], tail = min(255, tokens * kTopK - live);
+        if (task < tail) {
+            const int row = live + task;
+            *reinterpret_cast<uint2*>(codes + std::int64_t(row) * (kHidden / 2) + tid * 8) =
+                make_uint2(0, 0);
+            scales[std::int64_t(row) * (kHidden / 16) + tid] = 0;
+            if (tid < intermediate / 16) {
+                *reinterpret_cast<uint2*>(product + std::int64_t(row) * (intermediate / 2) +
+                                          tid * 8)                            = make_uint2(0, 0);
+                product_scales[std::int64_t(row) * (intermediate / 16) + tid] = 0;
+            }
+        }
+        int assignment;
+        __shared__ int packed;
+        if constexpr (Index) {
+            assignment       = task;
+            const int expert = ids[assignment];
+            if (!includes(kind, mask, expert)) {
+                if (!tid && groups.inverse) groups.inverse[assignment] = -1;
+                if constexpr (Persistent)
+                    continue;
+                else
+                    return;
+            }
+            if (!tid) {
+                packed =
+                    fully_covered_groups<kExperts, kTopK>(groups, tokens * kTopK, false, ordered)
+                        ? groups.offsets[expert] + assignment / kTopK
+                        : atomicAdd(groups.cursors + expert, 1);
+                groups.assignments[packed] = assignment;
+                if (groups.inverse) groups.inverse[assignment] = packed;
+            }
+            __syncthreads();
+        } else {
+            if (task >= groups.offsets[kExperts]) break;
+            assignment = groups.assignments[task];
+            if (!tid) packed = task;
+            __syncthreads();
+        }
+        const int expert = ids[assignment], token = assignment / kTopK;
+        const auto encoded = common::quantize_nvfp4_mul_k16(
+            x + std::int64_t(token) * kHidden + tid * 16, calibration.get(expert));
+        *reinterpret_cast<uint2*>(codes + std::int64_t(packed) * (kHidden / 2) + tid * 8) =
+            make_uint2(encoded.codes_lo, encoded.codes_hi);
+        scales[std::int64_t(packed) * (kHidden / 16) + tid] = encoded.scale;
+        if constexpr (Persistent)
+            __syncthreads();
+        else
+            break;
+    }
 }
 
 template <int I, bool Gate, int Columns, bool Csf>
@@ -214,7 +236,8 @@ void launch_bank(const Tensor& x, const CudaSwiGLUExperts& experts, const Expert
                     using V = short_expert::Shape<I, Gate, Columns>;
                     const int blocks =
                         std::min(kTopK * x.ne[1] * ((Gate ? I : kHidden) / V::features),
-                                 execution.multiprocessor_count() * 8);
+                                 execution.multiprocessor_count() *
+                                     (I == 2048 ? plan.queued_ctas_per_sm : 8));
                     short_expert::contract<I, Gate, Columns>
                         <<<blocks, V::threads, 0, execution.stream()>>>(
                             Gate ? storage.input_codes : storage.product_codes,
@@ -235,13 +258,22 @@ void launch_bank(const Tensor& x, const CudaSwiGLUExperts& experts, const Expert
             }
         }
         if (x.ne[1] <= vector_limit) return;
-        if constexpr (I == 1024) {
+        {
             const auto bank = Gate ? experts.bank.gate_up : experts.bank.down;
             constexpr int k = Gate ? kHidden : I;
             if (plan.native_a4_grouped_input && !bank.offsets && bank.code_stride % (k / 2) == 0) {
                 const auto run_tma = [&]<int C>(int first, int last) {
                     if (x.ne[1] <= first) return;
-                    if constexpr (Gate && C == 256) {
+                    if constexpr (I == 2048 && Csf && !Gate && C == 128) {
+                        // A single column tile uses two resident CTAs with a
+                        // full-K scale decoder. Longer groups favor the staged tile.
+                        grouped_scale_cache::launch<I, Gate, C, Csf>(
+                            x, experts, routes, plan, storage, execution,
+                            std::max(first, vector_limit), 128);
+                        if (x.ne[1] > 128)
+                            grouped_tma::launch<I, Gate, C, Csf>(x, experts, routes, plan, storage,
+                                                                 execution, 128, last);
+                    } else if constexpr (Gate && C == 256) {
                         grouped_scale_cache::launch<I, Gate, C, Csf>(
                             x, experts, routes, plan, storage, execution,
                             std::max(first, vector_limit), last);
@@ -361,37 +393,48 @@ void launch_mul_input(const Tensor& x, const CudaSwiGLUExperts& experts, const E
                       CudaExecutionView execution) {
     const bool quantize =
         plan.arithmetic == Nvfp4Arithmetic::MultiplyA4 && !plan.native_a4_grouped_input;
-    const auto launch = [&]<bool Quantize>() {
+    const auto launch = [&]<bool Quantize, bool SkipInactive>() {
         const auto run = [&]<bool Group>() {
             constexpr int threads = Group ? kExperts : 256;
             const int count       = x.ne[1] * (Quantize ? kTopK : 1);
-            prepare_input<Quantize, Group><<<std::max(count, (kExperts + threads - 1) / threads),
-                                             threads, 0, execution.stream()>>>(
-                static_cast<const __nv_bfloat16*>(x.data), storage.input_codes,
-                static_cast<std::uint8_t*>(storage.input_scales),
-                Quantize ? calibration(experts.activation_calibration.gate_up) : ActivationScale{},
-                static_cast<const int*>(routes.ids.data), x.ne[1], subset.kind,
-                static_cast<const int*>(subset.mask.data), storage.groups.counts,
-                storage.routed_sum, storage.active_tokens, storage.groups, plan.job_columns(),
-                plan.token_ordered_groups);
+            prepare_input<Quantize, Group, SkipInactive>
+                <<<std::max(count, (kExperts + threads - 1) / threads), threads, 0,
+                   execution.stream()>>>(
+                    static_cast<const __nv_bfloat16*>(x.data), storage.input_codes,
+                    static_cast<std::uint8_t*>(storage.input_scales),
+                    Quantize ? calibration(experts.activation_calibration.gate_up)
+                             : ActivationScale{},
+                    static_cast<const int*>(routes.ids.data), x.ne[1], subset.kind,
+                    static_cast<const int*>(subset.mask.data), storage.groups.counts,
+                    storage.routed_sum, storage.active_tokens, storage.groups, plan.job_columns(),
+                    plan.token_ordered_groups);
         };
         if (plan.single_block_grouping)
             run.template operator()<true>();
         else
             run.template operator()<false>();
     };
-    if (quantize)
-        launch.template operator()<true>();
+    const auto select = [&]<bool SkipInactive>() {
+        if (quantize)
+            launch.template operator()<true, SkipInactive>();
+        else
+            launch.template operator()<false, SkipInactive>();
+    };
+    if (plan.intermediate == 2048 && plan.arithmetic == Nvfp4Arithmetic::MultiplyA4)
+        select.template operator()<true>();
     else
-        launch.template operator()<false>();
+        select.template operator()<false>();
     CUDA_CHECK(cudaGetLastError());
 }
 
 void launch_mul_grouped_input(const Tensor& x, const CudaSwiGLUExperts& experts,
                               const ExpertRoutes& routes, ExpertSubset subset, const Plan& plan,
                               const Storage& storage, CudaExecutionView execution) {
-    const auto run = [&]<bool Index>() {
-        quantize_grouped_input<Index><<<kTopK * x.ne[1], kHidden / 16, 0, execution.stream()>>>(
+    const auto run = [&]<bool Index, bool Persistent>() {
+        const int blocks = Persistent
+                               ? std::min(kTopK * x.ne[1], execution.multiprocessor_count() * 8)
+                               : kTopK * x.ne[1];
+        quantize_grouped_input<Index, Persistent><<<blocks, kHidden / 16, 0, execution.stream()>>>(
             static_cast<const __nv_bfloat16*>(x.data), static_cast<const int*>(routes.ids.data),
             subset.kind, static_cast<const int*>(subset.mask.data), storage.groups, x.ne[1],
             plan.token_ordered_groups, calibration(experts.activation_calibration.gate_up),
@@ -399,10 +442,16 @@ void launch_mul_grouped_input(const Tensor& x, const CudaSwiGLUExperts& experts,
             storage.product_codes, static_cast<std::uint8_t*>(storage.product_scales),
             plan.intermediate);
     };
-    if (plan.single_block_grouping)
-        run.template operator()<false>();
+    const auto select = [&]<bool Persistent>() {
+        if (plan.single_block_grouping)
+            run.template operator()<false, Persistent>();
+        else
+            run.template operator()<true, Persistent>();
+    };
+    if (plan.intermediate == 2048)
+        select.template operator()<true>();
     else
-        run.template operator()<true>();
+        select.template operator()<false>();
     CUDA_CHECK(cudaGetLastError());
 }
 

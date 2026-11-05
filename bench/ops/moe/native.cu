@@ -146,6 +146,13 @@ void run(const Options& o) {
             const int active  = std::accumulate(counts.begin(), counts.end(), 0);
             const int unique =
                 std::count_if(counts.begin(), counts.end(), [](int count) { return count > 0; });
+            int input_tokens      = 0;
+            const auto& route_ids = fixture.route_ids();
+            for (int t = 0; t < tokens; ++t) {
+                const auto first = route_ids.begin() + t * native::Fixture::top_k;
+                input_tokens += std::any_of(first, first + native::Fixture::top_k,
+                                            [&](int e) { return fixture.resident(e); });
+            }
             std::ostringstream histogram;
             for (int e = 0; e < int(counts.size()); ++e) {
                 if (e) histogram << ';';
@@ -159,9 +166,14 @@ void run(const Options& o) {
                 const bool full                   = entry == "complete";
                 const std::uint64_t shared_weight = full ? fixture.shared_bytes() : 0;
                 const std::uint64_t router_weight = full ? fixture.router_bytes() : 0;
+                // Inactive routed tokens need no activation read or coefficient
+                // load. The complete entry still reads every input for router/shared.
                 const std::uint64_t public_bytes =
-                    std::uint64_t(tokens) *
-                    (4 * native::Fixture::hidden + (full ? 0 : 8 * native::Fixture::top_k));
+                    std::uint64_t(tokens + (full ? tokens : input_tokens)) * 2 *
+                        native::Fixture::hidden +
+                    (full ? 0
+                          : std::uint64_t(tokens) * 4 * native::Fixture::top_k +
+                                std::uint64_t(active) * 4);
                 const auto bytes =
                     routed_weight + shared_weight + router_weight + index_bytes + public_bytes;
                 const double routed_flops =
@@ -207,7 +219,8 @@ void run(const Options& o) {
                 const std::string tensor_arithmetic = fixture.main()          ? "NVFP4"
                                                       : plan.a16.fp16_product ? "BF16+FP16"
                                                                               : "BF16";
-                const std::string executed          = simt_flops == 0     ? tensor_arithmetic
+                const std::string executed          = routed_flops == 0   ? "none"
+                                                      : simt_flops == 0   ? tensor_arithmetic
                                                       : tensor_flops == 0 ? "FP32"
                                                                           : "FP32+" + tensor_arithmetic;
                 const double routed_compute =

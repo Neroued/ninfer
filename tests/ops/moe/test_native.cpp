@@ -65,9 +65,11 @@ int run(Fixture& f, const Case& c, CudaExecutionView cuda) {
             ops::routed_swiglu(x, profile, experts, routes, subset, c.epilogue, y, workspace, cuda);
     };
     const auto prepare = [&](int phase) {
-        const auto* offset = std::getenv("NINFER_NATIVE_MOE_EXPERT_OFFSET");
-        f.input(c.tokens, c.distribution, phase, c.dense, c.locality,
-                offset ? std::atoi(offset) : 0);
+        const auto* offset              = std::getenv("NINFER_NATIVE_MOE_EXPERT_OFFSET");
+        const std::string_view locality = std::string_view(c.locality) == "transition"
+                                              ? (phase ? "remote" : "local")
+                                              : c.locality;
+        f.input(c.tokens, c.distribution, phase, c.dense, locality, offset ? std::atoi(offset) : 0);
         f.publish_routes(!c.complete);
         for (int e = 0; e < Fixture::experts_count; ++e)
             mask[e] = !(f.resident(e) && (phase ? e % 3 != 1 : e % 4 != 2));
@@ -154,6 +156,7 @@ void add_native_cases(OpSuite& suite) {
             {129, true, false, DType::BF16, ops::MoeEpilogue::Write, "spread"},
         };
         if (profile == Profile::MainTp || profile == Profile::MainEp) {
+            calls.push_back({127, true, true, DType::BF16, ops::MoeEpilogue::Write, "reuse"});
             calls.push_back({129, true, false, DType::BF16, ops::MoeEpilogue::Write, "reuse"});
             calls.push_back({257, true, false, DType::BF16, ops::MoeEpilogue::Write, "tail"});
         } else {
@@ -166,6 +169,41 @@ void add_native_cases(OpSuite& suite) {
             calls.push_back({2049, true, true, DType::BF16, ops::MoeEpilogue::Write, "pool"});
             calls.push_back(
                 {2049, false, true, DType::BF16, ops::MoeEpilogue::AddResidual, "skewpool"});
+        }
+        if (profile == Profile::MainEp) {
+            calls.push_back({.tokens       = 33,
+                             .graph        = true,
+                             .dtype        = DType::FP32,
+                             .distribution = "reuse",
+                             .dense        = true});
+            calls.push_back({128, true, true, DType::BF16, ops::MoeEpilogue::Write, "pool"});
+            calls.push_back({5, false, true, DType::BF16, ops::MoeEpilogue::AddResidual, "reuse",
+                             "transition"});
+            calls.push_back(
+                {9, true, true, DType::BF16, ops::MoeEpilogue::Write, "reuse", "transition"});
+            calls.push_back(
+                {1025, false, true, DType::FP32, ops::MoeEpilogue::Write, "reuse", "remote"});
+            calls.push_back(
+                {.tokens = 1, .distribution = "reuse", .locality = "local", .dense = true});
+            calls.push_back({.tokens       = 2,
+                             .graph        = true,
+                             .distribution = "reuse",
+                             .locality     = "local",
+                             .dense        = true});
+            calls.push_back({.tokens       = 129,
+                             .graph        = true,
+                             .dtype        = DType::FP32,
+                             .distribution = "pool",
+                             .dense        = true});
+            calls.push_back({.tokens       = 257,
+                             .graph        = true,
+                             .dtype        = DType::FP32,
+                             .distribution = "reuse",
+                             .locality     = "local",
+                             .dense        = true});
+            calls.push_back(
+                {513, true, true, DType::BF16, ops::MoeEpilogue::Write, "reuse", "local"});
+            calls.push_back({2049, true, true, DType::BF16, ops::MoeEpilogue::Write, "pool"});
         }
         if (profile == Profile::MtpTp) {
             calls.push_back({.tokens = 1, .distribution = "reuse", .dense = true});

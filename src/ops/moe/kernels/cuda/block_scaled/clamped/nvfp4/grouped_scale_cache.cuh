@@ -16,8 +16,8 @@ struct Shape : grouped_tma::Shape<I, Gate, C, Csf> {
     static constexpr int stages           = 2;
     static constexpr int producer_threads = 64, producer_warps = 1, consumer_threads = 256,
                          consumer_warps = 8;
-    static constexpr int threads = 320, min_blocks = 1, warp_columns = C / 4,
-                         atoms = warp_columns / 8;
+    static constexpr int threads = 320, min_blocks = C == 128 && !Gate ? 2 : 1,
+                         warp_columns = C / 4, atoms = warp_columns / 8;
 };
 
 // Scale restoration, operand transfers and MMA have independent warp roles.
@@ -140,7 +140,9 @@ __global__ __launch_bounds__(S::threads, S::min_blocks) void contract(
     const int jobs = *groups.jobs, tasks = jobs * row_tiles,
               rotation = (int(blockIdx.x) % (S::k / 256)) * 2;
     const auto process = [&]<int Role>() {
-        int sequence = 0;
+        // A job can contain one tile. Destination slots follow transfers across
+        // jobs so the next producer cannot overwrite the preceding epilogue.
+        int sequence = 0, transfer = 0;
         for (int task = blockIdx.x; task < tasks; task += gridDim.x) {
             const int row_tile =
                 S::gate ? task % row_tiles : task / (jobs * window) * window + task % window;
@@ -191,8 +193,9 @@ __global__ __launch_bounds__(S::threads, S::min_blocks) void contract(
                     if constexpr (Role == 1) {
                         if constexpr (!S::gate) {
                             for (int c = lane; c < columns; c += 32) {
-                                const int a                 = __ldg(groups.assignments + begin + c);
-                                s.destinations[tile & 1][c] = {a / kTopK, __ldg(coefficients + a)};
+                                const int a = __ldg(groups.assignments + begin + c);
+                                s.destinations[transfer & 1][c] = {a / kTopK,
+                                                                   __ldg(coefficients + a)};
                             }
                         }
                         produce<S>(s, maps, physical_row, begin, rotation);
@@ -222,7 +225,7 @@ __global__ __launch_bounds__(S::threads, S::min_blocks) void contract(
 #pragma unroll
                                 for (int t = 0; t < 2; ++t)
                                     if (c + t < columns) {
-                                        const auto d = s.destinations[tile & 1][c + t];
+                                        const auto d = s.destinations[transfer & 1][c + t];
                                         float* out   = output + std::int64_t(d.token) * kHidden;
 #pragma unroll
                                         for (int m = 0; m < 2; ++m)
@@ -236,6 +239,7 @@ __global__ __launch_bounds__(S::threads, S::min_blocks) void contract(
                             }
                         }
                     }
+                    if constexpr (!S::gate) ++transfer;
                 }
                 if constexpr (Role == 2) {
                     __syncwarp();
@@ -257,7 +261,8 @@ template <int I, bool Gate, int Columns, bool Csf>
 void launch(const Tensor& x, const CudaSwiGLUExperts& experts, const ExpertRoutes& routes,
             const Plan& plan, const Storage& storage, CudaExecutionView execution, int minimum,
             int maximum) {
-    static_assert(Gate && Columns == 256, "full-scale cache is the long-expert GU schedule");
+    static_assert((Gate && Columns == 256) || (!Gate && Csf && I == 2048 && Columns == 128),
+                  "unregistered full-scale expert tile");
     using S         = Shape<I, Gate, Columns, Csf>;
     const auto bank = Gate ? experts.bank.gate_up : experts.bank.down;
     Maps maps;

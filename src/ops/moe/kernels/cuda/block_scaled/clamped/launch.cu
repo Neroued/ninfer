@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <stdexcept>
+#include <type_traits>
 
 namespace ninfer::ops::detail::moe_cuda::block_scaled::clamped {
 namespace {
@@ -174,6 +175,31 @@ __global__ void reduce(Storage storage, const float* coefficients, Output output
     }
 }
 
+template <class Output>
+__global__ void reduce_atomic_vectors(Storage storage, Output output, int elements) {
+    constexpr int width = 8;
+    const int first     = (blockIdx.x * blockDim.x + threadIdx.x) * width;
+    if (first >= elements) return;
+    const bool live = !storage.active_tokens || storage.active_tokens[first / kHidden];
+    common::F32Vector<width> values{};
+    if (live) values = common::F32Vector<width>::load(storage.routed_sum + first);
+    if constexpr (std::is_same_v<Output, BfloatResult>) {
+        common::Bf16x8Bits residual{};
+        if (output.add_residual) residual.raw = common::load_vec<uint4>(output.data + first);
+        uint4 result;
+        auto* words = reinterpret_cast<unsigned*>(&result);
+#pragma unroll
+        for (int pair = 0; pair < width / 2; ++pair) {
+            const auto initial = common::bf16x2_to_float2(residual.pair[pair]);
+            words[pair]        = common::pack_bf16x2(initial.x + values.word[2 * pair],
+                                                     initial.y + values.word[2 * pair + 1]);
+        }
+        common::store_vec(output.data + first, result);
+    } else {
+        values.store(output.data + first);
+    }
+}
+
 // One CTA emits column layer j across all experts. Its first output
 // index is sum_e min(j, jobs_e), followed by the prefix of experts with jobs_e > j.
 // Only the job metadata changes; packed assignments and GU products keep their offsets.
@@ -312,8 +338,16 @@ void launch(const Tensor& x, const CudaSwiGLUExperts& experts, const ExpertRoute
     if (s.partial_output && plan.atomic_output) return;
     with_output(destination, mode, [&](auto output) {
         const int elements = x.ne[1] * kHidden;
-        reduce<<<(elements + 255) / 256, 256, 0, stream>>>(
-            s, static_cast<const float*>(routes.coefficients.data), output, elements);
+        if (plan.format == QType::NVFP4_MUL && plan.intermediate == 2048 &&
+            plan.arithmetic == Nvfp4Arithmetic::MultiplyA4 && s.routed_sum &&
+            reinterpret_cast<std::uintptr_t>(s.routed_sum) % 16 == 0 &&
+            reinterpret_cast<std::uintptr_t>(output.data) % 16 == 0) {
+            reduce_atomic_vectors<<<(elements + 2047) / 2048, 256, 0, stream>>>(s, output,
+                                                                                elements);
+        } else {
+            reduce<<<(elements + 255) / 256, 256, 0, stream>>>(
+                s, static_cast<const float*>(routes.coefficients.data), output, elements);
+        }
     });
     CUDA_CHECK(cudaGetLastError());
 }

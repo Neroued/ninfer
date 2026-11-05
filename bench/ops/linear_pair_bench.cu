@@ -40,6 +40,8 @@ struct Options {
     int warmup                = 5;
     int repeat                = 30;
     std::uint64_t flush_bytes = 256ULL << 20;
+    std::string csv_out;
+    bool profile = false;
 };
 
 Options parse_options(int argc, char** argv) {
@@ -85,10 +87,17 @@ Options parse_options(int argc, char** argv) {
                 throw std::overflow_error("flush size overflows");
             }
             options.flush_bytes = mib << 20;
+        } else if (argument == "--csv-out") {
+            options.csv_out = next("--csv-out value");
+        } else if (argument == "--profile") {
+            options.profile = true;
         } else if (argument == "--help" || argument == "-h") {
             std::printf("Usage: %s --k 128|2048|5120 "
                         "[--tokens 1,2,... | --sweep START:END[:STEP]] "
-                        "[--execution eager|graph] [--warmup N] [--repeat N] [--flush-mib N]\n",
+                        "[--execution eager|graph] [--warmup N] [--repeat N] [--flush-mib N] "
+                        "[--csv-out PATH] [--profile]\n"
+                        "Graph timing brackets the complete Op body; --profile captures one "
+                        "post-warmup call.\n",
                         argv[0]);
             std::exit(0);
         } else {
@@ -100,6 +109,8 @@ Options parse_options(int argc, char** argv) {
     }
     if (options.k == 0) { throw std::invalid_argument("--k is required"); }
     if (options.repeat <= 0) { throw std::invalid_argument("--repeat must be positive"); }
+    if (options.profile && options.tokens.size() != 1)
+        throw std::invalid_argument("--profile requires exactly one token count");
     return options;
 }
 
@@ -172,6 +183,14 @@ int main(int argc, char** argv) {
                     bench::format_metric(bench::kRoofline.bf16_f32_tflops, 1).c_str());
 
         double t1_median = std::numeric_limits<double>::quiet_NaN();
+        bench::measurement::Options timing_options;
+        timing_options.warmup  = options.warmup;
+        timing_options.repeat  = options.repeat;
+        timing_options.profile = options.profile;
+        std::optional<bench::measurement::Csv> csv;
+        if (!options.csv_out.empty())
+            csv.emplace(options.csv_out, "logical_bytes,useful_flops,effective_gb_s,useful_tflops,"
+                                         "tensor_peak_tflops");
         for (const std::int32_t tokens : options.tokens) {
             Tensor x(input.span(), DType::BF16, {options.k, tokens});
             Tensor first(first_output.span(), DType::BF16, {rows, tokens});
@@ -182,18 +201,10 @@ int main(int argc, char** argv) {
                                      : x;
                 ops::linear_pair(x, second_x, first_weight, second_weight, first, second, cuda);
             };
-            bench::ColdTiming timing;
-            if (options.execution == Execution::Graph) {
-                bench::TimedGraph graph;
-                graph.capture(cuda, launch);
-                graph.launch(cuda);
-                CUDA_CHECK(cudaStreamSynchronize(stream));
-                timing =
-                    bench::measure_cold_graph(graph, flush, cuda, options.warmup, options.repeat);
-            } else {
-                timing =
-                    bench::measure_cold_launch(launch, flush, cuda, options.warmup, options.repeat);
-            }
+            const std::string execution = options.execution == Execution::Graph ? "graph" : "eager";
+            const auto result           = bench::measurement::measure(
+                launch, [](auto) {}, flush, cuda, timing_options, execution, "cold");
+            const auto& timing = result.gpu;
             if (tokens == 1) { t1_median = timing.median_us; }
 
             const double seconds       = timing.median_us * 1.0e-6;
@@ -208,14 +219,34 @@ int main(int argc, char** argv) {
                 tokens, timing.median_us, timing.min_us, timing.p95_us, gbs,
                 bench::format_metric(100.0 * gbs / bench::kRoofline.sustained_read_gbs, 1).c_str(),
                 tflops);
-            const double tc_pct = tokens > 1 ? 100.0 * tflops / bench::kRoofline.bf16_f32_tflops
-                                             : std::numeric_limits<double>::quiet_NaN();
+            const double tc_pct = options.k == 128 || tokens > 1
+                                      ? 100.0 * tflops / bench::kRoofline.bf16_f32_tflops
+                                      : std::numeric_limits<double>::quiet_NaN();
             std::printf("TC=%5s%% ", bench::format_metric(tc_pct, 1).c_str());
             if (std::isnan(extrapolation)) {
                 std::printf("T1_linear=n/a\n");
             } else {
                 std::printf("T1_linear=%5.2fx\n", extrapolation);
             }
+            bench::measurement::Row row;
+            row.op     = "linear_pair";
+            row.format = options.k == 128 ? "bf16" : "q8";
+            row.policy = "a16";
+            row.n      = rows;
+            row.k      = options.k;
+            row.tokens = tokens;
+            if (csv)
+                csv->write(
+                    row, result, execution, "cold",
+                    std::to_string(static_cast<std::uint64_t>(useful_bytes(options.k, tokens))) +
+                        ',' +
+                        std::to_string(
+                            static_cast<std::uint64_t>(useful_flops(options.k, tokens))) +
+                        ',' + bench::format_metric(gbs, 3, "") + ',' +
+                        bench::format_metric(tflops, 3, "") + ',' +
+                        (options.k == 128 || tokens > 1
+                             ? bench::format_metric(bench::kRoofline.bf16_f32_tflops, 3, "")
+                             : ""));
         }
 
         CUDA_CHECK(cudaStreamDestroy(stream));

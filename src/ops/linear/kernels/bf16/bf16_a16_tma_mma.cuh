@@ -97,10 +97,9 @@ inline constexpr int bf16_tma_scratch_bytes =
 
 template <class Schedule, bool FullTokens, class Output, class Epilogue, int Splits = 1,
           class WeightAccess = Bf16ContiguousTmaWeightAccess>
-__global__
-__launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_a16_tma_mma_kernel(
-    const __grid_constant__ Bf16TmaDescriptors descriptors, Output output, Epilogue epilogue,
-    int rows, int input_rows, int token_offset, int count) {
+__device__ __forceinline__ void bf16_a16_tma_mma_body(const Bf16TmaDescriptors& descriptors,
+                                                      Output output, Epilogue epilogue, int rows,
+                                                      int input_rows, int token_offset, int count) {
     constexpr int BR = Schedule::kBlockRows, BT = Schedule::kBlockTokens, BK = Schedule::kBlockK;
     constexpr int S       = Schedule::kStages;
     const int K           = Schedule::kStaticK ? Schedule::kStaticK : input_rows;
@@ -173,6 +172,16 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_a16_t
     }
     bf16_finish_mma_tile<Schedule, FullTokens>(output, epilogue, storage, accum, row_begin,
                                                token_begin, rows, token_offset + count, warp, lane);
+}
+
+template <class Schedule, bool FullTokens, class Output, class Epilogue, int Splits = 1,
+          class WeightAccess = Bf16ContiguousTmaWeightAccess>
+__global__
+__launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_a16_tma_mma_kernel(
+    const __grid_constant__ Bf16TmaDescriptors descriptors, Output output, Epilogue epilogue,
+    int rows, int input_rows, int token_offset, int count) {
+    bf16_a16_tma_mma_body<Schedule, FullTokens, Output, Epilogue, Splits, WeightAccess>(
+        descriptors, output, epilogue, rows, input_rows, token_offset, count);
 }
 
 template <class Schedule, int Splits = 1, class Output, class Epilogue,

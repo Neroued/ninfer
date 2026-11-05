@@ -25,10 +25,14 @@ Storage allocate(Arena& arena, const Plan& plan, int tokens, bool routed, bool p
         const int packing = fp8 ? 1 : 2, scale_group = fp8 ? 128 : 16;
         const auto scale_bytes = fp8 ? sizeof(float) : sizeof(std::uint8_t);
         if (a16) {
-            out.compensated_product.high = static_cast<std::uint16_t*>(
-                arena.alloc(DType::BF16, {plan.intermediate, assignments}).data);
-            out.compensated_product.low = static_cast<std::uint16_t*>(
-                arena.alloc(DType::BF16, {plan.intermediate, assignments}).data);
+            out.a16_product.values = static_cast<std::uint16_t*>(
+                arena
+                    .alloc(plan.a16.fp16_product ? DType::FP16 : DType::BF16,
+                           {plan.intermediate, assignments})
+                    .data);
+            if (!plan.a16.fp16_product)
+                out.a16_product.residual = static_cast<std::uint16_t*>(
+                    arena.alloc(DType::BF16, {plan.intermediate, assignments}).data);
         } else {
             out.input_codes   = bytes(std::size_t(inputs) * kHidden / packing);
             out.input_scales  = bytes(std::size_t(inputs) * (kHidden / scale_group) * scale_bytes);

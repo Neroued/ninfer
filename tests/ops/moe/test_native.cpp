@@ -23,12 +23,13 @@ struct Case {
     const char* distribution  = "pool";
     const char* locality      = "mixed";
     bool mask                 = false;
+    bool dense                = false;
 };
 
 std::string case_id(Profile profile, const Case& c) {
     return "native/" + std::string(profile_name(profile)) + "/" +
            (c.complete ? "complete" : "routed") + "/T" + std::to_string(c.tokens) + "/" +
-           c.distribution + "/" + c.locality;
+           c.distribution + "/" + c.locality + (c.dense ? "/dense" : "");
 }
 
 int run(Fixture& f, const Case& c, CudaExecutionView cuda) {
@@ -65,7 +66,8 @@ int run(Fixture& f, const Case& c, CudaExecutionView cuda) {
     };
     const auto prepare = [&](int phase) {
         const auto* offset = std::getenv("NINFER_NATIVE_MOE_EXPERT_OFFSET");
-        f.input(c.tokens, c.distribution, phase, false, c.locality, offset ? std::atoi(offset) : 0);
+        f.input(c.tokens, c.distribution, phase, c.dense, c.locality,
+                offset ? std::atoi(offset) : 0);
         f.publish_routes(!c.complete);
         for (int e = 0; e < Fixture::experts_count; ++e)
             mask[e] = !(f.resident(e) && (phase ? e % 3 != 1 : e % 4 != 2));
@@ -165,6 +167,21 @@ void add_native_cases(OpSuite& suite) {
             calls.push_back(
                 {2049, false, true, DType::BF16, ops::MoeEpilogue::AddResidual, "skewpool"});
         }
+        if (profile == Profile::MtpTp) {
+            calls.push_back({.tokens = 1, .distribution = "reuse", .dense = true});
+            calls.push_back({.tokens = 2, .graph = true, .distribution = "reuse", .dense = true});
+            calls.push_back(
+                {.tokens = 65, .graph = true, .dtype = DType::FP32, .distribution = "pool"});
+            calls.push_back(
+                {.tokens = 385, .graph = true, .dtype = DType::FP32, .distribution = "pool"});
+            calls.push_back(
+                {.tokens = 193, .graph = true, .dtype = DType::FP32, .distribution = "reuse"});
+            calls.push_back({.tokens       = 129,
+                             .graph        = true,
+                             .dtype        = DType::FP32,
+                             .distribution = "pool",
+                             .dense        = true});
+        }
         if (profile == Profile::MainEp || profile == Profile::MtpEp) {
             calls.push_back(
                 {2, false, true, DType::BF16, ops::MoeEpilogue::Write, "reuse", "remote"});
@@ -186,11 +203,13 @@ void add_native_cases(OpSuite& suite) {
             const auto cuda = cuda_environment().context.execution_view();
             int maximum     = 1;
             for (auto i : selected) maximum = std::max(maximum, calls[i].tokens);
-            const char* artifact = std::getenv("NINFER_NATIVE_MOE_ARTIFACT");
-            const char* layer    = std::getenv("NINFER_NATIVE_MOE_LAYER");
-            Fixture fixture(cuda, profile, maximum, 0, ScalePattern::Stress,
+            const char* artifact  = std::getenv("NINFER_NATIVE_MOE_ARTIFACT");
+            const char* layer     = std::getenv("NINFER_NATIVE_MOE_LAYER");
+            const char* rank_text = std::getenv("NINFER_NATIVE_MOE_RANK");
+            const int rank        = rank_text ? std::stoi(rank_text) : 0;
+            Fixture fixture(cuda, profile, maximum, rank, ScalePattern::Stress,
                             artifact ? std::optional(read_artifact_weights(
-                                           artifact, profile, 0, layer ? std::stoi(layer) : 3))
+                                           artifact, profile, rank, layer ? std::stoi(layer) : 3))
                                      : std::nullopt);
             int failures = 0;
             for (auto i : selected) {

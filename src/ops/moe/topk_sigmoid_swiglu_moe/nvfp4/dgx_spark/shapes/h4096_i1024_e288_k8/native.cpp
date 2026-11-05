@@ -43,16 +43,21 @@ moe_cuda::block_scaled::clamped::Plan select_native(const SwiGLUProfile& ffn, in
     if (p.arithmetic == clamped::Nvfp4Arithmetic::MultiplyA16) {
         p.gate_columns = p.down_columns = 8;
         p.group_columns                 = 128;
-        p.small_expert_limit            = 8;
-        p.medium                        = {.gate_columns = 32, .down_columns = 32, .max_load = 32};
-        p.dense                         = {.gate_columns = 64, .down_columns = 64, .max_load = 128};
-        p.broad                         = {.gate_columns = 64, .down_columns = 64};
         p.a16.vector_max_load           = 2;
-        p.a16.small                     = tokens <= 8 ? clamped::Nvfp4A16Tile{64, 64, 128, 2}
-                                                      : clamped::Nvfp4A16Tile{128, 128, 128, 1};
-        p.a16.medium                    = {128, 128, 128, 1};
-        p.a16.dense                     = {128, 128, 128, 1};
-        p.a16.hot                       = {128, 128, 64, 2};
+        p.a16.buckets[0]                = {8, 8, 8,
+                            tokens <= 8 ? clamped::Nvfp4A16Tile{64, 64, 128, 2}
+                                                       : clamped::Nvfp4A16Tile{128, 128, 128, 1}};
+        p.a16.buckets[1]                = {32, 32, 32, {128, 128, 128, 1}};
+        p.a16.buckets[2]                = {128, 64, 64, {128, 128, 128, 1}};
+        p.a16.fp16_product = ffn.gate_up_layout != QuantLayout::Csf32 && *ffn.clamp_limit == 10.F;
+        if (p.a16.fp16_product) {
+            p.nvfp4.down_row_window = 4;
+            p.column_major_down     = !p.single_block_grouping;
+            p.a16.buckets[3]        = {192, 128, 128, {128, 128, 64, 2}};
+            p.a16.buckets[4]        = {INT_MAX, 64, 64, {128, 128, 64, 2}};
+        } else {
+            p.a16.buckets[3] = {INT_MAX, 64, 64, {128, 128, 64, 2}};
+        }
     }
     return p;
 }

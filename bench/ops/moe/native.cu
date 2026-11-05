@@ -186,8 +186,12 @@ void run(const Options& o) {
                         least    = std::min(least, count);
                         greatest = std::max(greatest, count);
                     }
-                const bool promoted = fixture.main() && plan.native_a4_grouped_input &&
-                                      greatest - least <= 1 && greatest > vector_limit;
+                const bool promoted =
+                    fixture.main()
+                        ? plan.native_a4_grouped_input && greatest - least <= 1 &&
+                              greatest > vector_limit
+                        : plan.a16.fp16_product &&
+                              plan.a16.dispatch(true).cohort_load(least, greatest) > vector_limit;
                 if (!promoted) {
                     for (int count : counts)
                         if (count <= vector_limit) vector_assignments += count;
@@ -200,10 +204,12 @@ void run(const Options& o) {
                     simt_flops / (1e6 * kRoofline.fp32_f32_tflops) +
                     tensor_flops / (1e6 * (fixture.main() ? kRoofline.nvfp4_f32_tflops
                                                           : kRoofline.bf16_f32_tflops));
-                const std::string executed = simt_flops == 0 ? (fixture.main() ? "NVFP4" : "BF16")
-                                             : tensor_flops == 0 ? "FP32"
-                                             : fixture.main()    ? "FP32+NVFP4"
-                                                                 : "FP32+BF16";
+                const std::string tensor_arithmetic = fixture.main()          ? "NVFP4"
+                                                      : plan.a16.fp16_product ? "BF16+FP16"
+                                                                              : "BF16";
+                const std::string executed          = simt_flops == 0     ? tensor_arithmetic
+                                                      : tensor_flops == 0 ? "FP32"
+                                                                          : "FP32+" + tensor_arithmetic;
                 const double routed_compute =
                     routed_flops / (1e6 * (fixture.main() ? kRoofline.nvfp4_f32_tflops
                                                           : kRoofline.bf16_f32_tflops));

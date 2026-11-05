@@ -2,6 +2,7 @@
 
 #include "ninfer/ops/moe.h"
 #include "ops/moe/kernels/cuda/block_scaled/nvfp4/schedule.h"
+#include <climits>
 
 namespace ninfer::ops::detail::moe_cuda::block_scaled::clamped {
 
@@ -29,9 +30,54 @@ struct Nvfp4A16Tile {
     int k_step = 128, stages = 2;
 };
 
+struct Nvfp4A16Bucket {
+    int maximum_load = 0;
+    int gate_columns = 0, down_columns = 0;
+    Nvfp4A16Tile tile;
+};
+
+struct Nvfp4A16Dispatch {
+    int maximum_load[5]{}, columns[5]{};
+    int vector_limit = 0;
+#if defined(__CUDACC__)
+    __host__ __device__
+#endif
+        int
+        column_tile(int load) const {
+        if (load <= vector_limit) return vector_limit;
+        for (int i = 0; i < 5; ++i)
+            if (columns[i] && load <= maximum_load[i]) return columns[i];
+        return 0;
+    }
+#if defined(__CUDACC__)
+    __host__ __device__
+#endif
+        int
+        cohort_load(int low, int high) const {
+        if (!high || high - low > 1) return 0;
+        if (low == high) return high;
+        // Neighboring populations use the wider of their two tiles. This
+        // also covers a narrower tile becoming useful after a partial job.
+        return column_tile(low) > column_tile(high) ? low : high;
+    }
+};
+
 struct Nvfp4A16Tuning {
-    Nvfp4A16Tile small, medium, dense, hot;
+    Nvfp4A16Bucket buckets[5];
     int vector_max_load = 0;
+    // The clamp-10 product is bounded by 100. A power-of-two normalization
+    // permits one FP16 plane while retaining the A16 numerical contract.
+    bool fp16_product = false;
+
+    Nvfp4A16Dispatch dispatch(bool gate) const {
+        Nvfp4A16Dispatch out;
+        out.vector_limit = vector_max_load;
+        for (int i = 0; i < 5; ++i) {
+            out.maximum_load[i] = buckets[i].maximum_load;
+            out.columns[i]      = gate ? buckets[i].gate_columns : buckets[i].down_columns;
+        }
+        return out;
+    }
 };
 
 struct Plan {
@@ -72,6 +118,11 @@ struct Plan {
 
     int job_columns() const {
         int columns = gate_columns > down_columns ? gate_columns : down_columns;
+        if (arithmetic == Nvfp4Arithmetic::MultiplyA16)
+            for (const auto& bucket : a16.buckets) {
+                if (bucket.gate_columns > columns) columns = bucket.gate_columns;
+                if (bucket.down_columns > columns) columns = bucket.down_columns;
+            }
         if (fp8.k_step == 0) {
             if (fp8.large_gate_columns > columns) columns = fp8.large_gate_columns;
             if (fp8.large_down_columns > columns) columns = fp8.large_down_columns;
@@ -96,10 +147,11 @@ struct Groups {
     int* load_range;
 };
 
-// BF16 planes [assignment,I]: high=RN(x), low=RN(x-high).
-struct CompensatedProduct {
-    std::uint16_t* high = nullptr;
-    std::uint16_t* low  = nullptr;
+// Intermediate planes [assignment,I]. FP16 stores one normalized plane;
+// compensated BF16 stores RN(x) and RN(x-RN(x)) in values/residual.
+struct A16Product {
+    std::uint16_t* values   = nullptr;
+    std::uint16_t* residual = nullptr;
 };
 
 struct Storage {
@@ -110,7 +162,7 @@ struct Storage {
     void* product_scales        = nullptr;
     float* contributions        = nullptr;
     float* direct_product       = nullptr;
-    CompensatedProduct compensated_product;
+    A16Product a16_product;
     float* routed_sum  = nullptr;
     int* active_tokens = nullptr;
     Groups groups{};

@@ -343,9 +343,18 @@ void run_bf16_extensions(Suite& suite) {
     const std::array native_calls{
         Invocation{1, CallForm::A16Convenience}, Invocation{8}, Invocation{129}, Invocation{4096},
         Invocation{33, CallForm::Policy, ops::LinearPolicy::A16Only, true}};
-    for (auto [n, k] : std::array<std::array<int, 2>, 3>{{{128, 4096}, {256, 4096}, {4096, 1536}}})
+    for (auto [n, k] : std::array<std::array<int, 2>, 3>{{{128, 4096}, {256, 4096}, {4096, 1536}}}) {
+        std::vector<Invocation> calls(native_calls.begin(), native_calls.end());
+        if (n == 256 && k == 4096) {
+            for (int t : {2, 4, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512, 640,
+                          1024, 1536, 2048, 3072})
+                calls.push_back({t, CallForm::Policy, ops::LinearPolicy::A16Only});
+            for (int t : {3, 5, 25, 65, 97, 193, 257, 385, 513, 641, 1025, 1537, 3073})
+                calls.push_back({t, CallForm::Policy, ops::LinearPolicy::A16Only, true});
+        }
         add_shape(suite, QType::BF16, ActivationRecipe::TokenBlocks, make_bf16_weight,
-                  {n, k, 1973U, Comparison::Sampled, true, native_calls});
+                  {n, k, 1973U, Comparison::Sampled, true, calls});
+    }
     const std::array geometries{
         Geometry{20480, 1536, {16, 32, 64, 128, 256, 1024}},
         Geometry{16384, 1536, {16, 32, 64, 128, 256, 1024}},

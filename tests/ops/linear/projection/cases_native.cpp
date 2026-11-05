@@ -14,8 +14,9 @@ quantized_weight::PackedWeight native_weight(int n, int k, std::uint32_t seed) {
 }
 
 #if NINFER_TARGET_SPARK
-quantized_weight::PackedWeight mxfp8_four_byte_scales(int n, int k, std::uint32_t seed) {
-    auto weight = native_weight<QType::MXFP8>(n, k, seed);
+template <QType Format>
+quantized_weight::PackedWeight native_four_byte_scales(int n, int k, std::uint32_t seed) {
+    auto weight = native_weight<Format>(n, k, seed);
     // The public format permits a scale plane aligned to four bytes, independently of codes.
     weight.payload.insert(weight.payload.begin() + weight.geometry.scale_offset, 4, 0xa5);
     weight.geometry.scale_offset += 4;
@@ -80,7 +81,8 @@ void add_native_cases(Suite& suite) {
                  {257, CallForm::Policy, ops::LinearPolicy::AllowA8, true},
                  {512, CallForm::Policy, ops::LinearPolicy::AllowA8},
                  {513, CallForm::Policy, ops::LinearPolicy::AllowA8, true}}};
-            add_shape(suite, QType::MXFP8, ActivationRecipe::Hashed, mxfp8_four_byte_scales,
+            add_shape(suite, QType::MXFP8, ActivationRecipe::Hashed,
+                      native_four_byte_scales<QType::MXFP8>,
                       {n, k, 1461U, Comparison::Sampled, true, unaligned_calls});
         }
         if (n == 4096 && k == 4096) {
@@ -210,6 +212,21 @@ void add_native_cases(Suite& suite) {
                 calls.push_back({t, CallForm::Policy, ops::LinearPolicy::A16Only});
             for (int t : {49, 65, 97, 129, 193, 385, 513, 1025})
                 calls.push_back({t, CallForm::Policy, ops::LinearPolicy::A16Only, true});
+        }
+        if (n == 16384 && k == 1536) {
+            for (int t : {4, 8, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1152,
+                          2048, 4096})
+                calls.push_back({t, CallForm::Policy, ops::LinearPolicy::A16Only});
+            for (int t : {17, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1153, 2049})
+                calls.push_back({t, CallForm::Policy, ops::LinearPolicy::A16Only, true});
+            const std::array<Invocation, 3> unaligned_calls{{
+                {129, CallForm::Policy, ops::LinearPolicy::A16Only},
+                {193, CallForm::Policy, ops::LinearPolicy::A16Only, true},
+                {257, CallForm::Policy, ops::LinearPolicy::A16Only, true},
+            }};
+            add_shape(suite, QType::FP8_E4M3FN_BLOCK128X128_FP32, ActivationRecipe::Hashed,
+                      native_four_byte_scales<QType::FP8_E4M3FN_BLOCK128X128_FP32>,
+                      {n, k, 1471U, Comparison::Sampled, true, unaligned_calls});
         }
         add_shape(suite, QType::FP8_E4M3FN_BLOCK128X128_FP32, ActivationRecipe::Hashed,
                   native_weight<QType::FP8_E4M3FN_BLOCK128X128_FP32>,

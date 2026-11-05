@@ -27,7 +27,7 @@ Storage allocate(Arena& arena, const Plan& plan, int tokens, bool routed, bool p
         if (a16) {
             out.a16_product.values = static_cast<std::uint16_t*>(
                 arena
-                    .alloc(plan.a16.fp16_product ? DType::FP16 : DType::BF16,
+                    .alloc(plan.a16.fp16_product ? DType::FP32 : DType::BF16,
                            {plan.intermediate, assignments})
                     .data);
             if (!plan.a16.fp16_product)

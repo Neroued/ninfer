@@ -40,7 +40,7 @@ public:
     bool main() const;
     bool ep() const;
     void input(int tokens, std::string_view distribution, int phase = 0, bool dense = false,
-               std::string_view locality = "mixed", int expert_offset = 0);
+               std::string_view locality = "mixed", int expert_offset = 0, float input_scale = 1.F);
     void publish_routes(bool signed_coefficients = false);
     void release_host_weights();
     Tensor x(int tokens) const;

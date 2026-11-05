@@ -178,7 +178,7 @@ Fixture::Fixture(CudaExecutionView cuda, Profile p, int maximum, int r, ScalePat
 Fixture::~Fixture() = default;
 
 void Fixture::input(int tokens, std::string_view distribution, int phase, bool dense,
-                    std::string_view locality, int expert_offset) {
+                    std::string_view locality, int expert_offset, float input_scale) {
     if (tokens < 1 || tokens > max_tokens)
         throw std::out_of_range("native MoE input exceeds fixture");
     if (distribution != "reuse" && distribution != "pool" && distribution != "tail" &&
@@ -214,6 +214,8 @@ void Fixture::input(int tokens, std::string_view distribution, int phase, bool d
             if (ep() && locality != "mixed") e = 2 * e + (locality == "local" ? rank : 1 - rank);
             x[e] = f32_to_bf16(.32f - j * .02f);
         }
+        if (input_scale != 1.F)
+            for (int k = 0; k < hidden; ++k) x[k] = f32_to_bf16(bf16_to_f32(x[k]) * input_scale);
         std::vector<int> candidates(experts_count);
         std::iota(candidates.begin(), candidates.end(), 0);
         const auto score = [&](int e) { return 1.0 / (1 + std::exp(-8.0 * bf16_to_f32(x[e]))); };

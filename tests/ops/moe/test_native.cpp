@@ -24,12 +24,14 @@ struct Case {
     const char* locality      = "mixed";
     bool mask                 = false;
     bool dense                = false;
+    float input_scale         = 1.F;
 };
 
 std::string case_id(Profile profile, const Case& c) {
     return "native/" + std::string(profile_name(profile)) + "/" +
            (c.complete ? "complete" : "routed") + "/T" + std::to_string(c.tokens) + "/" +
-           c.distribution + "/" + c.locality + (c.dense ? "/dense" : "");
+           c.distribution + "/" + c.locality + (c.dense ? "/dense" : "") +
+           (c.input_scale != 1.F ? "/small-input" : "");
 }
 
 int run(Fixture& f, const Case& c, CudaExecutionView cuda) {
@@ -69,7 +71,9 @@ int run(Fixture& f, const Case& c, CudaExecutionView cuda) {
         const std::string_view locality = std::string_view(c.locality) == "transition"
                                               ? (phase ? "remote" : "local")
                                               : c.locality;
-        f.input(c.tokens, c.distribution, phase, c.dense, locality, offset ? std::atoi(offset) : 0);
+        const float input_scale         = c.graph && !phase ? 1.F : c.input_scale;
+        f.input(c.tokens, c.distribution, phase, c.dense, locality, offset ? std::atoi(offset) : 0,
+                input_scale);
         f.publish_routes(!c.complete);
         for (int e = 0; e < Fixture::experts_count; ++e)
             mask[e] = !(f.resident(e) && (phase ? e % 3 != 1 : e % 4 != 2));
@@ -204,6 +208,22 @@ void add_native_cases(OpSuite& suite) {
             calls.push_back(
                 {513, true, true, DType::BF16, ops::MoeEpilogue::Write, "reuse", "local"});
             calls.push_back({2049, true, true, DType::BF16, ops::MoeEpilogue::Write, "pool"});
+        }
+        if (profile == Profile::MtpTp || profile == Profile::MtpEp) {
+            calls.push_back(
+                {.tokens = 1, .distribution = "reuse", .dense = true, .input_scale = 1e-4F});
+            calls.push_back({.tokens       = 33,
+                             .graph        = true,
+                             .dtype        = DType::FP32,
+                             .distribution = "reuse",
+                             .dense        = true,
+                             .input_scale  = 1e-4F});
+            calls.push_back({.tokens       = 2,
+                             .graph        = true,
+                             .dtype        = DType::FP32,
+                             .distribution = "reuse",
+                             .dense        = true,
+                             .input_scale  = 1e-8F});
         }
         if (profile == Profile::MtpTp) {
             calls.push_back({.tokens = 1, .distribution = "reuse", .dense = true});

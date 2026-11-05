@@ -33,15 +33,11 @@ struct Tile {
     int sources[S::columns];
 };
 
-inline constexpr float kProductScale = 512.F;
-
-// The selected clamp-10 product has magnitude <=100, so the normalized
-// FP16 value remains <=51200. Its staging precision is private to this Op.
 template <bool Fp16>
 __device__ __forceinline__ void store_product(A16Product product, std::int64_t offset,
                                               float value) {
     if constexpr (Fp16) {
-        reinterpret_cast<__half*>(product.values)[offset] = __float2half_rn(value * kProductScale);
+        reinterpret_cast<float*>(product.values)[offset] = value;
     } else {
         const auto high = __float2bfloat16_rn(value);
         const auto low  = __float2bfloat16_rn(value - __bfloat162float(high));
@@ -50,10 +46,69 @@ __device__ __forceinline__ void store_product(A16Product product, std::int64_t o
     }
 }
 
-template <bool Fp16>
-__device__ __forceinline__ float restore_product(float value) {
-    if constexpr (Fp16) return value * (1.F / kProductScale);
-    return value;
+template <int Intermediate, bool Fp16>
+__device__ __forceinline__ float product_inverse(A16Product product, int column) {
+    if constexpr (Fp16) {
+        const auto* exponent = reinterpret_cast<const std::uint8_t*>(
+            product.values + std::int64_t(column) * (2 * Intermediate) + Intermediate);
+        return __uint_as_float(unsigned(127 - *exponent) << 23);
+    }
+    return 1.F;
+}
+
+template <int Intermediate>
+__global__ __launch_bounds__(256) void normalize_product(A16Product product, Groups groups,
+                                                          const int* ids, int vector_limit,
+                                                          Nvfp4A16Dispatch dispatch) {
+    static_assert(Intermediate % 1024 == 0);
+    constexpr int parts = Intermediate / 1024;
+    __shared__ float maxima[8];
+    const int tid = threadIdx.x, lane = tid % 32, warp = tid / 32;
+    if (groups.load_range[1] <= vector_limit) return;
+    const int cohort = dispatch.cohort_load(groups.load_range[0], groups.load_range[1]);
+    const int columns = groups.offsets[kExperts];
+    for (int column = blockIdx.x; column < columns; column += gridDim.x) {
+        if (!cohort) {
+            const int expert = ids[groups.assignments[column]];
+            if (groups.offsets[expert + 1] - groups.offsets[expert] <= vector_limit) continue;
+        }
+        float4 values[parts];
+        float maximum = 0.F;
+#pragma unroll
+        for (int part = 0; part < parts; ++part) {
+            const auto v = common::load_vec<float4>(reinterpret_cast<const float*>(product.values) +
+                                                    std::int64_t(column) * Intermediate +
+                                                    part * 1024 + tid * 4);
+            values[part] = v;
+            maximum =
+                fmaxf(maximum, fmaxf(fmaxf(fabsf(v.x), fabsf(v.y)), fmaxf(fabsf(v.z), fabsf(v.w))));
+        }
+        maximum = common::warp_max(maximum);
+        if (!lane) maxima[warp] = maximum;
+        __syncthreads();
+        maximum      = common::warp_max(lane < 8 ? maxima[lane] : 0.F);
+        int exponent = 9;
+        if (maximum > 0.F) {
+            const int power = int((__float_as_uint(maximum) >> 23) & 255) - 127;
+            exponent        = max(9, min(120, 14 - power));
+        }
+        const float scale = __uint_as_float(unsigned(127 + exponent) << 23);
+        // All original FP32 values are now private registers. Each column has
+        // its own FP32-sized row, so writing the half-sized prefix cannot race
+        // a different column's reads. Its spare half owns the exponent byte.
+        auto* destination = product.values + std::int64_t(column) * (2 * Intermediate);
+#pragma unroll
+        for (int part = 0; part < parts; ++part) {
+            const auto v = values[part];
+            common::store_vec(destination + part * 1024 + tid * 4,
+                              make_uint2(common::pack_f16x2(v.x * scale, v.y * scale),
+                                         common::pack_f16x2(v.z * scale, v.w * scale)));
+        }
+        if (!tid)
+            *reinterpret_cast<std::uint8_t*>(destination + Intermediate) =
+                static_cast<std::uint8_t>(exponent);
+        __syncthreads();
+    }
 }
 
 template <bool Bf16>
@@ -79,14 +134,6 @@ __device__ __forceinline__ unsigned weight_pair(std::uint8_t code, unsigned scal
         asm("mul.rn.f16x2 %0,%1,%2;" : "=r"(result) : "r"(value), "r"(scale));
         return result;
     }
-}
-
-__device__ __forceinline__ float dot_half_pair(float accum, unsigned w, unsigned x) {
-    asm("{.reg .b16 ax,ay,bx,by;mov.b32 {ax,ay},%1;mov.b32 {bx,by},%2;"
-        "fma.rn.f32.f16 %0,ax,bx,%0;fma.rn.f32.f16 %0,ay,by,%0;}"
-        : "+f"(accum)
-        : "r"(w), "r"(x));
-    return accum;
 }
 
 template <class S>
@@ -134,7 +181,8 @@ __device__ __forceinline__ void stage(Tile<S>& tile, int slot, int kt, int row0,
                                        x + std::int64_t(source >= 0 ? source : 0) * S::k + k0 + k,
                                        source >= 0 ? 16 : 0);
         } else {
-            const auto offset = std::int64_t(source >= 0 ? source : 0) * S::k + k0 + k;
+            const auto offset =
+                std::int64_t(source >= 0 ? source : 0) * S::k * (S::fp16_product ? 2 : 1) + k0 + k;
             common::cp_async_zfill<16>(tile.inputs[slot][0] + destination, product.values + offset,
                                        source >= 0 ? 16 : 0);
             if constexpr (!S::fp16_product)
@@ -291,6 +339,7 @@ __global__ __launch_bounds__(
                 for (int t = 0; t < 2; ++t) {
                     if (column + t >= end) continue;
                     const int assignment = groups.assignments[column + t];
+                    const float inverse  = product_inverse<Intermediate, Fp16>(product, column + t);
                     const float factor = weight.multiplier * (sum ? coefficients[assignment] : 1.F);
                     float* destination = sum ? sum + std::int64_t(assignment / kTopK) * kHidden
                                              : contributions + std::int64_t(column + t) * kHidden;
@@ -298,9 +347,8 @@ __global__ __launch_bounds__(
                     for (int m = 0; m < 2; ++m)
 #pragma unroll
                         for (int half = 0; half < 2; ++half) {
-                            const int r = row0 + wm * 32 + m * 16 + (lane >> 2) + half * 8;
-                            const float value =
-                                restore_product<Fp16>(acc[m][n][t + half * 2]) * factor;
+                            const int r       = row0 + wm * 32 + m * 16 + (lane >> 2) + half * 8;
+                            const float value = (acc[m][n][t + half * 2] * inverse) * factor;
                             if (sum)
                                 atomicAdd(destination + r, value);
                             else
@@ -422,25 +470,36 @@ __global__ __launch_bounds__(128) void vector_down(ExpertMatrixDeviceView bank, 
                     : "l"(address));
                 const unsigned scale =
                     weight.scales[common::nvfp4_scale_byte_offset(rows[r], group, Intermediate)];
-                scales[r] = scale_pair<!Fp16>(scale | (scale << 8));
+                scales[r] = scale_pair<true>(scale | (scale << 8));
             }
-            unsigned high[MaxColumns][8], low[Fp16 ? 1 : MaxColumns][8];
+            unsigned high[MaxColumns][Fp16 ? 16 : 8], low[Fp16 ? 1 : MaxColumns][8];
 #pragma unroll
             for (int col = 0; col < MaxColumns; ++col) {
                 if (begin + col >= end) continue;
                 const auto offset = std::int64_t(begin + col) * Intermediate + group * 16;
-                const auto a      = common::load_vec<uint4>(product.values + offset);
-                const auto b      = common::load_vec<uint4>(product.values + offset + 8);
-
-                high[col][0] = a.x;
-                high[col][1] = a.y;
-                high[col][2] = a.z;
-                high[col][3] = a.w;
-                high[col][4] = b.x;
-                high[col][5] = b.y;
-                high[col][6] = b.z;
-                high[col][7] = b.w;
-                if constexpr (!Fp16) {
+                if constexpr (Fp16) {
+                    // Short expert groups keep the original FP32 product. SIMT
+                    // needs no FP16 staging or separate normalization pass.
+#pragma unroll
+                    for (int part = 0; part < 4; ++part) {
+                        const auto v = common::load_vec<uint4>(
+                            reinterpret_cast<const float*>(product.values) + offset + part * 4);
+                        high[col][part * 4]     = v.x;
+                        high[col][part * 4 + 1] = v.y;
+                        high[col][part * 4 + 2] = v.z;
+                        high[col][part * 4 + 3] = v.w;
+                    }
+                } else {
+                    const auto a = common::load_vec<uint4>(product.values + offset);
+                    const auto b = common::load_vec<uint4>(product.values + offset + 8);
+                    high[col][0] = a.x;
+                    high[col][1] = a.y;
+                    high[col][2] = a.z;
+                    high[col][3] = a.w;
+                    high[col][4] = b.x;
+                    high[col][5] = b.y;
+                    high[col][6] = b.z;
+                    high[col][7] = b.w;
                     const auto c = common::load_vec<uint4>(product.residual + offset);
                     const auto d = common::load_vec<uint4>(product.residual + offset + 8);
                     low[col][0]  = c.x;
@@ -460,16 +519,20 @@ __global__ __launch_bounds__(128) void vector_down(ExpertMatrixDeviceView bank, 
                 for (int r = 0; r < 2; ++r) {
                     const unsigned word = pair < 4 ? codes[r].x : codes[r].y;
                     const auto code     = static_cast<std::uint8_t>(word >> (8 * (pair & 3)));
-                    values[r]           = weight_pair<!Fp16>(code, scales[r]);
+                    values[r]           = weight_pair<true>(code, scales[r]);
                 }
 #pragma unroll
                 for (int col = 0; col < MaxColumns; ++col) {
                     if (begin + col >= end) continue;
                     if constexpr (Fp16) {
+                        const float x = __uint_as_float(high[col][2 * pair]);
+                        const float y = __uint_as_float(high[col][2 * pair + 1]);
 #pragma unroll
-                        for (int r = 0; r < 2; ++r)
-                            accum[r][col] =
-                                dot_half_pair(accum[r][col], values[r], high[col][pair]);
+                        for (int r = 0; r < 2; ++r) {
+                            const auto w = common::bf16x2_bits_to_float2(values[r]);
+                            accum[r][col] = fmaf(w.x, x, accum[r][col]);
+                            accum[r][col] = fmaf(w.y, y, accum[r][col]);
+                        }
                     } else {
                         const auto h = common::bf16x2_bits_to_float2(high[col][pair]);
                         const auto l = common::bf16x2_bits_to_float2(low[col][pair]);
@@ -487,9 +550,9 @@ __global__ __launch_bounds__(128) void vector_down(ExpertMatrixDeviceView bank, 
         for (int r = 0; r < 2; ++r)
 #pragma unroll
             for (int col = 0; col < MaxColumns; ++col) {
-                const float value = restore_product<Fp16>(common::warp_reduce_sum(accum[r][col])) *
-                                    weight.multiplier;
+                const float dot = common::warp_reduce_sum(accum[r][col]);
                 if (!lane && begin + col < end) {
+                    const float value = dot * weight.multiplier;
                     if (sum) {
                         const int assignment = groups.assignments[begin + col];
                         atomicAdd(sum + std::int64_t(assignment / kTopK) * kHidden + rows[r],

@@ -152,6 +152,15 @@ void launch(const Tensor& x, const CudaSwiGLUExperts& experts, const ExpertRoute
         }
     };
     phase.template operator()<true>();
+    if constexpr (Fp16) {
+        if (x.ne[1] > vector_limit) {
+            const int blocks = std::min(kTopK * x.ne[1], execution.multiprocessor_count() * 6);
+            a16::normalize_product<I><<<blocks, 256, 0, execution.stream()>>>(
+                s.a16_product, s.groups, static_cast<const int*>(routes.ids.data), vector_limit,
+                p.a16.dispatch(true));
+            CUDA_CHECK(cudaGetLastError());
+        }
+    }
     if (p.column_major_down)
         launch_column_jobs(s.groups, x.ne[1], p.job_columns(), p.preserve_balanced_down, execution);
     phase.template operator()<false>();

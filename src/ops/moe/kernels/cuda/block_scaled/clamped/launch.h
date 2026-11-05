@@ -65,8 +65,7 @@ struct Nvfp4A16Dispatch {
 struct Nvfp4A16Tuning {
     Nvfp4A16Bucket buckets[5];
     int vector_max_load = 0;
-    // The clamp-10 product is bounded by 100. A power-of-two normalization
-    // permits one FP16 plane while retaining the A16 numerical contract.
+    // Normalize actual FP32 product columns before one FP16 down contraction.
     bool fp16_product = false;
 
     Nvfp4A16Dispatch dispatch(bool gate) const {
@@ -147,8 +146,9 @@ struct Groups {
     int* load_range;
 };
 
-// Intermediate planes [assignment,I]. FP16 stores one normalized plane;
-// compensated BF16 stores RN(x) and RN(x-RN(x)) in values/residual.
+// Compensated BF16 stores two [assignment,I] planes. The FP16 route first
+// stages FP32 columns in values. SIMT consumes them directly; MMA columns use
+// a normalized FP16 prefix and an exponent byte in their unused second half.
 struct A16Product {
     std::uint16_t* values   = nullptr;
     std::uint16_t* residual = nullptr;

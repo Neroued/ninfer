@@ -345,6 +345,17 @@ void run_bf16_extensions(Suite& suite) {
         Invocation{33, CallForm::Policy, ops::LinearPolicy::A16Only, true}};
     for (auto [n, k] : std::array<std::array<int, 2>, 3>{{{128, 4096}, {256, 4096}, {4096, 1536}}}) {
         std::vector<Invocation> calls(native_calls.begin(), native_calls.end());
+        if (n == 128 && k == 4096) {
+            for (int t : {2, 4, 5, 7, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512,
+                          768, 1024, 2048})
+                calls.push_back({t, CallForm::Policy, ops::LinearPolicy::A16Only});
+            for (int t : {3, 9, 17, 49, 65, 97, 193, 257, 385, 513, 769, 1025, 2049})
+                calls.push_back({t, CallForm::Policy, ops::LinearPolicy::A16Only, true});
+            for (int t : {1152, 1535, 1536})
+                calls.push_back({t, CallForm::Policy, ops::LinearPolicy::A16Only});
+            for (int t : {1153, 1537, 4097})
+                calls.push_back({t, CallForm::Policy, ops::LinearPolicy::A16Only, true});
+        }
         if (n == 256 && k == 4096) {
             for (int t : {2, 4, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512, 640,
                           1024, 1536, 2048, 3072})

@@ -57,6 +57,16 @@ int run(QType format, int n, int k, bool swiglu, ops::LinearPolicy policy,
     const auto execution         = context.execution_view();
     int failures                 = 0;
     bool checked_workspace_alias = false;
+    if (format == QType::MXFP8 && policy == ops::LinearPolicy::AllowA8) {
+        for (auto [first, last] : {std::pair{1, 64}, std::pair{33, 193}, std::pair{193, 769},
+                                   std::pair{769, 1025}, std::pair{1, 4097}}) {
+            const auto peak =
+                ops::linear_bias_workspace_capacity_bytes(format, n, k, policy, first, last);
+            for (int t = first; t <= last; ++t)
+                if (ops::linear_bias_workspace_capacity_bytes(format, n, k, policy, t, t) > peak)
+                    ++failures;
+        }
+    }
     for (auto i : selected) {
         const auto& c = cases[i];
         const auto capacity =
@@ -145,8 +155,14 @@ void add(linear_suite::Suite& suite, QType format, int n, int k, bool swiglu,
     for (int t : tokens)
         cases.push_back(linear_suite::make_case(linear_suite::format_name(format), n, k, t, policy,
                                                 linear_suite::Execution::Eager, label));
-    cases.push_back(linear_suite::make_case(linear_suite::format_name(format), n, k, 33, policy,
-                                            linear_suite::Execution::Graph, label));
+    if (format == QType::MXFP8 && policy == ops::LinearPolicy::AllowA8) {
+        for (int t : {1, 3, 4, 8, 9, 33, 65, 193, 385, 769, 1025, 4097})
+            cases.push_back(linear_suite::make_case(linear_suite::format_name(format), n, k, t,
+                                                    policy, linear_suite::Execution::Graph, label));
+    } else {
+        cases.push_back(linear_suite::make_case(linear_suite::format_name(format), n, k, 33, policy,
+                                                linear_suite::Execution::Graph, label));
+    }
     if (format == QType::NVFP4_MUL && swiglu)
         cases.push_back(linear_suite::make_case(linear_suite::format_name(format), n, k, 129,
                                                 policy, linear_suite::Execution::Graph, label));
@@ -163,7 +179,11 @@ void add(linear_suite::Suite& suite, QType format, int n, int k, bool swiglu,
 void add_native_cases(linear_suite::Suite& suite) {
 #if NINFER_TARGET_SPARK
     constexpr std::array tokens{1, 2, 7, 17, 129, 513};
-    add(suite, QType::MXFP8, 1024, 1024, false, ops::LinearPolicy::AllowA8, tokens);
+    constexpr std::array mx_tokens{
+        1,   2,   3,   4,   5,    7,    8,    9,    16,   17,   24,   31,   32,   33,  48,  63,
+        64,  65,  96,  128, 129,  191,  192,  193,  255,  256,  257,  383,  384,  385, 511, 512,
+        513, 767, 768, 769, 1023, 1024, 1025, 2047, 2048, 2049, 3072, 4095, 4096, 4097};
+    add(suite, QType::MXFP8, 1024, 1024, false, ops::LinearPolicy::AllowA8, mx_tokens);
     add(suite, QType::MXFP8, 1024, 1024, false, ops::LinearPolicy::A16Only, std::array{17, 257});
     add(suite, QType::NVFP4_MUL, 1024, 4096, false, ops::LinearPolicy::A16Only,
         std::array{1, 2, 8, 16, 17, 32, 65, 96, 97, 192, 193, 384, 385, 768, 769,

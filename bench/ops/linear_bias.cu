@@ -6,6 +6,8 @@
 #include "quantized_weight.cuh"
 #include "common/roofline.h"
 #include "ops/linear/bias/nvfp4_mul/dispatch.h"
+#include "ops/linear/bias/mxfp8/dispatch.h"
+#include "ops/linear/split/dispatch.h"
 
 using namespace ninfer;
 using namespace ninfer::bench;
@@ -126,18 +128,26 @@ void run(const Options& options, Fixture& fixture) {
                     cache);
                 row.workspace_peak = arena.peak_used();
                 const bool a8      = weight.qtype == QType::MXFP8 && row.workspace_peak != 0;
-                const auto workspace_bytes = a8 ? 2ULL * t * (k + k / 32) : 0ULL;
+                // The registered native K1024 workspaces have no internal alignment gap.
+                // Peak usage includes initialized code rows beyond the logical token extent.
+                const auto workspace_bytes = a8 ? 2ULL * row.workspace_peak : 0ULL;
                 const auto bytes           = operand_bytes + workspace_bytes;
-                const bool tensor          = weight.qtype == QType::MXFP8 ? true
-                                             : weight.qtype == QType::NVFP4_MUL
-                                                 ? options.form != "projection" ||
-                                                       ops::detail::select_nvfp4_mul_bias_route(
-                                                           n, k, t, policy).tensor_core
-                                             : t > 1;
-                const double peak          = !tensor ? std::numeric_limits<double>::quiet_NaN()
-                                             : a8    ? kRoofline.mxfp8_f32_tflops
-                                                     : kRoofline.bf16_f32_tflops;
-                const double compute       = flops / (peak * 1e6);
+                bool tensor                = weight.qtype == QType::MXFP8 ? true
+                                             : weight.qtype == QType::NVFP4_MUL ? options.form != "projection" ||
+                                                   ops::detail::select_nvfp4_mul_bias_route(
+                                                       n, k, t, policy).tensor_core
+                                                                                : t > 1;
+                if (weight.qtype == QType::MXFP8 && options.form == "projection") {
+                    tensor = ops::detail::select_mxfp8_bias_route(n, k, t, policy).tensor_core;
+                } else if (weight.qtype == QType::MXFP8 && options.form == "split") {
+                    const auto& shape = ops::detail::linear_split::select_split_bias_shape(
+                        weight.qtype, n, k, policy, segment_rows);
+                    if (shape.uses_tensor_cores) tensor = shape.uses_tensor_cores(policy, t);
+                }
+                const double peak     = !tensor ? std::numeric_limits<double>::quiet_NaN()
+                                        : a8    ? kRoofline.mxfp8_f32_tflops
+                                                : kRoofline.bf16_f32_tflops;
+                const double compute  = flops / (peak * 1e6);
                 const char* profile   = !tensor ? "SIMT_FP32" : a8 ? "MXFP8_F32ACC" : "BF16_F32ACC";
                 const double memory   = cache == "cold"
                                             ? bytes / (kRoofline.sustained_read_gbs * 1000)

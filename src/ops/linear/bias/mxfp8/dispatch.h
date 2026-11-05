@@ -14,6 +14,12 @@ struct Mxfp8BiasRoute {
     void (*launch)(const Tensor&, const Weight&, const Tensor&, Tensor&, Mxfp8A8Workspace,
                    cudaStream_t);
     bool quantize;
+    int code_token_alignment = 1;
+    bool tensor_core         = true;
+
+    int code_tokens(int tokens) const {
+        return mxfp8_a8_padded_tokens(tokens, code_token_alignment);
+    }
 };
 
 struct Mxfp8BiasShape {

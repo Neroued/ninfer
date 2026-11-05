@@ -38,7 +38,8 @@ std::size_t mxfp8_bias_workspace_capacity_bytes(int rows, int k, LinearPolicy po
     for (const auto& route : select_routes(rows, k, policy)) {
         const int end = std::min(route.last_tokens, last);
         if (route.quantize && begin <= last && end >= first)
-            peak = std::max(peak, mxfp8_a8_workspace_capacity_bytes(end, k));
+            peak =
+                std::max(peak, mxfp8_a8_workspace_capacity_bytes(end, k, route.code_tokens(end)));
         if (route.last_tokens >= last) return peak;
         begin = route.last_tokens + 1;
     }
@@ -52,12 +53,13 @@ void mxfp8_bias_dispatch(const Tensor& x, const Weight& weight, const Tensor& bi
     if (!route.quantize) return route.launch(x, weight, bias, out, {}, stream);
     if (workspace == nullptr)
         throw std::invalid_argument("MXFP8 linear_bias A8 requires caller workspace");
-    auto scope = workspace->scope();
-    const auto backing =
-        workspace->alloc_bytes(mxfp8_a8_workspace_capacity_bytes(x.ne[1], weight.k), 256);
+    auto scope            = workspace->scope();
+    const int code_tokens = route.code_tokens(x.ne[1]);
+    const auto backing    = workspace->alloc_bytes(
+        mxfp8_a8_workspace_capacity_bytes(x.ne[1], weight.k, code_tokens), 256);
     validate_projection_scratch(x, weight, {&out, 1}, &bias, backing, "MXFP8 linear_bias");
     MemoryArena local(backing);
-    const auto scratch = allocate_mxfp8_a8_workspace(local, x.ne[1], weight.k);
+    const auto scratch = allocate_mxfp8_a8_workspace(local, x.ne[1], weight.k, code_tokens);
     route.launch(x, weight, bias, out, scratch, stream);
 }
 

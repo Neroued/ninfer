@@ -24,7 +24,8 @@ struct SplitBiasShape {
     int rows, input_rows;
     std::span<const int> segments;
     SplitBiasLaunch launch;
-    SplitCapacity capacity = nullptr;
+    SplitCapacity capacity                                = nullptr;
+    bool (*uses_tensor_cores)(LinearPolicy, std::int32_t) = nullptr;
 };
 
 template <int... Rows>

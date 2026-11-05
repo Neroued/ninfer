@@ -4,6 +4,7 @@
 #include "ops/linear/kernels/mxfp8/a8.cuh"
 #include "ops/linear/kernels/mxfp8/a8_tma.cuh"
 #include "ops/linear/kernels/bf16/bf16_mma_epilogue.cuh"
+#include "ops/linear/kernels/bf16/bf16_bias_vector_epilogue.cuh"
 
 #include <algorithm>
 #include <array>
@@ -28,6 +29,7 @@ struct Route {
     Launch launch;
     bool quantize;
     int code_alignment = 1;
+    bool tensor_core   = true;
 
     int code_tokens(int t) const { return mxfp8_a8_padded_tokens(t, code_alignment); }
 };
@@ -82,34 +84,7 @@ struct StreamingOutput : Output {
     }
 };
 
-struct VectorBiasEpilogue : Bf16TmaVectorEpilogue {
-    Epilogue bias;
-
-    template <class S, bool Full, class O>
-    __device__ __forceinline__ void finish_tile(const O& out, unsigned char* scratch,
-                                                float (&acc)[S::kMmaRows][S::kMmaTokens][4],
-                                                int row, int token, int rows, int tokens) const {
-        static_assert(3072 % S::kBlockRows == 0);
-        const int warp = threadIdx.x / 32, lane = threadIdx.x & 31, wm = warp / S::kWarpsTokens;
-        for (int mi = 0; mi < S::kMmaRows; ++mi) {
-            int r    = row + wm * S::kWarpRows + mi * 16 + (lane >> 2);
-            float lo = __bfloat162float(bias.bias[r]), hi = __bfloat162float(bias.bias[r + 8]);
-            for (int ni = 0; ni < S::kMmaTokens; ++ni) {
-                acc[mi][ni][0] += lo;
-                acc[mi][ni][1] += lo;
-                acc[mi][ni][2] += hi;
-                acc[mi][ni][3] += hi;
-            }
-        }
-        auto dst = linear_output_tile<S::kBlockRows>(out, row);
-        if (Full || tokens - token >= S::kBlockTokens)
-            Bf16TmaVectorEpilogue::template finish_tile<S, true, false>(dst, scratch, acc, row,
-                                                                        token, rows, tokens);
-        else
-            Bf16TmaVectorEpilogue::template finish_tile<S, false, false>(dst, scratch, acc, row,
-                                                                         token, rows, tokens);
-    }
-};
+using VectorBiasEpilogue = Bf16BiasVectorEpilogue<3072>;
 
 template <class S, bool Padded = false, bool Vector = false>
 void tma(const Tensor& x, const Weight& w, Output out, Epilogue epi, Mxfp8A8Workspace scratch,
@@ -119,7 +94,7 @@ void tma(const Tensor& x, const Weight& w, Output out, Epilogue epi, Mxfp8A8Work
                                                     x.ne[1], scratch, stream, codes);
     if constexpr (Vector)
         launch_mxfp8_a8_tma<S, Padded>(mxfp8_a8_operands(w, scratch, x.ne[1]), StreamingOutput{out},
-                                       VectorBiasEpilogue{{}, epi}, stream);
+                                       VectorBiasEpilogue{{}, epi.bias}, stream);
     else
         launch_mxfp8_a8_tma<S, Padded>(mxfp8_a8_operands(w, scratch, x.ne[1]), out,
                                        StreamingBiasEpilogue{{}, epi}, stream);
@@ -159,7 +134,7 @@ constexpr std::array<Route, 2> kA16{{
     {kAllTokens, mma<A16Bulk>, false},
 }};
 constexpr std::array<Route, 15> kA8{{
-    {1, simt<Static<NativeFp8A16SimtSchedule<1, 8, 1, 16, 4, 2>>>, false},
+    {1, simt<Static<NativeFp8A16SimtSchedule<1, 8, 1, 16, 4, 2>>>, false, 1, false},
     {4, sliced<Static<NativeFp8A16SlicedKSchedule<8, 4, 8, 128, 1>>>, false},
     {8, sliced<Small>, false},
     {32, warp_mma<Near>, false},
@@ -184,6 +159,10 @@ const Route& select_route(LinearPolicy policy, int tokens) {
     for (const auto& route : routes(policy))
         if (tokens <= route.last_tokens) return route;
     throw std::invalid_argument("MXFP8 linear_split bias: unsupported token count");
+}
+
+bool uses_tensor_cores(LinearPolicy policy, int tokens) {
+    return select_route(policy, tokens).tensor_core;
 }
 
 std::size_t capacity(LinearPolicy policy, std::int32_t first, std::int32_t last) {
@@ -215,6 +194,6 @@ void launch(const Tensor& x, const Weight& weight, const Tensor& bias,
 }
 } // namespace
 
-const SplitBiasShape kMxfp8SplitBiasN3072K1024{3072, 1024, kSplitRows<1024, 1024, 1024>, launch,
-                                               capacity};
+const SplitBiasShape kMxfp8SplitBiasN3072K1024{3072,   1024,     kSplitRows<1024, 1024, 1024>,
+                                               launch, capacity, uses_tensor_cores};
 } // namespace ninfer::ops::detail::linear_split

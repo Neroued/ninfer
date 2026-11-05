@@ -6,13 +6,19 @@
 namespace ninfer::ops::detail::swiglu_ffn {
 template <int Rows>
 struct SwiGluRoutedOutput {
+    static constexpr int kRows = Rows;
     __nv_bfloat16* destination;
     RoutedSwiGLUContribution routed;
 
+    __device__ __forceinline__ float combine(int row, int token, float value) const {
+        if (!routed.valid_tokens || routed.valid_tokens[token])
+            value += routed.values[std::int64_t(token) * Rows + row];
+        return value;
+    }
+
     __device__ __forceinline__ void store(int row, int token, float value) const {
-        const auto index = std::int64_t(token) * Rows + row;
-        if (!routed.valid_tokens || routed.valid_tokens[token]) value += routed.values[index];
-        destination[index] = __float2bfloat16_rn(value);
+        destination[std::int64_t(token) * Rows + row] =
+            __float2bfloat16_rn(combine(row, token, value));
     }
 };
 

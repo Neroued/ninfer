@@ -21,6 +21,10 @@ void launch_nvfp4_down(const float* product, const Weight& down, Tensor& output,
                        MemoryArena& workspace, cudaStream_t stream);
 void launch_ffn_join(const Tensor&, const SwiGLUWeights&, Tensor&, RoutedSwiGLUContribution routed,
                      float limit, MemoryArena&, cudaStream_t);
+void launch_mxfp8_dense_ffn(const Tensor&, const SwiGLUWeights&, Tensor&, float limit, MemoryArena&,
+                            cudaStream_t);
+void launch_mxfp8_dense_ffn_join(const Tensor&, const SwiGLUWeights&, Tensor&,
+                                 RoutedSwiGLUContribution, float limit, MemoryArena&, cudaStream_t);
 void launch_scaled_fp8_ffn(const Tensor&, const SwiGLUWeights&, Tensor&, float limit, MemoryArena&,
                            cudaStream_t);
 void launch_scaled_fp8_ffn_join(const Tensor&, const SwiGLUWeights&, Tensor&,

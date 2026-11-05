@@ -158,11 +158,12 @@ void down_a8(const Mxfp8A8Operands& p, Output out, cudaStream_t stream) {
 template <int Intermediate, bool Mxfp8, class Output>
 void run(const Tensor& x, const SwiGLUWeights& weights, Output out, float limit,
          MemoryArena& workspace, cudaStream_t stream) {
-    auto scope         = workspace.scope();
-    const auto profile = swiglu_profile(weights);
-    const int tokens   = x.ne[1];
-    const auto plan    = select_scaled_fp8(profile, tokens);
-    const auto storage = allocate_scaled_fp8(workspace, profile, tokens);
+    auto scope            = workspace.scope();
+    const auto profile    = swiglu_profile(weights);
+    const int tokens      = x.ne[1];
+    constexpr bool joined = requires { out.combine(0, 0, 0.F); };
+    const auto plan       = select_scaled_fp8(profile, tokens, joined);
+    const auto storage    = allocate_scaled_fp8(workspace, profile, tokens, joined);
     if constexpr (Mxfp8) {
         if (plan.product == ScaledFp8Product::Mxfp8) {
             launch_mxfp8_a8_quantize(static_cast<const __nv_bfloat16*>(x.data), 4096, tokens,
@@ -214,6 +215,8 @@ void dispatch(const Tensor& x, const SwiGLUWeights& weights, Output out, float l
 
 void launch_scaled_fp8_ffn(const Tensor& x, const SwiGLUWeights& weights, Tensor& out, float limit,
                            MemoryArena& workspace, cudaStream_t stream) {
+    if (select_scaled_fp8(swiglu_profile(weights), x.ne[1]).kernel != ScaledFp8Kernel::Default)
+        return launch_mxfp8_dense_ffn(x, weights, out, limit, workspace, stream);
     dispatch(x, weights, LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), 4096}, limit,
              workspace, stream);
 }
@@ -221,6 +224,9 @@ void launch_scaled_fp8_ffn(const Tensor& x, const SwiGLUWeights& weights, Tensor
 void launch_scaled_fp8_ffn_join(const Tensor& x, const SwiGLUWeights& weights, Tensor& out,
                                 RoutedSwiGLUContribution routed, float limit,
                                 MemoryArena& workspace, cudaStream_t stream) {
+    if (select_scaled_fp8(swiglu_profile(weights), x.ne[1], true).kernel !=
+        ScaledFp8Kernel::Default)
+        return launch_mxfp8_dense_ffn_join(x, weights, out, routed, limit, workspace, stream);
     dispatch(x, weights, SwiGluRoutedOutput<4096>{static_cast<__nv_bfloat16*>(out.data), routed},
              limit, workspace, stream);
 }

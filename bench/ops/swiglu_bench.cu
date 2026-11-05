@@ -3,6 +3,7 @@
 #include "quantized_weight.cuh"
 #include "direct_bf16_weight.cuh"
 #include "common/roofline.h"
+#include "ops/moe/swiglu/fp8_plan.h"
 
 using namespace ninfer;
 using namespace ninfer::bench;
@@ -25,7 +26,8 @@ Options parse(int argc, char** argv) {
                          "  --tokens T[,T...] --sweep START:END[:STEP] --intermediate I\n"
                          "  H=4096. NVFP4: I=6144, AllowA4; BF16/Q8: I=1024, A16Only.\n"
                          "  MXFP8: I=1024 or 6144, AllowA8; block FP8: I=1024, A16Only.\n"
-                         "  Clamp limit=10. Operand traffic excludes private staging.\n";
+                         "  Clamp limit=10. operand_* excludes staging; effective_* includes "
+                         "staging traffic.\n";
             measurement::help();
             std::exit(0);
         }
@@ -69,7 +71,8 @@ void run(const Options& options, Fixture& gu, Fixture& down) {
         "operand_bytes,operand_gb_s,useful_tflops,bandwidth_reference_us,compute_reference_us,"
         "tensor_profile,tensor_peak_tflops,selected_compute_reference_us,scratch_logical_bytes,"
         "interval_capacity_bytes,bf16_compute_reference_us,mxfp8_compute_reference_us,"
-        "best_allowed_roofline_us,gap_to_best_allowed_us");
+        "best_allowed_roofline_us,gap_to_best_allowed_us,workspace_traffic_bytes,effective_bytes,"
+        "effective_gb_s,effective_bandwidth_reference_us");
     for (int t : options.tokens) {
         Tensor x(input.span(), DType::BF16, {weight.k, t}),
             y(output.span(), DType::BF16, {weight.k, t});
@@ -99,7 +102,19 @@ void run(const Options& options, Fixture& gu, Fixture& down) {
             std::max(bytes / (kRoofline.sustained_read_gbs * 1000), best_compute);
         const char* tensor_profile = "SIMT_FP32";
         if (native_fp8) {
-            tensor_profile = "unclassified";
+            namespace fp8   = ops::detail::swiglu_ffn;
+            const auto plan = fp8::select_scaled_fp8(profile, t);
+            if (plan.compute() == fp8::ScaledFp8Compute::Mxfp8) {
+                tensor_profile   = "MXFP8_F32ACC";
+                peak             = kRoofline.mxfp8_f32_tflops;
+                compute          = flops / (peak * 1e6);
+                selected_compute = compute * plan.storage_tokens(t) / t;
+            } else if (plan.compute() == fp8::ScaledFp8Compute::Bf16CompensatedDown) {
+                tensor_profile   = "BF16_F32ACC_COMPENSATED_DOWN";
+                peak             = kRoofline.bf16_f32_tflops;
+                compute          = flops / (peak * 1e6);
+                selected_compute = (gu_flops + 2 * down_flops) / (peak * 1e6);
+            }
         } else if ((options.format == "q8" && t >= 2) || (options.format == "bf16" && t >= 17)) {
             tensor_profile = options.format == "q8" && t >= 49 ? "BF16_F32ACC_COMPENSATED_GU_DOWN"
                                                                : "BF16_F32ACC_COMPENSATED_DOWN";
@@ -120,7 +135,11 @@ void run(const Options& options, Fixture& gu, Fixture& down) {
             compute = selected_compute = flops / (peak * 1e6);
         }
         const double scratch_bytes =
-            options.format != "nvfp4" && !native_fp8 ? 2.0 * row.workspace_bytes : absent;
+            native_fp8
+                ? double(ops::detail::swiglu_ffn::scaled_fp8_workspace_traffic_bytes(profile, t))
+            : options.format != "nvfp4" ? 2.0 * row.workspace_bytes
+                                        : absent;
+        const double effective_bytes = bytes + scratch_bytes;
         for (const auto& execution :
              measurement::selections(options.timing.execution, "graph", "eager"))
             for (const auto& cache :
@@ -129,28 +148,36 @@ void run(const Options& options, Fixture& gu, Fixture& down) {
                 const auto result = measurement::measure(
                     [&](auto cuda) { ops::swiglu(x, profile, weights, y, arena, cuda); },
                     [](auto) {}, flush, device_context().execution_view(), options.timing,
-                    execution, cache);
+                    execution, cache, options.timing.profile);
                 row.workspace_peak = arena.peak_used();
                 if (arena.used() != 0 || row.workspace_peak > row.workspace_bytes)
                     throw std::runtime_error("SwiGLU workspace contract violated");
-                csv.write(row, result, execution, cache,
-                          std::to_string(bytes) + ',' +
-                              format_metric(bytes / (result.gpu.median_us * 1000), 3, "") + ',' +
-                              format_metric(flops / (result.gpu.median_us * 1e6), 3, "") + ',' +
-                              format_metric(cache == "cold"
-                                                ? bytes / (kRoofline.sustained_read_gbs * 1000)
-                                                : absent,
-                                            3, "") +
-                              ',' + format_metric(compute, 3, "") + ',' + tensor_profile + ',' +
-                              format_metric(peak, 3, "") + ',' +
-                              format_metric(selected_compute, 3, "") + ',' +
-                              format_metric(scratch_bytes, 0, "") + ',' + std::to_string(capacity) +
-                              ',' + format_metric(bf16_reference, 3, "") + ',' +
-                              format_metric(mxfp8_reference, 3, "") + ',' +
-                              format_metric(cache == "cold" ? best_roofline : absent, 3, "") + ',' +
-                              format_metric(cache == "cold" ? result.gpu.median_us - best_roofline
-                                                            : absent,
-                                            3, ""));
+                csv.write(
+                    row, result, execution, cache,
+                    std::to_string(bytes) + ',' +
+                        format_metric(bytes / (result.gpu.median_us * 1000), 3, "") + ',' +
+                        format_metric(flops / (result.gpu.median_us * 1e6), 3, "") + ',' +
+                        format_metric(cache == "cold"
+                                          ? bytes / (kRoofline.sustained_read_gbs * 1000)
+                                          : absent,
+                                      3, "") +
+                        ',' + format_metric(compute, 3, "") + ',' + tensor_profile + ',' +
+                        format_metric(peak, 3, "") + ',' + format_metric(selected_compute, 3, "") +
+                        ',' + format_metric(scratch_bytes, 0, "") + ',' + std::to_string(capacity) +
+                        ',' + format_metric(bf16_reference, 3, "") + ',' +
+                        format_metric(mxfp8_reference, 3, "") + ',' +
+                        format_metric(cache == "cold" ? best_roofline : absent, 3, "") + ',' +
+                        format_metric(cache == "cold" ? result.gpu.median_us - best_roofline
+                                                      : absent,
+                                      3, "") +
+                        ',' + format_metric(scratch_bytes, 0, "") + ',' +
+                        format_metric(effective_bytes, 0, "") + ',' +
+                        format_metric(effective_bytes / (result.gpu.median_us * 1000), 3, "") +
+                        ',' +
+                        format_metric(cache == "cold"
+                                          ? effective_bytes / (kRoofline.sustained_read_gbs * 1000)
+                                          : absent,
+                                      3, ""));
             }
     }
 }

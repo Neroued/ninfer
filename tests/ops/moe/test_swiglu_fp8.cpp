@@ -4,8 +4,11 @@
 #include "ops/input_projection_test_common.h"
 #include "ops/linear_common.h"
 #include "swiglu_oracle.h"
+#include "ops/moe/swiglu/dispatch.h"
 
 #include <array>
+#include <limits>
+#include <optional>
 
 namespace ninfer::test::swiglu {
 namespace {
@@ -23,6 +26,7 @@ struct Profile {
 struct Call {
     int tokens;
     bool graph;
+    int join = 0; // 1: changing mask; 2: zero validity and null values; 3: null mask.
 };
 
 std::vector<std::uint16_t> activation(int tokens) {
@@ -57,7 +61,11 @@ int run(const Profile& profile, std::span<const Call> calls) {
     int failures        = 0;
     for (const auto& call : calls) {
         const auto label = std::string("swiglu/") + profile.name + "/T" +
-                           std::to_string(call.tokens) + (call.graph ? "/graph" : "/eager");
+                           std::to_string(call.tokens) + (call.graph ? "/graph" : "/eager") +
+                           (call.join == 1   ? "/join-mixed"
+                            : call.join == 2 ? "/join-zero"
+                            : call.join == 3 ? "/join-all"
+                                             : "");
         const auto capacity = ops::swiglu_workspace_capacity_bytes(math, call.tokens, call.tokens);
         if (capacity > interval) ++failures;
         GuardedDeviceBuffer scratch(capacity + 256);
@@ -65,8 +73,46 @@ int run(const Profile& profile, std::span<const Call> calls) {
         (void)workspace.alloc_bytes(64, 1);
         input_projection::GuardedBf16Tensor output(Hidden, call.tokens);
         Tensor x(input.span(), DType::BF16, {Hidden, call.tokens});
-        auto y            = output.tensor();
-        const auto launch = [&] { ops::swiglu(x, math, weights, y, workspace, cuda); };
+        auto y = output.tensor();
+        std::optional<GuardedDeviceBuffer> routed, validity;
+        std::vector<float> routed_host;
+        std::vector<int> valid_host;
+        if (call.join) {
+            validity.emplace(std::size_t(call.tokens) * sizeof(int));
+            valid_host.resize(call.tokens);
+            if (call.join == 1 || call.join == 3) {
+                routed.emplace(std::size_t(Hidden) * call.tokens * sizeof(float));
+                routed_host.resize(std::size_t(Hidden) * call.tokens);
+            }
+        }
+        const auto prepare_join = [&](int phase) {
+            if (!call.join) return;
+            for (int t = 0; t < call.tokens; ++t) {
+                valid_host[t] = call.join == 2 ? 0 : call.join == 3 ? 1 : int((t + phase) % 3 != 1);
+                if (routed)
+                    for (int r = 0; r < Hidden; ++r)
+                        routed_host[std::size_t(t) * Hidden + r] =
+                            valid_host[t]
+                                ? (int((std::uint32_t(r) * 13U + std::uint32_t(t) * 7U) % 17U) -
+                                   8) *
+                                      (phase ? -.03125F : .03125F)
+                                : std::numeric_limits<float>::quiet_NaN();
+            }
+            validity->copy_from_host(valid_host.data(), valid_host.size() * sizeof(int));
+            if (routed)
+                routed->copy_from_host(routed_host.data(), routed_host.size() * sizeof(float));
+        };
+        const auto launch = [&] {
+            if (call.join)
+                ops::detail::swiglu_ffn::launch_scaled_fp8_ffn_join(
+                    x, weights, y,
+                    {routed ? static_cast<const float*>(routed->data()) : nullptr,
+                     call.join == 3 ? nullptr : static_cast<const int*>(validity->data())},
+                    *math.clamp_limit, workspace, cuda.stream());
+            else
+                ops::swiglu(x, math, weights, y, workspace, cuda);
+        };
+        prepare_join(0);
         input.copy_from_host(initial.data(), input.bytes());
         launch();
         cuda_synchronize(cuda.stream());
@@ -81,6 +127,7 @@ int run(const Profile& profile, std::span<const Call> calls) {
             if (phase)
                 for (auto& value : values) value ^= 0x8000;
             input.copy_from_host(values.data(), input.bytes());
+            prepare_join(phase);
             scratch.fill(0xa5);
             output.repaint(cuda.stream());
             cuda_synchronize();
@@ -104,13 +151,26 @@ int run(const Profile& profile, std::span<const Call> calls) {
             for (const auto t : tokens)
                 for (const auto row : rows) {
                     got.push_back(actual[std::size_t(t) * Hidden + row]);
-                    reference.push_back(oracle.output(row, t, phase));
+                    reference.push_back(oracle.output(row, t, phase) +
+                                        (call.join && valid_host[t]
+                                             ? routed_host[std::size_t(t) * Hidden + row]
+                                             : 0.0));
                 }
             failures += verify_reduction(label, got, reference,
                                          profile.policy == ops::LinearPolicy::AllowA8 ? kA8 : kA16);
             failures += linear_common::verify_preserved(input.data(),
                                                         std::as_bytes(std::span(values)), label);
             failures += output.verify_guards(label) + scratch.verify_guards(label);
+            if (validity) {
+                failures += validity->verify_guards(label);
+                failures += linear_common::verify_preserved(
+                    validity->data(), std::as_bytes(std::span(valid_host)), label);
+            }
+            if (routed) {
+                failures += routed->verify_guards(label);
+                failures += linear_common::verify_preserved(
+                    routed->data(), std::as_bytes(std::span(routed_host)), label);
+            }
             std::array<std::byte, 64> prefix;
             prefix.fill(std::byte{0xa5});
             failures += linear_common::verify_preserved(scratch.data(), prefix, label);
@@ -128,19 +188,39 @@ void add_fp8_cases(OpSuite& suite) {
           Profile{"mxfp8-shared", QType::MXFP8, 1024, ops::LinearPolicy::AllowA8},
           Profile{"fp8-block-fp32", QType::FP8_E4M3FN_BLOCK128X128_FP32, 1024,
                   ops::LinearPolicy::A16Only}}) {
+        const bool dense = profile.format == QType::MXFP8 && profile.intermediate == 6144;
         const std::vector<int> tokens =
-            profile.format == QType::FP8_E4M3FN_BLOCK128X128_FP32
+            dense ? std::vector<int>{1,    2,    3,    4,    5,    7,    8,   9,   15,  16,   17,
+                                     24,   31,   32,   33,   63,   64,   65,  95,  96,  97,   127,
+                                     128,  129,  191,  192,  193,  255,  256, 257, 383, 384,  385,
+                                     511,  512,  513,  639,  640,  641,  767, 768, 769, 1023, 1024,
+                                     1025, 2047, 2048, 2049, 4095, 4096, 4097}
+            : profile.format == QType::FP8_E4M3FN_BLOCK128X128_FP32
                 ? std::vector<int>{1, 2, 3, 5, 9, 17, 33, 64, 65, 127, 128, 129, 4096}
                 : std::vector<int>{1, 2, 3, 5, 65, 128, 129, 4096};
         std::vector<Call> calls;
         for (int t : tokens) calls.push_back({t, false});
-        calls.push_back({129, true});
+        if (dense)
+            for (int t : {1, 8, 9, 17, 33, 129, 193, 257, 385, 513, 641, 2049, 4097})
+                calls.push_back({t, true});
+        else
+            calls.push_back({129, true});
+        if (dense) {
+            for (int t : {1, 9, 17, 24, 25, 33, 65, 129, 193, 257, 385, 513, 4097})
+                calls.push_back({t, true, 1});
+            for (int t : {1, 33, 193, 4095}) calls.push_back({t, true, 2});
+            for (int t : {1, 17, 32, 33, 257, 4096}) calls.push_back({t, true, 3});
+        }
         if (profile.format == QType::FP8_E4M3FN_BLOCK128X128_FP32) calls.push_back({127, true});
         std::vector<OpCase> cases;
         for (const auto& call : calls)
             cases.push_back(
                 {std::string("swiglu/") + profile.name + "/T" + std::to_string(call.tokens) +
-                     (call.graph ? "/graph" : "/eager"),
+                     (call.graph ? "/graph" : "/eager") +
+                     (call.join == 1   ? "/join-mixed"
+                      : call.join == 2 ? "/join-zero"
+                      : call.join == 3 ? "/join-all"
+                                       : ""),
                  {{"suite", "swiglu"},
                   {"format", profile.name},
                   {"policy", profile.policy == ops::LinearPolicy::AllowA8 ? "a8" : "a16"},
@@ -151,6 +231,36 @@ void add_fp8_cases(OpSuite& suite) {
             for (const auto i : selected) chosen.push_back(calls[i]);
             return run(profile, chosen);
         });
+        if (dense) {
+            suite.add({"swiglu/mxfp8-dense/capacity-intervals",
+                       {{"suite", "swiglu"},
+                        {"format", profile.name},
+                        {"execution", "eager"},
+                        {"policy", "a8"},
+                        {"t", "0"}}},
+                      [] {
+                          ops::SwiGLUProfile p{Hidden,
+                                               6144,
+                                               QType::MXFP8,
+                                               QType::MXFP8,
+                                               QuantLayout::RowGroupScale,
+                                               QuantLayout::RowGroupScale,
+                                               ops::LinearPolicy::AllowA8,
+                                               ops::LinearPolicy::AllowA8,
+                                               10.F};
+                          int failures = 0;
+                          for (auto [first, last] :
+                               {std::pair{1, 33}, std::pair{17, 65}, std::pair{97, 193},
+                                std::pair{129, 257}, std::pair{193, 385}, std::pair{1, 4097}}) {
+                              const auto capacity =
+                                  ops::swiglu_workspace_capacity_bytes(p, first, last);
+                              for (int t = first; t <= last; ++t)
+                                  if (ops::swiglu_workspace_capacity_bytes(p, t, t) > capacity)
+                                      ++failures;
+                          }
+                          return failures;
+                      });
+        }
     }
 #endif
 }

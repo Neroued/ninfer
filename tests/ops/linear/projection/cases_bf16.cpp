@@ -309,6 +309,7 @@ void run_new_bf16_geometry(Suite& suite, const Geometry& shape) {
                true, calls});
     if (shape.n > 640) {
         std::set<int> full_points{step, 4, 8};
+        if (shape.n == 4096 && shape.k == 128) full_points.insert({16, 24, 32, 129, 511});
         std::vector<Invocation> full;
         for (int t : full_points) full.push_back({t});
         add_shape(suite, ninfer::QType::BF16, ActivationRecipe::TokenBlocks, make_bf16_weight,

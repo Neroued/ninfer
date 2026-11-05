@@ -16,13 +16,23 @@ void add_two_output_cases(Suite& suite) {
             {{0, 16384}, {16384, 4096}},
             a16};
         std::vector<Invocation> calls;
-        for (int t : {1, 4, 5, 33, 129, 257})
-            calls.push_back({.t = t, .input_seed = 1207U, .columns = Columns::Seven});
-        calls.push_back({.t            = 17,
-                         .graph        = true,
-                         .input_seed   = 1207U,
-                         .changed_seed = 1213U,
-                         .columns      = Columns::Seven});
+        for (int t :
+             {1,   2,   3,   4,   7,   8,    9,    15,   16,   17,   32,   33,   47,  48,  49,
+              63,  64,  65,  95,  96,  97,   127,  128,  129,  191,  192,  193,  256, 257, 384,
+              385, 512, 513, 768, 769, 1024, 1025, 1536, 1537, 2048, 2049, 4096, 4097})
+            calls.push_back({.t          = t,
+                             .input_seed = 1207U,
+                             .columns    = Columns::HeadBoundaries,
+                             .full_rows  = t <= 17 || t == 33 || t == 49});
+        for (int t : {8, 9, 17, 49, 65, 129, 193, 385, 1537, 4097})
+            calls.push_back({.t             = t,
+                             .graph         = true,
+                             .input_seed    = 1207U,
+                             .changed_seed  = 1213U,
+                             .columns       = Columns::HeadBoundaries,
+                             .shared_output = true});
+        calls.push_back({.t = 0, .validate_operands = true});
+        calls.push_back({.t = 0, .workspace_intervals = true});
         add_profile(suite, profile, std::move(calls));
     }
     {

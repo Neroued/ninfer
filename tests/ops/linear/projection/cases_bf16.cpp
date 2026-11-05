@@ -363,6 +363,14 @@ void run_bf16_extensions(Suite& suite) {
             for (int t : {3, 5, 25, 65, 97, 193, 257, 385, 513, 641, 1025, 1537, 3073})
                 calls.push_back({t, CallForm::Policy, ops::LinearPolicy::A16Only, true});
         }
+        if (n == 4096 && k == 1536) {
+            for (int t : {2, 4, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 896,
+                          1024, 1152, 1280, 1536, 2048})
+                calls.push_back({t, CallForm::Policy, ops::LinearPolicy::A16Only});
+            for (int t : {3, 9, 17, 65, 129, 193, 257, 385, 513, 769, 897, 1025, 1153,
+                          1281, 1537, 4097})
+                calls.push_back({t, CallForm::Policy, ops::LinearPolicy::A16Only, true});
+        }
         add_shape(suite, QType::BF16, ActivationRecipe::TokenBlocks, make_bf16_weight,
                   {n, k, 1973U, Comparison::Sampled, true, calls});
     }

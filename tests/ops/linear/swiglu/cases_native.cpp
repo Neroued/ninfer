@@ -59,7 +59,15 @@ void add_native_cases(Suite& suite) {
     add_profile(suite,
                 {QType::FP8_E4M3FN_BLOCK128X128_FP32, 2048, 4096, 1024, 3313U,
                  ops::LinearPolicy::A16Only, 10.F},
-                tokens, graph);
+                shared_tokens, shared_graph);
+    add_profile(suite,
+                {QType::FP8_E4M3FN_BLOCK128X128_FP32, 2048, 4096, 1024, 3313U,
+                 ops::LinearPolicy::A16Only, 10.F},
+                std::array{575, 576, 577, 959, 960, 961}, std::array{577, 961});
+    add_profile(
+        suite,
+        {QType::FP8_E4M3FN_BLOCK128X128_FP32, 2048, 4096, 1024, 3313U, ops::LinearPolicy::A16Only},
+        std::array{1, 33, 65, 129, 193, 257, 385, 641, 4097}, std::array{65, 513});
     add_profile(suite,
                 {QType::NVFP4_MUL, 8192, 1024, 4096, 3319U, ops::LinearPolicy::A16Only, 10.F},
                 std::array{1, 2, 7, 8, 9, 16, 17, 64, 65, 128, 129, 513, 4096}, std::array{33, 129});

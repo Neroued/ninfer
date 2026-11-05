@@ -114,6 +114,11 @@ void run(const Options& options, Fixture& gu, Fixture& down) {
                 peak             = kRoofline.bf16_f32_tflops;
                 compute          = flops / (peak * 1e6);
                 selected_compute = (gu_flops + 2 * down_flops) / (peak * 1e6);
+            } else if (plan.compute() == fp8::ScaledFp8Compute::Bf16F16) {
+                tensor_profile   = "BF16_F16_F32ACC";
+                peak             = kRoofline.bf16_f32_tflops;
+                compute          = flops / (peak * 1e6);
+                selected_compute = compute * plan.storage_tokens(t) / t;
             }
         } else if ((options.format == "q8" && t >= 2) || (options.format == "bf16" && t >= 17)) {
             tensor_profile = options.format == "q8" && t >= 49 ? "BF16_F32ACC_COMPENSATED_GU_DOWN"

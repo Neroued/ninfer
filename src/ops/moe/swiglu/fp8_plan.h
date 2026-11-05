@@ -15,9 +15,9 @@ inline bool scaled_fp8_format(QType format) {
     return format == QType::MXFP8 || format == QType::FP8_E4M3FN_BLOCK128X128_FP32;
 }
 
-enum class ScaledFp8Product { Float, Compensated, Mxfp8 };
+enum class ScaledFp8Product { Float, Compensated, Mxfp8, ScaledF16 };
 
-enum class ScaledFp8Compute { Simt, Bf16CompensatedDown, Mxfp8 };
+enum class ScaledFp8Compute { Simt, Bf16CompensatedDown, Mxfp8, Bf16F16 };
 
 enum class ScaledFp8Kernel {
     Default,
@@ -27,7 +27,13 @@ enum class ScaledFp8Kernel {
     DenseSmall,
     DenseMma,
     DenseTransition,
-    DenseBulk
+    DenseBulk,
+    BlockFloat,
+    BlockCompensated,
+    BlockScaledF16Small,
+    BlockScaledF16Medium,
+    BlockScaledF16Wide,
+    BlockScaledF16Bulk
 };
 
 struct ScaledFp8Plan {
@@ -35,9 +41,11 @@ struct ScaledFp8Plan {
     ScaledFp8Product product;
     ScaledFp8Kernel kernel = ScaledFp8Kernel::Default;
     int token_alignment    = 1;
+    int product_group      = 32;
 
     ScaledFp8Compute compute() const {
         if (product == ScaledFp8Product::Mxfp8) return ScaledFp8Compute::Mxfp8;
+        if (product == ScaledFp8Product::ScaledF16) return ScaledFp8Compute::Bf16F16;
         if (product == ScaledFp8Product::Compensated || kernel != ScaledFp8Kernel::Default)
             return ScaledFp8Compute::Bf16CompensatedDown;
         return ScaledFp8Compute::Simt;
@@ -73,6 +81,30 @@ inline std::span<const ScaledFp8Plan> scaled_fp8_plans(const SwiGLUProfile& prof
         plans[3].token_alignment = 32;
         return plans;
     }();
+    static constexpr std::array block{
+        ScaledFp8Plan{2, ScaledFp8Product::Float},
+        ScaledFp8Plan{8, ScaledFp8Product::Float, ScaledFp8Kernel::BlockFloat},
+        ScaledFp8Plan{32, ScaledFp8Product::Compensated},
+        ScaledFp8Plan{48, ScaledFp8Product::Compensated, ScaledFp8Kernel::BlockCompensated},
+        ScaledFp8Plan{128, ScaledFp8Product::ScaledF16, ScaledFp8Kernel::BlockScaledF16Small, 32,
+                      32},
+        ScaledFp8Plan{192, ScaledFp8Product::ScaledF16, ScaledFp8Kernel::BlockScaledF16Medium, 64,
+                      32},
+        ScaledFp8Plan{384, ScaledFp8Product::ScaledF16, ScaledFp8Kernel::BlockScaledF16Wide, 128,
+                      128},
+        ScaledFp8Plan{2048, ScaledFp8Product::ScaledF16, ScaledFp8Kernel::BlockScaledF16Bulk, 128,
+                      64},
+        ScaledFp8Plan{all / 128 * 128, ScaledFp8Product::ScaledF16,
+                      ScaledFp8Kernel::BlockScaledF16Wide, 128, 128},
+        ScaledFp8Plan{all, ScaledFp8Product::Compensated}};
+    static constexpr auto block_join = [] {
+        auto plans          = block;
+        plans[0].last_token = 3;
+        return plans;
+    }();
+    if (profile.gate_up_type == QType::FP8_E4M3FN_BLOCK128X128_FP32)
+        return routed_join ? std::span<const ScaledFp8Plan>(block_join)
+                           : std::span<const ScaledFp8Plan>(block);
     if (a8 && profile.hidden == 4096 && profile.intermediate == 6144)
         return routed_join ? std::span<const ScaledFp8Plan>(dense_join)
                            : std::span<const ScaledFp8Plan>(dense);
@@ -94,11 +126,15 @@ inline std::size_t scaled_fp8_workspace_traffic_bytes(const SwiGLUProfile& profi
         return std::size_t(2) * plan.storage_tokens(tokens) *
                (profile.hidden + profile.hidden / 32 + profile.intermediate +
                 profile.intermediate / 32);
+    if (plan.product == ScaledFp8Product::ScaledF16)
+        return std::size_t(2) * plan.storage_tokens(tokens) *
+               (profile.intermediate * 2 + profile.intermediate / plan.product_group * 4);
     return std::size_t(2) * profile.intermediate * tokens * sizeof(float);
 }
 
 struct ScaledFp8Storage {
-    void* product = nullptr;
+    void* product         = nullptr;
+    float* product_scales = nullptr;
     Mxfp8A8Workspace input_a8{}, product_a8{};
 };
 
@@ -111,6 +147,12 @@ ScaledFp8Storage allocate_scaled_fp8(Arena& arena, const SwiGLUProfile& profile,
         const int physical = plan.storage_tokens(tokens);
         out.input_a8       = allocate_mxfp8_a8_workspace(arena, physical, profile.hidden);
         out.product_a8     = allocate_mxfp8_a8_workspace(arena, physical, profile.intermediate);
+    } else if (plan.product == ScaledFp8Product::ScaledF16) {
+        const int physical = plan.storage_tokens(tokens);
+        out.product = arena.alloc_bytes(std::size_t(profile.intermediate) * physical * 2).data;
+        out.product_scales = static_cast<float*>(
+            arena.alloc_bytes(std::size_t(profile.intermediate / plan.product_group) * physical * 4)
+                .data);
     } else {
         out.product =
             arena.alloc_bytes(std::size_t(profile.intermediate) * tokens * sizeof(float)).data;

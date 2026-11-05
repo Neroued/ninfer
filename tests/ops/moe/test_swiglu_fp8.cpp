@@ -21,6 +21,8 @@ struct Profile {
     QType format;
     int intermediate;
     ops::LinearPolicy policy;
+    float activation_scale = 1.F;
+    float down_extent      = .05F;
 };
 
 struct Call {
@@ -48,9 +50,14 @@ int run(const Profile& profile, std::span<const Call> calls) {
                          })->tokens;
     input_projection::DevicePackedWeight gate_up(qw::make_patterned_weight(
         profile.format, 2 * profile.intermediate, Hidden, 9131, {.native_extent = .05f}));
-    input_projection::DevicePackedWeight down(qw::make_patterned_weight(
-        profile.format, Hidden, profile.intermediate, 9133, {.native_extent = .05f}));
+    input_projection::DevicePackedWeight down(
+        qw::make_patterned_weight(profile.format, Hidden, profile.intermediate, 9133,
+                                  {.native_extent = profile.down_extent}));
     auto initial = activation(maximum);
+    if (profile.activation_scale != 1.F)
+        for (auto& value : initial)
+            value = f32_to_bf16(std::bit_cast<float>(std::uint32_t(value) << 16) *
+                                profile.activation_scale);
     Oracle oracle(gate_up.host, down.host, initial);
     GuardedDeviceBuffer input(initial.size() * sizeof(std::uint16_t));
     ops::SwiGLUWeights weights{{gate_up.view(), profile.policy}, {down.view(), profile.policy}};
@@ -189,27 +196,32 @@ void add_fp8_cases(OpSuite& suite) {
           Profile{"fp8-block-fp32", QType::FP8_E4M3FN_BLOCK128X128_FP32, 1024,
                   ops::LinearPolicy::A16Only}}) {
         const bool dense = profile.format == QType::MXFP8 && profile.intermediate == 6144;
+        const bool block = profile.format == QType::FP8_E4M3FN_BLOCK128X128_FP32;
         const std::vector<int> tokens =
             dense ? std::vector<int>{1,    2,    3,    4,    5,    7,    8,   9,   15,  16,   17,
                                      24,   31,   32,   33,   63,   64,   65,  95,  96,  97,   127,
                                      128,  129,  191,  192,  193,  255,  256, 257, 383, 384,  385,
                                      511,  512,  513,  639,  640,  641,  767, 768, 769, 1023, 1024,
                                      1025, 2047, 2048, 2049, 4095, 4096, 4097}
-            : profile.format == QType::FP8_E4M3FN_BLOCK128X128_FP32
-                ? std::vector<int>{1, 2, 3, 5, 9, 17, 33, 64, 65, 127, 128, 129, 4096}
+            : block
+                ? std::vector<int>{1,    2,    3,    4,    5,    8,    9,    15,   16,  17,  24,
+                                   31,   32,   33,   47,   48,   49,   63,   64,   65,  95,  96,
+                                   97,   127,  128,  129,  191,  192,  193,  255,  256, 257, 319,
+                                   320,  321,  383,  384,  385,  511,  512,  513,  767, 768, 769,
+                                   1023, 1024, 1025, 2047, 2048, 2049, 4095, 4096, 4097}
                 : std::vector<int>{1, 2, 3, 5, 65, 128, 129, 4096};
         std::vector<Call> calls;
         for (int t : tokens) calls.push_back({t, false});
-        if (dense)
+        if (dense || block)
             for (int t : {1, 8, 9, 17, 33, 129, 193, 257, 385, 513, 641, 2049, 4097})
                 calls.push_back({t, true});
         else
             calls.push_back({129, true});
-        if (dense) {
-            for (int t : {1, 9, 17, 24, 25, 33, 65, 129, 193, 257, 385, 513, 4097})
+        if (dense || block) {
+            for (int t : {1, 3, 9, 17, 24, 25, 33, 65, 129, 193, 257, 385, 513, 4097})
                 calls.push_back({t, true, 1});
-            for (int t : {1, 33, 193, 4095}) calls.push_back({t, true, 2});
-            for (int t : {1, 17, 32, 33, 257, 4096}) calls.push_back({t, true, 3});
+            for (int t : {1, 3, 33, 193, 4095}) calls.push_back({t, true, 2});
+            for (int t : {1, 3, 17, 32, 33, 257, 4096}) calls.push_back({t, true, 3});
         }
         if (profile.format == QType::FP8_E4M3FN_BLOCK128X128_FP32) calls.push_back({127, true});
         std::vector<OpCase> cases;
@@ -231,27 +243,31 @@ void add_fp8_cases(OpSuite& suite) {
             for (const auto i : selected) chosen.push_back(calls[i]);
             return run(profile, chosen);
         });
-        if (dense) {
-            suite.add({"swiglu/mxfp8-dense/capacity-intervals",
+        if (dense || block) {
+            suite.add({std::string("swiglu/") + profile.name + "/capacity-intervals",
                        {{"suite", "swiglu"},
                         {"format", profile.name},
                         {"execution", "eager"},
-                        {"policy", "a8"},
+                        {"policy", dense ? "a8" : "a16"},
                         {"t", "0"}}},
-                      [] {
-                          ops::SwiGLUProfile p{Hidden,
-                                               6144,
-                                               QType::MXFP8,
-                                               QType::MXFP8,
-                                               QuantLayout::RowGroupScale,
-                                               QuantLayout::RowGroupScale,
-                                               ops::LinearPolicy::AllowA8,
-                                               ops::LinearPolicy::AllowA8,
-                                               10.F};
+                      [profile] {
+                          ops::SwiGLUProfile p{
+                              Hidden,
+                              profile.intermediate,
+                              profile.format,
+                              profile.format,
+                              profile.format == QType::MXFP8 ? QuantLayout::RowGroupScale
+                                                             : QuantLayout::BlockScaleM128K128,
+                              profile.format == QType::MXFP8 ? QuantLayout::RowGroupScale
+                                                             : QuantLayout::BlockScaleM128K128,
+                              profile.policy,
+                              profile.policy,
+                              10.F};
                           int failures = 0;
                           for (auto [first, last] :
-                               {std::pair{1, 33}, std::pair{17, 65}, std::pair{97, 193},
-                                std::pair{129, 257}, std::pair{193, 385}, std::pair{1, 4097}}) {
+                               {std::pair{1, 33}, std::pair{17, 65}, std::pair{33, 49},
+                                std::pair{97, 193}, std::pair{129, 257}, std::pair{193, 385},
+                                std::pair{1, 4097}}) {
                               const auto capacity =
                                   ops::swiglu_workspace_capacity_bytes(p, first, last);
                               for (int t = first; t <= last; ++t)
@@ -260,6 +276,24 @@ void add_fp8_cases(OpSuite& suite) {
                           }
                           return failures;
                       });
+        }
+        if (block) {
+            for (int t : {65, 193, 513})
+                for (bool small : {false, true})
+                    suite.add({std::string("swiglu/") + profile.name + "/T" + std::to_string(t) +
+                                   (small ? "/small-product-large-down" : "/saturated-product"),
+                               {{"suite", "swiglu"},
+                                {"format", profile.name},
+                                {"policy", "a16"},
+                                {"execution", "graph"},
+                                {"t", std::to_string(t)}}},
+                              [profile, t, small] {
+                                  auto scaled             = profile;
+                                  scaled.activation_scale = small ? std::ldexp(1.F, -68) : 1e10F;
+                                  scaled.down_extent      = small ? 1e38F : .05F;
+                                  const std::array calls{Call{t, true}};
+                                  return run(scaled, calls);
+                              });
         }
     }
 #endif

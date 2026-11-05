@@ -40,7 +40,8 @@ std::size_t mxfp8_swiglu_workspace_capacity_bytes(int rows, int k, LinearPolicy 
     for (const auto& route : select_routes(rows, k, policy)) {
         const int end = std::min(route.last_tokens, last);
         if (route.quantize && begin <= last && end >= first)
-            peak = std::max(peak, mxfp8_a8_workspace_capacity_bytes(end, k));
+            peak = std::max(peak, mxfp8_a8_workspace_capacity_bytes(route.scale_tokens(end), k,
+                                                                    route.code_tokens(end)));
         if (route.last_tokens >= last) return peak;
         begin = route.last_tokens + 1;
     }
@@ -53,12 +54,14 @@ void mxfp8_swiglu_dispatch(const Tensor& x, const Weight& weight, Tensor& out, f
     (void)common::validate_mxfp8_weight(weight, "MXFP8 linear_swiglu");
     const auto route = select_mxfp8_swiglu_route(weight.n, weight.k, x.ne[1], policy);
     if (!route.quantize) return route.launch(x, weight, out, limit, clamped, {}, stream);
-    auto scope = workspace.scope();
-    const auto backing =
-        workspace.alloc_bytes(mxfp8_a8_workspace_capacity_bytes(x.ne[1], weight.k), 256);
+    auto scope            = workspace.scope();
+    const int code_tokens = route.code_tokens(x.ne[1]);
+    const auto backing    = workspace.alloc_bytes(
+        mxfp8_a8_workspace_capacity_bytes(route.scale_tokens(x.ne[1]), weight.k, code_tokens), 256);
     validate_projection_scratch(x, weight, {&out, 1}, nullptr, backing, "MXFP8 linear_swiglu");
     MemoryArena local(backing);
-    const auto scratch = allocate_mxfp8_a8_workspace(local, x.ne[1], weight.k);
+    const auto scratch =
+        allocate_mxfp8_a8_workspace(local, route.scale_tokens(x.ne[1]), weight.k, code_tokens);
     route.launch(x, weight, out, limit, clamped, scratch, stream);
 }
 

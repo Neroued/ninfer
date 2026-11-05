@@ -49,6 +49,18 @@ struct SwiGluBranchRows {
 };
 
 template <int RowsPerBranch>
+struct SwiGluTmaBranchRows {
+    static_assert(RowsPerBranch > 0 && RowsPerBranch % 8 == 0);
+    static constexpr bool kPaired         = true;
+    static constexpr int kTmaRowsPerPanel = RowsPerBranch;
+
+    // TMA visits two complete panels; local rows are in [0, 2 * RowsPerBranch).
+    __device__ __forceinline__ int weight_row(int begin, int row, int rows) const {
+        return begin + row + (row >= RowsPerBranch ? rows / 2 - RowsPerBranch : 0);
+    }
+};
+
+template <int RowsPerBranch>
 struct SwiGluInterleavedRows {
     static_assert(RowsPerBranch == 8);
     static constexpr bool kPaired         = true;

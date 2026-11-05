@@ -14,6 +14,15 @@ struct Mxfp8SwiGluRoute {
     void (*launch)(const Tensor&, const Weight&, Tensor&, float limit, bool clamped,
                    Mxfp8A8Workspace, cudaStream_t);
     bool quantize;
+    int code_token_alignment = 1;
+    bool tensor_core         = true;
+    bool padded_scales       = false;
+
+    int code_tokens(int tokens) const {
+        return mxfp8_a8_padded_tokens(tokens, code_token_alignment);
+    }
+
+    int scale_tokens(int tokens) const { return padded_scales ? code_tokens(tokens) : tokens; }
 };
 
 struct Mxfp8SwiGluShape {

@@ -3,9 +3,10 @@
 
 namespace ninfer::ops::detail {
 
-template <class Input, bool PadCodes>
+template <class Input, bool PadCodes, bool PadScales = false>
 __global__ void mxfp8_a8_quantize_kernel(const Input* x, Mxfp8A8Workspace out, int groups,
                                          int valid_groups) {
+    static_assert(!PadScales || PadCodes);
     const int group = (blockIdx.x * blockDim.x + threadIdx.x) / 4;
     const int part  = threadIdx.x & 3;
     if (group >= groups) return;
@@ -13,6 +14,8 @@ __global__ void mxfp8_a8_quantize_kernel(const Input* x, Mxfp8A8Workspace out, i
         if (group >= valid_groups) {
             common::store_vec(out.codes + static_cast<std::int64_t>(group) * 32 + part * 8,
                               make_uint2(0, 0));
+            if constexpr (PadScales)
+                if (part == 0) out.scales[group] = common::fp8_ue8m0_scale(0.0f).scale;
             return;
         }
     }
@@ -55,6 +58,16 @@ __global__ void mxfp8_a8_quantize_kernel(const Input* x, Mxfp8A8Workspace out, i
     if (part == 0) out.scales[group] = scale.scale;
 }
 
+template <class Input>
+void launch_mxfp8_a8_quantize_padded(const Input* x, int k, int tokens, Mxfp8A8Workspace out,
+                                     cudaStream_t stream, int padded_tokens) {
+    const int valid_groups = k / 32 * tokens;
+    const int groups       = k / 32 * padded_tokens;
+    mxfp8_a8_quantize_kernel<Input, true, true>
+        <<<common::div_up(groups, 64), 256, 0, stream>>>(x, out, groups, valid_groups);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 template <class Input, bool PadCodes>
 void launch_mxfp8_a8_quantize(const Input* x, int k, int tokens, Mxfp8A8Workspace out,
                               cudaStream_t stream, int code_tokens) {
@@ -73,5 +86,9 @@ template void launch_mxfp8_a8_quantize<float, false>(const float*, int, int, Mxf
                                                      cudaStream_t, int);
 template void launch_mxfp8_a8_quantize<float, true>(const float*, int, int, Mxfp8A8Workspace,
                                                     cudaStream_t, int);
+template void launch_mxfp8_a8_quantize_padded<__nv_bfloat16>(const __nv_bfloat16*, int, int,
+                                                             Mxfp8A8Workspace, cudaStream_t, int);
+template void launch_mxfp8_a8_quantize_padded<float>(const float*, int, int, Mxfp8A8Workspace,
+                                                     cudaStream_t, int);
 
 } // namespace ninfer::ops::detail

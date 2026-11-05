@@ -3,6 +3,7 @@
 #include "quantized_weight.cuh"
 #include "direct_bf16_weight.cuh"
 #include "common/roofline.h"
+#include "ops/linear/swiglu/mxfp8/dispatch.h"
 
 using namespace ninfer;
 using namespace ninfer::bench;
@@ -109,12 +110,16 @@ void run(const Options& options, Fixture& fixture) {
                 row.workspace_peak   = arena.peak_used();
                 const bool native_a8 = weight.qtype == QType::MXFP8 && row.workspace_peak != 0;
                 const bool native_a4 = weight.qtype == QType::NVFP4 && row.workspace_peak != 0;
-                const auto workspace_bytes = native_a8   ? 2ULL * t * (weight.k + weight.k / 32)
+                // Registered native K4096 workspaces have no internal alignment gap.
+                // Peak usage includes any initialized code rows beyond the logical extent.
+                const auto workspace_bytes = native_a8   ? 2ULL * row.workspace_peak
                                              : native_a4 ? 2ULL * t * (weight.k / 2 + weight.k / 16)
                                                          : 0ULL;
                 const auto bytes           = operand_bytes + workspace_bytes;
                 const bool tensor =
-                    weight.qtype == QType::MXFP8 ? t > (weight.n == 12288 ? 4 : 2)
+                    weight.qtype == QType::MXFP8
+                        ? ops::detail::select_mxfp8_swiglu_route(weight.n, weight.k, t, policy)
+                              .tensor_core
                     : weight.qtype == QType::FP8_E4M3FN_BLOCK128X128_FP32 ? t > 2
                     : weight.qtype == QType::NVFP4_MUL ? weight.n == 8192 || t > 2
                     : weight.qtype == QType::NVFP4

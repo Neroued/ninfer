@@ -25,6 +25,17 @@ extern template void launch_mxfp8_a8_quantize<float, false>(const float*, int, i
 extern template void launch_mxfp8_a8_quantize<float, true>(const float*, int, int, Mxfp8A8Workspace,
                                                            cudaStream_t, int);
 
+// Both code and scale planes cover padded_tokens. Padding represents exact zero;
+// only the first tokens rows are read from the input.
+template <class Input>
+void launch_mxfp8_a8_quantize_padded(const Input* x, int k, int tokens, Mxfp8A8Workspace out,
+                                     cudaStream_t stream, int padded_tokens);
+extern template void launch_mxfp8_a8_quantize_padded<__nv_bfloat16>(const __nv_bfloat16*, int, int,
+                                                                    Mxfp8A8Workspace, cudaStream_t,
+                                                                    int);
+extern template void launch_mxfp8_a8_quantize_padded<float>(const float*, int, int,
+                                                            Mxfp8A8Workspace, cudaStream_t, int);
+
 template <class S>
 __device__ __forceinline__ int mxfp8_shared_byte(int row, int col) {
     return col ^ ((row & (S::kBlockK / 16 - 1)) * 16);

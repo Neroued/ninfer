@@ -57,5 +57,6 @@ if(NINFER_TARGET STREQUAL "dgx_spark")
     "${CMAKE_CURRENT_LIST_DIR}/swiglu/dgx_spark/fp8.cu"
     "${CMAKE_CURRENT_LIST_DIR}/swiglu/dgx_spark/mxfp8_dense.cu"
     "${CMAKE_CURRENT_LIST_DIR}/swiglu/dgx_spark/fp8_block_shared.cu"
+    "${CMAKE_CURRENT_LIST_DIR}/swiglu/dgx_spark/mxfp8_shared.cu"
     "${CMAKE_CURRENT_LIST_DIR}/swiglu/dgx_spark/nvfp4_tma.cu")
 endif()

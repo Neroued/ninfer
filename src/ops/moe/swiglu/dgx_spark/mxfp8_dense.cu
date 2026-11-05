@@ -149,16 +149,16 @@ void run(const Tensor& x, const SwiGLUWeights& weights, Output output, float lim
                                  Mxfp8A8TmaSchedule<64, 64, 256, 32, 16, 2>, false>(
             x, weights, output, storage, plan.storage_tokens(tokens), limit, stream);
     case ScaledFp8Kernel::DenseTransition:
-        return quantized_product<Mxfp8A8TmaSchedule<64, 128, 128, 32, 32, 3>,
-                                 Mxfp8A8TmaSchedule<64, 128, 128, 32, 32, 3>, true>(
+        return quantized_product<Mxfp8A8TmaSchedule<64, 128, 128, 32, 32, 3, 1, 8, true>,
+                                 Mxfp8A8TmaSchedule<64, 128, 128, 32, 32, 3, 1, 8, true>, true>(
             x, weights, output, storage, plan.storage_tokens(tokens), limit, stream);
     case ScaledFp8Kernel::DenseBulk:
         if (tokens <= 2048)
-            return quantized_product<Mxfp8A8TmaSchedule<192, 128, 128, 48, 64, 2, 1, 8, false, 1>,
+            return quantized_product<Mxfp8A8TmaSchedule<192, 128, 128, 48, 64, 2, 1, 8, true, 1>,
                                      Mxfp8A8TmaSchedule<192, 128, 128, 48, 64, 2, 1, 4, true, 1>,
                                      true>(x, weights, output, storage, plan.storage_tokens(tokens),
                                            limit, stream);
-        return quantized_product<Mxfp8A8TmaSchedule<192, 128, 128, 48, 64, 2, 1, 2, false, 1>,
+        return quantized_product<Mxfp8A8TmaSchedule<192, 128, 128, 48, 64, 2, 1, 2, true, 1>,
                                  Mxfp8A8TmaSchedule<192, 128, 128, 48, 64, 2, 1, 8, true, 1>, true>(
             x, weights, output, storage, plan.storage_tokens(tokens), limit, stream);
     case ScaledFp8Kernel::Default:

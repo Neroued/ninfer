@@ -30,6 +30,11 @@ void launch_fp8_block_shared_ffn(const Tensor&, const SwiGLUWeights&, Tensor&, f
 void launch_fp8_block_shared_ffn_join(const Tensor&, const SwiGLUWeights&, Tensor&,
                                       RoutedSwiGLUContribution, float limit, MemoryArena&,
                                       cudaStream_t);
+void launch_mxfp8_shared_ffn(const Tensor&, const SwiGLUWeights&, Tensor&, float limit,
+                             MemoryArena&, cudaStream_t);
+void launch_mxfp8_shared_ffn_join(const Tensor&, const SwiGLUWeights&, Tensor&,
+                                  RoutedSwiGLUContribution, float limit, MemoryArena&,
+                                  cudaStream_t);
 void launch_scaled_fp8_ffn(const Tensor&, const SwiGLUWeights&, Tensor&, float limit, MemoryArena&,
                            cudaStream_t);
 void launch_scaled_fp8_ffn_join(const Tensor&, const SwiGLUWeights&, Tensor&,

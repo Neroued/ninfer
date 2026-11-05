@@ -156,7 +156,8 @@ __global__ __launch_bounds__(S::kThreads, S::kMinBlocksPerSm) void mxfp8_a8_tma_
             // cp.async scales contribute one arrival per producer lane; TMA scales have
             // separate full/empty barriers and outlive several code tiles.
             common::cta_mbarrier_init(full + s, TmaScales ? 1 : 33);
-            common::cta_mbarrier_init(empty + s, S::kConsumerWarps);
+            common::cta_mbarrier_init(empty + s,
+                                      TmaScales ? S::kConsumerWarps : S::kConsumerThreads);
         }
 #pragma unroll
         for (int s = 0; s < SC; ++s) {
@@ -223,10 +224,12 @@ __global__ __launch_bounds__(S::kThreads, S::kMinBlocksPerSm) void mxfp8_a8_tma_
                                             : 0),
                         valid ? 4 : 0);
                 }
-                // The full barrier tracks both transfer mechanisms, including every scale byte.
-                asm volatile("cp.async.mbarrier.arrive.noinc.shared::cta.b64 [%0];" ::"r"(
-                                 common::smem_addr(full + slot))
-                             : "memory");
+                // Close this slot's scale-copy group before publishing its arrival.
+                // The independent TMA transaction may still be in flight; the full
+                // barrier also waits for its expected bytes before consumers proceed.
+                common::cp_commit();
+                common::cp_wait<0>();
+                common::cta_mbarrier_arrive(full + slot);
             }
         }
     } else {
@@ -310,11 +313,14 @@ __global__ __launch_bounds__(S::kThreads, S::kMinBlocksPerSm) void mxfp8_a8_tma_
             }
             asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
             __syncwarp();
-            if (lane == 0) {
+            // cp.async scale slots are read by every consumer lane. Retire each
+            // reader explicitly before the producer can overwrite the slot.
+            if constexpr (!TmaScales) {
                 common::cta_mbarrier_arrive(empty + slot);
-                if constexpr (TmaScales)
-                    if (kt % SFSteps == SFSteps - 1)
-                        common::cta_mbarrier_arrive(sf_empty + sf_slot);
+            } else if (lane == 0) {
+                common::cta_mbarrier_arrive(empty + slot);
+                if (kt % SFSteps == SFSteps - 1)
+                    common::cta_mbarrier_arrive(sf_empty + sf_slot);
             }
         }
     }

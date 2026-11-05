@@ -218,6 +218,8 @@ void launch_scaled_fp8_ffn(const Tensor& x, const SwiGLUWeights& weights, Tensor
     if (select_scaled_fp8(swiglu_profile(weights), x.ne[1]).kernel != ScaledFp8Kernel::Default) {
         if (weights.gate_up.weight.qtype == QType::FP8_E4M3FN_BLOCK128X128_FP32)
             return launch_fp8_block_shared_ffn(x, weights, out, limit, workspace, stream);
+        if (weights.down.weight.k == 1024)
+            return launch_mxfp8_shared_ffn(x, weights, out, limit, workspace, stream);
         return launch_mxfp8_dense_ffn(x, weights, out, limit, workspace, stream);
     }
     dispatch(x, weights, LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), 4096}, limit,
@@ -232,6 +234,8 @@ void launch_scaled_fp8_ffn_join(const Tensor& x, const SwiGLUWeights& weights, T
         if (weights.gate_up.weight.qtype == QType::FP8_E4M3FN_BLOCK128X128_FP32)
             return launch_fp8_block_shared_ffn_join(x, weights, out, routed, limit, workspace,
                                                     stream);
+        if (weights.down.weight.k == 1024)
+            return launch_mxfp8_shared_ffn_join(x, weights, out, routed, limit, workspace, stream);
         return launch_mxfp8_dense_ffn_join(x, weights, out, routed, limit, workspace, stream);
     }
     dispatch(x, weights, SwiGluRoutedOutput<4096>{static_cast<__nv_bfloat16*>(out.data), routed},

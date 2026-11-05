@@ -33,7 +33,14 @@ enum class ScaledFp8Kernel {
     BlockScaledF16Small,
     BlockScaledF16Medium,
     BlockScaledF16Wide,
-    BlockScaledF16Bulk
+    BlockScaledF16Bulk,
+    MtpFloat,
+    MtpSmall,
+    MtpPadded,
+    MtpTransition,
+    MtpBulkMedium,
+    MtpBulk,
+    MtpLarge
 };
 
 struct ScaledFp8Plan {
@@ -63,6 +70,22 @@ inline std::span<const ScaledFp8Plan> scaled_fp8_plans(const SwiGLUProfile& prof
                                        ScaledFp8Plan{all, ScaledFp8Product::Compensated}};
     static constexpr std::array quantized{ScaledFp8Plan{4, ScaledFp8Product::Float},
                                           ScaledFp8Plan{all, ScaledFp8Product::Mxfp8}};
+    static constexpr std::array mtp{
+        ScaledFp8Plan{1, ScaledFp8Product::Float, ScaledFp8Kernel::MtpFloat},
+        ScaledFp8Plan{8, ScaledFp8Product::Float, ScaledFp8Kernel::MtpFloat},
+        ScaledFp8Plan{64, ScaledFp8Product::Mxfp8, ScaledFp8Kernel::MtpSmall, 96},
+        ScaledFp8Plan{96, ScaledFp8Product::Mxfp8, ScaledFp8Kernel::MtpSmall, 32},
+        ScaledFp8Plan{192, ScaledFp8Product::Mxfp8, ScaledFp8Kernel::MtpPadded, 192},
+        ScaledFp8Plan{384, ScaledFp8Product::Mxfp8, ScaledFp8Kernel::MtpTransition, 128},
+        ScaledFp8Plan{512, ScaledFp8Product::Mxfp8, ScaledFp8Kernel::MtpBulkMedium, 128},
+        ScaledFp8Plan{2048, ScaledFp8Product::Mxfp8, ScaledFp8Kernel::MtpBulk, 128},
+        ScaledFp8Plan{all / 128 * 128, ScaledFp8Product::Mxfp8, ScaledFp8Kernel::MtpLarge, 128},
+        ScaledFp8Plan{all, ScaledFp8Product::Mxfp8}};
+    static constexpr auto mtp_join = [] {
+        auto plans = mtp;
+        plans[0]   = ScaledFp8Plan{1, ScaledFp8Product::Float};
+        return plans;
+    }();
     static constexpr std::array dense{
         ScaledFp8Plan{8, ScaledFp8Product::Float, ScaledFp8Kernel::DenseFloat},
         ScaledFp8Plan{16, ScaledFp8Product::Compensated, ScaledFp8Kernel::DenseCompensated},
@@ -108,6 +131,9 @@ inline std::span<const ScaledFp8Plan> scaled_fp8_plans(const SwiGLUProfile& prof
     if (a8 && profile.hidden == 4096 && profile.intermediate == 6144)
         return routed_join ? std::span<const ScaledFp8Plan>(dense_join)
                            : std::span<const ScaledFp8Plan>(dense);
+    if (a8 && profile.hidden == 4096 && profile.intermediate == 1024)
+        return routed_join ? std::span<const ScaledFp8Plan>(mtp_join)
+                           : std::span<const ScaledFp8Plan>(mtp);
     return a8 ? std::span<const ScaledFp8Plan>(quantized) : std::span<const ScaledFp8Plan>(native);
 }
 

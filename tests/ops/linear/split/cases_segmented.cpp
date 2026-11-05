@@ -123,6 +123,13 @@ void add_segmented_cases(Suite& suite) {
         const bool w_b =
             fixture.profile.k == 1536 && fixture.profile.outputs == std::vector<int>{16384, 4096};
         if (w_b) graph_tokens.insert({17, 65, 257, 4097});
+        if (fixture.profile.k == 4096 &&
+            fixture.profile.outputs == std::vector<int>{32, 128, 128}) {
+            for (int end : {320, 640, 1536}) {
+                tokens.insert({end - 1, end, end + 1});
+                graph_tokens.insert({end, end + 1});
+            }
+        }
         if (fixture.profile.k == 4096) {
             for (int m = 1; m <= 128; ++m) tokens.insert(m);
             for (int b : {4, 8, 16, 32, 40, 48, 64, 96, 128, 192, 256, 512, 1024, 2048, 4096}) {

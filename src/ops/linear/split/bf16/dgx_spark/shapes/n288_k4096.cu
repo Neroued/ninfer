@@ -1,5 +1,6 @@
 #include "ops/linear/split/dispatch.h"
 #include "ops/linear/split/bf16/launch.cuh"
+#include "ops/linear/kernels/bf16/bf16_mma_epilogue.cuh"
 
 namespace ninfer::ops::detail::linear_split {
 namespace {
@@ -12,16 +13,18 @@ using Gemv =
     Tail<Bf16A16GemvSchedule<4, 4, 1, 8, 4, Bf16ActivationAccess::Direct, Bf16WeightCache::Default,
                              Bf16PhaseOrder::Sequential, 1, 1, 4, 2>>;
 using Short  = Tail<Bf16A16SlicedKMmaSchedule<16, 8, 16, 64, 2>>;
-using Hot    = Tail<Bf16A16SlicedKMmaSchedule<16, 16, 8, 64, 2>>;
-using Medium = Tail<Bf16A16SlicedKMmaSchedule<16, 32, 4, 64, 2>>;
+using Hot    = Static<Bf16A16SlicedKMmaSchedule<16, 8, 8, 64, 2>>;
+using Medium = Static<Bf16A16SlicedKMmaSchedule<16, 32, 8, 64, 2>>;
 using Mma16 =
-    Static<Bf16A16MmaSchedule<48, 16, 128, 16, 8, 3, 1, Cache::cg, Cache::cg,
+    Static<Bf16A16MmaSchedule<48, 16, 256, 16, 8, 2, 1, Cache::cg, Cache::cg,
                               Bf16MmaFragmentPipeline::PingPong, Bf16MmaRaster::TokenFast>>;
 using Mma32 =
     Static<Bf16A16MmaSchedule<48, 32, 256, 16, 8, 2, 1, Cache::cg, Cache::cg,
                               Bf16MmaFragmentPipeline::PingPong, Bf16MmaRaster::TokenFast>>;
-using Tma32 = Static<Bf16A16TmaMmaSchedule<48, 32, 128, 16, 16, 2, 2, Bf16MmaRaster::RowFast>>;
-using Tma64 = Static<Bf16A16TmaMmaSchedule<48, 64, 64, 16, 32, 2, 2, Bf16MmaRaster::RowFast>>;
+using Tma32     = Static<Bf16A16TmaMmaSchedule<32, 32, 128, 16, 16, 3, 2, Bf16MmaRaster::RowFast>>;
+using TmaMiddle = Static<Bf16A16TmaMmaSchedule<32, 64, 64, 16, 32, 3, 2, Bf16MmaRaster::RowFast>>;
+using Tma64     = Static<Bf16A16TmaMmaSchedule<48, 64, 64, 16, 32, 2, 2, Bf16MmaRaster::RowFast>>;
+using TmaDeep   = Static<Bf16A16TmaMmaSchedule<48, 64, 64, 16, 32, 3, 2, Bf16MmaRaster::RowFast>>;
 
 void launch_split(const Tensor& x, Weights weights, std::span<const Tensor> out, MemoryArena*,
                   cudaStream_t stream) {
@@ -33,12 +36,15 @@ void launch_split(const Tensor& x, Weights weights, std::span<const Tensor> out,
     const int tokens = x.ne[1];
     if (tokens == 1) return routes.gemv<Gemv>();
     if (tokens <= 16) return routes.sliced<Short>();
-    if (tokens <= 32) return routes.sliced<Hot>();
+    if (tokens <= 40) return routes.sliced<Hot>();
     if (tokens <= 64) return routes.sliced<Medium>();
     if (tokens <= 128) return routes.mma<Mma16>();
     if (tokens <= 256) return routes.mma<Mma32>();
-    if (tokens <= 512) return routes.tma<Tma32>();
-    return routes.tma<Tma64>();
+    if (tokens <= 320) return routes.tma<Tma32, Bf16MmaWarpStoreEpilogue>();
+    if (tokens <= 640) return routes.tma<TmaMiddle, Bf16MmaWarpStoreEpilogue>();
+    if (tokens <= 1024) return routes.tma<TmaDeep, Bf16TmaVectorEpilogue>();
+    if (tokens <= 1536) return routes.tma<Tma64>();
+    return routes.tma<TmaDeep, Bf16TmaVectorEpilogue>();
 }
 } // namespace
 

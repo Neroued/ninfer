@@ -33,7 +33,7 @@ void q4_a16_conformance(Suite& suite) {
         graph(4096),    a16(4097)};
     add_shape(suite, QType::Q4_G64_FP16, ActivationRecipe::Hashed, make_q4_g64_fp16_weight,
               {77440, 4096, 1031U, Comparison::Sampled, true, head_calls});
-    const std::array head_full{a16(1), a16(4), a16(8), graph(769)};
+    const std::array head_full{a16(1), a16(2), a16(3), a16(4), a16(8), a16(16), graph(769)};
     add_shape(suite, QType::Q4_G64_FP16, ActivationRecipe::TokenBlocks, make_q4_g64_fp16_weight,
               {77440, 4096, 1033U, Comparison::Full, true, head_full});
     const std::array head_stress{a16(1),    a16(2),    a16(3),    a16(4),     a16(8),

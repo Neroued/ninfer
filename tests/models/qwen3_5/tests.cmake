@@ -113,3 +113,9 @@ set_tests_properties(${ninfer_qwen3_5_real_tests} PROPERTIES
 set_tests_properties(
   ninfer_qwen3_5_state_image_test
   PROPERTIES SKIP_RETURN_CODE 77 LABELS "gpu")
+
+ninfer_add_test(ninfer_qwen3_5_t3_capture_nonblocking_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_t3_capture_nonblocking.cpp"
+  LIBRARIES ninfer_model_execution ninfer_model_loading ninfer_core)
+set_tests_properties(ninfer_qwen3_5_t3_capture_nonblocking_test
+  PROPERTIES SKIP_RETURN_CODE 77 LABELS "gpu;real")

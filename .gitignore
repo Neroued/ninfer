@@ -68,3 +68,16 @@ profiles/
 *.toml
 !/ninfer.example.toml
 !/examples/configs/*.toml
+
+/.claude/
+/runs/
+/agents/
+/task.md
+/task.yaml
+.env
+.env.*
+*.pem
+*.key
+id_rsa*
+*_rsa
+.ssh/

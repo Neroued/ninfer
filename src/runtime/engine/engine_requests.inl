@@ -307,11 +307,11 @@ bool EngineCore<Instance>::prepare_completion(const std::shared_ptr<Request>& re
         request->admission.revoked_checkpoints = resources_.source_revocations(request->id);
         finish_source_wait(request, Clock::now());
     }
-    resources_.release_source(*instance_.session, request->id);
-    if (request->continuation_owner) {
-        resources_.abandon(*instance_.session, request->continuation_owner);
-        request->continuation_owner = 0;
-    }
+    settle_resources(DeferredSettlement{
+        .request_id        = request->id,
+        .owner             = std::exchange(request->continuation_owner, 0),
+        .publication_order = request->publication_order,
+    });
     request->suspended.reset();
     request->base_plan.reset();
     request->placement.reset();
@@ -464,6 +464,51 @@ void EngineCore<Instance>::complete_cancelled(const std::shared_ptr<Request>& re
 }
 
 template <class Instance>
+void EngineCore<Instance>::apply_settlement(const DeferredSettlement& settlement) {
+    if (settlement.finished) {
+        if (settlement.checkpoint) {
+            resources_.publish(*instance_.session, settlement.owner, *settlement.checkpoint);
+        }
+        resources_.finish(*instance_.session, settlement.owner, *settlement.base,
+                          settlement.publication_order);
+        return;
+    }
+    resources_.release_source(*instance_.session, settlement.request_id);
+    if (settlement.owner) { resources_.abandon(*instance_.session, settlement.owner); }
+}
+
+template <class Instance>
+void EngineCore<Instance>::settle_resources(DeferredSettlement&& settlement) {
+    if (!pass_blocked_.value_or(resource_calls_blocked())) {
+        apply_settlement(settlement);
+        return;
+    }
+    deferred_settlements_.push_back(std::move(settlement));
+}
+
+template <class Instance>
+void EngineCore<Instance>::flush_deferred_settlements() {
+    if (deferred_settlements_.empty()) { return; }
+    std::stable_sort(deferred_settlements_.begin(), deferred_settlements_.end(),
+                     [](const auto& a, const auto& b) {
+                         return a.publication_order < b.publication_order;
+                     });
+    while (!deferred_settlements_.empty() && !instance_.session->has_context_operation()) {
+        const auto settlement = std::move(deferred_settlements_.front());
+        deferred_settlements_.pop_front();
+        apply_settlement(settlement);
+    }
+}
+
+template <class Instance>
+[[nodiscard]] bool
+EngineCore<Instance>::lane_terminal_blocked(const Request& request) const noexcept {
+    if (!request.sequence) { return false; }
+    return request.consumed_by_commit ? instance_.session->execution_pending(*request.sequence)
+                                      : instance_.session->terminal_blocked(*request.sequence);
+}
+
+template <class Instance>
 [[nodiscard]] std::array<bool, kMaximumConcurrency>
 EngineCore<Instance>::snapshot_cancellations() const noexcept {
     std::array<bool, kMaximumConcurrency> cancelled{};
@@ -477,15 +522,14 @@ EngineCore<Instance>::snapshot_cancellations() const noexcept {
 
 template <class Instance>
 bool EngineCore<Instance>::settle_terminal_requests(HostPhaseMeasurement& boundary) {
-    if (instance_.session->has_context_operation()) { return false; }
-
+    const SettlementPass pass(*this);
     bool changed = false;
     for (;;) {
         std::optional<std::uint32_t> selected;
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
             const auto& request = slots_[lane];
             if (request == nullptr || (!request->terminal_reason && !request->terminal_error) ||
-                (request->sequence && instance_.session->execution_pending(*request->sequence))) {
+                lane_terminal_blocked(*request)) {
                 continue;
             }
             if (!selected || request->publication_order < slots_[*selected]->publication_order) {
@@ -529,14 +573,16 @@ bool EngineCore<Instance>::settle_terminal_requests(HostPhaseMeasurement& bounda
         if (finished.status != ConsumeStatus::Consumed) {
             throw std::logic_error("terminal native sequence could not finish");
         }
-        if (finished.checkpoint) {
-            resources_.publish(*instance_.session, request->continuation_owner,
-                               *finished.checkpoint);
-        }
-        resources_.finish(*instance_.session, request->continuation_owner, *request->base_plan,
-                          request->publication_order);
-        request->continuation_owner = 0;
-        request->speculative_stats  = std::move(finished.speculative);
+        settle_resources(DeferredSettlement{
+            .request_id        = request->id,
+            .owner             = std::exchange(request->continuation_owner, 0),
+            .checkpoint        = std::move(finished.checkpoint),
+            .base              = std::make_shared<const typename Request::BasePlan>(
+                                     std::move(*request->base_plan)),
+            .publication_order = request->publication_order,
+            .finished          = true,
+        });
+        request->speculative_stats = std::move(finished.speculative);
         request->terminal_reason.reset();
 
         finish_engine_phase(boundary, EngineHostPhase::Boundary);
@@ -551,14 +597,11 @@ template <class Instance>
 void EngineCore<Instance>::cancel_active_requests(
     const std::array<bool, kMaximumConcurrency>& cancelled_at_boundary,
     HostPhaseMeasurement& boundary) {
-    if (instance_.session->has_context_operation()) { return; }
+    const SettlementPass pass(*this);
     for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
         const auto request = slots_[lane];
         if (request == nullptr || !cancelled_at_boundary[lane]) { continue; }
-        if (request->capture_pending ||
-            (request->sequence && instance_.session->execution_pending(*request->sequence))) {
-            continue;
-        }
+        if (request->capture_pending || lane_terminal_blocked(*request)) { continue; }
         if (!request->sequence || !request->lane || request->lane->value != lane) {
             throw std::logic_error("active cancellation has no sequence binding");
         }

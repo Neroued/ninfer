@@ -200,6 +200,14 @@ bool Session::execution_pending(SequenceHandle handle) const noexcept {
                impl_->compute->members.end();
 }
 
+bool Session::terminal_blocked(SequenceHandle handle) const noexcept {
+    // Conservative: any context transaction blocks every lane. Residency releases queued by
+    // earlier finish/abort calls touch no checkpoint and no transaction, so they do not.
+    const auto& p = *impl_;
+    return !p.valid(handle) || p.operation || p.pending_maintenance || execution_pending(handle) ||
+           context_blocks(handle);
+}
+
 bool Session::context_blocks(SequenceHandle handle) const noexcept {
     const auto& p = *impl_;
     if (!p.valid(handle)) return false;

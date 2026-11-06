@@ -990,6 +990,9 @@ template <class Instance>
 void EngineCore<Instance>::begin_cycle(HostPhaseMeasurement& boundary) {
     scheduler_.begin_prefill_cycle();
     control_executed_.fill(false);
+    // Tails recorded while a context operation was in flight run before anything else in this
+    // cycle, and in particular before admission can select a source.
+    flush_deferred_settlements();
     (void)expire_pending_requests();
     if (!instance_.session->has_context_operation()) {
         for (const auto& request : slots_) {
@@ -1002,16 +1005,22 @@ void EngineCore<Instance>::begin_cycle(HostPhaseMeasurement& boundary) {
     }
     (void)settle_terminal_requests(boundary);
     cancel_active_requests(snapshot_cancellations(), boundary);
-    for (auto it = paused_.begin();
-         !instance_.session->has_context_operation() && it != paused_.end();) {
-        const auto request = *it;
-        if (!request->cancelled.load(std::memory_order_acquire)) {
-            ++it;
-            continue;
+    {
+        const SettlementPass paused_pass(*this);
+        for (auto it = paused_.begin(); it != paused_.end();) {
+            const auto request = *it;
+            // Dropping a suspended snapshot erases a checkpoint that an in-flight context operation
+            // may still hold; such a request waits. Replay-route requests own no checkpoint.
+            if (!request->cancelled.load(std::memory_order_acquire) ||
+                (request->suspended && request->suspended->has_snapshot() &&
+                 instance_.session->has_context_operation())) {
+                ++it;
+                continue;
+            }
+            request->suspended.reset();
+            it = paused_.erase(it);
+            complete_cancelled(request);
         }
-        request->suspended.reset();
-        it = paused_.erase(it);
-        complete_cancelled(request);
     }
     const bool recovering = std::any_of(slots_.begin(), slots_.end(),
                                         [](const auto& r) { return r && r->recovery_pending; }) ||
@@ -1126,7 +1135,7 @@ template <class Instance>
 template <class Instance>
 bool EngineCore<Instance>::process_measurement() {
     if (!resident_empty() || !paused_.empty() || materializing_ || context_owner_ ||
-        admission_decision_ || execution_outstanding())
+        admission_decision_ || !deferred_settlements_.empty() || execution_outstanding())
         return false;
     MeasurementCommand command;
     {
@@ -1171,7 +1180,7 @@ void EngineCore<Instance>::worker_loop() noexcept {
         {
             std::unique_lock lock(queue_mutex_);
             if (!stopping_ && pending_.empty() && resident_empty() && paused_.empty() &&
-                !execution_outstanding()) {
+                deferred_settlements_.empty() && !execution_outstanding()) {
                 queue_cv_.wait(lock,
                                [&] { return stopping_ || !pending_.empty() || measurement_; });
             }

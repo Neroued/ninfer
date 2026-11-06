@@ -421,6 +421,9 @@ public:
     void cancel_context() noexcept;
     [[nodiscard]] bool context_blocks(SequenceHandle sequence) const noexcept;
     [[nodiscard]] bool execution_pending(SequenceHandle sequence) const noexcept;
+    // True when finish/abort of this sequence cannot run now: its lane is owned by a context
+    // operation or an execution. This is the only condition under which they decline.
+    [[nodiscard]] bool terminal_blocked(SequenceHandle sequence) const noexcept;
     // A resumed binding retains its complete recovery capacity until committed new progress.
     [[nodiscard]] bool recovery_pending(SequenceHandle sequence) const noexcept;
     [[nodiscard]] std::optional<runtime::ExecutionTicket> start_prefill(SequenceHandle,

@@ -382,6 +382,9 @@ public:
     [[nodiscard]] bool context_blocks(SequenceHandle) const noexcept;
     [[nodiscard]] bool recovery_pending(SequenceHandle) const noexcept;
     [[nodiscard]] bool execution_pending(SequenceHandle) const noexcept;
+    // True when finish/abort cannot run now. Conservative: any context transaction blocks every
+    // lane. This is the only condition under which they decline a resident, finishable sequence.
+    [[nodiscard]] bool terminal_blocked(SequenceHandle) const noexcept;
     void cancel_context();
 
     [[nodiscard]] std::optional<runtime::ExecutionTicket> start_prefill(SequenceHandle,

@@ -372,6 +372,7 @@ public:
     [[nodiscard]] bool has_context_operation() const noexcept;
     [[nodiscard]] bool context_blocks(SequenceHandle sequence) const noexcept;
     [[nodiscard]] bool execution_pending(SequenceHandle sequence) const noexcept;
+    [[nodiscard]] bool terminal_blocked(SequenceHandle sequence) const noexcept;
     // A resumed binding retains its complete recovery capacity until committed new progress.
     [[nodiscard]] bool recovery_pending(SequenceHandle sequence) const noexcept;
     [[nodiscard]] std::optional<runtime::ExecutionTicket> start_prefill(SequenceHandle,

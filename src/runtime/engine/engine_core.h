@@ -508,6 +508,56 @@ private:
         typename ResourceManagement::ReclaimCursor reclaim;
     };
 
+    // ResourceManagement may release a checkpoint that a Capture or Demote transaction still
+    // reads, so the Engine calls publish/finish/abandon/release_source only while the Session has
+    // no context operation. A request that ends during one keeps its Session result and lane
+    // release; only this resource tail is recorded here and replayed by begin_cycle.
+    // `finished`: publish the continuation checkpoint, then finish its owner. Otherwise: release
+    // the request's waiting source, then abandon its owner.
+    struct DeferredSettlement {
+        std::uint64_t request_id = 0;
+        typename ResourceManagement::OwnerToken owner = 0;
+        std::optional<Checkpoint> checkpoint;
+        std::shared_ptr<const typename Request::BasePlan> base;
+        std::uint64_t publication_order = 0;
+        bool finished                   = false;
+    };
+
+    // Fixes, for one settle/cancel pass, whether resource tails must wait. The decision is taken
+    // before the pass calls Session::finish/abort, because those calls queue their own residency
+    // release and would otherwise make every tail look blocked.
+    class SettlementPass {
+    public:
+        explicit SettlementPass(EngineCore& engine) : engine_(engine) {
+            engine_.pass_blocked_ = engine_.resource_calls_blocked();
+        }
+
+        ~SettlementPass() { engine_.pass_blocked_.reset(); }
+
+        SettlementPass(const SettlementPass&)            = delete;
+        SettlementPass& operator=(const SettlementPass&) = delete;
+
+    private:
+        EngineCore& engine_;
+    };
+
+    // A context operation is in flight, or earlier tails are waiting and must stay ahead.
+    [[nodiscard]] bool resource_calls_blocked() const noexcept {
+        return !deferred_settlements_.empty() || instance_.session->has_context_operation();
+    }
+
+    // Runs the resource tail now, or records it when resource calls are blocked.
+    void settle_resources(DeferredSettlement&& settlement);
+
+    void apply_settlement(const DeferredSettlement& settlement);
+
+    // Replays recorded tails in publication order while no context operation is in flight.
+    void flush_deferred_settlements();
+
+    // Whether the Session declines to end this lane's sequence now. A sequence already consumed
+    // by commit has nothing left to end; only an execution that still names it defers settlement.
+    [[nodiscard]] bool lane_terminal_blocked(const Request& request) const noexcept;
+
     [[nodiscard]] std::optional<GenerationTimingObservation>
     record_committed_output(const std::shared_ptr<Request>& request, std::uint32_t accepted_tokens);
 
@@ -693,6 +743,8 @@ private:
     std::uint64_t admission_generation_ = 1;
     std::array<std::optional<CaptureDecision>, kMaximumConcurrency> capture_decisions_;
     std::shared_ptr<Request> context_owner_;
+    std::deque<DeferredSettlement> deferred_settlements_;
+    std::optional<bool> pass_blocked_;
     std::vector<std::shared_ptr<Request>> paused_;
     Scheduling scheduler_;
     std::optional<ComputeFlight> compute_;

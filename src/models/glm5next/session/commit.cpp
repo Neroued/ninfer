@@ -288,7 +288,7 @@ DiscardResult Session::discard(PendingBatch&& batch) noexcept {
 
 FinishResult Session::finish(SequenceHandle handle) {
     auto& p = *impl_;
-    if (!p.valid(handle) || execution_pending(handle) || context_blocks(handle)) return {};
+    if (terminal_blocked(handle)) return {};
     auto& s = p.sequence(handle);
     if (s.phase != detail::Phase::Finished) return {};
     FinishResult result{runtime::ConsumeStatus::Consumed, s.speculative, {}};
@@ -302,7 +302,7 @@ FinishResult Session::finish(SequenceHandle handle) {
 
 AbortResult Session::abort(SequenceHandle handle) {
     auto& p = *impl_;
-    if (!p.valid(handle) || execution_pending(handle) || context_blocks(handle)) return {};
+    if (terminal_blocked(handle)) return {};
     auto& s = p.sequence(handle);
     AbortResult result{runtime::ConsumeStatus::Consumed, s.speculative};
     const auto lane = s.lane;

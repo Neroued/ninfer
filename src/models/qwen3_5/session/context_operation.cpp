@@ -53,6 +53,10 @@ bool SessionImpl::context_blocks(SequenceHandle handle) const noexcept {
            (backend && state.kv->backend && backend->blocks_writer(state.kv->backend->handle()));
 }
 
+bool SessionImpl::terminal_blocked(SequenceHandle handle) const noexcept {
+    return !valid_sequence(handle) || execution_pending(handle) || context_blocks(handle);
+}
+
 bool SessionImpl::submit_context(PendingContext& operation, ContextWork&& input) {
     operation.transaction.prepare_actions();
     operation.input = std::move(input);

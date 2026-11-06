@@ -374,6 +374,10 @@ bool Session::execution_pending(SequenceHandle h) const noexcept {
     return impl_->execution_pending(h);
 }
 
+bool Session::terminal_blocked(SequenceHandle h) const noexcept {
+    return impl_->terminal_blocked(h);
+}
+
 FinishResult Session::finish(SequenceHandle h) noexcept { return impl_->finish(h); }
 
 AbortResult Session::abort(SequenceHandle h) noexcept { return impl_->abort(h); }
@@ -451,7 +455,7 @@ void SessionImpl::fail_all_cleanup() noexcept {
 }
 
 FinishResult SessionImpl::finish(SequenceHandle h) noexcept {
-    if (!valid_sequence(h) || execution_pending(h) || context_blocks(h)) return {};
+    if (terminal_blocked(h)) return {};
     try {
         const auto l  = lane(h);
         auto& state   = sequences[l];
@@ -465,7 +469,7 @@ FinishResult SessionImpl::finish(SequenceHandle h) noexcept {
 }
 
 AbortResult SessionImpl::abort(SequenceHandle h) noexcept {
-    if (!valid_sequence(h) || execution_pending(h) || context_blocks(h)) return {};
+    if (terminal_blocked(h)) return {};
     const auto l = lane(h);
     AbortResult out{runtime::ConsumeStatus::Consumed, requests[l].speculative_stats};
     clear_lane(sequences[l], requests[l]);

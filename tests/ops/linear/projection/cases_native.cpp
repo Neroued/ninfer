@@ -73,11 +73,16 @@ void add_native_cases(Suite& suite) {
     add_shape(suite, QType::NVFP4_MUL, ActivationRecipe::Hashed,
               native_weight<QType::NVFP4_MUL>,
               {4096, 4096, 1459U, Comparison::Sampled, true, square_calls});
-    for (auto [n, k] : std::array<std::array<int, 2>, 2>{
-             {{20480, 4096}, {4096, 10240}}})
-        add_shape(suite, QType::NVFP4_MUL, ActivationRecipe::Hashed,
-                  native_weight<QType::NVFP4_MUL>,
-                  {n, k, 1459U, Comparison::Sampled, true, a16_calls});
+    const std::array<Invocation, 16> wide_n_calls{
+        {{1, CallForm::A16Convenience}, {2}, {3}, {4}, {5}, {16}, {17}, {32}, {33}, {64},
+         {65, CallForm::Policy, ops::LinearPolicy::A16Only, true},
+         {96}, {128}, {129}, {256}, {4096}}};
+    add_shape(suite, QType::NVFP4_MUL, ActivationRecipe::Hashed,
+              native_weight<QType::NVFP4_MUL>,
+              {20480, 4096, 1459U, Comparison::Sampled, true, wide_n_calls});
+    add_shape(suite, QType::NVFP4_MUL, ActivationRecipe::Hashed,
+              native_weight<QType::NVFP4_MUL>,
+              {4096, 10240, 1459U, Comparison::Sampled, true, a16_calls});
 #endif
 }
 } // namespace ninfer::test::linear

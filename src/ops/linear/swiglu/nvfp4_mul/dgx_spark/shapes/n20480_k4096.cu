@@ -5,16 +5,18 @@
 namespace ninfer::ops::detail {
 namespace {
 using Route0 = Nvfp4ScheduleInstance<
-    Nvfp4A16SimtSchedule<4, 1, 2, 8, 2, 2, Nvfp4SimtActivationAccess::TokenPacked,
-                         Nvfp4ScaleAccess::StagedRaw, Nvfp4CodeCache::Default, 2,
+    Nvfp4A16SimtSchedule<4, 2, 2, 16, 2, 4, Nvfp4SimtActivationAccess::TokenPacked,
+                         Nvfp4ScaleAccess::StagedRaw, Nvfp4CodeCache::Default, 1,
                          Nvfp4SimtBlockOrder::RowsContiguous, 2>,
     4096, 2>;
 using Route1 = Nvfp4ScheduleInstance<Nvfp4SlicedInstance<16, 8, 2>, 4096>;
 using Route2 = Nvfp4ScheduleInstance<Nvfp4SlicedInstance<32, 4, 1>, 4096>;
-using Route3 = Nvfp4ScheduleInstance<Nvfp4A16MmaSchedule<32, 64, 128, 16, 16, 1, 3>, 4096>;
-using Route4 = Nvfp4ScheduleInstance<Nvfp4A16MmaSchedule<64, 128, 64, 32, 32, 2, 2>, 4096>;
+using Route3 = Nvfp4ScheduleInstance<Nvfp4A16MmaSchedule<64, 64, 128, 16, 32, 2, 2, Cache::cg, Cache::cg,
+                        Nvfp4MmaFragmentPipeline::PingPong, true, 0, true>, 4096>;
+using Route4 = Nvfp4ScheduleInstance<Nvfp4A16MmaSchedule<64, 128, 64, 16, 64, 2, 2, Cache::cg, Cache::cg,
+                        Nvfp4MmaFragmentPipeline::PingPong, true, 0, true>, 4096>;
 using Route5 =
-    Nvfp4ScheduleInstance<Nvfp4A16MmaSchedule<128, 128, 64, 64, 32, 2, 2, Cache::cg, Cache::cg,
+    Nvfp4ScheduleInstance<Nvfp4A16MmaSchedule<128, 128, 64, 32, 64, 2, 2, Cache::cg, Cache::cg,
                                               Nvfp4MmaFragmentPipeline::PingPong, true, 8>,
                           4096>;
 

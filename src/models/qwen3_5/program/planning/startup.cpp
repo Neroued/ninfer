@@ -512,12 +512,85 @@ WorkspaceSpec build_workspace_plan(const SequencePlanImpl& plan) {
     out.general_capacity =
         std::max({out.text_prefill, out.ordinary_round, out.mtp_prefill, out.mtp_round,
                   out.dflash_context, out.dflash_round, out.causal_score});
+    if (plan.decision_scoring) {
+        // Fit both traversal paths and their persistent-between-frames mappings into the
+        // existing native workspace. Reduce the root chunk before reducing branch width.
+        for (int batch = 1; batch <= static_cast<int>(kBranchBatch); ++batch) {
+            for (int root_chunk = chunk; root_chunk; root_chunk /= 2) {
+                BranchLayout branch;
+                branch.batch_capacity = batch;
+                branch.prefill_chunk  = root_chunk;
+                LayoutBuilder layout;
+                branch.tables = plan_kv_execution_tables(
+                    layout,
+                    {
+                        .logical_page_capacity = page_count(plan.capacity),
+                        .table_rows = static_cast<int>(plan.max_concurrency + 1 + 2 * kBranchBatch),
+                    });
+                const auto tensor = [&](DType type, std::initializer_list<std::int32_t> shape) {
+                    return layout.add_tensor(type, shape, 256, "decision overlay");
+                };
+                branch.ids       = tensor(DType::I32, {static_cast<int>(kBranchWidth), batch});
+                branch.positions = tensor(DType::I32, {static_cast<int>(kBranchWidth), batch});
+                branch.rope_positions =
+                    plan.features.vision
+                        ? tensor(DType::I32, {static_cast<int>(kBranchWidth), batch})
+                        : branch.positions;
+                branch.counts    = tensor(DType::I32, {batch});
+                branch.rows      = tensor(DType::I32, {batch});
+                branch.offsets   = tensor(DType::I64, {batch});
+                branch.hidden    = tensor(DType::BF16, {dimension(config.hidden_size),
+                                                        static_cast<int>(kBranchWidth), batch});
+                branch.tails     = tensor(DType::BF16, {dimension(config.hidden_size), batch});
+                branch.logits    = tensor(DType::BF16, {dimension(config.vocab_size), batch});
+                if (config.gdn) {
+                    branch.records = plan_gdn_replay_records(
+                        layout, {
+                                    .layers          = dimension(config.linear_attention_layers),
+                                    .record_capacity = batch,
+                                    .width           = static_cast<int>(kBranchWidth),
+                                    .conv_channels   = dimension(config.gdn->conv_channels()),
+                                    .qk_heads        = dimension(config.gdn->linear_num_key_heads),
+                                    .value_heads = dimension(config.gdn->linear_num_value_heads),
+                                    .key_dim     = dimension(config.gdn->linear_key_head_dim),
+                                    .value_dim   = dimension(config.gdn->linear_value_head_dim),
+                                });
+                }
+                WorkspaceLayoutBuilder body;
+                matrix(body, DType::BF16, dimension(config.hidden_size), kBranchWidth * batch);
+                target_body(body, 1, kBranchWidth * batch, TextPhase::Verify,
+                            GdnWorkspacePath::ReplayRecord, batch, 1, kBranchWidth, text_envelope);
+                WorkspaceLayoutBuilder root;
+                matrix(root, DType::BF16, dimension(config.hidden_size), root_chunk);
+                target_body(root, 1, root_chunk, TextPhase::Prefill, GdnWorkspacePath::Prefill, 1,
+                            1, root_chunk, text_envelope);
+                WorkspaceLayoutBuilder projection;
+                linear_scratch(projection, profile.text.output_head, 1, batch);
+                branch.scratch =
+                    layout.add(std::max({finish(body), finish(root), finish(projection)}), 256,
+                               "decision scratch");
+                branch.bytes = layout.finish(256);
+                if (branch.bytes <= out.general_capacity) {
+                    out.branches = branch;
+                    break;
+                }
+            }
+        }
+    }
     out.capacity = out.general_capacity;
     if (plan.features.vision) {
         out.vision =
             qwen::VisionContext::plan_resources(*profile.config.vision, *profile.vision,
                                                 plan.capacity, plan.vision_memory_budget_bytes);
         out.capacity = std::max(out.capacity, out.vision->encoder.workspace_bytes);
+        if (out.branches) {
+            // The branch KV tables survive encoder calls. Everything after those tables
+            // is dead until text traversal starts and can share the encoder's scratch.
+            out.capacity =
+                std::max(out.capacity, checked_add(out.branches->ids.region.offset,
+                                                   out.vision->encoder.workspace_bytes,
+                                                   "decision Vision workspace exceeds size_t"));
+        }
     }
     return out;
 }
@@ -594,6 +667,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->gpu_timing                        = inputs.gpu_timing;
     impl->use_cuda_graph                    = inputs.use_cuda_graph;
     impl->causal_scoring                    = inputs.causal_scoring;
+    impl->decision_scoring                  = inputs.decision_scoring;
     impl->multiprocessor_count              = inputs.multiprocessor_count;
     impl->context_cache                     = inputs.context_cache;
     impl->vision_memory_budget_bytes        = inputs.vision_memory_budget_bytes;
@@ -645,6 +719,7 @@ make_sequence_planner_impl(std::shared_ptr<const execution::ModelProfile> profil
         .gpu_timing                 = options.observability.gpu_timing,
         .use_cuda_graph             = options.use_cuda_graph,
         .causal_scoring             = options.purpose == EnginePurpose::CausalScoring,
+        .decision_scoring           = options.enable_decisions,
         .multiprocessor_count       = device.multiprocessor_count(),
         .context_cache              = options.context_cache,
         .vision_memory_budget_bytes = options.vision_memory_budget_bytes,
@@ -684,6 +759,8 @@ make_sequence_planner_impl(std::shared_ptr<const execution::ModelProfile> profil
     capacity.fixed_device_bytes = base->device_reservation_bytes;
     capacity.fixed_host_bytes =
         base->persistent.host_context_bytes + base->persistent.pinned_bytes();
+    if (base->workspace.branches)
+        capacity.fixed_host_bytes += base->workspace.branches->pinned_bytes();
     if (base->workspace.vision)
         capacity.fixed_host_bytes += base->workspace.vision->encoder.host_staging_bytes;
     if (base->moe)

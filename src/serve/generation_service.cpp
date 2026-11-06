@@ -42,9 +42,10 @@ struct RequestLifetime {
 
 ApiError request_error_to_api_error(const ninfer::RequestError& exception,
                                     std::string_view constraint_param,
-                                    std::span<const std::string> tool_schema_params) {
+                                    std::span<const std::string> tool_schema_params,
+                                    std::string_view input_param) {
     ApiError error;
-    error.param           = "messages";
+    error.param           = input_param;
     error.message         = exception.what();
     const auto tool_param = [&] {
         const std::string_view pointer = exception.pointer();
@@ -337,32 +338,65 @@ GenerationService::GenerationService(product::ServeOptions options,
     auto engine_options             = options_.launch.engine;
     engine_options.startup_observer = std::move(startup_observer);
     engine_                         = std::make_unique<ninfer::Engine>(std::move(engine_options));
+    if (engine_->options().enable_decisions) {
+        decision_engine_   = std::make_unique<decision::DecisionEngine>(*engine_);
+        decision_capacity_ = std::make_shared<RequestCapacity>(kDecisionRequestCapacity);
+    }
     request_capacity_               = std::make_shared<RequestCapacity>(
         static_cast<std::size_t>(options_.launch.engine.max_concurrency) +
         options_.launch.engine.max_pending_requests);
 }
 
-std::shared_ptr<RequestLifetime>
-GenerationService::acquire_request_lifetime(DeadlinePolicy deadline_policy) const {
+std::shared_ptr<RequestLifetime> GenerationService::acquire_request_lifetime(
+    DeadlinePolicy deadline_policy, const std::shared_ptr<RequestCapacity>& capacity) const {
+    const auto& owner  = capacity ? capacity : request_capacity_;
     const auto started = Clock::now();
     {
-        std::lock_guard lock(request_capacity_->mutex);
-        if (request_capacity_->active >= request_capacity_->maximum) {
+        std::lock_guard lock(owner->mutex);
+        if (owner->active >= owner->maximum) {
             throw_request_error(ninfer::RequestError(RequestErrorKind::Overloaded,
                                                      "inference request queue is full"));
         }
-        ++request_capacity_->active;
+        ++owner->active;
     }
     try {
         const Clock::time_point deadline =
             deadline_policy == DeadlinePolicy::UnboundedStartup
                 ? Clock::time_point::max()
                 : started + std::chrono::milliseconds(options_.launch.engine.pending_timeout_ms);
-        return std::make_shared<RequestLifetime>(request_capacity_, started, deadline);
+        return std::make_shared<RequestLifetime>(owner, started, deadline);
     } catch (...) {
-        std::lock_guard lock(request_capacity_->mutex);
-        --request_capacity_->active;
+        std::lock_guard lock(owner->mutex);
+        --owner->active;
         throw;
+    }
+}
+
+DecisionOutcome GenerationService::decide(const decision::Request& request,
+                                          std::function<bool()> is_cancelled,
+                                          std::span<const std::string> images) {
+    if (!decision_engine_) throw std::logic_error("decision engine is disabled; start with --jev");
+    if (!images.empty() && !options_.launch.engine.enable_vision)
+        throw_invalid_input(std::invalid_argument("Vision is disabled for this server"),
+                            "vision_disabled");
+    auto lifetime =
+        acquire_request_lifetime(DeadlinePolicy::ClientPendingTimeout, decision_capacity_);
+    std::vector<OwnedMedia> media;
+    auto remaining = std::min(options_.max_request_bytes, ninfer::kMaximumPromptMediaBytes);
+    for (const auto& source : images) {
+        ContentPart part{.kind = ContentKind::Image};
+        part.source.value = source;
+        part.source.kind  = source.starts_with("data:") ? product::media_acquire::SourceKind::Data
+                            : (source.starts_with("http://") || source.starts_with("https://"))
+                                ? product::media_acquire::SourceKind::Url
+                                : product::media_acquire::SourceKind::Path;
+        media.push_back(acquire_media(part, lifetime->deadline, is_cancelled, remaining));
+    }
+    PreparationControl control{.cancellation = CancellationView(std::move(is_cancelled))};
+    try {
+        return {decision_engine_->run(request, control, media), std::move(lifetime)};
+    } catch (const std::invalid_argument& error) {
+        throw_invalid_input(error, "invalid_decision_request");
     }
 }
 

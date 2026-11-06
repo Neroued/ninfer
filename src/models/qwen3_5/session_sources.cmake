@@ -5,6 +5,7 @@ target_sources(ninfer_model_control PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/session/execution.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/session/commit.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/session/scoring.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/session/branch_scoring.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/session/source.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/session/checkpoints.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/session/binding.cpp"

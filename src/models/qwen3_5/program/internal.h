@@ -72,6 +72,7 @@ struct ComputeOperation {
     GpuExecutionObservation gpu;
     AttentionWorkCounters attention;
     std::optional<Tensor> input_embeddings;
+    std::unique_ptr<BranchExecution> branch;
     std::unique_ptr<execution::TextRun> text;
 
     ComputeOperation(runtime::ExecutionRequest<ExecutionTypes>&&);
@@ -107,7 +108,11 @@ public:
     void initialize_inputs(ComputeOperation&);
     void initialize_decode(ComputeOperation&, const DecodeWork&);
     void initialize_forward(ComputeOperation&, const ForwardWork&);
+    void install_visual_embeddings(ComputeOperation&, const qwen::VisionWork&, std::uint32_t);
     void initialize_score(ComputeOperation&, const ScoreWork&);
+    void initialize_branch(ComputeOperation&, const BranchWork&);
+    bool advance_branch(ComputeOperation&);
+    [[nodiscard]] BranchResult finish_branch(ComputeOperation&);
     void upload_input(std::uint32_t width, std::uint32_t batch);
     void upload_positions(std::uint32_t width, std::uint32_t batch);
     void upload_ingress();
@@ -155,6 +160,7 @@ public:
     const KvCacheStorage kv_storage;
     const WorkspaceSpec workspace_plan;
     Resources resources;
+    std::unique_ptr<BranchWorkspace> branches;
     std::unique_ptr<context::ContextStorage> storage;
     std::unique_ptr<context::ContextMigration> compute_actions;
     std::unique_ptr<context::ContextMigration> context_actions;

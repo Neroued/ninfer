@@ -125,6 +125,22 @@ void test_request_defaults() {
             "server output default overflowed at the protocol boundary");
 }
 
+void test_decisions() {
+    require(!parse({"ninfer-serve", "model.ninfer"}).launch.engine.enable_decisions,
+            "decisions must be opt-in");
+    const auto enabled = parse({"ninfer-serve", "model.ninfer", "--jev"});
+    require(enabled.launch.engine.enable_decisions && enabled.launch.engine.max_concurrency == 1,
+            "decisions changed generation concurrency");
+    require(!parse({"ninfer-serve", "model.ninfer", "--jev", "--no-jev"})
+                 .launch.engine.enable_decisions,
+            "explicit decision opt-out was ignored");
+    const auto view = ninfer::product::configuration_view(enabled);
+    bool listed     = false;
+    for (const auto& item : view.items)
+        if (item.key == "engine.jev") listed = std::get<bool>(item.value);
+    require(listed, "decision setting was omitted from the effective configuration");
+}
+
 void test_provenance() {
     for (auto args : std::vector<std::vector<std::string>>{
              {"ninfer-serve", "model.ninfer", "--api-key", "private-value"},
@@ -149,6 +165,7 @@ int main() {
         test_resources_and_units();
         test_request_defaults();
         test_provenance();
+        test_decisions();
         std::cout << "ok\n";
         return 0;
     } catch (const std::exception& error) {

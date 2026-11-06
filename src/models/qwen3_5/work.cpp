@@ -22,6 +22,13 @@ ExecutionWork ExecutionTypes::describe_work(const Work& work) {
                 result.kind         = ExecutionKind::Score;
                 result.rows         = 1;
                 result.input_tokens = result.scheduled_positions = op.input.tokens.size();
+            } else if constexpr (std::is_same_v<T, BranchWork>) {
+                result.kind = ExecutionKind::Score;
+                result.rows = op.rows.size();
+                for (const auto& row : op.rows) result.input_tokens += row.tokens.size();
+                result.scheduled_positions = op.prefill                       ? result.input_tokens
+                                             : op.rows.front().tokens.empty() ? 0
+                                                                              : op.rows.size() * 16;
             }
         },
         work.operation);

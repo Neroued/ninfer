@@ -1,0 +1,26 @@
+{
+  "instructions": "Classify each support request independently using the supplied evidence.",
+  "schema": {
+    "category": {
+      "type": "enum",
+      "choices": ["billing", "technical", "cancellation", "other"],
+      "description": "What is the main reason for the request?"
+    },
+    "urgent": {
+      "type": "boolean",
+      "description": "Does this request need urgent handling?"
+    },
+    "priority": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 5,
+      "description": "Priority from 1 (lowest) to 5 (highest)."
+    }
+  },
+  "contexts": [
+    "I was charged twice and need this fixed today.",
+    "How do I change the display language?"
+  ],
+  "mode": "tree",
+  "cache_prompt": true
+}

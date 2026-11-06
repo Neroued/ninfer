@@ -1,6 +1,7 @@
 #pragma once
 
 #include "models/common/context/checkpoint_store.h"
+#include "ninfer/branch_score.h"
 #include "models/common/context/directory.h"
 #include "models/common/context/recovery.h"
 #include "models/common/context/release_inventory.h"
@@ -314,6 +315,11 @@ struct SessionEvent {
 
 class Session {
 public:
+    [[nodiscard]] bool branch_scoring_available() const noexcept;
+    [[nodiscard]] BranchScoreResult
+    score_branches(std::span<const BranchScoreRow>, const PreparationControl&, bool reuse_prefix,
+                   std::shared_ptr<const qwen::PreparedPromptData> prompt = {});
+    [[nodiscard]] bool release_branch_cache();
     [[nodiscard]] std::optional<SequenceHandle> prefill_continuation() const;
     void yield_prefill(SequenceHandle);
 

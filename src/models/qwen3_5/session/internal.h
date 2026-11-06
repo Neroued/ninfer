@@ -18,6 +18,19 @@
 namespace ninfer::models::qwen3_5::detail {
 
 class SessionImpl;
+
+struct BranchPoint {
+    context::HistoryOwner history;
+    context::StateId state;
+    std::uint32_t frontier = 0;
+};
+
+struct BranchCache {
+    std::vector<TokenId> prefix;
+    std::unique_ptr<BranchPoint> root;
+    qwen::ResidentPrefixIdentity picture;
+    bool has_picture = false;
+};
 struct PendingContext;
 
 struct PreparedCaptureBacking {
@@ -296,6 +309,17 @@ struct PendingContext {
 
 class SessionImpl {
 public:
+    [[nodiscard]] bool branch_scoring_available() const noexcept;
+    [[nodiscard]] BranchScoreResult score_branches(std::span<const BranchScoreRow>,
+                                                   const PreparationControl&, bool,
+                                                   std::shared_ptr<const qwen::PreparedPromptData>);
+    void release_branch_visual();
+    [[nodiscard]] bool release_branch_cache();
+    void release_branch_point(std::unique_ptr<BranchPoint>&);
+    void settle_branch_context(context::ContextTransaction&);
+    [[nodiscard]] BranchResult run_branch_work(BranchWork);
+    [[nodiscard]] Result wait_branch_work(runtime::ExecutionTicket, bool context);
+    std::unique_ptr<BranchCache> branches;
     SessionImpl(std::shared_ptr<const ModelDefinition>, SessionPlan);
     ~SessionImpl();
     [[nodiscard]] RequestBasePlan plan_request(qwen::PreparedPromptData&& prompt,

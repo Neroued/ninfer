@@ -77,6 +77,8 @@ struct SessionPlan {
     std::optional<TransferWork> dflash_local_transfer;
     std::uint32_t vision_max_features = 0;
     bool causal_scoring               = false;
+    std::uint32_t branch_batch_capacity = 0;
+    std::uint32_t branch_prefill_chunk  = 0;
 };
 
 class SequencePlan {

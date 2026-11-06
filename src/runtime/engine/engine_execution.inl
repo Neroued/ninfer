@@ -667,10 +667,14 @@ template <class Instance>
 void EngineCore<Instance>::fail_all(std::exception_ptr error) noexcept {
     std::deque<std::shared_ptr<Request>> pending;
     std::unique_ptr<MeasurementRequest> measurement;
+    std::deque<std::shared_ptr<BranchScoreQueue::Job>> decisions;
+    std::shared_ptr<BranchScoreQueue::Job> active_decision;
     {
         std::lock_guard lock(queue_mutex_);
         failed_ = true;
         pending.swap(pending_);
+        decisions.swap(decisions_.pending);
+        active_decision = std::move(decisions_.active);
         measurement = std::move(measurement_);
     }
     scheduler_ = Scheduling{};
@@ -708,6 +712,8 @@ void EngineCore<Instance>::fail_all(std::exception_ptr error) noexcept {
     publish(materializing_request);
     for (const auto& request : pending) { publish(request); }
     if (measurement) measurement->completion.set_exception(error);
+    if (active_decision) active_decision->result.set_exception(error);
+    for (const auto& job : decisions) job->result.set_exception(error);
     queue_cv_.notify_all();
 }
 

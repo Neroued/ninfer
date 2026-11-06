@@ -117,10 +117,10 @@ void launch_pre(Operands o, Plan p, float* scratch, CudaExecutionView e) {
             launch_dependent_finish<288, expand_finish_kernel<Gamma, 288, 16, 64, true>>(
                 o.columns, e, o, scratch, 64);
         else if (p.output_threads == 128)
-            expand_finish_kernel<Gamma, 128>
+            expand_finish_kernel<Gamma, 128, 8, 16>
                 <<<o.columns, 128, 0, e.stream()>>>(o, scratch, p.partials);
         else
-            expand_finish_kernel<Gamma, 256>
+            expand_finish_kernel<Gamma, 256, 8, 32>
                 <<<o.columns, 256, 0, e.stream()>>>(o, scratch, p.partials);
     } else {
         if constexpr (F == Form::PostPre) o.residual = o.updated;
@@ -132,11 +132,15 @@ void launch_pre(Operands o, Plan p, float* scratch, CudaExecutionView e) {
             launch_dependent_finish<288,
                                     pre_finish_kernel<Gamma, 288, 16, 64, true, F == Form::Pre>>(
                 o.columns, e, o, scratch, 64);
-        else if (p.output_threads == 128)
-            pre_finish_kernel<Gamma, 128, 8, 0, false, false, true>
-                <<<o.columns, 128, 0, e.stream()>>>(o, scratch, p.partials);
-        else if (p.output_threads == 512)
-            pre_finish_kernel<Gamma, 512, 4>
+        else if (p.output_threads == 128) {
+            if (p.partials == 32)
+                pre_finish_kernel<Gamma, 128, 8, 32, false, false, true>
+                    <<<o.columns, 128, 0, e.stream()>>>(o, scratch, 32);
+            else
+                pre_finish_kernel<Gamma, 128, 8, 16, false, false, true>
+                    <<<o.columns, 128, 0, e.stream()>>>(o, scratch, 16);
+        } else if (p.output_threads == 512)
+            pre_finish_kernel<Gamma, 512, 4, 32>
                 <<<o.columns, 512, 0, e.stream()>>>(o, scratch, p.partials);
         else
             throw std::logic_error("mhc: invalid pre finish plan");
@@ -196,17 +200,15 @@ void launch_typed(Form form, Operands o, Plan p, void* scratch, CudaExecutionVie
         const auto tiles = std::int64_t(o.columns) * (kHidden / p.hidden_tile);
         for (std::int64_t offset = 0; offset < tiles; offset += GridLimit) {
             const auto count = static_cast<unsigned>(std::min(GridLimit, tiles - offset));
-            if (p.output_vector == 1) {
+            if (p.output_vector == 8) {
+                post_register_kernel<128, 8><<<count, 128, 0, e.stream()>>>(o, offset);
+            } else if (p.output_vector == 4) {
                 if (p.output_threads == 128)
-                    post_kernel<128><<<count, 128, 0, e.stream()>>>(o, offset);
+                    post_vector_kernel<128, 4><<<count, 128, 0, e.stream()>>>(o, offset);
                 else
-                    post_kernel<512><<<count, 512, 0, e.stream()>>>(o, offset);
-            } else if (p.output_vector == 2) {
-                post_vector_kernel<128, 2><<<count, 128, 0, e.stream()>>>(o, offset);
-            } else if (p.output_threads == 128) {
-                post_vector_kernel<128, 4><<<count, 128, 0, e.stream()>>>(o, offset);
+                    post_vector_kernel<256, 4><<<count, 256, 0, e.stream()>>>(o, offset);
             } else {
-                post_vector_kernel<256, 4><<<count, 256, 0, e.stream()>>>(o, offset);
+                post_kernel<512><<<count, 512, 0, e.stream()>>>(o, offset);
             }
             CUDA_CHECK(cudaGetLastError());
         }

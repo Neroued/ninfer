@@ -49,14 +49,10 @@ __global__ void pre_finish_kernel(Operands o, const float* partial, int parts) {
     __syncthreads();
     float values[Groups][Vector], square = 0;
     if (warp == 0) {
-        if constexpr (Dependent) {
-            if (o.parameters.sinkhorn_iterations == 20)
-                sinkhorn<20>(o, logit, m);
-            else
-                sinkhorn(o, logit, m);
-        } else {
+        if (o.parameters.sinkhorn_iterations == 20)
+            sinkhorn<20>(o, logit, m);
+        else
             sinkhorn(o, logit, m);
-        }
     } else if constexpr (Workers * Vector == kHidden && Vector % 8 == 0) {
         // One packed vector per worker covers D exactly; no tail group or scalar loads.
         const int d = (tid - 32) * Vector;

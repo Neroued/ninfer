@@ -147,8 +147,11 @@ void add_cases(OpSuite& suite) {
             for (int m : {511, 512}) add(m, Pattern::General);
             for (auto p : {Pattern::Small, Pattern::Saturated, Pattern::Unbalanced}) add(513, p);
         }
-        if (form == Form::Post)
+        if (form == Form::Post) {
+            add(48, Pattern::General);
+            add(48, Pattern::General, true, true);
             for (int m : {1023, 1024, 1025}) add(m, Pattern::General);
+        }
         for (auto p : {Pattern::Zero, Pattern::Saturated, Pattern::Unbalanced, Pattern::Midpoint,
                        Pattern::Small})
             if (has_pre(form) || (p != Pattern::Saturated && p != Pattern::Unbalanced)) add(3, p);
@@ -163,7 +166,11 @@ void add_cases(OpSuite& suite) {
             add(1, Pattern::Midpoint, true);
             add(17, Pattern::General, true, true);
             add(form == Form::Post ? 1025 : 129, Pattern::General, true, true);
-            if (form == Form::PostPre) add(513, Pattern::General, true, true);
+            if (form == Form::PostPre) {
+                add(512, Pattern::General);
+                add(512, Pattern::General, true, true);
+                add(513, Pattern::General, true, true);
+            }
         }
         suite.add(std::string(name(form)) + "/contract",
                   [=] { return validate(form, cuda_environment().context.execution_view()); });

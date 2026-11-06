@@ -15,10 +15,11 @@ struct Options {
     std::string op = "pre";
     std::vector<int> columns{1,  2,  3,  4,  5,   6,   7,   8,    12,   16,  24,
                              32, 48, 64, 96, 128, 256, 512, 1024, 2048, 4096};
-    bool alias       = false;
-    int sites        = 1;
-    int calls        = 0;
-    int condition_us = 200;
+    bool alias          = false;
+    int sites           = 1;
+    int calls           = 0;
+    int condition_us    = 200;
+    int reserve_columns = 0;
     DType base_type = DType::BF16, scale_type = DType::BF16, gamma_type = DType::BF16;
 };
 
@@ -38,6 +39,7 @@ Options parse(int argc, char** argv) {
             std::cout << "mHC complete Op benchmark, D=4096 S=4\n"
                          "  --op pre|post|expand-pre|post-pre|post-mean-norm\n"
                          "  --columns M[,M...] --alias disjoint|inplace --sites N --calls N\n"
+                         "  --reserve-columns M  keep allocations fixed across a partial sweep\n"
                          "  --base-type bf16|fp32 --scale-type bf16|fp32 --gamma-type bf16|fp32\n"
                          "  --condition-us N "
                          "(default 200)\n"
@@ -57,6 +59,8 @@ Options parse(int argc, char** argv) {
             o.scale_type = parameter_type(value);
         else if (flag == "--gamma-type")
             o.gamma_type = parameter_type(value);
+        else if (flag == "--reserve-columns")
+            o.reserve_columns = measurement::integer(value);
         else if (flag == "--condition-us")
             o.condition_us = measurement::integer(value, 0);
         else if (flag == "--sites")
@@ -85,13 +89,13 @@ Options parse(int argc, char** argv) {
     return o;
 }
 
-std::size_t capacity(const std::string& op, int m) {
+std::size_t capacity(const std::string& op, int m, int first = 0) {
     if (op == "post") return 0;
     auto query = ops::mhc_pre_workspace_capacity_bytes;
     if (op == "expand-pre") query = ops::mhc_expand_pre_workspace_capacity_bytes;
     if (op == "post-pre") query = ops::mhc_post_pre_workspace_capacity_bytes;
     if (op == "post-mean-norm") query = ops::mhc_post_mean_norm_workspace_capacity_bytes;
-    return query({D, S}, device_context().multiprocessor_count(), m, m);
+    return query({D, S}, device_context().multiprocessor_count(), first ? first : m, m);
 }
 
 std::size_t semantic_bytes(const Options& options, int m) {
@@ -125,7 +129,7 @@ struct Fixture {
           c(make_f32(S * S * m, 7117, 0.01F, 0.5F)), r(make_zeros(std::size_t(K) * m * 2)),
           u(make_zeros(std::size_t(D) * m * 2)), nq(make_zeros(S * m * 4)),
           nc(make_zeros(S * S * m * 4)), backup(o.alias ? make_zeros(x.size()) : DeviceBuffer{}),
-          capacity(::capacity(o.op, m)), scratch(device_context().device(), capacity),
+          capacity(::capacity(o.op, m, 1)), scratch(device_context().device(), capacity),
           arena(scratch.span()), tx(x.span(), DType::BF16, {D, S, m}),
           ty(y.span(), DType::BF16, {D, m}),
           tr(o.alias ? x.span() : r.span(), DType::BF16, {D, S, m}),
@@ -140,11 +144,27 @@ struct Fixture {
             CUDA_CHECK(cudaMemcpy(backup.data(), x.data(), x.size(), cudaMemcpyDeviceToDevice));
     }
 
+    void reset_columns(int columns) {
+        if (columns <= 0 || std::size_t(columns) * K * 2 > x.size())
+            throw std::invalid_argument("mHC fixture column capacity");
+        m            = columns;
+        tx           = Tensor(x.span(), DType::BF16, {D, S, m});
+        ty           = Tensor(y.span(), DType::BF16, {D, m});
+        tr           = Tensor(options.alias ? x.span() : r.span(), DType::BF16, {D, S, m});
+        coefficients = {Tensor(q.span(), DType::FP32, {S, m}),
+                        Tensor(c.span(), DType::FP32, {S, S, m})};
+        output       = {
+            Tensor(u.span(), DType::BF16, {D, m}),
+            {Tensor(nq.span(), DType::FP32, {S, m}), Tensor(nc.span(), DType::FP32, {S, S, m})}};
+        capacity = ::capacity(options.op, m);
+        arena    = MemoryArena(scratch.span().subspan(0, capacity));
+    }
+
     void restore(CudaExecutionView e) {
         condition_gpu(e, options.condition_us);
         if (options.alias)
-            CUDA_CHECK(cudaMemcpyAsync(x.data(), backup.data(), x.size(), cudaMemcpyDeviceToDevice,
-                                       e.stream()));
+            CUDA_CHECK(cudaMemcpyAsync(x.data(), backup.data(), std::size_t(m) * K * 2,
+                                       cudaMemcpyDeviceToDevice, e.stream()));
     }
 
     void launch(CudaExecutionView e) {
@@ -191,8 +211,11 @@ int main(int argc, char** argv) {
             o.timing.csv_out,
             "alias,semantic_bytes,logical_gb_s,bandwidth_reference_us,projection_"
             "flops,bf16_mma_reference_us,calls,sites,base_type,scale_type,gamma_type");
+        Fixture f(
+            o, std::max(o.reserve_columns, *std::max_element(o.columns.begin(), o.columns.end())),
+            projections);
         for (int m : o.columns) {
-            Fixture f(o, m, projections);
+            f.reset_columns(m);
             for (const auto& execution :
                  measurement::selections(o.timing.execution, "graph", "eager"))
                 for (const auto& cache : measurement::selections(o.timing.cache, "cold", "warm")) {

@@ -38,7 +38,13 @@ __global__ __launch_bounds__(Tokens == 8 ? 512 : 256, 2) void __cluster_dims__(C
     auto cluster   = cooperative_groups::this_cluster();
     const int rank = cluster.block_rank(), tid = threadIdx.x, lane = tid & 31, warp = tid / 32;
     const auto first_tile = tile_offset + blockIdx.x / Cluster;
-    auto tile             = first_tile;
+    __shared__ ClusterBarrier gate_ready[Tokens], norm_ready[Tokens];
+    if (tid < Tokens) {
+        init_cluster_barrier(gate_ready + tid, 1);
+        init_cluster_barrier(norm_ready + tid, Cluster);
+    }
+    unsigned phase = 0;
+    auto tile      = first_tile;
     do {
         const std::int64_t m0 = tile * Tokens;
 
@@ -156,10 +162,6 @@ __global__ __launch_bounds__(Tokens == 8 ? 512 : 256, 2) void __cluster_dims__(C
             for (int k = 0; k < KParts; ++k) value += data[(k * Tokens + warp) * 32 + lane];
             data[warp * 32 + lane] = value;
         }
-        auto* ready      = reinterpret_cast<unsigned*>(data + KParts * Tokens * 32);
-        auto* gate_ready = ready + Tokens;
-        if (tid < Tokens) ready[tid] = 0;
-        if (tid == 0) *gate_ready = 0;
         cluster.sync();
         auto* pre  = data + Tokens * 32;
         auto* norm = pre + Tokens * 4;
@@ -173,9 +175,15 @@ __global__ __launch_bounds__(Tokens == 8 ? 512 : 256, 2) void __cluster_dims__(C
                 for (int c = 0; c < Cluster; ++c)
                     value += cluster.map_shared_rank(data, c)[rank * 32 + lane];
             }
-            logit = activate_coefficients(o, value, m0 + rank, pre, m0 + rank < o.columns);
+            logit =
+                activate_coefficients(o, value, m0 + rank, pre + rank * 4, m0 + rank < o.columns);
             __syncwarp();
-            if (lane == 0) publish_cluster_value(gate_ready);
+            const auto gates = common::F32Vector<4>::load(pre + rank * 4);
+            __syncwarp();
+            if (lane < Cluster) {
+                gates.store(cluster.map_shared_rank(pre, lane) + rank * 4);
+                arrive_cluster_barrier(cluster.map_shared_rank(gate_ready, lane) + rank);
+            }
         }
         // The owner finishes Sinkhorn while workers acquire the gates, collapse the
         // retained residual and reduce the branch RMS without waiting for Sinkhorn.
@@ -184,11 +192,11 @@ __global__ __launch_bounds__(Tokens == 8 ? 512 : 256, 2) void __cluster_dims__(C
         if (warp < Tokens) {
             if (warp == 0 && m0 + rank < o.columns) sinkhorn(o, logit, m0 + rank);
         } else {
-            wait_cluster_value(cluster.map_shared_rank(gate_ready, token));
-            auto* remote_pre = cluster.map_shared_rank(pre, token);
+            wait_cluster_barrier(gate_ready + token, phase);
+            auto* local_pre = pre + token * 4;
             float gates[4];
 #pragma unroll
-            for (int i = 0; i < 4; ++i) gates[i] = remote_pre[i];
+            for (int i = 0; i < 4; ++i) gates[i] = local_pre[i];
 #pragma unroll
             for (int g = 0; g < Groups; ++g) {
                 int d = (g * Wpt * 32 + local * 32 + lane) * V;
@@ -218,13 +226,15 @@ __global__ __launch_bounds__(Tokens == 8 ? 512 : 256, 2) void __cluster_dims__(C
             square = common::warp_reduce_sum(square);
             // One warp owns this token's complete local collapse. Publish it without
             // waiting for the other tokens; each consumer needs only its own norm.
-            if (lane == 0) {
-                norm[token] = square;
-                publish_cluster_value(ready + token);
+            square = __shfl_sync(0xffffffffu, square, 0);
+            if (lane < Cluster) {
+                cluster.map_shared_rank(norm, lane)[token * Cluster + rank] = square;
+                arrive_cluster_barrier(cluster.map_shared_rank(norm_ready, lane) + token);
             }
             if constexpr (F == Form::Pre) {
                 const auto next_m0 = (tile + gridDim.x / Cluster) * Tokens;
                 if (next_m0 < o.columns) {
+                    __syncwarp();
                     // This warp has finished every read of its token's old residual.
                     // Fill the same shared slice while the current norm/output retires.
                     // The next iteration's first F wait also waits for this copy group.
@@ -245,9 +255,8 @@ __global__ __launch_bounds__(Tokens == 8 ? 512 : 256, 2) void __cluster_dims__(C
                     common::cp_commit();
                 }
             }
-            if (lane < Cluster) wait_cluster_value(cluster.map_shared_rank(ready, lane) + token);
-            __syncwarp();
-            float ss      = lane < Cluster ? cluster.map_shared_rank(norm, lane)[token] : 0.f;
+            wait_cluster_barrier(norm_ready + token, phase);
+            float ss      = lane < Cluster ? norm[token * Cluster + lane] : 0.f;
             ss            = common::warp_reduce_sum(ss);
             float inverse = 0;
             if (lane == 0) inverse = rsqrtf(ss / kHidden + o.parameters.branch_epsilon);
@@ -274,9 +283,10 @@ __global__ __launch_bounds__(Tokens == 8 ? 512 : 256, 2) void __cluster_dims__(C
                 }
             }
         }
-        // Every remote gate/norm read must complete before any CTA retires shared memory.
+        // Every DSM publication must complete before any CTA reuses or retires shared memory.
         cluster.sync();
         if constexpr (F != Form::Pre) break;
+        phase ^= 1;
         tile += gridDim.x / Cluster;
     } while (tile * Tokens < o.columns);
 }

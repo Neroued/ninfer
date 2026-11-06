@@ -42,14 +42,10 @@ __global__ void expand_finish_kernel(Operands o, const float* partial, int parts
     }
     __syncthreads();
     if (warp == 0) {
-        if constexpr (Dependent) {
-            if (o.parameters.sinkhorn_iterations == 20)
-                sinkhorn<20>(o, logit, m);
-            else
-                sinkhorn(o, logit, m);
-        } else {
+        if (o.parameters.sinkhorn_iterations == 20)
+            sinkhorn<20>(o, logit, m);
+        else
             sinkhorn(o, logit, m);
-        }
     } else {
 #pragma unroll
         for (int group = 0; group < Groups; ++group) {

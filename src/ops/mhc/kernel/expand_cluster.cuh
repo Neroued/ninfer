@@ -32,6 +32,8 @@ __global__ __launch_bounds__(Threads, 3) void __cluster_dims__(8, 1, 1)
     auto* data   = reinterpret_cast<float*>(a);
     auto cluster = cooperative_groups::this_cluster();
     int rank = cluster.block_rank(), tid = threadIdx.x, lane = tid & 31, warp = tid / 32;
+    __shared__ ClusterBarrier gate_ready[Tokens];
+    if (tid < Tokens) init_cluster_barrier(gate_ready + tid, 1);
     const std::int64_t m0 = (tile_offset + std::int64_t(blockIdx.x / 8)) * Tokens;
     for (int i = tid * 8; i < Tokens * H; i += Threads * 8) {
         int t = i / H, d = i % H;
@@ -110,8 +112,6 @@ __global__ __launch_bounds__(Threads, 3) void __cluster_dims__(8, 1, 1)
             data[i] = value;
         }
     }
-    auto* ready = reinterpret_cast<unsigned*>(data + KParts * Tokens * 32);
-    if (!tid) *ready = 0;
     cluster.sync();
     auto* pre  = data + Tokens * 32;
     auto* gain = pre + 4;
@@ -126,10 +126,11 @@ __global__ __launch_bounds__(Threads, 3) void __cluster_dims__(8, 1, 1)
         float square = __shfl_sync(0xffffffffu, value, 24),
               logit  = activate_coefficients(o, value, m0 + rank, pre, m0 + rank < o.columns);
         __syncwarp();
-        if (!lane) {
-            float gate = (pre[0] + pre[1]) + (pre[2] + pre[3]);
-            *gain      = gate * rsqrtf(gate * gate * square / kWidth + o.parameters.branch_epsilon);
-            publish_cluster_value(ready);
+        float gate   = (pre[0] + pre[1]) + (pre[2] + pre[3]);
+        float factor = gate * rsqrtf(gate * gate * square / kWidth + o.parameters.branch_epsilon);
+        if (lane < Tokens) {
+            cluster.map_shared_rank(gain, lane)[rank] = factor;
+            arrive_cluster_barrier(cluster.map_shared_rank(gate_ready, lane) + rank);
         }
         if (m0 + rank < o.columns) sinkhorn(o, logit, m0 + rank);
     } else {
@@ -153,8 +154,8 @@ __global__ __launch_bounds__(Threads, 3) void __cluster_dims__(8, 1, 1)
                                  : "memory");
                 }
             }
-            wait_cluster_value(cluster.map_shared_rank(ready, t));
-            float factor = *cluster.map_shared_rank(gain, t);
+            wait_cluster_barrier(gate_ready + t, 0);
+            float factor = gain[t];
             if (m0 + t < o.columns) {
                 common::Bf16Vector<8> out;
 #pragma unroll
@@ -166,7 +167,7 @@ __global__ __launch_bounds__(Threads, 3) void __cluster_dims__(8, 1, 1)
             }
         }
     }
-    // Remote gain readers must finish before their owner's shared memory retires.
+    // All DSM producers and consumers finish before any CTA retires shared memory.
     cluster.sync();
 }
 } // namespace ninfer::ops::detail::mhc

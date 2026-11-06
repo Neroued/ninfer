@@ -109,9 +109,9 @@ int validate(Form form, CudaExecutionView e) {
     }
     if (auto query = capacity_query(form)) {
         const int sm = e.multiprocessor_count();
-        for (const auto interval :
-             {std::pair{1, 17}, std::pair{7, 128}, std::pair{15, 17}, std::pair{127, 129},
-              std::pair{511, 513}, std::pair{607, 609}, std::pair{1023, 1025}}) {
+        for (const auto interval : {std::pair{1, 4097}, std::pair{1, 17}, std::pair{7, 128},
+                                    std::pair{15, 17}, std::pair{127, 129}, std::pair{511, 513},
+                                    std::pair{607, 609}, std::pair{1023, 1025}}) {
             std::size_t maximum = 0;
             for (int m = interval.first; m <= interval.second; ++m)
                 maximum = std::max(maximum, query({D, S}, sm, m, m));

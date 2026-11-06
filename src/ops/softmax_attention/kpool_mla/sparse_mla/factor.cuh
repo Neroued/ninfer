@@ -21,15 +21,18 @@ __device__ __forceinline__ int row_factor_offset(int row, int column) {
 // chip. Both maps reuse a weight tile across queries, including different requests.
 template <bool Key, int Queries, int Rows = 64, int K = 32, bool Direct = false, bool Merge = false,
           bool Fp8 = false, bool Mxfp8 = false>
-__global__ __launch_bounds__(Rows > 64 ? 256 : 128) void mla_factor_kernel(
-    const __grid_constant__ SparseMlaArguments a) {
+__global__
+__launch_bounds__(Rows > 128 ? 512
+                  : Rows > 64
+                      ? 256
+                      : 128) void mla_factor_kernel(const __grid_constant__ SparseMlaArguments a) {
     if constexpr (Key)
         if (a.direct) return;
     constexpr int Outputs = Key ? 512 : 256, Reduction = Key ? 256 : 512;
-    constexpr int Threads  = Rows > 64 ? 256 : 128;
+    constexpr int Threads  = Rows > 128 ? 512 : Rows > 64 ? 256 : 128;
     constexpr int WarpRows = Rows / 16, WarpColumns = Threads / 32 / WarpRows,
                   PerWarp = Queries / WarpColumns;
-    static_assert(Rows == 32 || Rows == 64 || Rows == 128);
+    static_assert(Rows == 32 || Rows == 64 || Rows == 128 || (!Key && Rows == 256));
     static_assert(PerWarp % 8 == 0);
     const int tid = threadIdx.x, lane = tid % 32, warp = tid / 32;
     const int warp_row = warp % WarpRows, warp_column = warp / WarpRows * PerWarp;

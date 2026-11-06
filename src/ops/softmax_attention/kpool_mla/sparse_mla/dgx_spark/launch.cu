@@ -42,7 +42,7 @@ void factor_format(SparseMlaArguments a, cudaStream_t stream) {
         Key && a.direct
             ? dim3(1)
             : dim3(((a.width + Queries - 1) / Queries) * ((Key ? 512 : 256) / Rows), 64);
-    constexpr int threads = Rows > 64 ? 256 : 128;
+    constexpr int threads = Rows > 128 ? 512 : Rows > 64 ? 256 : 128;
     kernel<<<grid, threads, shared, stream>>>(a);
 }
 
@@ -56,6 +56,24 @@ void factor(SparseMlaArguments a, cudaStream_t stream) {
 
 template <bool Key, bool Direct = false, bool Fp8 = false>
 void factor(SparseMlaArguments a, MlaFactorSchedule schedule, cudaStream_t stream) {
+    if constexpr (Key) {
+        if (a.key_mxfp8 && a.width >= 9 && a.width <= 32) {
+            factor<Key, Direct, 32, 128, 64, false, Fp8>(a, stream);
+            return;
+        }
+        if (a.key_mxfp8 && a.width >= 33 && a.width <= 64) {
+            factor<Key, Direct, 64, 128, 64, false, Fp8>(a, stream);
+            return;
+        }
+    }
+    if (!Key && a.value_mxfp8 && a.width >= 25 && a.width <= 32) {
+        factor<Key, Direct, 32, 64, 64, false, Fp8>(a, stream);
+        return;
+    }
+    if (!Key && a.value_mxfp8 && a.width >= 33 && a.width <= 48) {
+        factor<Key, Direct, 16, 64, 64, false, Fp8>(a, stream);
+        return;
+    }
     if ((Key ? a.key_mxfp8 : a.value_mxfp8) && a.width <= 8) {
         factor<Key, Direct, 8, 64, 64, false, Fp8>(a, stream);
         return;
@@ -124,7 +142,10 @@ void launch_sparse_mla(SparseMlaArguments a, MemorySpan scratch,
                     factor<true, false, 16, 128, 128, false, true>(a, stream);
                 break;
             case MlaFactorSchedule::Medium:
-                factor<true, false, 32, 128, 128, false, true>(a, stream);
+                if (a.key_mxfp8)
+                    factor<true, false, 32, 128, 64, false, true>(a, stream);
+                else
+                    factor<true, false, 32, 128, 128, false, true>(a, stream);
                 break;
             case MlaFactorSchedule::Bulk:
                 factor<true, false, 32, 128, 64, false, true>(a, stream);
@@ -155,9 +176,14 @@ void launch_sparse_mla(SparseMlaArguments a, MemorySpan scratch,
         if (plan.merge_value) merge.splits = 1;
         const int merge_blocks = merge.splits > 1 ? a.width * 64 : 1;
         mla_merge_kernel<<<merge_blocks, 256, 0, stream>>>(merge);
-        if (plan.merge_value)
-            factor<false, false, 8, 64, 128, true>(a, stream);
-        else if (a.direct) {
+        if (plan.merge_value) {
+            if (a.width <= 8)
+                factor<false, false, 8, 256, 64, true>(a, stream);
+            else if (fp8 && a.value_mxfp8)
+                factor<false, false, 32, 128, 64, true>(a, stream);
+            else
+                factor<false, false, 8, 64, 128, true>(a, stream);
+        } else if (a.direct) {
             if (fp8)
                 factor<false, true, true>(a, plan.factor, stream);
             else

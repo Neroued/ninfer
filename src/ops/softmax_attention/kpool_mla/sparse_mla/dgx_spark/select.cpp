@@ -45,11 +45,7 @@ SparseMlaPlan sparse_mla_plan(const KpoolSparseMlaProfile& profile, KpoolMlaStor
                                    ? MlaAttentionSchedule::Small
                                    : MlaAttentionSchedule::Bulk;
     }
-    const bool native_factors =
-        profile.key_format == QType::MXFP8 && profile.value_format == QType::MXFP8;
-    p.tile   = p.attention == MlaAttentionSchedule::Small     ? 16
-               : fp8 && columns >= (native_factors ? 49 : 64) ? 64
-                                                              : 32;
+    p.tile   = p.attention == MlaAttentionSchedule::Small ? 16 : fp8 && columns >= 49 ? 64 : 32;
     p.direct = bound <= 1;
     p.splits = 1;
     if (p.direct) return p;
@@ -58,12 +54,21 @@ SparseMlaPlan sparse_mla_plan(const KpoolSparseMlaProfile& profile, KpoolMlaStor
         p.splits          = std::clamp<std::int64_t>(target / (columns * 2), 1, 32);
     } else if (columns <= sms / 2)
         p.splits = std::min(32, sms / columns);
+    const bool native_value = profile.value_format == QType::MXFP8;
+    const bool widen_small =
+        fp8 ? !(envelope.max_visible_tokens > 65536 && !native_value && columns >= 5 &&
+                columns <= 6)
+            : native_value && envelope.max_visible_tokens <= 65536 && columns >= 6;
+    if (widen_small && batch == 1 && columns >= 4 && columns <= 8)
+        p.splits = std::max(1, sms / columns);
     if (short_context && columns >= 4) p.splits = 1;
     if (fp8 && p.tile == 64) p.splits = 1;
     p.splits = std::min(p.splits, std::max(1, (bound + p.tile - 1) / p.tile));
-    // Two partials fit the fused value map's on-chip reduction without the
-    // repeated partial traffic that outweighs fusion at larger split counts.
-    p.merge_value = columns > 16 && p.splits == 2;
+    // Tiny native-factor calls give one CTA the complete output head, so merge
+    // reads each partial once. Wider calls fuse only the two-partial route.
+    p.merge_value =
+        (profile.value_format == QType::MXFP8 && columns >= 5 && columns <= 8 && p.splits > 1) ||
+        (columns > 16 && p.splits == 2);
     LayoutBuilder builder;
     if (fp8) {
         p.query_fp8 =

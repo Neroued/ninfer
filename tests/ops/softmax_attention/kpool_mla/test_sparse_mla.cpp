@@ -102,6 +102,24 @@ int run(int T, int B, int E, int cap = 512, bool ragged = false, bool frozen = f
     return verify(f);
 }
 
+int token_sweep(bool fp8, bool mx) {
+    auto& d = cuda_environment().context;
+    const std::vector<int> tokens{1, 3, 8, 17};
+    kp::SparseMlaFixture f(d.execution_view(), 17, 2, 8192, 512, 1, true, false, 1, 1,
+                           fp8 ? ops::KpoolMlaStorage::Fp8E4m3fnGroup128Ue8m0
+                               : ops::KpoolMlaStorage::BFloat16,
+                           KvCacheVectorFormat::BFloat16, 0, 0, tokens);
+    if (mx) f.encode_factors(d.execution_view());
+    int failures = 0;
+    for (int t : {17, 1, 8, 3, 17}) {
+        f.reset_tokens(t, 512, true, false, 1, d.execution_view());
+        f.launch(d.execution_view());
+        d.synchronize();
+        failures += verify(f);
+    }
+    return failures;
+}
+
 int empty(bool fp8 = false) {
     auto& d = cuda_environment().context;
     kp::SparseMlaFixture f(d.execution_view(), 4, 2, 8196, 0, 1, false, true, 1, 1,
@@ -291,10 +309,12 @@ int read_footprint(bool fp8 = false) {
     return verify(f);
 }
 
-int workspace_interval(bool fp8 = false) {
+int workspace_interval(bool fp8 = false, bool mx = false) {
     const auto capacity = [=](int B, int lo, int hi, unsigned E) {
+        auto profile       = ops::KpoolSparseMlaProfile{64, 256, 256, 512};
+        profile.key_format = profile.value_format = mx ? QType::MXFP8 : QType::BF16;
         return ops::kpool_sparse_mla_workspace_capacity_bytes(
-            {64, 256, 256, 512},
+            profile,
             fp8 ? ops::KpoolMlaStorage::Fp8E4m3fnGroup128Ue8m0 : ops::KpoolMlaStorage::BFloat16,
             {E}, B, lo, hi, 48);
     };
@@ -340,6 +360,11 @@ int admission() {
 
 int main(int argc, char** argv) {
     OpSuite suite;
+    for (bool fp8 : {false, true})
+        for (bool mx : {false, true})
+            suite.add("kpool_sparse_mla/token_sweep/" + std::to_string(fp8) + "/" +
+                          std::to_string(mx),
+                      [=] { return token_sweep(fp8, mx); });
     const auto add = [&](std::string id, std::function<int()> run, bool graph = false) {
         suite.add(std::move(id), std::move(run),
                   {{"format", "bf16"}, {"execution", graph ? "graph" : "eager"}});
@@ -437,6 +462,19 @@ int main(int argc, char** argv) {
                           std::to_string(E),
                       [=] { return run(T, B, E, 17, B > 1, false, 1, fp8, false, true); },
                       {{"format", "mxfp8"}});
+        suite.add(prefix + "workspace_interval", [=] { return workspace_interval(fp8, true); },
+                  {{"format", "mxfp8"}});
+        suite.add(prefix + "merge_full_selection",
+                  [=] { return run(18, 1, 8195, 512, false, false, 4, fp8, false, true); },
+                  {{"format", "mxfp8"}});
+        suite.add(prefix + "small_full_selection",
+                  [=] { return run(8, 1, 8195, 512, false, false, 4, fp8, false, true); },
+                  {{"format", "mxfp8"}});
+        suite.add(prefix + "small_graph", [=] { return graph(fp8, true, 2); },
+                  {{"format", "mxfp8"}, {"execution", "graph"}});
+        suite.add(prefix + "full_selection",
+                  [=] { return run(32, 1, 8195, 512, false, false, 4, fp8, false, true); },
+                  {{"format", "mxfp8"}});
         suite.add(prefix + "graph", [=] { return graph(fp8, true, 17); },
                   {{"format", "mxfp8"}, {"execution", "graph"}});
     }

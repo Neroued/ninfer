@@ -11,7 +11,7 @@ namespace kp = ninfer::tool::kpool;
 int main(int argc, char** argv) {
     try {
         measurement::Options options;
-        std::vector<int> tokens{1, 2, 4, 8, 16, 32, 64};
+        std::vector<int> tokens{1, 2, 4, 8, 16, 32, 64}, reserve_tokens;
         int batch = 1, end = 8192, layers = 11, selected = 512, selection_span = 1;
         int shared_prefix = 0, envelope = 0;
         bool ragged = false, frozen = false, mxfp8 = false;
@@ -23,6 +23,7 @@ int main(int argc, char** argv) {
                 std::cout
                     << "Complete latent Sparse MLA: U_K, attention, U_V.\n"
                        "  --tokens N,... --batch 1..8 --end E --layers 1|11\n"
+                       "  --reserve-tokens N,...  preserve the cache layout of a wider sweep\n"
                        "  --selected 0..512 --ragged 0|1 --frozen 0|1\n"
                        "  --selection-span N  share each selection across N consecutive queries\n"
                        "  --latent-cache bf16|fp8 --index-cache bf16|fp8\n"
@@ -36,7 +37,9 @@ int main(int argc, char** argv) {
             if (i + 1 >= argc) throw std::invalid_argument("missing flag value: " + flag);
             const std::string value = argv[++i];
             if (measurement::parse(options, flag, value)) continue;
-            if (flag == "--tokens")
+            if (flag == "--reserve-tokens")
+                reserve_tokens = measurement::integers(value);
+            else if (flag == "--tokens")
                 tokens = measurement::integers(value);
             else if (flag == "--factor-format" && (value == "bf16" || value == "mxfp8"))
                 mxfp8 = value == "mxfp8";
@@ -72,6 +75,16 @@ int main(int argc, char** argv) {
         measurement::hardware();
         auto& device = device_context();
         L2FlushBuffer flush(options.flush_bytes);
+        reserve_tokens.insert(reserve_tokens.end(), tokens.begin(), tokens.end());
+        std::sort(reserve_tokens.begin(), reserve_tokens.end());
+        reserve_tokens.erase(std::unique(reserve_tokens.begin(), reserve_tokens.end()),
+                             reserve_tokens.end());
+        const int max_tokens = *std::max_element(reserve_tokens.begin(), reserve_tokens.end());
+        if (max_tokens > end) throw std::invalid_argument("tokens exceed --end");
+        kp::SparseMlaFixture f(device.execution_view(), max_tokens, batch, end, selected, layers,
+                               ragged, frozen, 1, selection_span, storage, index_format,
+                               shared_prefix, envelope, reserve_tokens);
+        if (mxfp8) f.encode_factors(device.execution_view());
         measurement::Csv csv(
             options.csv_out,
             "factor_format,end,selected_cap,frozen,selection_span,nonempty_queries,nontrivial_"
@@ -81,11 +94,7 @@ int main(int argc, char** argv) {
             "factor_bytes,query_bytes,output_bytes,metadata_bytes,factor_flops,attention_flops,"
             "useful_TFLOps,qk_flops,pv_flops,index_storage,shared_prefix,envelope");
         for (int T : tokens) {
-            if (T > end) throw std::invalid_argument("tokens exceed --end");
-            kp::SparseMlaFixture f(device.execution_view(), T, batch, end, selected, layers, ragged,
-                                   frozen, 1, selection_span, storage, index_format, shared_prefix,
-                                   envelope);
-            if (mxfp8) f.encode_factors(device.execution_view());
+            f.reset_tokens(T, selected, ragged, frozen, selection_span, device.execution_view());
             std::uint64_t nonempty = 0, nontrivial = 0, visits = 0, attention_visits = 0;
             std::unordered_set<std::size_t> unique;
             std::unordered_set<int> selection, requests;

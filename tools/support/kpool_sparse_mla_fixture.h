@@ -38,7 +38,8 @@ struct SparseMlaFixture {
                      float magnitude = 1, int selection_span = 1,
                      ops::KpoolMlaStorage storage     = ops::KpoolMlaStorage::BFloat16,
                      KvCacheVectorFormat index_format = KvCacheVectorFormat::BFloat16,
-                     int shared_prefix = 0, int max_visible = 0)
+                     int shared_prefix = 0, int max_visible = 0,
+                     const std::vector<int>& sweep_tokens = {})
         : T(tokens), B(batch), E(end), P(std::max(1, (std::max(end, max_visible) + 63) / 64)),
           layers(layer_count), layer(layers / 2),
           query(cuda.device(), DType::BF16, {256, 64, T, B}),
@@ -62,30 +63,14 @@ struct SparseMlaFixture {
         std::fill(counts.host.begin(), counts.host.end(), -1);
         std::fill(ends.host.begin(), ends.host.end(), -1);
         std::fill(tables.host.begin(), tables.host.end(), -1);
-        std::set<std::pair<int, int>> pages;
-        for (int b = 0; b < B; ++b) {
-            valid.at(b)     = !E || (ragged && b == B - 1) ? 0 : ragged ? std::max(1, T - b) : T;
-            selectors.at(b) = valid.at(b) ? B - 1 - b : -1;
-            for (int t = 0; t < T; ++t) {
-                positions.at(t, b)      = t < valid.at(b) ? E - T + t : -1;
-                const int source        = t / selection_span * selection_span;
-                const int row           = b * T + T - 1 - source;
-                selection_rows.at(t, b) = t < valid.at(b) ? row : -1;
-                if (t >= valid.at(b)) continue;
-                if (t != source) continue;
-                const int e = frozen ? E - T : E - T + t + 1, c = e / 4;
-                counts.at(row) = std::min(cap, c);
-                ends.at(row)   = e;
-                int stride     = 503;
-                while (c && std::gcd(stride, c) != 1) stride += 2;
-                for (int i = 0; i < counts.at(row); ++i) {
-                    const int g    = (std::int64_t(i) * stride + t + 17 * b) % c;
-                    ids.at(i, row) = g;
-                    pages.emplace(b, g / 16);
-                }
-                if (e % 4) pages.emplace(b, e / 64);
-            }
+        auto pages = selection_metadata(cap, ragged, frozen, selection_span);
+        for (int extent : sweep_tokens) {
+            reshape_tokens(extent);
+            auto extra = selection_metadata(cap, ragged, frozen, selection_span);
+            pages.merge(extra);
         }
+        reshape_tokens(tokens);
+        (void)selection_metadata(cap, ragged, frozen, selection_span);
         std::map<std::pair<int, int>, int> physical;
         for (auto [b, p] : pages)
             physical.emplace(std::pair{p < shared_prefix / 64 ? 0 : b + 1, p}, 0);
@@ -119,6 +104,75 @@ struct SparseMlaFixture {
         upload_latent();
         scratch = DeviceBuffer(cuda.device(), workspace_bytes + 512);
         scratch.fill(0xa5);
+        workspace = std::make_unique<MemoryArena>(scratch.span().subspan(256, workspace_bytes));
+    }
+
+    // Host-only metadata construction is shared by fixtures and fixed-address
+    // benchmark sweeps; the latter reserve the union of referenced native pages.
+    std::set<std::pair<int, int>> selection_metadata(int cap, bool ragged, bool frozen,
+                                                     int selection_span) {
+        std::set<std::pair<int, int>> pages;
+        for (int b = 0; b < B; ++b) {
+            valid.at(b)     = !E || (ragged && b == B - 1) ? 0 : ragged ? std::max(1, T - b) : T;
+            selectors.at(b) = valid.at(b) ? B - 1 - b : -1;
+            for (int t = 0; t < T; ++t) {
+                positions.at(t, b)      = t < valid.at(b) ? E - T + t : -1;
+                const int source        = t / selection_span * selection_span;
+                const int row           = b * T + T - 1 - source;
+                selection_rows.at(t, b) = t < valid.at(b) ? row : -1;
+                if (t >= valid.at(b)) continue;
+                if (t != source) continue;
+                const int e = frozen ? E - T : E - T + t + 1, c = e / 4;
+                counts.at(row) = std::min(cap, c);
+                ends.at(row)   = e;
+                int stride     = 503;
+                while (c && std::gcd(stride, c) != 1) stride += 2;
+                for (int i = 0; i < counts.at(row); ++i) {
+                    const int g    = (std::int64_t(i) * stride + t + 17 * b) % c;
+                    ids.at(i, row) = g;
+                    pages.emplace(b, g / 16);
+                }
+                if (e % 4) pages.emplace(b, e / 64);
+            }
+        }
+        return pages;
+    }
+
+    void reshape_tokens(int tokens) {
+        if (tokens <= 0 || (E && tokens > E) || std::size_t(tokens) * B > counts.host.size())
+            throw std::invalid_argument("Sparse MLA fixture token capacity");
+        T                  = tokens;
+        const auto reshape = [](auto& buffer, std::initializer_list<int> shape) {
+            auto v      = Tensor::metadata(buffer.view.dtype, shape);
+            v.data      = buffer.view.data;
+            v.device    = buffer.view.device;
+            buffer.view = v;
+        };
+        reshape(query, {256, 64, T, B});
+        reshape(output, {256, 64, T, B});
+        reshape(positions, {T, B});
+        reshape(selection_rows, {T, B});
+        reshape(ids, {512, T * B});
+        reshape(counts, {T * B});
+        reshape(ends, {T * B});
+    }
+
+    void reset_tokens(int tokens, int cap, bool ragged, bool frozen, int selection_span,
+                      CudaExecutionView cuda) {
+        reshape_tokens(tokens);
+        for (auto [b, page] : selection_metadata(cap, ragged, frozen, selection_span))
+            if (tables.at(page, B - 1 - b) < 0)
+                throw std::invalid_argument("Sparse MLA sweep page was not reserved");
+        positions.upload();
+        valid.upload();
+        selectors.upload();
+        selection_rows.upload();
+        ids.upload();
+        counts.upload();
+        ends.upload();
+        workspace_bytes = ops::kpool_sparse_mla_workspace_capacity_bytes(
+            ops::kpool_sparse_mla_profile(factors(), 64), cache.storage, envelope, B, 1, T,
+            cuda.multiprocessor_count());
         workspace = std::make_unique<MemoryArena>(scratch.span().subspan(256, workspace_bytes));
     }
 

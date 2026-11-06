@@ -12,11 +12,20 @@
 
 namespace ninfer::ops::detail {
 
+// FP32 + FP16 in one instruction (FHADD); the half is the low 16 bits of `bits`.
+__device__ __forceinline__ float add_f32_f16(float accumulator, unsigned bits) {
+    asm("add.rn.f32.f16 %0, %1, %0;" : "+f"(accumulator) : "h"(static_cast<unsigned short>(bits)));
+    return accumulator;
+}
+
 struct Fp8KvTiledValues {
     using Scale                      = std::uint8_t;
     using SharedScale                = unsigned;
     static constexpr int kCodeBytes  = 256;
     static constexpr int kScaleItems = 2;
+    // A tile whose V scales stay within 2^1 bounds |V| by 896, so a 64-key sum of P V (P <= 1)
+    // fits FP16 and the tile may accumulate in FP16 before joining the FP32 accumulator.
+    static constexpr bool kHalfAccumulatePv = true;
 
     template <bool SingleFactor>
     __device__ __forceinline__ static int4 expand(const std::uint8_t* codes, SharedScale scale) {
@@ -28,16 +37,23 @@ struct Fp8KvTiledValues {
 };
 
 struct K8V4KvTiledValues {
-    using Scale                      = std::uint8_t;
-    using SharedScale                = Scale;
-    static constexpr int kCodeBytes  = 128;
-    static constexpr int kScaleItems = 16;
+    using Scale                             = std::uint8_t;
+    using SharedScale                       = Scale;
+    static constexpr int kCodeBytes         = 128;
+    static constexpr int kScaleItems        = 16;
+    static constexpr bool kHalfAccumulatePv = false;
 
     template <bool SingleFactor>
     __device__ __forceinline__ static int4 expand(const std::uint8_t* codes, Scale scale) {
         return common::nvfp4_dequant_f16x8(codes, scale);
     }
 };
+
+// Per-tile facts about the V scales, ANDed over the CTA at the tile barrier. SingleFactor lets the
+// half-range decoder expand V; Bounded admits FP16 accumulation of the tile's PV product.
+inline constexpr unsigned kModeSingleFactor = 1u;
+inline constexpr unsigned kModeBounded      = 2u;
+inline constexpr unsigned kModeAll          = kModeSingleFactor | kModeBounded;
 
 // Each warp retains 16 query rows through MXFP8 QK, softmax, and FP16 PV.
 // Values selects the stored V representation; split outputs remain FP32 with
@@ -66,11 +82,13 @@ __global__ __maxnreg__(Schedule::kMaxRegisters) void mxfp8_kv_tiled_mma_kernel(
     float* q_scale      = reinterpret_cast<float*>(q_fp8 + Schedule::kQBytes);
     std::uint8_t* k_fp8 = reinterpret_cast<std::uint8_t*>(
         reinterpret_cast<unsigned char*>(q_scale) + Schedule::kQScaleBytes);
-    std::uint8_t* v_codes = k_fp8 + Schedule::kKBytes;
+    std::uint8_t* v_codes   = k_fp8 + Schedule::kKBytes;
     __half* v_f16           = reinterpret_cast<__half*>(v_codes + Schedule::kVBytes);
     std::uint8_t* k_scale_s = reinterpret_cast<std::uint8_t*>(
         reinterpret_cast<unsigned char*>(v_f16) + Schedule::kVStageBytes);
-    auto* v_scale_s = reinterpret_cast<typename Values::SharedScale*>(k_scale_s + 2 * Bc);
+    auto* v_scale_s  = reinterpret_cast<typename Values::SharedScale*>(k_scale_s + 2 * Bc);
+    auto* tile_flags = reinterpret_cast<unsigned*>(v_scale_s + Bc * Values::kScaleItems);
+    static_assert(!Values::kHalfAccumulatePv || Values::kScaleItems == 2);
 
     const int q_block = static_cast<int>(blockIdx.x);
     const int q_head  = static_cast<int>(blockIdx.y);
@@ -140,7 +158,7 @@ __global__ __maxnreg__(Schedule::kMaxRegisters) void mxfp8_kv_tiled_mma_kernel(
     const unsigned v_as        = (lane >> 4) << 4;
     const unsigned v_r         = b_rin << 4;
     auto issue_kv_scales       = [&](int tile_k0, int cooperative_tid, int cooperative_threads) {
-        bool single_factor               = true;
+        unsigned mode                    = kModeAll;
         const std::int64_t record_offset = block_table[tile_k0 >> kv::kPageShift];
         const int page_offset0           = tile_k0 & (kPagedKVPageSize - 1);
         for (int key_l = cooperative_tid; key_l < Bc; key_l += cooperative_threads) {
@@ -160,7 +178,8 @@ __global__ __maxnreg__(Schedule::kMaxRegisters) void mxfp8_kv_tiled_mma_kernel(
                         // Retain the exponent for tiles requiring the full-range decoder.
                         v_scale_s[2 * key_l + group] =
                             unsigned(__half_as_ushort(factor)) | raw << 16;
-                        single_factor &= raw >= 103 && raw <= 142;
+                        if (raw < 103 || raw > 142) mode &= ~kModeSingleFactor;
+                        if (raw > 128) mode &= ~kModeBounded;
                     }
                 } else {
                     const auto v_off =
@@ -179,7 +198,7 @@ __global__ __maxnreg__(Schedule::kMaxRegisters) void mxfp8_kv_tiled_mma_kernel(
                                       make_int4(0, 0, 0, 0));
             }
         }
-        return single_factor;
+        return mode;
     };
 
     auto issue_kv_codes = [&](int tile_k0, int cooperative_tid, int cooperative_threads) {
@@ -224,29 +243,47 @@ __global__ __maxnreg__(Schedule::kMaxRegisters) void mxfp8_kv_tiled_mma_kernel(
     };
 
     auto issue_kv_tile = [&](int tile_k0, int cooperative_tid, int cooperative_threads) {
-        const bool single_factor = issue_kv_scales(tile_k0, cooperative_tid, cooperative_threads);
+        const unsigned mode = issue_kv_scales(tile_k0, cooperative_tid, cooperative_threads);
         issue_kv_codes(tile_k0, cooperative_tid, cooperative_threads);
-        return single_factor;
+        return mode;
     };
 
-    bool value_half = true;
-    if (key_blocks > 0) value_half = issue_kv_tile(first_owned_tile * Bc, tid, Schedule::kThreads);
+    // Barrier that also ANDs the per-thread tile modes across the CTA. A later barrier always
+    // separates the next write of tile_flags from this read.
+    const auto barrier_and_modes = [&](unsigned local) {
+        if constexpr (Values::kScaleItems == 2) {
+            const unsigned warp_mode = __reduce_and_sync(FullMask, local);
+            if (lane == 0) tile_flags[warp] = warp_mode;
+            __syncthreads();
+            unsigned all = kModeAll;
+#pragma unroll
+            for (int w = 0; w < Schedule::kWarps; ++w) all &= tile_flags[w];
+            return all;
+        } else {
+            __syncthreads();
+            return kModeAll;
+        }
+    };
+    unsigned tile_mode = kModeAll;
+    if (key_blocks > 0) tile_mode = issue_kv_tile(first_owned_tile * Bc, tid, Schedule::kThreads);
     common::cp_wait<0>();
-    if constexpr (Values::kScaleItems == 2)
-        value_half = __syncthreads_and(value_half);
-    else
-        __syncthreads();
+    tile_mode = barrier_and_modes(tile_mode);
 
     float acc[PVNtPerWarp][4]{};
     float m0 = -CUDART_INF_F, m1 = -CUDART_INF_F;
     float l0 = 0.0F, l1 = 0.0F;
-    const float scale_l2      = scale * common::kLog2E;
-    const auto update_softmax = [&](float& maximum, float tile_maximum) {
+    // Scores stay in raw MMA units; each row's query scale joins the softmax scale, so running
+    // maxima are raw and the score*q_scale pass disappears. q_scale >= 0 preserves the order.
+    const float row_scale0    = q_scale_r0 * scale * common::kLog2E;
+    const float row_scale1    = q_scale_r1 * scale * common::kLog2E;
+    const auto update_softmax = [&](float& maximum, float tile_maximum, float row_scale) {
         const float previous = maximum;
         maximum              = fmaxf(maximum, tile_maximum);
-        return previous == -CUDART_INF_F
-                   ? 0.0F
-                   : causal_exp_scaled(previous, maximum * scale_l2, scale_l2);
+        if (previous == -CUDART_INF_F) return 0.0F;
+        // An unchanged maximum rescales by exactly 1; the FMA form would leave a rounding residue.
+        return tile_maximum <= previous ? 1.0F
+                                        : common::exp2_approx_ftz(__fmaf_rn(
+                                              previous, row_scale, -(maximum * row_scale)));
     };
     const auto step = [&]<bool FullTile>(int kb) {
         const int k0             = (first_owned_tile + kb) * Bc;
@@ -263,7 +300,7 @@ __global__ __maxnreg__(Schedule::kMaxRegisters) void mxfp8_kv_tiled_mma_kernel(
             }
         };
         if constexpr (Values::kScaleItems == 2) {
-            if (value_half)
+            if (tile_mode & kModeSingleFactor)
                 expand_values.template operator()<true>();
             else
                 expand_values.template operator()<false>();
@@ -317,17 +354,10 @@ __global__ __maxnreg__(Schedule::kMaxRegisters) void mxfp8_kv_tiled_mma_kernel(
             }
         }
 
-#pragma unroll
-        for (int nt = 0; nt < QKNt; ++nt) {
-            score[nt][0] *= q_scale_r0;
-            score[nt][1] *= q_scale_r0;
-            score[nt][2] *= q_scale_r1;
-            score[nt][3] *= q_scale_r1;
-        }
         // QK is finished with the codes; V has been decoded into its own arena.
         __syncthreads();
-        bool next_half = true;
-        if (kb + 1 < key_blocks) next_half = issue_kv_tile(k0 + Bc, tid, Schedule::kThreads);
+        unsigned next_mode = kModeAll;
+        if (kb + 1 < key_blocks) next_mode = issue_kv_tile(k0 + Bc, tid, Schedule::kThreads);
         const int row0  = warp_row0 + gid;
         const int row1  = warp_row0 + gid + 8;
         const int qrow0 = q0 + row0;
@@ -359,10 +389,10 @@ __global__ __maxnreg__(Schedule::kMaxRegisters) void mxfp8_kv_tiled_mma_kernel(
         bm0 = common::warp_max<4>(bm0, FullMask);
         bm1 = common::warp_max<4>(bm1, FullMask);
 
-        const float alpha0     = update_softmax(m0, bm0);
-        const float alpha1     = update_softmax(m1, bm1);
-        const float nm0_scaled = m0 * scale_l2;
-        const float nm1_scaled = m1 * scale_l2;
+        const float alpha0     = update_softmax(m0, bm0, row_scale0);
+        const float alpha1     = update_softmax(m1, bm1, row_scale1);
+        const float nm0_scaled = m0 * row_scale0;
+        const float nm1_scaled = m1 * row_scale1;
 
         // P = exp2(S - m), repacked into the PV A-fragment layout, plus local block row-sum.
         // The row-sum allreduce is deferred to the epilogue; only row max must be reduced per tile.
@@ -372,13 +402,13 @@ __global__ __maxnreg__(Schedule::kMaxRegisters) void mxfp8_kv_tiled_mma_kernel(
 #pragma unroll
             for (int nt = 0; nt < QKNt; ++nt) {
                 const float p00 =
-                    common::exp2_approx(__fmaf_rn(score[nt][0], scale_l2, -nm0_scaled));
+                    common::exp2_approx_ftz(__fmaf_rn(score[nt][0], row_scale0, -nm0_scaled));
                 const float p01 =
-                    common::exp2_approx(__fmaf_rn(score[nt][1], scale_l2, -nm0_scaled));
+                    common::exp2_approx_ftz(__fmaf_rn(score[nt][1], row_scale0, -nm0_scaled));
                 const float p10 =
-                    common::exp2_approx(__fmaf_rn(score[nt][2], scale_l2, -nm1_scaled));
+                    common::exp2_approx_ftz(__fmaf_rn(score[nt][2], row_scale1, -nm1_scaled));
                 const float p11 =
-                    common::exp2_approx(__fmaf_rn(score[nt][3], scale_l2, -nm1_scaled));
+                    common::exp2_approx_ftz(__fmaf_rn(score[nt][3], row_scale1, -nm1_scaled));
                 bl0 += p00 + p01;
                 bl1 += p10 + p11;
                 const int pk = nt >> 1;
@@ -395,19 +425,19 @@ __global__ __maxnreg__(Schedule::kMaxRegisters) void mxfp8_kv_tiled_mma_kernel(
             for (int nt = 0; nt < QKNt; ++nt) {
                 const float p00 =
                     (score[nt][0] > -CUDART_INF_F)
-                        ? common::exp2_approx(__fmaf_rn(score[nt][0], scale_l2, -nm0_scaled))
+                        ? common::exp2_approx_ftz(__fmaf_rn(score[nt][0], row_scale0, -nm0_scaled))
                         : 0.0f;
                 const float p01 =
                     (score[nt][1] > -CUDART_INF_F)
-                        ? common::exp2_approx(__fmaf_rn(score[nt][1], scale_l2, -nm0_scaled))
+                        ? common::exp2_approx_ftz(__fmaf_rn(score[nt][1], row_scale0, -nm0_scaled))
                         : 0.0f;
                 const float p10 =
                     (score[nt][2] > -CUDART_INF_F)
-                        ? common::exp2_approx(__fmaf_rn(score[nt][2], scale_l2, -nm1_scaled))
+                        ? common::exp2_approx_ftz(__fmaf_rn(score[nt][2], row_scale1, -nm1_scaled))
                         : 0.0f;
                 const float p11 =
                     (score[nt][3] > -CUDART_INF_F)
-                        ? common::exp2_approx(__fmaf_rn(score[nt][3], scale_l2, -nm1_scaled))
+                        ? common::exp2_approx_ftz(__fmaf_rn(score[nt][3], row_scale1, -nm1_scaled))
                         : 0.0f;
                 bl0 += p00 + p01;
                 bl1 += p10 + p11;
@@ -424,12 +454,15 @@ __global__ __maxnreg__(Schedule::kMaxRegisters) void mxfp8_kv_tiled_mma_kernel(
 
         l0 = __fmaf_rn(l0, alpha0, bl0);
         l1 = __fmaf_rn(l1, alpha1, bl1);
+        // A tile that leaves every row maximum unchanged keeps acc as is.
+        if (!__all_sync(FullMask, alpha0 == 1.0F && alpha1 == 1.0F)) {
 #pragma unroll
-        for (int n = 0; n < PVNtPerWarp; ++n) {
-            acc[n][0] *= alpha0;
-            acc[n][1] *= alpha0;
-            acc[n][2] *= alpha1;
-            acc[n][3] *= alpha1;
+            for (int n = 0; n < PVNtPerWarp; ++n) {
+                acc[n][0] *= alpha0;
+                acc[n][1] *= alpha0;
+                acc[n][2] *= alpha1;
+                acc[n][3] *= alpha1;
+            }
         }
 
         // O += P V, contracting over the Bc keys. The (k, n) iteration space is
@@ -439,39 +472,100 @@ __global__ __maxnreg__(Schedule::kMaxRegisters) void mxfp8_kv_tiled_mma_kernel(
         // load against the current pair of MMAs.
         constexpr int PVHalf  = PVNtPerWarp / 2; // 16 n-tile pairs
         constexpr int PVLoads = PVKs * PVHalf;   // 64 x4.trans loads
-        // Swizzled V x4.trans addresses via precomputed per-lane base + immediates.
-        unsigned vf[2][4];
-        {
-            common::ldmatrix_x4_t(vf[0][0], vf[0][1], vf[0][2], vf[0][3],
-                                  common::swizzle_xor_address(v_lane_base, 0u, v_as, v_r));
-        }
-#pragma unroll
-        for (int li = 0; li < PVLoads; ++li) {
-            const int k   = li / PVHalf;
-            const int n2  = (li % PVHalf) * 2;
-            const int cur = li & 1;
-            const int nxt = cur ^ 1;
-            if (li + 1 < PVLoads) {
-                const int k2       = (li + 1) / PVHalf;
-                const int n2b      = ((li + 1) % PVHalf) * 2;
-                const unsigned ckv = static_cast<unsigned>(n2b << 4);
-                common::ldmatrix_x4_t(
-                    vf[nxt][0], vf[nxt][1], vf[nxt][2], vf[nxt][3],
-                    common::swizzle_xor_address(
-                        v_lane_base + static_cast<unsigned>(k2 * (16 * D * 2)), ckv, v_as, v_r));
+        const auto pv_fp32    = [&]() {
+            // Swizzled V x4.trans addresses via precomputed per-lane base + immediates.
+            unsigned vf[2][4];
+            {
+                common::ldmatrix_x4_t(vf[0][0], vf[0][1], vf[0][2], vf[0][3],
+                                         common::swizzle_xor_address(v_lane_base, 0u, v_as, v_r));
             }
-            common::mma_f16(acc[n2][0], acc[n2][1], acc[n2][2], acc[n2][3], p_frag[k][0],
-                            p_frag[k][1], p_frag[k][2], p_frag[k][3], vf[cur][0], vf[cur][1]);
-            common::mma_f16(acc[n2 + 1][0], acc[n2 + 1][1], acc[n2 + 1][2], acc[n2 + 1][3],
-                            p_frag[k][0], p_frag[k][1], p_frag[k][2], p_frag[k][3], vf[cur][2],
-                            vf[cur][3]);
-        }
+#pragma unroll
+            for (int li = 0; li < PVLoads; ++li) {
+                const int k   = li / PVHalf;
+                const int n2  = (li % PVHalf) * 2;
+                const int cur = li & 1;
+                const int nxt = cur ^ 1;
+                if (li + 1 < PVLoads) {
+                    const int k2       = (li + 1) / PVHalf;
+                    const int n2b      = ((li + 1) % PVHalf) * 2;
+                    const unsigned ckv = static_cast<unsigned>(n2b << 4);
+                    common::ldmatrix_x4_t(
+                        vf[nxt][0], vf[nxt][1], vf[nxt][2], vf[nxt][3],
+                        common::swizzle_xor_address(v_lane_base +
+                                                        static_cast<unsigned>(k2 * (16 * D * 2)),
+                                                    ckv, v_as, v_r));
+                }
+                common::mma_f16(acc[n2][0], acc[n2][1], acc[n2][2], acc[n2][3], p_frag[k][0],
+                                p_frag[k][1], p_frag[k][2], p_frag[k][3], vf[cur][0], vf[cur][1]);
+                common::mma_f16(acc[n2 + 1][0], acc[n2 + 1][1], acc[n2 + 1][2], acc[n2 + 1][3],
+                                p_frag[k][0], p_frag[k][1], p_frag[k][2], p_frag[k][3], vf[cur][2],
+                                vf[cur][3]);
+            }
+        };
+        // FP16-accumulate variant: each group of GroupTiles output n-tiles sums the tile's PVKs
+        // contraction steps in packed half2 registers, then joins the FP32 accumulator. Only
+        // entered for tiles with bounded V (kModeBounded), where |sum| <= 64 * 896 < 65504.
+        const auto pv_fp16 = [&]() {
+            constexpr int Groups     = 4;
+            constexpr int GroupTiles = PVNtPerWarp / Groups; // 8 n-tiles
+            constexpr int GroupPairs = GroupTiles / 2;       // 4 x4.trans loads per k
+            constexpr int GroupLoads = PVKs * GroupPairs;    // 16
+            static_assert(Groups * GroupLoads == PVLoads);
+            unsigned vh[2][4];
+            common::ldmatrix_x4_t(vh[0][0], vh[0][1], vh[0][2], vh[0][3],
+                                  common::swizzle_xor_address(v_lane_base, 0u, v_as, v_r));
+            unsigned half_acc[GroupTiles][2];
+#pragma unroll
+            for (int li = 0; li < PVLoads; ++li) {
+                const int group = li / GroupLoads;
+                const int local = li % GroupLoads;
+                const int k     = local / GroupPairs;
+                const int pair  = local % GroupPairs;
+                const int cur   = li & 1;
+                const int nxt   = cur ^ 1;
+                if (li + 1 < PVLoads) {
+                    const int group2 = (li + 1) / GroupLoads;
+                    const int local2 = (li + 1) % GroupLoads;
+                    const int k2     = local2 / GroupPairs;
+                    const int n2b    = group2 * GroupTiles + (local2 % GroupPairs) * 2;
+                    common::ldmatrix_x4_t(
+                        vh[nxt][0], vh[nxt][1], vh[nxt][2], vh[nxt][3],
+                        common::swizzle_xor_address(v_lane_base +
+                                                        static_cast<unsigned>(k2 * (16 * D * 2)),
+                                                    static_cast<unsigned>(n2b << 4), v_as, v_r));
+                }
+                if (local == 0) {
+#pragma unroll
+                    for (int t = 0; t < GroupTiles; ++t) half_acc[t][0] = half_acc[t][1] = 0u;
+                }
+                common::mma_f16_acc16(half_acc[2 * pair][0], half_acc[2 * pair][1], p_frag[k][0],
+                                      p_frag[k][1], p_frag[k][2], p_frag[k][3], vh[cur][0],
+                                      vh[cur][1]);
+                common::mma_f16_acc16(half_acc[2 * pair + 1][0], half_acc[2 * pair + 1][1],
+                                      p_frag[k][0], p_frag[k][1], p_frag[k][2], p_frag[k][3],
+                                      vh[cur][2], vh[cur][3]);
+                if (local == GroupLoads - 1) {
+#pragma unroll
+                    for (int t = 0; t < GroupTiles; ++t) {
+                        const int n = group * GroupTiles + t;
+                        acc[n][0]   = add_f32_f16(acc[n][0], half_acc[t][0] & 0xffffu);
+                        acc[n][1]   = add_f32_f16(acc[n][1], half_acc[t][0] >> 16);
+                        acc[n][2]   = add_f32_f16(acc[n][2], half_acc[t][1] & 0xffffu);
+                        acc[n][3]   = add_f32_f16(acc[n][3], half_acc[t][1] >> 16);
+                    }
+                }
+            }
+        };
+        if constexpr (Values::kHalfAccumulatePv) {
+            if (tile_mode & kModeBounded)
+                pv_fp16();
+            else
+                pv_fp32();
+        } else
+            pv_fp32();
 
         if (kb + 1 < key_blocks) common::cp_wait<0>();
-        if constexpr (Values::kScaleItems == 2)
-            value_half = __syncthreads_and(next_half);
-        else
-            __syncthreads();
+        tile_mode = barrier_and_modes(next_mode);
     };
     const int full_blocks =
         q0 + Br <= tokens ? min(key_blocks, max(0, (base_pos + q0 + 1) / Bc - first_owned_tile))
@@ -485,12 +579,12 @@ __global__ __maxnreg__(Schedule::kMaxRegisters) void mxfp8_kv_tiled_mma_kernel(
     if (lid == 0) {
         if (row0 < tile_rows) {
             const auto index       = causal_stat_index<Geometry>(q_head, q0 + row0, split, width);
-            partial.maximum[index] = m0 * scale;
+            partial.maximum[index] = m0 == -CUDART_INF_F ? m0 : m0 * q_scale_r0 * scale;
             partial.sum[index]     = l0;
         }
         if (row1 < tile_rows) {
             const auto index       = causal_stat_index<Geometry>(q_head, q0 + row1, split, width);
-            partial.maximum[index] = m1 * scale;
+            partial.maximum[index] = m1 == -CUDART_INF_F ? m1 : m1 * q_scale_r1 * scale;
             partial.sum[index]     = l1;
         }
     }

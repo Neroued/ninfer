@@ -5,8 +5,6 @@
 #include "ops/softmax_attention/kernels/topk_512_words.cuh"
 #include "ops/softmax_attention/kpool_mla/indexer/work.cuh"
 
-#include <type_traits>
-
 namespace ninfer::ops::detail::kpool {
 
 __device__ inline int candidate_count(int count, int partition) {
@@ -14,42 +12,10 @@ __device__ inline int candidate_count(int count, int partition) {
            min(kIndexSelected, (count - 1) % partition + 1);
 }
 
-template <int Bits = 6, int Copies = 2>
-__global__
-__launch_bounds__(256) void indexer_partition_kernel(const __grid_constant__ IndexerArguments a) {
-    if (a.columns <= kIndexSelected) return;
-    __shared__ Top512Storage<Bits, Copies> radix;
-    const int tid = threadIdx.x;
-    for (int job = blockIdx.x; job < a.width * a.batch * a.partitions; job += gridDim.x) {
-        const int slot = job / a.partitions, part = job % a.partitions;
-        const auto column = a.column(slot);
-        const int visible = a.ends[column] / 4, first = part * kIndexPartition;
-        if (visible <= kIndexSelected || first >= visible) continue;
-        const int count = min(kIndexPartition, visible - first);
-        std::uint64_t keys[kIndexPartition / 256];
-#pragma unroll
-        for (int j = 0; j < kIndexPartition / 256; ++j) {
-            const int i = j * 256 + tid;
-            keys[j]     = i < count
-                              ? common::score_id_order_key(
-                                a.scores[std::int64_t(slot) * a.columns + first + i], first + i)
-                              : 0;
-        }
-        if (visible <= kIndexPartition)
-            select_top512(keys, count, radix, Top512StoreIds{a.ids + column * kIndexSelected});
-        else
-            select_top512(
-                keys, count, radix,
-                Top512StoreKeys{a.candidates +
-                                (std::int64_t(slot) * a.partitions + part) * kIndexSelected});
-        __syncthreads();
-    }
-}
-
-// FP8 score windows can contain very different live histories inside one captured
+// Score windows can contain very different live histories inside one captured
 // envelope. Enumerate actual partitions so short requests share all resident CTAs.
 template <int MinBlocks>
-__global__ __launch_bounds__(256, MinBlocks) void indexer_partition_fp8_kernel(
+__global__ __launch_bounds__(256, MinBlocks) void indexer_partition_words_kernel(
     const __grid_constant__ IndexerArguments a) {
     if (a.columns <= kIndexSelected) return;
     __shared__ Top512WordStorage radix;
@@ -91,11 +57,11 @@ __global__ __launch_bounds__(256, MinBlocks) void indexer_partition_fp8_kernel(
     }
 }
 
-template <bool Final, int Bits = 6, int Copies = 2, bool WordKeys = false>
+template <bool Final>
 __global__
 __launch_bounds__(256) void indexer_merge_kernel(const __grid_constant__ IndexerArguments a) {
     if (a.partitions <= (Final ? 1 : kIndexFanIn)) return;
-    __shared__ std::conditional_t<WordKeys, Top512WordStorage, Top512Storage<Bits, Copies>> radix;
+    __shared__ Top512WordStorage radix;
     const int tid     = threadIdx.x;
     const int slot    = Final ? blockIdx.x : blockIdx.x / a.merge_groups;
     const int group   = Final ? 0 : blockIdx.x % a.merge_groups;
@@ -129,25 +95,15 @@ __launch_bounds__(256) void indexer_merge_kernel(const __grid_constant__ Indexer
             return Top512StoreKeys{a.merged +
                                    (std::int64_t(slot) * a.merge_groups + group) * kIndexSelected};
     }();
-    if constexpr (WordKeys) {
-        unsigned scores[Items];
-        Top512GatherIds<Items> ids;
+    unsigned scores[Items];
+    Top512GatherIds<Items> ids;
 #pragma unroll
-        for (int j = 0; j < Items; ++j) {
-            const int i    = j * 256 + tid;
-            const auto key = i < count ? input[i] : 0;
-            scores[j]      = unsigned(key >> 32);
-            ids.values[j]  = unsigned(key);
-        }
-        select_top512_words(scores, ids, count, radix, store);
-    } else {
-        std::uint64_t keys[Items];
-#pragma unroll
-        for (int j = 0; j < Items; ++j) {
-            const int i = j * 256 + tid;
-            keys[j]     = i < count ? input[i] : 0;
-        }
-        select_top512(keys, count, radix, store);
+    for (int j = 0; j < Items; ++j) {
+        const int i    = j * 256 + tid;
+        const auto key = i < count ? input[i] : 0;
+        scores[j]      = unsigned(key >> 32);
+        ids.values[j]  = unsigned(key);
     }
+    select_top512_words(scores, ids, count, radix, store);
 }
 } // namespace ninfer::ops::detail::kpool

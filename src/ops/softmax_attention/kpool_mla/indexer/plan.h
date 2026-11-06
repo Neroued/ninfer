@@ -15,8 +15,34 @@ struct IndexerWindows {
     int count, width;
 };
 
+struct IndexerWindow {
+    int begin, width;
+};
+
+// Balance query tiles and put the single partial tile in the first, largest
+// window. This keeps a short tail from selecting a smaller pipeline in isolation.
+inline IndexerWindow indexer_window(int tokens, int windows, int slot, int tile = 4) {
+    const auto tiles = (std::int64_t(tokens) + tile - 1) / tile;
+    const auto width = tiles / windows, larger = tiles % windows;
+    const int padding = int(tiles * tile - tokens);
+    const int begin =
+        int((slot * width + std::min<std::int64_t>(slot, larger)) * tile) - (slot ? padding : 0);
+    return {begin, int((width + (slot < larger)) * tile) - (slot ? 0 : padding)};
+}
+
+inline int indexer_window_width(int tokens, int windows, int tile = 4) {
+    const int first = indexer_window(tokens, windows, 0, tile).width;
+    return windows == 1 ? first : std::max(first, indexer_window(tokens, windows, 1, tile).width);
+}
+
 IndexerWindows indexer_windows(int min_tokens, int max_tokens, int batch, int columns);
 inline constexpr int kIndexPreparedQueries = 128;
+
+inline int indexer_graph_stride(int batch) {
+    // Single-request windows never need more than one score/select slot per
+    // 32 queries. Batched decode retains its finer request-grouping budget.
+    return batch == 1 ? 32 : kIndexGraphRows / batch;
+}
 
 struct Fp8IndexerWindows {
     int group_size, row_budget, rows;
@@ -104,6 +130,7 @@ inline std::size_t fp8_indexer_capacity(int lo, int hi, int batch,
 
 struct IndexerSchedule {
     int queries, stages, score_workers, select_workers;
+    bool resident_selection;
 };
 
 IndexerSchedule select_indexer(const IndexerArguments&, int sms);

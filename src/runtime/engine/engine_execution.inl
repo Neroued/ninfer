@@ -253,9 +253,27 @@ void EngineCore<Instance>::commit_pending(PendingBatch&& pending, ComputeFlight 
 }
 
 template <class Instance>
-void EngineCore<Instance>::resolve_prefill_progress(
-    const std::shared_ptr<Request>& request, typename ModelContract::PrefillProgress&& progress,
-    ComputeFlight flight) {
+void EngineCore<Instance>::resolve_prefill_flight(
+    typename ModelContract::PrefillProgress&& progress, ComputeFlight flight) {
+    if (progress.rows.size() != flight.requests.size() || progress.rows.empty()) {
+        throw std::logic_error("prefill result changed its frozen membership");
+    }
+    for (std::size_t row = 0; row < progress.rows.size(); ++row) {
+        scheduler_.prefill_executed(flight.lanes[row], max_concurrency_,
+                                    progress.rows[row].processed_prompt_tokens);
+        flight.progressed[row] = progress.rows[row].processed_prompt_tokens != 0;
+    }
+    record_service(flight);
+    for (std::size_t row = 0; row < progress.rows.size(); ++row) {
+        const auto request = flight.requests[row];
+        resolve_prefill_progress(request, std::move(progress.rows[row]), flight);
+        update_recovery(request);
+    }
+}
+
+template <class Instance>
+void EngineCore<Instance>::resolve_prefill_progress(const std::shared_ptr<Request>& request,
+                                                    PrefillRow&& progress, ComputeFlight& flight) {
     EnginePhaseScope phase(*this, EngineHostPhase::CommitOutput);
     ++request->host_timing.prefill_units;
     cumulative_stats_.computed_prefill_tokens += progress.processed_prompt_tokens;
@@ -273,8 +291,6 @@ void EngineCore<Instance>::resolve_prefill_progress(
     }
     const auto computed_begin = begin.reused_prompt_tokens + request->computed_prompt_tokens;
     request->computed_prompt_tokens += progress.processed_prompt_tokens;
-    flight.progressed.front() = progress.processed_prompt_tokens != 0;
-    record_service(flight);
     if (!request->cancelled.load(std::memory_order_acquire)) {
         resources_.observe_committed(*request->base_plan, request->id, computed_begin,
                                      computed_begin + progress.processed_prompt_tokens,
@@ -294,6 +310,9 @@ void EngineCore<Instance>::resolve_prefill_progress(
     if (!progress.complete) { return; }
     if (!request->lane || !progress.pending) {
         throw std::logic_error("completed prefill has no lane or pending token");
+    }
+    if (flight.requests.size() != 1) {
+        throw std::logic_error("a packed prefill flight produced a pending token");
     }
     if (!request->admitted_begin || progress.summary != *request->admitted_begin) {
         throw std::logic_error("runtime Begin summary differs from committed admission");
@@ -329,21 +348,43 @@ EngineCore<Instance>::freeze_members(std::span<const std::uint32_t> lanes, UnitK
 }
 
 template <class Instance>
-[[nodiscard]] bool EngineCore<Instance>::start_prefill(std::uint32_t lane) {
-    const std::array<std::uint32_t, 1> lanes{lane};
-    const auto& request = slots_[lane];
-    auto flight =
-        freeze_members(lanes, request->is_replaying() ? UnitKind::Replay : UnitKind::Prefill);
+[[nodiscard]] bool EngineCore<Instance>::start_prefill(std::span<const std::uint32_t> lanes) {
+    if (lanes.empty() || lanes.size() > kMaximumConcurrency) {
+        throw std::logic_error("prefill membership is invalid");
+    }
+    const bool replay = slots_[lanes.front()]->is_replaying();
+    if (replay && lanes.size() != 1) {
+        throw std::logic_error("a replaying lane cannot share an execution");
+    }
+    auto flight = freeze_members(lanes, replay ? UnitKind::Replay : UnitKind::Prefill);
+    std::array<bool, kMaximumConcurrency> constrained{};
+    for (std::size_t row = 0; row < flight.requests.size(); ++row) {
+        constrained[row] = flight.requests[row]->output.constrained();
+    }
+    std::optional<ExecutionTicket> ticket;
+    std::size_t segments = 1;
     ExecutionCallScope call(*this);
-    const auto ticket = request->is_replaying()
-                            ? instance_.session->start_replay(flight.sequences.front())
-                            : instance_.session->start_prefill(flight.sequences.front(),
-                                                               request->output.constrained());
+    if (replay) {
+        ticket = instance_.session->start_replay(flight.sequences.front());
+    } else if (const auto started = instance_.session->start_prefill(
+                   flight.sequences, {constrained.data(), flight.requests.size()})) {
+        ticket   = started->ticket;
+        segments = started->segments;
+    }
     call.finish();
     if (!ticket) return false;
+    if (segments == 0 || segments > lanes.size()) {
+        throw std::logic_error("Session admitted an invalid number of prefill segments");
+    }
+    // Freeze only the admitted prefix. The remaining lanes lose their unit for this execution.
+    flight.requests.resize(segments);
+    flight.sequences.resize(segments);
+    flight.residencies.resize(segments);
+    flight.lanes.resize(segments);
+    flight.cancelled.resize(segments);
     flight.ticket = *ticket;
     compute_.emplace(std::move(flight));
-    reserved_units_[lane].reset();
+    for (const auto lane : lanes) reserved_units_[lane].reset();
     return true;
 }
 
@@ -572,11 +613,7 @@ template <class Instance>
             commit_pending(std::move(*pending), std::move(flight));
         } else if (auto* prefill =
                        std::get_if<typename ModelContract::PrefillProgress>(&event->result)) {
-            const auto request = flight.requests.front();
-            scheduler_.prefill_executed(flight.lanes.front(), max_concurrency_,
-                                        prefill->processed_prompt_tokens);
-            resolve_prefill_progress(request, std::move(*prefill), std::move(flight));
-            update_recovery(request);
+            resolve_prefill_flight(std::move(*prefill), std::move(flight));
         } else if (auto* replay =
                        std::get_if<typename ModelContract::ReplayProgress>(&event->result)) {
             const auto& request = flight.requests.front();

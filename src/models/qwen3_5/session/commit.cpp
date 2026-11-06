@@ -97,31 +97,41 @@ void SessionImpl::receive_result(runtime::ResultReady<ExecutionTypes>&& event) {
             current.completed.push_back(forward_metadata(current.bases[b].metadata,
                                                          current.columns[b], speculative_backend,
                                                          has_backend_pool()));
-        const auto& request = requests[lane(current.members[0])];
-        const auto end      = current.completed[0].execution_frontier;
-        const bool capture =
-            request.capture_reservation && request.capture_reservation->frontier == end;
         if (current.kind == OperationKind::Prefill) {
             PrefillProgress progress;
-            progress.summary = {request.base->summary.prompt_tokens, request.prefill->base,
-                                request.prefill->reuse};
-            progress.processed_prompt_tokens = current.columns[0];
-            progress.capture_ready           = capture && !forward->generated;
-            progress.complete                = end == request.base->summary.prompt_tokens;
-
+            progress.rows.reserve(current.members.size());
+            for (std::size_t b = 0; b < current.members.size(); ++b) {
+                const auto& request = requests[lane(current.members[b])];
+                const auto end      = current.completed[b].execution_frontier;
+                const bool capture =
+                    request.capture_reservation && request.capture_reservation->frontier == end;
+                auto& row   = progress.rows.emplace_back();
+                row.summary = {request.base->summary.prompt_tokens, request.prefill->base,
+                               request.prefill->reuse};
+                row.processed_prompt_tokens = current.columns[b];
+                row.capture_ready           = capture && !forward->generated;
+                row.complete                = end == request.base->summary.prompt_tokens;
+            }
             if (forward->generated) {
-                if (!progress.complete)
+                if (progress.rows.size() != 1)
+                    throw std::logic_error("packed prefill produced a token");
+                if (!progress.rows[0].complete)
                     throw std::logic_error("incomplete prefill produced a token");
                 current.generated.emplace(std::move(*forward->generated));
-                progress.pending.emplace(generated_pending(*current.generated));
+                progress.rows[0].pending.emplace(generated_pending(*current.generated));
                 events.push_back({current.ticket, current.members, std::move(progress)});
                 return;
             }
-            if (progress.complete)
+            if (std::any_of(progress.rows.begin(), progress.rows.end(),
+                            [](const auto& row) { return row.complete; }))
                 throw std::logic_error("completed prefill omitted its first token");
             current.completion.emplace(
                 SessionEvent{current.ticket, current.members, std::move(progress)});
         } else if (current.kind == OperationKind::Replay) {
+            const auto& request = requests[lane(current.members[0])];
+            const auto end      = current.completed[0].execution_frontier;
+            const bool capture =
+                request.capture_reservation && request.capture_reservation->frontier == end;
             current.completion.emplace(
                 SessionEvent{current.ticket, current.members,
                              ReplayProgress{capture, current.columns[0],

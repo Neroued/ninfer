@@ -375,8 +375,9 @@ public:
     [[nodiscard]] bool terminal_blocked(SequenceHandle sequence) const noexcept;
     // A resumed binding retains its complete recovery capacity until committed new progress.
     [[nodiscard]] bool recovery_pending(SequenceHandle sequence) const noexcept;
-    [[nodiscard]] std::optional<runtime::ExecutionTicket> start_prefill(SequenceHandle,
-                                                                        bool constrained = false);
+    [[nodiscard]] std::uint32_t prefill_pack_limit() const noexcept;
+    [[nodiscard]] std::optional<PrefillStart> start_prefill(std::span<const SequenceHandle>,
+                                                            std::span<const bool> constrained);
     [[nodiscard]] std::optional<runtime::ExecutionTicket> start_replay(SequenceHandle);
     [[nodiscard]] std::optional<runtime::ExecutionTicket>
     start_decode(std::span<const SequenceHandle>, std::span<const runtime::RoundBudget>,

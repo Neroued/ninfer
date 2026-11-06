@@ -285,9 +285,10 @@ struct Fixture {
         for (;;) {
             const glm::ExecutionUnit unit{h, glm::ExecutionUnitKind::Prefill, 64};
             require(bool(session.reserve_units({&unit, 1})), "prefill reservation failed");
-            require(session.start_prefill(h).has_value(), "prefill did not start");
+            require(session.start_prefill({&h, 1}, {}).has_value(), "prefill did not start");
             auto result = event<glm::PrefillProgress>();
-            if (result.pending) return std::move(*result.pending);
+            require(result.rows.size() == 1, "single prefill returned several rows");
+            if (result.rows.front().pending) return std::move(*result.rows.front().pending);
             idle();
         }
     }
@@ -343,8 +344,9 @@ void transactions(std::shared_ptr<const glm::ModelDefinition> definition) {
         require(bool(f.session.reserve_units({&unit, 1})), "capture input reservation failed");
         const auto capture = f.session.prepare_capture(sequence);
         require(capture && capture->reserved, "input checkpoint was not reserved");
-        (void)f.session.start_prefill(sequence);
-        const auto progress = f.event<glm::PrefillProgress>();
+        (void)f.session.start_prefill({&sequence, 1}, {});
+        const auto result    = f.event<glm::PrefillProgress>();
+        const auto& progress = result.rows.at(0);
         require(progress.capture_ready && !progress.pending,
                 "input checkpoint boundary not honored");
         f.idle();

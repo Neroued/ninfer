@@ -154,11 +154,12 @@ public:
         const auto b = bind_b_during_capture();
         require(!session_.terminal_blocked(b), "idle lane B is blocked by A's capture");
         reserve_prefill(b);
-        const auto ticket = session_.start_prefill(b);
-        require(ticket.has_value() && session_.has_context_operation(),
+        const auto start = session_.start_prefill({&b, 1}, {});
+        require(start.has_value() && session_.has_context_operation(),
                 "lane B could not start prefill while A's capture was in flight");
-        const auto step = driver_.wait<q35::PrefillProgress>(*ticket);
-        require(step.processed_prompt_tokens != 0, "lane B made no progress during A's capture");
+        const auto step = driver_.wait<q35::PrefillProgress>(start->ticket);
+        require(step.rows.at(0).processed_prompt_tokens != 0,
+                "lane B made no progress during A's capture");
 
         const auto progress = driver_.wait<q35::ContextProgress>();
         require(progress.published && !progress.captured_checkpoints.empty(),

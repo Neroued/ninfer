@@ -857,22 +857,68 @@ PrefillUnitTokens EngineCore<Instance>::prefill_unit_tokens() const {
 }
 
 template <class Instance>
-std::optional<std::uint32_t> EngineCore<Instance>::next_prefill(
+std::optional<std::uint32_t> EngineCore<Instance>::continuation_prefill_lane(
     const std::array<std::shared_ptr<Request>, kMaximumConcurrency>& candidates) const {
-    const auto units     = prefill_unit_tokens();
     const auto preferred = instance_.session->prefill_continuation();
-    // A continuing sequence keeps the lane, but its units still spend the cycle budget.
     if (preferred)
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
             const auto& request = candidates[lane];
             if (request && request->sequence == preferred && !request->capture_pending &&
-                (request->is_prefilling() || request->is_replaying())) {
-                auto only  = std::array<std::shared_ptr<Request>, kMaximumConcurrency>{};
-                only[lane] = request;
-                return scheduler_.next_prefill(only, max_concurrency_, units);
-            }
+                (request->is_prefilling() || request->is_replaying()))
+                return lane;
         }
+    return std::nullopt;
+}
+
+template <class Instance>
+std::optional<std::uint32_t> EngineCore<Instance>::exclusive_prefill_lane(
+    const std::array<std::shared_ptr<Request>, kMaximumConcurrency>& candidates) const {
+    if (const auto owner = scheduler_.progress_owner()) {
+        for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+            const auto& request = candidates[lane];
+            if (request && request->sequence && request->id == owner &&
+                (request->is_prefilling() || request->is_replaying()))
+                return lane;
+        }
+    }
+    return continuation_prefill_lane(candidates);
+}
+
+template <class Instance>
+std::optional<std::uint32_t> EngineCore<Instance>::next_prefill(
+    const std::array<std::shared_ptr<Request>, kMaximumConcurrency>& candidates) const {
+    const auto units = prefill_unit_tokens();
+    // A continuing sequence keeps the lane, but its units still spend the cycle budget.
+    if (const auto lane = continuation_prefill_lane(candidates)) {
+        auto only  = std::array<std::shared_ptr<Request>, kMaximumConcurrency>{};
+        only[*lane] = candidates[*lane];
+        return scheduler_.next_prefill(only, max_concurrency_, units);
+    }
     return scheduler_.next_prefill(candidates, max_concurrency_, units);
+}
+
+template <class Instance>
+std::uint32_t EngineCore<Instance>::prefill_pack_limit() const {
+    return std::min(instance_.session->prefill_pack_limit(), max_concurrency_);
+}
+
+template <class Instance>
+std::vector<std::uint32_t> EngineCore<Instance>::next_prefill_lanes(
+    const std::array<std::shared_ptr<Request>, kMaximumConcurrency>& candidates) const {
+    const auto first = next_prefill(candidates);
+    if (!first) return {};
+    std::vector<std::uint32_t> lanes{*first};
+    const auto limit = prefill_pack_limit();
+    if (limit <= 1 || !candidates[*first]->is_prefilling() || exclusive_prefill_lane(candidates))
+        return lanes;
+    const auto membership =
+        scheduler_.prefill_candidates(candidates, max_concurrency_, prefill_unit_tokens());
+    if (membership.empty() || membership.lanes[0] != *first) return lanes;
+    for (std::size_t i = 1; i < membership.size && lanes.size() < limit; ++i) {
+        if (!candidates[membership.lanes[i]]->is_prefilling()) break;
+        lanes.push_back(membership.lanes[i]);
+    }
+    return lanes;
 }
 
 template <class Instance>
@@ -897,6 +943,20 @@ void EngineCore<Instance>::reserve_resident_units(ReservationScope scope) {
     }
     const auto units   = prefill_unit_tokens();
     const auto prefill = priority_prefill ? priority_prefill : next_prefill(slots_);
+    // Prefilling lanes that may share the first prefill lane's execution: the lanes the cycle
+    // budget admits behind it. An exclusive lane and a replaying lane run alone.
+    std::array<bool, kMaximumConcurrency> joinable{};
+    std::optional<std::uint32_t> pack_head;
+    const auto pack_limit = prefill_pack_limit();
+    if (prefill && pack_limit > 1 && slots_[*prefill]->is_prefilling() &&
+        !exclusive_prefill_lane(slots_)) {
+        const auto membership = scheduler_.prefill_candidates(slots_, max_concurrency_, units);
+        if (!membership.empty() && membership.lanes[0] == *prefill) {
+            pack_head = *prefill;
+            for (std::size_t i = 1; i < membership.size; ++i)
+                joinable[membership.lanes[i]] = slots_[membership.lanes[i]]->is_prefilling();
+        }
+    }
     std::vector<std::uint32_t> candidates;
     for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
         const auto& request = slots_[lane];
@@ -918,10 +978,14 @@ void EngineCore<Instance>::reserve_resident_units(ReservationScope scope) {
             remaining[*fallback].reset();
         }
     }
-    std::optional<std::uint32_t> granted_prefill;
+    std::vector<std::uint32_t> granted_prefill;
     for (const auto lane : candidates) {
-        const auto request = slots_[lane];
-        if (granted_prefill && request && (request->is_prefilling() || request->is_replaying()))
+        const auto request      = slots_[lane];
+        const bool prefill_lane = request && (request->is_prefilling() || request->is_replaying());
+        // Behind a granted prefill lane, only the lanes that can share its execution take a unit.
+        const bool joining = prefill_lane && !granted_prefill.empty();
+        if (joining && !(pack_head == granted_prefill.front() && joinable[lane] &&
+                         granted_prefill.size() < pack_limit))
             continue;
         if (!request || !request->sequence || request->capture_pending ||
             request->cancelled.load(std::memory_order_acquire) ||
@@ -938,9 +1002,11 @@ void EngineCore<Instance>::reserve_resident_units(ReservationScope scope) {
             const auto result = instance_.session->reserve_units({&unit, 1});
             if (result) {
                 reserved_units_[lane] = UnitPermit{unit, *request->residency};
-                if (request->is_prefilling() || request->is_replaying()) granted_prefill = lane;
+                if (prefill_lane) granted_prefill.push_back(lane);
                 break;
             }
+            // A lane that only joins another execution never forces reclamation or a pause.
+            if (joining) break;
             if (result.status == UnitReservationStatus::ExecutionUnavailable ||
                 instance_.session->has_context_operation()) {
                 if (priority == lane) return;
@@ -967,8 +1033,9 @@ void EngineCore<Instance>::reserve_resident_units(ReservationScope scope) {
             throw std::logic_error("progress owner cannot obtain its legal unit");
         }
     }
-    if (granted_prefill && !prepare_semantic_capture(slots_[*granted_prefill]))
-        reserved_units_[*granted_prefill].reset();
+    // A lane whose capture cannot be prepared loses its unit and leaves the execution.
+    for (const auto lane : granted_prefill)
+        if (!prepare_semantic_capture(slots_[lane])) reserved_units_[lane].reset();
 }
 
 template <class Instance>
@@ -1110,9 +1177,9 @@ template <class Instance>
             for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
                 if (!unit_runnable(lane)) eligible[lane].reset();
             }
-            if (const auto lane = next_prefill(eligible)) {
+            if (const auto lanes = next_prefill_lanes(eligible); !lanes.empty()) {
                 set_host_work_class(HostWorkClass::Prefill);
-                if (!start_prefill(*lane)) return submitted;
+                if (!start_prefill(lanes)) return submitted;
                 submitted = true;
                 // The cycle stays in Prefill: once this flight completes, the Scheduler
                 // budget decides whether another unit starts before the next begin_cycle.

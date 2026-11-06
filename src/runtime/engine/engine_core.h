@@ -610,9 +610,18 @@ private:
 
     bool prepare_semantic_capture(const std::shared_ptr<Request>& request);
 
-    void resolve_prefill_progress(const std::shared_ptr<Request>& request,
-                                  typename ModelContract::PrefillProgress&& progress,
-                                  ComputeFlight flight);
+    using PrefillRow = typename decltype(std::declval<typename ModelContract::PrefillProgress&>()
+                                             .rows)::value_type;
+
+    // Applies the prefill result of one flight: charges every segment to the cycle budget, then
+    // resolves its rows in member order.
+    void resolve_prefill_flight(typename ModelContract::PrefillProgress&& progress,
+                                ComputeFlight flight);
+
+    // `flight` is consumed only by a row that carries a pending token, which exists only in a
+    // single-segment flight.
+    void resolve_prefill_progress(const std::shared_ptr<Request>& request, PrefillRow&& progress,
+                                  ComputeFlight& flight);
 
     void ensure_base_plan(const std::shared_ptr<Request>& request);
 
@@ -677,8 +686,26 @@ private:
     // limited by the prompt suffix a prefilling request still has to compute.
     [[nodiscard]] PrefillUnitTokens prefill_unit_tokens() const;
 
+    // The lane the Session's Vision window continues, when it can run now.
+    [[nodiscard]] std::optional<std::uint32_t> continuation_prefill_lane(
+        const std::array<std::shared_ptr<Request>, kMaximumConcurrency>&) const;
+
+    // The prefilling or replaying lane that must run alone: the progress owner, else the Vision
+    // continuation lane. nullopt when every prefill lane may be packed.
+    [[nodiscard]] std::optional<std::uint32_t>
+    exclusive_prefill_lane(const std::array<std::shared_ptr<Request>, kMaximumConcurrency>&) const;
+
     [[nodiscard]] std::optional<std::uint32_t>
     next_prefill(const std::array<std::shared_ptr<Request>, kMaximumConcurrency>&) const;
+
+    // Segments the Session may join into one prefill execution, bounded by the lane count.
+    [[nodiscard]] std::uint32_t prefill_pack_limit() const;
+
+    // The lanes of the next prefill execution: next_prefill() first, then the lanes the cycle
+    // budget admits behind it while the group may be packed. Packing starts only from a
+    // prefilling lane, ends at the first Replay lane and excludes an exclusive lane.
+    [[nodiscard]] std::vector<std::uint32_t>
+    next_prefill_lanes(const std::array<std::shared_ptr<Request>, kMaximumConcurrency>&) const;
 
     // Admission can pin an existing writer's tail after its reservation. Membership must
     // observe current context dependencies, including pauses selected during reclamation.
@@ -687,7 +714,10 @@ private:
     [[nodiscard]] ComputeFlight freeze_members(std::span<const std::uint32_t> lanes,
                                                UnitKind kind) const;
 
-    [[nodiscard]] bool start_prefill(std::uint32_t lane);
+    // Starts one execution for a non-empty prefix of `lanes`, which are all prefilling or a
+    // single replaying lane. Lanes the Session does not admit keep their sequences and lose
+    // their Engine unit; the next cycle step reserves them again.
+    [[nodiscard]] bool start_prefill(std::span<const std::uint32_t> lanes);
 
     [[nodiscard]] bool start_decode(const RoundMembership& membership);
 

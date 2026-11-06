@@ -24,47 +24,88 @@ SessionImpl::submit_execution(Execution&& pending, runtime::ExecutionReservation
     }
 }
 
-std::optional<runtime::ExecutionTicket> SessionImpl::start_prefill(SequenceHandle handle,
-                                                                   bool constrained) {
+std::uint32_t SessionImpl::prefill_pack_limit() const noexcept {
+    return is_masked_draft_backend(speculative_backend) ? 1U : max_concurrency;
+}
+
+std::optional<PrefillStart> SessionImpl::start_prefill(std::span<const SequenceHandle> candidates,
+                                                       std::span<const bool> constrained) {
     if (execution) return {};
-    const auto l  = lane(handle);
-    auto& state   = sequences[l];
-    auto& request = requests[l];
-    if (request.lifecycle != Lifecycle::Prefilling || !request.prefill || request.capture_pending)
-        throw std::logic_error("sequence has no executable prefill window");
-    require_unit(l, ExecutionUnitKind::Prefill);
+    if (candidates.empty() || (!constrained.empty() && constrained.size() != candidates.size()))
+        throw std::invalid_argument("prefill membership is invalid");
+    const auto considered = std::min<std::size_t>(candidates.size(), prefill_pack_limit());
+    for (std::size_t i = 0; i < considered; ++i) {
+        if (std::find(candidates.begin(), candidates.begin() + i, candidates[i]) !=
+            candidates.begin() + i)
+            throw std::logic_error("duplicate sequence in prefill");
+        const auto l        = lane(candidates[i]);
+        const auto& request = requests[l];
+        if (request.lifecycle != Lifecycle::Prefilling || !request.prefill ||
+            request.capture_pending)
+            throw std::logic_error("sequence has no executable prefill window");
+        require_unit(l, ExecutionUnitKind::Prefill);
+    }
     auto reservation = executor().try_reserve(runtime::FrameKind::Compute);
     if (!reservation) return {};
+
+    struct Segment {
+        std::uint32_t lane  = 0;
+        std::uint32_t begin = 0;
+        std::uint32_t end   = 0;
+        bool constrained    = false;
+    };
+
+    std::vector<Segment> segments;
+    bool final_segment = false;
     try {
-        prepare_capture_boundary(l);
-        const auto begin = state.continuation.metadata.execution_frontier;
-        const auto end =
-            window_end(state, request, begin,
-                       std::min(request.permit->main_frontier, request.base->summary.prompt_tokens),
-                       vision_window);
-        const bool sample = end == request.base->summary.prompt_tokens;
+        for (std::size_t i = 0; i < considered; ++i) {
+            const auto l  = lane(candidates[i]);
+            auto& state   = sequences[l];
+            auto& request = requests[l];
+            prepare_capture_boundary(l);
+            const auto begin = state.continuation.metadata.execution_frontier;
+            const auto end   = window_end(
+                state, request, begin,
+                std::min(request.permit->main_frontier, request.base->summary.prompt_tokens),
+                vision_window);
+            // A window that reaches the prompt end produces the first token. Vision and DFlash
+            // windows carry state that only a single-row execution owns.
+            const bool final_window = end == request.base->summary.prompt_tokens;
+            const bool alone        = final_window || request.base->vision ||
+                               is_masked_draft_backend(speculative_backend);
+            if (i && (alone || end == begin)) break;
+            segments.push_back({l, begin, end, !constrained.empty() && constrained[i]});
+            final_segment = final_window;
+            if (alone) break;
+        }
         Execution pending{.kind = OperationKind::Prefill};
-        pending.members     = {handle};
-        pending.bases       = {state.continuation};
-        pending.columns     = {end - begin};
         pending.preparation = std::make_unique<context::ContextTransaction>(directory);
-        ensure_sequence_kv_mapped(state, end,
-                                  speculative_backend == SpeculativeBackend::Mtp
-                                      ? (end ? end - 1 : 0)
-                                  : has_backend_pool() ? end
-                                                       : 0,
-                                  *pending.preparation);
         ForwardWork forward;
         forward.purpose = ForwardPurpose::Prefill;
-        forward.rows.push_back(execution_row(state));
-        forward.inputs.push_back(input_window(state, begin, end));
-        forward.inputs.back().visual = prepare_visual(state, begin, end);
-        if (forward.inputs.back().visual)
-            pending.vision_id = forward.inputs.back().visual->window.id;
-        forward.sample = sample ? SamplePurpose::FirstToken : SamplePurpose::None;
-        forward.sampling.push_back({request.sampling_host, constrained});
-        return submit_execution(std::move(pending), std::move(*reservation),
-                                Work{.operation = std::move(forward)});
+        for (std::size_t i = 0; i < segments.size(); ++i) {
+            const auto& segment = segments[i];
+            auto& state         = sequences[segment.lane];
+            auto& request       = requests[segment.lane];
+            pending.members.push_back(candidates[i]);
+            pending.bases.push_back(state.continuation);
+            pending.columns.push_back(segment.end - segment.begin);
+            ensure_sequence_kv_mapped(state, segment.end,
+                                      speculative_backend == SpeculativeBackend::Mtp
+                                          ? (segment.end ? segment.end - 1 : 0)
+                                      : has_backend_pool() ? segment.end
+                                                           : 0,
+                                      *pending.preparation);
+            forward.rows.push_back(execution_row(state));
+            forward.inputs.push_back(input_window(state, segment.begin, segment.end));
+            forward.inputs.back().visual = prepare_visual(state, segment.begin, segment.end);
+            if (forward.inputs.back().visual)
+                pending.vision_id = forward.inputs.back().visual->window.id;
+            forward.sampling.push_back({request.sampling_host, segment.constrained});
+        }
+        forward.sample    = final_segment ? SamplePurpose::FirstToken : SamplePurpose::None;
+        const auto ticket = submit_execution(std::move(pending), std::move(*reservation),
+                                             Work{.operation = std::move(forward)});
+        return PrefillStart{*ticket, static_cast<std::uint32_t>(segments.size())};
     } catch (const std::exception& error) {
         executor().fail(error.what());
         throw;

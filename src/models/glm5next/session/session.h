@@ -176,13 +176,25 @@ private:
     friend class Session;
 };
 
-struct PrefillProgress {
+// One prefill segment of an execution. `pending` exists only when the execution has one segment.
+struct PrefillRowProgress {
     runtime::BeginSummary summary;
     std::uint32_t processed_prompt_tokens = 0;
     bool complete                         = false;
 
     std::optional<PendingBatch> pending;
     bool capture_ready = false;
+};
+
+// Rows follow the execution members.
+struct PrefillProgress {
+    std::vector<PrefillRowProgress> rows;
+};
+
+// `segments` is the length of the candidate prefix the execution admitted.
+struct PrefillStart {
+    runtime::ExecutionTicket ticket;
+    std::uint32_t segments = 0;
 };
 
 struct CommitRowResult {
@@ -387,8 +399,11 @@ public:
     [[nodiscard]] bool terminal_blocked(SequenceHandle) const noexcept;
     void cancel_context();
 
-    [[nodiscard]] std::optional<runtime::ExecutionTicket> start_prefill(SequenceHandle,
-                                                                        bool constrained = false);
+    // This model runs one prefill window per execution.
+    [[nodiscard]] std::uint32_t prefill_pack_limit() const noexcept;
+    // Admits the first sequence of `sequences`; `constrained` is empty or parallel to it.
+    [[nodiscard]] std::optional<PrefillStart>
+    start_prefill(std::span<const SequenceHandle> sequences, std::span<const bool> constrained);
     [[nodiscard]] std::optional<runtime::ExecutionTicket> start_replay(SequenceHandle);
     [[nodiscard]] std::optional<runtime::ExecutionTicket>
     start_decode(std::span<const SequenceHandle>, std::span<const runtime::RoundBudget>,

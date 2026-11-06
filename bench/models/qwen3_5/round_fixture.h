@@ -68,18 +68,21 @@ public:
             if (!session.reserve_units(unit)) {
                 throw std::runtime_error("benchmark seed prefill unit could not be reserved");
             }
-            const auto ticket = session.start_prefill(sequence);
-            if (!ticket) throw std::runtime_error("benchmark seed execution slot is occupied");
-            auto progress = await<model::PrefillProgress>(*ticket);
-            if (!progress.complete) continue;
-            if (!progress.pending || progress.pending->tokens().size() != 1) {
+            const auto start = session.start_prefill({&sequence, 1}, {});
+            if (!start) throw std::runtime_error("benchmark seed execution slot is occupied");
+            auto progress = await<model::PrefillProgress>(start->ticket);
+            if (start->segments != 1 || progress.rows.size() != 1)
+                throw std::runtime_error("benchmark seed prefill admitted several segments");
+            auto& row = progress.rows.front();
+            if (!row.complete) continue;
+            if (!row.pending || row.pending->tokens().size() != 1) {
                 throw std::runtime_error(
                     "benchmark seed prefill did not license exactly one token");
             }
             const std::array<runtime::CommitDecision, 1> decision{
                 runtime::CommitDecision{.accepted_tokens = 1}};
-            (void)session.commit(std::move(*progress.pending), decision);
-            retire(*ticket, {&sequence, 1});
+            (void)session.commit(std::move(*row.pending), decision);
+            retire(start->ticket, {&sequence, 1});
             return sequence;
         }
     }

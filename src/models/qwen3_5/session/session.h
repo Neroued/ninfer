@@ -226,13 +226,26 @@ private:
     friend class detail::SessionImpl;
 };
 
-struct PrefillProgress {
+// One prefill segment of an execution. `pending` exists only when the execution has one segment.
+struct PrefillRowProgress {
     runtime::BeginSummary summary;
     std::uint32_t processed_prompt_tokens = 0;
     bool complete                         = false;
 
     std::optional<PendingBatch> pending;
     bool capture_ready = false;
+};
+
+// Rows follow the execution members.
+struct PrefillProgress {
+    std::vector<PrefillRowProgress> rows;
+};
+
+// `segments` is the length of the candidate prefix the execution admitted. More than one segment
+// means every segment is a non-final, text-only window.
+struct PrefillStart {
+    runtime::ExecutionTicket ticket;
+    std::uint32_t segments = 0;
 };
 
 struct CommitRowResult {
@@ -426,8 +439,14 @@ public:
     [[nodiscard]] bool terminal_blocked(SequenceHandle sequence) const noexcept;
     // A resumed binding retains its complete recovery capacity until committed new progress.
     [[nodiscard]] bool recovery_pending(SequenceHandle sequence) const noexcept;
-    [[nodiscard]] std::optional<runtime::ExecutionTicket> start_prefill(SequenceHandle,
-                                                                        bool constrained = false);
+    // Upper bound on the segments one start_prefill call admits.
+    [[nodiscard]] std::uint32_t prefill_pack_limit() const noexcept;
+    // Admits a non-empty prefix of `sequences`. The first segment always runs; a later one joins
+    // only while every segment so far is a non-final, text-only window and the backend is not
+    // DFlash. A final (token-producing), Vision or DFlash segment runs alone. `constrained` is
+    // empty or parallel to `sequences`.
+    [[nodiscard]] std::optional<PrefillStart>
+    start_prefill(std::span<const SequenceHandle> sequences, std::span<const bool> constrained);
     [[nodiscard]] std::optional<runtime::ExecutionTicket> start_replay(SequenceHandle);
     [[nodiscard]] std::optional<runtime::ExecutionTicket>
     start_decode(std::span<const SequenceHandle>, std::span<const runtime::RoundBudget>,

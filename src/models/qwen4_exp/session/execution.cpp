@@ -28,10 +28,17 @@ std::optional<PlePrefetch> prefetch(const detail::SessionImpl& p, const detail::
 }
 } // namespace
 
-std::optional<runtime::ExecutionTicket> Session::start_prefill(SequenceHandle handle,
-                                                               bool constrained) {
-    auto& p = *impl_;
-    auto& s = p.sequence(handle);
+std::uint32_t Session::prefill_pack_limit() const noexcept { return 1; }
+
+std::optional<PrefillStart> Session::start_prefill(std::span<const SequenceHandle> sequences,
+                                                   std::span<const bool> constrained_rows) {
+    if (sequences.empty() ||
+        (!constrained_rows.empty() && constrained_rows.size() != sequences.size()))
+        throw std::invalid_argument("prefill membership is invalid");
+    const auto handle      = sequences.front();
+    const bool constrained = !constrained_rows.empty() && constrained_rows.front();
+    auto& p                = *impl_;
+    auto& s                = p.sequence(handle);
     if (p.compute) return {};
     if (s.phase != detail::Phase::Prefill || !s.permit || s.capture_pending)
         throw std::logic_error("prefill has no executable unit");
@@ -59,7 +66,7 @@ std::optional<runtime::ExecutionTicket> Session::start_prefill(SequenceHandle ha
         if (forward.visual) tx.vision_id = forward.visual->window.id;
         forward.prefetch = prefetch(p, s, end, s.request->summary.prompt_tokens);
         submit(p, std::move(*reservation), {{}, std::move(forward)});
-        return tx.ticket;
+        return PrefillStart{tx.ticket, 1};
     } catch (const std::exception& error) {
         p.executor->fail(error.what());
         throw;

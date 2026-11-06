@@ -229,10 +229,15 @@ public:
         return {};
     }
 
-    q35::PrefillProgress prefill(q35::SequenceHandle sequence) {
-        const auto ticket = session_.start_prefill(sequence);
-        if (!ticket) throw std::logic_error("native prefill had no execution capacity");
-        return wait<q35::PrefillProgress>(*ticket);
+    q35::PrefillRowProgress prefill(q35::SequenceHandle sequence) {
+        const auto start = session_.start_prefill({&sequence, 1}, {});
+        if (!start) throw std::logic_error("native prefill had no execution capacity");
+        if (start->segments != 1)
+            throw std::logic_error("single prefill admitted several segments");
+        auto progress = wait<q35::PrefillProgress>(start->ticket);
+        if (progress.rows.size() != 1)
+            throw std::logic_error("single prefill returned several rows");
+        return std::move(progress.rows.front());
     }
 
     q35::ReplayProgress replay(q35::SequenceHandle sequence) {

@@ -107,7 +107,10 @@ void RankProgramImpl::initialize_forward(ComputeOperation& operation, const Forw
     operation.width        = end - offset;
     operation.row_finished = false;
     auto& frame            = resources.frame;
-    *frame.host_ingress    = {};
+    // Rows execute one after another as a B=1 window in compact row 0. Only the operation's first
+    // window starts from a clean ingress; later windows rebind every field they use (row binding,
+    // valid_columns, sampling positions, previous RoPE) in place.
+    if (!index && !offset) *frame.host_ingress = {};
     bind_row(*frame.host_ingress, 0, row);
     frame.host_ingress->valid_columns[0] = static_cast<std::int32_t>(operation.width);
     if (work.sample != SamplePurpose::None)

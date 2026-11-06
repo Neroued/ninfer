@@ -8,6 +8,7 @@
 #include "models/common/qwen/vision/vision.h"
 #include "models/qwen3_5/program/program.h"
 #include "models/qwen3_5/execution/parameters.h"
+#include "models/qwen3_5/execution/text.h"
 #include "models/qwen3_5/program/resources.h"
 #include "models/qwen3_5/program/graphs.h"
 #include "models/qwen3_5/program/planning/startup.h"
@@ -17,10 +18,7 @@
 #include <deque>
 #include <memory>
 #include <optional>
-
-namespace ninfer::models::qwen3_5::execution {
-class TextRun;
-}
+#include <vector>
 
 namespace ninfer::models::qwen3_5::detail {
 
@@ -62,8 +60,11 @@ struct ComputeOperation {
     bool cancelled               = false;
     bool speculative             = false;
     bool row_finished            = false;
-    bool graph_started           = false;
-    bool projected               = false;
+    // Prefill rows share one TextRun over the summed token axis; `segments` lists them in row
+    // order and `width` is their total length.
+    bool packed        = false;
+    bool graph_started = false;
+    bool projected     = false;
     std::array<std::uint32_t, kMaximumConcurrency> dead_positions{};
     std::optional<runtime::DecisionInput> decision;
     std::optional<Commit> commit;
@@ -72,6 +73,7 @@ struct ComputeOperation {
     GpuExecutionObservation gpu;
     AttentionWorkCounters attention;
     std::optional<Tensor> input_embeddings;
+    std::vector<execution::SequenceSegment> segments;
     std::unique_ptr<execution::TextRun> text;
 
     ComputeOperation(runtime::ExecutionRequest<ExecutionTypes>&&);
@@ -107,6 +109,9 @@ public:
     void initialize_inputs(ComputeOperation&);
     void initialize_decode(ComputeOperation&, const DecodeWork&);
     void initialize_forward(ComputeOperation&, const ForwardWork&);
+    void initialize_packed_forward(ComputeOperation&, const ForwardWork&);
+    void validate_packed_forward(const ForwardWork&) const;
+    void publish_continuation_hidden(ComputeOperation&);
     void initialize_score(ComputeOperation&, const ScoreWork&);
     void upload_input(std::uint32_t width, std::uint32_t batch);
     void upload_positions(std::uint32_t width, std::uint32_t batch);
@@ -127,6 +132,7 @@ public:
     void append_draft_history(std::uint32_t batch, ops::KVCacheAppendPrefixExecutionEnvelope);
     void commit_draft_history(ComputeOperation&);
     void align_mtp_history(ComputeOperation&);
+    void align_packed_mtp_history(ComputeOperation&);
     void rebuild_mtp_history(std::uint32_t batch);
     void execute_mtp_commit(std::uint32_t batch, bool repair, bool counts,
                             DecodeGraphSection* repair_section = nullptr,

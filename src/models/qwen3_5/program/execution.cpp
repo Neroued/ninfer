@@ -86,12 +86,7 @@ void RankProgramImpl::progress() {
                         frame.backend_table_rows.slice(0, 0, 1),
                         {operation.width, operation.width});
                 }
-                const auto source = resources.frame.input_view(static_cast<int>(operation.width), 1)
-                                        .hidden.slice(1, static_cast<int>(operation.width - 1), 1);
-                const auto target = resources.state_images.continuation_hidden(
-                    operation.rows[operation.forward_row].state_offsets.destination);
-                CUDA_CHECK(cudaMemcpyAsync(target.data, source.data, target.bytes(),
-                                           cudaMemcpyDeviceToDevice, device.stream()));
+                publish_continuation_hidden(operation);
             }
             if (operation.width) prefill_timer.record_stop();
             gpu_timer.record_result();
@@ -103,7 +98,16 @@ void RankProgramImpl::progress() {
             if (operation.width)
                 operation.gpu.add_prefill(
                     static_cast<std::uint64_t>(prefill_timer.elapsed_ms() * 1.0e6));
-            if (const auto* forward = std::get_if<ForwardWork>(&operation.request.work.operation)) {
+            if (operation.packed) {
+                // Every segment completed in the one traversal; none samples.
+                auto& result = std::get<ForwardResult>(operation.result->output);
+                for (const auto& segment : operation.segments)
+                    result.processed_tokens.push_back(segment.tokens);
+                operation.forward_row    = static_cast<std::uint32_t>(operation.rows.size());
+                operation.forward_offset = 0;
+                operation.stage          = ComputeStage::Readback;
+            } else if (const auto* forward =
+                           std::get_if<ForwardWork>(&operation.request.work.operation)) {
                 auto& result       = std::get<ForwardResult>(operation.result->output);
                 const auto& window = forward->inputs[operation.forward_row];
                 operation.forward_offset += operation.width;
@@ -161,6 +165,24 @@ void RankProgramImpl::progress() {
             return;
         }
     }
+}
+
+// Each sequence's last Main hidden column seeds its continuation: the next window, the first
+// token's sampling and MTP conditioning read it from the destination State.
+void RankProgramImpl::publish_continuation_hidden(ComputeOperation& operation) {
+    const auto hidden  = resources.frame.input_view(static_cast<int>(operation.width), 1).hidden;
+    const auto publish = [&](std::uint32_t last_column, std::int64_t destination) {
+        const auto source = hidden.slice(1, static_cast<int>(last_column), 1);
+        const auto target = resources.state_images.continuation_hidden(destination);
+        CUDA_CHECK(cudaMemcpyAsync(target.data, source.data, target.bytes(),
+                                   cudaMemcpyDeviceToDevice, device.stream()));
+    };
+    if (operation.packed) {
+        for (const auto& segment : operation.segments)
+            publish(segment.token_offset + segment.tokens - 1, segment.destination_offset);
+        return;
+    }
+    publish(operation.width - 1, operation.rows[operation.forward_row].state_offsets.destination);
 }
 
 } // namespace ninfer::models::qwen3_5::detail

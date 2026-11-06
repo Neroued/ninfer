@@ -415,7 +415,9 @@ SessionImpl::SessionImpl(std::shared_ptr<const ModelDefinition> definition_in, S
       draft_window(plan.draft_window), speculative_backend(plan.speculative_backend),
       context_cache(plan.context_cache), vision_enabled(plan.profile->options.vision),
       causal_scoring(plan.causal_scoring) {
-    if (!definition || !plan.profile || plan.context.pools.empty())
+    if (!definition || !plan.profile || plan.context.pools.empty() ||
+        plan.pack_tokens < plan.prefill_chunk || plan.pack_segments == 0 ||
+        plan.pack_segments > plan.max_concurrency)
         throw std::invalid_argument("Session preparation is incomplete");
     checkpoints.configure(Checkpoints::capacity_for_metadata(directory.metadata_budget().limit()),
                           directory.metadata_budget(), &recovery_index);

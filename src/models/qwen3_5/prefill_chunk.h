@@ -16,6 +16,11 @@ namespace ninfer::models::qwen3_5 {
 inline constexpr std::uint32_t kResidentPrefillChunk    = 2048;
 inline constexpr std::uint32_t kHostExpertsPrefillChunk = 4096;
 
+// One packed prefill execution carries at most this many chunks of tokens in total, summed over
+// its sequence segments. It matches the Engine's per-cycle prefill budget, so the Session never
+// trims a flight the Scheduler admitted.
+inline constexpr std::uint32_t kPrefillPackChunks = 2;
+
 // Explicit EngineOptions::prefill_chunk wins over the placement default. The result is clamped to
 // max_context and must be a multiple of kPrefillChunkAlignment.
 [[nodiscard]] inline std::uint32_t resolve_prefill_chunk(const EngineOptions& options,
@@ -28,6 +33,23 @@ inline constexpr std::uint32_t kHostExpertsPrefillChunk = 4096;
         throw std::invalid_argument("prefill_chunk must be a nonzero multiple of " +
                                     std::to_string(kPrefillChunkAlignment));
     return chunk;
+}
+
+// Upper bound of the summed segment length of one packed prefill execution. It is the only
+// authority for that bound: planning sizes the token-axis workspace and the execution frame from
+// it, and the Session admits segments against it. The result is a multiple of
+// kPrefillChunkAlignment and at least `prefill_chunk`, so a single window always fits. A pack
+// never needs to exceed the largest context a request can occupy.
+[[nodiscard]] inline std::uint32_t resolve_prefill_pack_tokens(std::uint32_t prefill_chunk,
+                                                               std::uint32_t max_context) {
+    if (prefill_chunk == 0 || prefill_chunk % kPrefillChunkAlignment != 0)
+        throw std::invalid_argument("prefill_chunk must be a nonzero multiple of " +
+                                    std::to_string(kPrefillChunkAlignment));
+    const std::uint64_t aligned_context =
+        (std::uint64_t{max_context} + kPrefillChunkAlignment - 1) / kPrefillChunkAlignment *
+        kPrefillChunkAlignment;
+    const std::uint64_t packed = std::uint64_t{prefill_chunk} * kPrefillPackChunks;
+    return std::max(prefill_chunk, static_cast<std::uint32_t>(std::min(packed, aligned_context)));
 }
 
 } // namespace ninfer::models::qwen3_5

@@ -80,7 +80,9 @@ void RankProgramImpl::initialize_forward(ComputeOperation& operation, const Forw
         operation.sampling = work.sampling;
         operation.batch    = static_cast<std::uint32_t>(work.rows.size());
         operation.result   = Result{ForwardResult{}};
+        operation.packed   = work.purpose == ForwardPurpose::Prefill && work.rows.size() > 1;
     }
+    if (operation.packed) return initialize_packed_forward(operation, work);
     const auto index   = operation.forward_row;
     const auto& window = work.inputs[index];
     const auto offset  = operation.forward_offset;
@@ -174,6 +176,65 @@ void RankProgramImpl::initialize_forward(ComputeOperation& operation, const Forw
                 embeddings.view({embeddings.ne[0], static_cast<int>(operation.width), 1});
         }
     }
+}
+
+// Rows of a packed prefill are independent B=1 windows laid out back to back on one token axis.
+// Compact row i of the ingress arrays describes segment i; execution reads them by segment.
+void RankProgramImpl::initialize_packed_forward(ComputeOperation& operation,
+                                                const ForwardWork& work) {
+    auto& frame         = resources.frame;
+    const auto count    = static_cast<std::uint32_t>(work.rows.size());
+    *frame.host_ingress = {};
+    operation.segments.clear();
+    operation.segments.reserve(count);
+    std::uint32_t total = 0;
+    for (std::uint32_t i = 0; i < count; ++i) {
+        const auto& row    = work.rows[i];
+        const auto columns = static_cast<std::uint32_t>(work.inputs[i].tokens.size());
+        bind_row(*frame.host_ingress, i, row);
+        frame.host_ingress->valid_columns[i] = static_cast<std::int32_t>(columns);
+        for (int axis = 0; axis < 3; ++axis)
+            frame.host_ingress->previous_rope[axis * count + i] = row.tail_rope_position[axis];
+        operation.segments.push_back(
+            {i, total, columns, row.state_offsets.source, row.state_offsets.destination});
+        total += columns;
+    }
+    upload_ingress();
+    operation.input_embeddings.reset();
+    operation.width        = total;
+    operation.row_finished = false;
+    auto host              = frame.host_input_view(static_cast<int>(total), 1);
+    auto* ids              = static_cast<TokenId*>(host.ids.data);
+    auto* positions        = static_cast<std::int32_t*>(host.cache_positions.data);
+    auto* rope             = static_cast<std::int32_t*>(host.rope_positions.data);
+    for (const auto& segment : operation.segments) {
+        const auto& window = work.inputs[segment.row];
+        const auto& row    = work.rows[segment.row];
+        std::copy(window.tokens.begin(), window.tokens.end(), ids + segment.token_offset);
+        for (std::uint32_t i = 0; i < segment.tokens; ++i)
+            positions[segment.token_offset + i] = static_cast<std::int32_t>(row.main_frontier + i);
+        for (int axis = 0; axis < 3; ++axis)
+            std::copy_n(window.rope_positions.begin() + axis * segment.tokens, segment.tokens,
+                        rope + axis * total + segment.token_offset);
+    }
+    upload_input(total, 1);
+}
+
+// The supported extent of packed prefill is owned here: one flat token axis of bounded total
+// length, whole windows only, no sampling, vision or draft feature state.
+void RankProgramImpl::validate_packed_forward(const ForwardWork& work) const {
+    const auto& spec = resources.frame.spec;
+    if (work.sample != SamplePurpose::None || resources.dflash ||
+        work.rows.size() > spec.pack_segments)
+        throw std::invalid_argument("Qwen3.5 packed prefill has unsupported membership");
+    std::uint64_t total = 0;
+    for (const auto& input : work.inputs) {
+        if (input.tokens.empty() || input.visual || !input.execution_splits.empty())
+            throw std::invalid_argument("Qwen3.5 packed prefill window cannot share an execution");
+        total += input.tokens.size();
+    }
+    if (total > spec.pack_tokens)
+        throw std::invalid_argument("Qwen3.5 packed prefill exceeds its token capacity");
 }
 
 void RankProgramImpl::initialize_decode(ComputeOperation& operation, const DecodeWork& work) {

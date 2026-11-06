@@ -27,6 +27,9 @@ struct TextExecutionView {
 // valid_columns/kv_table_rows I32 [B], and State byte offsets I64 [B]. SequenceUpdate
 // uses Host byte offsets; ReplayRecords only reads source records. Embeddings, when supplied,
 // are immutable BF16 [H,W,B] with visual replacements already applied.
+// PackedSequenceUpdate flattens its sequences onto one token axis: ids/cache_positions are I32
+// [N,1], RoPE positions I32 [N,3], N the summed segment length, and valid_columns/kv_table_rows
+// I32 [S], indexed by SequenceSegment::row. State offsets come from the segments.
 struct TextInputs {
     Tensor ids;
     Tensor cache_positions;
@@ -47,13 +50,34 @@ struct SequenceUpdate {
     std::int64_t destination_offset;
 };
 
+// One independent sequence inside a packed token axis: tokens [token_offset, token_offset+tokens)
+// belong to the sequence whose table row and valid length are entry `row` of kv_table_rows and
+// valid_columns. Its State is read at source_offset and published at destination_offset (Host
+// byte offsets). Segments are consecutive, cover the token axis and share no destination State.
+struct SequenceSegment {
+    std::uint32_t row;
+    std::uint32_t token_offset;
+    std::uint32_t tokens;
+    std::int64_t source_offset;
+    std::int64_t destination_offset;
+};
+
+// Publishes every segment as a complete B=1 sequence with the same chunked recurrence and the
+// same attention as SequenceUpdate would apply to it alone. Token-wise stages (embedding,
+// normalization, projection, routed experts) run once over the whole token axis, so each segment
+// matches its separate execution. The segment storage is borrowed for the traversal.
+struct PackedSequenceUpdate {
+    std::span<const SequenceSegment> segments;
+};
+
 struct StepUpdate {};
 
 struct ReplayRecords {
     const GdnReplayRecords& records;
 };
 
-using TextStateUpdate = std::variant<SequenceUpdate, StepUpdate, ReplayRecords>;
+using TextStateUpdate =
+    std::variant<SequenceUpdate, PackedSequenceUpdate, StepUpdate, ReplayRecords>;
 
 // Selected post-layer residuals concatenate along the feature axis. With residency_slots,
 // features is BF16 [H*layers,W,Slots], and valid row prefixes scatter to absolute residency

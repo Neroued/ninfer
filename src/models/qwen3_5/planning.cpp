@@ -151,6 +151,8 @@ SessionPlan plan_session(const SequencePlan& sequence) {
     out.capacity            = source.capacity;
     out.max_concurrency     = source.max_concurrency;
     out.prefill_chunk       = source.prefill_chunk;
+    out.pack_tokens         = source.pack_tokens;
+    out.pack_segments       = source.pack_segments;
     out.draft_window        = source.draft_window;
     out.speculative_backend = source.speculative_backend;
     out.context_cache       = source.context_cache;

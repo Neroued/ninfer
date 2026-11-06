@@ -24,8 +24,15 @@ SessionImpl::submit_execution(Execution&& pending, runtime::ExecutionReservation
     }
 }
 
-std::uint32_t SessionImpl::prefill_pack_limit() const noexcept {
-    return is_masked_draft_backend(speculative_backend) ? 1U : max_concurrency;
+std::uint32_t SessionImpl::prefill_pack_limit() const noexcept { return plan.pack_segments; }
+
+// A window that spans a prefix execution boundary runs as separate traversals so cached State
+// stays identical to an uncached run; such a window does not share a packed traversal.
+bool SessionImpl::crosses_execution_boundary(const SequenceState& state, std::uint32_t begin,
+                                             std::uint32_t end) const {
+    const auto frontiers = state.prefix_identity.execution_frontiers();
+    const auto next      = std::upper_bound(frontiers.begin(), frontiers.end(), begin);
+    return next != frontiers.end() && *next < end;
 }
 
 std::optional<PrefillStart> SessionImpl::start_prefill(std::span<const SequenceHandle> candidates,
@@ -56,7 +63,8 @@ std::optional<PrefillStart> SessionImpl::start_prefill(std::span<const SequenceH
     };
 
     std::vector<Segment> segments;
-    bool final_segment = false;
+    std::uint32_t packed_tokens = 0;
+    bool final_segment          = false;
     try {
         for (std::size_t i = 0; i < considered; ++i) {
             const auto l  = lane(candidates[i]);
@@ -69,12 +77,17 @@ std::optional<PrefillStart> SessionImpl::start_prefill(std::span<const SequenceH
                 std::min(request.permit->main_frontier, request.base->summary.prompt_tokens),
                 vision_window);
             // A window that reaches the prompt end produces the first token. Vision and DFlash
-            // windows carry state that only a single-row execution owns.
+            // windows carry state that only a single-row execution owns, and so does a window
+            // that crosses a prefix execution boundary. The summed window length of a pack stays
+            // within the planned token axis.
             const bool final_window = end == request.base->summary.prompt_tokens;
             const bool alone        = final_window || request.base->vision ||
-                               is_masked_draft_backend(speculative_backend);
-            if (i && (alone || end == begin)) break;
+                               is_masked_draft_backend(speculative_backend) ||
+                               crosses_execution_boundary(state, begin, end);
+            if (i && (alone || end == begin || packed_tokens + (end - begin) > plan.pack_tokens))
+                break;
             segments.push_back({l, begin, end, !constrained.empty() && constrained[i]});
+            packed_tokens += end - begin;
             final_segment = final_window;
             if (alone) break;
         }

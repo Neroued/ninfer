@@ -194,6 +194,8 @@ void RankProgramImpl::validate_work(const Work& work, runtime::FrameKind kind) c
                          op.purpose != ForwardPurpose::Replay))
                         throw std::invalid_argument("Qwen3.5 forward exceeds its context");
                 }
+                if (op.purpose == ForwardPurpose::Prefill && op.rows.size() > 1)
+                    validate_packed_forward(op);
             } else if constexpr (std::is_same_v<T, DecodeWork>) {
                 validate_members(
                     op.rows, [](const auto& row) -> const ExecutionRow& { return row.binding; });

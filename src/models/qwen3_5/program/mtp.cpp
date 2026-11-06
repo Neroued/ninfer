@@ -36,12 +36,15 @@ Tensor causal_rope(const Tensor& rope, int width, int batch) {
     return rope.view({width, batch, 3}).permute({0, 2, 1, 3});
 }
 
-void gather_conditioning(Resources& resources, int batch, CudaExecutionView cuda) {
+// Gathers the continuation hidden of compact rows [first, first + batch) into the conditioning
+// plane's first `batch` columns.
+void gather_conditioning(Resources& resources, int first, int batch, CudaExecutionView cuda) {
     const auto& frame = resources.frame;
     auto output       = packed(frame.mtp->base_conditioning, {frame.spec.hidden, batch});
     const std::array fields{ops::StateGather{
-        resources.state_images.continuation_hidden(frame.state_source_offsets.slice(0, 0, batch)),
-        frame.valid_columns.slice(0, 0, batch), output}};
+        resources.state_images.continuation_hidden(
+            frame.state_source_offsets.slice(0, first, batch)),
+        frame.valid_columns.slice(0, first, batch), output}};
     ops::gather_state_fields(fields, cuda);
 }
 
@@ -83,7 +86,7 @@ void RankProgramImpl::run_mtp_draft(std::uint32_t batch_size, std::uint32_t step
     const auto hidden        = execution::dimension(parameters.profile->config.text.hidden_size);
     const auto mtp_execution = mtp_view(parameters, resources, cuda, proposal_head);
     auto base                = packed(mtp.base_conditioning, {hidden, batch});
-    gather_conditioning(resources, batch, cuda);
+    gather_conditioning(resources, 0, batch, cuda);
     auto logits = packed(mtp.proposal_logits,
                          {execution::dimension(parameters.profile->config.text.vocab_size), batch});
     for (std::uint32_t step = 0; step < steps; ++step) {
@@ -130,6 +133,10 @@ void RankProgramImpl::align_mtp_history(ComputeOperation& operation) {
     const auto batch         = forward ? 1 : static_cast<std::int32_t>(operation.batch);
     const auto width         = static_cast<std::int32_t>(operation.width);
     const auto hidden        = execution::dimension(parameters.profile->config.text.hidden_size);
+    if (operation.packed) {
+        align_packed_mtp_history(operation);
+        return;
+    }
     const auto row_begin     = forward ? operation.forward_row : 0;
     const auto rows    = std::span<const ExecutionRow>(operation.rows).subspan(row_begin, batch);
     const auto skip    = forward && rows.front().main_frontier == 0 ? 1 : 0;
@@ -142,7 +149,7 @@ void RankProgramImpl::align_mtp_history(ComputeOperation& operation) {
     auto positions    = packed(mtp.history_positions, {history_width, batch});
     auto rope         = packed(mtp.history_rope_positions, {history_width * batch, 3});
     auto valid        = mtp.history_columns.slice(0, 0, batch);
-    gather_conditioning(resources, batch, cuda);
+    gather_conditioning(resources, 0, batch, cuda);
     ops::prepare_causal_pairs(
         {main.hidden,
          packed(mtp.base_conditioning, {hidden, batch}),
@@ -167,6 +174,56 @@ void RankProgramImpl::align_mtp_history(ComputeOperation& operation) {
         .input_embeddings = embeddings ? &*embeddings : nullptr,
     };
     execution::mtp_history(mtp_execution, inputs, {0, static_cast<std::uint32_t>(history_width)});
+}
+
+// Segments of a packed prefill each align their own history as an independent B=1 window: the
+// first token pairs with the sequence's previous continuation hidden and later tokens with the
+// preceding Main column of the same segment, never a neighbouring sequence's column.
+void RankProgramImpl::align_packed_mtp_history(ComputeOperation& operation) {
+    auto& frame              = resources.frame;
+    auto& mtp                = *frame.mtp;
+    const auto cuda          = device.execution_view();
+    const auto mtp_execution = mtp_view(parameters, resources, cuda, proposal_head);
+    const auto hidden        = execution::dimension(parameters.profile->config.text.hidden_size);
+    const auto total         = static_cast<std::int32_t>(operation.width);
+    const auto count         = static_cast<std::int32_t>(operation.segments.size());
+    const auto main          = frame.input_view(total, 1);
+    const auto main_rope     = causal_rope(main.rope_positions, total, 1);
+    const auto previous_rope = packed(frame.previous_rope, {count, 3});
+    for (const auto& segment : operation.segments) {
+        const auto row     = static_cast<std::int32_t>(segment.row);
+        const auto begin   = static_cast<std::int32_t>(segment.token_offset);
+        const auto width   = static_cast<std::int32_t>(segment.tokens);
+        const auto skip    = operation.rows[segment.row].main_frontier == 0 ? 1 : 0;
+        const auto history = width - skip;
+        if (history == 0) continue;
+        auto conditioning = packed(mtp.history_conditioning, {hidden, history, 1});
+        auto ids          = packed(mtp.history_ids, {history, 1});
+        auto positions    = packed(mtp.history_positions, {history, 1});
+        auto rope         = packed(mtp.history_rope_positions, {history, 3});
+        auto valid        = mtp.history_columns.slice(0, 0, 1);
+        gather_conditioning(resources, row, 1, cuda);
+        ops::prepare_causal_pairs(
+            {main.hidden.slice(1, begin, width),
+             packed(mtp.base_conditioning, {hidden, 1}),
+             main.ids.slice(0, begin, width),
+             main.cache_positions.slice(0, begin, width),
+             main_rope.slice(0, begin, width),
+             previous_rope.slice(0, row, 1).permute({1, 0, 2, 3}),
+             frame.valid_columns.slice(0, row, 1),
+             frame.history_skip.slice(0, row, 1),
+             {}},
+            {conditioning, ids, positions, valid, causal_rope(rope, history, 1)}, cuda);
+        const execution::MtpInputs inputs{
+            .ids             = ids,
+            .conditioning    = conditioning,
+            .cache_positions = positions,
+            .rope_positions  = rope,
+            .valid_columns   = valid,
+            .kv_table_rows   = frame.backend_table_rows.slice(0, row, 1),
+        };
+        execution::mtp_history(mtp_execution, inputs, {0, static_cast<std::uint32_t>(history)});
+    }
 }
 
 void RankProgramImpl::rebuild_mtp_history(std::uint32_t batch_size) {

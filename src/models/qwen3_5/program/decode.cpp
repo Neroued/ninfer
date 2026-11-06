@@ -134,8 +134,10 @@ void RankProgramImpl::begin_target(ComputeOperation& operation) {
                          std::holds_alternative<ScoreWork>(operation.request.work.operation);
     const int batch = forward ? 1 : static_cast<int>(operation.batch);
     const int width = static_cast<int>(operation.width);
+    // A packed traversal is one B=1 token axis whose metadata has one entry per segment.
+    const int rows = operation.packed ? static_cast<int>(operation.segments.size()) : batch;
     ++operation.attention.forwards;
-    operation.attention.rows += batch;
+    operation.attention.rows += rows;
     operation.attention.scheduled_positions += std::uint64_t(width) * batch;
     if (forward)
         operation.attention.valid_positions += width;
@@ -156,20 +158,22 @@ void RankProgramImpl::begin_target(ComputeOperation& operation) {
     execution::TextInputs inputs{input.ids,
                                  input.cache_positions,
                                  input.rope_positions,
-                                 frame.valid_columns.slice(0, 0, batch),
-                                 frame.main_table_rows.slice(0, 0, batch),
-                                 frame.state_source_offsets.slice(0, 0, batch),
-                                 frame.state_destination_offsets.slice(0, 0, batch),
+                                 frame.valid_columns.slice(0, 0, rows),
+                                 frame.main_table_rows.slice(0, 0, rows),
+                                 frame.state_source_offsets.slice(0, 0, rows),
+                                 frame.state_destination_offsets.slice(0, 0, rows),
                                  operation.input_embeddings};
     execution::TextStateUpdate update = execution::StepUpdate{};
-    if (forward) {
+    if (operation.packed) {
+        update = execution::PackedSequenceUpdate{operation.segments};
+    } else if (forward) {
         const auto& row = operation.rows[operation.forward_row];
         update = execution::SequenceUpdate{row.state_offsets.source, row.state_offsets.destination};
     } else if (operation.speculative) {
         update.emplace<execution::ReplayRecords>(*resources.replay_records);
     }
     std::uint32_t minimum = capacity, maximum = 0;
-    for (int row = 0; row < batch; ++row) {
+    for (int row = 0; row < rows; ++row) {
         const auto end = static_cast<std::uint32_t>(frame.host_ingress->frontiers[row] +
                                                     frame.host_ingress->valid_columns[row]);
         minimum        = std::min(minimum, end);

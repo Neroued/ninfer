@@ -36,7 +36,35 @@ void require_shape(const Tensor& value, DType dtype, std::initializer_list<std::
 }
 
 bool is_sequence(const TextStateUpdate& update) {
-    return std::holds_alternative<SequenceUpdate>(update);
+    return std::holds_alternative<SequenceUpdate>(update) ||
+           std::holds_alternative<PackedSequenceUpdate>(update);
+}
+
+// Segments cover [0, tokens) in order, address distinct rows of the [rows] metadata and leave
+// every published State separate from every other segment's State.
+void validate_segments(std::span<const SequenceSegment> segments, std::int32_t tokens,
+                       std::int32_t rows, bool states) {
+    if (segments.empty()) throw std::invalid_argument("Main packed update has no segment");
+    std::int64_t next = 0;
+    for (std::size_t i = 0; i < segments.size(); ++i) {
+        const auto& segment = segments[i];
+        if (segment.tokens == 0 || segment.token_offset != next ||
+            segment.row >= static_cast<std::uint32_t>(rows))
+            throw std::invalid_argument("Main packed segment has an invalid extent or row");
+        if (states && (segment.source_offset < 0 || segment.destination_offset < 0))
+            throw std::invalid_argument("Main packed segment State offsets are invalid");
+        next += segment.tokens;
+        for (std::size_t j = 0; j < i; ++j) {
+            const auto& other = segments[j];
+            if (other.row == segment.row ||
+                (states && (other.destination_offset == segment.destination_offset ||
+                            other.destination_offset == segment.source_offset ||
+                            segment.destination_offset == other.source_offset)))
+                throw std::invalid_argument("Main packed segments share a row or State");
+        }
+    }
+    if (next != tokens)
+        throw std::invalid_argument("Main packed segments do not cover the token axis");
 }
 
 } // namespace
@@ -60,14 +88,22 @@ TextRun::TextRun(TextExecutionView execution, TextInputs inputs, TextStateUpdate
         throw std::invalid_argument("Main RoPE positions require one or three axes");
     require_shape(inputs_.rope_positions, DType::I32, {columns, inputs_.rope_positions.ne[1]},
                   "Main RoPE positions");
-    require_shape(inputs_.kv_table_rows, DType::I32, {batch}, "Main KV table rows");
+    const auto* packed = std::get_if<PackedSequenceUpdate>(&update_);
+    const auto rows    = packed ? inputs_.kv_table_rows.ne[0] : batch;
+    if (packed && (batch != 1 || rows <= 0 || !inputs_.valid_columns.data))
+        throw std::invalid_argument(
+            "PackedSequenceUpdate requires one token axis and row metadata");
+    require_shape(inputs_.kv_table_rows, DType::I32, {rows}, "Main KV table rows");
     if (inputs_.valid_columns.data)
-        require_shape(inputs_.valid_columns, DType::I32, {batch}, "Main valid columns");
+        require_shape(inputs_.valid_columns, DType::I32, {rows}, "Main valid columns");
     require_shape(hidden_, DType::BF16, {channels, width, batch}, "Main hidden output");
     if (inputs_.input_embeddings)
         require_shape(*inputs_.input_embeddings, DType::BF16, {channels, width, batch},
                       "Main input embeddings");
-    if (const auto* sequence = std::get_if<SequenceUpdate>(&update_)) {
+    if (packed) {
+        if (features) throw std::invalid_argument("PackedSequenceUpdate has no feature sink");
+        validate_segments(packed->segments, width, rows, config.gdn.has_value());
+    } else if (const auto* sequence = std::get_if<SequenceUpdate>(&update_)) {
         if (batch != 1) throw std::invalid_argument("SequenceUpdate requires one sequence");
         if (config.gdn && (sequence->source_offset < 0 || sequence->destination_offset < 0))
             throw std::invalid_argument("Main sequence State offsets are invalid");
@@ -168,14 +204,33 @@ void TextRun::attention(const BlockParameters& block, std::uint32_t compact_laye
     ops::rmsnorm(query, p.query_norm, cfg.rms_norm_eps, true, q, cuda);
     ops::rmsnorm(key, p.key_norm, cfg.rms_norm_eps, true, k, cuda);
     text_rope(inputs_.rope_positions, *cfg.rope_parameters, q, k, cuda);
-    Tensor qb = q.view({dim, heads, width, batch});
-    Tensor kb = k.view({dim, kv, width, batch});
-    Tensor vb = value.view({dim, kv, width, batch});
-    Tensor ab = a.view({dim, heads, width, batch});
-    ops::causal_softmax_attention(
-        qb, kb, vb, inputs_.cache_positions, inputs_.valid_columns, inputs_.kv_table_rows,
-        {dim, heads, kv}, static_cast<float>(1.0 / std::sqrt(double(attn.head_dim))),
-        view_.cache.batch_layer_view(compact_layer), envelope_, work, ab, cuda);
+    Tensor qb        = q.view({dim, heads, width, batch});
+    Tensor kb        = k.view({dim, kv, width, batch});
+    Tensor vb        = value.view({dim, kv, width, batch});
+    Tensor ab        = a.view({dim, heads, width, batch});
+    const auto scale = static_cast<float>(1.0 / std::sqrt(double(attn.head_dim)));
+    const auto cache = view_.cache.batch_layer_view(compact_layer);
+    if (const auto* packed = std::get_if<PackedSequenceUpdate>(&update_)) {
+        // Each segment is an independent B=1 sequence, so it uses the existing Op with its own
+        // positions, table row and valid length. The envelope bounds every segment's visible keys.
+        for (const auto& segment : packed->segments) {
+            const auto begin  = static_cast<std::int32_t>(segment.token_offset);
+            const auto length = static_cast<std::int32_t>(segment.tokens);
+            const auto row    = static_cast<std::int32_t>(segment.row);
+            Tensor qs         = q.slice(2, begin, length).view({dim, heads, length, 1});
+            Tensor ks         = k.slice(2, begin, length).view({dim, kv, length, 1});
+            Tensor vs         = value.slice(2, begin, length).view({dim, kv, length, 1});
+            Tensor as         = a.slice(2, begin, length).view({dim, heads, length, 1});
+            ops::causal_softmax_attention(
+                qs, ks, vs, inputs_.cache_positions.slice(0, begin, length),
+                inputs_.valid_columns.slice(0, row, 1), inputs_.kv_table_rows.slice(0, row, 1),
+                {dim, heads, kv}, scale, cache, envelope_, work, as, cuda);
+        }
+    } else {
+        ops::causal_softmax_attention(qb, kb, vb, inputs_.cache_positions, inputs_.valid_columns,
+                                      inputs_.kv_table_rows, {dim, heads, kv}, scale, cache,
+                                      envelope_, work, ab, cuda);
+    }
     ops::sigmoid_mul(gate, a, cuda);
     ops::linear_add(a.view({dimension(attn.query_width()), tokens}), p.output.weight, residual_,
                     p.output.policy, work, cuda);
@@ -196,6 +251,7 @@ void TextRun::gdn(const BlockParameters& block, std::uint32_t compact_layer) {
     const auto dv        = dimension(gdn.linear_value_head_dim);
     const auto scale     = static_cast<float>(1.0 / std::sqrt(double(gdn.linear_key_head_dim)));
     const auto* sequence = std::get_if<SequenceUpdate>(&update_);
+    const auto* packed   = std::get_if<PackedSequenceUpdate>(&update_);
     const auto* replay   = std::get_if<ReplayRecords>(&update_);
 
     const auto control = workspace::gdn_control(work, cfg, tokens);
@@ -209,13 +265,33 @@ void TextRun::gdn(const BlockParameters& block, std::uint32_t compact_layer) {
     Tensor qc             = projection.query;
     Tensor kc             = projection.key;
     Tensor vc             = projection.value;
-    if (sequence) {
+    if (sequence || packed) {
         Tensor qkv    = workspace::gdn_prefill_conv(work, cfg, tokens);
         Tensor z_flat = z.view({dimension(gdn.value_width()), tokens});
         gdn_projection(h, p, qkv, z_flat, work, cuda);
-        Tensor source      = view_.states.conv_tensor(compact_layer, sequence->source_offset);
-        Tensor destination = view_.states.conv_tensor(compact_layer, sequence->destination_offset);
-        ops::causal_conv1d_silu_split(qkv, p.convolution, source, destination, qc, kc, vc, cuda);
+        if (sequence) {
+            Tensor source = view_.states.conv_tensor(compact_layer, sequence->source_offset);
+            Tensor destination =
+                view_.states.conv_tensor(compact_layer, sequence->destination_offset);
+            ops::causal_conv1d_silu_split(qkv, p.convolution, source, destination, qc, kc, vc,
+                                          cuda);
+        } else {
+            // The convolution window is per sequence: each segment starts from its own State and
+            // publishes its own trailing window.
+            for (const auto& segment : packed->segments) {
+                const auto begin  = static_cast<std::int32_t>(segment.token_offset);
+                const auto length = static_cast<std::int32_t>(segment.tokens);
+                Tensor x          = qkv.slice(1, begin, length);
+                Tensor query      = qc.slice(1, begin, length);
+                Tensor key        = kc.slice(1, begin, length);
+                Tensor value      = vc.slice(1, begin, length);
+                Tensor source     = view_.states.conv_tensor(compact_layer, segment.source_offset);
+                Tensor destination =
+                    view_.states.conv_tensor(compact_layer, segment.destination_offset);
+                ops::causal_conv1d_silu_split(x, p.convolution, source, destination, query, key,
+                                              value, cuda);
+            }
+        }
     } else {
         Tensor projection_input = h.view({dimension(cfg.hidden_size), width, batch});
         Tensor query_output     = qc.view({dimension(gdn.key_width()), width, batch});
@@ -247,6 +323,19 @@ void TextRun::gdn(const BlockParameters& block, std::uint32_t compact_layer) {
         Tensor destination =
             view_.states.recurrent_tensor(compact_layer, sequence->destination_offset);
         ops::gated_delta_net(q, k, v, g, beta, scale, true, work, source, destination, o, cuda);
+    } else if (packed) {
+        for (const auto& segment : packed->segments) {
+            const auto begin  = static_cast<std::int32_t>(segment.token_offset);
+            const auto length = static_cast<std::int32_t>(segment.tokens);
+            Tensor source     = view_.states.recurrent_tensor(compact_layer, segment.source_offset);
+            Tensor destination =
+                view_.states.recurrent_tensor(compact_layer, segment.destination_offset);
+            Tensor qs = q.slice(2, begin, length), ks = k.slice(2, begin, length);
+            Tensor vs = v.slice(2, begin, length), os = o.slice(2, begin, length);
+            ops::gated_delta_net(qs, ks, vs, g.slice(1, begin, length),
+                                 beta.slice(1, begin, length), scale, true, work, source,
+                                 destination, os, cuda);
+        }
     } else {
         const auto source =
             view_.states.layer_view(compact_layer, inputs_.state_source_offsets).recurrent;

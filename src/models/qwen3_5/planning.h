@@ -64,9 +64,13 @@ struct SessionPlan {
     std::shared_ptr<const execution::ModelProfile> profile;
     context::ContextDirectorySpec context;
     std::vector<runtime::KvPoolDescriptor> kv_pools;
-    std::uint32_t capacity                 = 0;
-    std::uint32_t max_concurrency          = 1;
-    std::uint32_t prefill_chunk            = 0;
+    std::uint32_t capacity        = 0;
+    std::uint32_t max_concurrency = 1;
+    std::uint32_t prefill_chunk   = 0;
+    // One prefill execution packs at most pack_segments sequence windows whose lengths sum to at
+    // most pack_tokens (>= prefill_chunk).
+    std::uint32_t pack_tokens              = 0;
+    std::uint32_t pack_segments            = 0;
     std::uint32_t draft_window             = 0;
     SpeculativeBackend speculative_backend = SpeculativeBackend::None;
     ContextCacheOptions context_cache;

@@ -29,7 +29,9 @@ std::int32_t dimension(std::uint64_t value) {
 void validate(const FrameSpec& spec) {
     if (spec.hidden <= 0 || spec.output_rows <= 0 || spec.public_tokens <= 0 ||
         spec.public_tokens > spec.output_rows || spec.prefill_chunk == 0 ||
-        spec.batch_capacity == 0 || spec.batch_capacity > kMaximumConcurrency) {
+        spec.pack_tokens < spec.prefill_chunk || spec.pack_segments == 0 ||
+        spec.batch_capacity == 0 || spec.batch_capacity > kMaximumConcurrency ||
+        spec.pack_segments > spec.batch_capacity) {
         throw std::invalid_argument("Qwen3.5 frame geometry is invalid");
     }
     if ((spec.backend == SpeculativeBackend::None && spec.draft_window != 0) ||
@@ -57,9 +59,12 @@ FrameLayout plan_frames(LayoutBuilder& builder, const FrameSpec& spec) {
     const auto width = dimension(std::uint64_t(spec.draft_window) + 1);
     const auto chunk = dimension(spec.prefill_chunk);
     FrameLayout out;
+    const auto pack     = dimension(spec.pack_tokens);
     out.spec            = spec;
-    out.input_capacity  = dimension(std::max<std::uint64_t>(chunk, std::uint64_t(width) * batch));
+    out.staged_capacity = dimension(std::max<std::uint64_t>(chunk, std::uint64_t(width) * batch));
+    out.input_capacity  = std::max(out.staged_capacity, pack);
     const auto inputs   = out.input_capacity;
+    const auto staged   = out.staged_capacity;
     out.ingress         = builder.add(sizeof(FrameIngress), kAlignment, "execution ingress");
     out.commit          = builder.add(sizeof(FrameCommit), kAlignment, "execution commit");
     out.egress          = builder.add(sizeof(FrameEgress), kAlignment, "execution egress");
@@ -69,7 +74,7 @@ FrameLayout plan_frames(LayoutBuilder& builder, const FrameSpec& spec) {
     out.hidden = add(builder, DType::BF16, {spec.hidden, inputs}, "execution target hidden");
     if (spec.vision) {
         out.input_embeddings =
-            add(builder, DType::BF16, {spec.hidden, inputs}, "execution input embeddings");
+            add(builder, DType::BF16, {spec.hidden, staged}, "execution input embeddings");
         out.visual_indices = add(builder, DType::I32, {chunk}, "execution visual indices");
     }
     if (spec.causal_scoring) {
@@ -95,12 +100,12 @@ FrameLayout plan_frames(LayoutBuilder& builder, const FrameSpec& spec) {
         mtp.proposal_logits =
             add(builder, DType::BF16, {spec.output_rows, batch}, "MTP proposal logits");
         mtp.history_conditioning =
-            add(builder, DType::BF16, {spec.hidden, inputs}, "MTP history conditioning");
-        mtp.history_ids       = add(builder, DType::I32, {inputs}, "MTP history ids");
-        mtp.history_positions = add(builder, DType::I32, {inputs}, "MTP history positions");
+            add(builder, DType::BF16, {spec.hidden, staged}, "MTP history conditioning");
+        mtp.history_ids       = add(builder, DType::I32, {staged}, "MTP history ids");
+        mtp.history_positions = add(builder, DType::I32, {staged}, "MTP history positions");
         mtp.history_columns   = add(builder, DType::I32, {batch}, "MTP history lengths");
         mtp.history_rope_positions =
-            add(builder, DType::I32, {inputs, 3}, "MTP history rope positions");
+            add(builder, DType::I32, {staged, 3}, "MTP history rope positions");
     }
     if (is_masked_draft_backend(spec.backend)) {
         auto& draft        = out.dflash.emplace();
@@ -186,7 +191,8 @@ DFlashFrame::DFlashFrame(MemorySpan backing, const DFlashFrameLayout& layout)
 }
 
 ExecutionFrame::ExecutionFrame(MemorySpan backing, const FrameLayout& layout)
-    : spec(layout.spec), input_capacity(layout.input_capacity), host_storage(layout.host.bytes),
+    : spec(layout.spec), input_capacity(layout.input_capacity),
+      staged_capacity(layout.staged_capacity), host_storage(layout.host.bytes),
       ingress(layout.ingress.bind(backing)), commit(layout.commit.bind(backing)),
       egress(layout.egress.bind(backing)), input_ids(layout.input_ids.bind(backing)),
       cache_positions(layout.cache_positions.bind(backing)),

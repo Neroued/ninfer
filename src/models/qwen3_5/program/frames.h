@@ -12,10 +12,14 @@
 namespace ninfer::models::qwen3_5 {
 
 struct FrameSpec {
-    std::int32_t hidden               = 0;
-    std::int32_t output_rows          = 0;
-    std::int32_t public_tokens        = 0;
-    std::uint32_t prefill_chunk       = 0;
+    std::int32_t hidden         = 0;
+    std::int32_t output_rows    = 0;
+    std::int32_t public_tokens  = 0;
+    std::uint32_t prefill_chunk = 0;
+    // Summed token extent and segment count of one packed prefill execution: pack_tokens >=
+    // prefill_chunk, pack_segments <= batch_capacity. Per-sequence consumers stay at one chunk.
+    std::uint32_t pack_tokens         = 0;
+    std::uint32_t pack_segments       = 1;
     std::uint32_t batch_capacity      = 1;
     std::uint32_t draft_window        = 0;
     SpeculativeBackend backend        = SpeculativeBackend::None;
@@ -100,7 +104,10 @@ struct FrameHostLayout {
 
 struct FrameLayout {
     FrameSpec spec;
-    std::int32_t input_capacity = 0;
+    // Token columns of the Main input/output planes; staged_capacity bounds one window's
+    // per-sequence consumers (visual embeddings, MTP history).
+    std::int32_t input_capacity  = 0;
+    std::int32_t staged_capacity = 0;
     LayoutRegion ingress;
     LayoutRegion commit;
     LayoutRegion egress;
@@ -157,6 +164,8 @@ public:
     ExecutionFrame(const ExecutionFrame&)            = delete;
     ExecutionFrame& operator=(const ExecutionFrame&) = delete;
 
+    // Packed prefill columns: segments are consecutive token ranges of one [sum, 1] plane, with
+    // one valid length and one table row per segment in the ingress arrays.
     [[nodiscard]] FrameInputView input_view(std::int32_t width, std::int32_t batch) const;
     [[nodiscard]] FrameInputView host_input_view(std::int32_t width, std::int32_t batch) const;
     [[nodiscard]] FrameInputView decode_view(std::int32_t width, std::int32_t batch) const;
@@ -164,6 +173,7 @@ public:
 
     const FrameSpec spec;
     const std::int32_t input_capacity;
+    const std::int32_t staged_capacity;
     PinnedHostBuffer host_storage;
     FrameIngress* host_ingress = nullptr;
     FrameCommit* host_commit   = nullptr;

@@ -376,6 +376,8 @@ public:
     // A resumed binding retains its complete recovery capacity until committed new progress.
     [[nodiscard]] bool recovery_pending(SequenceHandle sequence) const noexcept;
     [[nodiscard]] std::uint32_t prefill_pack_limit() const noexcept;
+    [[nodiscard]] bool crosses_execution_boundary(const SequenceState&, std::uint32_t begin,
+                                                  std::uint32_t end) const;
     [[nodiscard]] std::optional<PrefillStart> start_prefill(std::span<const SequenceHandle>,
                                                             std::span<const bool> constrained);
     [[nodiscard]] std::optional<runtime::ExecutionTicket> start_replay(SequenceHandle);

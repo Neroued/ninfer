@@ -81,3 +81,5 @@ profiles/
 id_rsa*
 *_rsa
 .ssh/
+/plugins/
+/tools/bench/gate_last_result.json

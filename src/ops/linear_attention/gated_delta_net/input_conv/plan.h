@@ -4,6 +4,8 @@
 
 namespace ninfer::ops::detail::gdn_input {
 
+inline constexpr int kQ8AggregateColumns = 32;
+
 enum class Compute { A16, A8, A4 };
 enum class ConvKernel {
     Materialized,

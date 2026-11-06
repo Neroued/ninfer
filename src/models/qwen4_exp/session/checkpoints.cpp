@@ -65,7 +65,8 @@ Session::prepare_capture(SequenceHandle h, std::span<const CheckpointHandle> hos
     if (s.capture)
         return CapturePreparation{.frontier = s.captures[s.next_capture].frontier,
                                   .reserved = true,
-                                  .origin   = s.captures[s.next_capture].origin};
+                                  .origin   = s.captures[s.next_capture].origin,
+                                  .evidence = s.captures[s.next_capture].evidence};
     while (s.next_capture < s.captures.size() &&
            s.captures[s.next_capture].frontier <= s.continuation.metadata.main_frontier)
         ++s.next_capture;
@@ -114,7 +115,8 @@ Session::prepare_capture(SequenceHandle h, std::span<const CheckpointHandle> hos
             return CapturePreparation{.frontier   = point.frontier,
                                       .assessment = assessment,
                                       .host       = {.state_images = 1},
-                                      .origin     = point.origin};
+                                      .origin     = point.origin,
+                                      .evidence   = point.evidence};
         destination = p.directory.states().reserve_logical_destination();
         if (!destination) return {};
         ticket->destination = *destination;
@@ -131,14 +133,18 @@ Session::prepare_capture(SequenceHandle h, std::span<const CheckpointHandle> hos
     if (!destination) {
         ContextDemand demand;
         demand.add_state({.count = 1});
-        return CapturePreparation{
-            point.frontier, false, p.directory.assess(demand), {.state_images = 1}, point.origin};
+        return CapturePreparation{.frontier   = point.frontier,
+                                  .assessment = p.directory.assess(demand),
+                                  .host       = {.state_images = 1},
+                                  .origin     = point.origin,
+                                  .evidence   = point.evidence};
     }
     ticket->destination = *destination;
     s.capture           = std::move(ticket);
     return CapturePreparation{.frontier       = point.frontier,
                               .reserved       = true,
                               .origin         = point.origin,
+                              .evidence       = point.evidence,
                               .retired_points = std::move(retired)};
 }
 

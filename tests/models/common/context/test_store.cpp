@@ -297,6 +297,96 @@ void test_mixed_context_demand() {
         }
 }
 
+void test_physical_resource_accounting() {
+    store::ContextDirectory directory({.ranks                 = {{0, 8192, 4096}},
+                                       .state                 = {16, {{0, {{0, 256, 256}}}}},
+                                       .pools                 = {{.pool_id       = 0,
+                                                                  .logical_pages = 32,
+                                                                  .histories     = 8,
+                                                                  .page_capacity = 8,
+                                                                  .table_rows    = 2,
+                                                                  .parts         = {{0, {256, 256}}}}},
+                                       .metadata_budget_bytes = 1024 * 1024});
+    const auto usage = [&](ninfer::ContextMemoryDomain memory, bool kv) {
+        const auto snapshot = directory.usage();
+        for (const auto& pool : snapshot.pools)
+            expect(pool.live_bytes == pool.in_use_bytes + pool.cached_bytes,
+                   "Context live purposes must conserve physical occupancy");
+        for (const auto& value : snapshot.resources)
+            if (value.domain == memory && value.history_pool.has_value() == kv) return value;
+        throw std::logic_error("missing Context resource observation");
+    };
+    auto& states     = directory.states();
+    const auto state = states.reserve_destination().value();
+    expect(usage(ninfer::ContextMemoryDomain::Device, false).in_use_bytes == 256,
+           "materialized State destination is request storage");
+    states.complete_initialization(state);
+    states.freeze(state);
+    states.retain_checkpoint_reference(state);
+    states.retain_checkpoint_reference(state);
+    expect(usage(ninfer::ContextMemoryDomain::Device, false).cached_bytes == 256,
+           "immutable cache aliases count their physical storage once");
+    {
+        store::ContextDemand demand;
+        const auto id = demand.add_history(0, 1);
+        auto reserved = directory.reserve(demand);
+        auto backing  = reserved.reservation->take(id);
+        std::array<store::PageId, 1> page;
+        auto& pages = directory.pool(0).pages();
+        pages.materialize(backing, page);
+        pages.retain_reference(page[0]);
+        const auto s = usage(ninfer::ContextMemoryDomain::Device, false);
+        const auto k = usage(ninfer::ContextMemoryDomain::Device, true);
+        expect(s.live_records == 1 && s.live_bytes == 256 && k.live_records == 1 &&
+                   k.live_bytes == 256,
+               "identical allocator geometry must distinguish State from KV without counting "
+               "references");
+        auto backup = states.reserve_device_to_host(state).value();
+        expect(usage(ninfer::ContextMemoryDomain::Host, false).cached_bytes == 256 &&
+                   usage(ninfer::ContextMemoryDomain::Device, false).cached_bytes == 256,
+               "cache backup must keep both replicas classified as cache");
+        backup.publish(true);
+        expect(pages.release_reference(page[0]) && pages.release_reference(page[0]),
+               "shared page release");
+    }
+    expect(usage(ninfer::ContextMemoryDomain::Device, true).live_records == 0,
+           "abandoned history binding leaked its resource count");
+    {
+        auto maintenance = states.pin_binding(state);
+        expect(usage(ninfer::ContextMemoryDomain::Device, false).in_use_bytes == 0,
+               "allocator maintenance does not own a request");
+        auto read = states.read(state);
+        expect(usage(ninfer::ContextMemoryDomain::Device, false).in_use_bytes == 256 &&
+                   usage(ninfer::ContextMemoryDomain::Host, false).cached_bytes == 256,
+               "Device request reader must not classify the idle Host replica as in use");
+        auto host_read = states.read(state, store::ContextMemory::Host);
+        expect(usage(ninfer::ContextMemoryDomain::Host, false).in_use_bytes == 256,
+               "Host restore reader holds request storage until retirement");
+    }
+    expect(usage(ninfer::ContextMemoryDomain::Device, false).cached_bytes == 256 &&
+               usage(ninfer::ContextMemoryDomain::Host, false).cached_bytes == 256,
+           "last request reader returns the remaining replicas to cache");
+    expect(states.release_checkpoint_owner(state), "first shared checkpoint owner release");
+    expect(usage(ninfer::ContextMemoryDomain::Device, false).live_records == 1,
+           "releasing one shared owner freed its remaining replica");
+    auto reader = states.read(state);
+    expect(states.release_checkpoint_owner(state), "last shared checkpoint owner release");
+    const auto pending = usage(ninfer::ContextMemoryDomain::Device, false);
+    expect(pending.live_records == 0 && pending.pending_retirement_records == 1,
+           "last-owner release must retain the borrowed physical record until retirement");
+    expect(pending.in_use_bytes == 0 && pending.cached_bytes == 0,
+           "retiring storage must not also count as live request or cache storage");
+    states.retain_checkpoint_reference(state);
+    expect(usage(ninfer::ContextMemoryDomain::Device, false).in_use_bytes == 256 &&
+               usage(ninfer::ContextMemoryDomain::Host, false).cached_bytes == 256,
+           "cancelled retirement must restore each replica's actual use");
+    expect(states.release_checkpoint_owner(state), "revived checkpoint release");
+    reader.reset();
+    for (const auto& resource : directory.usage().resources)
+        expect(resource.live_records == 0 && resource.pending_retirement_records == 0,
+               "retired physical replica leaked semantic usage");
+}
+
 void test_state_store(ninfer::DeviceContext& device) {
     ninfer::StateImageBuilder schema;
     (void)schema.add(ninfer::DType::BF16, {8, 3}, 1, "conv");
@@ -663,6 +753,7 @@ int main() {
         test_state_variants_and_metadata();
         test_metadata_admission();
         test_mixed_context_demand();
+        test_physical_resource_accounting();
         test_state_store(device);
         test_migration_state_fields(device);
         device.synchronize();

@@ -250,6 +250,8 @@ CommitResult SessionImpl::commit(PendingBatch&& pending,
             const auto& d = decisions[b];
             const auto l  = lane(current.members[b]);
             auto& state   = sequences[l];
+            result.rows[b].speculative.attempted_per_position.reserve(
+                requests[l].speculative_stats.attempted_per_position.size());
             result.rows[b].speculative.accepted_per_position.reserve(
                 requests[l].speculative_stats.accepted_per_position.size());
             physical.rows.push_back({d.accepted_tokens, d.terminal, d.cancelled || d.failed});
@@ -306,6 +308,7 @@ CommitResult SessionImpl::commit(PendingBatch&& pending,
             else
                 ++stats.fallback_steps;
             stats.drafted_tokens += drafted;
+            for (std::uint32_t i = 0; i < drafted; ++i) ++stats.attempted_per_position[i];
             stats.accepted_tokens += accepted;
             for (std::uint32_t j = 0; j < accepted; ++j) ++stats.accepted_per_position[j];
         }

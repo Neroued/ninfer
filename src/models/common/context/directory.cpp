@@ -722,6 +722,34 @@ std::size_t ContextDirectory::useful_release_bytes(const ContextReleaseSet& rele
     return useful;
 }
 
+std::vector<std::uint64_t>
+ContextDirectory::release_limits(const ContextAssessment& assessment) const {
+    std::vector<std::uint64_t> result;
+    for (const auto& domain : assessment.placement.domains)
+        if (domain.placement.status != PoolAvailability::Ready)
+            result.push_back(domain.placement.reclaim_bytes);
+    return result;
+}
+
+runtime::ContextReleaseMeasure
+ContextDirectory::release_measure(const ContextReleaseSet& release,
+                                  const ContextAssessment& assessment) const {
+    runtime::ContextReleaseMeasure result;
+    const auto records = normalized_releases(release.records);
+    for (const auto& domain : assessment.placement.domains) {
+        if (domain.placement.status == PoolAvailability::Ready) continue;
+        std::uint64_t bytes = 0;
+        for (const auto& record : records)
+            if (record.domain == domain.domain)
+                bytes += records_.pool(record.domain).resolve(record.allocation).bytes;
+        result.bytes.push_back(bytes);
+    }
+    if (assessment.metadata_shortage)
+        result.metadata_objects = release.states.size() + release.pages.size() +
+                                  release.histories.size() + release.catalog.size();
+    return result;
+}
+
 ContextReleaseSet ContextDirectory::state_release(StateId image) const {
     return {.records = states_.allocations(image), .states = {image}};
 }
@@ -794,6 +822,38 @@ ContextUsage ContextDirectory::usage() const {
             value.tail_bytes               = usage.tail_bytes;
             value.peak_occupied_bytes      = usage.peak_occupied_bytes;
             result.pools.push_back(value);
+            const auto add = [&](ninfer::ContextResourceUsage& into, std::uint32_t layout) {
+                const auto& records = records_.usage({rank.rank, memory}, layout);
+                into.live_records += records.live_records;
+                into.live_bytes += records.live_records * records.stride_bytes;
+                const auto cached = records.cached_records * records.stride_bytes;
+                const auto in_use =
+                    (records.live_records - records.cached_records) * records.stride_bytes;
+                into.cached_bytes += cached;
+                into.in_use_bytes += in_use;
+                result.pools.back().cached_bytes += cached;
+                result.pools.back().in_use_bytes += in_use;
+                into.pending_retirement_records += records.pending_retirement_records;
+                into.pending_retirement_bytes +=
+                    records.pending_retirement_records * records.stride_bytes;
+            };
+            ninfer::ContextResourceUsage state{.rank = rank.rank, .domain = value.domain};
+            for (const auto& layout : spec_.state.layouts)
+                if (std::any_of(layout.parts.begin(), layout.parts.end(),
+                                [&](const auto& part) { return part.rank == rank.rank; }))
+                    add(state, state_record_layout(layout.variant));
+            result.resources.push_back(state);
+            for (const auto& history : spec_.pools) {
+                if (std::none_of(history.parts.begin(), history.parts.end(),
+                                 [&](const auto& part) { return part.rank == rank.rank; }))
+                    continue;
+                ninfer::ContextResourceUsage kv{.rank   = rank.rank,
+                                                .domain = value.domain,
+                                                .history_pool =
+                                                    static_cast<std::uint16_t>(history.pool_id)};
+                add(kv, history.pool_id + 1);
+                result.resources.push_back(kv);
+            }
         }
     result.metadata      = {spec_.metadata_budget_bytes,
                             metadata_.allocated() + records_.metadata_bytes(), metadata_.reserved()};

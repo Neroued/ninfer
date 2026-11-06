@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <utility>
@@ -292,16 +293,18 @@ private:
         nodes_[index].frontier = frontier;
         nodes_[index].key      = identity;
         add_alias(index, handle);
-        for (auto child = nodes_[parent].first_child; child != none;) {
-            const auto next = nodes_[child].next;
-            if (nodes_[child].frontier > frontier) {
-                const auto other = representative(child);
-                if (key(view, other, frontier) == identity && prefix(view, handle, other)) {
-                    detach(child);
-                    attach(child, index);
+        if (!depths_.empty() && depths_.back().frontier > frontier) {
+            for (auto child = nodes_[parent].first_child; child != none;) {
+                const auto next = nodes_[child].next;
+                if (nodes_[child].frontier > frontier) {
+                    const auto other = representative(child);
+                    if (key(view, other, frontier) == identity && prefix(view, handle, other)) {
+                        detach(child);
+                        attach(child, index);
+                    }
                 }
+                child = next;
             }
-            child = next;
         }
         attach(index, parent);
         link_bucket(index);
@@ -416,6 +419,69 @@ public:
         const auto& x = index_->nodes_[a];
         const auto& y = index_->nodes_[b];
         return x.begin <= y.begin && y.begin < x.end;
+    }
+
+    // Removing checkpoints on disjoint branches has additive recovery loss. This set tracks
+    // ancestor overlap without comparing every trial with every previously removed point.
+    class OverlapSet {
+    public:
+        explicit OverlapSet(const RecoveryEvaluation& evaluation) : evaluation_(&evaluation) {}
+
+        [[nodiscard]] bool intersects(std::span<const Handle> handles) const {
+            for (const auto handle : handles) {
+                const auto region = region_of(handle);
+                const auto it     = first_overlap(region.first);
+                if (it != regions_.end() && it->first < region.second) return true;
+            }
+            return false;
+        }
+
+        void include(std::span<const Handle> handles) {
+            for (const auto handle : handles) {
+                auto region = region_of(handle);
+                auto first = first_overlap(region.first), last = first;
+                while (last != regions_.end() && last->first < region.second) {
+                    region.first  = std::min(region.first, last->first);
+                    region.second = std::max(region.second, last->second);
+                    ++last;
+                }
+                regions_.insert(regions_.erase(first, last), region);
+            }
+        }
+
+    private:
+        std::pair<std::uint32_t, std::uint32_t> region_of(Handle handle) const {
+            evaluation_->check();
+            const auto& node = evaluation_->index_->nodes_[evaluation_->require_node(handle)];
+            return {node.begin, node.end};
+        }
+
+        auto first_overlap(std::uint32_t begin) const {
+            return std::lower_bound(
+                regions_.begin(), regions_.end(), begin,
+                [](const auto& region, auto value) { return region.second <= value; });
+        }
+
+        const RecoveryEvaluation* evaluation_;
+        std::vector<std::pair<std::uint32_t, std::uint32_t>> regions_;
+    };
+
+    // A trial's marginal loss changes only along its own branches, or when a removed leaf
+    // ancestor acquires another removed branch and its previously shared loss splits.
+    [[nodiscard]] OverlapSet dependencies(std::span<const Handle> removed,
+                                          std::span<const Handle> additions) const {
+        OverlapSet result(*this);
+        result.include(additions);
+        for (const auto added : additions) {
+            std::optional<Handle> nearest;
+            for (const auto h : removed)
+                if (prefix(h, added) && (!nearest || frontier(h) > frontier(*nearest))) nearest = h;
+            if (nearest && std::none_of(removed.begin(), removed.end(), [&](auto h) {
+                    return frontier(h) > frontier(*nearest) && prefix(*nearest, h);
+                }))
+                result.include(std::span<const Handle>(&*nearest, 1));
+        }
+        return result;
     }
 
     [[nodiscard]] std::uint64_t loss(std::span<const Handle> removed,

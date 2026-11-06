@@ -78,6 +78,8 @@ Json context_usage_json(const RuntimeStats& stats) {
                          {"capacity_bytes", pool.capacity_bytes},
                          {"block_bytes", pool.block_bytes},
                          {"live_bytes", pool.live_bytes},
+                         {"in_use_bytes", pool.in_use_bytes},
+                         {"cached_bytes", pool.cached_bytes},
                          {"reserved_bytes", pool.reserved_bytes},
                          {"pending_retirement_bytes", pool.pending_retirement_bytes},
                          {"relocation_bytes", pool.relocation_bytes},
@@ -137,13 +139,12 @@ Json execution_json(const ExecutionSample& value) {
 
 Json request_execution_json(const RequestStats& value) {
     constexpr const char* names[] = {"prefill", "decode", "replay", "control", "score", "context"};
-    constexpr const char* intervals[] = {"result_stream", "commit_stream", "prefill_stream",
-                                         "vision_stream"};
+
     Json out;
     for (std::size_t i = 0; i < value.executions.size(); ++i)
         out[names[i]] = execution_json(value.executions[i]);
     for (std::size_t i = 0; i < value.max_rank_gpu.size(); ++i)
-        out["max_rank_gpu_intervals"][intervals[i]] = duration_json(value.max_rank_gpu[i]);
+        out["max_rank_gpu_intervals"][kGpuIntervalNames[i]] = duration_json(value.max_rank_gpu[i]);
     return out;
 }
 

@@ -9,6 +9,8 @@ using Small = Bf16ScheduleInstance<
                         Bf16WeightCache::Default, Bf16PhaseOrder::Sequential, 1, 4, 1, 2, 8>,
     2560>;
 using Sliced = Bf16ScheduleInstance<Bf16A16SlicedKMmaSchedule<16, 16, 8, 64, 2>, 2560>;
+using Sliced32 =
+    Bf16ScheduleInstance<Bf16KTailSchedule<Bf16A16SlicedKMmaSchedule<16, 32, 8, 128, 1>>, 2560>;
 using Hot256 = Bf16ScheduleInstance<
     Bf16A16MmaSchedule<32, 32, 256, 16, 8, 3, 1, Cache::cg, Cache::cg,
                        Bf16MmaFragmentPipeline::PingPong, Bf16MmaRaster::TokenFast>,
@@ -50,6 +52,7 @@ void streaming(const Tensor& x, const Weight& w, Tensor& y, cudaStream_t stream)
 Bf16Launch select_bf16_n124160_k2560(std::int32_t tokens) {
     if (tokens <= 8) return launch_bf16_simt<Small>;
     if (tokens <= 16) return launch_bf16_sliced_k_mma<Sliced>;
+    if (tokens <= 32) return launch_bf16_sliced_k_mma<Sliced32>;
     if (tokens <= 96) return launch_bf16_mma<Hot256>;
     if (tokens <= 128) return launch_bf16_mma<Hot128>;
     if (tokens <= 256) return launch_bf16_tma_mma<Medium>;

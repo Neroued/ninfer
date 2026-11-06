@@ -97,7 +97,6 @@ bool EngineCore<Instance>::release_branch_workspace_before_chat() {
             // Return decision-owned KV pages and StateImage leases; chat cache policy is unchanged.
             if (instance_.session->release_branch_cache()) {
                 request_admission_check();
-                scheduler_.capacity_released();
             }
             return true;
         }

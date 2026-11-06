@@ -4,6 +4,7 @@
 #include "models/common/context/directory/records.h"
 #include "models/common/context/directory/metadata.h"
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -98,12 +99,15 @@ public:
         void reset() noexcept;
 
     private:
-        ReadLease(StateDirectory& directory, StateId image, std::uint64_t epoch) noexcept
-            : directory_(&directory), image_(image), epoch_(epoch) {}
+        ReadLease(StateDirectory& directory, StateId image, std::uint64_t epoch,
+                  ContextMemory memory, ContextUse use) noexcept
+            : directory_(&directory), image_(image), epoch_(epoch), memory_(memory), use_(use) {}
 
         StateDirectory* directory_ = nullptr;
         StateId image_;
-        std::uint64_t epoch_ = 0;
+        std::uint64_t epoch_  = 0;
+        ContextMemory memory_ = ContextMemory::Device;
+        ContextUse use_       = ContextUse::Cache;
         friend class StateDirectory;
     };
 
@@ -217,7 +221,8 @@ public:
     [[nodiscard]] ContextRecordBinding device_binding(StateId image, std::uint32_t rank = 0) const;
     [[nodiscard]] ContextRecordBinding host_binding(StateId image, std::uint32_t rank = 0) const;
     [[nodiscard]] std::vector<RecordRelease> allocations(StateId image) const;
-    [[nodiscard]] ReadLease read(StateId image);
+    [[nodiscard]] ReadLease read(StateId image, ContextMemory memory = ContextMemory::Device,
+                                 ContextUse use = ContextUse::Request);
 
     void retain_checkpoint_reference(StateId image);
 
@@ -268,6 +273,7 @@ private:
         std::uint64_t transfer_id           = 0;
         std::uint32_t checkpoint_references = 0;
         std::uint32_t source_pins           = 0;
+        std::array<std::uint32_t, 2> request_references{};
         StateId write_source{};
         bool destination_pinned = false;
         bool release_pending    = false;
@@ -278,6 +284,11 @@ private:
                           std::uint32_t variant) const;
     [[nodiscard]] const StateLayoutSpec& layout_spec(std::uint32_t variant) const;
     void retire_released_owner(StateId image) noexcept;
+    static void refresh_usage(Object&) noexcept;
+    void retain_request_reference(StateId image, ContextMemory memory);
+    void release_request_reference(StateId image, ContextMemory memory) noexcept;
+    template <class Metadata, class Identity>
+    friend class ContextSnapshot;
     [[nodiscard]] bool can_release_checkpoint_owner(StateId image) const noexcept;
     [[nodiscard]] static bool has_pending_replica(const Object& object) noexcept;
     [[nodiscard]] std::optional<StateId> allocate(std::uint32_t index, StateRole role,

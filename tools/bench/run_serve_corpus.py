@@ -14,12 +14,14 @@ import statistics
 import subprocess
 import sys
 import time
+import tomllib
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 from urllib.parse import quote
 
-
 REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 MANIFEST_PATH = REPO_ROOT / "examples/cli/manifest.json"
 
 SPECULATIVE_MODES = {
@@ -138,7 +140,9 @@ class ServerLogTail:
     def _check_process(self) -> None:
         returncode = self.process.poll()
         if returncode is not None:
-            raise CampaignError(f"ninfer-serve exited unexpectedly with status {returncode}")
+            raise CampaignError(
+                f"ninfer-serve exited unexpectedly with status {returncode}"
+            )
 
     def _read_new(self) -> None:
         if not self.path.exists():
@@ -158,10 +162,15 @@ class ServerLogTail:
             try:
                 event = json.loads(raw_line)
             except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-                raise CampaignError(f"invalid serving JSONL record in {self.path}: {exc}") from exc
+                raise CampaignError(
+                    f"invalid serving JSONL record in {self.path}: {exc}"
+                ) from exc
             if not isinstance(event, dict):
-                raise CampaignError(f"serving JSONL record is not an object in {self.path}")
-            self.pending.append(event)
+                raise CampaignError(
+                    f"serving JSONL record is not an object in {self.path}"
+                )
+            if event.get("event") in ("server_start", "request_done", "request_error"):
+                self.pending.append(event)
 
     def wait_for(
         self,
@@ -177,7 +186,9 @@ class ServerLogTail:
                     return self.pending.pop(index)
             self._check_process()
             if time.monotonic() >= deadline:
-                raise CampaignError(f"timed out waiting for {description} in {self.path}")
+                raise CampaignError(
+                    f"timed out waiting for {description} in {self.path}"
+                )
             time.sleep(0.05)
 
 
@@ -222,7 +233,9 @@ class RunningServer:
         while True:
             returncode = self.process.poll()
             if returncode is not None:
-                raise CampaignError(f"ninfer-serve exited during startup with status {returncode}")
+                raise CampaignError(
+                    f"ninfer-serve exited during startup with status {returncode}"
+                )
             connection = http.client.HTTPConnection(self.host, self.port, timeout=2.0)
             try:
                 connection.request("GET", "/health", headers={"Connection": "close"})
@@ -250,7 +263,9 @@ class RunningServer:
             "server_start event",
         )
 
-    def wait_for_request_done(self, server_instance_id: str) -> dict[str, Any]:
+    def wait_for_request_done(
+        self, server_instance_id: str, response_id: str | None = None
+    ) -> dict[str, Any]:
         if self.tail is None:
             raise CampaignError("server log tail is unavailable")
 
@@ -258,11 +273,113 @@ class RunningServer:
             if event.get("server_instance_id") != server_instance_id:
                 return False
             if event.get("event") == "request_error":
-                message = event.get("error", {}).get("message", "unknown generation error")
+                message = event.get("error", {}).get(
+                    "message", "unknown generation error"
+                )
                 raise CampaignError(f"serving request failed: {message}")
-            return event.get("event") == "request_done"
+            return event.get("event") == "request_done" and (
+                response_id is None
+                or event.get("request", {}).get("response_id") == response_id
+            )
 
         return self.tail.wait_for(matches, "request_done event")
+
+
+def add_launch_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--config", type=Path, help="public Serve TOML, including deployment"
+    )
+    parser.add_argument("--max-context", type=int)
+    parser.add_argument("--context-capacity", metavar="SIZE|auto")
+    parser.add_argument("--prefill-chunk", type=int)
+    parser.add_argument("--kv-dtype", choices=KV_CACHE_NAMES)
+    parser.add_argument("--device", type=int)
+    parser.add_argument(
+        "--engine-concurrency",
+        type=int,
+        help="Engine capacity; defaults to TOML or measured concurrency",
+    )
+    parser.add_argument(
+        "--thinking",
+        choices=("fixture", "on", "off"),
+        default="fixture",
+        help="request thinking; fixture preserves the corpus settings",
+    )
+
+
+def resolve_launch_arguments(args: argparse.Namespace) -> argparse.Namespace:
+    engine = {}
+    if args.config:
+        args.config = args.config.expanduser().resolve()
+        with args.config.open("rb") as source:
+            engine = tomllib.load(source).get("engine", {})
+    for name, key, fallback in (
+        ("max_context", "max_context", 262144),
+        ("context_capacity", "context_capacity", "auto"),
+        ("prefill_chunk", "prefill_chunk", 1024),
+        ("kv_dtype", "kv_dtype", "int8"),
+        ("device", "device", 0),
+        ("engine_concurrency", "max_concurrency", None),
+    ):
+        if getattr(args, name) is None:
+            setattr(args, name, engine.get(key, fallback))
+    args.cuda_graph = engine.get("cuda_graph", True)
+    return args
+
+
+def launch_arguments(
+    args: argparse.Namespace, concurrency: int, stats_interval: int
+) -> list[str]:
+    command = ["--config", str(args.config)] if args.config else []
+    command.extend(
+        [
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(args.port),
+            "--max-context",
+            str(args.max_context),
+            "--context-capacity",
+            str(args.context_capacity),
+            "--max-concurrency",
+            str(
+                concurrency
+                if args.engine_concurrency is None
+                else args.engine_concurrency
+            ),
+            "--prefill-chunk",
+            str(args.prefill_chunk),
+            "--device",
+            str(args.device),
+            "--stats-interval",
+            str(stats_interval),
+            "--no-prefix-reuse",
+            "--host-cache-capacity",
+            "0",
+            "--gpu-timing",
+            "--cuda-graph" if args.cuda_graph else "--no-cuda-graph",
+        ]
+    )
+    return command
+
+
+def sampling_arguments(mode: str) -> list[str]:
+    if mode == "greedy":
+        return ["--temperature", "0"]
+    return [
+        "--temperature",
+        "0.6",
+        "--top-p",
+        "0.95",
+        "--top-k",
+        "20",
+        "--min-p",
+        "0",
+        "--presence-penalty",
+        "1.0",
+        "--frequency-penalty",
+        "0",
+    ]
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -292,11 +409,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default="stochastic",
         help="sampling profile for all requests (default: stochastic)",
     )
-    parser.add_argument("--output", type=Path, required=True, help="campaign output directory")
+    parser.add_argument(
+        "--output", type=Path, required=True, help="campaign output directory"
+    )
     parser.add_argument("--port", type=int, default=8080, help="loopback serving port")
-    parser.add_argument("--device", type=int, default=0, help="CUDA device index")
-    parser.add_argument("--kv-dtype", choices=tuple(KV_CACHE_NAMES), default="int8")
-    return parser.parse_args(argv)
+    add_launch_arguments(parser)
+    return resolve_launch_arguments(parser.parse_args(argv))
 
 
 def filename_label(label: str) -> str:
@@ -309,7 +427,9 @@ def parse_artifacts(values: Sequence[str]) -> list[tuple[str, Path]]:
     for value in values:
         target, separator, raw_path = value.partition("=")
         if not separator or not target or not raw_path:
-            raise CampaignError(f"invalid --artifact value {value!r}; expected LABEL=PATH")
+            raise CampaignError(
+                f"invalid --artifact value {value!r}; expected LABEL=PATH"
+            )
         if not target.strip():
             raise CampaignError("artifact label must not be empty")
         if target in parsed:
@@ -334,7 +454,7 @@ def fixture_metadata(name: str) -> tuple[str, str | None]:
     raise CampaignError(f"fixture has no campaign assignment: {name}")
 
 
-def load_fixtures() -> dict[str, Fixture]:
+def load_fixtures(thinking: str = "fixture") -> dict[str, Fixture]:
     try:
         manifest = json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
@@ -356,13 +476,19 @@ def load_fixtures() -> dict[str, Fixture]:
             fixtures[name] = Fixture(
                 name=name,
                 messages=messages,
-                thinking=bool(case["thinking"]),
+                thinking=(
+                    bool(case["thinking"])
+                    if thinking == "fixture"
+                    else thinking == "on"
+                ),
                 max_new=int(case["max_new"]),
                 suite=suite,
                 category=category,
             )
         except (KeyError, OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
-            raise CampaignError(f"failed to load fixture {name!r} from the examples manifest: {exc}") from exc
+            raise CampaignError(
+                f"failed to load fixture {name!r} from the examples manifest: {exc}"
+            ) from exc
     return fixtures
 
 
@@ -417,7 +543,9 @@ def request_payload(model_id: str, fixture: Fixture, seed: int) -> dict[str, Any
 
 
 def send_json(connection: http.client.HTTPConnection, payload: dict[str, Any]) -> None:
-    body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode(
+        "utf-8"
+    )
     try:
         connection.request(
             "POST",
@@ -452,7 +580,9 @@ def receive_json(connection: http.client.HTTPConnection) -> dict[str, Any]:
     return parsed
 
 
-def post_json(connection: http.client.HTTPConnection, payload: dict[str, Any]) -> dict[str, Any]:
+def post_json(
+    connection: http.client.HTTPConnection, payload: dict[str, Any]
+) -> dict[str, Any]:
     send_json(connection, payload)
     return receive_json(connection)
 
@@ -465,10 +595,14 @@ def require_server_log_identity(event: dict[str, Any], event_name: str) -> None:
     )
     expected = (SERVER_LOG_ARTIFACT_TYPE, SERVER_LOG_SCHEMA_VERSION, event_name)
     if identity != expected:
-        raise CampaignError(f"unexpected serving log identity {identity!r}; expected {expected!r}")
+        raise CampaignError(
+            f"unexpected serving log identity {identity!r}; expected {expected!r}"
+        )
 
 
-def validate_server_start(event: dict[str, Any], spec: RunSpec, device: int) -> tuple[str, str]:
+def validate_server_start(
+    event: dict[str, Any], spec: RunSpec, args: argparse.Namespace
+) -> tuple[str, str]:
     require_server_log_identity(event, "server_start")
     engine = event.get("engine", {})
     actual = {
@@ -484,12 +618,14 @@ def validate_server_start(event: dict[str, Any], spec: RunSpec, device: int) -> 
         "proposal_head": engine.get("proposal_head"),
     }
     expected = {
-        "device": device,
-        "max_context": 262144,
-        "context_capacity_mode": "auto",
-        "prefill_chunk": 1024,
+        "device": args.device,
+        "max_context": args.max_context,
+        "context_capacity_mode": (
+            "auto" if args.context_capacity == "auto" else "explicit"
+        ),
+        "prefill_chunk": args.prefill_chunk,
         "kv_cache": spec.kv_dtype,
-        "cuda_graph": True,
+        "cuda_graph": args.cuda_graph,
         "prefix_reuse": False,
         "speculative_backend": spec.speculative_backend,
         "speculative_draft_window": spec.draft_tokens,
@@ -499,18 +635,28 @@ def validate_server_start(event: dict[str, Any], spec: RunSpec, device: int) -> 
         raise CampaignError(f"server_start Engine configuration mismatch: {actual!r}")
     context_cache = engine.get("context_cache", {})
     if context_cache.get("host_capacity_bytes") != 0:
-        raise CampaignError("server_start context cache capacity differs from the campaign")
-    if (event.get("sampling_defaults", {}).get("server_overrides", {}).get("temperature") == 0) != (
-        spec.sampling_mode == "greedy"
-    ):
+        raise CampaignError(
+            "server_start context cache capacity differs from the campaign"
+        )
+    if (
+        event.get("sampling_defaults", {})
+        .get("server_overrides", {})
+        .get("temperature")
+        == 0
+    ) != (spec.sampling_mode == "greedy"):
         raise CampaignError("server_start sampling mode does not match the campaign")
-    if Path(event.get("artifact", {}).get("path", "")).resolve() != spec.artifact.resolve():
+    if (
+        Path(event.get("artifact", {}).get("path", "")).resolve()
+        != spec.artifact.resolve()
+    ):
         raise CampaignError("loaded artifact path does not match the campaign")
     prefill_signature = event.get("artifact", {}).get("prefill_signature")
     if not isinstance(prefill_signature, str) or not prefill_signature:
         raise CampaignError("server_start has no canonical artifact prefill_signature")
     if event.get("server", {}).get("public_model_id") != spec.model_id:
-        raise CampaignError("server_start public model id does not match the campaign target")
+        raise CampaignError(
+            "server_start public model id does not match the campaign target"
+        )
     server_instance_id = event.get("server_instance_id")
     if not isinstance(server_instance_id, str) or not server_instance_id:
         raise CampaignError("server_start has no server_instance_id")
@@ -521,6 +667,17 @@ def safe_ratio(numerator: float, denominator: float) -> float | None:
     if denominator <= 0.0:
         return None
     return numerator / denominator
+
+
+def repeated_suffix(response: dict[str, Any]) -> int | None:
+    message = response.get("choices", [{}])[0].get("message", {})
+    text = (message.get("reasoning_content") or "") + (message.get("content") or "")
+    tail = text[-1024:]
+    for width in range(16, min(256, len(tail) // 4) + 1):
+        unit = tail[-width:]
+        if unit.strip() and tail.endswith(unit * 4):
+            return width
+    return None
 
 
 def build_result_record(
@@ -562,7 +719,9 @@ def build_result_record(
         prepare_seconds = float(timings["prepare"])
         ttft_seconds = float(timings["ttft"])
         vision_seconds = float(timings["vision_stream"])
-        vision_samples = server_event["execution"]["max_rank_gpu_intervals"]["vision_stream"]["count"]
+        vision_samples = server_event["execution"]["max_rank_gpu_intervals"][
+            "vision_stream"
+        ]["count"]
         prefill_seconds = float(timings["prefill"])
         decode_seconds = float(timings["decode"])
         total_seconds = float(timings["total"])
@@ -576,10 +735,14 @@ def build_result_record(
         session_call_exposed_seconds = float(host_exposed["session_call"])
         executor_poll_exposed_seconds = float(host_exposed["executor_poll"])
         executor_flush_exposed_seconds = float(host_exposed["executor_flush"])
-        engine_commit_output_exposed_seconds = float(host_exposed["engine_commit_output"])
+        engine_commit_output_exposed_seconds = float(
+            host_exposed["engine_commit_output"]
+        )
         engine_maintenance_exposed_seconds = float(host_exposed["engine_maintenance"])
         engine_host_exposed_seconds = float(host_exposed["total"])
-        scheduler_yield_exposed_seconds = float(engine_timing["scheduler_yield_exposed_seconds"])
+        scheduler_yield_exposed_seconds = float(
+            engine_timing["scheduler_yield_exposed_seconds"]
+        )
         decode_host_exposed_seconds = float(decode_engine["host_exposed_seconds"])
         decode_scheduler_yield_exposed_seconds = float(
             decode_engine["scheduler_yield_exposed_seconds"]
@@ -615,12 +778,23 @@ def build_result_record(
         usage.get("prompt_tokens") != prompt_tokens
         or usage.get("completion_tokens") != completion_tokens
     ):
-        raise CampaignError("HTTP response usage does not match request_done token counts")
+        raise CampaignError(
+            "HTTP response usage does not match request_done token counts"
+        )
 
     decode_tokens = max(completion_tokens - 1, 0)
+    reasoning_tokens = usage.get("completion_tokens_details", {}).get(
+        "reasoning_tokens"
+    )
     metrics = {
         "prompt_tokens": prompt_tokens,
         "completion_tokens": completion_tokens,
+        "reasoning_tokens": reasoning_tokens,
+        "answer_tokens": (
+            completion_tokens - reasoning_tokens
+            if reasoning_tokens is not None
+            else None
+        ),
         "decode_tokens": decode_tokens,
         "finish_reason": result.get("finish_reason"),
         "prepare_seconds": prepare_seconds,
@@ -635,9 +809,13 @@ def build_result_record(
         "speculative_rounds": speculative_rounds,
         "drafted_tokens": drafted_tokens,
         "accepted_tokens": accepted_tokens,
-        "speculative_acceptance": safe_ratio(float(accepted_tokens), float(drafted_tokens)),
+        "speculative_acceptance": safe_ratio(
+            float(accepted_tokens), float(drafted_tokens)
+        ),
         "speculative_tokens_per_round": (
-            1.0 + accepted_tokens / speculative_rounds if speculative_rounds > 0 else None
+            1.0 + accepted_tokens / speculative_rounds
+            if speculative_rounds > 0
+            else None
         ),
         "fallback_steps": fallback_steps,
         # Request values are latency exposure, not worker cost. They are valid for distribution
@@ -683,6 +861,7 @@ def build_result_record(
         "response": response,
         "server_event": server_event,
         "metrics": metrics,
+        "output_checks": {"repeated_suffix_characters": repeated_suffix(response)},
     }
 
 
@@ -720,9 +899,13 @@ def load_existing_records(
                     )
                 key = record_key(record)
                 if key not in expected_specs:
-                    raise CampaignError(f"{path}:{line_number}: result is outside this campaign")
+                    raise CampaignError(
+                        f"{path}:{line_number}: result is outside this campaign"
+                    )
                 if key in records:
-                    raise CampaignError(f"{path}:{line_number}: duplicate result for {key!r}")
+                    raise CampaignError(
+                        f"{path}:{line_number}: duplicate result for {key!r}"
+                    )
                 spec = expected_specs[key]
                 if record.get("kv_dtype") != spec.kv_dtype:
                     raise CampaignError(
@@ -732,9 +915,18 @@ def load_existing_records(
                     raise CampaignError(
                         f"{path}:{line_number}: artifact path differs from the current command"
                     )
+                if (
+                    record.get("request", {}).get("enable_thinking")
+                    != spec.fixture.thinking
+                ):
+                    raise CampaignError(
+                        f"{path}:{line_number}: thinking differs from the current command"
+                    )
                 records[key] = record
     except (OSError, json.JSONDecodeError) as exc:
-        raise CampaignError(f"failed to read existing results from {path}: {exc}") from exc
+        raise CampaignError(
+            f"failed to read existing results from {path}: {exc}"
+        ) from exc
     return records
 
 
@@ -748,68 +940,26 @@ def server_command(
     serve: Path,
     spec: RunSpec,
     server_log: Path,
-    port: int,
-    device: int,
+    args: argparse.Namespace,
 ) -> list[str]:
     command = [
         str(serve),
         str(spec.artifact),
-        "--host",
-        "127.0.0.1",
-        "--port",
-        str(port),
+        *launch_arguments(args, 1, 0),
         "--model-id",
         spec.model_id,
-        "--max-context",
-        "262144",
-        "--context-capacity",
-        "auto",
-        "--prefill-chunk",
-        "1024",
-        "--stats-interval",
-        "0",
-        "--device",
-        str(device),
         "--request-log-jsonl",
         str(server_log),
         "--kv-dtype",
         spec.kv_dtype,
-        "--no-prefix-reuse",
-        "--host-cache-capacity",
-        "0",
+        "--spec",
+        spec.speculative_backend,
     ]
-    if spec.speculative_backend != "none":
+    if spec.draft_tokens:
         command.extend(
-            [
-                "--spec",
-                spec.speculative_backend,
-                "--draft-tokens",
-                str(spec.draft_tokens),
-                "--proposal-head", "optimized",
-            ]
+            ["--draft-tokens", str(spec.draft_tokens), "--proposal-head", "optimized"]
         )
-    if spec.sampling_mode == "greedy":
-        command.extend(["--temperature", "0"])
-    else:
-        # Published stochastic measurements use this explicit profile; they must not drift when
-        # product defaults follow a newly registered model recommendation.
-        command.extend(
-            [
-                "--temperature",
-                "0.6",
-                "--top-p",
-                "0.95",
-                "--top-k",
-                "20",
-                "--min-p",
-                "0",
-                "--presence-penalty",
-                "1.0",
-                "--frequency-penalty",
-                "0",
-            ]
-        )
-    return command
+    return command + sampling_arguments(spec.sampling_mode)
 
 
 def run_block(
@@ -817,8 +967,7 @@ def run_block(
     block_specs: Sequence[RunSpec],
     fixtures: dict[str, Fixture],
     output_dir: Path,
-    port: int,
-    device: int,
+    args: argparse.Namespace,
     run_handle: Any,
     records: dict[tuple[str, str, str, str, int], dict[str, Any]],
     completed_before_block: int,
@@ -830,7 +979,8 @@ def run_block(
         / "server"
         / f"{filename_label(first.target)}_{first.kv_dtype}_{first.speculative_mode}_{first.sampling_mode}.jsonl"
     )
-    command = server_command(serve, first, server_log, port, device)
+    command = server_command(serve, first, server_log, args)
+    port = args.port
     print(
         f"start {first.target}/{first.speculative_mode}: "
         f"{len(block_specs)} missing request(s)",
@@ -838,7 +988,9 @@ def run_block(
     )
     with RunningServer(command, "127.0.0.1", port, server_log) as server:
         server_start = server.wait_until_ready()
-        server_instance_id, prefill_signature = validate_server_start(server_start, first, device)
+        server_instance_id, prefill_signature = validate_server_start(
+            server_start, first, args
+        )
 
         connection = http.client.HTTPConnection(
             "127.0.0.1", port, timeout=REQUEST_TIMEOUT_SECONDS
@@ -861,7 +1013,9 @@ def run_block(
                         f"non-sequential serving request id {request_id}; expected {last_request_id + 1}"
                     )
                 last_request_id = request_id
-                record = build_result_record(spec, prefill_signature, payload, response, request_done)
+                record = build_result_record(
+                    spec, prefill_signature, payload, response, request_done
+                )
                 append_record(run_handle, record)
                 records[spec.key] = record
                 completed = completed_before_block + block_index
@@ -883,7 +1037,9 @@ def metric_values(records: Iterable[dict[str, Any]], name: str) -> list[float]:
     return values
 
 
-def sample_stats(records: Sequence[dict[str, Any]], name: str) -> tuple[int, float | None, float | None]:
+def sample_stats(
+    records: Sequence[dict[str, Any]], name: str
+) -> tuple[int, float | None, float | None]:
     values = metric_values(records, name)
     if not values:
         return 0, None, None
@@ -926,6 +1082,10 @@ SUMMARY_FIELDS = (
     "completion_tokens_stddev",
     "decode_tok_s_mean",
     "decode_tok_s_stddev",
+    "prefill_chunk_ms_mean",
+    "prefill_chunk_ms_stddev",
+    "decode_step_ms_mean",
+    "decode_step_ms_stddev",
     "queue_wait_ms_mean",
     "queue_wait_ms_stddev",
     "engine_host_exposed_ms_mean",
@@ -961,9 +1121,13 @@ def summary_row(
     sampling_mode: str,
     records: Sequence[dict[str, Any]],
 ) -> dict[str, Any]:
-    prefill_signatures = {str(record.get("prefill_signature", "")) for record in records}
+    prefill_signatures = {
+        str(record.get("prefill_signature", "")) for record in records
+    }
     if len(prefill_signatures) != 1 or not next(iter(prefill_signatures)):
-        raise CampaignError("summary group does not have one canonical prefill_signature")
+        raise CampaignError(
+            "summary group does not have one canonical prefill_signature"
+        )
     kv_dtypes = {record["kv_dtype"] for record in records}
     if len(kv_dtypes) != 1:
         raise CampaignError("summary group mixes KV dtypes")
@@ -983,6 +1147,8 @@ def summary_row(
     set_stats(row, "server_ttft_ms", records, "server_ttft_ms")
     set_stats(row, "completion_tokens", records, "completion_tokens")
     set_stats(row, "decode_tok_s", records, "decode_tok_s")
+    set_stats(row, "prefill_chunk_ms", records, "prefill_chunk_ms")
+    set_stats(row, "decode_step_ms", records, "decode_step_ms")
     set_stats(row, "queue_wait_ms", records, "queue_wait_ms")
     set_stats(row, "engine_host_exposed_ms", records, "engine_host_exposed_ms")
     set_stats(row, "decode_host_us_per_round", records, "decode_host_us_per_round")
@@ -1011,9 +1177,14 @@ def build_summary_rows(
     rows: list[dict[str, Any]] = []
     for target in target_order:
         for mode_name in mode_names:
-            backend, _ = SPECULATIVE_MODES[mode_name]
-            if backend == "none":
-                for fixture in NIAH_FIXTURES:
+            available = {
+                record["fixture"]
+                for record in records.values()
+                if record["target"] == target
+                and record["speculative_mode"] == mode_name
+            }
+            for fixture in NIAH_FIXTURES:
+                if fixture in available:
                     rows.append(
                         summary_row(
                             "context_profile",
@@ -1027,9 +1198,10 @@ def build_summary_rows(
                             ),
                         )
                     )
-                continue
 
             for fixture in LONG_DECODE_FIXTURES:
+                if fixture not in available:
+                    continue
                 rows.append(
                     summary_row(
                         "long_decode",
@@ -1045,6 +1217,8 @@ def build_summary_rows(
                 )
 
             for category, fixture_names in SCENARIO_FIXTURES.items():
+                if not all(name in available for name in fixture_names):
+                    continue
                 for fixture in fixture_names:
                     rows.append(
                         summary_row(
@@ -1110,8 +1284,8 @@ def markdown_table(headers: Sequence[str], rows: Sequence[Sequence[str]]) -> str
 def mode_display_name(mode_name: str) -> str:
     if mode_name == "mtp0":
         return "MTP0"
-    if mode_name == "mtp3":
-        return "MTP3"
+    if mode_name in ("mtp3", "mtp5"):
+        return mode_name.upper()
     if mode_name == "dflash7":
         return "DFlash block=8 (k=7)"
     if mode_name == "dflash2_7":
@@ -1121,10 +1295,13 @@ def mode_display_name(mode_name: str) -> str:
 
 def write_summaries(rows: Sequence[dict[str, Any]], output_dir: Path) -> None:
     with (output_dir / "summary.csv").open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=SUMMARY_FIELDS, extrasaction="ignore")
+        writer = csv.DictWriter(
+            handle, fieldnames=SUMMARY_FIELDS, extrasaction="ignore"
+        )
         writer.writeheader()
         writer.writerows(
-            {field: csv_value(row.get(field)) for field in SUMMARY_FIELDS} for row in rows
+            {field: csv_value(row.get(field)) for field in SUMMARY_FIELDS}
+            for row in rows
         )
 
     sections: list[str] = []
@@ -1132,12 +1309,8 @@ def write_summaries(rows: Sequence[dict[str, Any]], output_dir: Path) -> None:
     for mode_name in mode_names:
         label = mode_display_name(mode_name)
         mode_rows = [row for row in rows if row["speculative_mode"] == mode_name]
-        context_rows = [
-            row for row in mode_rows if row["section"] == "context_profile"
-        ]
-        long_decode_rows = [
-            row for row in mode_rows if row["section"] == "long_decode"
-        ]
+        context_rows = [row for row in mode_rows if row["section"] == "context_profile"]
+        long_decode_rows = [row for row in mode_rows if row["section"] == "long_decode"]
         category_rows = [
             row for row in mode_rows if row["section"] == "scenario_category"
         ]
@@ -1153,6 +1326,8 @@ def write_summaries(rows: Sequence[dict[str, Any]], output_dir: Path) -> None:
                     "Prefill tok/s",
                     "Server TTFT ms",
                     "Decode tok/s",
+                    "Prefill chunk ms",
+                    "Decode step ms",
                     "Host exposure ms",
                     "Decode Host us/round",
                 ),
@@ -1166,6 +1341,8 @@ def write_summaries(rows: Sequence[dict[str, Any]], output_dir: Path) -> None:
                         format_mean_stddev(row, "prefill_tok_s"),
                         format_mean_stddev(row, "server_ttft_ms"),
                         format_mean_stddev(row, "decode_tok_s"),
+                        format_mean_stddev(row, "prefill_chunk_ms"),
+                        format_mean_stddev(row, "decode_step_ms"),
                         format_mean_stddev(row, "engine_host_exposed_ms"),
                         format_mean_stddev(row, "decode_host_us_per_round"),
                     )
@@ -1267,7 +1444,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     mode_names = args.mode or list(DEFAULT_MODES)
     if len(mode_names) != len(set(mode_names)):
         raise CampaignError("duplicate --mode value")
-    fixtures = load_fixtures()
+    fixtures = load_fixtures(args.thinking)
     specs = build_specs(artifacts, fixtures, mode_names, args.sampling, args.kv_dtype)
     expected_specs = {spec.key: spec for spec in specs}
     total = len(expected_specs)
@@ -1276,7 +1453,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     (output_dir / "server").mkdir(parents=True, exist_ok=True)
     run_path = output_dir / "run.jsonl"
     records = load_existing_records(run_path, expected_specs)
-    print(f"resume state: {len(records)}/{total} formal request(s) complete", flush=True)
+    print(
+        f"resume state: {len(records)}/{total} formal request(s) complete", flush=True
+    )
 
     with run_path.open("a", encoding="utf-8") as run_handle:
         for target, _ in artifacts:
@@ -1296,8 +1475,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     block_specs,
                     fixtures,
                     output_dir,
-                    args.port,
-                    args.device,
+                    args,
                     run_handle,
                     records,
                     len(records),
@@ -1306,7 +1484,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     missing = set(expected_specs) - set(records)
     if missing:
-        raise CampaignError(f"campaign ended with {len(missing)} missing formal request(s)")
+        raise CampaignError(
+            f"campaign ended with {len(missing)} missing formal request(s)"
+        )
     target_order = [target for target, _ in artifacts]
     summary_rows = build_summary_rows(records, target_order, mode_names, args.sampling)
     write_summaries(summary_rows, output_dir)

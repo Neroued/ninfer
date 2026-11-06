@@ -269,6 +269,7 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
         .output_tokens_explicit            = request.requested_max_output_tokens.has_value(),
         .preserve_thinking_semantic_change = resolved.preserve_thinking_semantic_change,
     };
+    observations_.preparing(req_id, "openai_responses", metadata);
     PreparedRequest prepared;
     try {
         prepared = service_->prepare(
@@ -276,7 +277,7 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
             request.stream ? GenerationConsumerMode::Streaming : GenerationConsumerMode::Aggregate,
             {.constraint_timings = true,
              .scheduling         = scheduling_observer(req_id, metadata.http_request_id),
-             .first_token        = first_token_observer()},
+             .first_token        = first_token_observer(req_id)},
             [&req] { return client_disconnected(req); }, std::move(resolved.cache_hints));
     } catch (const ApiException& exception) {
         const ApiError error = responses_error(exception.error());

@@ -279,7 +279,8 @@ __global__ __launch_bounds__(
                                      int feature_rows = 0, int cache_policy = 0,
                                      int minimum_expert_count = 0,
                                      int maximum_expert_count = 0x7fffffff,
-                                     int pool_expert_limit = 0, int pool_min_experts = 0) {
+                                     int pool_expert_limit = 0, int pool_min_experts = 0,
+                                     int pool_token_threshold = 0) {
     using S = Schedule<Columns, Gate, Stages, KStep, Eviction, Intermediate>;
     if constexpr (!Gate) {
         if (pool_expert_limit && groups.load_range[2] > pool_min_experts &&
@@ -321,6 +322,11 @@ __global__ __launch_bounds__(
         const int offset = groups.offsets[expert], end = groups.offsets[expert + 1];
         const int expert_count = end - offset;
         if (expert_count <= minimum_expert_count || expert_count > maximum_expert_count) continue;
+        if constexpr (!Gate && Intermediate == 320) {
+            if (pool_token_threshold && groups.load_range[2] > pool_min_experts &&
+                expert_count >= pool_token_threshold)
+                continue;
+        }
         const int begin = offset + groups.job_columns[job] + subtile * Columns;
         if (begin >= end) { continue; }
         const auto weight = resolve(bank, expert);

@@ -281,6 +281,37 @@ void physical_selection() {
         }
     }
 }
+
+void marginal_dependencies() {
+    View view;
+    std::vector<Handle> all;
+    for (const auto& key : std::vector<std::vector<std::uint32_t>>{
+             {1}, {1, 2}, {1, 3}, {1, 2, 4}, {1, 2, 4}, {1, 3, 5}, {9}, {9, 8}})
+        all.push_back(view.add(key));
+    context::RecoveryIndex index(view.metadata);
+    index.synchronize(view);
+    auto evaluation = index.evaluate(all);
+    for (unsigned mask = 0; mask < (1U << all.size()); ++mask) {
+        std::vector<Handle> removed;
+        for (unsigned i = 0; i < all.size(); ++i)
+            if (mask & (1U << i)) removed.push_back(all[i]);
+        for (unsigned a = 0; a < all.size(); ++a) {
+            const std::array additions{all[a], all[(a + 3) % all.size()]};
+            const auto dependencies = evaluation.dependencies(removed, additions);
+            auto trial              = removed;
+            trial.insert(trial.end(), additions.begin(), additions.end());
+            const auto marginal = oracle(view, trial, all) - oracle(view, removed, all);
+            for (const auto b : all) {
+                if (dependencies.intersects(std::span<const Handle>(&b, 1))) continue;
+                auto changed = removed, combined = trial;
+                changed.push_back(b);
+                combined.push_back(b);
+                require(oracle(view, combined, all) - oracle(view, changed, all) == marginal,
+                        "unrelated removal changed cached marginal recovery loss");
+            }
+        }
+    }
+}
 } // namespace
 
 int main() {
@@ -290,6 +321,7 @@ int main() {
         lifecycle();
         exhaustive_and_random();
         physical_selection();
+        marginal_dependencies();
         std::cout << "ok\n";
         return 0;
     } catch (const std::exception& error) {

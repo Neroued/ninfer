@@ -67,7 +67,8 @@ Session::prepare_capture(SequenceHandle h, std::span<const CheckpointHandle> hos
     if (s.capture)
         return CapturePreparation{.frontier = s.captures[s.next_capture].frontier,
                                   .reserved = true,
-                                  .origin   = s.captures[s.next_capture].origin};
+                                  .origin   = s.captures[s.next_capture].origin,
+                                  .evidence = s.captures[s.next_capture].evidence};
     while (s.next_capture < s.captures.size() &&
            s.captures[s.next_capture].frontier <= s.continuation.metadata.main_frontier)
         ++s.next_capture;
@@ -112,13 +113,18 @@ Session::prepare_capture(SequenceHandle h, std::span<const CheckpointHandle> hos
     if (!destination) {
         ContextDemand demand;
         demand.add_state({.count = 1, .variant = s.continuation.metadata.placement.value});
-        return CapturePreparation{
-            point.frontier, false, p.directory.assess(demand), {}, point.origin};
+        return CapturePreparation{.frontier   = point.frontier,
+                                  .assessment = p.directory.assess(demand),
+                                  .origin     = point.origin,
+                                  .evidence   = point.evidence};
     }
     ticket->destination = *destination;
     s.capture           = std::move(ticket);
-    return CapturePreparation{
-        .frontier = point.frontier, .reserved = true, .origin = point.origin, .retired_points = {}};
+    return CapturePreparation{.frontier       = point.frontier,
+                              .reserved       = true,
+                              .origin         = point.origin,
+                              .evidence       = point.evidence,
+                              .retired_points = {}};
 }
 
 std::vector<std::uint32_t> Session::capture_frontiers(SequenceHandle h) const {
@@ -199,7 +205,7 @@ bool Session::start_capture(SequenceHandle h) {
 
 namespace ninfer::models::glm5next {
 
-std::size_t Session::checkpoint_capacity() const noexcept { return impl_->checkpoints.size(); }
+std::size_t Session::checkpoint_extent() const noexcept { return impl_->checkpoints.size(); }
 
 std::vector<runtime::ContextTransferRequirement>
 Session::checkpoint_restore_requirements(CheckpointHandle h) const {
@@ -217,8 +223,12 @@ bool Session::release_checkpoint(CheckpointHandle h) noexcept {
 CheckpointMetadata Session::checkpoint_metadata(CheckpointHandle h) const {
     const auto& p = *impl_;
     const auto& c = p.checkpoints.at(h);
-    return {c.frontier(), c.role, p.checkpoints[h.index].pins != 0, c.origin,
-            c.snapshot.continuation().metadata.placement};
+    return {.frontier  = c.frontier(),
+            .role      = c.role,
+            .leased    = p.checkpoints[h.index].pins != 0,
+            .origin    = c.origin,
+            .evidence  = c.evidence,
+            .placement = c.snapshot.continuation().metadata.placement};
 }
 
 PrefixShortlistKey Session::checkpoint_key(CheckpointHandle h, std::uint32_t f) const {

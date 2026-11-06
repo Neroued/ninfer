@@ -68,7 +68,7 @@ endif()
 
 add_executable(ninfer_glm5next_session_test "${CMAKE_CURRENT_LIST_DIR}/test_session.cpp")
 ninfer_test_includes(ninfer_glm5next_session_test)
-target_link_libraries(ninfer_glm5next_session_test PRIVATE ninfer_model_execution)
+target_link_libraries(ninfer_glm5next_session_test PRIVATE ninfer_model_execution ninfer_runtime_support)
 target_compile_definitions(ninfer_glm5next_session_test PRIVATE NINFER_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
 add_test(NAME ninfer_glm5next_session_test
   COMMAND ${Python3_EXECUTABLE} -B "${CMAKE_CURRENT_LIST_DIR}/test_loading.py"

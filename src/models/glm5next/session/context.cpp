@@ -98,7 +98,8 @@ ContextProgress detail::SessionImpl::complete_context() {
             result.captured_checkpoints.reserve(tx->reservation->records.size());
             for (const auto& [record, role] : tx->reservation->records) {
                 p.checkpoints.publish(record,
-                                      {*tx->snapshot, role, s.captures[s.next_capture].origin});
+                                      {*tx->snapshot, role, s.captures[s.next_capture].origin,
+                                       s.captures[s.next_capture].evidence});
                 result.captured_checkpoints.push_back(record);
             }
             const auto writer    = context::adopt_capture_writer(states, s.continuation.image,
@@ -126,6 +127,7 @@ ContextProgress detail::SessionImpl::complete_context() {
                 }
                 checkpoint.snapshot = detail::Snapshot(states, continuation, std::move(prefixes),
                                                        checkpoint.snapshot.identity_owner());
+                checkpoint.snapshot.set_use(context::ContextUse::Request);
                 (void)destination.release();
                 tx->paused->sequence->continuation.metadata.placement = tx->action.placement;
             }

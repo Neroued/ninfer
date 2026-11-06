@@ -213,6 +213,8 @@ CommitResult Session::commit(PendingBatch&& batch,
         for (std::size_t b = 0; b < decisions.size(); ++b) {
             auto& s              = p.sequence(tx.members[b]);
             const auto& decision = decisions[b];
+            result.rows[b].speculative.attempted_per_position.reserve(
+                s.speculative.attempted_per_position.size());
             result.rows[b].speculative.accepted_per_position.reserve(
                 s.speculative.accepted_per_position.size());
             physical.rows.push_back({p.member(s), tx.rows[b].states, decision.accepted_tokens,
@@ -260,6 +262,7 @@ CommitResult Session::commit(PendingBatch&& batch,
             else
                 ++stats.fallback_steps;
             stats.drafted_tokens += drafted;
+            for (std::uint32_t i = 0; i < drafted; ++i) ++stats.attempted_per_position[i];
             stats.accepted_tokens += accepted;
             for (std::uint32_t i = 0; i < accepted; ++i) ++stats.accepted_per_position[i];
         }

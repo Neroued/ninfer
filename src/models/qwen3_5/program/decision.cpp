@@ -133,7 +133,10 @@ void RankProgramImpl::launch_decision(ComputeOperation& operation) {
     }
     resources.work.reset();
     if (std::holds_alternative<DecodeWork>(operation.request.work.operation)) {
-        if (!operation.projected) project_decode(operation.batch, operation.width);
+        if (!operation.projected) {
+            project_decode(operation.batch, operation.width);
+            gpu_timer.end_target();
+        }
         if (graphs) {
             (void)graphs->start(operation.speculative ? GraphPhase::Accept : GraphPhase::Sample,
                                 operation.batch, operation.rows.front().main_frontier,
@@ -183,6 +186,8 @@ void RankProgramImpl::launch_decision(ComputeOperation& operation) {
 
 void RankProgramImpl::publish_result(ComputeOperation& operation) {
     gpu_timer.observe_result(operation.gpu);
+    if (std::holds_alternative<DecodeWork>(operation.request.work.operation))
+        gpu_timer.observe_decode(operation.gpu, operation.speculative);
     Result result;
     const auto* forward  = std::get_if<ForwardWork>(&operation.request.work.operation);
     const bool generated = std::holds_alternative<DecodeWork>(operation.request.work.operation) ||

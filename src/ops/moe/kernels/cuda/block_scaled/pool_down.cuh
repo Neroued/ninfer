@@ -5,8 +5,8 @@
 
 namespace ninfer::ops::detail::moe_cuda::block_scaled {
 
-// A small active expert set shares one output tile. Each CTA owns the sum across
-// that set, including zero contributions for tokens that do not select an expert.
+// Each CTA sums a small expert set into one output tile. The set is either all
+// active experts or the heavily reused subset; other experts accumulate afterward.
 template <int TopK, int Columns, class Contraction>
 struct PoolDownStorage {
     typename Contraction::Tile tile;
@@ -17,19 +17,23 @@ struct PoolDownStorage {
 template <int Hidden, int Experts, int TopK, int Columns, class Contraction, class Group>
 __global__ __launch_bounds__(Contraction::threads) void pool_down(
     Contraction contraction, Group groups, const int* ids, const float* coefficients, float* output,
-    int tokens, int minimum_experts, int expert_limit, int row_window) {
+    int tokens, int minimum_experts, int expert_limit, int row_window, int token_threshold) {
     const int active = groups.load_range[2];
-    if (active <= minimum_experts || active > expert_limit) return;
+    if (active <= minimum_experts) return;
+    const bool whole_pool = active <= expert_limit;
+    if (!whole_pool && (!token_threshold || groups.load_range[1] < token_threshold)) return;
     using Storage = PoolDownStorage<TopK, Columns, Contraction>;
     auto& storage = *reinterpret_cast<Storage*>(common::shared_storage<sizeof(Storage)>());
     if (threadIdx.x == 0) storage.count = 0;
     __syncthreads();
     for (int e = threadIdx.x; e < Experts; e += blockDim.x)
-        if (groups.offsets[e] < groups.offsets[e + 1]) {
+        if (const int count = groups.offsets[e + 1] - groups.offsets[e];
+            count > 0 && (whole_pool || count >= token_threshold)) {
             const int slot        = atomicAdd(&storage.count, 1);
             storage.experts[slot] = e;
         }
     __syncthreads();
+    const int pooled = storage.count;
 
     constexpr int row_tiles    = Hidden / 128;
     constexpr int warp_columns = Columns >= 64 ? Columns / 2 : Columns;
@@ -45,7 +49,7 @@ __global__ __launch_bounds__(Contraction::threads) void pool_down(
         if (row0 >= Hidden) continue;
         const int begin = task % span / window * Columns;
         float total[2][atoms][4]{};
-        for (int slot = 0; slot < active; ++slot) {
+        for (int slot = 0; slot < pooled; ++slot) {
             const int expert = storage.experts[slot];
             if (threadIdx.x < Columns) {
                 const int token = begin + threadIdx.x;
@@ -92,9 +96,11 @@ template <int Hidden, int Experts, int TopK, int Columns, class Contraction, cla
 void launch_pool_down(Contraction contraction, Group groups, const int* ids,
                       const float* coefficients, float* output, int tokens, int minimum_experts,
                       int expert_limit, int row_window, int queued_ctas_per_sm,
-                      CudaExecutionView execution) {
+                      CudaExecutionView execution, int token_threshold = 0) {
     if (!output || expert_limit > 2 * TopK || queued_ctas_per_sm <= 0)
         throw std::logic_error("invalid reduced expert pool");
+    if (token_threshold && tokens * TopK / token_threshold > expert_limit)
+        throw std::logic_error("expert pool token threshold exceeds capacity");
     using Storage         = PoolDownStorage<TopK, Columns, Contraction>;
     constexpr auto kernel = pool_down<Hidden, Experts, TopK, Columns, Contraction, Group>;
     const int bytes       = common::prepare_shared<sizeof(Storage), kernel>();
@@ -102,7 +108,7 @@ void launch_pool_down(Contraction contraction, Group groups, const int* ids,
     const int blocks      = std::min(tiles, execution.multiprocessor_count() * queued_ctas_per_sm);
     kernel<<<blocks, Contraction::threads, bytes, execution.stream()>>>(
         contraction, groups, ids, coefficients, output, tokens, minimum_experts, expert_limit,
-        row_window);
+        row_window, token_threshold);
     CUDA_CHECK(cudaGetLastError());
 }
 

@@ -2,3 +2,6 @@
 # tokenizer only: run with --tokenizer-path or NINFER_TOKENIZER_PATH; never downloads from the network.
 transformers>=4.40
 tokenizers>=0.19
+
+# Optional rendering of collected Serve performance summaries.
+matplotlib>=3.8

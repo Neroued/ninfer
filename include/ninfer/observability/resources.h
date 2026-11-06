@@ -143,11 +143,14 @@ struct ContextPoolCapacity {
 // These disjoint occupancies account for the complete backing. Relocation destinations are
 // reserved until publication; the old records remain live or pending retirement until then.
 struct ContextPoolUsage {
-    std::uint32_t rank                     = 0;
-    ContextMemoryDomain domain             = ContextMemoryDomain::Device;
-    std::uint64_t capacity_bytes           = 0;
-    std::uint64_t block_bytes              = 0;
-    std::uint64_t live_bytes               = 0;
+    std::uint32_t rank           = 0;
+    ContextMemoryDomain domain   = ContextMemoryDomain::Device;
+    std::uint64_t capacity_bytes = 0;
+    std::uint64_t block_bytes    = 0;
+    std::uint64_t live_bytes     = 0;
+    // Disjoint purposes of live storage. Request references take precedence over cache owners.
+    std::uint64_t in_use_bytes             = 0;
+    std::uint64_t cached_bytes             = 0;
     std::uint64_t reserved_bytes           = 0;
     std::uint64_t pending_retirement_bytes = 0;
     // Relocation is a subset of reserved bytes; future reservations promise positions
@@ -167,6 +170,27 @@ struct ContextMetadataUsage {
     std::uint64_t allocated_bytes                                                    = 0;
     std::uint64_t reserved_bytes                                                     = 0;
     friend bool operator==(const ContextMetadataUsage&, const ContextMetadataUsage&) = default;
+};
+
+// Materialized physical records, counted once per replica independently of logical references.
+// Pool reservations, padding and free capacity remain in ContextPoolUsage.
+struct ContextResourceUsage {
+    std::uint32_t rank         = 0;
+    ContextMemoryDomain domain = ContextMemoryDomain::Device;
+    std::optional<std::uint16_t> history_pool;
+    std::uint64_t live_records = 0, live_bytes = 0;
+    std::uint64_t in_use_bytes = 0, cached_bytes = 0;
+    std::uint64_t pending_retirement_records = 0, pending_retirement_bytes = 0;
+};
+
+struct PrefixCacheCounters {
+    std::uint64_t retained = 0, published = 0, released = 0, reclaimed = 0;
+    std::uint64_t adopted = 0, reused_tokens = 0;
+};
+
+// Advertised checkpoint identities, independently of their physical replica/reference count.
+struct PrefixCacheStatistics {
+    PrefixCacheCounters input_replay, long_anchor, shared_prefix, continuation;
 };
 
 struct MediaCacheSummary {

@@ -10,7 +10,7 @@ using Small8  = Q8A16SlicedKMmaSchedule<8, 8, 2, 1, Q8ScaleAccess::Shared, Cache
                                         Q8ActivationStage::PaddedZero, 2560>;
 using Small16 = Q8A16SlicedKMmaSchedule<16, 8, 2, 1, Q8ScaleAccess::Shared, Cache::ca, Cache::cg,
                                         Q8ActivationStage::PaddedZero, 2560>;
-using Small32 = Q8A16SlicedKMmaSchedule<32, 4, 2, 1, Q8ScaleAccess::Shared, Cache::ca, Cache::cg,
+using Small32 = Q8A16SlicedKMmaSchedule<32, 8, 1, 1, Q8ScaleAccess::Shared, Cache::ca, Cache::cg,
                                         Q8ActivationStage::PaddedZero, 2560>;
 using Small40 = Q8A16SlicedKMmaSchedule<40, 4, 1, 1, Q8ScaleAccess::Shared, Cache::ca, Cache::cg,
                                         Q8ActivationStage::PaddedZero, 2560>;

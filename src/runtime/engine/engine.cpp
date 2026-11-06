@@ -124,7 +124,8 @@ public:
     template <class Submission>
     Impl(std::shared_ptr<void> keep_alive, Submission submission,
          ResolvedSamplingParameters sampling)
-        : state_(std::make_unique<Model<Submission>>(std::move(keep_alive), std::move(submission))),
+        : request_id_(submission.request_id()),
+          state_(std::make_unique<Model<Submission>>(std::move(keep_alive), std::move(submission))),
           sampling_(sampling) {}
 
     void wait_for_admission(const CancellationView& cancellation) {
@@ -139,7 +140,10 @@ public:
         return sampling_;
     }
 
+    [[nodiscard]] std::uint64_t request_id() const noexcept { return request_id_; }
+
 private:
+    std::uint64_t request_id_ = 0;
     std::unique_ptr<Concept> state_;
     ResolvedSamplingParameters sampling_;
 };
@@ -152,6 +156,10 @@ GenerationHandle& GenerationHandle::operator=(GenerationHandle&&) noexcept = def
 GenerationHandle::GenerationHandle(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
 
 GenerationHandle::operator bool() const noexcept { return impl_ != nullptr; }
+
+std::uint64_t GenerationHandle::request_id() const noexcept {
+    return impl_ ? impl_->request_id() : 0;
+}
 
 const ResolvedSamplingParameters& GenerationHandle::resolved_sampling() const noexcept {
     static const ResolvedSamplingParameters empty;
@@ -255,15 +263,9 @@ private:
                 startup.ranks = instance->rank_budgets;
                 for (const auto& pool : instance->session->kv_pools())
                     description.kv_pools.push_back({pool.id.index, std::string(pool.label), 0});
-                for (const auto& rank : instance->executor->observations()) {
-                    int device = options.device;
-                    if (options.deployment)
-                        for (const auto& configured : options.deployment->ranks)
-                            if (configured.rank == rank.rank) device = configured.device;
-                    description.ranks.push_back(
-                        {rank.rank, rank.node, device, rank.hardware,
-                         rank.physical_memory && rank.physical_memory->shared_physical_memory});
-                }
+                const auto ranks = instance->executor->rank_descriptions();
+                description.ranks.assign(ranks.begin(), ranks.end());
+                description.placements = instance->session->placement_descriptions();
             },
             active);
     }
@@ -403,6 +405,8 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
             GenerationResult result;
             OutputConsumerMode consumer_mode = OutputConsumerMode::Aggregate;
 
+            [[nodiscard]] std::uint64_t request_id() const noexcept { return 0; }
+
             void wait_for_admission(const CancellationView& cancellation) {
                 try {
                     if (cancellation.requested()) {
@@ -482,15 +486,15 @@ const StartupReport& Engine::startup_report() const {
     return impl_->startup;
 }
 
-EngineSnapshot Engine::snapshot() const {
+EngineSnapshot Engine::snapshot(SnapshotOptions options) const {
     if (!impl_) throw std::logic_error("Engine is moved from");
     auto result = std::visit(
-        [](const auto& core) -> EngineSnapshot {
+        [options](const auto& core) -> EngineSnapshot {
             using State = std::remove_cvref_t<decltype(core)>;
             if constexpr (std::is_same_v<State, std::monostate>)
                 throw std::logic_error("Engine core is unavailable");
             else
-                return core->snapshot();
+                return core->snapshot(options);
         },
         impl_->core);
     result.media =

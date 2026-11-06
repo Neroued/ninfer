@@ -55,7 +55,8 @@ CheckpointMetadata SessionImpl::checkpoint_metadata(CheckpointHandle handle) con
             .role     = record.role,
             .leased   = checkpoints[handle.index].pins != 0 ||
                       state_store->source_pins(record.continuation().image) != 0,
-            .origin = record.origin};
+            .origin   = record.origin,
+            .evidence = record.evidence};
 }
 
 CheckpointSummary SessionImpl::checkpoint_summary(CheckpointHandle handle) const {

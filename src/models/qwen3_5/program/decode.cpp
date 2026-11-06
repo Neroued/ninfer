@@ -101,6 +101,7 @@ void RankProgramImpl::begin_draft(ComputeOperation& operation) {
         minimum = std::min(minimum, row.main_frontier);
         maximum = std::max(maximum, row.main_frontier);
     }
+    if (!graphs) gpu_timer.begin_draft();
     if (graphs) {
         (void)graphs->start(GraphPhase::Draft, operation.batch, maximum, device.execution_view());
     } else if (backend == SpeculativeBackend::Mtp) {
@@ -108,6 +109,7 @@ void RankProgramImpl::begin_draft(ComputeOperation& operation) {
     } else {
         run_dflash_draft(operation.batch, minimum, maximum);
     }
+    if (!graphs) gpu_timer.end_draft();
     Tensor proposals = backend == SpeculativeBackend::Mtp
                            ? frame.mtp->proposals(batch)
                            : dense_prefix(frame.dflash->drafts, {drafts, batch});
@@ -132,7 +134,15 @@ void RankProgramImpl::begin_target(ComputeOperation& operation) {
                          std::holds_alternative<ScoreWork>(operation.request.work.operation);
     const int batch = forward ? 1 : static_cast<int>(operation.batch);
     const int width = static_cast<int>(operation.width);
-    auto input      = forward ? frame.input_view(width, batch) : frame.decode_view(width, batch);
+    ++operation.attention.forwards;
+    operation.attention.rows += batch;
+    operation.attention.scheduled_positions += std::uint64_t(width) * batch;
+    if (forward)
+        operation.attention.valid_positions += width;
+    else
+        for (int row = 0; row < batch; ++row)
+            operation.attention.valid_positions += frame.host_ingress->valid_columns[row];
+    auto input = forward ? frame.input_view(width, batch) : frame.decode_view(width, batch);
     if (!forward && graphs) {
         const auto phase       = operation.speculative ? GraphPhase::Verify : GraphPhase::Main;
         std::uint32_t frontier = 0;
@@ -180,6 +190,7 @@ void RankProgramImpl::begin_target(ComputeOperation& operation) {
     }
     resources.work.reset();
     if (forward) prefill_timer.start();
+    if (!forward) gpu_timer.begin_target();
     operation.text = std::make_unique<execution::TextRun>(
         execution::TextExecutionView{parameters, resources.work, device.execution_view(),
                                      resources.decoder.text_kv, resources.state_images.linear(),

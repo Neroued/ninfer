@@ -58,6 +58,7 @@ bool same_ownership(const q35::PhysicalUsageSnapshot& a, const q35::PhysicalUsag
         const auto& x = a.pools[i];
         const auto& y = b.pools[i];
         if (x.rank != y.rank || x.domain != y.domain || x.live_bytes != y.live_bytes ||
+            x.in_use_bytes != y.in_use_bytes || x.cached_bytes != y.cached_bytes ||
             x.reserved_bytes != y.reserved_bytes ||
             x.pending_retirement_bytes != y.pending_retirement_bytes ||
             x.future_reserved_bytes != y.future_reserved_bytes ||
@@ -814,6 +815,25 @@ public:
                     program_.release_checkpoint(saved),
                 "capture retry retained its owners");
         expect_empty("capture retry retained physical ownership");
+    }
+
+    void capture_without_metadata() {
+        auto marked       = marker_request();
+        const auto active = bind(marked.base);
+        reserve(active, q35::ExecutionUnitKind::Prefill);
+        {
+            auto& budget = program_.directory.metadata_budget();
+            models::context::MetadataAccount pressure(budget);
+            pressure.acquire(budget.available());
+            require(!program_.prepare_capture(active),
+                    "unavailable checkpoint metadata was reported as State capacity pressure");
+        }
+        const auto step = driver_.prefill(active);
+        require(step.processed_prompt_tokens == kChunk && !step.complete && !step.capture_ready,
+                "optional metadata exhaustion blocked the reserved prefill unit");
+        require(driver_.abort(active).status == runtime::ConsumeStatus::Consumed,
+                "metadata pressure retained its active writer");
+        expect_empty("unavailable checkpoint metadata retained physical resources");
     }
 
     void capture_without_destination() {
@@ -2006,6 +2026,7 @@ int main(int argc, char** argv) {
         {
             SessionFixture instance(definition, model, profile, options, {.retained_states = 4});
             Fixture fixture(instance.rank, instance.session, frontend);
+            fixture.capture_without_metadata();
             fixture.capture_opportunities();
             fixture.input_replay_lifecycle();
             fixture.active_input_zero_growth_binding();

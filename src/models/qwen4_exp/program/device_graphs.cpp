@@ -40,6 +40,7 @@ void DeviceGraphs::body(Batch& profiles, Round* round, std::uint32_t batch, bool
     const auto visible = round ? bounds_.front() : bounds_.back();
     p.install_decode(batch);
     if (depth) {
+        p.gpu_timer.begin_draft(round != nullptr);
         for (std::uint32_t step = 0; step < depth; ++step) {
             DecodeGraphChild child;
             p.draft_forward(step, batch, visible, round ? &profiles.drafts[step].front() : nullptr,
@@ -47,14 +48,16 @@ void DeviceGraphs::body(Batch& profiles, Round* round, std::uint32_t batch, bool
             if (round) round->draft.push_back(child);
         }
         const auto& mtp = *io.mtp;
-        auto anchors    = r.tensor(io.anchors).slice(0, 0, batch);
-        auto extents    = r.tensor(mtp.extents).slice(0, 0, batch);
-        auto drafts     = p.draft_proposals(b);
-        auto ids        = r.main_batch(t, b, visible).ids;
+        p.gpu_timer.end_draft(round != nullptr);
+        auto anchors = r.tensor(io.anchors).slice(0, 0, batch);
+        auto extents = r.tensor(mtp.extents).slice(0, 0, batch);
+        auto drafts  = p.draft_proposals(b);
+        auto ids     = r.main_batch(t, b, visible).ids;
         ops::prepare_verify_ids(anchors, drafts, extents, ids, p.cuda);
         p.copy_verify_inputs(batch, round ? &round->readback : nullptr);
     }
     const auto call = r.main_batch(t, b, visible);
+    p.gpu_timer.begin_target(round != nullptr);
     p.prepare_device_ple(call);
     {
         auto run = main_run(batch, depth != 0, visible);
@@ -91,6 +94,7 @@ void DeviceGraphs::body(Batch& profiles, Round* round, std::uint32_t batch, bool
         else
             project();
     }
+    p.gpu_timer.end_target(round != nullptr);
 }
 
 void DeviceGraphs::prepare(GraphInputs& inputs, GraphPreparation& preparation) {

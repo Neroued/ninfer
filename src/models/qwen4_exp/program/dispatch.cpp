@@ -163,11 +163,11 @@ void RankProgramImpl::finish_result() {
     auto& f      = *compute;
     auto& result = f.result;
     result.rows.resize(f.rows.size());
-    const auto& buffers = resources.plan.persistent.buffers;
-    const auto* ids     = static_cast<const TokenId*>(resources.egress().data);
-    const auto* forward = std::get_if<ForwardWork>(&f.request.work.operation);
-    const bool sampled  = f.verify || (forward && forward->sample != SampleKind::None);
-    const std::int32_t* counts   = nullptr;
+    const auto& buffers        = resources.plan.persistent.buffers;
+    const auto* ids            = static_cast<const TokenId*>(resources.egress().data);
+    const auto* forward        = std::get_if<ForwardWork>(&f.request.work.operation);
+    const bool sampled         = f.verify || (forward && forward->sample != SampleKind::None);
+    const std::int32_t* counts = nullptr;
     if (f.verify) {
         counts = reinterpret_cast<const std::int32_t*>(
             resources.egress()
@@ -195,6 +195,8 @@ void RankProgramImpl::finish_result() {
             static_cast<std::uint64_t>(double(prefill_timer.elapsed_ms()) * 1.0e6 + 0.5));
 
     gpu_timer.observe_result(f.gpu);
+    if (ExecutionTypes::describe_work(f.request.work).kind == ExecutionKind::Decode)
+        gpu_timer.observe_decode(f.gpu, f.verify.has_value());
     events.emplace_back(runtime::ResultReady<ExecutionTypes>{f.request.ticket, Result(result)});
     if (resources.compute_actions->occupied()) resources.compute_actions->finish();
     f.phase = ComputePhase::PendingCommit;
@@ -283,7 +285,9 @@ void RankProgramImpl::retire_compute() {
     }
     auto observation = retirement_observation();
     gpu_timer.observe_retirement(compute->gpu);
-    observation.gpu  = compute->gpu;
+    observation.gpu = compute->gpu;
+    const auto work = ExecutionTypes::describe_work(compute->request.work);
+    if (compute->attention.forwards) observation.attention = {work.kind, compute->attention};
     observation.path = compute->graph_main || (compute->graph && compute->graph->resident())
                            ? ExecutionPath::Graph
                        : compute->graph ? ExecutionPath::Mixed

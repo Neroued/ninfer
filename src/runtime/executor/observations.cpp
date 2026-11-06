@@ -58,11 +58,15 @@ auto fields(T& v) {
         return std::tie(v.submit_ns, v.progress_ns, v.supply_ns, v.commit_ns, v.discard_ns);
     else if constexpr (std::is_same_v<Value, GpuExecutionObservation>)
         return std::tie(v.result_stream_ns, v.commit_stream_ns, v.prefill_stream_ns,
-                        v.vision_stream_ns);
+                        v.vision_stream_ns, v.draft_stream_ns, v.target_stream_ns);
+    else if constexpr (std::is_same_v<Value, AttentionWorkCounters>)
+        return std::tie(v.forwards, v.rows, v.valid_positions, v.scheduled_positions);
+    else if constexpr (std::is_same_v<Value, AttentionWorkObservation>)
+        return std::tie(v.kind, v.work);
     else if constexpr (std::is_same_v<Value, RankExecutionObservation>)
         return std::tie(v.path, v.host, v.gpu, v.communication_eager, v.communication_graph,
                         v.workspace_peak_bytes, v.measurement_peak_bytes, v.expert_upload_bytes,
-                        v.ple_upload_bytes);
+                        v.ple_upload_bytes, v.attention);
     else {
         static_assert(std::is_same_v<Value, RankMemoryBudget>);
         return std::tie(v.limit_bytes, v.runtime_reservation_bytes,
@@ -145,6 +149,15 @@ RankSnapshot rank_snapshot(wire::Decoder& in) {
 }
 
 void encode(wire::Encoder& out, const RankExecutionObservation& value) { write(out, value); }
+
+std::size_t rank_execution_observation_capacity() {
+    RankExecutionObservation value;
+    for (const auto field : kGpuIntervalFields) value.gpu.*field = 0;
+    value.attention.emplace();
+    wire::Encoder out;
+    encode(out, value);
+    return std::move(out).take().size();
+}
 
 RankExecutionObservation rank_execution_observation(wire::Decoder& in) {
     RankExecutionObservation result;

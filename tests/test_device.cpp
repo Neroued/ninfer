@@ -171,5 +171,22 @@ int main(int argc, char** argv) {
         std::cerr << "timer elapsed time was negative\n";
     }
 
+    ninfer::DeviceBuffer timed_work(moved.device(), 1 << 20);
+    cudaGraph_t graph          = nullptr;
+    cudaGraphExec_t executable = nullptr;
+    CUDA_CHECK(cudaStreamBeginCapture(moved.stream(), cudaStreamCaptureModeThreadLocal));
+    timer.start_external();
+    CUDA_CHECK(cudaMemsetAsync(timed_work.data(), 0, timed_work.size(), moved.stream()));
+    timer.record_stop_external();
+    CUDA_CHECK(cudaStreamEndCapture(moved.stream(), &graph));
+    CUDA_CHECK(cudaGraphInstantiate(&executable, graph, 0));
+    for (int replay = 0; replay < 2; ++replay) {
+        CUDA_CHECK(cudaGraphLaunch(executable, moved.stream()));
+        moved.synchronize();
+        if (timer.elapsed_ms() < 0) return fail("Graph timing events lost their replay interval");
+    }
+    CUDA_CHECK(cudaGraphExecDestroy(executable));
+    CUDA_CHECK(cudaGraphDestroy(graph));
+
     return failures == 0 ? 0 : fail("device test failed");
 }

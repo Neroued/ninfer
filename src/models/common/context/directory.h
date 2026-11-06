@@ -174,6 +174,7 @@ class ContextTransaction;
 
 struct ContextUsage {
     std::vector<ninfer::ContextPoolUsage> pools;
+    std::vector<ninfer::ContextResourceUsage> resources;
     ninfer::ContextMetadataUsage metadata;
     std::uint64_t state_objects   = 0;
     std::uint64_t history_objects = 0;
@@ -208,6 +209,9 @@ public:
                                            const ContextReleaseSet& = {}) const;
     [[nodiscard]] ContextReserveResult reserve(const ContextDemand&);
     [[nodiscard]] std::size_t released_bytes(const ContextReleaseSet&) const;
+    [[nodiscard]] std::vector<std::uint64_t> release_limits(const ContextAssessment&) const;
+    [[nodiscard]] runtime::ContextReleaseMeasure release_measure(const ContextReleaseSet&,
+                                                                 const ContextAssessment&) const;
     [[nodiscard]] std::size_t useful_release_bytes(const ContextReleaseSet&,
                                                    const ContextAssessment&) const;
     [[nodiscard]] ContextReleaseSet state_release(StateId) const;

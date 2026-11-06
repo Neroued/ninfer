@@ -71,13 +71,23 @@ void RankProgramImpl::prepare_inputs(std::span<const WorkRow> rows, const BatchP
                    })->size;
     const auto& local = resources.plan.frame.attention;
     const auto own    = plan.owners[rank];
+    if (f.tokens && (!f.sequence || own.size)) {
+        ++f.attention.forwards;
+        f.attention.rows += own.size;
+        f.attention.scheduled_positions += std::uint64_t(width) * c;
+        for (std::uint32_t j = own.begin; j < own.begin + own.size; ++j) {
+            const auto logical = plan.members[j];
+            f.attention.valid_positions +=
+                valid_columns.empty() ? rows[logical].ids.size() : valid_columns[logical];
+        }
+    }
     for (std::uint32_t j = 0; j < c; ++j) {
-        const bool live                = j < own.size;
-        i32(local.to_global)[j]        = live ? int(own.begin + j) : -1;
-        i32(local.live_rows)[j]        = live;
-        i32(local.live_columns)[j]     = live ? 0 : -1;
-        i32(local.record_offsets)[j]   = 0;
-        i64(local.source_offsets)[j]   = live ? i64(global.source_offsets)[own.begin + j] : -1;
+        const bool live              = j < own.size;
+        i32(local.to_global)[j]      = live ? int(own.begin + j) : -1;
+        i32(local.live_rows)[j]      = live;
+        i32(local.live_columns)[j]   = live ? 0 : -1;
+        i32(local.record_offsets)[j] = 0;
+        i64(local.source_offsets)[j] = live ? i64(global.source_offsets)[own.begin + j] : -1;
         i64(local.destination_offsets)[j] =
             live ? i64(global.destination_offsets)[own.begin + j] : -1;
         i32(local.base_positions)[j] = live ? i32(global.base_positions)[own.begin + j] : 0;

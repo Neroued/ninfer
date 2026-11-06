@@ -34,7 +34,7 @@ int main() {
 
     bool protected_artifact_rejected = false;
     try {
-        JsonlRequestLog unsafe("same-path.ninfer", "same-path.ninfer");
+        JsonlRequestLog unsafe("test-instance", "same-path.ninfer", "same-path.ninfer");
     } catch (const std::invalid_argument&) { protected_artifact_rejected = true; }
     failures += check(protected_artifact_rejected,
                       "request log accepted the model artifact as its output path");
@@ -782,8 +782,8 @@ int main() {
         make_internal_request_failure(RequestFailurePhase::Generation, "sentinel-internal-detail"));
     failures +=
         check(internal_failure.severity == OperationalSeverity::Error &&
-                  internal_failure.message.find("sentinel-internal-detail") == std::string::npos,
-              "operational internal failure severity or data policy mismatch");
+                  internal_failure.message.find("sentinel-internal-detail") != std::string::npos,
+              "operational internal failure lost its diagnostic cause");
     const OperationalRecord disconnected = render_request_failure(
         context, make_client_disconnected_failure(RequestFailurePhase::Transport));
     failures += check(disconnected.severity == OperationalSeverity::Info &&
@@ -960,11 +960,11 @@ int main() {
          ".jsonl");
     std::filesystem::remove(log_path);
     {
-        JsonlRequestLog writer(log_path.string());
+        JsonlRequestLog writer("test-instance", log_path.string());
         writer.write_request_start(context);
     }
     {
-        JsonlRequestLog writer(log_path.string());
+        JsonlRequestLog writer("test-instance", log_path.string());
         writer.write_request_rejected(rejected_context);
         writer.write_request_error(context, "generation failed");
     }

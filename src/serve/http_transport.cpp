@@ -52,12 +52,14 @@ std::unique_ptr<httplib::TaskQueue> make_http_task_queue(std::size_t workers,
     return std::make_unique<HttpTaskQueue>(static_cast<std::uint32_t>(workers), queued_requests);
 }
 
-std::unique_ptr<httplib::TaskQueue> make_http_task_queue(const product::ServeOptions& options) {
+std::unique_ptr<httplib::TaskQueue> make_http_task_queue(const product::ServeOptions& options,
+                                                       std::size_t reserved_workers) {
     const std::size_t outstanding =
         static_cast<std::size_t>(options.launch.engine.max_concurrency) +
         options.launch.engine.max_pending_requests +
         (options.launch.engine.enable_decisions ? kDecisionRequestCapacity : 0);
-    return make_http_task_queue(outstanding + 1, outstanding);
+    // Long-lived monitor subscribers must not consume Jev's independent admission budget.
+    return make_http_task_queue(outstanding + 1 + reserved_workers, outstanding);
 }
 
 RequestJson parse_json_body(const httplib::Request& request) {

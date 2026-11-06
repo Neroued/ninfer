@@ -1,0 +1,22 @@
+{
+  "id": "fjord",
+  "name": "Fjord",
+  "scheme": "light",
+  "colors": {
+    "bg": "#edf1f2",
+    "surface": "#e2e9ea",
+    "plot": "#e4ecee",
+    "ink": "#152328",
+    "secondary": "#3e5158",
+    "muted": "#5b6d73",
+    "faint": "#75878c",
+    "rule": "rgba(21, 35, 40, 0.15)",
+    "grid": "rgba(21, 35, 40, 0.07)",
+    "decode": "#0c6b86",
+    "decode-fill": "rgba(12, 107, 134, 0.12)",
+    "prefill": "#5c7c63",
+    "prefill-fill": "rgba(92, 124, 99, 0.10)",
+    "alert": "#ae4b36",
+    "hover": "rgba(21, 35, 40, 0.04)"
+  }
+}

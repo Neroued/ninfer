@@ -194,8 +194,8 @@ void RankProgramImpl::accept_forward(std::int32_t batch) {
     const auto width      = shape.draft_tokens + 1;
     const auto vocabulary = parameters.profile->public_tokens;
     const auto row = [&](const TensorRegion& r) { return device_tensor(r).slice(0, 0, batch); };
-    auto drafts           = draft_proposals(batch);
-    auto extents          = row(frame.extents);
+    auto drafts    = draft_proposals(batch);
+    auto extents   = row(frame.extents);
     auto device_configs = device_tensor(*buffers.sampling);
     auto logits =
         packed_tensor(*buffers.logits, {dimension(parameters.profile->config.text.vocabulary),
@@ -264,6 +264,7 @@ void RankProgramImpl::prepare_mtp() {
         return;
     }
     if (!graphs) install_decode(batch);
+    gpu_timer.begin_draft();
     {
         const nvtx::ScopedRange range(nvtx::Name::DecodeMtpDraft, nvtx::Category::Mtp);
         if (graphs && host_ple)
@@ -280,6 +281,7 @@ void RankProgramImpl::prepare_mtp() {
         }
     }
     std::array<std::uint32_t, kMaximumConcurrency> valid;
+    gpu_timer.end_draft();
     for (int b = 0; b < batch; ++b) valid[b] = round.extents[b] + 1;
     if (host_ple) host_ple->seal(*f.ple, {valid.data(), f.rows.size()});
     ops::prepare_verify_ids(row_tensor(buffers.anchors), drafts, row_tensor(frame.extents),

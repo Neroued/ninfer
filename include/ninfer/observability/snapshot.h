@@ -2,6 +2,8 @@
 
 #include "ninfer/observability/resources.h"
 #include "ninfer/observability/execution.h"
+#include "ninfer/observability/request.h"
+#include "ninfer/deployment.h"
 
 #include <filesystem>
 
@@ -36,16 +38,21 @@ struct RuntimeHostWorkStats {
 // Monotonic execution counters, boundary-consistent current gauges, and explicitly named last
 // decision observations. Consumers derive interval counters by subtracting two snapshots.
 struct RuntimeStats {
+    RequestCounters requests;
     RuntimeHostWorkStats host_work;
     // Full prompt counted once when initial binding succeeds; includes reused tokens.
     std::uint64_t prompt_tokens = 0;
     // All committed output tokens, including the first token and Engine-injected control tokens.
-    std::uint64_t generated_tokens = 0;
+    std::uint64_t generated_tokens        = 0;
+    std::uint64_t injected_control_tokens = 0;
     // Native verification work, using the same acceptance semantics as SpeculativeStats.
-    std::uint64_t speculative_rounds          = 0;
-    std::uint64_t speculative_draft_tokens    = 0;
-    std::uint64_t speculative_accepted_tokens = 0;
-    std::uint64_t speculative_fallback_steps  = 0;
+    std::uint64_t speculative_rounds                 = 0;
+    std::uint64_t speculative_draft_tokens           = 0;
+    std::uint64_t speculative_accepted_tokens        = 0;
+    std::uint64_t speculative_fallback_steps         = 0;
+    std::uint64_t speculative_committed_draft_tokens = 0;
+    std::vector<std::uint64_t> speculative_attempted_per_position;
+    std::vector<std::uint64_t> speculative_accepted_per_position;
     // Initial prompt tokens evaluated by prefill. Reused checkpoint-prefix tokens and replay
     // recomputation are excluded; replayed_tokens separately counts that additional model work.
     std::uint64_t computed_prefill_tokens = 0;
@@ -82,6 +89,9 @@ struct RuntimeStats {
     ContextTransferStats context_transfers;
     std::vector<ContextKvPoolUsage> kv_pools;
     std::vector<ContextPoolUsage> context_pools;
+    std::vector<ContextResourceUsage> context_resources;
+    PrefixCacheStatistics prefix_cache;
+    std::vector<PlacementUsage> placements;
     ContextMetadataUsage context_metadata;
 
     std::uint64_t pressure_spill_pages   = 0;
@@ -141,11 +151,18 @@ struct RankDescriptor {
     int device = 0;
     std::string hardware;
     bool shared_physical_memory = false;
+    ParallelCoordinate tp, ep, dp, pp, adp;
+};
+
+struct PlacementDescriptor {
+    std::uint32_t id = 0;
+    std::vector<std::uint32_t> attention_ranks;
 };
 
 struct EngineDescription {
     std::string architecture, model_name;
     std::vector<RankDescriptor> ranks;
+    std::vector<PlacementDescriptor> placements;
     std::uint32_t max_context = 0, max_concurrency = 0, prefill_chunk = 0;
     std::vector<ContextPoolCapacity> context_pools;
     std::uint64_t context_token_capacity_estimate = 0;
@@ -175,7 +192,8 @@ struct RankSnapshot {
     std::vector<CommunicationStatistics> communication;
     CommunicationWork communication_eager, communication_graph;
     std::array<std::uint64_t, 3> compute_paths{};
-    std::array<DurationCounter, 4> gpu_intervals{};
+    GpuIntervalCounters gpu_intervals{};
+    std::array<AttentionWorkCounters, static_cast<std::size_t>(ExecutionKind::Count)> attention{};
     std::optional<PhysicalMemorySample> physical_memory;
 };
 
@@ -190,6 +208,12 @@ struct EngineSnapshot {
     SnapshotStamp stamp;
     RuntimeStats runtime;
     ExecutionStatistics executions{};
+    // Entry B-1 counts each retired decode batch once, independent of request exposure.
+    std::vector<ExecutionCounters> decode_by_batch;
+    std::vector<ExecutionProgress> in_flight;
+    EngineStatus status = EngineStatus::Ready;
+    // Absent unless explicitly requested; an empty included vector means no live requests.
+    std::optional<std::vector<RequestSnapshot>> requests;
     ScoringStatistics scoring;
     std::vector<RankSnapshot> ranks;
 };

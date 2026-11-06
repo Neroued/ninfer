@@ -28,6 +28,7 @@ public:
             if (!prefix.valid())
                 throw std::invalid_argument("snapshot has an empty prefix reference");
         states_->retain_checkpoint_reference(continuation_.image);
+        for (auto& prefix : prefixes_) prefix.set_use(ContextUse::Cache);
     }
 
     ~ContextSnapshot() { release(); }
@@ -36,12 +37,13 @@ public:
         : states_(other.states_), continuation_(other.continuation_), prefixes_(other.prefixes_),
           identity_(other.identity_) {
         if (states_) states_->retain_checkpoint_reference(continuation_.image);
+        set_use(other.use_, other.memory_);
     }
 
     ContextSnapshot(ContextSnapshot&& other) noexcept
         : states_(std::exchange(other.states_, nullptr)),
           continuation_(std::move(other.continuation_)), prefixes_(std::move(other.prefixes_)),
-          identity_(std::move(other.identity_)) {}
+          identity_(std::move(other.identity_)), use_(other.use_), memory_(other.memory_) {}
 
     ContextSnapshot& operator=(const ContextSnapshot& other) {
         if (this != &other) {
@@ -58,6 +60,8 @@ public:
             continuation_ = std::move(other.continuation_);
             prefixes_     = std::move(other.prefixes_);
             identity_     = std::move(other.identity_);
+            use_          = other.use_;
+            memory_       = other.memory_;
         }
         return *this;
     }
@@ -77,6 +81,17 @@ public:
     }
 
     [[nodiscard]] std::span<const HistoryPrefix> prefixes() const noexcept { return prefixes_; }
+
+    void set_use(ContextUse use, ContextMemory memory = ContextMemory::Device) {
+        if (use == use_ && memory == memory_) return;
+        if (states_ && use == ContextUse::Request)
+            states_->retain_request_reference(continuation_.image, memory);
+        if (states_ && use_ == ContextUse::Request)
+            states_->release_request_reference(continuation_.image, memory_);
+        for (auto& prefix : prefixes_) prefix.set_use(use, memory);
+        use_    = use;
+        memory_ = memory;
+    }
 
     [[nodiscard]] std::vector<runtime::ContextTransferRequirement>
     restore_requirements(const ContextDirectory& directory) const {
@@ -127,12 +142,16 @@ public:
     [[nodiscard]] StateId take_mutable_image() {
         if (!states_) throw std::logic_error("snapshot image already consumed");
         states_->consume_checkpoint(continuation_.image);
+        if (use_ == ContextUse::Request)
+            states_->release_request_reference(continuation_.image, memory_);
         states_ = nullptr;
         return continuation_.image;
     }
 
 private:
     void release() noexcept {
+        if (states_ && use_ == ContextUse::Request)
+            states_->release_request_reference(continuation_.image, memory_);
         if (states_ && !states_->release_checkpoint_owner(continuation_.image)) std::terminate();
         states_ = nullptr;
     }
@@ -141,6 +160,8 @@ private:
     Continuation<Metadata> continuation_;
     std::vector<HistoryPrefix> prefixes_;
     std::shared_ptr<const Identity> identity_;
+    ContextUse use_       = ContextUse::Cache;
+    ContextMemory memory_ = ContextMemory::Device;
 };
 
 } // namespace ninfer::models::context

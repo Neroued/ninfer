@@ -1030,6 +1030,79 @@ void qwen_reclaim_facts(DeviceContext& device) {
     f.empty();
 }
 
+void request_and_cache_usage(DeviceContext& device) {
+    Fixture f(device);
+    const auto check = [&](ContextMemoryDomain memory, unsigned used, unsigned cached) {
+        const auto usage = f.directory->usage();
+        for (const auto& pool : usage.pools)
+            expect(pool.live_bytes == pool.in_use_bytes + pool.cached_bytes,
+                   "pool purposes do not conserve physical bytes");
+        for (const auto& value : usage.resources)
+            if (value.domain == memory && value.history_pool == 0)
+                expect(value.in_use_bytes == used * f.page_layout.page_bytes &&
+                           value.cached_bytes == cached * f.page_layout.page_bytes,
+                       "KV request/cache classification does not match its physical owners");
+    };
+    auto owner         = f.create(193);
+    auto cache         = f.histories->retain_prefix(owner.handle(), 193);
+    auto short_request = f.histories->retain_prefix(owner.handle(), 65);
+    short_request.set_use(context::ContextUse::Request);
+    auto another_request = short_request;
+    check(ContextMemoryDomain::Device, 4, 0);
+    owner.reset();
+    check(ContextMemoryDomain::Device, 2, 2);
+    short_request.reset();
+    check(ContextMemoryDomain::Device, 2, 2);
+    another_request.reset();
+    check(ContextMemoryDomain::Device, 0, 4);
+
+    const auto first = f.histories->logical_page(cache.history(), 0);
+    {
+        auto records = f.host_reservation(1);
+        auto backup  = f.pages->prepare_host_replica(first, 0, records.materialize(0));
+        check(ContextMemoryDomain::Device, 0, 4);
+        check(ContextMemoryDomain::Host, 0, 1);
+    }
+    check(ContextMemoryDomain::Host, 0, 0);
+    const auto logical = f.logical(cache.history());
+    f.backup(logical);
+    check(ContextMemoryDomain::Host, 0, 4);
+    {
+        auto maintenance = f.pages->pin_binding(first, 0, context::ContextMemory::Device);
+        check(ContextMemoryDomain::Device, 0, 4);
+        auto reader = f.pages->read_device(first, 0, 64);
+        check(ContextMemoryDomain::Device, 1, 3);
+        check(ContextMemoryDomain::Host, 0, 4);
+    }
+    check(ContextMemoryDomain::Device, 0, 4);
+
+    auto& states     = f.directory->states();
+    const auto image = states.reserve_destination().value();
+    states.complete_initialization(image);
+    states.freeze(image);
+    using Snapshot = context::ContextSnapshot<int, int>;
+    {
+        Snapshot checkpoint(states, {image, 0}, {cache}, std::make_shared<const int>(1));
+        auto paused = checkpoint;
+        paused.set_use(context::ContextUse::Request);
+        check(ContextMemoryDomain::Device, 4, 0);
+        auto other = paused;
+        paused.set_use(context::ContextUse::Cache);
+        check(ContextMemoryDomain::Device, 4, 0);
+        other.set_use(context::ContextUse::Request, context::ContextMemory::Host);
+        check(ContextMemoryDomain::Device, 0, 4);
+        check(ContextMemoryDomain::Host, 4, 0);
+        paused = std::move(other);
+        check(ContextMemoryDomain::Host, 4, 0);
+    }
+    check(ContextMemoryDomain::Device, 0, 4);
+    check(ContextMemoryDomain::Host, 0, 4);
+    cache.reset();
+    check(ContextMemoryDomain::Device, 0, 0);
+    check(ContextMemoryDomain::Host, 0, 0);
+    f.empty();
+}
+
 void accepted_frontier_and_retirement(DeviceContext& device) {
     Fixture f(device);
     auto owner = f.create(65);
@@ -1066,6 +1139,7 @@ int main() {
             return 77;
         CUDA_CHECK(error);
         DeviceContext device(0);
+        request_and_cache_usage(device);
         accepted_frontier_and_retirement(device);
         prefix_retention_and_replicas(device);
         reservations_and_host(device);

@@ -94,7 +94,8 @@ int main(int argc, char** argv) {
                              "/b" + std::to_string(c.batch) + "/" + policy_name(c.policy) +
                              "/valid";
             for (int v : c.valid) id += "_" + std::to_string(v);
-            const bool graph = c.width == 2 || c.width == 9 || c.width == 10 || c.width == 16;
+            const bool graph = c.width == 2 || (c.width == 4 && c.batch == 8) || c.width == 9 ||
+                               c.width == 10 || c.width == 16;
             catalogue.push_back({id,
                                  {{"format", profile.name},
                                   {"policy", policy_name(c.policy)},

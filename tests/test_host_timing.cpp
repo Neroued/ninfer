@@ -25,6 +25,14 @@ int main() {
           "accepted/result/resolve/retire boundaries must partition one execution");
     ExecutionStatistics global{};
     accumulate(global, sample);
+    check(global[1].latency.bins.front() == 1,
+          "completed execution latency must be recorded once in a disjoint histogram bin");
+    ExecutionLatencyDistribution distribution;
+    distribution.observe(kExecutionLatencyBoundsNs[0]);
+    distribution.observe(kExecutionLatencyBoundsNs[0] + 1);
+    distribution.observe(kExecutionLatencyBoundsNs.back() + 1);
+    check(distribution.bins[0] == 1 && distribution.bins[1] == 1 && distribution.bins.back() == 1,
+          "latency histogram must preserve inclusive boundaries and overflow");
     RequestExecutionStatistics a{}, b{};
     for (auto* row : {&a, &b}) (*row)[1].observe(sample.latency);
     check(global[1].units == 1 && global[1].rows == 2 && global[1].scheduled_positions == 8 &&
@@ -52,11 +60,13 @@ int main() {
           "yield/relock latency is not host-active time or GPU time");
     GpuExecutionObservation gpu;
     merge_gpu_intervals(gpu, {.result_stream_ns = 20, .prefill_stream_ns = 50});
-    merge_gpu_intervals(gpu, {.result_stream_ns = 30});
-    std::array<DurationCounter, 4> measured{};
+    merge_gpu_intervals(gpu,
+                        {.result_stream_ns = 30, .draft_stream_ns = 0, .target_stream_ns = 17});
+    GpuIntervalCounters measured{};
     accumulate_gpu(measured, gpu);
     check(measured[0].count == 1 && measured[0].total_ns == 30 && measured[1].count == 0 &&
-              measured[2].total_ns == 50,
+              measured[2].total_ns == 50 && measured[4].count == 1 && measured[4].total_ns == 0 &&
+              measured[5].total_ns == 17,
           "rank max is per execution; unavailable GPU intervals stay unmeasured");
     GenerationTransferTiming peer_timing;
     ContextTransferObservation peer{.direction   = ContextTransferDirection::PeerDeviceToDevice,

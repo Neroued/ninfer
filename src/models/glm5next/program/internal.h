@@ -37,6 +37,7 @@ struct ComputeFrame {
     execution::BatchView batch;
     Tensor hidden;
     GpuExecutionObservation gpu;
+    AttentionWorkCounters attention;
     bool sequence = false, timed_prefill = false, counts_pending = false;
     bool head_ready = false, graph_round = false;
     bool release_vision = false;

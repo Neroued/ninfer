@@ -830,7 +830,8 @@ int main() {
         }
         RankExecutionObservation completion;
         completion.path                                 = ExecutionPath::Graph;
-        completion.gpu                                  = {123, {}, 456, {}};
+        completion.gpu                                  = {123, {}, 456, {}, 45, 67};
+        completion.attention                            = {ExecutionKind::Decode, {1, 3, 10, 16}};
         completion.communication_graph.calls[0]         = 37;
         completion.communication_graph.payload_bytes[0] = 8192;
         wire::Encoder observed;
@@ -840,7 +841,12 @@ int main() {
         const auto completed = runtime::protocol::rank_execution_observation(completed_input);
         completed_input.finish();
         require(completed.path == ExecutionPath::Graph && completed.gpu.result_stream_ns == 123 &&
-                    !completed.gpu.commit_stream_ns &&
+                    !completed.gpu.commit_stream_ns && completed.gpu.draft_stream_ns == 45 &&
+                    completed.gpu.target_stream_ns == 67 && completed.attention &&
+                    completed.attention->kind == ExecutionKind::Decode &&
+                    completed.attention->work.rows == 3 &&
+                    completed.attention->work.valid_positions == 10 &&
+                    completed.attention->work.scheduled_positions == 16 &&
                     completed.communication_graph.calls[0] == 37 &&
                     completed.communication_graph.payload_bytes[0] == 8192,
                 "completion observations lost GPU coverage or replayed communication work");

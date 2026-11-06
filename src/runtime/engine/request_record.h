@@ -224,6 +224,8 @@ struct RequestRecord {
     std::optional<Clock::time_point> source_wait_started;
     bool recovery_pending                  = false;
     std::uint64_t committed_decode_tokens  = 0;
+    std::uint32_t injected_control_tokens  = 0;
+    bool completion_observed               = false;
     GenerationRecoveryRoute recovery_route = GenerationRecoveryRoute::None;
     std::uint64_t preemption_count         = 0;
     std::uint64_t replay_restores          = 0;
@@ -234,7 +236,7 @@ struct RequestRecord {
     std::uint32_t computed_prompt_tokens = 0;
     RequestExecutionStatistics executions;
     std::vector<ExecutionExposure> decode_by_batch;
-    std::array<DurationCounter, 4> max_rank_gpu{};
+    GpuIntervalCounters max_rank_gpu{};
     std::optional<ExecutionSample> pending_execution;
     RequestHostTiming host_timing;
     std::uint64_t initial_binding_ns = 0;

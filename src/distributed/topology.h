@@ -22,10 +22,6 @@ struct GroupDescription {
     [[nodiscard]] std::uint32_t index(RankId rank) const;
 };
 
-struct ParallelCoordinate {
-    std::uint32_t rank = 0, size = 1;
-};
-
 struct RankIdentity {
     RankId rank        = 0;
     std::uint32_t node = 0, local_rank = 0;

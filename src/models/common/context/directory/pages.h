@@ -47,8 +47,9 @@ public:
     struct Replica {
         RecordLease record;
         PageId page;
-        std::uint32_t columns = 0;
-        std::uint32_t readers = 0;
+        std::uint32_t columns         = 0;
+        std::uint32_t readers         = 0;
+        std::uint32_t request_readers = 0;
     };
 
     [[nodiscard]] Replica* emplace(RecordLease&, PageId, std::uint32_t columns = 0);
@@ -99,14 +100,15 @@ public:
         void reset() noexcept;
 
     private:
-        ReadLease(PageDirectory&, PageId, std::uint32_t rank, ContextMemory,
-                  std::uint32_t coverage) noexcept;
+        ReadLease(PageDirectory&, PageId, std::uint32_t rank, ContextMemory, std::uint32_t coverage,
+                  ContextUse use = ContextUse::Request) noexcept;
         PageDirectory* store_ = nullptr;
         PageId page_;
         std::uint64_t epoch_    = 0;
         std::uint32_t rank_     = UINT32_MAX;
         std::uint32_t coverage_ = 0;
         ContextMemory memory_   = ContextMemory::Device;
+        ContextUse use_         = ContextUse::Request;
         friend class PageDirectory;
     };
 
@@ -243,12 +245,14 @@ public:
 
     [[nodiscard]] ReadLease pin_binding(PageId, std::uint32_t rank, ContextMemory);
     [[nodiscard]] ReadLease read_device(PageId, std::uint32_t coverage);
-    [[nodiscard]] ReadLease read_device(PageId, std::uint32_t rank, std::uint32_t coverage);
+    [[nodiscard]] ReadLease read_device(PageId, std::uint32_t rank, std::uint32_t coverage,
+                                        ContextUse use = ContextUse::Request);
     // Protected prefix bytes remain immutable even when an existing writer appends a suffix.
     [[nodiscard]] ReadLease read_device_prefix(PageId, std::uint32_t rank, std::uint32_t coverage);
     [[nodiscard]] ReadLease read_host(PageId, std::uint32_t rank, std::uint32_t coverage);
     [[nodiscard]] Restore reserve_device_replica(PageId, std::uint32_t rank, RecordReservation&);
     [[nodiscard]] Backup prepare_host_replica(PageId, std::uint32_t rank, RecordLease);
+
     [[nodiscard]] bool can_drop_device_replica(PageId, std::uint32_t rank) const noexcept;
     [[nodiscard]] bool drop_device_replica(PageId, std::uint32_t rank) noexcept;
     [[nodiscard]] bool drop_device_replica(PageId) noexcept;
@@ -337,6 +341,7 @@ private:
         std::uint32_t committed_columns = 0;
         std::uint32_t references        = 0;
         std::uint32_t active_references = 0;
+        std::array<std::uint32_t, 2> request_references{};
         std::uint32_t protected_columns = 0;
         std::uint32_t required_columns  = 0;
         std::uint64_t writer_identity   = 0;
@@ -360,6 +365,10 @@ private:
     [[nodiscard]] PageId create(RecordReservation&, std::span<const std::uint32_t> ranks);
     void release_descriptor(PageId, RecordReservation* reservation = nullptr) noexcept;
     void retire_unowned(PageId) noexcept;
+    static void refresh_usage(Page&) noexcept;
+    void retain_request_reference(PageId, ContextMemory);
+    void release_request_reference(PageId, ContextMemory);
+    friend class HistoryDirectory;
 
     MetadataAccount metadata_;
     PageAllocationIndex* allocation_pages_;

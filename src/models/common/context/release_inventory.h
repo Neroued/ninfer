@@ -10,6 +10,7 @@
 #include <optional>
 #include <span>
 #include <stdexcept>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -58,11 +59,15 @@ public:
 
     const Work& work() const { return work_; }
 
+    template <class Value = Resources>
     class Selection {
     public:
-        explicit Selection(const ReleaseInventory& inventory)
-            : inventory_(&inventory), selected_(inventory.capacity()),
+        explicit Selection(const ReleaseInventory& inventory, std::span<const Value> values = {})
+            : inventory_(&inventory), values_(values), selected_(inventory.capacity()),
               remaining_(inventory.objects_.size()) {
+            if ((!values.empty() || !std::is_same_v<Value, Resources>) &&
+                values.size() != inventory.objects_.size())
+                throw std::logic_error("release measures do not match their inventory");
             for (std::size_t i = 0; i < remaining_.size(); ++i)
                 remaining_[i] = inventory.objects_[i].holders.size();
         }
@@ -93,7 +98,7 @@ public:
             return Probe(*this, additions);
         }
 
-        const Resources& released() const { return released_; }
+        const Value& released() const { return released_; }
 
         std::span<const Handle> handles() const { return handles_; }
 
@@ -104,9 +109,11 @@ public:
         }
 
     private:
-        static void add_resources(Resources& a, const Resources& b) { a.merge(b); }
-
-        static void subtract_resources(Resources& a, const Resources& b) { a.subtract(b); }
+        const Value& value(std::uint32_t object) const {
+            if constexpr (std::is_same_v<Value, Resources>)
+                if (values_.empty()) return inventory_->objects_[object].released;
+            return values_[object];
+        }
 
         void add(Handle handle) {
             if (!inventory_->contains(handle))
@@ -117,7 +124,7 @@ public:
             for (const auto object : inventory_->objects_by_handle_[handle.index]) {
                 ++inventory_->work_.owner_visits;
                 if (!--remaining_[object]) {
-                    add_resources(released_, inventory_->objects_[object].released);
+                    released_.merge(value(object));
                     freed_.push_back(object);
                 }
             }
@@ -129,8 +136,7 @@ public:
                 handles_.pop_back();
                 selected_[handle.index] = false;
                 for (const auto object : inventory_->objects_by_handle_[handle.index]) {
-                    if (!remaining_[object]++ && size != 0)
-                        subtract_resources(released_, inventory_->objects_[object].released);
+                    if (!remaining_[object]++ && size != 0) released_.subtract(value(object));
                 }
             }
             freed_.resize(freed);
@@ -138,13 +144,19 @@ public:
         }
 
         const ReleaseInventory* inventory_;
+        std::span<const Value> values_;
         std::vector<bool> selected_;
         std::vector<std::uint32_t> remaining_, freed_;
         std::vector<Handle> handles_;
-        Resources released_;
+        Value released_;
     };
 
-    Selection select() const { return Selection(*this); }
+    Selection<> select() const { return Selection<>(*this); }
+
+    template <class Value>
+    Selection<Value> select(std::span<const Value> values) const {
+        return Selection<Value>(*this, values);
+    }
 
 private:
     std::vector<std::optional<Handle>> handles_;

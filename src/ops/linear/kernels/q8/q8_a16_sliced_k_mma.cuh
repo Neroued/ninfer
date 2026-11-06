@@ -78,8 +78,12 @@ __device__ __forceinline__ void q8_a16_sliced_k_mma(Q8LinearOperands operands, O
     constexpr bool kRuntimeActive = Schedule::kActivationStage == Q8ActivationStage::RuntimeActive;
     static_assert(ActiveCols >= 1 && ActiveCols <= kTileCols);
     static_assert(RowPolicy::kOutputRowsPerCta <= kRowsPerCta);
-    constexpr int kNt        = kTileCols / 8;
-    constexpr unsigned kMask = 0xffffffffu;
+    constexpr int kNt            = kTileCols / 8;
+    constexpr unsigned kMask     = 0xffffffffu;
+    constexpr bool tile_epilogue = requires(const float* values) {
+        epilogue.template apply_tile<kRowsPerCta, ActiveCols>(output, 0, 0, values, kTileCols, 0,
+                                                              0);
+    };
 
     using SharedStorage = Q8SlicedKSharedStorage<Schedule>;
 
@@ -379,7 +383,7 @@ __device__ __forceinline__ void q8_a16_sliced_k_mma(Q8LinearOperands operands, O
                           }) {
                 epilogue.store_fragment(output, cta_row0 + gid, column_offset + col0, sum,
                                         operands.rows, column_offset + live_columns);
-            } else if constexpr (requires {
+            } else if constexpr (tile_epilogue || requires {
                                      epilogue.apply_row(
                                          output, cta_row0, column_offset,
                                          *reinterpret_cast<const float(*)[ActiveCols]>(partial),
@@ -407,7 +411,7 @@ __device__ __forceinline__ void q8_a16_sliced_k_mma(Q8LinearOperands operands, O
                 store(cta_row0 + gid + 8, col0 + 1, sum.w);
             }
         }
-        if constexpr (requires {
+        if constexpr (!tile_epilogue && requires {
                           epilogue.apply_row(output, cta_row0, column_offset,
                                              *reinterpret_cast<const float(*)[ActiveCols]>(partial),
                                              live_columns);
@@ -423,6 +427,12 @@ __device__ __forceinline__ void q8_a16_sliced_k_mma(Q8LinearOperands operands, O
                                   live_columns);
             }
         }
+    }
+    if constexpr (tile_epilogue) {
+        __syncthreads();
+        epilogue.template apply_tile<kRowsPerCta, ActiveCols>(
+            output, cta_row0, column_offset, shared.partial, kTileCols, live_columns,
+            min(RowPolicy::kOutputRowsPerCta, operands.rows - cta_row0));
     }
 }
 

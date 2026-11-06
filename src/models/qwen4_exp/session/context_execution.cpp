@@ -31,6 +31,7 @@ ResidencyBinding SessionImpl::context_binding(BindOperation& operation) {
             sequence.speculative.backend      = SpeculativeBackend::Mtp;
             sequence.speculative.enabled      = true;
             sequence.speculative.draft_window = shape.draft_tokens;
+            sequence.speculative.attempted_per_position.resize(shape.draft_tokens);
             sequence.speculative.accepted_per_position.resize(shape.draft_tokens);
         }
     }
@@ -118,6 +119,11 @@ void SessionImpl::prepare_pause_resources(context::ContextReservation& targets) 
             detach(sequence, runtime::CheckpointRole::Continuation, std::move(pause.checkpoint));
         if (!pause.paused->snapshot)
             throw std::logic_error("prepared pause lost its checkpoint reservation");
+        checkpoints.at(*pause.paused->snapshot)
+            .snapshot.set_use(context::ContextUse::Request,
+                              pause.action.kind == runtime::PauseKind::HostSnapshot
+                                  ? context::ContextMemory::Host
+                                  : context::ContextMemory::Device);
     }
     pause.paused->sequence = std::move(sequences[pause.lane]);
     if (pause.paused->snapshot && pause.action.kind == runtime::PauseKind::HostSnapshot) {

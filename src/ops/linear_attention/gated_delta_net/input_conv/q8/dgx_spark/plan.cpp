@@ -6,7 +6,7 @@ ConvPlan select_q8_conv_plan(const WeightProfile& weights, Batch batch) {
     if (weights.geometry.query_rows == 1024) {
         if (batch.rows == 1 && batch.tokens <= 16)
             plan.kernel = ConvKernel::Q8Window;
-        else if (batch.columns() <= 16 && batch.tokens <= 8)
+        else if (batch.columns() <= kQ8AggregateColumns && batch.tokens <= 8)
             plan.kernel = ConvKernel::Q8Aggregate;
         if (batch.rows == 1 && batch.tokens > 16) plan.post = ProjectedConvKernel::TokenParallel8;
     } else if (weights.geometry.input_rows == 2560) {

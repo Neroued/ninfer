@@ -97,6 +97,8 @@ Session::inspect_source(const RequestBasePlan& base, std::optional<CheckpointHan
                                  target, resume);
 }
 
+std::vector<PlacementDescriptor> Session::placement_descriptions() const { return {{0, {0}}}; }
+
 std::span<const runtime::PlacementId> Session::placements(const RequestBasePlan&) const {
     static constexpr std::array<runtime::PlacementId, 1> placements{{{0}}};
     return placements;
@@ -157,6 +159,15 @@ std::uint64_t Session::useful_release_bytes(const ContextReleaseSet& released,
     return impl_->directory.useful_release_bytes(released, assessment);
 }
 
+std::vector<std::uint64_t> Session::release_limits(const ContextAssessment& assessment) const {
+    return impl_->directory.release_limits(assessment);
+}
+
+runtime::ContextReleaseMeasure Session::release_measure(const ContextReleaseSet& released,
+                                                        const ContextAssessment& assessment) const {
+    return impl_->directory.release_measure(released, assessment);
+}
+
 runtime::ContextStart Session::start_maintenance(const ContextAssessment& assessment) {
     return impl_->start_maintenance(assessment);
 }
@@ -185,7 +196,7 @@ Session::evaluate_recovery(std::span<const CheckpointHandle> advertised) const {
     return impl_->recovery_index.evaluate(advertised);
 }
 
-std::size_t Session::checkpoint_capacity() const noexcept { return impl_->checkpoints.capacity(); }
+std::size_t Session::checkpoint_extent() const noexcept { return impl_->checkpoints.size(); }
 
 std::vector<runtime::ContextTransferRequirement>
 Session::checkpoint_restore_requirements(CheckpointHandle h) const {

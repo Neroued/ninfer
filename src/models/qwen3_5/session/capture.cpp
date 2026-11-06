@@ -39,13 +39,17 @@ bool SessionImpl::reclaim_capture_reservation(const ContextAssessment& assessmen
     return false;
 }
 
-bool SessionImpl::reserve_capture_destination(std::uint32_t lane, std::uint32_t frontier,
-                                              std::span<const CheckpointHandle> host_victims) {
+SessionImpl::CaptureReservationStatus
+SessionImpl::reserve_capture_destination(std::uint32_t lane, std::uint32_t frontier,
+                                         std::span<const CheckpointHandle> host_victims) {
+    using Status  = CaptureReservationStatus;
     auto& request = requests[lane];
-    if (request.capture_reservation) { return request.capture_reservation->frontier == frontier; }
-    if (request.next_capture >= request.capture_groups.size()) { return false; }
+    if (request.capture_reservation)
+        return request.capture_reservation->frontier == frontier ? Status::Ready
+                                                                 : Status::Unavailable;
+    if (request.next_capture >= request.capture_groups.size()) return Status::Unavailable;
     const auto& group = request.capture_groups[request.next_capture];
-    if (group.frontier != frontier) { return false; }
+    if (group.frontier != frontier) return Status::Unavailable;
     auto ticket      = std::make_unique<CaptureReservation>();
     ticket->owner    = this;
     ticket->frontier = frontier;
@@ -56,23 +60,23 @@ bool SessionImpl::reserve_capture_destination(std::uint32_t lane, std::uint32_t 
             if (role == runtime::CheckpointRole::SharedPrefix && !ticket->points.empty()) {
                 continue;
             }
-            return false;
+            return Status::Unavailable;
         }
         ticket->points.emplace_back(*point, role);
     }
     if (host_victims.empty()) {
         const auto destination = context::reserve_capture_destination(directory, ticket->host);
-        if (!destination) return false;
+        if (!destination) return Status::NeedsContext;
         ticket->state = *destination;
     } else {
         const auto released = checkpoint_release_set(host_victims);
-        if (!released) return false;
+        if (!released) return Status::NeedsContext;
         ContextDemand demand;
         const auto host = demand.add_state(
             {.count = 1, .logical_count = 0, .memory = context::ContextMemory::Host});
-        if (!directory.assess(demand, *released).ready()) return false;
+        if (!directory.assess(demand, *released).ready()) return Status::NeedsContext;
         const auto destination = state_store->reserve_logical_destination();
-        if (!destination) return false;
+        if (!destination) return Status::NeedsContext;
         ticket->state = *destination;
         for (const auto victim : host_victims)
             if (!release_checkpoint(victim))
@@ -83,7 +87,7 @@ bool SessionImpl::reserve_capture_destination(std::uint32_t lane, std::uint32_t 
         ticket->host.emplace(backing.reservation->take(host));
     }
     request.capture_reservation = std::move(ticket);
-    return true;
+    return Status::Ready;
 }
 
 std::optional<CapturePreparation>
@@ -107,7 +111,9 @@ SessionImpl::prepare_capture(SequenceHandle handle,
     if (request.capture_reservation) {
         return CapturePreparation{.frontier = request.capture_reservation->frontier,
                                   .reserved = true,
-                                  .origin   = request.capture_groups[request.next_capture].origin};
+                                  .origin   = request.capture_groups[request.next_capture].origin,
+                                  .evidence =
+                                      request.capture_groups[request.next_capture].evidence};
     }
     const auto cursor =
         request.lifecycle == Lifecycle::Replaying ? request.replay_cursor : request.prefill->cursor;
@@ -139,15 +145,24 @@ SessionImpl::prepare_capture(SequenceHandle handle,
             continue;
         }
         if (frontier > request.permit->main_frontier) { return std::nullopt; }
-        if (reserve_capture_destination(lane, frontier, host_victims)) {
+        const auto status = reserve_capture_destination(lane, frontier, host_victims);
+        if (status == CaptureReservationStatus::Unavailable) {
+            // Catalog exhaustion ends this optional publication; it is not a State placement quote.
+            skip_capture(handle);
+            continue;
+        }
+        if (status == CaptureReservationStatus::Ready) {
             return CapturePreparation{.frontier       = frontier,
                                       .reserved       = true,
                                       .retired_points = {host_victims.begin(), host_victims.end()},
-                                      .origin =
-                                          request.capture_groups[request.next_capture].origin};
+                                      .origin = request.capture_groups[request.next_capture].origin,
+                                      .evidence =
+                                          request.capture_groups[request.next_capture].evidence};
         }
         CapturePreparation result{.frontier = frontier,
-                                  .origin   = request.capture_groups[request.next_capture].origin};
+                                  .origin   = request.capture_groups[request.next_capture].origin,
+                                  .evidence =
+                                      request.capture_groups[request.next_capture].evidence};
         ContextDemand demand;
         demand.add_state({.count = 1});
         result.assessment        = directory.assess(demand);
@@ -211,7 +226,8 @@ bool SessionImpl::start_capture(SequenceHandle handle) {
         !state.continuation.metadata.tail_hidden_valid) {
         return false;
     }
-    if (!reserve_capture_destination(lane, frontier)) { return false; }
+    if (reserve_capture_destination(lane, frontier) != CaptureReservationStatus::Ready)
+        return false;
     auto execution_reservation = executor().try_reserve(runtime::FrameKind::Context);
     if (!execution_reservation) return false;
     auto ticket = std::move(request.capture_reservation);
@@ -260,7 +276,8 @@ void SessionImpl::publish_capture(CaptureOperation& tx, context::ContextTransact
         checkpoints.publish(handle, CheckpointState{.snapshot = snapshot,
                                                     .role     = role,
                                                     .key      = group.key,
-                                                    .origin   = group.origin});
+                                                    .origin   = group.origin,
+                                                    .evidence = group.evidence});
     const auto writer =
         context::adopt_capture_writer(*state_store, source_state, migration.state_destination());
     state.continuation.image = writer.image;

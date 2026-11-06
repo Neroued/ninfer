@@ -385,19 +385,25 @@ void exercise(const std::filesystem::path& artifact, ninfer::SpeculativeBackend 
         if (first_error) { std::rethrow_exception(first_error); }
         throw std::runtime_error("first admission never submitted the second request");
     }
+    const auto cancellation_target = second.request_id();
     bool cancellation_requested = false;
     ninfer::RuntimeStats cancellation_observed;
     std::uint32_t committed_at_cancellation = 0;
     const ninfer::CancellationView cancellation([&] {
         if (cancellation_requested) { return true; }
         if (cancel_stage == CancelStage::None) { return false; }
-        const auto stats    = engine.snapshot().runtime;
-        const bool observed = cancel_stage == CancelStage::Paused
-                                  ? stats.paused_requests == 1
-                                  : stats.replaying_requests != 0 && stats.replayed_tokens != 0;
+        const auto snapshot = engine.snapshot({.include_requests = true});
+        const auto& stats   = snapshot.runtime;
+        const auto target =
+            std::find_if(snapshot.requests->begin(), snapshot.requests->end(),
+                         [&](const auto& r) { return r.id == cancellation_target; });
+        const bool observed =
+            target != snapshot.requests->end() &&
+            (cancel_stage == CancelStage::Paused
+                 ? target->phase == ninfer::RequestPhase::Paused
+                 : target->phase == ninfer::RequestPhase::Replay && stats.replayed_tokens != 0);
         if (!observed) { return false; }
-        // The second request's ticket is strictly newer: its submit follows first.start().
-        // With only these two requests, protecting the oldest resident makes it the only victim.
+        // Observe this request's lifecycle directly: pressure service can preempt either row.
         // CancellationView is checked by the consumer, including while its stream is idle; it
         // observes actual Engine state without delaying a model callback or guessing a sleep.
         cancellation_observed     = stats;
@@ -494,10 +500,9 @@ void exercise(const std::filesystem::path& artifact, ninfer::SpeculativeBackend 
                 after.replayed_tokens - before.replayed_tokens == totals.replayed_tokens,
             "request and Engine scheduling counters disagree");
     if (cancel_stage != CancelStage::None) {
-        require(first_result->stats.scheduling.preemptions == 0 &&
-                    second_result.stats.scheduling.preemptions != 0 &&
+        require(second_result.stats.scheduling.preemptions != 0 &&
                     second_result.stats.scheduling.paused_ns != 0,
-                "cancellation pressure did not preserve the oldest resident");
+                "cancellation did not reach the requested pressure state");
         // The consumer may still have committed events queued when it observes paused state.
         // validate() checks the complete drained stream against the terminal result as well.
         require(second_result.generated_token_ids.size() >= committed_at_cancellation,

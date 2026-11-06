@@ -194,10 +194,12 @@ HttpServer::HttpServer(product::ServeOptions options, std::shared_ptr<spdlog::lo
     : options_(std::move(options)), openai_responses_store_(options_.response_store_max_records,
                                                             options_.response_store_max_bytes),
       operational_log_(logger),
-      request_jsonl_(options_.launch.logging.request_jsonl.string(),
+      request_jsonl_(observations_.instance_id(), options_.launch.logging.request_jsonl.string(),
                      options_.launch.engine.artifact_path.string(), std::move(logger)) {
     request_jsonl_.write_startup_config(options_);
-    server_.new_task_queue = [this] { return make_http_task_queue(options_).release(); };
+    server_.new_task_queue = [this] {
+        return make_http_task_queue(options_, MonitorEvents::kMaxSubscribers).release();
+    };
     server_.set_socket_options(configure_http_server_socket);
     server_.set_payload_max_length(options_.max_request_bytes);
     register_routes();
@@ -230,47 +232,49 @@ std::shared_ptr<HttpServer::RequestLifecycle> HttpServer::begin_request(RequestL
 }
 
 void HttpServer::record_request_start(const RequestLogContext& context) {
+    observations_.prepared(context);
     request_jsonl_.write_request_start(context);
     operational_log_.request_start(context);
 }
 
 void HttpServer::record_request_rejected(const RequestRejectionLogContext& context) {
-    metrics_.rejected();
+    observations_.rejected(context.id);
     request_jsonl_.write_request_rejected(context);
     operational_log_.request_rejected(context);
 }
 
-ninfer::GenerationFirstTokenObserver HttpServer::first_token_observer() {
-    return [this](const ninfer::GenerationFirstTokenObservation& observation) {
-        metrics_.first_token(observation);
+ninfer::GenerationFirstTokenObserver HttpServer::first_token_observer(std::uint64_t request_id) {
+    return [this, request_id](const ninfer::GenerationFirstTokenObservation& observation) {
+        observations_.first_token(request_id, observation);
     };
 }
 
 ninfer::GenerationSchedulingObserver HttpServer::scheduling_observer(std::uint64_t request_id,
                                                                      std::string http_request_id) {
-    if (!request_jsonl_.enabled()) { return {}; }
     return [this, request_id, http_request_id = std::move(http_request_id)](
                const ninfer::GenerationSchedulingObservation& observation) {
+        observations_.scheduling(request_id, observation);
         request_jsonl_.write_request_scheduling(request_id, http_request_id, observation);
     };
 }
 
 void HttpServer::record_request_done(const RequestLogContext& context,
                                      const GenerationOutcome& outcome) {
-    metrics_.done(outcome);
+    observations_.done(context.id, outcome);
     request_jsonl_.write_request_done(context, outcome);
     operational_log_.request_done(context, outcome);
 }
 
 void HttpServer::record_request_failure(const RequestLogContext& context,
                                         const RequestFailure& failure) {
-    metrics_.failed(failure.classification == RequestFailureClass::ClientDisconnected);
+    observations_.failed(context.id,
+                         failure.classification == RequestFailureClass::ClientDisconnected);
     request_jsonl_.write_request_error(context, failure.machine_message);
     operational_log_.request_failure(context, failure);
 }
 
 void HttpServer::record_response_failure(std::uint64_t request_id, const RequestFailure& failure) {
-    metrics_.response_failed();
+    observations_.response_failed(request_id);
     operational_log_.response_failure(request_id, failure);
 }
 
@@ -419,6 +423,7 @@ void HttpServer::register_routes() {
             }
         });
 
+    register_monitor_routes();
     server_.Get("/health", [this](const httplib::Request&, httplib::Response& res) {
         const bool available = service_ != nullptr && service_->is_available();
         res.status           = available ? 200 : 503;
@@ -429,9 +434,9 @@ void HttpServer::register_routes() {
         handle_models(req, res);
     });
     server_.Get("/metrics", [this](const httplib::Request&, httplib::Response& res) {
-        const auto stats = service_->snapshot();
+        const auto stats = observations_.normalize(service_->snapshot());
         res.set_header("Cache-Control", "no-store");
-        res.set_content(metrics_.render(stats, service_->is_available()),
+        res.set_content(metrics_.render(stats, observations_.snapshot(), service_->is_available()),
                         "text/plain; version=0.0.4; charset=utf-8");
     });
     server_.Get(R"(/v1/models/(.+))", [this](const httplib::Request& req, httplib::Response& res) {
@@ -522,8 +527,9 @@ void HttpServer::attach(GenerationService& service) {
     }
     public_model_id_ = options_.model_id_override.value_or(load.model_name);
     service_         = &service;
-    metrics_.configure(public_model_id_, service.engine_options(), service.description(),
-                       service.startup_report(), service.snapshot());
+    observations_.attach(service.snapshot());
+    metrics_.configure(public_model_id_, service.engine_options(), service.startup_report(),
+                       observations_.start_seconds());
     request_jsonl_.write_server_start(
         options_, service.engine_options(), service.sampling_defaults(), public_model_id_,
         service.description(), service.startup_report(), service.snapshot());
@@ -540,14 +546,19 @@ bool HttpServer::listen() {
     }
     try {
         const bool result = server_.listen_after_bind();
+        observations_.stop();
         stop_stats_reporter();
         return result;
     } catch (...) {
+        observations_.stop();
         stop_stats_reporter();
         throw;
     }
 }
 
-void HttpServer::stop() { server_.stop(); }
+void HttpServer::stop() {
+    observations_.stop();
+    server_.stop();
+}
 
 } // namespace ninfer::serve

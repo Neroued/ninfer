@@ -1,0 +1,22 @@
+{
+  "id": "paper",
+  "name": "Paper",
+  "scheme": "light",
+  "colors": {
+    "bg": "#f2efe6",
+    "surface": "#eae5d9",
+    "plot": "#e9e4d8",
+    "ink": "#161714",
+    "secondary": "#3f413b",
+    "muted": "#565951",
+    "faint": "#85837a",
+    "rule": "rgba(22, 23, 20, 0.17)",
+    "grid": "rgba(22, 23, 20, 0.08)",
+    "decode": "#9c5a1a",
+    "decode-fill": "rgba(156, 90, 26, 0.10)",
+    "prefill": "#4f6b7a",
+    "prefill-fill": "rgba(79, 107, 122, 0.10)",
+    "alert": "#a33f31",
+    "hover": "rgba(22, 23, 20, 0.045)"
+  }
+}

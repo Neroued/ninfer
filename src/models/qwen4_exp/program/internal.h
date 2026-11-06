@@ -74,6 +74,7 @@ struct ComputeFrame {
     std::vector<std::uint32_t> dead_positions;
     runtime::CommandSequence retirement;
     GpuExecutionObservation gpu;
+    AttentionWorkCounters attention;
     ComputeResult result;
 };
 

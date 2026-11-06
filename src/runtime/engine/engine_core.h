@@ -21,6 +21,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <deque>
 #include <exception>
 #include <future>
@@ -66,6 +67,9 @@ public:
           max_concurrency_(options.max_concurrency),
           max_outstanding_(static_cast<std::size_t>(options.max_concurrency) +
                            options.max_pending_requests),
+          speculative_positions_(options.speculative.backend == SpeculativeBackend::None
+                                     ? 0
+                                     : options.speculative.draft_tokens),
           pending_timeout_(std::chrono::milliseconds(options.pending_timeout_ms)),
           decisions_(options.enable_decisions, options.context_cache.enabled),
           resources_(options.context_cache.enabled, std::move(context_cost)) {
@@ -77,11 +81,21 @@ public:
         for (const auto& pool : instance_.session->kv_pools()) {
             cumulative_stats_.kv_pools.push_back({pool.id.index, std::string(pool.label), 0});
         }
+        cumulative_stats_.speculative_attempted_per_position.resize(speculative_positions_);
+        cumulative_stats_.speculative_accepted_per_position.resize(speculative_positions_);
+        for (const auto& placement : instance_.session->placement_descriptions())
+            cumulative_stats_.placements.push_back({.id = placement.id});
         stats_snapshot_             = cumulative_stats_;
         published_snapshot_.runtime = cumulative_stats_;
         published_snapshot_.ranks.assign(instance_.executor->observations().begin(),
                                          instance_.executor->observations().end());
         paused_.reserve(max_outstanding_);
+        request_observations_.reserve(max_outstanding_ + 1);
+        published_requests_.reserve(max_outstanding_);
+        published_snapshot_.decode_by_batch.resize(max_concurrency_);
+        const auto frames = instance_.executor->capacity();
+        execution_observations_.reserve(frames.compute_frames + frames.context_frames);
+        published_snapshot_.in_flight.reserve(frames.compute_frames + frames.context_frames);
         std::promise<void> startup;
         std::future<void> started = startup.get_future();
         worker_                   = std::thread([this, startup = std::move(startup)]() mutable {
@@ -138,6 +152,10 @@ public:
 
         Submission(const Submission&)            = delete;
         Submission& operator=(const Submission&) = delete;
+
+        [[nodiscard]] std::uint64_t request_id() const noexcept {
+            return request_ ? request_->id : 0;
+        }
 
         void wait_for_admission(const CancellationView& cancellation) {
             if (owner_ == nullptr || request_ == nullptr) {
@@ -243,6 +261,8 @@ public:
                                                 std::move(options), consumer_mode,
                                                 std::move(observation), pending_deadline, ready);
             request->decode_by_batch.resize(max_concurrency_);
+            request->speculative_stats.attempted_per_position.resize(speculative_positions_);
+            request->speculative_stats.accepted_per_position.resize(speculative_positions_);
             request->context_transfers.resize(instance_.session->kv_pools().size() + 1);
         } catch (...) {
             {
@@ -263,15 +283,18 @@ public:
                                    "inference engine is unavailable");
             }
             pending_.push_back(request);
+            ++submitted_requests_;
         }
         request_admission_check();
         queue_cv_.notify_one();
         return Submission(*this, std::move(request));
     }
 
-    [[nodiscard]] EngineSnapshot snapshot() const {
+    [[nodiscard]] EngineSnapshot snapshot(SnapshotOptions options = {}) const {
         std::lock_guard lock(stats_mutex_);
-        return published_snapshot_;
+        auto result = published_snapshot_;
+        if (options.include_requests) result.requests = published_requests_;
+        return result;
     }
 
     [[nodiscard]] bool is_available() const {
@@ -322,6 +345,9 @@ private:
         std::vector<ResidencyId> residencies;
         std::vector<std::uint32_t> lanes;
         std::vector<bool> cancelled;
+        std::array<bool, kMaximumConcurrency> progressed{};
+        std::optional<std::uint64_t> retired_ns;
+        bool service_accounted = false;
         std::vector<TokenId> control_tokens;
         std::uint32_t control_stride = 0;
         std::vector<std::size_t> generated_sizes;
@@ -443,6 +469,8 @@ private:
     };
 
     void publish_runtime_stats();
+    [[nodiscard]] RequestSnapshot observe_request(const Request&) const;
+    void record_completion(const std::shared_ptr<Request>&, FinishReason, bool failed);
 
     void wait_for_admission(const std::shared_ptr<Request>& request,
                             const CancellationView& cancellation);
@@ -545,8 +573,6 @@ private:
 
     [[nodiscard]] bool resident_empty() const noexcept;
 
-    [[nodiscard]] bool has_older_resident(std::uint64_t ticket) const noexcept;
-
     void record_context_work(const typename ModelContract::ContextProgress& progress,
                              const std::shared_ptr<Request>& owner);
 
@@ -555,13 +581,11 @@ private:
 
     ReclaimProgress reclaim(const ContextAssessment& assessment, bool allow_pause,
                             std::span<const Checkpoint> excluded               = {},
-                            typename ResourceManagement::ReclaimCursor* cursor = nullptr,
-                            std::optional<std::uint64_t> priority_ticket       = std::nullopt);
+                            typename ResourceManagement::ReclaimCursor* cursor = nullptr);
 
-    bool pause_reclaim_victim(std::optional<std::uint64_t> priority_ticket,
-                              const ContextAssessment&);
+    bool pause_reclaim_victim(const ContextAssessment&);
 
-    enum class PauseGoal { YieldLane, ReleaseCapacity, RecoverCapacity, RelocateOnly };
+    enum class PauseGoal { YieldLane, ReleaseCapacity, RelocateOnly };
     bool pause_resident(std::uint32_t lane, PauseGoal goal = PauseGoal::YieldLane,
                         const ContextAssessment* pressure = nullptr);
 
@@ -605,7 +629,7 @@ private:
 
     [[nodiscard]] bool start_control(const ControlMembership& membership);
 
-    void resolve_control(const ComputeFlight& flight);
+    void resolve_control(ComputeFlight& flight);
 
     void supply_decision(ExecutionTicket ticket, const DecisionRequest& decision);
 
@@ -617,6 +641,8 @@ private:
 
     [[nodiscard]] bool compute_pending() const noexcept;
 
+    void record_service(ComputeFlight& flight) noexcept;
+    void log_worker_failure(std::exception_ptr error) const noexcept;
     void fail_all(std::exception_ptr error) noexcept;
 
     void begin_cycle(HostPhaseMeasurement& boundary);
@@ -629,6 +655,7 @@ private:
     const std::uint32_t max_context_;
     const std::uint32_t max_concurrency_;
     const std::size_t max_outstanding_;
+    const std::uint32_t speculative_positions_;
     const std::chrono::milliseconds pending_timeout_;
     BranchScoreQueue decisions_;
     ResourceManagement resources_;
@@ -644,6 +671,7 @@ private:
     std::size_t preparing_requests_       = 0;
     std::size_t outstanding_              = 0;
     std::uint64_t next_request_id_        = 1;
+    std::uint64_t submitted_requests_     = 0;
     std::uint64_t next_publication_order_ = 1;
     std::array<std::shared_ptr<Request>, kMaximumConcurrency> slots_{};
     std::optional<MaterializingRequest> materializing_;
@@ -660,6 +688,7 @@ private:
     std::array<std::optional<UnitPermit>, kMaximumConcurrency> reserved_units_{};
     std::atomic<bool> admission_check_pending_{false};
     std::atomic<std::uint64_t> schedule_revision_{0};
+    std::uint64_t published_revision_          = 0;
     Clock::time_point pending_deadline_        = Clock::time_point::max();
     std::uint64_t worker_accounted_elapsed_ns_ = 0;
     HostWorkClass current_host_work_class_     = HostWorkClass::Control;
@@ -668,6 +697,8 @@ private:
     RuntimeStats cumulative_stats_;
     RuntimeStats stats_snapshot_;
     EngineSnapshot published_snapshot_;
+    std::vector<RequestSnapshot> request_observations_, published_requests_;
+    std::vector<ExecutionProgress> execution_observations_;
     bool stopping_ = false;
     bool failed_   = false;
     std::thread worker_;

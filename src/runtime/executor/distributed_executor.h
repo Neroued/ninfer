@@ -35,6 +35,11 @@ public:
         for (const auto& rank : group_->topology().ranks) {
             this->observations_[rank.rank].rank = rank.rank;
             this->observations_[rank.rank].node = rank.node;
+            const auto& observed                = this->observations_[rank.rank];
+            this->rank_descriptions_.push_back(
+                {rank.rank, rank.node, rank.device, observed.hardware,
+                 observed.physical_memory && observed.physical_memory->shared_physical_memory,
+                 rank.tp, rank.ep, rank.dp, rank.pp, rank.adp});
             // Runtime communication counters start at activation, after preparation and capture.
             for (auto& counters : this->observations_[rank.rank].communication) {
                 counters.eager = {};
@@ -177,6 +182,7 @@ public:
                     snapshot.communication_eager = previous.communication_eager;
                     snapshot.communication_graph = previous.communication_graph;
                     snapshot.compute_paths       = previous.compute_paths;
+                    snapshot.attention           = previous.attention;
                     merge_host_observations(snapshot.host, previous.host);
                     auto& memory                         = snapshot.memory;
                     const auto& old                      = previous.memory;
@@ -230,6 +236,7 @@ public:
                     updated.communication_eager = previous.communication_eager;
                     updated.communication_graph = previous.communication_graph;
                     updated.compute_paths       = previous.compute_paths;
+                    updated.attention           = previous.attention;
                     merge_host_observations(updated.host, previous.host);
                     previous                                        = std::move(updated);
                     this->observations_[incoming->peer].received_ns = observation_time_ns();
@@ -304,6 +311,19 @@ public:
     [[nodiscard]] bool failed() const noexcept override { return failed_; }
 
     [[nodiscard]] bool has_pending_work() const noexcept override { return pool_.busy(); }
+
+    void observe_in_flight(std::vector<ExecutionProgress>& out) const override {
+        for (const auto* flights : {&compute_, &context_})
+            for (const auto& flight : *flights) {
+                if (flight.phase == Phase::Empty) continue;
+                const auto stage = flight.phase == Phase::Decision     ? ExecutionStage::Decision
+                                   : flight.phase == Phase::Result     ? ExecutionStage::ResultReady
+                                   : flight.phase == Phase::Retiring   ? ExecutionStage::Retiring
+                                   : flight.phase == Phase::Discarding ? ExecutionStage::Discarding
+                                                                       : ExecutionStage::Submitted;
+                out.push_back(flight.clock.progress(flight.ticket.id, stage));
+            }
+    }
 
     void measure(MeasurementCommand command) override {
         require_available();
@@ -557,7 +577,7 @@ private:
                                 throw std::logic_error("context retired before publication");
                             auto observed         = f.clock.finish(observation_time_ns());
                             observed.max_rank_gpu = f.gpu;
-                            accumulate(this->execution_statistics_, observed);
+                            this->observe_execution(observed);
                             events_.emplace_back(DeviceRetired{f.ticket, f.command, {}, observed});
                             retire_inputs(*f.work);
                             pool_.retire(f.ticket.frame);

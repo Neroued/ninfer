@@ -12,6 +12,7 @@
 build
 build-*
 cmake-build-*
+dashboard
 eval/runs
 eval/server-logs
 out

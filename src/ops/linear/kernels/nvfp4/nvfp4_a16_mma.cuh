@@ -101,6 +101,14 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a16_
         }
     };
 
+    const auto code_offset = [](int row, int byte) {
+        const int linear = row * (BK / 2) + byte;
+        // Preserve 16-byte copy alignment while giving the MMA's eight row
+        // groups distinct shared-memory banks for their packed code words.
+        if constexpr (Schedule::kSwizzleCodes) return linear ^ ((row & 7) * 16);
+        return linear;
+    };
+
     const auto stage_codes = [&](int k_tile) {
         const int k_begin = k_tile * BK;
         const int slot    = k_tile % Schedule::kRawStages;
@@ -110,7 +118,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a16_
             const int row = item / (BK / 32), chunk = item % (BK / 32);
             const int parent = row_policy.weight_row(row_begin, row, M);
             common::cp_async<16, Schedule::kWeightCache>(
-                codes + row * (BK / 2) + chunk * 16,
+                codes + code_offset(row, chunk * 16),
                 weight_codes + static_cast<std::int64_t>(parent) * (K / 2) + k_begin / 2 +
                     chunk * 16);
         }
@@ -130,7 +138,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a16_
             for (int col32 = 0; col32 < BK; col32 += 32) {
                 const int col = col32 + half_lane * 2;
                 const unsigned widened =
-                    common::nvfp4_scaled_pair_bf16(code_shared[row * (BK / 2) + col / 2],
+                    common::nvfp4_scaled_pair_bf16(code_shared[code_offset(row, col / 2)],
                                                    scale_shared[row * (BK / 16) + col / 16]);
                 common::store_vec(weight_shared + row * BK + common::swizzle_xor_64(row, col),
                                   widened);
@@ -182,13 +190,13 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a16_
                     const unsigned sf0 = common::fp8_e4m3x2_to_bf16x2_bits(scale0 | (scale0 << 8));
                     const unsigned sf1 = common::fp8_e4m3x2_to_bf16x2_bits(scale1 | (scale1 << 8));
                     a_fragments[slot][mma_row][0] =
-                        common::nvfp4_pair_bf16_scaled(tile_codes[row * (BK / 2) + col / 2], sf0);
+                        common::nvfp4_pair_bf16_scaled(tile_codes[code_offset(row, col / 2)], sf0);
                     a_fragments[slot][mma_row][1] = common::nvfp4_pair_bf16_scaled(
-                        tile_codes[(row + 8) * (BK / 2) + col / 2], sf1);
+                        tile_codes[code_offset(row + 8, col / 2)], sf1);
                     a_fragments[slot][mma_row][2] = common::nvfp4_pair_bf16_scaled(
-                        tile_codes[row * (BK / 2) + col / 2 + 4], sf0);
+                        tile_codes[code_offset(row, col / 2 + 4)], sf0);
                     a_fragments[slot][mma_row][3] = common::nvfp4_pair_bf16_scaled(
-                        tile_codes[(row + 8) * (BK / 2) + col / 2 + 4], sf1);
+                        tile_codes[code_offset(row + 8, col / 2 + 4)], sf1);
                 } else {
                     const int row = wm * WM + mma_row * 16 + a_row_offset;
                     const int col = k_step * 16 + a_col_offset;

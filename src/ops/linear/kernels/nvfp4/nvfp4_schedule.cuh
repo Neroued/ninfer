@@ -178,7 +178,7 @@ template <int BlockRows, int BlockTokens, int BlockK, int WarpRows, int WarpToke
           int ActivationStages, int MinBlocksPerSm, Cache WeightCache = Cache::cg,
           Cache ActivationCache                     = Cache::cg,
           Nvfp4MmaFragmentPipeline FragmentPipeline = Nvfp4MmaFragmentPipeline::PingPong,
-          bool RegisterWeights = false, int RasterGroupRows = 0>
+          bool RegisterWeights = false, int RasterGroupRows = 0, bool SwizzleCodes = false>
 struct Nvfp4A16MmaSchedule {
     static constexpr int kStaticK           = 0;
     static constexpr auto kFragmentPipeline = FragmentPipeline;
@@ -193,6 +193,7 @@ struct Nvfp4A16MmaSchedule {
     static constexpr Cache kActivationCache = ActivationCache;
     static constexpr bool kRegisterWeights  = RegisterWeights;
     static constexpr int kRasterGroupRows   = RasterGroupRows;
+    static constexpr bool kSwizzleCodes     = SwizzleCodes;
 
     static constexpr int kWarpsRows   = kBlockRows / kWarpRows;
     static constexpr int kWarpsTokens = kBlockTokens / kWarpTokens;

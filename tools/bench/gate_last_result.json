@@ -1,0 +1,33 @@
+{
+  "prefill_ratio_min": 1.2725433516605569,
+  "decode_keep_ratio_min": 1.0154735218243363,
+  "functional_ok": true,
+  "points": {
+    "ctx2048_c1": {
+      "ctx": 2048,
+      "c": 1,
+      "n": 2,
+      "failed": 0,
+      "prefill_tps": 34294.40302692825,
+      "decode_tps_mean": 593.9504629150542,
+      "prompt_tokens_total": 4158,
+      "max_ttft_s": 0.12124427407979965,
+      "wall_s": 1.9601922258734703,
+      "prefill_ratio": 4.654885444923345,
+      "decode_keep": 1.0154735218243363
+    },
+    "ctx32768_c2": {
+      "ctx": 32768,
+      "c": 2,
+      "n": 4,
+      "failed": 0,
+      "prefill_tps": 35225.39977165104,
+      "decode_tps_mean": 390.85016971774735,
+      "prompt_tokens_total": 126652,
+      "max_ttft_s": 3.5954737439751625,
+      "wall_s": 9.80353532731533,
+      "prefill_ratio": 1.2725433516605569,
+      "decode_keep": 1.1601370427953321
+    }
+  }
+}

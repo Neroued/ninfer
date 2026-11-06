@@ -1,6 +1,7 @@
 #include "models/qwen3_5/startup.h"
 #include "models/qwen3_5/execution/profile.h"
 #include "models/qwen3_5/measurement.h"
+#include "models/qwen3_5/prefill_chunk.h"
 #include "models/qwen3_5/program/planning/moe.h"
 #include "core/platform.h"
 
@@ -41,10 +42,8 @@ Startup::plan(DeviceContext& device, const EngineOptions& options, WeightPlaceme
     using runtime::resolve_context_capacity;
     const bool host_experts = placement == WeightPlacement::HostExperts;
     if (host_experts && !offload_) return {};
-    auto trial       = options;
-    const auto chunk = std::min(options.max_context, options.prefill_chunk ? options.prefill_chunk
-                                                     : host_experts        ? 4096U
-                                                                           : 1024U);
+    auto trial                   = options;
+    const auto chunk             = resolve_prefill_chunk(options, placement);
     trial.prefill_chunk          = chunk;
     const auto& policy           = options.context_capacity;
     constexpr bool shared_memory = NINFER_SHARED_PHYSICAL_MEMORY != 0;

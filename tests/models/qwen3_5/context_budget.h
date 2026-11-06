@@ -4,6 +4,7 @@
 #include "core/device.h"
 #include "models/qwen3_5/definition.h"
 #include "models/qwen3_5/planning.h"
+#include "models/qwen3_5/prefill_chunk.h"
 #include "ninfer/observability/snapshot.h"
 
 #include <algorithm>
@@ -12,7 +13,10 @@
 namespace ninfer::test::qwen3_5 {
 
 [[nodiscard]] inline runtime::ContextCapacityPlan
-context_capacity_plan(const EngineOptions& options) {
+context_capacity_plan(const EngineOptions& configured) {
+    auto options = configured;
+    options.prefill_chunk =
+        models::qwen3_5::resolve_prefill_chunk(options, models::WeightPlacement::Resident);
     artifact::Reader reader(options.artifact_path);
     const auto definition = models::qwen3_5::read_definition(reader, models::load_options(options));
     const auto profile    = models::qwen3_5::execution::describe_model(*definition);

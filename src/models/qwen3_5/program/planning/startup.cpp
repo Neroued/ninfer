@@ -538,6 +538,9 @@ void validate_target_options(const execution::ModelProfile& profile, DeviceConte
         options.max_context > profile.config.text.max_position_embeddings) {
         throw std::invalid_argument("max_context exceeds the configured position capacity");
     }
+    if (options.prefill_chunk == 0) {
+        throw std::invalid_argument("prefill_chunk must be resolved before sequence planning");
+    }
     if (options.prefill_chunk % kPrefillChunkAlignment != 0) {
         throw std::invalid_argument("prefill_chunk must be a nonzero multiple of 128");
     }
@@ -631,12 +634,11 @@ make_sequence_planner_impl(std::shared_ptr<const execution::ModelProfile> profil
                            std::shared_ptr<const moe::Plan> moe) {
     validate_target_options(*profile, device, options);
     SequencePlanningInputs inputs{
-        .profile         = std::move(profile),
-        .moe             = std::move(moe),
-        .capacity        = options.max_context,
-        .max_concurrency = options.max_concurrency,
-        .prefill_chunk =
-            std::min(options.prefill_chunk ? options.prefill_chunk : 1024U, options.max_context),
+        .profile                    = std::move(profile),
+        .moe                        = std::move(moe),
+        .capacity                   = options.max_context,
+        .max_concurrency            = options.max_concurrency,
+        .prefill_chunk              = std::min(options.prefill_chunk, options.max_context),
         .draft_window               = options.speculative.draft_tokens,
         .speculative_backend        = options.speculative.backend,
         .kv_storage                 = options.kv_cache,

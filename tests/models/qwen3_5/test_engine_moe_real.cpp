@@ -1,6 +1,8 @@
 #include "ninfer/engine.h"
 #include "context_budget.h"
+#include "models/qwen3_5/prefill_chunk.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -327,10 +329,14 @@ int main(int argc, char** argv) {
         }
 
         {
-            ninfer::Engine engine(engine_options(artifact));
+            const auto configured = engine_options(artifact);
+            ninfer::Engine engine(configured);
             if (const int result = verify_loaded_product(engine); result != 0) { return result; }
-            const auto before         = engine.snapshot().ranks.at(0).memory;
-            const auto expected_chunk = offload ? 4096U : 1024U;
+            const auto before = engine.snapshot().ranks.at(0).memory;
+            const auto expected_chunk =
+                std::min(offload ? ninfer::models::qwen3_5::kHostExpertsPrefillChunk
+                                 : ninfer::models::qwen3_5::kResidentPrefillChunk,
+                         configured.max_context);
             if (engine.options().prefill_chunk != expected_chunk ||
                 engine.description().prefill_chunk != expected_chunk) {
                 throw std::runtime_error(

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "context_budget.h"
+#include "models/qwen3_5/prefill_chunk.h"
 #include "models/qwen3_5/program/internal.h"
 #include "models/qwen3_5/session/internal.h"
 #include "runtime/executor/local_executor.h"
@@ -110,8 +111,11 @@ public:
     NativeRankFixture(std::shared_ptr<const q35::ModelDefinition> definition,
                       std::shared_ptr<const q35::ModelShard> model,
                       std::shared_ptr<const q35::execution::ModelProfile> profile,
-                      const EngineOptions& options, ContextBudget budget = {})
+                      const EngineOptions& configured, ContextBudget budget = {})
         : definition(std::move(definition)) {
+        auto options = configured;
+        options.prefill_chunk =
+            q35::resolve_prefill_chunk(options, models::WeightPlacement::Resident);
         auto device   = std::make_unique<DeviceContext>();
         device_       = device.get();
         auto instance = std::make_unique<runtime::RankModelInstance<ObservedTypes>>(

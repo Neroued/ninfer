@@ -1,0 +1,138 @@
+{
+  "measured": "2026-11-06",
+  "gpu": "RTX 5090D 32GB (single card, GPU5)",
+  "model": "Qwen3.6-35B-A3B-NVFP4",
+  "ninfer": "commit a754fcf3, build rtx5090-release, kv fp8, MTP3, cuda graph",
+  "sglang": "0.5.16, run_qwen36_35b_new_sglang.sh flags (context 262144, max-running 6, NEXTN 3/1/4, kv fp8_e4m3, flashinfer, mem-frac 0.85, mamba bf16)",
+  "methodology": "Anthropic /v1/messages streaming, thinking disabled, greedy, out=512, unique-nonce prompts; prefill_tps = sum(prompt_tokens)/max(ttft); decode = mean per-stream (out-1)/(e2e-ttft)",
+  "points": {
+    "ctx2048_c1": {
+      "ctx": 2048,
+      "c": 1,
+      "n": 3,
+      "sglang_prefill_tps": 7367.4,
+      "ninfer_prefill_tps": 45437.3,
+      "ninfer_decode_tps": 584.9
+    },
+    "ctx2048_c2": {
+      "ctx": 2048,
+      "c": 2,
+      "n": 4,
+      "sglang_prefill_tps": 18330.9,
+      "ninfer_prefill_tps": 31895.2,
+      "ninfer_decode_tps": 418.3
+    },
+    "ctx2048_c4": {
+      "ctx": 2048,
+      "c": 4,
+      "n": 8,
+      "sglang_prefill_tps": 22922.4,
+      "ninfer_prefill_tps": 5705.6,
+      "ninfer_decode_tps": 148.0
+    },
+    "ctx2048_c6": {
+      "ctx": 2048,
+      "c": 6,
+      "n": 12,
+      "sglang_prefill_tps": 5670.6,
+      "ninfer_prefill_tps": 6263.4,
+      "ninfer_decode_tps": 116.2
+    },
+    "ctx32768_c1": {
+      "ctx": 32768,
+      "c": 1,
+      "n": 3,
+      "sglang_prefill_tps": 32621.3,
+      "ninfer_prefill_tps": 52501.6,
+      "ninfer_decode_tps": 546.8
+    },
+    "ctx32768_c2": {
+      "ctx": 32768,
+      "c": 2,
+      "n": 4,
+      "sglang_prefill_tps": 27681.1,
+      "ninfer_prefill_tps": 35144.3,
+      "ninfer_decode_tps": 336.9
+    },
+    "ctx32768_c4": {
+      "ctx": 32768,
+      "c": 4,
+      "n": 8,
+      "sglang_prefill_tps": 27369.1,
+      "ninfer_prefill_tps": 15501.1,
+      "ninfer_decode_tps": 158.1
+    },
+    "ctx32768_c6": {
+      "ctx": 32768,
+      "c": 6,
+      "n": 12,
+      "sglang_prefill_tps": 23376.6,
+      "ninfer_prefill_tps": 14399.3,
+      "ninfer_decode_tps": 83.4
+    },
+    "ctx131072_c1": {
+      "ctx": 131072,
+      "c": 1,
+      "n": 3,
+      "sglang_prefill_tps": 21682.7,
+      "ninfer_prefill_tps": 34857.3,
+      "ninfer_decode_tps": 453.4
+    },
+    "ctx131072_c2": {
+      "ctx": 131072,
+      "c": 2,
+      "n": 4,
+      "sglang_prefill_tps": 13881.3,
+      "ninfer_prefill_tps": 22296.9,
+      "ninfer_decode_tps": 280.4
+    },
+    "ctx131072_c4": {
+      "ctx": 131072,
+      "c": 4,
+      "n": 8,
+      "sglang_prefill_tps": 13361.6,
+      "ninfer_prefill_tps": 14522.8,
+      "ninfer_decode_tps": 160.9
+    },
+    "ctx131072_c6": {
+      "ctx": 131072,
+      "c": 6,
+      "n": 6,
+      "sglang_prefill_tps": 6665.0,
+      "ninfer_prefill_tps": 8935.2,
+      "ninfer_decode_tps": 125.5
+    },
+    "ctx204800_c1": {
+      "ctx": 204800,
+      "c": 1,
+      "n": 3,
+      "sglang_prefill_tps": 15359.3,
+      "ninfer_prefill_tps": 19073.5,
+      "ninfer_decode_tps": 372.0
+    },
+    "ctx204800_c2": {
+      "ctx": 204800,
+      "c": 2,
+      "n": 4,
+      "sglang_prefill_tps": 10154.6,
+      "ninfer_prefill_tps": 13877.2,
+      "ninfer_decode_tps": 248.5
+    },
+    "ctx204800_c4": {
+      "ctx": 204800,
+      "c": 4,
+      "n": 8,
+      "sglang_prefill_tps": 9946.8,
+      "ninfer_prefill_tps": 15520.5,
+      "ninfer_decode_tps": 152.3
+    },
+    "ctx204800_c6": {
+      "ctx": 204800,
+      "c": 6,
+      "n": 6,
+      "sglang_prefill_tps": 4992.5,
+      "ninfer_prefill_tps": 7896.2,
+      "ninfer_decode_tps": 153.9
+    }
+  }
+}

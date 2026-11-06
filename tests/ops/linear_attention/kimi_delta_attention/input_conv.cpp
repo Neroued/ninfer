@@ -285,16 +285,15 @@ int main(int argc, char** argv) {
          {31, 32, 33, 63, 64, 65, 127, 128, 255, 256, 257, 511, 512, 513, 2047, 2048, 2049})
         suite.add("kda/input/prefill_t" + std::to_string(width),
                   [width] { return run_case(width, 1, false, false); });
-    for (const auto [width, batch, in_place, graph] : {std::tuple{1, 1, true, false},
-                                                       {2, 4, false, false},
-                                                       {3, 8, true, true},
-                                                       {8, 8, false, true},
-                                                       {9, 2, true, false},
-                                                       {17, 1, true, true},
-                                                       {31, 1, false, false},
-                                                       {33, 1, true, true},
-                                                       {9, 4, true, true},
-                                                       {129, 1, false, true}})
+    for (const auto [width, batch, in_place, graph] :
+         {std::tuple{1, 1, true, false}, {2, 4, false, false},   {3, 8, true, true},
+          {8, 8, false, true},           {9, 2, true, false},    {17, 1, true, true},
+          {31, 1, false, false},         {33, 1, true, true},    {9, 4, true, true},
+          {129, 1, false, true},         {24, 1, true, true},    {64, 1, true, true},
+          {65, 1, true, true},           {128, 1, true, true},   {16, 8, true, true},
+          {192, 1, false, false},        {193, 1, true, true},   {257, 1, false, true},
+          {385, 1, true, true},          {513, 1, false, true},  {1024, 1, false, false},
+          {2048, 1, false, false},       {4096, 1, false, false}})
         suite.add("kda/input/mxfp8/t" + std::to_string(width) + "b" + std::to_string(batch), [=] {
             return run_case(width, batch, in_place, graph, 0, QType::MXFP8,
                             ops::LinearPolicy::AllowA8);

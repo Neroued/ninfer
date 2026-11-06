@@ -60,6 +60,7 @@ void launch(const Tensor&, const Weight&, const Arguments&, float* scratch, cuda
 
 std::size_t mxfp8_workspace_capacity(int batch, int first, int last, bool update,
                                      LinearPolicy policy);
+Mxfp8Workspace mxfp8_execution_workspace(int width, int batch, bool update, LinearPolicy policy);
 void launch_mxfp8(const Tensor&, const Weight&, LinearPolicy, const Arguments&, void* scratch,
                   cudaStream_t);
 } // namespace ninfer::ops::detail::kda_input

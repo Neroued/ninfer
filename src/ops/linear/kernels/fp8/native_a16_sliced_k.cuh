@@ -52,6 +52,23 @@ struct NativeFp8SlicedKStorage {
     static constexpr int kBytes = kStaging > kPartial ? kStaging : kPartial;
 };
 
+template <class S, bool Swizzled>
+struct NativeFp8SlicedRowTile {
+    float* values;
+
+    __device__ __forceinline__ static int offset(int row, int token) {
+        if constexpr (Swizzled) {
+            constexpr int group = S::kBlockTokens & -S::kBlockTokens;
+            token ^= (row / (32 / group)) & (group - 1);
+        }
+        return row * S::kBlockTokens + token;
+    }
+
+    __device__ __forceinline__ float& at(int row, int token) const {
+        return values[offset(row, token)];
+    }
+};
+
 template <class Epilogue, class Output, int Tokens, class = void>
 struct NativeFp8SlicedRowConsumer : std::false_type {};
 
@@ -71,14 +88,21 @@ native_fp8_a16_sliced_k_body(const Input* __restrict__ x, const std::uint8_t* __
     constexpr int BR = S::kBlockRows, BT = S::kBlockTokens, WK = S::kWarpK;
     constexpr int BK = S::kBlockK, KW = S::kKWarps, ST = S::kStages;
     constexpr int MR = S::kMmaRows, MT = S::kMmaTokens;
-    constexpr bool fp32_scale   = std::is_same_v<Scale, float>;
-    constexpr bool fp32_input   = std::is_same_v<Input, float>;
-    using Storage               = NativeFp8SlicedKStorage<S, Input, Scale>;
-    constexpr int planes        = Storage::kPlanes;
-    constexpr bool row_consumer = NativeFp8SlicedRowConsumer<Epilogue, Output, BT>::value;
-    auto* code_shared           = raw;
-    auto* activation            = reinterpret_cast<__nv_bfloat16*>(raw + Storage::kCodes);
-    auto* scale_shared          = raw + Storage::kCodes + Storage::kActivation;
+    constexpr bool fp32_scale    = std::is_same_v<Scale, float>;
+    constexpr bool fp32_input    = std::is_same_v<Input, float>;
+    using Storage                = NativeFp8SlicedKStorage<S, Input, Scale>;
+    constexpr int planes         = Storage::kPlanes;
+    constexpr bool row_consumer  = NativeFp8SlicedRowConsumer<Epilogue, Output, BT>::value;
+    constexpr bool swizzled_rows = [] {
+        if constexpr (requires { Epilogue::kSwizzleRowStorage; })
+            return Epilogue::kSwizzleRowStorage;
+        return false;
+    }();
+    using RowTile         = NativeFp8SlicedRowTile<S, swizzled_rows>;
+    const auto row_offset = [](int row, int token) { return RowTile::offset(row, token); };
+    auto* code_shared     = raw;
+    auto* activation      = reinterpret_cast<__nv_bfloat16*>(raw + Storage::kCodes);
+    auto* scale_shared    = raw + Storage::kCodes + Storage::kActivation;
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
     const int gid = lane >> 2, lid = lane & 3;
     const int k         = S::kStaticK ? S::kStaticK : input_rows;
@@ -285,12 +309,12 @@ native_fp8_a16_sliced_k_body(const Input* __restrict__ x, const std::uint8_t* __
                 const int lr = mi * 16 + gid, lt = ni * 8 + 2 * lid;
                 if constexpr (Rows::kPaired || row_consumer) {
                     if (lt < BT) {
-                        partial[lr * BT + lt] = a[0];
-                        if constexpr (BR >= 16) partial[(lr + 8) * BT + lt] = a[2];
+                        partial[row_offset(lr, lt)] = a[0];
+                        if constexpr (BR >= 16) partial[row_offset(lr + 8, lt)] = a[2];
                     }
                     if (lt + 1 < BT) {
-                        partial[lr * BT + lt + 1] = a[1];
-                        if constexpr (BR >= 16) partial[(lr + 8) * BT + lt + 1] = a[3];
+                        partial[row_offset(lr, lt + 1)] = a[1];
+                        if constexpr (BR >= 16) partial[row_offset(lr + 8, lt + 1)] = a[3];
                     }
                 } else {
                     const int row0 = rows.weight_row(row_begin, lr, n);
@@ -313,7 +337,13 @@ native_fp8_a16_sliced_k_body(const Input* __restrict__ x, const std::uint8_t* __
     }
     if constexpr (Rows::kPaired || row_consumer) {
         __syncthreads();
-        if (tid < BR) {
+        if constexpr (requires {
+                          epilogue.template finish_rows<S>(output, RowTile{partial}, row_begin,
+                                                           token_begin, n, tokens);
+                      }) {
+            epilogue.template finish_rows<S>(output, RowTile{partial}, row_begin, token_begin, n,
+                                             tokens);
+        } else if (tid < BR) {
             const int row = rows.weight_row(row_begin, tid, n);
             if constexpr (Rows::kPaired) {
                 if (row < n / 2) {
@@ -324,13 +354,14 @@ native_fp8_a16_sliced_k_body(const Input* __restrict__ x, const std::uint8_t* __
 #pragma unroll
                     for (int t = 0; t < BT; ++t)
                         if (token_begin + t < tokens)
-                            epilogue.apply_pair(output, row, token_begin + t, partial[tid * BT + t],
-                                                partial[up * BT + t]);
+                            epilogue.apply_pair(output, row, token_begin + t,
+                                                partial[row_offset(tid, t)],
+                                                partial[row_offset(up, t)]);
                 }
             } else if (row < n) {
                 float values[BT];
 #pragma unroll
-                for (int t = 0; t < BT; ++t) values[t] = partial[tid * BT + t];
+                for (int t = 0; t < BT; ++t) values[t] = partial[row_offset(tid, t)];
                 linear_finish_row(output, epilogue, row, token_begin, values,
                                   min(BT, tokens - token_begin));
             }

@@ -12,7 +12,8 @@ struct ConvolutionSchedule : Schedule {
     static constexpr int kWarpGridTokens = Schedule::kWarpsTokens;
 };
 
-template <class A16Schedule, class A8Schedule, bool Tma, bool CacheColumns = false>
+template <class A16Schedule, class A8Schedule, bool Tma, bool CacheColumns = false,
+          bool Packed = false, bool FastSilu = false>
 void launch_mxfp8_tiled(const Tensor& x, const Weight& w, LinearPolicy policy, const Arguments& a,
                         void* scratch, cudaStream_t stream) {
     const auto plan = mxfp8_workspace(a.width, a.batch, a.destination != nullptr, policy, true);
@@ -39,6 +40,9 @@ void launch_mxfp8_tiled(const Tensor& x, const Weight& w, LinearPolicy policy, c
     // changing request-relative convolution coordinates or the final publication boundary.
     constexpr int max_columns = 65535 * kTiledTokens;
     const auto launch         = [&]<class Column>() {
+        using Epilogue =
+            std::conditional_t<Packed, PackedConvolutionEpilogue<Column, false, FastSilu>,
+                                       ConvolutionEpilogue<__nv_bfloat16, Column, false, CacheColumns>>;
         for (std::int64_t begin = 0; begin < total_columns;) {
             const int columns =
                 static_cast<int>(std::min<std::int64_t>(max_columns, total_columns - begin));
@@ -52,16 +56,13 @@ void launch_mxfp8_tiled(const Tensor& x, const Weight& w, LinearPolicy policy, c
                     quantized.scales + std::int64_t(begin) * (kInputFeatures / 32)};
                 launch_mxfp8_a8_quantize(slice.x, kInputFeatures, columns, packed, stream);
                 if constexpr (Tma)
-                    launch_mxfp8_a8_tma<A8Schedule>(
-                        mxfp8_a8_operands(w, packed, columns), output,
-                        ConvolutionEpilogue<__nv_bfloat16, Column, false, CacheColumns>{}, stream);
+                    launch_mxfp8_a8_tma<A8Schedule>(mxfp8_a8_operands(w, packed, columns), output,
+                                                            Epilogue{}, stream);
                 else
                     launch_mxfp8_a8_mma<A8Schedule>(mxfp8_a8_operands(w, packed, columns), output,
-                                                            ConvolutionEpilogue<__nv_bfloat16, Column>{},
-                                                            stream);
+                                                            Epilogue{}, stream);
             } else {
-                launch_native_fp8_a16_mma<A16Schedule>(
-                    slice, output, ConvolutionEpilogue<__nv_bfloat16, Column>{}, stream);
+                launch_native_fp8_a16_mma<A16Schedule>(slice, output, Epilogue{}, stream);
             }
             begin += columns;
         }

@@ -36,8 +36,13 @@ struct MmaSchedule
 
 } // namespace
 
+Mxfp8Workspace mxfp8_execution_workspace(int width, int batch, bool update, LinearPolicy policy) {
+    return window_route(width, batch) ? Mxfp8Workspace{}
+                                      : mxfp8_workspace(width, batch, update, policy, true);
+}
+
 std::size_t mxfp8_workspace_capacity(int batch, int, int last, bool update, LinearPolicy policy) {
-    return window_route(last, batch) ? 0 : mxfp8_workspace(last, batch, update, policy, true).bytes;
+    return mxfp8_execution_workspace(last, batch, update, policy).bytes;
 }
 
 void launch_mxfp8(const Tensor& x, const Weight& w, LinearPolicy policy, const Arguments& a,

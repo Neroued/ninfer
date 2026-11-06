@@ -20,6 +20,7 @@ int select_record_rows(int value_heads, int tokens, int batch);
 
 struct FoldSchedule {
     int warps, values;
+    int steps = 0;
 };
 
 FoldSchedule select_fold_schedule(int layers, int value_heads, int width, int batch, int sms);

@@ -110,13 +110,15 @@ struct BasicSwiGluRowMajorMmaEpilogue {
                 }
             }
         } else {
-            static_assert((Cfg::kBlockRows / Cfg::kWarpRows) == 2);
+            constexpr int gate_row_warps = Cfg::kBlockRows / Cfg::kWarpRows / 2;
+            static_assert((Cfg::kBlockRows / Cfg::kWarpRows) % 2 == 0);
+            const int paired_row = (wm % gate_row_warps) * Cfg::kWarpRows;
             auto* up_shared = reinterpret_cast<float*>(scratch);
             synchronize();
-            if (wm == 1) {
+            if (wm >= gate_row_warps) {
 #pragma unroll
                 for (int mi = 0; mi < MT; ++mi) {
-                    const int local_r0 = mi * 16 + gid;
+                    const int local_r0 = paired_row + mi * 16 + gid;
                     const int local_r1 = local_r0 + 8;
 #pragma unroll
                     for (int ni = 0; ni < NT; ++ni) {
@@ -131,10 +133,10 @@ struct BasicSwiGluRowMajorMmaEpilogue {
                 }
             }
             synchronize();
-            if (wm == 0) {
+            if (wm < gate_row_warps) {
 #pragma unroll
                 for (int mi = 0; mi < MT; ++mi) {
-                    const int local_r0 = mi * 16 + gid;
+                    const int local_r0 = paired_row + mi * 16 + gid;
                     const int local_r1 = local_r0 + 8;
                     const int r0       = m0 + local_r0;
                     const int r1       = m0 + local_r1;
@@ -149,7 +151,9 @@ struct BasicSwiGluRowMajorMmaEpilogue {
                         const float up01      = up_shared[local_r0 * BN + local_c1];
                         const float up10      = up_shared[local_r1 * BN + local_c0];
                         const float up11      = up_shared[local_r1 * BN + local_c1];
-                        if constexpr (Full) {
+                        // Most fragments in a partial tile still have four live
+                        // outputs. Share their bounds check before the product.
+                        if (Full || (gate_row_warps > 1 && r1 < m / 2 && c1 < n)) {
                             output_tile.store(r0, c0,
                                               swiglu_product(product, r0, gate_acc[0], up00));
                             output_tile.store(r0, c1,

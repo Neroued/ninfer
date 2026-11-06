@@ -23,7 +23,7 @@ void add_native_cases(Suite& suite) {
                 tokens, graph);
     add_profile(suite,
                 {QType::NVFP4_MUL, 8192, 1024, 4096, 3319U, ops::LinearPolicy::A16Only, 10.F},
-                tokens, graph);
+                std::array{1, 2, 7, 8, 9, 16, 17, 64, 65, 128, 129, 513, 4096}, std::array{33, 129});
     add_profile(suite,
                 {QType::NVFP4_MUL, 20480, 4096, 10240, 3323U, ops::LinearPolicy::A16Only, 10.F},
                 tokens, graph);

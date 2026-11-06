@@ -116,7 +116,7 @@ void run(const Options& options, Fixture& fixture) {
                 const bool tensor =
                     weight.qtype == QType::MXFP8 ? t > (weight.n == 12288 ? 4 : 2)
                     : weight.qtype == QType::FP8_E4M3FN_BLOCK128X128_FP32 ? t > 2
-                    : weight.qtype == QType::NVFP4_MUL ? t > (weight.n == 8192 ? 1 : 2)
+                    : weight.qtype == QType::NVFP4_MUL ? weight.n == 8192 || t > 2
                     : weight.qtype == QType::NVFP4
                         ? t >= 3
                         : t >= 2 || (weight.qtype == QType::BF16 && weight.n == 20480);

@@ -316,8 +316,9 @@ struct SessionEvent {
 class Session {
 public:
     [[nodiscard]] bool branch_scoring_available() const noexcept;
-    [[nodiscard]] BranchScoreResult score_branches(std::span<const BranchScoreRow>,
-                                                   const PreparationControl&, bool reuse_prefix);
+    [[nodiscard]] BranchScoreResult
+    score_branches(std::span<const BranchScoreRow>, const PreparationControl&, bool reuse_prefix,
+                   std::shared_ptr<const qwen::PreparedPromptData> prompt = {});
     [[nodiscard]] bool release_branch_cache();
     [[nodiscard]] std::optional<SequenceHandle> prefill_continuation() const;
     void yield_prefill(SequenceHandle);

@@ -17,10 +17,10 @@ BranchWorkspace::BranchWorkspace(MemorySpan backing, const BranchLayout& layout,
 BranchExecution::BranchExecution(MemorySpan backing, const BranchLayout& layout,
                                  LinearAttentionStateView& states)
     : ids(layout.ids.bind(backing)), positions(layout.positions.bind(backing)),
-      counts(layout.counts.bind(backing)), rows(layout.rows.bind(backing)),
-      offsets(layout.offsets.bind(backing)), hidden(layout.hidden.bind(backing)),
-      tails(layout.tails.bind(backing)), logits(layout.logits.bind(backing)),
-      work(layout.scratch.bind(backing)) {
+      rope_positions(layout.rope_positions.bind(backing)), counts(layout.counts.bind(backing)),
+      rows(layout.rows.bind(backing)), offsets(layout.offsets.bind(backing)),
+      hidden(layout.hidden.bind(backing)), tails(layout.tails.bind(backing)),
+      logits(layout.logits.bind(backing)), work(layout.scratch.bind(backing)) {
     if (layout.records.spec.layers) {
         records = GdnReplayRecords(backing, layout.records);
         fold.emplace(records, states.all_layers_view());
@@ -56,18 +56,21 @@ void RankProgramImpl::initialize_branch(ComputeOperation& operation, const Branc
             static_cast<std::int32_t*>(host.cache_positions.data)[i] = row.frontier + i;
             for (int axis = 0; axis < 3; ++axis)
                 static_cast<std::int32_t*>(host.rope_positions.data)[axis * operation.width + i] =
-                    row.frontier + i;
+                    row.rope_positions.empty() ? row.frontier + i
+                                               : row.rope_positions[axis * operation.width + i];
         }
         upload_ingress();
         upload_input(operation.width, 1);
         auto input = frame.input_view(operation.width, 1);
+        if (work.visual) install_visual_embeddings(operation, *work.visual, row.frontier);
         inputs     = {input.ids,
                       input.cache_positions,
                       input.rope_positions,
                       frame.valid_columns.slice(0, 0, 1),
                       frame.main_table_rows.slice(0, 0, 1),
                       frame.state_source_offsets.slice(0, 0, 1),
-                      frame.state_destination_offsets.slice(0, 0, 1)};
+                      frame.state_destination_offsets.slice(0, 0, 1),
+                      operation.input_embeddings};
         hidden     = input.hidden;
         update.emplace<execution::SequenceUpdate>(row.offsets.source, row.offsets.destination);
         arena = &b.work;
@@ -86,6 +89,8 @@ void RankProgramImpl::initialize_branch(ComputeOperation& operation, const Branc
                 const auto column               = std::min<std::size_t>(c, row.tokens.size() - 1);
                 ids[r * kBranchWidth + c]       = row.tokens[column];
                 positions[r * kBranchWidth + c] = row.frontier + column;
+                if (b.rope_positions.data != b.positions.data)
+                    b.host_rope[r * kBranchWidth + c] = row.frontier + column + row.rope_delta;
             }
         }
         const auto upload = [&](Tensor destination, const auto& values) {
@@ -94,15 +99,17 @@ void RankProgramImpl::initialize_branch(ComputeOperation& operation, const Branc
         };
         auto tokens = b.ids.slice(1, 0, batch);
         auto pos    = b.positions.slice(1, 0, batch);
+        auto rope   = b.rope_positions.slice(1, 0, batch);
         auto valid  = b.counts.slice(0, 0, batch);
         auto tables = b.rows.slice(0, 0, batch);
         auto state  = b.offsets.slice(0, 0, batch);
         upload(tokens, ids);
         upload(pos, positions);
+        if (rope.data != pos.data) upload(rope, b.host_rope);
         upload(valid, counts);
         upload(tables, rows);
         upload(state, offsets);
-        inputs = {tokens, pos,  pos.view({static_cast<int>(kBranchWidth) * batch}), valid, tables,
+        inputs = {tokens, pos,  rope.view({static_cast<int>(kBranchWidth) * batch}), valid, tables,
                   state,  state};
         hidden = b.hidden.slice(2, 0, batch);
         update.emplace<execution::ReplayRecords>(b.records);

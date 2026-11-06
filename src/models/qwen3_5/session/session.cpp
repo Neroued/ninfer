@@ -77,8 +77,9 @@ bool Session::branch_scoring_available() const noexcept {
 }
 
 BranchScoreResult Session::score_branches(std::span<const BranchScoreRow> rows,
-                                          const PreparationControl& control, bool reuse_prefix) {
-    return impl_->score_branches(rows, control, reuse_prefix);
+                                          const PreparationControl& control, bool reuse_prefix,
+                                          std::shared_ptr<const qwen::PreparedPromptData> prompt) {
+    return impl_->score_branches(rows, control, reuse_prefix, std::move(prompt));
 }
 
 bool Session::release_branch_cache() { return impl_->release_branch_cache(); }

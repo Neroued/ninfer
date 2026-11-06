@@ -58,6 +58,7 @@ RankProgramImpl::~RankProgramImpl() {
 }
 
 void RankProgramImpl::install_residencies(const ContextWork& work) {
+    if (work.release_vision && resources.vision) resources.vision->release(work.release_vision);
     const auto vocabulary = static_cast<std::size_t>(parameters.profile->public_tokens);
     for (auto id : work.releases) {
         auto& residency = residencies[id.lane.value];

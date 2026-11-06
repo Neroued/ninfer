@@ -152,6 +152,11 @@ void RankProgramImpl::retire_compute() {
                     return row.member.residency == active->owner.residency;
                 });
             bool release = compute->cancelled && reads_window;
+            if (const auto* branch = std::get_if<BranchWork>(&compute->request.work.operation);
+                branch && branch->visual && branch->visual->window.id == active->id)
+                release |= compute->cancelled ||
+                           branch->rows.front().frontier + branch->rows.front().tokens.size() >=
+                               active->plan->consume_end;
             if (const auto* forward = std::get_if<ForwardWork>(&compute->request.work.operation))
                 for (const auto& input : forward->inputs)
                     if (input.visual && input.visual->window.id == active->id)

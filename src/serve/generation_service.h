@@ -141,7 +141,8 @@ public:
 
     void warmup();
     [[nodiscard]] DecisionOutcome decide(const decision::Request& request,
-                                         std::function<bool()> is_cancelled = {});
+                                         std::function<bool()> is_cancelled  = {},
+                                         std::span<const std::string> images = {});
 
 private:
     enum class CacheParticipation : std::uint8_t {

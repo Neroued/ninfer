@@ -28,11 +28,24 @@ void HttpServer::handle_systemone(const httplib::Request& req, httplib::Response
         return;
     }
     try {
+        if (!permits_local_media(req)) {
+            for (const auto& source : request.images)
+                if (!source.starts_with("data:") && !source.starts_with("http://") &&
+                    !source.starts_with("https://")) {
+                    ApiError error;
+                    error.status  = 403;
+                    error.code    = "image_source_not_allowed";
+                    error.message = "Local image paths require a direct localhost client; use an "
+                                    "HTTPS or data URL.";
+                    write_openai_error(res, error);
+                    return;
+                }
+        }
         if (!request.decision.model.empty()) {
             validate_openai_model(request.decision.model, public_model_id_);
         }
-        auto outcome =
-            service_->decide(request.decision, [&req] { return client_disconnected(req); });
+        auto outcome = service_->decide(
+            request.decision, [&req] { return client_disconnected(req); }, request.images);
         auto body = format_systemone_response(request, outcome.body, public_model_id_);
         res.set_header("Cache-Control", "no-store");
         set_owned_json_content(res, body.dump(), std::move(outcome.lifetime));

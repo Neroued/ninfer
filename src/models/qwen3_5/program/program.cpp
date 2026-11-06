@@ -234,6 +234,8 @@ void RankProgramImpl::validate_work(const Work& work, runtime::FrameKind kind) c
                     throw std::invalid_argument("decision work exceeds its prepared overlay");
                 const bool forwarding = !op.rows.front().tokens.empty();
                 const bool projecting = !op.rows.front().candidates.empty();
+                if (op.visual && (!op.prefill || !forwarding || !resources.vision))
+                    throw std::invalid_argument("decision visual input requires a Vision prefill");
                 for (std::size_t i = 0; i < op.rows.size(); ++i) {
                     const auto& row = op.rows[i];
                     if (!row.state.valid() || row.offsets.source < 0 ||
@@ -248,6 +250,10 @@ void RankProgramImpl::validate_work(const Work& work, runtime::FrameKind kind) c
                         row.candidates.size() > 255 || (!forwarding && !projecting))
                         throw std::invalid_argument(
                             "decision work has invalid state, row or token bounds");
+                    if (!row.rope_positions.empty() &&
+                        (!op.prefill || row.rope_positions.size() != 3 * row.tokens.size()))
+                        throw std::invalid_argument(
+                            "decision RoPE positions have an invalid shape");
                     (void)resources.state_images.storage().image(row.offsets.source);
                     for (std::size_t j = 0; j < i; ++j)
                         if (op.rows[j].table.index == row.table.index ||

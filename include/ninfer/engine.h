@@ -94,6 +94,9 @@ public:
     [[nodiscard]] std::vector<TokenId>
     tokenize_prompt(PromptInput input, const PreparationControl& control = {}) const;
 
+    [[nodiscard]] BranchScorePrompt
+    prepare_branch_prompt(PromptInput input, const PreparationControl& control = {}) const;
+
     // Artifact-tokenizer raw-text encoding. No chat template or implicit special token is added.
     [[nodiscard]] std::vector<TokenId> tokenize_text(std::string_view text) const;
 
@@ -106,7 +109,8 @@ public:
     // reuse_prefix=false rebuilds the retained root; rows still share work within this call.
     [[nodiscard]] BranchScoreResult score_branches(std::span<const BranchScoreRow> rows,
                                                    const PreparationControl& control = {},
-                                                   bool reuse_prefix                 = true);
+                                                   bool reuse_prefix                 = true,
+                                                   const BranchScorePrompt* prompt   = nullptr);
 
     [[nodiscard]] std::uint32_t count_tokens(PromptInput input,
                                              const PreparationControl& control = {}) const;

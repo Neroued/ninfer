@@ -532,6 +532,10 @@ WorkspaceSpec build_workspace_plan(const SequencePlanImpl& plan) {
                 };
                 branch.ids       = tensor(DType::I32, {static_cast<int>(kBranchWidth), batch});
                 branch.positions = tensor(DType::I32, {static_cast<int>(kBranchWidth), batch});
+                branch.rope_positions =
+                    plan.features.vision
+                        ? tensor(DType::I32, {static_cast<int>(kBranchWidth), batch})
+                        : branch.positions;
                 branch.counts    = tensor(DType::I32, {batch});
                 branch.rows      = tensor(DType::I32, {batch});
                 branch.offsets   = tensor(DType::I64, {batch});
@@ -579,6 +583,14 @@ WorkspaceSpec build_workspace_plan(const SequencePlanImpl& plan) {
             qwen::VisionContext::plan_resources(*profile.config.vision, *profile.vision,
                                                 plan.capacity, plan.vision_memory_budget_bytes);
         out.capacity = std::max(out.capacity, out.vision->encoder.workspace_bytes);
+        if (out.branches) {
+            // The branch KV tables survive encoder calls. Everything after those tables
+            // is dead until text traversal starts and can share the encoder's scratch.
+            out.capacity =
+                std::max(out.capacity, checked_add(out.branches->ids.region.offset,
+                                                   out.vision->encoder.workspace_bytes,
+                                                   "decision Vision workspace exceeds size_t"));
+        }
     }
     return out;
 }

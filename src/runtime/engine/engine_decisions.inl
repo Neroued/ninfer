@@ -3,12 +3,13 @@
 namespace ninfer::runtime {
 
 template <class Instance>
-BranchScoreResult EngineCore<Instance>::score_branches(std::span<const BranchScoreRow> rows,
-                                                       const PreparationControl& control,
-                                                       bool reuse_prefix) {
+BranchScoreResult EngineCore<Instance>::score_branches(
+    std::span<const BranchScoreRow> rows, const PreparationControl& control, bool reuse_prefix,
+    std::shared_ptr<const models::qwen::PreparedPromptData> prompt) {
     auto job = std::make_shared<BranchScoreQueue::Job>();
     job->rows.assign(rows.begin(), rows.end());
     job->reuse_prefix     = reuse_prefix;
+    job->prompt           = std::move(prompt);
     job->control          = control;
     job->pending_deadline = Clock::now() + pending_timeout_;
     if (control.deadline != Clock::time_point{}) {
@@ -61,7 +62,7 @@ bool EngineCore<Instance>::progress_branch_job() {
                 return stopping_;
             });
             auto scored          = instance_.session->score_branches(
-                job->rows, control, job->reuse_prefix && decisions_.cache_enabled);
+                job->rows, control, job->reuse_prefix && decisions_.cache_enabled, job->prompt);
             if (!decisions_.cache_enabled) { (void)instance_.session->release_branch_cache(); }
             publish_runtime_stats();
             job->result.set_value(std::move(scored));

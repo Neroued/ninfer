@@ -2,6 +2,7 @@
 #include "ninfer/engine.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <cstdlib>
@@ -273,6 +274,69 @@ int main() {
             for (std::size_t i = 0; i < cases.size(); ++i) {
                 worst = std::max(worst, compare(scored.logits[i], again.logits[i]));
             }
+        }
+        if (const auto* vision = std::getenv("NINFER_DECISION_TEST_VISION");
+            vision && std::string(vision) == "1") {
+            auto visual_options          = options;
+            visual_options.enable_vision = true;
+            ninfer::Engine engine(visual_options);
+            const auto before  = engine.generate(engine.prepare(chat()), generation);
+            const auto picture = [&](bool blue) {
+                ninfer::OwnedMedia image;
+                image.kind               = ninfer::MediaKind::Image;
+                image.media_type         = "image/x-portable-pixmap";
+                image.source_name        = "decision.ppm";
+                const std::string header = "P6\n64 64\n255\n";
+                image.bytes.assign(header.begin(), header.end());
+                for (int pixel = 0; pixel < 64 * 64; ++pixel)
+                    image.bytes.insert(image.bytes.end(),
+                                       {static_cast<std::uint8_t>(blue ? 0 : 255), 0,
+                                        static_cast<std::uint8_t>(blue ? 255 : 0)});
+                ninfer::PromptInput input;
+                input.options.enable_thinking = false;
+                input.options.continuation = ninfer::PromptContinuationMode::ContinueFinalAssistant;
+                input.messages             = {
+                    {.role  = ninfer::ChatRole::User,
+                     .parts = {{.kind = ninfer::MessagePartKind::Media, .media = std::move(image)},
+                               {.text = "Is this picture red?"}}},
+                    {.role = ninfer::ChatRole::Assistant, .parts = {{.text = "{\"answer\":"}}}};
+                return engine.prepare_branch_prompt(std::move(input));
+            };
+            auto red = picture(false), same = picture(false), blue = picture(true);
+            expect(red.tokens == blue.tokens,
+                   "picture identity fixture needs identical placeholder IDs");
+            const std::vector<ninfer::TokenId> choices{engine.tokenize_text("true").front(),
+                                                       engine.tokenize_text("false").front()};
+            const auto score = [&](const ninfer::BranchScorePrompt& prompt, bool cache) {
+                const std::array<ninfer::BranchScoreRow, 2> batch{
+                    {{prompt.tokens,
+                      {},
+                      choices,
+                      static_cast<std::uint32_t>(prompt.tokens.size()),
+                      static_cast<std::uint32_t>(prompt.tokens.size())},
+                     {prompt.tokens,
+                      {},
+                      choices,
+                      static_cast<std::uint32_t>(prompt.tokens.size()),
+                      static_cast<std::uint32_t>(prompt.tokens.size())}}};
+                return engine.score_branches(batch, {}, cache, &prompt);
+            };
+            const auto first = score(red, false);
+            expect(first.computed_tokens == red.tokens.size(),
+                   "picture root was encoded/prefilled per branch");
+            const auto cached = score(same, true);
+            expect(cached.computed_tokens == 0, "identical picture lost native prefix reuse");
+            const auto changed = score(blue, true);
+            expect(changed.computed_tokens == blue.tokens.size(),
+                   "different pixels reused stale picture state");
+            const auto rebuilt = score(red, false);
+            for (std::size_t i = 0; i < first.logits.size(); ++i) {
+                worst = std::max(worst, compare(first.logits[i], cached.logits[i]));
+                worst = std::max(worst, compare(first.logits[i], rebuilt.logits[i]));
+            }
+            const auto after = engine.generate(engine.prepare(chat()), generation);
+            expect(before.generated_token_ids == after.generated_token_ids,
+                   "picture scoring changed ordinary chat state");
         }
         // Independent execution route: ordinary causal prefill + full-vocabulary log-softmax.
         // Destroy generation first so the model is never resident twice.

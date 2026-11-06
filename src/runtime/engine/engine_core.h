@@ -130,7 +130,8 @@ public:
     EngineCore& operator=(const EngineCore&) = delete;
 
     BranchScoreResult score_branches(std::span<const BranchScoreRow>, const PreparationControl&,
-                                     bool reuse_prefix);
+                                     bool reuse_prefix,
+                                     std::shared_ptr<const models::qwen::PreparedPromptData>);
 
     class Submission {
     public:

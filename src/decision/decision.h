@@ -131,7 +131,8 @@ class DecisionEngine {
 public:
     explicit DecisionEngine(Engine& engine) : engine_(engine) {}
 
-    [[nodiscard]] Json run(const Request& request, const PreparationControl& control = {});
+    [[nodiscard]] Json run(const Request& request, const PreparationControl& control = {},
+                           std::span<const OwnedMedia> images = {});
 private:
     Engine& engine_;
 };

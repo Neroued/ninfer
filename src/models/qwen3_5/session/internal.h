@@ -28,6 +28,8 @@ struct BranchPoint {
 struct BranchCache {
     std::vector<TokenId> prefix;
     std::unique_ptr<BranchPoint> root;
+    qwen::ResidentPrefixIdentity picture;
+    bool has_picture = false;
 };
 struct PendingContext;
 
@@ -309,7 +311,9 @@ class SessionImpl {
 public:
     [[nodiscard]] bool branch_scoring_available() const noexcept;
     [[nodiscard]] BranchScoreResult score_branches(std::span<const BranchScoreRow>,
-                                                   const PreparationControl&, bool);
+                                                   const PreparationControl&, bool,
+                                                   std::shared_ptr<const qwen::PreparedPromptData>);
+    void release_branch_visual();
     [[nodiscard]] bool release_branch_cache();
     void release_branch_point(std::unique_ptr<BranchPoint>&);
     void settle_branch_context(context::ContextTransaction&);

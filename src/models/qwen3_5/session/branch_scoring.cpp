@@ -9,7 +9,7 @@ namespace ninfer::models::qwen3_5::detail {
 
 bool SessionImpl::branch_scoring_available() const noexcept {
     return !closing && !execution && !scoring && !has_context_operation() && events.empty() &&
-           !executor().has_pending_work();
+           !executor().has_pending_work() && !vision_window.current();
 }
 
 Result SessionImpl::wait_branch_work(runtime::ExecutionTicket ticket, bool context) {
@@ -94,12 +94,19 @@ void SessionImpl::settle_branch_context(context::ContextTransaction& transaction
 }
 
 BranchResult SessionImpl::run_branch_work(BranchWork value) {
+    const auto visual = value.visual;
+    const auto end    = value.rows.front().frontier + value.rows.front().tokens.size();
     context::ContextTransaction address_borrow(directory);
     auto frame = executor().try_reserve(runtime::FrameKind::Compute);
     if (!frame) throw std::logic_error("decision compute frame is occupied");
     try {
         auto ticket = executor().submit(std::move(*frame), Work{.operation = std::move(value)});
+        if (visual) vision_window.submitted(visual->window.id, ticket);
         auto result = wait_branch_work(ticket, false);
+        if (visual) {
+            vision_window.consumed(visual->window.id, end >= visual->window.plan->consume_end);
+            vision_window.retired(ticket);
+        }
         return std::get<BranchResult>(std::move(result.output));
     } catch (...) {
         executor().fail("decision execution failed");
@@ -108,6 +115,20 @@ BranchResult SessionImpl::run_branch_work(BranchWork value) {
         } catch (...) {}
         throw;
     }
+}
+
+void SessionImpl::release_branch_visual() {
+    const auto* active = vision_window.current();
+    if (!active) return;
+    const auto owner = active->owner;
+    const auto id    = active->id;
+    // Called at an idle boundary after physical retirement, including cancelled requests.
+    auto frame = executor().try_reserve(runtime::FrameKind::Context);
+    if (!frame) throw std::logic_error("decision visual cleanup frame is occupied");
+    auto ticket =
+        executor().submit(std::move(*frame), Work{.operation = ContextWork{.release_vision = id}});
+    (void)wait_branch_work(ticket, true);
+    vision_window.revoke(owner);
 }
 
 void SessionImpl::release_branch_point(std::unique_ptr<BranchPoint>& point) {
@@ -128,9 +149,10 @@ bool SessionImpl::release_branch_cache() {
     return true;
 }
 
-BranchScoreResult SessionImpl::score_branches(std::span<const BranchScoreRow> rows,
-                                              const PreparationControl& control,
-                                              bool reuse_prefix) {
+BranchScoreResult
+SessionImpl::score_branches(std::span<const BranchScoreRow> rows, const PreparationControl& control,
+                            bool reuse_prefix,
+                            std::shared_ptr<const qwen::PreparedPromptData> picture) {
     if (!branch_scoring_available())
         throw std::logic_error("decision scoring requires an idle Session execution boundary");
     if (!plan.branch_batch_capacity)
@@ -145,8 +167,24 @@ BranchScoreResult SessionImpl::score_branches(std::span<const BranchScoreRow> ro
             throw RequestError(RequestErrorKind::QueueTimeout, "decision deadline exceeded");
     };
     check();
-    if (!reuse_prefix) (void)release_branch_cache();
+    // Use the same content/geometry/mRoPE proof as ordinary image prefix reuse. Retain
+    // only compact identity metadata, never the encoded image or its patch payload.
+    if (!reuse_prefix ||
+        (branches &&
+         (branches->has_picture != bool(picture) ||
+          (picture && (branches->picture.size() != picture->token_ids.size() ||
+                       !branches->picture.matches(*picture, picture->token_ids.size()))))))
+        (void)release_branch_cache();
     if (!branches) branches = std::make_unique<BranchCache>();
+    branches->has_picture = bool(picture);
+    if (picture) branches->picture.assign(*picture);
+    std::shared_ptr<const qwen::VisionExecutionInput> visual;
+    if (picture) {
+        if (!vision_enabled || !plan.profile->config.vision || !plan.vision_max_features)
+            throw std::invalid_argument("decision images require enabled Vision");
+        visual = qwen::prepare_vision_input(*picture, *plan.profile->config.vision,
+                                            plan.vision_max_features);
+    }
     const auto batch = plan.branch_batch_capacity;
     std::vector<std::unique_ptr<BranchPoint>> owned;
     owned.reserve(1 + 2 * batch);
@@ -160,6 +198,7 @@ BranchScoreResult SessionImpl::score_branches(std::span<const BranchScoreRow> ro
     const auto cleanup = [&] {
         for (auto& point : owned) release_branch_point(point);
         owned.clear();
+        if (!executor().failed()) release_branch_visual();
     };
     const auto create = [&](BranchPoint* source, std::uint32_t length, std::uint32_t row) {
         check();
@@ -234,10 +273,47 @@ BranchScoreResult SessionImpl::score_branches(std::span<const BranchScoreRow> ro
                               .frontier = point.frontier};
                 for (std::uint32_t c = 0; c < count; ++c)
                     row.tokens.push_back(inputs[r][point.frontier + c]);
+                row.rope_delta = picture ? picture->rope_delta : 0;
+                if (prefill && picture) {
+                    for (int axis = 0; axis < 3; ++axis)
+                        for (std::uint32_t c = 0; c < count; ++c) {
+                            const auto p = point.frontier + c;
+                            row.rope_positions.push_back(p < picture->token_ids.size()
+                                                             ? picture->position_axis(axis)[p]
+                                                             : static_cast<std::int32_t>(p) +
+                                                                   picture->rope_delta);
+                        }
+                }
                 work.rows.push_back(std::move(row));
             }
             if (live.empty()) return;
             settle_branch_context(transaction);
+            if (visual && prefill) {
+                auto& row           = work.rows.front();
+                const auto end      = row.frontier + row.tokens.size();
+                const auto* current = vision_window.current();
+                auto planned = current ? current->plan
+                                       : vision::plan_window(visual->units, row.frontier, end,
+                                                             plan.vision_max_features, 1);
+                if (planned) {
+                    // A window can end before the chunk when the next picture exceeds the
+                    // existing feature budget. Finish this window before reserving another.
+                    const auto limit = std::min<std::size_t>(end, planned->consume_end);
+                    const auto count = limit - row.frontier;
+                    if (count < row.tokens.size()) {
+                        const auto previous = row.tokens.size();
+                        std::vector<std::int32_t> positions;
+                        for (int axis = 0; axis < 3; ++axis)
+                            positions.insert(positions.end(),
+                                             row.rope_positions.begin() + axis * previous,
+                                             row.rope_positions.begin() + axis * previous + count);
+                        row.rope_positions = std::move(positions);
+                        row.tokens.resize(count);
+                    }
+                    work.visual = qwen::prepare_vision_work(
+                        vision_window.reserve({}, current ? nullptr : planned), visual, 1);
+                }
+            }
             std::vector<std::size_t> counts;
             for (const auto& row : work.rows) counts.push_back(row.tokens.size());
             (void)run_branch_work(std::move(work));
@@ -384,7 +460,8 @@ BranchScoreResult SessionImpl::score_branches(std::span<const BranchScoreRow> ro
         } catch (const RequestError& error) {
             cleanup();
             (void)release_branch_cache();
-            if (error.kind() != RequestErrorKind::Overloaded || !sharing || executor().failed())
+            if (error.kind() != RequestErrorKind::Overloaded || !sharing || executor().failed() ||
+                picture)
                 throw;
             sharing  = false;
             branches = std::make_unique<BranchCache>();

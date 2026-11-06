@@ -108,6 +108,7 @@ public:
     void initialize_inputs(ComputeOperation&);
     void initialize_decode(ComputeOperation&, const DecodeWork&);
     void initialize_forward(ComputeOperation&, const ForwardWork&);
+    void install_visual_embeddings(ComputeOperation&, const qwen::VisionWork&, std::uint32_t);
     void initialize_score(ComputeOperation&, const ScoreWork&);
     void initialize_branch(ComputeOperation&, const BranchWork&);
     bool advance_branch(ComputeOperation&);

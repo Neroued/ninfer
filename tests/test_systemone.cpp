@@ -41,8 +41,8 @@ Json example() {
 Json scored(const ninfer::serve::SystemOneRequest& request,
             const std::vector<std::vector<double>>& p) {
     Json fields = Json::object();
-    for (std::size_t i = 0; i < request.questions.size(); ++i) {
-        fields[request.questions[i].id] = {{"probabilities", p.at(i)}};
+    for (std::size_t i = 0; i < request.decision.fields.size(); ++i) {
+        fields[request.decision.fields[i].name] = {{"probabilities", p.at(i)}};
     }
     return {{"results", Json::array({{{"fields", fields}}})}, {"usage", {{"prompt_tokens", 123}}}};
 }
@@ -66,6 +66,98 @@ int main() {
         expect(response.at("model") == "local-27b" && response.at("usage").at("output_tokens") == 0,
                "report the actual model and no generated tokens");
         expect(response.at("usage").at("input_tokens") == 123, "native usage preserved");
+        auto picture_body =
+            Json::parse(R"({"state":"find the label","images":["data:image/png;base64,AA=="],
+            "questions":{"target":{"type":"box","instructions":"Bound the label"},
+                         "visible":{"type":"noul","instructions":"Is it visible?"}}})");
+        auto picture = parse_systemone_request(picture_body);
+        expect(picture.images.size() == 1 && picture.questions.size() == 2 &&
+                   picture.decision.fields.size() == 5,
+               "picture box expands into four isolated edges");
+        expect(picture.decision.fields[0].values.size() == 101 &&
+                   picture.questions[1].first_field == 4,
+               "default grid and mixed field offsets");
+        expect(Json::parse(picture.decision.fields[0].isolated_question)["edge"] == "top",
+               "box rubric names only its own edge");
+        std::vector<std::vector<double>> box_ps(4, std::vector<double>(101));
+        box_ps[0][80] = 1;
+        box_ps[1][20] = 1;
+        box_ps[2][90] = 1;
+        box_ps[3][10] = 1;
+        box_ps.push_back({.8, .2});
+        auto box_answer =
+            format_systemone_response(picture, scored(picture, box_ps), "local")["answers"];
+        expect(box_answer["target"]["box"] ==
+                   Json{{"top", .2}, {"bottom", .8}, {"left", .1}, {"right", .9}},
+               "box pairs are normalized rather than returned inverted");
+        expect(box_answer["target"]["confidence"] == 1 &&
+                   box_answer["target"]["edges"]["top"]["moved"] == true &&
+                   box_answer["visible"]["noul"] == .8,
+               "edge movement, confidence, and mixed noul mapping");
+        for (const auto* aggregate : {"mode", "mean", "median"}) {
+            picture_body["questions"].erase("visible");
+            picture_body["questions"]["target"]["criteria"] = {{"step", .25},
+                                                               {"aggregate", aggregate}};
+            picture                                         = parse_systemone_request(picture_body);
+            std::vector<std::vector<double>> ps(4, {.3, 0, .4, 0, .3});
+            const auto answer = format_systemone_response(picture, scored(picture, ps),
+                                                          "local")["answers"]["target"];
+            expect(answer["box"]["left"] == .5 && answer["aggregate"] == aggregate,
+                   "box aggregation stays on the requested coordinate grid");
+            ps.assign(4, {.4, .3, .1, .1, .1});
+            const auto estimates = format_systemone_response(picture, scored(picture, ps),
+                                                             "local")["answers"]["target"];
+            const auto value     = estimates["box"]["left"];
+            expect(value == (std::string(aggregate) == "mode" ? 0.0 : .25),
+                   "mode uses the peak, median the cumulative mass, mean the nearest grid point");
+            expect(estimates["edges"]["left"]["mean"] == .25,
+                   "Basalt edge summaries report the snapped mean, not an off-grid average");
+            ps.assign(4, {.2, .2, .2, .2, .2});
+            expect(near(format_systemone_response(picture, scored(picture, ps),
+                                                  "local")["answers"]["target"]["confidence"],
+                        0),
+                   "flat box distribution has zero confidence");
+        }
+        for (const auto& step :
+             {Json(0), Json(-1), Json(.03), Json(.001), Json(".25"), Json(true)}) {
+            auto bad                               = picture_body;
+            bad["questions"]["target"]["criteria"] = {{"step", step}};
+            rejects([&] { (void)parse_systemone_request(bad); },
+                    "box step requires an exact bounded numeric grid");
+        }
+        for (const auto& criteria :
+             {Json{{"aggregate", "maximum"}}, Json{{"aggregate", 1}}, Json{{"units", "pixels"}}}) {
+            auto bad                               = picture_body;
+            bad["questions"]["target"]["criteria"] = criteria;
+            rejects([&] { (void)parse_systemone_request(bad); },
+                    "box options are explicitly bounded");
+        }
+        for (const auto& images :
+             {Json(nullptr), Json("file.png"), Json::array({""}), Json::array({3}),
+              Json(std::vector<std::string>(9, "a.png")), Json::array()}) {
+            auto bad      = picture_body;
+            bad["images"] = images;
+            rejects([&] { (void)parse_systemone_request(bad); },
+                    "box requires a valid nonempty image list");
+        }
+        auto many_boxes         = picture_body;
+        many_boxes["questions"] = Json::object();
+        for (int i = 0; i < 32; ++i)
+            many_boxes["questions"][std::to_string(i)] = {{"type", "box"},
+                                                          {"criteria", {{"step", 1}}}};
+        const auto expanded = parse_systemone_request(many_boxes);
+        expect(expanded.decision.fields.size() == 128,
+               "32 public questions allow 128 internal box edges");
+        auto renamed_boxes = many_boxes;
+        renamed_boxes["questions"].erase("0");
+        renamed_boxes["questions"][std::string(1, '\0') + "0:top"] = {{"type", "noul"}};
+        const auto disjoint = parse_systemone_request(renamed_boxes);
+        std::vector<std::string> names;
+        for (const auto& field : disjoint.decision.fields) {
+            expect(std::find(names.begin(), names.end(), field.name) == names.end(),
+                   "caller question IDs cannot collide with private box coordinates");
+            names.push_back(field.name);
+        }
         expect(answers.at("route_private_id").at("choice") == "billing", "choice argmax");
         expect(near(answers.at("route_private_id").at("confidence"), .4),
                "published choice confidence");
@@ -73,7 +165,8 @@ int main() {
                "full choice distribution");
         expect(near(answers.at("urgent_private_id").at("noul"), .1),
                "noul is p(true), not winning probability");
-        expect(answers.at("urgent_private_id").size() == 2, "no invented noul confidence field");
+        expect(near(answers.at("urgent_private_id").at("confidence"), .1),
+               "Basalt noul confidence remains p(true)");
         expect(near(answers.at("score_private_id").at("score"), 1.4),
                "score mean is not grid rounded");
         expect(near(answers.at("score_private_id").at("confidence"), .4),
@@ -217,6 +310,13 @@ int main() {
         const auto old_response = ninfer::decision::evaluate(old_request, backend);
         expect(!old_response["results"][0]["fields"]["yes"].contains("probabilities"),
                "ordinary decision response has not gained private formatter fields");
+
+        const auto box_results     = ninfer::decision::evaluate(expanded.decision, backend);
+        const auto formatted_boxes = format_systemone_response(expanded, box_results, "local");
+        expect(formatted_boxes["answers"].size() == 32,
+               "expanded box fields return exactly the public questions");
+        expect(formatted_boxes["timings"] == box_results["timings"],
+               "native timings survive the SystemOne adapter");
 
         auto branching = parse_systemone_request(Json::parse(R"({"state":"state text","questions":{
           "pick":{"type":"choice","instructions":"Select a label","criteria":{

@@ -8,6 +8,10 @@
 #include <memory>
 #include <vector>
 
+namespace ninfer::models::qwen {
+struct PreparedPromptData;
+}
+
 namespace ninfer::runtime {
 
 // EngineCore's queue mutex guards admission; its worker settles every borrowed token span.
@@ -15,6 +19,7 @@ struct BranchScoreQueue {
     struct Job {
         std::vector<BranchScoreRow> rows;
         bool reuse_prefix = true;
+        std::shared_ptr<const models::qwen::PreparedPromptData> prompt;
         PreparationControl control;
         std::chrono::steady_clock::time_point pending_deadline;
         std::promise<BranchScoreResult> result;

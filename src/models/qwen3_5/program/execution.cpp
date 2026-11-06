@@ -61,6 +61,9 @@ void RankProgramImpl::progress() {
         case ComputeStage::Forward:
             if (std::holds_alternative<BranchWork>(operation.request.work.operation)) {
                 if (!advance_branch(operation)) return;
+                if (resources.vision)
+                    if (auto elapsed = resources.vision->take_timing())
+                        operation.gpu.add_vision(*elapsed);
                 gpu_timer.record_result();
                 result_ready.record(device.stream());
                 operation.stage = ComputeStage::Readback;

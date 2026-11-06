@@ -441,8 +441,12 @@ Json assemble(const std::vector<Field>& fields, const std::vector<FieldResult>& 
 }
 
 Json evaluate(const Request& request, const Backend& backend) {
+    const bool expanded_systemone =
+        request.contexts.size() == 1 && request.retain_probabilities &&
+        std::all_of(request.fields.begin(), request.fields.end(),
+                    [](const auto& field) { return !field.isolated_question.empty(); });
     require(!request.contexts.empty() && request.contexts.size() <= 256 &&
-                !request.fields.empty() && request.fields.size() <= 32,
+                !request.fields.empty() && request.fields.size() <= (expanded_systemone ? 128 : 32),
             "decision request needs 1-256 contexts and 1-32 compiled fields");
     for (const auto& field : request.fields) {
         require(!field.values.empty() && field.values.size() <= 255 &&

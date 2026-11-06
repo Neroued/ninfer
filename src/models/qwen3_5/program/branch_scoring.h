@@ -24,7 +24,7 @@ struct BranchLayout {
     std::uint32_t prefill_chunk  = 0;
     KVExecutionTableLayout tables;
     GdnReplayRecordLayout records;
-    TensorRegion ids, positions, counts, rows, offsets, hidden, tails, logits;
+    TensorRegion ids, positions, rope_positions, counts, rows, offsets, hidden, tails, logits;
     LayoutRegion scratch;
     std::size_t bytes = 0;
 
@@ -48,12 +48,13 @@ struct BranchExecution {
     BranchExecution(MemorySpan, const BranchLayout&, LinearAttentionStateView&);
     GdnReplayRecords records;
     std::optional<ops::GdnReplayFoldPlan> fold;
-    Tensor ids, positions, counts, rows, offsets, hidden, tails, logits;
+    Tensor ids, positions, rope_positions, counts, rows, offsets, hidden, tails, logits;
     MemoryArena work;
     std::vector<std::vector<std::uint16_t>> readback;
     std::vector<TokenId> lows;
     std::array<TokenId, kBranchWidth * kBranchBatch> host_ids{};
     std::array<std::int32_t, kBranchWidth * kBranchBatch> host_positions{};
+    std::array<std::int32_t, kBranchWidth * kBranchBatch> host_rope{};
     std::array<std::int32_t, kBranchBatch> host_counts{}, host_rows{};
     std::array<std::int64_t, kBranchBatch> host_offsets{};
 };

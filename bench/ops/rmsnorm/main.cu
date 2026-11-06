@@ -1,5 +1,6 @@
 #include "fixture.cuh"
 #include "common/roofline.h"
+#include "common/gpu_activity.cuh"
 using namespace ninfer;
 using namespace ninfer::bench;
 
@@ -10,13 +11,16 @@ int main(int argc, char** argv) {
         auto& device = ninfer::bench::device_context();
         L2FlushBuffer flush(o.timing.flush_bytes);
         measurement::Csv csv(o.timing.csv_out, "logical_bytes,logical_gb_s,bandwidth_reference_us");
+        rmsnorm::Fixture f(
+            o, std::max(o.reserve_tokens, *std::max_element(o.tokens.begin(), o.tokens.end())));
         for (int columns : o.tokens) {
-            rmsnorm::Fixture f(o, columns);
+            f.reset_columns(columns);
             for (const auto& execution :
                  measurement::selections(o.timing.execution, "graph", "eager"))
                 for (const auto& cache : measurement::selections(o.timing.cache, "cold", "warm")) {
                     const auto result = measurement::measure(
-                        [&](CudaExecutionView cuda) { f.launch(cuda); }, [](auto) {}, flush,
+                        [&](CudaExecutionView cuda) { f.launch(cuda); },
+                        [&](CudaExecutionView cuda) { condition_gpu(cuda, o.condition_us); }, flush,
                         device.execution_view(), o.timing, execution, cache);
                     measurement::Row row;
                     row.op          = rmsnorm::name(o.op);

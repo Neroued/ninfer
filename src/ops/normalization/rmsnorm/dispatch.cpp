@@ -1,5 +1,6 @@
 #include "ops/normalization/rmsnorm/dispatch.h"
 #include "ops/normalization/rmsnorm/launch.h"
+#include "core/platform.h"
 
 #include <algorithm>
 #include <limits>
@@ -8,8 +9,13 @@ namespace ninfer::ops::detail::rmsnorm {
 namespace {
 
 Instance select_instance(Epilogue kind, Operands operands, std::int32_t sms) {
-    const auto [d, rows, aligned] = operands;
+    const auto [d, rows, aligned, vectors] = operands;
     if (!aligned) return Instance::Generic;
+#if NINFER_TARGET_SPARK
+    if (kind == Epilogue::Plain && d == 1024 && vectors) return Instance::D1024Vector;
+    if (kind == Epilogue::Plain && d == 4096)
+        return vectors && rows >= 289 ? Instance::D4096Vector : Instance::D4096;
+#endif
     if (kind == Epilogue::Offset && d == 10240) return Instance::D10240;
     if (gated(kind) && d == 128) {
         // Sixteen rows per CTA cover one wave; smaller CTAs overlap the next wave.
@@ -47,7 +53,8 @@ void dispatch(const Tensor& x, const Tensor& weight, const Tensor* gate, float e
             gate_chunk      = *gate;
             gate_chunk.data = static_cast<std::byte*>(gate->data) + offset;
         }
-        const Operands chunk{operands.dimension, count, operands.aligned_pairs};
+        const Operands chunk{operands.dimension, count, operands.aligned_pairs,
+                             operands.aligned_vectors};
         launch(x_chunk, weight, gate ? &gate_chunk : nullptr, eps, kind, out_chunk, chunk,
                select_instance(kind, chunk, execution.multiprocessor_count()), execution.stream());
         first += count;

@@ -836,17 +836,43 @@ EngineCore<Instance>::execution_unit(const Request& request) const {
 }
 
 template <class Instance>
+PrefillUnitTokens EngineCore<Instance>::prefill_unit_tokens() const {
+    PrefillUnitTokens units{};
+    for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+        const auto& request = slots_[lane];
+        if (!request || !(request->is_prefilling() || request->is_replaying())) continue;
+        std::uint32_t tokens = prefill_chunk_;
+        if (request->is_prefilling() && request->admitted_begin) {
+            const BeginSummary& begin = *request->admitted_begin;
+            const std::uint32_t suffix =
+                begin.prompt_tokens > begin.reused_prompt_tokens
+                    ? begin.prompt_tokens - begin.reused_prompt_tokens
+                    : 0U;
+            const std::uint32_t computed = std::min(request->computed_prompt_tokens, suffix);
+            tokens                       = std::min(tokens, suffix - computed);
+        }
+        units[lane] = tokens;
+    }
+    return units;
+}
+
+template <class Instance>
 std::optional<std::uint32_t> EngineCore<Instance>::next_prefill(
     const std::array<std::shared_ptr<Request>, kMaximumConcurrency>& candidates) const {
+    const auto units     = prefill_unit_tokens();
     const auto preferred = instance_.session->prefill_continuation();
+    // A continuing sequence keeps the lane, but its units still spend the cycle budget.
     if (preferred)
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
             const auto& request = candidates[lane];
             if (request && request->sequence == preferred && !request->capture_pending &&
-                (request->is_prefilling() || request->is_replaying()))
-                return lane;
+                (request->is_prefilling() || request->is_replaying())) {
+                auto only  = std::array<std::shared_ptr<Request>, kMaximumConcurrency>{};
+                only[lane] = request;
+                return scheduler_.next_prefill(only, max_concurrency_, units);
+            }
         }
-    return scheduler_.next_prefill(candidates, max_concurrency_);
+    return scheduler_.next_prefill(candidates, max_concurrency_, units);
 }
 
 template <class Instance>
@@ -869,6 +895,7 @@ void EngineCore<Instance>::reserve_resident_units(ReservationScope scope) {
         if (continuation && slots_[*priority]->sequence != continuation)
             instance_.session->yield_prefill(*continuation);
     }
+    const auto units   = prefill_unit_tokens();
     const auto prefill = priority_prefill ? priority_prefill : next_prefill(slots_);
     std::vector<std::uint32_t> candidates;
     for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
@@ -886,7 +913,7 @@ void EngineCore<Instance>::reserve_resident_units(ReservationScope scope) {
     if (prefill) {
         auto remaining = slots_;
         remaining[*prefill].reset();
-        while (const auto fallback = scheduler_.next_prefill(remaining, max_concurrency_)) {
+        while (const auto fallback = scheduler_.next_prefill(remaining, max_concurrency_, units)) {
             candidates.push_back(*fallback);
             remaining[*fallback].reset();
         }
@@ -961,6 +988,7 @@ template <class Instance>
 
 template <class Instance>
 void EngineCore<Instance>::begin_cycle(HostPhaseMeasurement& boundary) {
+    scheduler_.begin_prefill_cycle();
     control_executed_.fill(false);
     (void)expire_pending_requests();
     if (!instance_.session->has_context_operation()) {
@@ -1077,6 +1105,9 @@ template <class Instance>
                 set_host_work_class(HostWorkClass::Prefill);
                 if (!start_prefill(*lane)) return submitted;
                 submitted = true;
+                // The cycle stays in Prefill: once this flight completes, the Scheduler
+                // budget decides whether another unit starts before the next begin_cycle.
+                break;
             }
             cycle_step_ = CycleStep::Complete;
             break;

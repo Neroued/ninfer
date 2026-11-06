@@ -64,6 +64,7 @@ public:
                ContextMachineCostModel context_cost)
         : instance_(instance), max_context_(options.max_context),
           max_concurrency_(options.max_concurrency),
+          prefill_chunk_(options.prefill_chunk),
           max_outstanding_(static_cast<std::size_t>(options.max_concurrency) +
                            options.max_pending_requests),
           speculative_positions_(options.speculative.backend == SpeculativeBackend::None
@@ -75,6 +76,7 @@ public:
             options.max_pending_requests == 0 || pending_timeout_.count() <= 0) {
             throw std::invalid_argument("Engine core bounds are invalid");
         }
+        scheduler_.configure_prefill(prefill_cycle_policy(prefill_chunk_, max_concurrency_));
         cumulative_stats_.context_transfers.kv.resize(instance_.session->kv_pools().size());
         for (const auto& pool : instance_.session->kv_pools()) {
             cumulative_stats_.kv_pools.push_back({pool.id.index, std::string(pool.label), 0});
@@ -606,6 +608,25 @@ private:
     [[nodiscard]] ExecutionUnit execution_unit(const Request& request) const;
 
     void reserve_resident_units(ReservationScope scope = ReservationScope::Round);
+
+    // Prefill token budget of one cycle, in prefill chunks. The Scheduler contract then
+    // bounds the work between two decode rounds by max(budget, prefill_chunk) = budget.
+    static constexpr std::uint32_t kPrefillCycleChunks = 2;
+
+    // Without a resolved chunk there is no unit size to budget, so a cycle keeps one unit.
+    [[nodiscard]] static PrefillPolicy prefill_cycle_policy(std::uint32_t chunk,
+                                                            std::uint32_t concurrency) noexcept {
+        const std::uint64_t tokens = std::uint64_t{kPrefillCycleChunks} * chunk;
+        const std::uint32_t units  = chunk == 0 ? 1U : std::max(kPrefillCycleChunks, concurrency);
+        return {.max_units_per_cycle  = units,
+                .max_tokens_per_cycle = static_cast<std::uint32_t>(std::min<std::uint64_t>(
+                    tokens, std::numeric_limits<std::uint32_t>::max()))};
+    }
+
+    // Upper bound of the next prefill/replay unit of every lane: the public prefill chunk,
+    // limited by the prompt suffix a prefilling request still has to compute.
+    [[nodiscard]] PrefillUnitTokens prefill_unit_tokens() const;
+
     [[nodiscard]] std::optional<std::uint32_t>
     next_prefill(const std::array<std::shared_ptr<Request>, kMaximumConcurrency>&) const;
 
@@ -649,6 +670,7 @@ private:
     Instance& instance_;
     const std::uint32_t max_context_;
     const std::uint32_t max_concurrency_;
+    const std::uint32_t prefill_chunk_;
     const std::size_t max_outstanding_;
     const std::uint32_t speculative_positions_;
     const std::chrono::milliseconds pending_timeout_;

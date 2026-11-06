@@ -344,7 +344,6 @@ template <class Instance>
     flight.ticket = *ticket;
     compute_.emplace(std::move(flight));
     reserved_units_[lane].reset();
-    scheduler_.prefill_executed(lane, max_concurrency_);
     return true;
 }
 
@@ -574,11 +573,15 @@ template <class Instance>
         } else if (auto* prefill =
                        std::get_if<typename ModelContract::PrefillProgress>(&event->result)) {
             const auto request = flight.requests.front();
+            scheduler_.prefill_executed(flight.lanes.front(), max_concurrency_,
+                                        prefill->processed_prompt_tokens);
             resolve_prefill_progress(request, std::move(*prefill), std::move(flight));
             update_recovery(request);
         } else if (auto* replay =
                        std::get_if<typename ModelContract::ReplayProgress>(&event->result)) {
             const auto& request = flight.requests.front();
+            scheduler_.prefill_executed(flight.lanes.front(), max_concurrency_,
+                                        replay->processed_tokens);
             request->replayed_tokens += replay->processed_tokens;
             cumulative_stats_.replayed_tokens += replay->processed_tokens;
             if (replay->capture_ready) reserve_active_capture(request, EngineRequestState::Replay);

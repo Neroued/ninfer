@@ -43,3 +43,7 @@ add_test(NAME ninfer_json_schema_oracle_test
   COMMAND ${CMAKE_COMMAND} -E env
     "NINFER_SCHEMA_PROBE=$<TARGET_FILE:ninfer_json_schema_test>"
     ${Python3_EXECUTABLE} -B ${PROJECT_SOURCE_DIR}/tests/text/test_json_schema.py)
+
+ninfer_add_test(ninfer_t5_flight_scheduling_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../runtime/test_t5_flight_scheduling.cpp"
+  LIBRARIES ninfer_runtime_support)

@@ -126,7 +126,7 @@ public:
     q35::SequenceHandle bind(const q35::RequestBasePlan& base, std::uint32_t lane = 0,
                              q35::ResumeState* resume           = nullptr,
                              q35::ExecutionUnitKind resume_kind = q35::ExecutionUnitKind::Decode) {
-        const bool needs_replay = resume && !resume->has_snapshot();
+        const bool needs_replay = resume && !resume->has_snapshot() && resume->frontier() != 0;
         require(static_cast<bool>(program_.start_binding(
                     base, {lane}, source_for(base, resume), resume, resume_kind,
                     resume_kind == q35::ExecutionUnitKind::Prefill ? 0 : 1)),
@@ -137,6 +137,8 @@ public:
         last_binding_ = progress.residency;
         if (needs_replay) {
             require(progress.replaying, "snapshot-free binding did not enter replay");
+        } else if (resume && !resume->has_snapshot()) {
+            require(!progress.replaying, "binding entered replay without committed input");
         }
         return *progress.sequence;
     }
@@ -1045,6 +1047,33 @@ public:
                 "paused replay cancellation lost its request target");
         cancelled.paused.reset();
         expect_empty("destroyed paused replay retained Context resources");
+        next_request();
+    }
+
+    void pause_before_first_prefill_chunk() {
+        // Pressure may select a request after binding and before its first chunk. With no reused
+        // prefix its pause frontier is 0, which offers no snapshot, and nothing remains to replay.
+        auto base           = request(kPromptTokens);
+        const auto original = bind(base);
+        require(program_.start_pause(original, {runtime::PauseKind::ReleaseAndReplay, {0}}),
+                "unstarted prefill pause was not accepted");
+        auto paused = settle();
+        require(paused.paused && !paused.paused->has_snapshot() && paused.paused->frontier() == 0,
+                "unstarted prefill pause did not keep its empty frontier");
+        expect_empty("unstarted prefill pause retained execution resources");
+
+        const auto resumed = bind(base, 1, &*paused.paused, q35::ExecutionUnitKind::Prefill);
+        paused.paused.reset();
+        require(resumed == original && program_.recovery_pending(resumed),
+                "unstarted prefill resume changed identity or lost recovery protection");
+        prefill_prefix(resumed, kChunk);
+        require(!program_.recovery_pending(resumed),
+                "first resumed prefill chunk did not release recovery protection");
+        const auto summary = finish_prefill(resumed, kPromptTokens - kChunk, false);
+        require(summary == runtime::BeginSummary{kPromptTokens, 0, PrefixReusePath::Root},
+                "unstarted prefill resume changed its original admission summary");
+        decode_and_finish(resumed);
+        expect_empty("unstarted prefill resume retained physical resources after finishing");
         next_request();
     }
 
@@ -2039,6 +2068,7 @@ int main(int argc, char** argv) {
             fixture.cancel_gpu_binding();
             fixture.cancel_host_restore();
             fixture.replay_pause_and_resume();
+            fixture.pause_before_first_prefill_chunk();
             fixture.independent_physical_demotions();
             fixture.demotion_holder_changes();
             fixture.release_set_union();

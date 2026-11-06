@@ -56,7 +56,10 @@ BindingPlan SessionImpl::plan_binding(const RequestBasePlan& base, runtime::Lane
     transaction.backend_frontier = source ? checkpoint(*source).backend_frontier() : 0;
     transaction.source_tail_hidden =
         source && checkpoint(*source).continuation().metadata.tail_hidden_valid;
-    transaction.resume_snapshot = resume && source && actual->reused_tokens == resume->frontier();
+    // Replay rebuilds only committed input beyond the reused source. A request paused before its
+    // first prefill chunk has none, so it resumes its saved lifecycle instead of an empty Replay
+    // that could never reserve a unit or reach its target.
+    transaction.resume_snapshot = resume && actual->reused_tokens == resume->frontier();
     transaction.take_private    = candidate.take_private;
     transaction.carried_points  = actual->private_points;
     transaction.state_action    = actual->state_action;

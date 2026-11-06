@@ -126,7 +126,8 @@ int run(Fixture& f, const Case& c, CudaExecutionView cuda) {
             allowed.resize(mask.size());
             std::transform(mask.begin(), mask.end(), allowed.begin(), [](int v) { return 1 - v; });
         }
-        for (int token : std::set<int>{0, c.tokens - 1})
+        // Adjacent tail tokens cover both halves of alternating expert pools.
+        for (int token : std::set<int>{0, std::max(0, c.tokens - 2), c.tokens - 1})
             for (int row : rows) {
                 const auto index = std::size_t(token) * Fixture::hidden + row;
                 got.push_back(output[index]);
@@ -247,6 +248,47 @@ void add_native_cases(OpSuite& suite) {
                 {2, true, true, DType::BF16, ops::MoeEpilogue::Write, "reuse", "remote"});
             calls.push_back(
                 {4, true, false, DType::BF16, ops::MoeEpilogue::Write, "tail", "local"});
+        }
+        if (profile == Profile::MtpEp) {
+            calls.push_back({.tokens       = 128,
+                             .graph        = true,
+                             .dtype        = DType::FP32,
+                             .distribution = "reuse",
+                             .locality     = "local",
+                             .dense        = true});
+            calls.push_back({.tokens       = 257,
+                             .graph        = true,
+                             .dtype        = DType::FP32,
+                             .distribution = "pool",
+                             .locality     = "local",
+                             .dense        = true});
+            calls.push_back({5, false, true, DType::BF16, ops::MoeEpilogue::AddResidual, "reuse",
+                             "transition"});
+            calls.push_back(
+                {9, true, true, DType::BF16, ops::MoeEpilogue::Write, "reuse", "transition"});
+            calls.push_back(
+                {1025, false, true, DType::FP32, ops::MoeEpilogue::Write, "reuse", "remote"});
+            calls.push_back({.tokens       = 2,
+                             .graph        = true,
+                             .distribution = "reuse",
+                             .locality     = "local",
+                             .dense        = true});
+            calls.push_back({.tokens       = 129,
+                             .graph        = true,
+                             .dtype        = DType::FP32,
+                             .distribution = "pool",
+                             .locality     = "local",
+                             .dense        = true});
+            calls.push_back({.tokens       = 193,
+                             .graph        = true,
+                             .dtype        = DType::FP32,
+                             .distribution = "reuse",
+                             .locality     = "local",
+                             .dense        = true});
+            calls.push_back(
+                {257, true, true, DType::BF16, ops::MoeEpilogue::Write, "reuse", "local"});
+            calls.push_back(
+                {2049, true, true, DType::BF16, ops::MoeEpilogue::Write, "pool", "mixed"});
         }
         std::vector<OpCase> catalogue;
         for (const auto& c : calls)

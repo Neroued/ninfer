@@ -11,7 +11,7 @@
 namespace ninfer::ops::detail::moe_cuda::block_scaled::clamped::nvfp4::a16 {
 
 template <int Intermediate, bool Gate, int Rows, int Columns, int KStep, int Stages,
-          bool Fp16 = false>
+          bool Fp16 = false, bool RegisterPipeline = false>
 struct Schedule {
     static constexpr int intermediate = Intermediate;
     static constexpr bool gate        = Gate;
@@ -23,13 +23,14 @@ struct Schedule {
     static constexpr bool fp16_product = Fp16;
     static constexpr bool bf16_weights = Gate || !Fp16;
     static constexpr int planes        = Gate || Fp16 ? 1 : 2;
+    static constexpr bool register_pipeline = RegisterPipeline;
 };
 
 template <class S>
 struct Tile {
     alignas(16) std::uint16_t inputs[S::stages][S::planes][S::columns * S::k_step];
     alignas(16) std::uint8_t codes[S::stages][S::rows * (S::k_step / 2)];
-    alignas(16) std::uint8_t scales[S::stages][128 * (S::k_step / 16)];
+    alignas(16) std::uint8_t scales[S::stages][S::register_pipeline ? 1 : 128 * (S::k_step / 16)];
     int sources[S::columns];
 };
 
@@ -143,51 +144,67 @@ __device__ __forceinline__ int weight_row(int row0, int row) {
     return row0 + row;
 }
 
-template <class S, bool Compressed>
+template <class S>
+__device__ __forceinline__ int code_offset(int row, int byte) {
+    const int offset = row * (S::k_step / 2) + byte;
+    if constexpr (S::register_pipeline) {
+        static_assert(S::k_step == 128);
+        // Permute aligned 16-byte chunks within each 128-byte row pair so
+        // lanes caching different rows do not all hit the same banks.
+        return offset ^ ((row & 7) * 16);
+    }
+    return offset;
+}
+
+template <class S, bool Compressed, bool CopyCodes = true, bool CopyInputs = true>
 __device__ __forceinline__ void stage(Tile<S>& tile, int slot, int kt, int row0,
                                       common::Nvfp4MultiplierMatrix weight, const __nv_bfloat16* x,
                                       A16Product product, int active_columns) {
     const int tid = threadIdx.x, k0 = kt * S::k_step;
-    for (int v = tid; v < S::rows * (S::k_step / 32); v += S::threads) {
-        const int row = v / (S::k_step / 32), k = v % (S::k_step / 32) * 32;
-        common::cp_async<16, Cache::cg>(
-            tile.codes[slot] + row * (S::k_step / 2) + k / 2,
-            weight.codes + std::int64_t(weight_row<S>(row0, row)) * (S::k / 2) + (k0 + k) / 2);
-    }
-    if constexpr (Compressed) {
-        const int warp = tid / 32;
-        for (int b = warp; b < (S::rows / 32) * (S::k_step / 32); b += S::threads / 32) {
-            const int row   = b / (S::k_step / 32) * 32;
-            const int group = b % (S::k_step / 32) * 2;
-            common::csf32_stage_block<S::k_step, S::gate ? 2 * S::intermediate : kHidden,
-                                      S::k / 16>(weight.csf, weight_row<S>(row0, row),
-                                                 k0 / 16 + group, tile.scales[slot], row, group);
+    if constexpr (CopyCodes) {
+        for (int v = tid; v < S::rows * (S::k_step / 32); v += S::threads) {
+            const int row = v / (S::k_step / 32), k = v % (S::k_step / 32) * 32;
+            common::cp_async<16, Cache::cg>(
+                tile.codes[slot] + code_offset<S>(row, k / 2),
+                weight.codes + std::int64_t(weight_row<S>(row0, row)) * (S::k / 2) + (k0 + k) / 2);
         }
-    } else {
-        for (int v = tid; v < S::rows * (S::k_step / 64); v += S::threads) {
-            const int row = v / (S::k_step / 64), group = v % (S::k_step / 64) * 4;
-            common::cp_async<4>(
-                tile.scales[slot] + common::nvfp4_scale_byte_offset(row, group, S::k_step),
-                weight.scales + common::nvfp4_scale_byte_offset(weight_row<S>(row0, row),
-                                                                k0 / 16 + group, S::k));
+        if constexpr (Compressed) {
+            const int warp = tid / 32;
+            for (int b = warp; b < (S::rows / 32) * (S::k_step / 32); b += S::threads / 32) {
+                const int row   = b / (S::k_step / 32) * 32;
+                const int group = b % (S::k_step / 32) * 2;
+                common::csf32_stage_block<S::k_step, S::gate ? 2 * S::intermediate : kHidden,
+                                          S::k / 16>(weight.csf, weight_row<S>(row0, row),
+                                                     k0 / 16 + group, tile.scales[slot], row, group);
+            }
+        } else if constexpr (!S::register_pipeline) {
+            for (int v = tid; v < S::rows * (S::k_step / 64); v += S::threads) {
+                const int row = v / (S::k_step / 64), group = v % (S::k_step / 64) * 4;
+                common::cp_async<4>(
+                    tile.scales[slot] + common::nvfp4_scale_byte_offset(row, group, S::k_step),
+                    weight.scales + common::nvfp4_scale_byte_offset(weight_row<S>(row0, row),
+                                                                    k0 / 16 + group, S::k));
+            }
         }
     }
-    for (int v = tid; v < active_columns * (S::k_step / 8); v += S::threads) {
-        const int column = v / (S::k_step / 8), k = v % (S::k_step / 8) * 8;
-        const int source      = tile.sources[column];
-        const int destination = column * S::k_step + common::swizzle_xor_64(column, k);
-        if constexpr (S::gate) {
-            common::cp_async_zfill<16>(tile.inputs[slot][0] + destination,
-                                       x + std::int64_t(source >= 0 ? source : 0) * S::k + k0 + k,
-                                       source >= 0 ? 16 : 0);
-        } else {
-            const auto offset =
-                std::int64_t(source >= 0 ? source : 0) * S::k * (S::fp16_product ? 2 : 1) + k0 + k;
-            common::cp_async_zfill<16>(tile.inputs[slot][0] + destination, product.values + offset,
-                                       source >= 0 ? 16 : 0);
-            if constexpr (!S::fp16_product)
-                common::cp_async_zfill<16>(tile.inputs[slot][1] + destination,
-                                           product.residual + offset, source >= 0 ? 16 : 0);
+    if constexpr (CopyInputs) {
+        for (int v = tid; v < active_columns * (S::k_step / 8); v += S::threads) {
+            const int column = v / (S::k_step / 8), k = v % (S::k_step / 8) * 8;
+            const int source      = tile.sources[column];
+            const int destination = column * S::k_step + common::swizzle_xor_64(column, k);
+            if constexpr (S::gate) {
+                common::cp_async_zfill<16>(tile.inputs[slot][0] + destination,
+                                           x + std::int64_t(source >= 0 ? source : 0) * S::k + k0 + k,
+                                           source >= 0 ? 16 : 0);
+            } else {
+                const auto offset =
+                    std::int64_t(source >= 0 ? source : 0) * S::k * (S::fp16_product ? 2 : 1) + k0 + k;
+                common::cp_async_zfill<16>(tile.inputs[slot][0] + destination, product.values + offset,
+                                           source >= 0 ? 16 : 0);
+                if constexpr (!S::fp16_product)
+                    common::cp_async_zfill<16>(tile.inputs[slot][1] + destination,
+                                               product.residual + offset, source >= 0 ? 16 : 0);
+            }
         }
     }
     common::cp_commit();
@@ -199,13 +216,56 @@ contract(Tile<S>& tile, int row0, common::Nvfp4MultiplierMatrix weight, const __
          A16Product product, int valid_columns, float (&acc)[2][S::mma_tokens][4]) {
     const int lane = threadIdx.x % 32, wm = threadIdx.x / 32;
 #pragma unroll
-    for (int i = 0; i < S::stages; ++i)
-        stage<S, Compressed>(tile, i, i, row0, weight, x, product, (valid_columns + 7) / 8 * 8);
+    for (int i = 0; i < S::stages; ++i) {
+        if constexpr (S::register_pipeline) {
+            stage<S, Compressed, true, false>(tile, i, i, row0, weight, x, product,
+                                               (valid_columns + 7) / 8 * 8);
+            stage<S, Compressed, false, true>(tile, i, i, row0, weight, x, product,
+                                               (valid_columns + 7) / 8 * 8);
+        } else {
+            stage<S, Compressed>(tile, i, i, row0, weight, x, product,
+                                 (valid_columns + 7) / 8 * 8);
+        }
+    }
 #pragma unroll 1
     for (int kt = 0; kt < S::k / S::k_step; ++kt) {
         const int slot = kt % S::stages;
-        common::cp_wait<S::stages - 1>();
+        const int owned_row = S::gate ? wm * 16 + (lane & 15) + (lane >> 4) * (S::rows / 2)
+                                      : wm * 32 + (lane & 15) + (lane >> 4) * 16;
+        unsigned scale_words[S::k_step / 64];
+        if constexpr (S::register_pipeline) {
+#pragma unroll
+            for (int word = 0; word < S::k_step / 64; ++word)
+                scale_words[word] = common::load_vec<unsigned>(
+                    weight.scales + common::nvfp4_scale_byte_offset(
+                                        weight_row<S>(row0, owned_row),
+                                        kt * (S::k_step / 16) + word * 4, S::k));
+        }
+        // The register pipeline commits codes and inputs as separate groups.
+        common::cp_wait<(S::register_pipeline ? 2 : 1) * (S::stages - 1)>();
         __syncthreads();
+        unsigned code_words[S::k_step / 8];
+        const int next = kt + S::stages;
+        if constexpr (S::register_pipeline) {
+#pragma unroll
+            for (int part = 0; part < S::k_step / 32; ++part) {
+                const auto v = common::load_vec<uint4>(tile.codes[slot] +
+                                                       code_offset<S>(owned_row, part * 16));
+                code_words[part * 4]     = v.x;
+                code_words[part * 4 + 1] = v.y;
+                code_words[part * 4 + 2] = v.z;
+                code_words[part * 4 + 3] = v.w;
+            }
+            // All lanes own their code row now; reuse its shared slot while
+            // contracting. The copy wrappers do not carry a memory clobber.
+            __syncthreads();
+            asm volatile("" ::: "memory");
+            if (next < S::k / S::k_step)
+                stage<S, Compressed, true, false>(tile, slot, next, row0, weight, x, product,
+                                                   (valid_columns + 7) / 8 * 8);
+            else
+                common::cp_commit();
+        }
 #pragma unroll
         for (int k = 0; k < S::k_step; k += 16) {
             unsigned a[2][4];
@@ -214,20 +274,41 @@ contract(Tile<S>& tile, int row0, common::Nvfp4MultiplierMatrix weight, const __
                 const int base   = S::gate ? wm * 16 + m * (S::rows / 2) : wm * 32 + m * 16;
                 const int row    = base + (lane >> 2);
                 const int column = k + (lane & 3) * 2;
-                const auto low_scale =
-                    tile.scales[slot][common::nvfp4_scale_byte_offset(row, k / 16, S::k_step)];
-                const auto high_scale =
-                    tile.scales[slot][common::nvfp4_scale_byte_offset(row + 8, k / 16, S::k_step)];
+                const auto scale = [&](int half) {
+                    if constexpr (S::register_pipeline)
+                        return static_cast<std::uint8_t>(
+                            __shfl_sync(0xffffffff, scale_words[k / 64],
+                                        m * 16 + half * 8 + (lane >> 2)) >>
+                            (8 * ((k / 16) & 3)));
+                    else
+                        return tile.scales[slot][common::nvfp4_scale_byte_offset(
+                            row + half * 8, k / 16, S::k_step)];
+                };
+                const auto low_scale  = scale(0);
+                const auto high_scale = scale(1);
                 const unsigned low_factor =
                     scale_pair<S::bf16_weights>(unsigned(low_scale) * 0x101U);
                 const unsigned high_factor =
                     scale_pair<S::bf16_weights>(unsigned(high_scale) * 0x101U);
-                const auto* low  = tile.codes[slot] + row * (S::k_step / 2) + column / 2;
-                const auto* high = tile.codes[slot] + (row + 8) * (S::k_step / 2) + column / 2;
-                a[m][0]          = weight_pair<S::bf16_weights>(low[0], low_factor);
-                a[m][1]          = weight_pair<S::bf16_weights>(high[0], high_factor);
-                a[m][2]          = weight_pair<S::bf16_weights>(low[4], low_factor);
-                a[m][3]          = weight_pair<S::bf16_weights>(high[4], high_factor);
+                if constexpr (S::register_pipeline) {
+                    const auto code = [&](int half, int part) {
+                        return static_cast<std::uint8_t>(
+                            __shfl_sync(0xffffffff, code_words[k / 8 + part],
+                                        m * 16 + half * 8 + (lane >> 2)) >>
+                            (8 * (lane & 3)));
+                    };
+                    a[m][0] = weight_pair<S::bf16_weights>(code(0, 0), low_factor);
+                    a[m][1] = weight_pair<S::bf16_weights>(code(1, 0), high_factor);
+                    a[m][2] = weight_pair<S::bf16_weights>(code(0, 1), low_factor);
+                    a[m][3] = weight_pair<S::bf16_weights>(code(1, 1), high_factor);
+                } else {
+                    const auto* low  = tile.codes[slot] + row * (S::k_step / 2) + column / 2;
+                    const auto* high = tile.codes[slot] + (row + 8) * (S::k_step / 2) + column / 2;
+                    a[m][0] = weight_pair<S::bf16_weights>(low[0], low_factor);
+                    a[m][1] = weight_pair<S::bf16_weights>(high[0], high_factor);
+                    a[m][2] = weight_pair<S::bf16_weights>(low[4], low_factor);
+                    a[m][3] = weight_pair<S::bf16_weights>(high[4], high_factor);
+                }
             }
             // High and low input contractions share one FP32 accumulator.
 #pragma unroll
@@ -254,10 +335,14 @@ contract(Tile<S>& tile, int row0, common::Nvfp4MultiplierMatrix weight, const __
                 }
         }
         __syncthreads();
-        const int next = kt + S::stages;
-        if (next < S::k / S::k_step)
-            stage<S, Compressed>(tile, slot, next, row0, weight, x, product,
-                                 (valid_columns + 7) / 8 * 8);
+        if (next < S::k / S::k_step) {
+            if constexpr (S::register_pipeline)
+                stage<S, Compressed, false, true>(tile, slot, next, row0, weight, x, product,
+                                                   (valid_columns + 7) / 8 * 8);
+            else
+                stage<S, Compressed>(tile, slot, next, row0, weight, x, product,
+                                     (valid_columns + 7) / 8 * 8);
+        }
         else
             common::cp_commit();
     }
@@ -265,7 +350,7 @@ contract(Tile<S>& tile, int row0, common::Nvfp4MultiplierMatrix weight, const __
 }
 
 template <int Intermediate, bool Gate, int Rows, int Columns, int KStep, int Stages,
-          bool Compressed, bool Fp16 = false>
+          bool Compressed, bool Fp16 = false, bool RegisterPipeline = false>
 __global__ __launch_bounds__(
     Schedule<Intermediate, Gate, Rows, Columns, KStep, Stages, Fp16>::threads,
     Fp16&& Rows == 128 && Columns == 64 && KStep == 128 && Stages == 1
@@ -275,7 +360,7 @@ __global__ __launch_bounds__(
                           const float* __restrict__ coefficients, float* __restrict__ sum,
                           int job_columns, float limit, int minimum_load, int maximum_load,
                           int row_window, Nvfp4A16Dispatch dispatch) {
-    using S = Schedule<Intermediate, Gate, Rows, Columns, KStep, Stages, Fp16>;
+    using S = Schedule<Intermediate, Gate, Rows, Columns, KStep, Stages, Fp16, RegisterPipeline>;
     static_assert(Rows == 64 || Rows == 128);
     static_assert(KStep == 64 || KStep == 128);
     static_assert(S::k % KStep == 0 && S::k / KStep >= Stages);
@@ -291,7 +376,9 @@ __global__ __launch_bounds__(
     auto& tile     = *reinterpret_cast<Tile<S>*>(common::shared_storage<sizeof(Tile<S>)>());
     const int lane = threadIdx.x % 32, wm = threadIdx.x / 32;
     const int jobs    = *groups.jobs;
-    const int window  = Gate || row_window <= 0 ? row_tiles : min(row_tiles, row_window);
+    const bool full_rows = dispatch.full_rows_when_mixed &&
+                           groups.load_range[1] - groups.load_range[0] > 1;
+    const int window = Gate || full_rows || row_window <= 0 ? row_tiles : min(row_tiles, row_window);
     const int windows = (row_tiles + window - 1) / window;
     const int tasks   = jobs * windows * window * subtiles;
     for (int task = blockIdx.x; task < tasks; task += gridDim.x) {

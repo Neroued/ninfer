@@ -420,7 +420,7 @@ void launch_mul_input(const Tensor& x, const CudaSwiGLUExperts& experts, const E
         else
             launch.template operator()<false, SkipInactive>();
     };
-    if (plan.intermediate == 2048 && plan.arithmetic == Nvfp4Arithmetic::MultiplyA4)
+    if (plan.intermediate == 2048)
         select.template operator()<true>();
     else
         select.template operator()<false>();

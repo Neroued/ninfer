@@ -339,7 +339,7 @@ void launch(const Tensor& x, const CudaSwiGLUExperts& experts, const ExpertRoute
     with_output(destination, mode, [&](auto output) {
         const int elements = x.ne[1] * kHidden;
         if (plan.format == QType::NVFP4_MUL && plan.intermediate == 2048 &&
-            plan.arithmetic == Nvfp4Arithmetic::MultiplyA4 && s.routed_sum &&
+            s.routed_sum &&
             reinterpret_cast<std::uintptr_t>(s.routed_sum) % 16 == 0 &&
             reinterpret_cast<std::uintptr_t>(output.data) % 16 == 0) {
             reduce_atomic_vectors<<<(elements + 2047) / 2048, 256, 0, stream>>>(s, output,

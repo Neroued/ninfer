@@ -45,6 +45,17 @@ Plan select_native(const SwiGLUProfile& ffn, int tokens, int) {
         p.a16.buckets[1]                = {32, 32, 32, {128, 128, 128, 1}};
         p.a16.buckets[2]                = {128, 64, 64, {128, 128, 128, 1}};
         p.a16.buckets[3]                = {INT_MAX, 64, 64, {128, 128, 64, 1}};
+        p.a16.fp16_product = ffn.gate_up_layout != QuantLayout::Csf32 && *ffn.clamp_limit == 10.F;
+        if (p.a16.fp16_product) {
+            p.group_columns         = 256;
+            p.nvfp4.down_row_window  = 4;
+            p.column_major_down     = !p.single_block_grouping;
+            p.preserve_balanced_down = true;
+            p.a16.buckets[0].tile.queued_ctas_per_sm = 6;
+            p.a16.buckets[1] = {64, 64, 64, {128, 128, 128, 1, 6, true}};
+            p.a16.buckets[2] = {128, 64, 64, {128, 128, 128, 1, 6, true, true}};
+            p.a16.buckets[3] = {INT_MAX, 64, 64, {128, 128, 64, 1, 3}};
+        }
     }
     Plan plan;
     plan.implementation = Implementation::ClampedBlockScaled;

@@ -10,34 +10,52 @@ namespace {
 template <int I, bool Gate, int Rows, int Columns, int KStep, int Stages, bool Compressed,
           bool Fp16>
 void mma(const Tensor& x, const CudaSwiGLUExperts& experts, const ExpertRoutes& routes,
-         const Plan& p, const Storage& s, CudaExecutionView execution, int minimum, int maximum) {
-    using S             = a16::Schedule<I, Gate, Rows, Columns, KStep, Stages, Fp16>;
-    constexpr int bytes = sizeof(a16::Tile<S>);
-    if constexpr (bytes > 96 * 1024) {
-        throw std::logic_error("NVFP4 A16 tile exceeds shared memory");
-    } else {
-        constexpr auto entry =
-            a16::grouped<I, Gate, Rows, Columns, KStep, Stages, Compressed, Fp16>;
-        const int shared        = common::prepare_shared<bytes, entry>();
-        const int possible_jobs = kTopK * x.ne[1] / p.job_columns() + kExperts;
-        const int row_tiles     = (Gate ? I : kHidden) / S::feature_rows;
-        const int maximum_load  = std::min(maximum, x.ne[1]);
-        const int subtiles      = (std::min(p.job_columns(), maximum_load) + Columns - 1) / Columns;
-        int blocks              = std::min(possible_jobs * row_tiles * subtiles,
-                                           execution.multiprocessor_count() * p.queued_ctas_per_sm);
-        // Rotate persistent CTAs through partial column jobs. An even stride
-        // can otherwise leave whole CTAs assigned only to empty tail subtiles.
-        if constexpr (Fp16) {
-            if (subtiles > 1 && blocks > 1 && !(blocks & 1)) --blocks;
+         const Plan& p, const Storage& s, CudaExecutionView execution, int minimum, int maximum,
+         const Nvfp4A16Tile& tuning) {
+    const auto run = [&]<bool RegisterPipeline>() {
+        using S = a16::Schedule<I, Gate, Rows, Columns, KStep, Stages, Fp16, RegisterPipeline>;
+        constexpr int bytes = sizeof(a16::Tile<S>);
+        if constexpr (bytes > 96 * 1024) {
+            throw std::logic_error("NVFP4 A16 tile exceeds shared memory");
+        } else {
+            constexpr auto entry =
+                a16::grouped<I, Gate, Rows, Columns, KStep, Stages, Compressed, Fp16, RegisterPipeline>;
+            const int shared        = common::prepare_shared<bytes, entry>();
+            const int possible_jobs = kTopK * x.ne[1] / p.job_columns() + kExperts;
+            const int row_tiles     = (Gate ? I : kHidden) / S::feature_rows;
+            const int maximum_load  = std::min(maximum, x.ne[1]);
+            const int subtiles      = (std::min(p.job_columns(), maximum_load) + Columns - 1) / Columns;
+            const int queued        = tuning.queued_ctas_per_sm ? tuning.queued_ctas_per_sm
+                                                              : p.queued_ctas_per_sm;
+            int blocks              = std::min(possible_jobs * row_tiles * subtiles,
+                                               execution.multiprocessor_count() * queued);
+            // Rotate persistent CTAs through partial column jobs. An even stride
+            // can otherwise leave whole CTAs assigned only to empty tail subtiles.
+            if constexpr (Fp16) {
+                if (subtiles > 1 && blocks > 1 && !(blocks & 1)) --blocks;
+            }
+            auto dispatch = p.a16.dispatch(Gate);
+            dispatch.full_rows_when_mixed = tuning.full_rows_when_mixed;
+            entry<<<blocks, S::threads, shared, execution.stream()>>>(
+                static_cast<const __nv_bfloat16*>(x.data),
+                Gate ? experts.bank.gate_up : experts.bank.down, s.groups, s.a16_product,
+                s.contributions, static_cast<const float*>(routes.coefficients.data), s.routed_sum,
+                p.job_columns(), p.clamp_limit, minimum, maximum_load,
+                Gate ? 0 : p.nvfp4.down_row_window,
+                dispatch);
+            CUDA_CHECK(cudaGetLastError());
         }
-        entry<<<blocks, S::threads, shared, execution.stream()>>>(
-            static_cast<const __nv_bfloat16*>(x.data),
-            Gate ? experts.bank.gate_up : experts.bank.down, s.groups, s.a16_product,
-            s.contributions, static_cast<const float*>(routes.coefficients.data), s.routed_sum,
-            p.job_columns(), p.clamp_limit, minimum, maximum_load, p.nvfp4.down_row_window,
-            p.a16.dispatch(Gate));
-        CUDA_CHECK(cudaGetLastError());
+    };
+    if constexpr (Gate) {
+        if (tuning.gate_register_pipeline) {
+            if constexpr (Rows == 128 && Columns == 64 && KStep == 128 && Stages == 2 &&
+                          !Compressed && Fp16)
+                return run.template operator()<true>();
+            else
+                throw std::logic_error("unregistered NVFP4 A16 register pipeline");
+        }
     }
+    run.template operator()<false>();
 }
 
 template <int I, bool Gate, int Columns, bool Compressed, bool Fp16>
@@ -48,11 +66,12 @@ void tuned(const Tensor& x, const CudaSwiGLUExperts& experts, const ExpertRoutes
         const auto k = [&]<int KStep>() {
             const auto stages = [&]<int Stages>() {
                 mma<I, Gate, Rows, Columns, KStep, Stages, Compressed, Fp16>(
-                    x, experts, routes, p, s, execution, minimum, maximum);
+                    x, experts, routes, p, s, execution, minimum, maximum, tuning);
             };
-            if (tuning.stages == 1)
+            const int stage_count = Gate && tuning.gate_register_pipeline ? 2 : tuning.stages;
+            if (stage_count == 1)
                 stages.template operator()<1>();
-            else if (tuning.stages == 2)
+            else if (stage_count == 2)
                 stages.template operator()<2>();
             else
                 throw std::logic_error("invalid NVFP4 A16 stage count");

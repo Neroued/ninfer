@@ -28,6 +28,9 @@ struct Fp8PopulationTuning {
 struct Nvfp4A16Tile {
     int gate_rows = 64, down_rows = 64;
     int k_step = 128, stages = 2;
+    int queued_ctas_per_sm = 0;
+    bool full_rows_when_mixed = false;
+    bool gate_register_pipeline = false;
 };
 
 struct Nvfp4A16Bucket {
@@ -39,6 +42,7 @@ struct Nvfp4A16Bucket {
 struct Nvfp4A16Dispatch {
     int maximum_load[5]{}, columns[5]{};
     int vector_limit = 0;
+    bool full_rows_when_mixed = false;
 #if defined(__CUDACC__)
     __host__ __device__
 #endif
@@ -58,7 +62,9 @@ struct Nvfp4A16Dispatch {
         if (low == high) return high;
         // Neighboring populations use the wider of their two tiles. This
         // also covers a narrower tile becoming useful after a partial job.
-        return column_tile(low) > column_tile(high) ? low : high;
+        const int low_columns = column_tile(low), high_columns = column_tile(high);
+        if (low_columns == high_columns) return 0;
+        return low_columns > high_columns ? low : high;
     }
 };
 

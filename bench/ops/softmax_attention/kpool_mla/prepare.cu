@@ -1,6 +1,7 @@
 #include "ops/op_measurement.cuh"
 #include "common/gpu_activity.cuh"
 #include "../../../../tools/support/kpool_prepare_fixture.h"
+#include "prepare_traffic.cuh"
 
 using namespace ninfer;
 using namespace ninfer::bench;
@@ -68,11 +69,16 @@ int main(int argc, char** argv) {
         auto& device = device_context();
         kp::Weights weights(device.device(), projection, weight_format);
         L2FlushBuffer flush(options.flush_bytes);
-        measurement::Csv csv(options.csv_out, "weight_format,index_storage,projection,form,phase,"
-                                              "live_columns,weight_bytes,read_payload_bytes,"
-                                              "write_payload_bytes,payload_bytes,projection_flops,"
-                                              "physical_projection_flops,payload_GBps,"
-                                              "projection_TFLOps");
+        measurement::Csv csv(options.csv_out,
+                             "weight_format,index_storage,projection,form,phase,"
+                             "live_columns,weight_bytes,read_payload_bytes,"
+                             "write_payload_bytes,payload_bytes,projection_flops,"
+                             "physical_projection_flops,payload_GBps,"
+                             "projection_TFLOps,workspace_read_bytes,workspace_write_bytes,"
+                             "additional_weight_bytes,additional_input_bytes,pipeline_bytes,"
+                             "pipeline_GBps,payload_read_reference_pct,pipeline_read_reference_pct,"
+                             "pipeline_nominal_pct,matrix_tensor_reference_us,"
+                             "matrix_tensor_reference_pct,uses_simt");
         for (int T : tokens) {
             kp::Fixture f(weights, device.execution_view(), T, batch, update, ragged, false,
                           inplace, phase, index_format, latent_storage);
@@ -111,12 +117,15 @@ int main(int argc, char** argv) {
                         (update ? 0 : 512)) +
                 M * (weights.q * 2 + weights.heads * 4) +
                 pools * (index_format == KvCacheVectorFormat::BFloat16 ? 256 : 129) + tail_write;
-            const std::size_t payload   = reads + writes;
-            const double flops          = 2. * weights.rows * 4096 * live;
-            const double physical_flops = 2. * weights.rows * 4096 * M;
+            const std::size_t payload = reads + writes;
+            const double flops        = 2. * weights.rows * 4096 * live;
+            const auto traffic        = kpool_prepare_traffic(f, device.execution_view());
+            const auto pipeline       = payload + traffic.workspace_read + traffic.workspace_write +
+                                  traffic.repeated_weights + traffic.quantization_input;
             measurement::Row row;
             row.op              = "kpool_mla_prepare";
             row.format          = latent_storage == ops::KpoolMlaStorage::BFloat16 ? "bf16" : "fp8";
+            row.policy          = weight_format == kp::ProjectionFormat::Mxfp8 ? "a8/a16" : "a16";
             row.n               = weights.rows;
             row.k               = 4096;
             row.tokens          = T;
@@ -145,9 +154,26 @@ int main(int argc, char** argv) {
                             std::to_string(phase) + "," + std::to_string(live) + "," +
                             std::to_string(weights.bytes()) + "," + std::to_string(reads) + "," +
                             std::to_string(writes) + "," + std::to_string(payload) + "," +
-                            std::to_string(flops) + "," + std::to_string(physical_flops) + "," +
+                            std::to_string(flops) + "," +
+                            std::to_string(traffic.executed_matrix_flops) + "," +
                             std::to_string(payload / us / 1000) + "," +
-                            std::to_string(flops / us / 1e6));
+                            std::to_string(flops / us / 1e6) + "," +
+                            std::to_string(traffic.workspace_read) + "," +
+                            std::to_string(traffic.workspace_write) + "," +
+                            std::to_string(traffic.repeated_weights) + "," +
+                            std::to_string(traffic.quantization_input) + "," +
+                            std::to_string(pipeline) + "," + std::to_string(pipeline / us / 1000) +
+                            "," +
+                            std::to_string(payload / us / 1000 / kRoofline.sustained_read_gbs *
+                                           100) +
+                            "," +
+                            std::to_string(pipeline / us / 1000 / kRoofline.sustained_read_gbs *
+                                           100) +
+                            "," +
+                            std::to_string(pipeline / us / 1000 / kRoofline.memory_gbs * 100) +
+                            "," + std::to_string(traffic.matrix_tensor_us) + "," +
+                            std::to_string(traffic.matrix_tensor_us / us * 100) + "," +
+                            std::to_string(traffic.simt));
                 }
         }
     } catch (const std::exception& e) {

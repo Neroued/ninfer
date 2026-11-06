@@ -279,13 +279,20 @@ int run(kp::Projection mode, int T, int B, bool update, bool graph, int phase, b
     return verify(f);
 }
 
-int inert(bool update, bool fp8 = false, bool fp8_latent = false) {
+int inert(bool update, bool fp8 = false, bool fp8_latent = false,
+          kp::ProjectionFormat format = kp::ProjectionFormat::BFloat16, int tokens = 9) {
     auto& device = cuda_environment().context;
-    kp::Weights weights(device.device(), kp::Projection::Full);
-    kp::Fixture f(weights, device.execution_view(), 9, 3, update, false, true, update, 0,
+    kp::Weights weights(device.device(), kp::Projection::Full, format);
+    kp::Fixture f(weights, device.execution_view(), tokens, 3, update, false, true, update, 0,
                   fp8 ? KvCacheVectorFormat::Fp8E4m3fnGroup128Ue8m0 : KvCacheVectorFormat::BFloat16,
                   fp8_latent ? ops::KpoolMlaStorage::Fp8E4m3fnGroup128Ue8m0
                              : ops::KpoolMlaStorage::BFloat16);
+    DecodeGraphDefinition capture;
+    DecodeGraphExecutable graph;
+    if (format != kp::ProjectionFormat::BFloat16) {
+        capture.capture(device.stream(), [&] { f.launch(device.execution_view()); });
+        graph.instantiate(capture);
+    }
     for (int b = 0; b < f.B; ++b) {
         f.valid.at(b)     = 0;
         f.selectors.at(b) = f.offsets.at(b) = -1;
@@ -295,7 +302,10 @@ int inert(bool update, bool fp8 = false, bool fp8_latent = false) {
     for (auto* v : {&f.valid, &f.selectors, &f.offsets, &f.positions}) v->upload();
     f.before_offsets.upload();
     f.after_offsets.upload();
-    f.launch(device.execution_view());
+    if (format != kp::ProjectionFormat::BFloat16)
+        graph.launch(device.stream());
+    else
+        f.launch(device.execution_view());
     device.synchronize();
     return verify(f);
 }
@@ -434,6 +444,50 @@ int main(int argc, char** argv) {
                                  kp::ProjectionFormat::Mxfp8);
                   },
                   {{"format", "mxfp8"}});
+    for (auto format : {kp::ProjectionFormat::BlockFp8, kp::ProjectionFormat::Mxfp8})
+        for (auto [T, B] : {std::pair{128, 1}, {193, 1}, {257, 1}, {4096, 1}, {4097, 1}, {1025, 8}})
+            suite.add(
+                std::string("kpool_prepare/native/") + kp::name(format) + "/extended/" +
+                    std::to_string(T) + "x" + std::to_string(B),
+                [=] { return run(kp::Projection::Full, T, B, true, true, 3, true, true, format); },
+                {{"format", kp::name(format)}, {"execution", "graph"}});
+    for (auto format : {kp::ProjectionFormat::BlockFp8, kp::ProjectionFormat::Mxfp8})
+        for (bool update : {false, true})
+            suite.add(std::string("kpool_prepare/native/") + kp::name(format) + "/inert/" +
+                          (update ? "update" : "record"),
+                      [=] { return inert(update, true, true, format); },
+                      {{"format", kp::name(format)}, {"execution", "graph"}});
+    for (auto format : {kp::ProjectionFormat::BlockFp8, kp::ProjectionFormat::Mxfp8})
+        for (int tokens : {17, 129})
+            suite.add(std::string("kpool_prepare/native/") + kp::name(format) + "/inert-t" +
+                          std::to_string(tokens),
+                      [=] { return inert(true, true, true, format, tokens); },
+                      {{"format", kp::name(format)}, {"execution", "graph"}});
+    for (auto mode :
+         {kp::Projection::Full, kp::Projection::QueryAndHistory, kp::Projection::History})
+        suite.add(std::string("kpool_prepare/native/mxfp8/short-boundary/") + kp::name(mode),
+                  [=] {
+                      return run(mode, mode == kp::Projection::Full ? 49 : 65, 1, true, true, 3,
+                                 true, true, kp::ProjectionFormat::Mxfp8);
+                  },
+                  {{"format", "mxfp8"}, {"execution", "graph"}});
+    for (auto format : {kp::ProjectionFormat::BlockFp8, kp::ProjectionFormat::Mxfp8})
+        for (bool update : {false, true})
+            suite.add(std::string("kpool_prepare/native/") + kp::name(format) + "/single/" +
+                          (update ? "update" : "record"),
+                      [=] {
+                          return run(kp::Projection::Full, 1, 1, update, true, 3, true, true,
+                                     format);
+                      },
+                      {{"format", kp::name(format)}, {"execution", "graph"}});
+    for (auto mode :
+         {kp::Projection::Full, kp::Projection::QueryAndHistory, kp::Projection::History})
+        suite.add(std::string("kpool_prepare/native/mxfp8/aux_record/") + kp::name(mode),
+                  [=] {
+                      return run(mode, 512, 3, false, true, 3, true, true,
+                                 kp::ProjectionFormat::Mxfp8);
+                  },
+                  {{"format", "mxfp8"}, {"execution", "graph"}});
     suite.add("kpool_prepare/native/mxfp8/a16",
               [] {
                   return run(kp::Projection::Full, 65, 1, true, false, 3, false, false,

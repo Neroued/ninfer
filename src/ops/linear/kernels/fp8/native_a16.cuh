@@ -243,9 +243,13 @@ __global__ __launch_bounds__(S::kThreads, S::kMinBlocksPerSm) void native_fp8_a1
     native_fp8_tile<S>(blockIdx.x, p.rows, p.tokens, row_tile, token_tile);
     const int row_begin   = row_tile * (BR / (Rows::kPaired ? 2 : 1));
     const int token_begin = token_tile * BT;
-    const int k           = S::kStaticK ? S::kStaticK : p.k;
-    const int tiles       = k / BK;
-    const auto stage      = [&](int slot, int kt) {
+    if constexpr (requires { output.clear_if_empty(0, 0, 0, 0); })
+        if (output.clear_if_empty(row_begin, token_begin, min(BR, p.rows - row_begin),
+                                  min(BT, p.tokens - token_begin)))
+            return;
+    const int k      = S::kStaticK ? S::kStaticK : p.k;
+    const int tiles  = k / BK;
+    const auto stage = [&](int slot, int kt) {
         for (int i = tid; i < BR * (BK / 16); i += S::kThreads) {
             const int lr = i / (BK / 16), col = i % (BK / 16) * 16;
             const int row        = rows.weight_row(row_begin, lr, p.rows);
@@ -273,7 +277,7 @@ __global__ __launch_bounds__(S::kThreads, S::kMinBlocksPerSm) void native_fp8_a1
                     scales[slot * BR * (BK / 32) + i] =
                         row < p.rows ? p.scales[static_cast<std::int64_t>(row) * (k / 32) +
                                                 kt * (BK / 32) + col]
-                                          : 127;
+                                     : 127;
                 }
             }
         } else {

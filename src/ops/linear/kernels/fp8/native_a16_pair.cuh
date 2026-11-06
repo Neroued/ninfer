@@ -10,7 +10,7 @@ namespace ninfer::ops::detail {
 
 // A CTA belongs to one parent for its whole lifetime. Each branch consumes the same
 // contraction body as the homogeneous entry, with independently mapped output rows.
-template <class EncodedSchedule, class DenseSchedule, bool Sliced, class Encoded,
+template <class EncodedSchedule, class DenseSchedule, bool Sliced, bool Interleave, class Encoded,
           class EncodedOutput, class DenseOutput, class EncodedEpilogue, class DenseEpilogue>
 __global__ __launch_bounds__(EncodedSchedule::kThreads) void native_fp8_bf16_pair_kernel(
     Encoded encoded, Bf16A16Operands dense, EncodedOutput encoded_output, DenseOutput dense_output,
@@ -19,18 +19,39 @@ __global__ __launch_bounds__(EncodedSchedule::kThreads) void native_fp8_bf16_pai
     using E = EncodedSchedule;
     using D = DenseSchedule;
     static_assert(E::kThreads == D::kThreads && E::kBlockTokens == D::kBlockTokens);
+    int index = blockIdx.x;
+    if constexpr (Interleave) {
+        const int pairs = min(encoded_blocks, int(gridDim.x) - encoded_blocks);
+        if (index < 2 * pairs)
+            index = (index & 1) ? index / 2 : encoded_blocks + index / 2;
+        else if (encoded_blocks > pairs)
+            index -= pairs;
+        else
+            index += encoded_blocks - pairs;
+    }
+    const auto skip = [&](const auto& output, int block, int block_rows, int rows) {
+        if constexpr (requires { output.clear_if_empty(0, 0, 0, 0); })
+            return output.clear_if_empty(
+                block / token_tiles * block_rows, block % token_tiles * E::kBlockTokens,
+                min(block_rows, rows - block / token_tiles * block_rows),
+                min(E::kBlockTokens, encoded.tokens - block % token_tiles * E::kBlockTokens));
+        return false;
+    };
+
     if constexpr (Sliced) {
         constexpr int encoded_shared = NativeFp8SlicedKStorage<E, typename Encoded::InputType,
                                                                typename Encoded::ScaleType>::kBytes;
         constexpr int bytes = encoded_shared > D::kSharedBytes ? encoded_shared : D::kSharedBytes;
         auto* scratch       = common::shared_storage<bytes>();
-        if (blockIdx.x < encoded_blocks) {
+        if (index < encoded_blocks) {
+            if (skip(encoded_output, index, E::kBlockRows, encoded.rows)) return;
             native_fp8_a16_sliced_k_body<E>(
                 encoded.x, encoded.codes, encoded.scales, encoded.rows, encoded.k, encoded.tokens,
-                encoded_output, encoded_epilogue, Fp8IdentityRows{}, blockIdx.x / token_tiles,
-                blockIdx.x % token_tiles * E::kBlockTokens, scratch);
+                encoded_output, encoded_epilogue, Fp8IdentityRows{}, index / token_tiles,
+                index % token_tiles * E::kBlockTokens, scratch);
         } else {
-            const int block = blockIdx.x - encoded_blocks;
+            const int block = index - encoded_blocks;
+            if (skip(dense_output, block, D::kBlockRows, dense.rows)) return;
             bf16_a16_sliced_k_mma_body<D>(dense.x, dense.weight, dense_output, dense_epilogue,
                                           dense.rows, dense.k, dense.tokens, block / token_tiles,
                                           block % token_tiles * D::kBlockTokens, scratch);
@@ -38,12 +59,14 @@ __global__ __launch_bounds__(EncodedSchedule::kThreads) void native_fp8_bf16_pai
     } else {
         using Storage = Bf16SimtSharedStorage<D, D::kBlockTokens>;
         auto& scratch = *reinterpret_cast<Storage*>(common::shared_storage<sizeof(Storage)>());
-        if (blockIdx.x < encoded_blocks) {
+        if (index < encoded_blocks) {
+            if (skip(encoded_output, index, E::kBlockRows, encoded.rows)) return;
             native_fp8_a16_simt_body<E>(encoded, encoded_output, encoded_epilogue,
-                                        Fp8IdentityRows{}, blockIdx.x / token_tiles,
-                                        blockIdx.x % token_tiles * E::kBlockTokens);
+                                        Fp8IdentityRows{}, index / token_tiles,
+                                        index % token_tiles * E::kBlockTokens);
         } else {
-            const int block = blockIdx.x - encoded_blocks;
+            const int block = index - encoded_blocks;
+            if (skip(dense_output, block, D::kBlockRows, dense.rows)) return;
             bf16_a16_simt_body<D>(dense.x, dense.weight, dense_output, dense_epilogue, dense.k,
                                   dense.tokens, block / token_tiles,
                                   block % token_tiles * D::kBlockTokens, scratch);
@@ -51,8 +74,9 @@ __global__ __launch_bounds__(EncodedSchedule::kThreads) void native_fp8_bf16_pai
     }
 }
 
-template <class EncodedSchedule, class DenseSchedule, bool Sliced, class Encoded,
-          class EncodedOutput, class DenseOutput, class EncodedEpilogue, class DenseEpilogue>
+template <class EncodedSchedule, class DenseSchedule, bool Sliced, bool Interleave = false,
+          class Encoded, class EncodedOutput, class DenseOutput, class EncodedEpilogue,
+          class DenseEpilogue>
 void launch_native_fp8_bf16_pair(const Encoded& encoded, const Bf16A16Operands& dense,
                                  EncodedOutput encoded_output, DenseOutput dense_output,
                                  EncodedEpilogue encoded_epilogue, DenseEpilogue dense_epilogue,
@@ -80,7 +104,7 @@ void launch_native_fp8_bf16_pair(const Encoded& encoded, const Bf16A16Operands& 
             return int(sizeof(Bf16SimtSharedStorage<D, D::kBlockTokens>));
     }();
     constexpr auto kernel =
-        native_fp8_bf16_pair_kernel<E, D, Sliced, Encoded, EncodedOutput, DenseOutput,
+        native_fp8_bf16_pair_kernel<E, D, Sliced, Interleave, Encoded, EncodedOutput, DenseOutput,
                                     EncodedEpilogue, DenseEpilogue>;
     const auto shared = common::prepare_shared<bytes, kernel>();
     kernel<<<static_cast<unsigned>(blocks), E::kThreads, shared, stream>>>(

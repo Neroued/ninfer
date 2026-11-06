@@ -26,12 +26,12 @@ struct Mxfp8A8TmaSchedule
     : NativeFp8MmaSchedule<BlockRows, BlockTokens, BlockK, WarpRows, WarpTokens, Stages,
                            MinBlocksPerSm, RasterGroupRows>,
       Mxfp8TmaStageStorage<BlockRows, BlockTokens, BlockK, Stages, TmaScales> {
-    static constexpr int kConsumerWarps   = (BlockRows / WarpRows) * (BlockTokens / WarpTokens);
-    static constexpr int kConsumerThreads = kConsumerWarps * 32;
-    static constexpr int kProducerThreads = 32;
-    static constexpr int kThreads         = kConsumerThreads + kProducerThreads;
-    static constexpr bool kTmaScales      = TmaScales;
-    static constexpr int kFragmentStages  = FragmentStages;
+    static constexpr int kConsumerWarps     = (BlockRows / WarpRows) * (BlockTokens / WarpTokens);
+    static constexpr int kConsumerThreads   = kConsumerWarps * 32;
+    static constexpr int kProducerThreads   = 32;
+    static constexpr int kThreads           = kConsumerThreads + kProducerThreads;
+    static constexpr bool kTmaScales        = TmaScales;
+    static constexpr int kFragmentStages    = FragmentStages;
     static constexpr int kRasterGroupTokens = RasterGroupTokens;
     static_assert(BlockK == 128 || BlockK == 256);
     static_assert(BlockRows <= 256 && BlockTokens <= 256);
@@ -148,8 +148,12 @@ __global__ __launch_bounds__(S::kThreads, S::kMinBlocksPerSm) void mxfp8_a8_tma_
     native_fp8_tile<S>(blockIdx.x, p.rows, p.tokens, row_tile, token_tile);
     const int row_begin   = row_tile * (BR / (Rows::kPaired ? 2 : 1));
     const int token_begin = token_tile * BT;
-    const int k           = S::kStaticK ? S::kStaticK : p.k;
-    const int k_tiles     = k / BK;
+    if constexpr (requires { output.clear_if_empty(0, 0, 0, 0); })
+        if (output.clear_if_empty(row_begin, token_begin, min(BR, p.rows - row_begin),
+                                  min(BT, p.tokens - token_begin)))
+            return;
+    const int k       = S::kStaticK ? S::kStaticK : p.k;
+    const int k_tiles = k / BK;
     if (tid == 0) {
 #pragma unroll
         for (int s = 0; s < ST; ++s) {
@@ -319,8 +323,7 @@ __global__ __launch_bounds__(S::kThreads, S::kMinBlocksPerSm) void mxfp8_a8_tma_
                 common::cta_mbarrier_arrive(empty + slot);
             } else if (lane == 0) {
                 common::cta_mbarrier_arrive(empty + slot);
-                if (kt % SFSteps == SFSteps - 1)
-                    common::cta_mbarrier_arrive(sf_empty + sf_slot);
+                if (kt % SFSteps == SFSteps - 1) common::cta_mbarrier_arrive(sf_empty + sf_slot);
             }
         }
     }
@@ -331,7 +334,8 @@ __global__ __launch_bounds__(S::kThreads, S::kMinBlocksPerSm) void mxfp8_a8_tma_
                                       p.rows, p.tokens);
 }
 
-template <class S, bool PaddedCodes = false, class Output, class Epilogue, class Rows = Fp8IdentityRows>
+template <class S, bool PaddedCodes = false, class Output, class Epilogue,
+          class Rows = Fp8IdentityRows>
 void launch_mxfp8_a8_tma(const Mxfp8A8Operands& p, Output output, Epilogue epilogue,
                          cudaStream_t stream, Rows rows = {}) {
     constexpr int panel = mxfp8_tma_panel_rows<S, Rows>;
@@ -347,8 +351,8 @@ void launch_mxfp8_a8_tma(const Mxfp8A8Operands& p, Output output, Epilogue epilo
     if (blocks > 2147483647LL) throw std::invalid_argument("MXFP8 TMA grid exceeds CUDA grid.x");
     const auto launch = [&]<bool TmaScales, bool Full>() {
         const auto maps = [&] {
-            const int code_tokens = PaddedCodes ? mxfp8_a8_padded_tokens(p.tokens, S::kBlockTokens)
-                                                : p.tokens;
+            const int code_tokens =
+                PaddedCodes ? mxfp8_a8_padded_tokens(p.tokens, S::kBlockTokens) : p.tokens;
             const auto xmap = fp8_tma_map(p.x, code_tokens, p.k, S::kBlockTokens, 128);
             const auto wmap = fp8_tma_map(p.codes, p.rows, p.k, panel, 128);
             if constexpr (TmaScales)

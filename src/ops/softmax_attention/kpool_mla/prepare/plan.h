@@ -28,26 +28,16 @@ enum class ProjectionRoute {
     Fp8Sliced16,
     Fp8Mma32,
     Fp8Mma64,
-    Mxfp8A8Mma8,
-    Mxfp8A8Mma8Deep,
-    Mxfp8A8Mma16,
-    Mxfp8A8Mma32,
-    Mxfp8A8Mma32Deep,
-    Mxfp8A8Tma64,
-    Mxfp8A8Tma128,
-    Mxfp8A8Tma128Wide
+    Mxfp8A8Short,
+    Mxfp8A8Medium,
+    Mxfp8A8Large
 };
 
 inline bool projection_uses_a8(ProjectionRoute route) {
     switch (route) {
-    case ProjectionRoute::Mxfp8A8Mma8:
-    case ProjectionRoute::Mxfp8A8Mma8Deep:
-    case ProjectionRoute::Mxfp8A8Mma16:
-    case ProjectionRoute::Mxfp8A8Mma32:
-    case ProjectionRoute::Mxfp8A8Mma32Deep:
-    case ProjectionRoute::Mxfp8A8Tma64:
-    case ProjectionRoute::Mxfp8A8Tma128:
-    case ProjectionRoute::Mxfp8A8Tma128Wide:
+    case ProjectionRoute::Mxfp8A8Short:
+    case ProjectionRoute::Mxfp8A8Medium:
+    case ProjectionRoute::Mxfp8A8Large:
         return true;
     default:
         return false;
@@ -72,6 +62,7 @@ struct PrepareProjectionPlan {
     bool quantize                = false;
     int splits                   = 1;
     PairedProjectionRoute paired = PairedProjectionRoute::None;
+    bool skip_empty              = true;
     int last_column              = std::numeric_limits<int>::max();
 };
 

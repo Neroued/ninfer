@@ -104,18 +104,9 @@ PrepareProjectionPlan prepare_projection_plan(const PrepareGeometry& geometry, i
             return selected;
         }
         if (weight.qtype == QType::MXFP8 && allows_a8(weight.policy) && columns > 32) {
-            if (weight.n <= 768) {
-                if (columns <= 64) return {ProjectionRoute::Mxfp8A8Mma8Deep, 64};
-                if (columns <= 128) return {ProjectionRoute::Mxfp8A8Mma32Deep, 128};
-                if (columns <= 512) return {ProjectionRoute::Mxfp8A8Tma64, 512};
-                return {ProjectionRoute::Mxfp8A8Tma128, std::numeric_limits<int>::max()};
-            }
-            if (columns <= 48) return {ProjectionRoute::Mxfp8A8Mma8, 48};
-            if (columns <= 64) return {ProjectionRoute::Mxfp8A8Mma16, 64};
-            if (columns <= 128) return {ProjectionRoute::Mxfp8A8Mma32, 128};
-            return {weight.n == 2176 ? ProjectionRoute::Mxfp8A8Tma128
-                                     : ProjectionRoute::Mxfp8A8Tma128Wide,
-                    std::numeric_limits<int>::max()};
+            if (columns <= 128) return {ProjectionRoute::Mxfp8A8Short, 128};
+            if (columns <= 256) return {ProjectionRoute::Mxfp8A8Medium, 256};
+            return {ProjectionRoute::Mxfp8A8Large, std::numeric_limits<int>::max()};
         }
         if (columns == 1) return {ProjectionRoute::Fp8Simt1, 1};
         if (columns <= 4 && weight.n <= 768) return {ProjectionRoute::Fp8Simt4, 4};
@@ -155,6 +146,10 @@ PrepareProjectionPlan prepare_projection_plan(const PrepareGeometry& geometry, i
             activation_quantization,
             single_bf16 ? projection_splits(first.route) : 1,
             paired,
+            paired == PairedProjectionRoute::None ||
+                (columns > 1 &&
+                 !(encoded_format == QType::MXFP8 && (geometry.query_rank == 0 || columns > 32 ||
+                                                      (geometry.heads == 0 && columns > 16)))),
             std::min({first.last_column, second.last_column, last})};
 }
 

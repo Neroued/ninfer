@@ -58,8 +58,15 @@ void add_native_cases(Suite& suite) {
     add_shape(suite, QType::NVFP4_MUL, ActivationRecipe::Hashed,
               native_weight<QType::NVFP4_MUL>,
               {8192, 1024, 1459U, Comparison::Sampled, true, short_k_calls});
-    for (auto [n, k] : std::array<std::array<int, 2>, 4>{
-             {{1024, 4096}, {4096, 4096}, {20480, 4096}, {4096, 10240}}})
+    const std::array<Invocation, 16> narrow_n_calls{
+        {{1, CallForm::A16Convenience}, {2}, {65}, {96},
+         {97, CallForm::Policy, ops::LinearPolicy::A16Only, true},
+         {192}, {193}, {384}, {385}, {512}, {768}, {769}, {1024}, {1152}, {1153}, {4096}}};
+    add_shape(suite, QType::NVFP4_MUL, ActivationRecipe::Hashed,
+              native_weight<QType::NVFP4_MUL>,
+              {1024, 4096, 1459U, Comparison::Sampled, true, narrow_n_calls});
+    for (auto [n, k] : std::array<std::array<int, 2>, 3>{
+             {{4096, 4096}, {20480, 4096}, {4096, 10240}}})
         add_shape(suite, QType::NVFP4_MUL, ActivationRecipe::Hashed,
                   native_weight<QType::NVFP4_MUL>,
                   {n, k, 1459U, Comparison::Sampled, true, a16_calls});

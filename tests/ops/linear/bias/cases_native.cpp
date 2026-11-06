@@ -150,6 +150,10 @@ void add(linear_suite::Suite& suite, QType format, int n, int k, bool swiglu,
     if (format == QType::NVFP4_MUL && swiglu)
         cases.push_back(linear_suite::make_case(linear_suite::format_name(format), n, k, 129,
                                                 policy, linear_suite::Execution::Graph, label));
+    if (format == QType::NVFP4_MUL && !swiglu)
+        for (int t : {1, 97})
+            cases.push_back(linear_suite::make_case(linear_suite::format_name(format), n, k, t,
+                                                    policy, linear_suite::Execution::Graph, label));
     suite.add(std::move(cases), [=](auto selected, auto entries) {
         return run(format, n, k, swiglu, policy, selected, entries);
     });
@@ -161,7 +165,9 @@ void add_native_cases(linear_suite::Suite& suite) {
     constexpr std::array tokens{1, 2, 7, 17, 129, 513};
     add(suite, QType::MXFP8, 1024, 1024, false, ops::LinearPolicy::AllowA8, tokens);
     add(suite, QType::MXFP8, 1024, 1024, false, ops::LinearPolicy::A16Only, std::array{17, 257});
-    add(suite, QType::NVFP4_MUL, 1024, 4096, false, ops::LinearPolicy::A16Only, tokens);
+    add(suite, QType::NVFP4_MUL, 1024, 4096, false, ops::LinearPolicy::A16Only,
+        std::array{1, 2, 8, 16, 17, 32, 65, 96, 97, 192, 193, 384, 385, 768, 769,
+                   1152, 1153, 4096});
     add(suite, QType::NVFP4_MUL, 8192, 1024, true, ops::LinearPolicy::A16Only,
         std::array{1, 2, 7, 8, 9, 16, 17, 64, 65, 128, 129, 513});
 #endif

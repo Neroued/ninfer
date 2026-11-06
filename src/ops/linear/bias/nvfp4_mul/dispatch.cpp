@@ -7,7 +7,7 @@
 
 namespace ninfer::ops::detail {
 
-Nvfp4MulBiasLaunch select_nvfp4_mul_bias_launch(int rows, int k, int tokens, LinearPolicy policy) {
+Nvfp4MulBiasRoute select_nvfp4_mul_bias_route(int rows, int k, int tokens, LinearPolicy policy) {
     if (tokens <= 0 || !valid_linear_policy(policy))
         throw std::invalid_argument("NVFP4_MUL linear_bias: invalid tokens or policy");
 #if NINFER_TARGET_SPARK
@@ -20,15 +20,16 @@ std::size_t nvfp4_mul_bias_workspace_capacity_bytes(int rows, int k, LinearPolic
                                                     int last) {
     if (first <= 0 || last < first)
         throw std::invalid_argument("NVFP4_MUL linear_bias workspace: invalid token interval");
-    (void)select_nvfp4_mul_bias_launch(rows, k, first, policy);
-    (void)select_nvfp4_mul_bias_launch(rows, k, last, policy);
+    (void)select_nvfp4_mul_bias_route(rows, k, first, policy);
+    (void)select_nvfp4_mul_bias_route(rows, k, last, policy);
     return 0;
 }
 
 void nvfp4_mul_bias_dispatch(const Tensor& x, const Weight& weight, const Tensor& bias, Tensor& out,
                              LinearPolicy policy, cudaStream_t stream) {
     (void)common::validate_nvfp4_mul_weight(weight, "NVFP4_MUL linear_bias");
-    select_nvfp4_mul_bias_launch(weight.n, weight.k, x.ne[1], policy)(x, weight, bias, out, stream);
+    select_nvfp4_mul_bias_route(weight.n, weight.k, x.ne[1], policy)
+        .launch(x, weight, bias, out, stream);
 }
 
 } // namespace ninfer::ops::detail

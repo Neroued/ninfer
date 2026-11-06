@@ -5,6 +5,7 @@
 #include "direct_bf16_weight.cuh"
 #include "quantized_weight.cuh"
 #include "common/roofline.h"
+#include "ops/linear/bias/nvfp4_mul/dispatch.h"
 
 using namespace ninfer;
 using namespace ninfer::bench;
@@ -128,7 +129,10 @@ void run(const Options& options, Fixture& fixture) {
                 const auto workspace_bytes = a8 ? 2ULL * t * (k + k / 32) : 0ULL;
                 const auto bytes           = operand_bytes + workspace_bytes;
                 const bool tensor          = weight.qtype == QType::MXFP8 ? true
-                                             : weight.qtype == QType::NVFP4_MUL ? true
+                                             : weight.qtype == QType::NVFP4_MUL
+                                                 ? options.form != "projection" ||
+                                                       ops::detail::select_nvfp4_mul_bias_route(
+                                                           n, k, t, policy).tensor_core
                                              : t > 1;
                 const double peak          = !tensor ? std::numeric_limits<double>::quiet_NaN()
                                              : a8    ? kRoofline.mxfp8_f32_tflops

@@ -132,3 +132,7 @@ ninfer_add_test(ninfer_qwen3_5_t3_capture_nonblocking_test
   LIBRARIES ninfer_model_execution ninfer_model_loading ninfer_core)
 set_tests_properties(ninfer_qwen3_5_t3_capture_nonblocking_test
   PROPERTIES SKIP_RETURN_CODE 77 LABELS "gpu;real")
+
+ninfer_add_test(ninfer_qwen3_5_t6_packed_contract_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_t6_packed_contract.cpp"
+  LIBRARIES ninfer_model_execution ninfer_model_loading ninfer_core)

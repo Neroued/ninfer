@@ -9,12 +9,13 @@
 
 namespace ninfer::distributed {
 class Group;
-}
+struct GroupRequirements;
+} // namespace ninfer::distributed
 
 namespace ninfer::models::context {
 
-void prepare_peer_communication(const distributed::Group&, std::size_t chunk_bytes,
-                                CudaExecutionView);
+[[nodiscard]] distributed::GroupRequirements
+peer_communication_requirements(const distributed::Group&, std::size_t chunk_bytes);
 
 // Borrowed startup resources. Every group member uses the same chunk_bytes; staging covers
 // one chunk and is private to this slot. Members map group coordinates to logical ranks.

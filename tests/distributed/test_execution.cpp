@@ -1,5 +1,6 @@
 #include "core/buffer.h"
 #include "core/decode_graph.h"
+#include "distributed/communication/preparation.h"
 #include "models/common/context/transfer.h"
 #include "models/common/context/wire.h"
 #include "ninfer/ops/collective.h"
@@ -236,9 +237,14 @@ public:
             CUDA_CHECK(cudaMemcpyAsync(f.source.data(), f.input.data(), f.input_bytes,
                                        cudaMemcpyHostToDevice, device_.stream()));
             if (w.graph) {
-                f.definition.capture(device_.stream(), [&] { collective(f); });
+                group_.record_graph(f.communication, [&] {
+                    f.definition.capture(device_.stream(), [&] { collective(f); });
+                });
                 f.graph.instantiate(f.definition);
-                for (int i = 0; i < 4; ++i) f.graph.launch(device_.stream());
+                for (int i = 0; i < 4; ++i) {
+                    f.graph.launch(device_.stream());
+                    group_.replayed(f.communication);
+                }
             } else
                 collective(f);
             CUDA_CHECK(cudaMemcpyAsync(f.output.data(), f.destination.data(), f.output_bytes,
@@ -375,6 +381,7 @@ private:
         CudaCompletionEvent done;
         DecodeGraphDefinition definition;
         DecodeGraphExecutable graph;
+        CommunicationGraphWork communication;
         rt::ExecutionRequest<Types> request;
         rt::CommandSequence command;
         Phase phase    = Phase::Empty;
@@ -570,6 +577,43 @@ int worker() {
     std::cerr << dist::rank_description(bootstrap.identity) << '\n';
     dist::WorkerConnection connection(std::move(bootstrap));
     try {
+        const auto& group = connection.communication().group(0);
+        const std::array requirements{
+            dist::GroupRequirements{
+                0,
+                {{dist::Collective::AllReduce, DType::FP32, 1, 4096},
+                 {dist::Collective::AllReduce, DType::BF16, 1, 4096},
+                 {dist::Collective::AllReduce, DType::U32, 1, 4096},
+                 {dist::Collective::AllReduce, DType::U64, 1, 4096, 1, dist::Reduction::Max},
+                 {dist::Collective::AllGather, DType::FP32, 1, 4096},
+                 {dist::Collective::ReduceScatter, DType::FP32, 1, 4096},
+                 {dist::Collective::Broadcast, DType::BF16, 1, 4096, 1, dist::Reduction::Sum,
+                  group.size() - 1}},
+                {{1 - group.rank(), 4096, 4096}}},
+            ctx::peer_communication_requirements(connection.communication().group(1),
+                                                 kPeerChunkBytes),
+            dist::GroupRequirements{2,
+                                    {},
+                                    {{1 - group.rank(), group.rank() == 0 ? 1024U : 0U,
+                                      group.rank() == 1 ? 512U : 0U}}}};
+        if (!dist::prepare_communication(connection, requirements)) {
+            connection.shutdown();
+            return 0;
+        }
+        {
+            DeviceBuffer value(connection.device().device(), 257);
+            value.fill(group.rank() == 0 ? 0x5a : 0);
+            const dist::PeerTransfer transfer{1 - group.rank(),
+                                              group.rank() == 0 ? value.span() : ConstMemorySpan{},
+                                              group.rank() == 1 ? value.span() : MemorySpan{}};
+            connection.communication().group(2).exchange({&transfer, 1},
+                                                         connection.device().execution_view());
+            connection.device().synchronize();
+            std::array<std::uint8_t, 257> actual;
+            value.copy_to_host(actual.data(), actual.size());
+            require(std::all_of(actual.begin(), actual.end(), [](auto x) { return x == 0x5a; }),
+                    "one-way peer communication lost its payload");
+        }
         {
             Program program(connection);
             connection.send(wire::Kind::Ready);
@@ -681,6 +725,8 @@ int coordinator(int argc, char** argv) {
                                   {r.rank, size}, {r.rank, size}, {}, {}};
     topology.groups.push_back({0, {0, 1}});
     topology.groups.push_back({1, {0, 1}, dist::GroupUsage::PeerExchange});
+    topology.groups.push_back({2, {0, 1}, dist::GroupUsage::PeerExchange});
+    topology.groups.push_back({3, {0, 1}}); // Logical group without a communication requirement.
     topology.roles = {{"tp", 0}, {"ep", 0}, {"context", 1}};
     const std::array<std::string, 1> arguments{"--worker"};
     const auto prepare = [&] {
@@ -688,6 +734,7 @@ int coordinator(int argc, char** argv) {
             deployment, topology,
             ninfer::StartupObserver{[](const auto&) { throw std::runtime_error("log failure"); }},
             [](auto, auto line) { std::cerr << line << '\n'; }, arguments);
+        dist::prepare_communication(*group, std::chrono::seconds(60));
         std::size_t ready = 0;
         const auto until  = std::chrono::steady_clock::now() + std::chrono::seconds(60);
         while (ready != size) {
@@ -738,6 +785,14 @@ int coordinator(int argc, char** argv) {
                     2 * (131072 + kContextBytes) + kPeerChunkBytes,
                 "rank resource observation differs from owned buffers");
     executor.measure({rt::MeasurementAction::Reset});
+    for (const auto& rank : executor.observations()) {
+        const auto& group = rank.communication.at(0);
+        require(group.backends.size() == 1 &&
+                    group.backends[0].backend == CommunicationBackend::Nccl &&
+                    group.backends[0].graph.calls[0] == 4 &&
+                    group.backends[0].graph.payload_bytes[0] == 4 * 128 * sizeof(float),
+                "communication observations lost backend identity or Graph replay work");
+    }
     for (const auto& rank : executor.observations())
         require(rank.memory.workspace.measurement_peak_bytes == 0 &&
                     rank.memory.workspace.required_peak_bytes > 0,

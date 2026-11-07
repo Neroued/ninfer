@@ -25,13 +25,6 @@ Deadline deadline(std::uint32_t ms) {
     return std::chrono::steady_clock::now() + std::chrono::milliseconds(ms);
 }
 
-wire::Bytes group_payload(GroupId group, std::span<const std::byte> id = {}) {
-    wire::Encoder out;
-    out.u32(group);
-    out.bytes(id);
-    return std::move(out).take();
-}
-
 template <class Sender>
 void send(Sender& transport, std::uint64_t epoch, std::span<const RankId> ranks, wire::Kind kind,
           wire::Bytes payload = {}) {
@@ -283,30 +276,6 @@ struct ExecutionGroup::Impl {
         wire::encode(encoded, topology);
         send(*this, epoch, ranks, wire::Kind::Topology, std::move(encoded).take());
         await(ranks, wire::Kind::Prepared, deadline(options.connect_timeout_ms));
-        for (const auto& group : topology.groups) {
-            wire::Bytes id;
-            if (group.members.size() > 1) {
-                const std::array root{group.members.front()};
-                send(*this, epoch, root, wire::Kind::GroupId, group_payload(group.id));
-                auto messages =
-                    await(root, wire::Kind::GroupId, deadline(options.connect_timeout_ms));
-                wire::Decoder input(messages.front().message.payload);
-                if (input.u32() != group.id)
-                    throw std::runtime_error("NCCL ID belongs to another group");
-                const auto bytes = input.bytes();
-                id.assign(bytes.begin(), bytes.end());
-                input.finish();
-            }
-            send(*this, epoch, group.members, wire::Kind::Enter, group_payload(group.id, id));
-            auto messages =
-                await(group.members, wire::Kind::Connected, deadline(options.connect_timeout_ms));
-            for (const auto& message : messages) {
-                wire::Decoder input(message.message.payload);
-                if (input.u32() != group.id)
-                    throw std::runtime_error("worker connected the wrong group");
-                input.finish();
-            }
-        }
         send(*this, epoch, ranks, wire::Kind::Connected);
     }
 
@@ -462,33 +431,11 @@ WorkerConnection::WorkerConnection(WorkerBootstrap bootstrap)
             memory_origin_ = device_memory_snapshot(device_->device());
             phase.complete();
         }
-        communication_ =
-            std::make_unique<CommunicationContext>(*device_, transport_->failure_signal());
+        communication_ = std::make_unique<CommunicationContext>(*device_, topology_, rank.rank,
+                                                                transport_->failure_signal());
         send(wire::Kind::Prepared);
-        for (;;) {
-            auto message = wait();
-            if (message.kind == wire::Kind::Connected) break;
-            if (message.kind != wire::Kind::GroupId && message.kind != wire::Kind::Enter)
-                throw std::runtime_error("unexpected communicator preparation command");
-            wire::Decoder data(message.payload);
-            const auto id     = data.u32();
-            const auto unique = data.bytes();
-            data.finish();
-            const auto& group = topology_.group(id);
-            if (message.kind == wire::Kind::GroupId) {
-                if (group.members.front() != rank.rank || !unique.empty())
-                    throw std::runtime_error("invalid NCCL unique ID request");
-                send(wire::Kind::GroupId, group_payload(id, CommunicationContext::unique_id()));
-            } else {
-                StartupPhaseScope phase(observer, StartupPhase::CommunicationInitialize);
-                communication_->connect(group, rank.rank, unique,
-                                        deadline(bootstrap_.connect_timeout_ms));
-                phase.complete();
-                wire::Encoder response;
-                response.u32(id);
-                send(wire::Kind::Connected, std::move(response).take());
-            }
-        }
+        if (wait().kind != wire::Kind::Connected)
+            throw std::runtime_error("expected execution group connection completion");
     } catch (const std::exception& e) {
         fail(e.what());
         throw;

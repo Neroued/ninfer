@@ -7,7 +7,7 @@
 namespace ninfer::models {
 
 struct GraphSegment {
-    CommunicationWork communication;
+    CommunicationGraphWork communication;
     DecodeGraphDefinition definition;
     DecodeGraphExecutable executable;
 

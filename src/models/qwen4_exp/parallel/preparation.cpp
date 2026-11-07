@@ -61,7 +61,7 @@ void RankPreparation::materialize() {
     load_.reset();
 }
 
-void RankPreparation::prepare_communication() {
+std::vector<distributed::GroupRequirements> RankPreparation::communication_requirements() const {
     using distributed::Collective;
     using distributed::Reduction;
     const auto plan   = plan_graph_probe(profile_, {}, options_, device_, {});
@@ -69,30 +69,31 @@ void RankPreparation::prepare_communication() {
     const auto hidden = std::size_t(profile_->config.text.hidden);
     const auto batch  = std::size_t(shape.max_concurrency);
     const auto decode = batch * (shape.draft_tokens + 1);
-    std::vector<distributed::CollectivePreparation> work;
-    for (const auto columns : {std::size_t(1), batch, decode, std::size_t(shape.prefill_chunk)}) {
-        work.push_back({Collective::AllReduce, DType::BF16, hidden * columns});
-        if (plan.persistent.buffers.ple_embedding)
-            work.push_back({Collective::AllReduce, DType::U32,
-                            profile_->config.text.ple.embedding * columns *
-                                dtype_size(DType::BF16) / dtype_size(DType::U32)});
+    distributed::GroupRequirements result{binding_.group->id(), {}, {}};
+    auto& work         = result.collectives;
+    const auto columns = std::max({batch, decode, std::size_t(shape.prefill_chunk)});
+    work.push_back({Collective::AllReduce, DType::BF16, hidden, hidden * columns, hidden});
+    if (plan.persistent.buffers.ple_embedding) {
+        const auto words =
+            profile_->config.text.ple.embedding * dtype_size(DType::BF16) / dtype_size(DType::U32);
+        work.push_back({Collective::AllReduce, DType::U32, words, words * columns, words});
     }
     if (shape.purpose == EnginePurpose::Generation) {
-        for (const auto columns : {std::size_t(1), batch, decode})
-            work.push_back(
-                {Collective::AllGather, DType::I64, DistributedVocabulary::candidates * columns});
+        constexpr auto candidates = std::size_t(DistributedVocabulary::candidates);
+        work.push_back(
+            {Collective::AllGather, DType::I64, candidates, candidates * decode, candidates});
         if (profile_->mtp)
-            work.push_back({Collective::AllReduce, DType::U64, batch, Reduction::Max});
+            work.push_back({Collective::AllReduce, DType::U64, 1, batch, 1, Reduction::Max});
     } else {
-        work.push_back({Collective::AllGather, DType::FP32,
-                        3 * std::size_t(std::min(shape.prefill_chunk, 1024U))});
+        work.push_back({Collective::AllGather, DType::FP32, 3,
+                        3 * std::size_t(std::min(shape.prefill_chunk, 1024U)), 3});
     }
     if (plan.workspace.vision)
         for (std::uint32_t root = 0; root < binding_.group->size(); ++root)
-            work.push_back({Collective::Broadcast, DType::BF16,
-                            plan.workspace.vision->output_bytes / dtype_size(DType::BF16),
+            work.push_back({Collective::Broadcast, DType::BF16, hidden,
+                            plan.workspace.vision->output_bytes / dtype_size(DType::BF16), hidden,
                             Reduction::Sum, root});
-    binding_.group->prepare(work, {}, device_.execution_view());
+    return {std::move(result)};
 }
 
 runtime::RankPreparationReport RankPreparation::report(std::size_t available) const {

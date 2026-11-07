@@ -6,8 +6,8 @@
 
 namespace ninfer::distributed {
 
-// Owns the deployment's processes and control connections. Model resources are installed after
-// communicator preparation; communication readiness alone does not publish model readiness.
+// Owns processes and control connections. Workers install logical group identities here;
+// communication resources are prepared explicitly before device execution.
 class ExecutionGroup {
 public:
     ExecutionGroup(DeploymentOptions, ExecutionTopology, StartupObserver = {},

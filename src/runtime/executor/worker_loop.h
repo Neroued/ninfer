@@ -17,6 +17,8 @@ class WorkerLoop {
 public:
     WorkerLoop(distributed::WorkerConnection& connection, Program& program, Codec codec)
         : connection_(connection), program_(program), codec_(std::move(codec)),
+          budget_(protocol::with_communication_capacity(codec_.control_budget(),
+                                                        connection.communication().statistics())),
           compute_(program.capacity().compute_frames), context_(program.capacity().context_frames) {
         if constexpr (requires { codec_.bind_input_storage(program_.input_storage()); })
             codec_.bind_input_storage(program_.input_storage());
@@ -131,7 +133,7 @@ private:
         distributed::wire::Encoder report;
         protocol::encode_measurement_report(report, boundary.id, error, observation_);
         auto payload = std::move(report).take();
-        if (payload.size() > protocol::measurement_report_capacity(codec_.control_budget().report))
+        if (payload.size() > protocol::measurement_report_capacity(budget_.report))
             throw std::logic_error("rank measurement report exceeds its prepared capacity");
         connection_.send(distributed::wire::Kind::MeasurementComplete, std::move(payload));
         measurement_boundary_.reset();
@@ -309,7 +311,7 @@ private:
             event);
         if (publish) {
             auto payload = protocol::encode_event<Types>(event, codec_);
-            if (payload.size() > codec_.control_budget().event)
+            if (payload.size() > budget_.event)
                 throw std::logic_error("execution event exceeds its prepared capacity");
             connection_.send(distributed::wire::Kind::Event, std::move(payload));
         }
@@ -319,6 +321,7 @@ private:
     distributed::WorkerConnection& connection_;
     Program& program_;
     Codec codec_;
+    protocol::ControlBudget budget_;
     RankSnapshot observation_;
     RankHostStatistics host_;
     std::vector<Flight> compute_, context_;

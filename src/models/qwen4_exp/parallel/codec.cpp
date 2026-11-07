@@ -104,12 +104,6 @@ ExecutionCodec::ExecutionCodec(const ModelDefinition& definition,
     scope_.validate(topology);
     auto described = rank;
     described.observation.communication.clear();
-    for (const auto& group : topology.groups) {
-        if (std::find(group.members.begin(), group.members.end(), rank.observation.rank) !=
-            group.members.end())
-            described.observation.communication.push_back(
-                {group.id, static_cast<std::uint32_t>(group.members.size())});
-    }
     budget_ = qwen4_exp::control_budget(definition, described, scope_);
 }
 

@@ -23,8 +23,8 @@ inline constexpr std::size_t kMeasurementErrorBytes = 2048;
 void encode_measurement_report(distributed::wire::Encoder&, std::uint64_t query,
                                std::string_view error, const RankSnapshot&);
 
-// Execution payload ceilings include their envelopes; report is the encoded RankSnapshot bound.
-// Runtime owns measurement framing around that snapshot.
+// Execution payload ceilings include their envelopes. Codecs provide the RankSnapshot bound
+// with an empty communication vector; Runtime adds prepared communication and measurement framing.
 struct ControlBudget {
     std::size_t compute_work, context_work, decision, commit, event, report;
 
@@ -32,6 +32,9 @@ struct ControlBudget {
         return kind == FrameKind::Compute ? compute_work : context_work;
     }
 };
+
+[[nodiscard]] ControlBudget with_communication_capacity(ControlBudget,
+                                                        std::span<const CommunicationStatistics>);
 
 [[nodiscard]] constexpr std::size_t envelope_capacity(std::size_t owners) {
     return 57 + 4 * owners;

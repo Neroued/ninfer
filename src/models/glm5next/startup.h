@@ -34,7 +34,7 @@ public:
     [[nodiscard]] runtime::PreparationMemory memory() const;
     [[nodiscard]] runtime::RankPreparationReport report(std::size_t available_bytes) const;
     void materialize();
-    void prepare_communication();
+    [[nodiscard]] std::vector<distributed::GroupRequirements> communication_requirements() const;
     void prepare_probe();
     void calibrate();
     void prepare_rebuild_probe();

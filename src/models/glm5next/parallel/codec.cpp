@@ -29,10 +29,6 @@ ExecutionCodec::ExecutionCodec(const ModelDefinition& definition,
     auto snapshot = rank.observation;
     snapshot.physical_memory.emplace();
     snapshot.communication.clear();
-    for (const auto& group : topology.groups)
-        if (std::find(group.members.begin(), group.members.end(), rank.rank) != group.members.end())
-            snapshot.communication.push_back(
-                {group.id, static_cast<std::uint32_t>(group.members.size())});
     wire::Encoder report;
     runtime::protocol::encode(report, snapshot);
     budget_ = {payloads.compute_work,

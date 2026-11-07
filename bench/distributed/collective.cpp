@@ -1,6 +1,7 @@
 #include "core/buffer.h"
 #include "core/decode_graph.h"
 #include "distributed/bootstrap.h"
+#include "distributed/communication/preparation.h"
 #include "ninfer/ops/collective.h"
 #include "product/config/options.h"
 
@@ -47,6 +48,15 @@ struct Events {
 int worker() {
     dist::WorkerConnection connection(dist::read_worker_bootstrap());
     try {
+        const std::array requirements{dist::GroupRequirements{
+            0,
+            {{dist::Collective::AllReduce, DType::BF16, 1, (20ULL << 20) / 2},
+             {dist::Collective::AllReduce, DType::U64, 1, 1, 1, dist::Reduction::Max}},
+            {}}};
+        if (!dist::prepare_communication(connection, requirements)) {
+            connection.shutdown();
+            return 0;
+        }
         {
             auto& device      = connection.device();
             const auto& group = connection.communication().group(0);
@@ -156,6 +166,7 @@ int coordinator(int argc, char** argv) {
     dist::ExecutionGroup group(
         deployment, topology, {},
         [](auto rank, auto line) { std::cerr << "rank=" << rank << " " << line << '\n'; }, args);
+    dist::prepare_communication(group, std::chrono::seconds(90));
     const auto receive = [&] {
         std::vector<wire::Payload> results(size);
         std::vector<bool> seen(size);

@@ -22,7 +22,7 @@ public:
 
     [[nodiscard]] runtime::PreparationMemory memory() const;
     void materialize();
-    void prepare_communication();
+    [[nodiscard]] std::vector<distributed::GroupRequirements> communication_requirements() const;
     void prepare_probe();
     void calibrate();
     void prepare_rebuild_probe();

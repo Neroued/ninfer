@@ -50,8 +50,13 @@ auto fields(T& v) {
     else if constexpr (std::is_same_v<Value, CommunicationWork>)
         return std::tie(v.calls, v.payload_bytes);
     else if constexpr (std::is_same_v<Value, CommunicationStatistics>)
-        return std::tie(v.group, v.size, v.eager, v.graph, v.startup_memory);
+        return std::tie(v.group, v.size, v.backends);
+    else if constexpr (std::is_same_v<Value, CommunicationBackendStatistics>)
+        return std::tie(v.backend, v.eager, v.graph, v.memory);
     else if constexpr (std::is_same_v<Value, CommunicationMemory>)
+        return std::tie(v.owned_host_bytes, v.owned_device_bytes, v.registered_host_bytes,
+                        v.library);
+    else if constexpr (std::is_same_v<Value, LibraryCommunicationMemory>)
         return std::tie(v.tracked_device_bytes, v.persistent_device_bytes,
                         v.suspendable_device_bytes);
     else if constexpr (std::is_same_v<Value, RankHostStatistics>)
@@ -131,6 +136,17 @@ void read(wire::Decoder& in, T& v) {
         std::apply([&](auto&... values) { (read(in, values), ...); }, fields(v));
 }
 } // namespace
+
+ControlBudget with_communication_capacity(ControlBudget budget,
+                                          std::span<const CommunicationStatistics> communication) {
+    wire::Encoder out;
+    write(out, communication);
+    const auto extra = std::move(out).take().size() - sizeof(std::uint64_t);
+    if (extra > SIZE_MAX - budget.report)
+        throw std::overflow_error("communication observation capacity overflow");
+    budget.report += extra;
+    return budget;
+}
 
 void encode(wire::Encoder& out, const RankMemoryBudget& summary) { write(out, summary); }
 

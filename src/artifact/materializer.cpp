@@ -581,7 +581,10 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
         out.stats_.host_pinned_limit_bytes = pinned_limit;
         HostResidency residency;
         bool placed_whole = false;
-        if (limit == 0 || limit >= plan.host_mapped_bytes || !may_split) {
+        // Even capybaras have a memory budget.
+        // Even without pageable candidates, an explicit cap must hold. The residency planner
+        // below reports mandatory pinned bytes above the budget and refuses before allocation.
+        if (limit == 0 || limit >= plan.host_mapped_bytes) {
             try {
                 out.host_mapped_ = std::make_unique<PinnedHostBuffer>(
                     static_cast<std::size_t>(plan.host_mapped_bytes), HostMapping::Yes,
@@ -616,8 +619,9 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
                 if (residency.required_pinned_bytes > budget) {
                     throw ArtifactError(
                         "host-mapped weights: the parents that must stay page-locked need " +
-                        gib_text(residency.required_pinned_bytes) + ", more than the " +
-                        gib_text(budget) +
+                        gib_text(residency.required_pinned_bytes) + " (" +
+                        std::to_string(residency.required_pinned_bytes) + " bytes), more than the " +
+                        gib_text(budget) + " (" + std::to_string(budget) + " bytes)" +
                         " allowed (--host-pinned-max-gib / NINFER_HOST_PINNED_MAX_GIB, or what "
                         "the driver grants); drop --embedding-host or raise the limit");
                 }

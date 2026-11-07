@@ -82,6 +82,8 @@ uses `flash-next` with `--host-kv-mib 1024 --host-state-slots 2` (smaller RAM ca
   `--host-pinned-max-gib G` (or `NINFER_HOST_PINNED_MAX_GIB`) sets the cap by hand.
   The value must be a complete, finite positive number of GiB representing at least one byte
   and less than 16 EiB. Fractional bytes are truncated; invalid values are rejected.
+  Loading fails if weights that must stay pinned (such as host-mapped embeddings) exceed the
+  remaining budget after active Host KV reservations; they cannot fall back to pageable RAM.
 
 ### Chat template
 

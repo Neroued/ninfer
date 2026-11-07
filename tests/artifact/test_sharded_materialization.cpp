@@ -30,6 +30,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -650,44 +651,89 @@ void large_upload(ExecutionContext& execution) {
     }
 }
 
-// The page-locked limit also holds what the Engine page-locks after the weights
-// (MaterializationPlan::host_pinned_reserved_bytes: active KV in RAM's Host planes). With "fp8" a
-// pageable candidate and a limit that holds both host-mapped parents, nothing is pageable; one
-// reserved byte moves "fp8" to pageable memory; a reservation of the whole limit fails the load.
+// Exercise the materializer's explicit cap, including mandatory parents and active Host KV.
+// Run the same cases on one and two devices; shared host storage must obey one host budget.
 void host_mapped_reservation(const Fixture& fixture, std::span<DeviceContext* const> devices) {
     Reader reader(fixture.entry);
-    const auto plan_with = [&](std::uint64_t reserved, bool whole_limit) {
-        Binder binder(reader, 1);
+    const auto make_plan = [&] {
+        Binder binder(reader, static_cast<int>(devices.size()));
         binder.set_shard_resolver([&reader](ObjectHandle object, const WeightGeometry&) {
             return host_mapped_resolver(reader, object);
         });
         (void)bind_all(binder);
-        auto plan = std::move(binder).finish();
+        return std::move(binder).finish();
+    };
+    const auto total = make_plan().host_mapped_bytes;
+
+    struct Case {
+        const char* name;
+        bool pageable;
+        std::uint64_t limit;
+        std::uint64_t reserved;
+        bool split;
+        std::string_view error;
+    };
+
+    const Case cases[] = {
+        {"mandatory, no cap", false, 0, 0, false, {}},
+        {"mandatory, exact cap", false, total, 0, false, {}},
+        {"mandatory, spare byte", false, total + 1, 0, false, {}},
+        {"mandatory, one byte short", false, total - 1, 0, false, "must stay page-locked"},
+        {"mandatory, reservation leaves exact room", false, total + 1, 1, false, {}},
+        {"mandatory, reservation leaves insufficient room", false, total, 1, false,
+         "must stay page-locked"},
+        {"mixed, exact cap", true, total, 0, false, {}},
+        {"mixed, one byte short", true, total - 1, 0, true, {}},
+        {"mixed, reservation forces split", true, total, 1, true, {}},
+        {"mixed, mandatory parent exceeds cap", true, 1, 0, false, "must stay page-locked"},
+        {"reservation consumes cap", true, total, total, false, "leaves nothing"},
+        {"reservation exceeds cap", true, total, total + 1, false, "leaves nothing"},
+    };
+    for (const auto& test : cases) {
+        const auto check = [&](bool condition, const std::string& detail) {
+            require(condition, (std::string(test.name) + ": " + detail).c_str());
+        };
+        auto plan = make_plan();
         for (auto& placement : plan.host_mapped_objects) {
-            if (reader.directory().tensor(placement.object).id == "fp8") {
+            if (test.pageable && reader.directory().tensor(placement.object).id == "fp8") {
                 placement.pageable_rank = 1;
             }
         }
-        plan.host_pinned_limit_bytes    = plan.host_mapped_bytes;
-        plan.host_pinned_reserved_bytes = whole_limit ? plan.host_mapped_bytes : reserved;
-        return plan;
-    };
-    {
-        auto backing = materialize(reader, plan_with(0, false), devices);
-        require(backing.stats().host_pageable_bytes == 0,
-                "a page-locked limit that holds every host-mapped parent made one pageable");
+        plan.host_pinned_limit_bytes    = test.limit;
+        plan.host_pinned_reserved_bytes = test.reserved;
+        const auto placements           = plan.host_mapped_objects;
+        std::string error;
+        try {
+            auto backing      = materialize(reader, std::move(plan), devices);
+            const auto& stats = backing.stats();
+            check((stats.host_pageable_objects != 0) == test.split,
+                  "incorrect pinned/pageable placement");
+            check(stats.host_pinned_limit_bytes == test.limit, "incorrect reported limit");
+            check(!stats.host_pinned_alloc_failed,
+                  "explicit budget unexpectedly needed allocation fallback");
+            if (test.limit != 0) {
+                check(stats.host_mapped_bytes <= test.limit - test.reserved,
+                      "allocation exceeded the remaining budget");
+            }
+            // Placement changes storage, never the encoded weights. Check every rank's view.
+            for (const auto& placement : placements) {
+                const auto expected = reader.read_object(placement.object);
+                for (std::size_t rank = 0; rank < devices.size(); ++rank) {
+                    const auto& parent =
+                        backing.device_parent(placement.object, static_cast<int>(rank));
+                    CUDA_CHECK(cudaSetDevice(devices[rank]->device));
+                    std::vector<std::byte> actual(expected.size());
+                    CUDA_CHECK(
+                        cudaMemcpy(actual.data(), parent.data, actual.size(), cudaMemcpyDefault));
+                    check(parent.geometry.bytes == expected.size() && actual == expected,
+                          "stored weight bytes changed");
+                }
+            }
+            CUDA_CHECK(cudaSetDevice(devices[0]->device));
+        } catch (const ArtifactError& exception) { error = exception.what(); }
+        check(test.error.empty() ? error.empty() : error.find(test.error) != std::string::npos,
+              "unexpected result: " + error);
     }
-    {
-        auto backing = materialize(reader, plan_with(1, false), devices);
-        require(backing.stats().host_pageable_bytes != 0 &&
-                    backing.stats().host_pageable_objects == 1,
-                "a reservation inside the page-locked limit kept every host-mapped parent pinned");
-    }
-    bool refused = false;
-    try {
-        (void)materialize(reader, plan_with(0, true), devices);
-    } catch (const ArtifactError&) { refused = true; }
-    require(refused, "a reservation of the whole page-locked limit left room for the weights");
 }
 
 } // namespace
@@ -726,6 +772,7 @@ int main(int argc, char** argv) {
         large_upload(execution);
         DeviceContext* const pair[] = {&*execution.dev[0], &*execution.dev[1]};
         host_mapped_upload(fixture, pair);
+        host_mapped_reservation(fixture, pair);
         std::cout << "two-device artifact placement checks passed\n";
         return 0;
     } catch (const std::exception& error) {

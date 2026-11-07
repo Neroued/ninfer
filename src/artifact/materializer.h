@@ -69,6 +69,8 @@ struct MaterializationPlan {
     // Most bytes of the host-mapped parents to keep page-locked; 0 = no limit (the
     // NINFER_HOST_PINNED_MAX_GIB environment variable may still set one). Above it, or when the
     // whole page-locked allocation fails, parents with pageable_rank > 0 move to pageable memory.
+    // Mandatory pinned parents must fit the remaining budget after host_pinned_reserved_bytes;
+    // otherwise materialization fails, even when no parent can move to pageable memory.
     std::uint64_t host_pinned_limit_bytes = 0;
     // Page-locked bytes the Engine allocates after the weights within the same limit (active KV
     // in RAM's Host planes): the host-mapped parents keep at most the limit minus them

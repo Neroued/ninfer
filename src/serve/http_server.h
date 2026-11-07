@@ -32,6 +32,10 @@ httplib::Server::HandlerResponse handle_unrendered_http_error(const ServeOptions
                                                               const httplib::Request& request,
                                                               httplib::Response& response);
 
+// True when `given` equals the API key; the time depends on the key's length only, not on where
+// the first differing byte is (used for both Authorization: Bearer and x-api-key).
+[[nodiscard]] bool api_key_equal(std::string_view given, std::string_view api_key) noexcept;
+
 [[nodiscard]] bool matches_bearer_credential(std::string_view authorization,
                                              std::string_view api_key) noexcept;
 

@@ -65,6 +65,13 @@ int main() {
                           !ninfer::serve::matches_bearer_credential("Bearersecret", "secret") &&
                           !ninfer::serve::matches_bearer_credential("Bearer secret", ""),
                       "invalid Bearer credentials were accepted");
+    failures += check(ninfer::serve::api_key_equal("secret", "secret") &&
+                          !ninfer::serve::api_key_equal("secreT", "secret") &&
+                          !ninfer::serve::api_key_equal("secre", "secret") &&
+                          !ninfer::serve::api_key_equal("secrets", "secret") &&
+                          !ninfer::serve::api_key_equal("", "secret") &&
+                          !ninfer::serve::api_key_equal(std::string_view("secret\0", 7), "secret"),
+                      "API key comparison accepted a different key");
 
     // Local-only guard: loopback Host/Origin (and absent headers) pass; anything else is foreign.
     failures += check(ninfer::serve::host_header_is_local("") &&

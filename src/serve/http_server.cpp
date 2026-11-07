@@ -191,6 +191,15 @@ httplib::Server::HandlerResponse handle_unrendered_http_error(const ServeOptions
     return httplib::Server::HandlerResponse::Handled;
 }
 
+bool api_key_equal(std::string_view given, std::string_view api_key) noexcept {
+    unsigned char differ = given.size() == api_key.size() ? 0 : 1;
+    for (std::size_t index = 0; index < api_key.size(); ++index) {
+        const unsigned char byte = index < given.size() ? static_cast<unsigned char>(given[index]) : 0;
+        differ |= static_cast<unsigned char>(byte ^ static_cast<unsigned char>(api_key[index]));
+    }
+    return differ == 0;
+}
+
 bool matches_bearer_credential(std::string_view authorization, std::string_view api_key) noexcept {
     if (api_key.empty()) { return false; }
     const auto is_whitespace = [](char value) { return value == ' ' || value == '\t'; };
@@ -218,7 +227,7 @@ bool matches_bearer_credential(std::string_view authorization, std::string_view 
     }
     std::size_t end = authorization.size();
     while (end > position && is_whitespace(authorization[end - 1])) { --end; }
-    return authorization.substr(position, end - position) == api_key;
+    return api_key_equal(authorization.substr(position, end - position), api_key);
 }
 
 namespace {
@@ -463,7 +472,8 @@ void HttpServer::register_routes() {
             // -> x-api-key, ANTHROPIC_AUTH_TOKEN -> Authorization: Bearer) both work.
             const bool bearer_ok =
                 matches_bearer_credential(req.get_header_value("Authorization"), options_.api_key);
-            const bool x_api_key_ok = req.get_header_value("x-api-key") == options_.api_key;
+            const bool x_api_key_ok =
+                api_key_equal(req.get_header_value("x-api-key"), options_.api_key);
             if (!bearer_ok && !x_api_key_ok) {
                 ApiError error;
                 error.status  = 401;

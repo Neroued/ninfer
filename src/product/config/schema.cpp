@@ -98,6 +98,8 @@ constexpr FieldSpec kFields[] = {
      Scope::Serve},
     {Field::MaxRequestSize, "server.max_request_size", "--max-request-size", "", "SIZE",
      "HTTP body limit before JSON parsing (384MiB).", Scope::Serve, ConfigurationUnit::Bytes},
+    {Field::AdminCache, "server.admin_cache", "--enable-admin-cache", "--no-admin-cache", "",
+     "Register the /admin/cache/prefixes inspection and eviction routes.", Scope::Serve},
     {Field::ResponseRecords, "server.responses.max_records", "--response-store-max-records", "",
      "N", "Responses store record limit (1024).", Scope::Serve},
     {Field::ResponseSize, "server.responses.max_size", "--response-store-max-size", "", "SIZE",
@@ -316,6 +318,7 @@ FieldValue parse_field_value(Field field, const RawValue& value, bool command_li
     case Field::Thinking:
     case Field::PreserveThinking:
     case Field::Cors:
+    case Field::AdminCache:
     case Field::RawOutput:
     case Field::PrintTokenIds:
         if (const auto* boolean = std::get_if<bool>(&value)) return *boolean;

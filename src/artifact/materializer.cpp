@@ -4,6 +4,7 @@
 #include "artifact/host_residency.h"
 #include "artifact/reader.h"
 #include "core/startup.h"
+#include "core/byte_size.h"
 
 #include <cuda_runtime.h>
 
@@ -99,12 +100,12 @@ std::uint64_t host_pinned_limit(const MaterializationPlan& plan) {
     if (plan.host_pinned_limit_bytes != 0) { return plan.host_pinned_limit_bytes; }
     const char* env = std::getenv("NINFER_HOST_PINNED_MAX_GIB");
     if (env == nullptr || *env == 0) { return 0; }
-    char* end        = nullptr;
-    const double gib = std::strtod(env, &end);
-    if (end == env || *end != 0 || !(gib > 0.0) || !std::isfinite(gib)) {
-        throw ArtifactError("NINFER_HOST_PINNED_MAX_GIB must be a positive number of GiB");
+    const auto bytes = parse_positive_gib(env);
+    if (!bytes) {
+        throw ArtifactError("NINFER_HOST_PINNED_MAX_GIB must be a number of GiB "
+                            "representing at least 1 byte and less than 16 EiB");
     }
-    return static_cast<std::uint64_t>(gib * static_cast<double>(1ULL << 30));
+    return *bytes;
 }
 
 constexpr std::size_t kSlotBytes        = 64ULL * 1024 * 1024;

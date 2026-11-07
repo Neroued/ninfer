@@ -1,4 +1,5 @@
 #include "serve/serve_options.h"
+#include "core/byte_size.h"
 #include "product/speculative_options.h"
 #include "product/tensor_parallel_options.h"
 #include "product/vision_options.h"
@@ -751,16 +752,12 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.embedding_host = true;
         } else if (arg == "--host-pinned-max-gib") {
             const std::string value = require_value("--host-pinned-max-gib");
-            double gib              = 0.0;
-            try {
-                gib = std::stod(value);
-            } catch (const std::exception&) {
-                throw std::invalid_argument("--host-pinned-max-gib must be a number");
+            const auto bytes        = parse_positive_gib(value.c_str());
+            if (!bytes) {
+                throw std::invalid_argument("--host-pinned-max-gib must be a number of GiB "
+                                            "representing at least 1 byte and less than 16 EiB");
             }
-            if (!(gib > 0.0) || !std::isfinite(gib)) {
-                throw std::invalid_argument("--host-pinned-max-gib must be positive");
-            }
-            options.host_pinned_max_bytes = static_cast<std::uint64_t>(gib * 1073741824.0);
+            options.host_pinned_max_bytes = *bytes;
         } else if (arg == "--no-prefix-reuse") {
             options.allow_prefix_reuse = false;
         } else if (arg == "--reasoning-close-retry") {

@@ -163,7 +163,11 @@ if [ ! -x "$release/bin/ninfer-serve" ]; then
   rmdir "$unpack"
   rm -f "$dir/$tarball" "$dir/$tarball.sha256"
 fi
-(cd "$release" && sha256sum --quiet -c SHA256SUMS) && ok "release $version verified ($release)"
+(cd "$release" && sha256sum --quiet -c SHA256SUMS) || {
+  echo "capy-flash: release verification failed in $release; installation stopped" >&2
+  exit 1
+}
+ok "release $version verified ($release)"
 ln -sfn "$release" "$dir/current" # stable path for units and llama-swap (examples/serving)
 missing_libs=$(LD_LIBRARY_PATH="$release/lib" ldd "$release/bin/ninfer-serve" | awk '/not found/ {print $1}' | tr '\n' ' ')
 if [ -n "$missing_libs" ]; then
@@ -176,7 +180,11 @@ if [ "$fetch_model" = 1 ]; then
   echo "capy-flash: downloading $hf_repo (resumable: run again if it stops)"
   hf download "$hf_repo" --local-dir "$dir/models/$model"
   if [ "$verify_model" = 1 ]; then
-    (cd "$dir/models/$model" && sha256sum -c SHA256SUMS) && ok "model verified"
+    (cd "$dir/models/$model" && sha256sum -c SHA256SUMS) || {
+      echo "capy-flash: model verification failed in $dir/models/$model; installation stopped" >&2
+      exit 1
+    }
+    ok "model verified"
   fi
 fi
 

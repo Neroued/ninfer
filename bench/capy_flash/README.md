@@ -49,3 +49,5 @@ the probe output, the expert slots per layer per GPU and the KV bytes per GPU of
 request carries an `X-Ninfer-Client` label unique to its run and size, which the probe records and the request log
 keeps: `summarize` pairs a request with its probe by that label, so other requests in the log and earlier runs
 appended to the probe file do not shift the pairing.
+
+`decode` uses monotonic response timings; `wall_s` excludes the post-response wait for server logs.

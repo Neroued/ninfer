@@ -56,11 +56,9 @@ struct HostResidency {
 // (`reserved_bytes`, MaterializationPlan::host_pinned_reserved_bytes) together: the available RAM
 // outside CMA minus max(2 GiB, 5 % of MemTotal) for the system and `engine_bytes` for the Engine's
 // other page-locked buffers; at least 1. Returns 0 (no limit) without CMA or when the weights fit.
-[[nodiscard]] std::uint64_t cma_pinned_limit(std::uint64_t total_bytes,
-                                             std::uint64_t available_bytes,
-                                             std::uint64_t cma_free_bytes,
-                                             std::uint64_t host_mapped_bytes,
-                                             std::uint64_t reserved_bytes,
-                                             std::uint64_t engine_bytes) noexcept;
+[[nodiscard]] std::uint64_t
+cma_pinned_limit(std::uint64_t total_bytes, std::uint64_t available_bytes,
+                 std::uint64_t cma_free_bytes, std::uint64_t host_mapped_bytes,
+                 std::uint64_t reserved_bytes, std::uint64_t engine_bytes) noexcept;
 
 } // namespace ninfer::artifact

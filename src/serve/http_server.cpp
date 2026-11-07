@@ -194,7 +194,8 @@ httplib::Server::HandlerResponse handle_unrendered_http_error(const ServeOptions
 bool api_key_equal(std::string_view given, std::string_view api_key) noexcept {
     unsigned char differ = given.size() == api_key.size() ? 0 : 1;
     for (std::size_t index = 0; index < api_key.size(); ++index) {
-        const unsigned char byte = index < given.size() ? static_cast<unsigned char>(given[index]) : 0;
+        const unsigned char byte =
+            index < given.size() ? static_cast<unsigned char>(given[index]) : 0;
         differ |= static_cast<unsigned char>(byte ^ static_cast<unsigned char>(api_key[index]));
     }
     return differ == 0;

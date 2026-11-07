@@ -8,7 +8,7 @@
 #include <random>
 
 #if defined(__linux__)
-#include <sys/random.h>
+#    include <sys/random.h>
 #endif
 
 namespace ninfer::serve {

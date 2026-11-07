@@ -42,8 +42,8 @@ Plan make_plan(bool embedding, std::int32_t layers, std::uint64_t gate_up, std::
     Plan plan;
     std::size_t object = 0;
     const auto add     = [&](std::uint64_t bytes, std::uint32_t r) {
-        HostMappedPlacement p{.object = ObjectHandle{object++}, .bytes = bytes,
-                                  .alignment = alignment};
+        HostMappedPlacement p{
+                .object = ObjectHandle{object++}, .bytes = bytes, .alignment = alignment};
         p.offset        = align_up(plan.total, alignment, "test offset");
         plan.total      = p.offset + bytes;
         p.pageable_rank = r;
@@ -122,7 +122,8 @@ void test_split() {
         for (std::size_t i = 0; i < order.size(); ++i) {
             prefix = prefix && (pinned_layers.count(order[i]) != 0) == (i < n);
         }
-        check(prefix, what + ": pinned layers are the first " + std::to_string(n) + " of the order");
+        check(prefix,
+              what + ": pinned layers are the first " + std::to_string(n) + " of the order");
         check(r.pageable_objects == 2 * (49 - n), what + ": pageable object count");
         check(r.pinned_bytes + r.pageable_bytes >= plan.total - 4096 * plan.placements.size(),
               what + ": every byte placed once");
@@ -143,8 +144,8 @@ void test_skip_rank_that_does_not_fit() {
         {100, 0}, {500, 1}, {300, 2}, {200, 3}};
     for (std::size_t i = 0; i < items.size(); ++i) {
         HostMappedPlacement p{.object = ObjectHandle{i}, .bytes = items[i].first, .alignment = 1};
-        p.offset        = plan.total;
-        plan.total     += p.bytes;
+        p.offset = plan.total;
+        plan.total += p.bytes;
         p.pageable_rank = items[i].second;
         plan.placements.push_back(p);
     }
@@ -176,12 +177,12 @@ void test_order() {
 
 // #40: free CMA memory caps the page-locked limit; no CMA or enough RAM outside it = no limit.
 void test_cma_limit() {
-    const auto mib = [](std::uint64_t v) { return v << 20; };
+    const auto mib           = [](std::uint64_t v) { return v << 20; };
     const std::uint64_t host = mib(49'962); // 48.79 GiB: Flash-Next 64 GB edition experts
     check(cma_pinned_limit(mib(64'184), mib(57'000), 0, host, 0, 8 * kGiB) == 0, "no CMA");
     // The #40 machine: 62.68 GiB, 7.8 GiB CMA free, 47.8 GiB available outside it.
     const std::uint64_t total = mib(64'184), cma = mib(8'000), outside = mib(48'947);
-    const std::uint64_t keep  = total / 20 + 8 * kGiB;
+    const std::uint64_t keep = total / 20 + 8 * kGiB;
     check(cma_pinned_limit(total, outside + cma, cma, host, 0, 8 * kGiB) == outside - keep,
           "the #40 machine: outside CMA minus 5 % and the engine's room");
     check(cma_pinned_limit(total, outside + cma, cma, host, 0, 8 * kGiB) < host - 10 * kGiB,

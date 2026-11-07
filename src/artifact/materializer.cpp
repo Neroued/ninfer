@@ -584,9 +584,8 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
         if (pinned_limit == 0 && ram_guard_enabled()) {
             // #40: without an explicit limit, keep the page-locked part outside free CMA memory.
             const HostMemInfo memory = read_host_meminfo();
-            pinned_limit             = cma_pinned_limit(memory.total, memory.available,
-                                                        memory.cma_free, plan.host_mapped_bytes,
-                                                        reserved, kPinnedReserveBytes);
+            pinned_limit = cma_pinned_limit(memory.total, memory.available, memory.cma_free,
+                                            plan.host_mapped_bytes, reserved, kPinnedReserveBytes);
             if (pinned_limit != 0) {
                 std::fprintf(stderr,
                              "host-mapped weights: %s of the available RAM is CMA (CmaFree), which "
@@ -653,8 +652,9 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
                     throw ArtifactError(
                         "host-mapped weights: the parents that must stay page-locked need " +
                         gib_text(residency.required_pinned_bytes) + " (" +
-                        std::to_string(residency.required_pinned_bytes) + " bytes), more than the " +
-                        gib_text(budget) + " (" + std::to_string(budget) + " bytes)" +
+                        std::to_string(residency.required_pinned_bytes) +
+                        " bytes), more than the " + gib_text(budget) + " (" +
+                        std::to_string(budget) + " bytes)" +
                         " allowed (--host-pinned-max-gib / NINFER_HOST_PINNED_MAX_GIB, or what "
                         "the driver grants); drop --embedding-host or raise the limit");
                 }

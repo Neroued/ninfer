@@ -80,6 +80,8 @@ uses `flash-next` with `--host-kv-mib 1024 --host-state-slots 2` (smaller RAM ca
   banks of the least used layers stay in pageable RAM: the CPU reads them in place and the GPUs copy them through a
   pinned staging ring (no prefill streaming for those layers). Same tokens as fully pinned, slower where pageable.
   `--host-pinned-max-gib G` (or `NINFER_HOST_PINNED_MAX_GIB`) sets the cap by hand.
+  Loading fails if weights that must stay pinned (such as host-mapped embeddings) exceed the
+  remaining budget after active Host KV reservations; they cannot fall back to pageable RAM.
 
 ### Chat template
 

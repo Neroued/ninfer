@@ -49,3 +49,26 @@ the probe output, the expert slots per layer per GPU and the KV bytes per GPU of
 request carries an `X-Ninfer-Client` label unique to its run and size, which the probe records and the request log
 keeps: `summarize` pairs a request with its probe by that label, so other requests in the log and earlier runs
 appended to the probe file do not shift the pairing.
+
+## Portable ladder with a recorded environment (`ladder.py`, issue #30)
+
+One command to produce a row that is comparable with other people's machines, without downloading a
+corpus or a tokenizer. It runs a fixed set of context sizes against a running server, each with a
+deterministic self-contained prompt, and reports — as the median of a few passes — the cold-prefill
+and decode rates from the server's own `timings` block. Alongside the numbers it records the
+machine (GPUs, driver, PCIe link width, WSL2, CPU, RAM) and, when given the server's startup log,
+the P2P state and the expanded launch line the server printed, since those decide what the numbers
+mean.
+
+```
+# start the server keeping its log, then:
+python3 bench/capy_flash/ladder.py http://127.0.0.1:8098 capy-flash result.json \
+  --server-log server.log --note "2x RTX 5070 Ti, bare metal"      # default sizes 8k-128k
+python3 bench/capy_flash/check_result.py result.json               # validate before sharing
+```
+
+Defaults: sizes `8000,16000,32000,64000,128000`, 3 passes, 256 decode tokens. The cold-prefill leg
+uses a different prompt each pass so it never hits the prefix cache. If the server is started with
+`--api-key`, set `CAPY_API_KEY` for the client. `check_result.py` refuses a row that is missing the
+environment that makes it comparable or whose prompt-token counts do not match the targets — the
+gate for a shared results log.

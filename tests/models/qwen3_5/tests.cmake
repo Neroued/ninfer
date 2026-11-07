@@ -136,3 +136,7 @@ set_tests_properties(ninfer_qwen3_5_t3_capture_nonblocking_test
 ninfer_add_test(ninfer_qwen3_5_t6_packed_contract_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_t6_packed_contract.cpp"
   LIBRARIES ninfer_model_execution ninfer_model_loading ninfer_core)
+
+ninfer_add_test(ninfer_qwen3_5_t1_f2_f5_contract_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_t1_f2_f5_contract.cpp"
+  LIBRARIES ninfer_model_execution ninfer_model_loading ninfer_core)

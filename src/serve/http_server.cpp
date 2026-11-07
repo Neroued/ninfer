@@ -221,6 +221,74 @@ bool matches_bearer_credential(std::string_view authorization, std::string_view 
     return authorization.substr(position, end - position) == api_key;
 }
 
+namespace {
+// True only for a dotted-quad entirely inside 127.0.0.0/8 (four decimal octets 0-255, first ==
+// 127). Deliberately strict: it must be a real IPv4 literal, so a rebinding host like
+// "127.0.0.1.attacker.com" or "127.0.0.1@evil" is NOT accepted.
+bool is_ipv4_loopback_literal(std::string_view s) noexcept {
+    int octets    = 0;
+    std::size_t i = 0;
+    while (true) {
+        int value = 0, digits = 0;
+        while (i < s.size() && s[i] >= '0' && s[i] <= '9') {
+            value = value * 10 + (s[i] - '0');
+            if (++digits > 3) { return false; }
+            ++i;
+        }
+        if (digits == 0 || value > 255) { return false; }
+        if (octets == 0 && value != 127) { return false; }
+        ++octets;
+        if (i == s.size()) { break; }
+        if (s[i] != '.') { return false; } // stray char (letter, '@', ':') => not an IPv4 literal
+        ++i;
+    }
+    return octets == 4;
+}
+
+// "localhost" (any case), the IPv6 loopback "::1", and 127.0.0.0/8 are loopback. The input is a
+// URL authority; a bracketed IPv6 literal or a trailing :port is stripped first.
+bool authority_is_loopback(std::string_view authority) noexcept {
+    if (!authority.empty() && authority.front() == '[') {
+        const auto close = authority.find(']');
+        if (close == std::string_view::npos) { return false; }
+        authority = authority.substr(1, close - 1); // strip [ ] around an IPv6 literal
+    } else {
+        const auto colon = authority.find(':'); // strip a :port (bare IPv6 has no port form here)
+        if (colon != std::string_view::npos) { authority = authority.substr(0, colon); }
+    }
+    if (authority == "::1") { return true; }
+    if (authority.size() == 9) { // "localhost", case-insensitive
+        static constexpr char kLocal[] = "localhost";
+        bool match                     = true;
+        for (std::size_t i = 0; i < 9; ++i) {
+            char c = authority[i];
+            if (c >= 'A' && c <= 'Z') { c = static_cast<char>(c - 'A' + 'a'); }
+            if (c != kLocal[i]) {
+                match = false;
+                break;
+            }
+        }
+        if (match) { return true; }
+    }
+    return is_ipv4_loopback_literal(authority);
+}
+} // namespace
+
+bool host_header_is_local(std::string_view host_header) noexcept {
+    if (host_header.empty()) { return true; }
+    return authority_is_loopback(host_header);
+}
+
+bool origin_header_is_local(std::string_view origin_header) noexcept {
+    if (origin_header.empty()) { return true; }
+    const auto sep = origin_header.find("://");
+    if (sep == std::string_view::npos) { return false; } // "null" or malformed
+    std::string_view authority = origin_header.substr(sep + 3);
+    const auto slash           = authority.find('/');
+    if (slash != std::string_view::npos) { authority = authority.substr(0, slash); }
+    return authority_is_loopback(authority);
+}
+
 HttpServer::HttpServer(ServeOptions options, std::shared_ptr<spdlog::logger> logger)
     : options_(std::move(options)), openai_responses_store_(options_.response_store_max_records,
                                                             options_.response_store_max_bytes),
@@ -363,33 +431,55 @@ void HttpServer::register_routes() {
                         [](const httplib::Request&, httplib::Response& res) { res.status = 204; });
     }
 
-    server_.set_pre_routing_handler([this](const httplib::Request& req, httplib::Response& res) {
-        ensure_openai_request_id(req, res);
-        if (options_.api_key.empty() || req.path == "/health" || req.method == "OPTIONS") {
-            return httplib::Server::HandlerResponse::Unhandled;
-        }
-        // Accept both the OpenAI-style bearer token and the Anthropic-style
-        // x-api-key header so OpenAI clients and Claude Code (ANTHROPIC_API_KEY
-        // -> x-api-key, ANTHROPIC_AUTH_TOKEN -> Authorization: Bearer) both work.
-        const bool bearer_ok =
-            matches_bearer_credential(req.get_header_value("Authorization"), options_.api_key);
-        const bool x_api_key_ok = req.get_header_value("x-api-key") == options_.api_key;
-        if (!bearer_ok && !x_api_key_ok) {
-            ApiError error;
-            error.status  = 401;
-            error.type    = "invalid_request_error";
-            error.code    = "invalid_api_key";
-            error.message = "missing or invalid API key";
-            // Render the 401 in the shape the target endpoint speaks.
-            if (req.path.rfind("/v1/messages", 0) == 0) {
-                write_anthropic_error(res, error, new_anthropic_request_id());
-            } else {
-                write_openai_error(res, error);
+    // Local-only guard: active when we listen on a loopback address and the operator has not
+    // opted into browser access with --cors. It blocks the two ways a web page in a victim's
+    // browser can reach this server — a cross-site request (foreign Origin) and DNS rebinding
+    // (foreign Host) — before auth or body parsing. Non-browser clients send neither and are
+    // unaffected; to allow browsers, bind a non-loopback address or pass --cors.
+    const bool local_only_guard = host_header_is_local(options_.host) && !options_.enable_cors;
+    server_.set_pre_routing_handler(
+        [this, local_only_guard](const httplib::Request& req, httplib::Response& res) {
+            ensure_openai_request_id(req, res);
+            if (local_only_guard && !(host_header_is_local(req.get_header_value("Host")) &&
+                                      origin_header_is_local(req.get_header_value("Origin")))) {
+                ApiError error;
+                error.status  = 403;
+                error.type    = "invalid_request_error";
+                error.code    = "forbidden";
+                error.message = "refused a cross-origin or non-local request; bind a non-loopback "
+                                "address or pass --cors to allow browser clients";
+                if (req.path.rfind("/v1/messages", 0) == 0) {
+                    write_anthropic_error(res, error, new_anthropic_request_id());
+                } else {
+                    write_openai_error(res, error);
+                }
+                return httplib::Server::HandlerResponse::Handled;
             }
-            return httplib::Server::HandlerResponse::Handled;
-        }
-        return httplib::Server::HandlerResponse::Unhandled;
-    });
+            if (options_.api_key.empty() || req.path == "/health" || req.method == "OPTIONS") {
+                return httplib::Server::HandlerResponse::Unhandled;
+            }
+            // Accept both the OpenAI-style bearer token and the Anthropic-style
+            // x-api-key header so OpenAI clients and Claude Code (ANTHROPIC_API_KEY
+            // -> x-api-key, ANTHROPIC_AUTH_TOKEN -> Authorization: Bearer) both work.
+            const bool bearer_ok =
+                matches_bearer_credential(req.get_header_value("Authorization"), options_.api_key);
+            const bool x_api_key_ok = req.get_header_value("x-api-key") == options_.api_key;
+            if (!bearer_ok && !x_api_key_ok) {
+                ApiError error;
+                error.status  = 401;
+                error.type    = "invalid_request_error";
+                error.code    = "invalid_api_key";
+                error.message = "missing or invalid API key";
+                // Render the 401 in the shape the target endpoint speaks.
+                if (req.path.rfind("/v1/messages", 0) == 0) {
+                    write_anthropic_error(res, error, new_anthropic_request_id());
+                } else {
+                    write_openai_error(res, error);
+                }
+                return httplib::Server::HandlerResponse::Handled;
+            }
+            return httplib::Server::HandlerResponse::Unhandled;
+        });
 
     server_.set_exception_handler(
         [this](const httplib::Request& req, httplib::Response& res, std::exception_ptr ep) {

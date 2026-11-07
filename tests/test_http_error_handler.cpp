@@ -66,6 +66,42 @@ int main() {
                           !ninfer::serve::matches_bearer_credential("Bearer secret", ""),
                       "invalid Bearer credentials were accepted");
 
+    // Local-only guard: loopback Host/Origin (and absent headers) pass; anything else is foreign.
+    failures += check(ninfer::serve::host_header_is_local("") &&
+                          ninfer::serve::host_header_is_local("127.0.0.1") &&
+                          ninfer::serve::host_header_is_local("127.0.0.1:8080") &&
+                          ninfer::serve::host_header_is_local("localhost:8080") &&
+                          ninfer::serve::host_header_is_local("[::1]:8080"),
+                      "a loopback or absent Host was treated as foreign");
+    failures += check(!ninfer::serve::host_header_is_local("rebind.attacker.example:8080") &&
+                          !ninfer::serve::host_header_is_local("evil.com") &&
+                          !ninfer::serve::host_header_is_local("10.0.0.5:8080"),
+                      "a foreign Host was treated as loopback (DNS-rebinding guard open)");
+    // Bypass attempts: a loopback-looking prefix/suffix that is really a foreign authority.
+    failures += check(!ninfer::serve::host_header_is_local("127.0.0.1.attacker.com") &&
+                          !ninfer::serve::host_header_is_local("127.0.0.1@evil.com") &&
+                          !ninfer::serve::host_header_is_local("127.0.0.1.") &&
+                          !ninfer::serve::host_header_is_local("localhost.evil.com") &&
+                          !ninfer::serve::host_header_is_local("127x0x0x1") &&
+                          !ninfer::serve::host_header_is_local("2130706433") &&
+                          !ninfer::serve::host_header_is_local("127.0.0.256"),
+                      "a rebinding host disguised as loopback was accepted");
+    failures += check(ninfer::serve::host_header_is_local("LocalHost") &&
+                          ninfer::serve::host_header_is_local("127.5.6.7"),
+                      "a valid loopback spelling was rejected");
+    failures += check(ninfer::serve::origin_header_is_local("") &&
+                          ninfer::serve::origin_header_is_local("http://127.0.0.1:8080") &&
+                          ninfer::serve::origin_header_is_local("http://localhost") &&
+                          ninfer::serve::origin_header_is_local("https://[::1]:8443"),
+                      "a loopback or absent Origin was treated as foreign");
+    failures += check(!ninfer::serve::origin_header_is_local("https://attacker.example") &&
+                          !ninfer::serve::origin_header_is_local("http://evil.com:8080") &&
+                          !ninfer::serve::origin_header_is_local("null") &&
+                          !ninfer::serve::origin_header_is_local("http://127.0.0.1.attacker.com") &&
+                          !ninfer::serve::origin_header_is_local("http://127.0.0.1@evil.com/") &&
+                          !ninfer::serve::origin_header_is_local("127.0.0.1:8080"),
+                      "a foreign Origin was treated as loopback (cross-site guard open)");
+
     httplib::Request messages_request;
     messages_request.path = "/v1/messages";
     httplib::Response messages_response;

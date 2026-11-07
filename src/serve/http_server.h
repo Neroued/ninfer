@@ -35,6 +35,15 @@ httplib::Server::HandlerResponse handle_unrendered_http_error(const ServeOptions
 [[nodiscard]] bool matches_bearer_credential(std::string_view authorization,
                                              std::string_view api_key) noexcept;
 
+// Browser-CSRF / DNS-rebinding guard helpers. Both return true for the "safe" case so that
+// non-browser clients (which send no Origin and a loopback Host) are never rejected.
+//   host_header_is_local:   true unless the HTTP Host header names a non-loopback authority.
+//                           An empty Host counts as local.
+//   origin_header_is_local: true unless the browser Origin header names a non-loopback origin.
+//                           An empty Origin counts as local; "null" counts as non-local.
+[[nodiscard]] bool host_header_is_local(std::string_view host_header) noexcept;
+[[nodiscard]] bool origin_header_is_local(std::string_view origin_header) noexcept;
+
 class HttpServer {
 public:
     HttpServer(ServeOptions options, std::shared_ptr<spdlog::logger> logger);

@@ -1285,7 +1285,12 @@ multi-conversation servers should set `--device-state-slots 12` to `16` when mem
 limitations in the README). The startup log prints one
 line per rank and a `tensor parallel` capacity line with the Device checkpoint pool and the
 transfer path: `p2p on` when the driver grants direct peer access, `p2p off (host-staged copies)`
-otherwise (GeForce boards). With CUDA Graphs one `cuda graphs` line per rank compares the device
+otherwise (GeForce boards). When the driver advertises peer access but cannot map the peer's
+memory, the server prints why and starts with `p2p off` (#41). Under VFIO passthrough this happens
+with the default 256 MiB BAR1 (`cudaErrorMapBufferObjectFailed`): QEMU exposes the size the host BAR
+has, so grow it on the hypervisor with the VM off (for example
+`echo 14 > /sys/bus/pci/devices/<gpu>/resource1_resize`, 16 GiB, with Above 4G Decoding and Resizable
+BAR enabled in the BIOS) and `p2p on` follows. With CUDA Graphs one `cuda graphs` line per rank compares the device
 memory graph preparation took with the planned per-device allowance, and a warning follows if a
 rank took more; startup still succeeds, the excess coming out of the memory KV sizing left free.
 The tp 2 allowance is three times what two RTX 5070 Ti measured at 32K context and

@@ -262,6 +262,24 @@ bool enable_peer_access(const ExecutionContext& ec) {
             cudaGetLastError();
             continue;
         }
+        // #41: the driver may advertise peer access and still fail to map the peer's memory
+        // (a VM whose GPUs expose a 256 MiB BAR1: cudaErrorMapBufferObjectFailed). Undo the
+        // direction already enabled and use the staged path instead of aborting startup.
+        if (status == cudaErrorMapBufferObjectFailed || status == cudaErrorMemoryAllocation ||
+            status == cudaErrorTooManyPeers) {
+            cudaGetLastError();
+            for (int done = 0; done < rank; ++done) {
+                CurrentDeviceGuard::set(pair[done]);
+                (void)cudaDeviceDisablePeerAccess(pair[1 - done]);
+                cudaGetLastError();
+            }
+            std::fprintf(stderr,
+                         "tensor parallel: peer access between devices %d and %d failed (%s); "
+                         "using the host-staged path (p2p off). Under VFIO, grow the GPUs' BAR1 "
+                         "on the host (see docs/serving.md)\n",
+                         pair[0], pair[1], cudaGetErrorString(status));
+            return false;
+        }
         CUDA_CHECK(status);
     }
     return true;

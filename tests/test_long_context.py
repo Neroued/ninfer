@@ -42,6 +42,46 @@ class Response:
 
 
 class LongContextTests(unittest.TestCase):
+    def test_response_timing_excludes_log_wait_and_ignores_wall_clock_changes(self):
+        for first_at, fail in [(0.0, False), (0.25, False), (None, True), (0.25, True)]:
+            with self.subTest(first_at=first_at, fail=fail), tempfile.TemporaryDirectory() as tmp:
+                clock = [0.0]
+
+                class TimedResponse(Response):
+                    def __enter__(self):
+                        return iter(self)
+
+                    def __iter__(self):
+                        if first_at is not None:
+                            clock[0] = first_at
+                            yield b'data: {"choices": [{"delta": {"content": "x"}}]}'
+                        clock[0] = 0.75
+                        if fail:
+                            raise OSError("connection lost")
+                        yield b'data: {"choices": [{"delta": {}, "finish_reason": "stop"}]}'
+                        yield b"data: [DONE]"
+
+                def sleep(seconds):
+                    clock[0] += seconds
+
+                out = Path(tmp) / "lc.jsonl"
+                args = SimpleNamespace(
+                    url="http://x", model="m", out=str(out), sizes=[3], max_tokens=4, server_log=None
+                )
+                with (
+                    patch.object(long_context, "post", return_value=TimedResponse()),
+                    patch.object(long_context.time, "perf_counter", side_effect=lambda: clock[0]),
+                    patch.object(long_context.time, "time", side_effect=lambda: 100 - clock[0] * 1000),
+                    patch.object(long_context.time, "sleep", side_effect=sleep),
+                    contextlib.redirect_stdout(io.StringIO()),
+                ):
+                    long_context.decode(args, Tokenizer(), "a" * 64)
+                row = json.loads(out.read_text())
+                self.assertEqual(row["wall_s"], 0.75)
+                self.assertEqual(row["ttft_s"], first_at)
+                self.assertEqual(clock[0], 1.75)
+                self.assertEqual(row["error"] is not None, fail)
+
     def test_decode_records_the_label_it_sends(self):
         sent = []
 

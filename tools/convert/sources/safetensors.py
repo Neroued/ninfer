@@ -9,6 +9,7 @@ from math import prod
 import os
 from pathlib import Path
 import struct
+import threading
 
 import torch
 
@@ -52,6 +53,7 @@ class SafetensorsSource:
         self._headers: dict[Path, dict[str, TensorInfo]] = {}
         self._fds: OrderedDict[Path, int] = OrderedDict()
         self.bytes_read = 0
+        self._read_lock = threading.RLock()
         if self.path.is_file() and self.path.suffix == ".safetensors":
             file = self.path
             self.weight_map = {name: file for name in self._header(file)}
@@ -107,11 +109,12 @@ class SafetensorsSource:
         return name in self.weight_map
 
     def describe(self, name: str) -> TensorInfo:
-        try:
-            file = self.weight_map[name]
-            return self._header(file)[name]
-        except KeyError as error:
-            raise ValueError(f"{self.path}: missing source tensor {name!r}") from error
+        with self._read_lock:
+            try:
+                file = self.weight_map[name]
+                return self._header(file)[name]
+            except KeyError as error:
+                raise ValueError(f"{self.path}: missing source tensor {name!r}") from error
 
     def _file(self, path: Path) -> int:
         if path in self._fds:
@@ -146,20 +149,23 @@ class SafetensorsSource:
         if begin == end:
             return torch.empty(0, dtype=dtype)
         count = (end - begin) * word_bytes
-        fd = self._file(info.file)
         offset = info.offset + begin * word_bytes
         raw = bytearray(count)
-        if os.preadv(fd, [raw], offset) != count:
-            raise ValueError(f"{name}: short source read")
-        self.bytes_read += count
-        discard_cached_pages(fd, offset, count)
+        with self._read_lock:
+            # A concurrent reader must not evict the FD during preadv.
+            fd = self._file(info.file)
+            if os.preadv(fd, [raw], offset) != count:
+                raise ValueError(f"{name}: short source read")
+            self.bytes_read += count
+            discard_cached_pages(fd, offset, count)
         return torch.frombuffer(raw, dtype=dtype)
 
     def close(self) -> None:
-        while self._fds:
-            _, fd = self._fds.popitem()
-            discard_cached_pages(fd)
-            os.close(fd)
+        with self._read_lock:
+            while self._fds:
+                _, fd = self._fds.popitem()
+                discard_cached_pages(fd)
+                os.close(fd)
 
     def __enter__(self) -> SafetensorsSource:
         return self

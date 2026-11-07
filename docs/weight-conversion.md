@@ -142,6 +142,7 @@ row-FP8 quantization on the GPU; encoded NVFP4/block-FP8 imports retain their or
 |---|---:|---|
 | `--rows-per-chunk` | Automatic | Override row batching; methods align rows to their encoding boundaries. |
 | `--cpu-threads` | `1` | Set PyTorch CPU intra-op threads; the source reader is a separate worker. |
+| `--workers` | `1` | Independent CPU weight conversion jobs processed concurrently; CUDA requires `1`. |
 | `--source-cache-mib` | `2048` | Maximum FP32 source size retained on the conversion device for one multi-pass object. Larger objects stream both passes; `0` disables this cache. |
 
 `stored_scale_mse` first finds the whole object's maximum, then selects stored scales/codes.
@@ -149,6 +150,15 @@ Its cache avoids rereading eligible objects between these passes. CUDA candidate
 conservative error bounds and retains the FP64 selection and tie rules defined in the
 [stored-scale implementation](../tools/convert/quantization/stored_scale.py).
 The conversion report records resource settings and per-object conversion times.
+
+The converter also supports `--device cpu --workers 2`. Jobs stage output in
+up to 8 MiB of memory each and spill larger objects to temporary files in the output
+directory; publication remains ordered and single-threaded. Reserve disk space for
+up to `2 * workers` staged objects. `--cpu-threads` sets PyTorch threads **per**
+job; `--source-cache-mib` can additionally consume memory per concurrent job.
+For memory-constrained systems, start with `--workers 2 --cpu-threads 1
+--source-cache-mib 0` and benchmark against `--workers 1`.
+
 
 ## Change part of a recipe
 

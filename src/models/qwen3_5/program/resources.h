@@ -59,6 +59,7 @@ struct ResourceLayout {
 
 struct WorkspaceSpec {
     std::size_t text_prefill     = 0;
+    std::size_t text_mixed       = 0;
     std::size_t ordinary_round   = 0;
     std::size_t mtp_prefill      = 0;
     std::size_t mtp_round        = 0;

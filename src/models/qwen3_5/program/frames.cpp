@@ -1,6 +1,7 @@
 #include "models/qwen3_5/program/frames.h"
 
 #include "models/load_options.h"
+#include "models/qwen3_5/prefill_chunk.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -34,6 +35,13 @@ void validate(const FrameSpec& spec) {
         spec.pack_segments > spec.batch_capacity) {
         throw std::invalid_argument("Qwen3.5 frame geometry is invalid");
     }
+    if (spec.mixed_tokens !=
+            resolve_mixed_tokens(spec.pack_tokens, spec.mixed_decode_rows, spec.draft_window) ||
+        (spec.mixed_decode_rows != 0 &&
+         (spec.mixed_decode_rows >= spec.batch_capacity || spec.causal_scoring ||
+          is_masked_draft_backend(spec.backend)))) {
+        throw std::invalid_argument("Qwen3.5 frame mixed geometry is invalid");
+    }
     if ((spec.backend == SpeculativeBackend::None && spec.draft_window != 0) ||
         (spec.backend == SpeculativeBackend::Mtp &&
          (spec.draft_window == 0 || spec.draft_window > 5)) ||
@@ -62,7 +70,8 @@ FrameLayout plan_frames(LayoutBuilder& builder, const FrameSpec& spec) {
     const auto pack     = dimension(spec.pack_tokens);
     out.spec            = spec;
     out.staged_capacity = dimension(std::max<std::uint64_t>(chunk, std::uint64_t(width) * batch));
-    out.input_capacity  = std::max(out.staged_capacity, pack);
+    out.input_capacity =
+        std::max({out.staged_capacity, pack, static_cast<std::int32_t>(spec.mixed_tokens)});
     const auto inputs   = out.input_capacity;
     const auto staged   = out.staged_capacity;
     out.ingress         = builder.add(sizeof(FrameIngress), kAlignment, "execution ingress");
@@ -305,6 +314,19 @@ FrameInputView ExecutionFrame::decode_view(std::int32_t width, std::int32_t batc
     return {prefix(width == 1 ? anchors : input_ids, {width, batch}),
             prefix(decode_positions, {width, batch}), prefix(decode_rope, {width * batch, 3}),
             prefix(hidden, {spec.hidden, width, batch})};
+}
+
+FrameInputView ExecutionFrame::verify_view(std::int32_t column, std::int32_t width,
+                                           std::int32_t batch) const {
+    validate_input_shape(width, batch);
+    if (width > 16) throw std::invalid_argument("Qwen3.5 decode exceeds its token capacity");
+    const auto columns = width * batch;
+    if (column < 0 || spec.mixed_tokens == 0 ||
+        std::int64_t(column) + columns > std::int64_t(spec.mixed_tokens))
+        throw std::invalid_argument("Qwen3.5 verify block exceeds the mixed token axis");
+    return {input_ids.slice(0, column, columns).view({width, batch}),
+            prefix(decode_positions, {width, batch}), prefix(decode_rope, {columns, 3}),
+            hidden.slice(1, column, columns).view({spec.hidden, width, batch})};
 }
 
 FrameInputView ExecutionFrame::host_decode_view(std::int32_t width, std::int32_t batch) const {

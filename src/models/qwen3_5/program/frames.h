@@ -18,8 +18,13 @@ struct FrameSpec {
     std::uint32_t prefill_chunk = 0;
     // Summed token extent and segment count of one packed prefill execution: pack_tokens >=
     // prefill_chunk, pack_segments <= batch_capacity. Per-sequence consumers stay at one chunk.
-    std::uint32_t pack_tokens         = 0;
-    std::uint32_t pack_segments       = 1;
+    std::uint32_t pack_tokens   = 0;
+    std::uint32_t pack_segments = 1;
+    // A mixed execution appends the verify block of up to mixed_decode_rows decode rows to a
+    // packed prefill on the same token axis; mixed_tokens (0 when the frame does not mix) is the
+    // resolved extent of that axis, see resolve_mixed_tokens().
+    std::uint32_t mixed_decode_rows   = 0;
+    std::uint32_t mixed_tokens        = 0;
     std::uint32_t batch_capacity      = 1;
     std::uint32_t draft_window        = 0;
     SpeculativeBackend backend        = SpeculativeBackend::None;
@@ -170,6 +175,11 @@ public:
     [[nodiscard]] FrameInputView host_input_view(std::int32_t width, std::int32_t batch) const;
     [[nodiscard]] FrameInputView decode_view(std::int32_t width, std::int32_t batch) const;
     [[nodiscard]] FrameInputView host_decode_view(std::int32_t width, std::int32_t batch) const;
+    // Verify block of a mixed execution: columns [column, column + width * batch) of the shared
+    // token axis. Ids and hidden are those columns; positions and RoPE are the dense decode
+    // planes, exactly as decode_view binds them.
+    [[nodiscard]] FrameInputView verify_view(std::int32_t column, std::int32_t width,
+                                             std::int32_t batch) const;
 
     const FrameSpec spec;
     const std::int32_t input_capacity;

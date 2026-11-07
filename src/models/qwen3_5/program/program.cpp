@@ -149,6 +149,15 @@ void RankProgramImpl::validate_work(const Work& work, runtime::FrameKind kind) c
             present = true;
         }
     };
+    auto validate_decode_extents = [&](const auto& rows) {
+        for (const auto& row : rows) {
+            if (!row.binding.main_frontier || row.draft_extent > draft_window ||
+                row.binding.main_frontier + row.draft_extent + 1 > capacity || row.anchor < 0 ||
+                static_cast<std::uint32_t>(row.anchor) >= parameters.profile->public_tokens ||
+                !row.output_tokens_remaining || row.draft_extent >= row.output_tokens_remaining)
+                throw std::invalid_argument("Qwen3.5 decode extent exceeds its execution permit");
+        }
+    };
     std::visit(
         [&](const auto& op) {
             using T = std::decay_t<decltype(op)>;
@@ -199,17 +208,23 @@ void RankProgramImpl::validate_work(const Work& work, runtime::FrameKind kind) c
             } else if constexpr (std::is_same_v<T, DecodeWork>) {
                 validate_members(
                     op.rows, [](const auto& row) -> const ExecutionRow& { return row.binding; });
-                for (const auto& row : op.rows) {
-                    if (!row.binding.main_frontier || row.draft_extent > draft_window ||
-                        row.binding.main_frontier + row.draft_extent + 1 > capacity ||
-                        row.anchor < 0 ||
-                        static_cast<std::uint32_t>(row.anchor) >=
-                            parameters.profile->public_tokens ||
-                        !row.output_tokens_remaining ||
-                        row.draft_extent >= row.output_tokens_remaining)
-                        throw std::invalid_argument(
-                            "Qwen3.5 decode extent exceeds its execution permit");
-                }
+                validate_decode_extents(op.rows);
+            } else if constexpr (std::is_same_v<T, MixedWork>) {
+                // The two parts are distinct sequences: one residency cannot prefill and decode in
+                // the same traversal.
+                validate_members(
+                    op.decode.rows,
+                    [](const auto& row) -> const ExecutionRow& { return row.binding; });
+                validate_members(op.prefill.rows,
+                                 [](const auto& row) -> const ExecutionRow& { return row; });
+                for (const auto& prefill : op.prefill.rows)
+                    for (const auto& decode : op.decode.rows)
+                        if (prefill.member.residency.lane.value ==
+                            decode.binding.member.residency.lane.value)
+                            throw std::invalid_argument("Qwen3.5 mixed work repeats a residency");
+                for (const auto& input : op.prefill.inputs) validate_input(input, prefill_chunk);
+                validate_decode_extents(op.decode.rows);
+                validate_mixed(op);
             } else if constexpr (std::is_same_v<T, NormalizeWork>) {
                 validate_members(op.rows,
                                  [](const auto& row) -> const ExecutionRow& { return row; });
@@ -265,8 +280,7 @@ void RankProgramImpl::prepare_commit(runtime::ExecutionTicket ticket, Commit& va
     if (op.stage != ComputeStage::AwaitCommit || !op.result_published)
         throw std::logic_error("Qwen3.5 commit does not match the pending result");
     const auto* forward  = std::get_if<ForwardWork>(&op.request.work.operation);
-    const bool generated = std::holds_alternative<DecodeWork>(op.request.work.operation) ||
-                           (forward && forward->sample != SamplePurpose::None);
+    const bool generated = has_decode(op) || (forward && forward->sample != SamplePurpose::None);
     if (!generated) {
         if (!value.rows.empty() && value.rows.size() != op.batch)
             throw std::invalid_argument("Qwen3.5 non-generating commit has invalid membership");

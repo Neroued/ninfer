@@ -42,6 +42,13 @@ void RankProgramImpl::progress() {
                 operation.stage = ComputeStage::Readback;
                 break;
             }
+            if (operation.mixed) {
+                if (operation.speculative) begin_draft(operation);
+                request_decision(operation);
+                begin_target(operation);
+                operation.stage = ComputeStage::Forward;
+                break;
+            }
             if (std::holds_alternative<DecodeWork>(operation.request.work.operation)) {
                 if (!operation.speculative || !graphs) append_draft_history(operation);
                 if (operation.speculative) begin_draft(operation);
@@ -56,6 +63,11 @@ void RankProgramImpl::progress() {
             if (!advance_target(operation)) {
                 request_decision(operation);
                 return;
+            }
+            if (operation.mixed) {
+                finish_mixed_forward(operation);
+                operation.stage = ComputeStage::AwaitDecision;
+                break;
             }
             if (std::holds_alternative<DecodeWork>(operation.request.work.operation)) {
                 if (backend == SpeculativeBackend::Mtp && !operation.speculative)
@@ -167,17 +179,30 @@ void RankProgramImpl::progress() {
     }
 }
 
+// A mixed traversal is complete: the segments align their MTP history and publish their
+// continuation hidden, then the decode rows project their logits from the verify block.
+void RankProgramImpl::finish_mixed_forward(ComputeOperation& operation) {
+    if (backend == SpeculativeBackend::Mtp) align_packed_mtp_history(operation);
+    publish_continuation_hidden(operation);
+    resources.work.reset();
+    project_decode(operation.batch, operation.width, operation.prefill_tokens);
+    gpu_timer.end_target();
+    operation.projected = true;
+}
+
 // Each sequence's last Main hidden column seeds its continuation: the next window, the first
 // token's sampling and MTP conditioning read it from the destination State.
 void RankProgramImpl::publish_continuation_hidden(ComputeOperation& operation) {
-    const auto hidden  = resources.frame.input_view(static_cast<int>(operation.width), 1).hidden;
+    const auto total =
+        static_cast<int>(operation.mixed ? operation.axis_tokens : operation.width);
+    const auto hidden  = resources.frame.input_view(total, 1).hidden;
     const auto publish = [&](std::uint32_t last_column, std::int64_t destination) {
         const auto source = hidden.slice(1, static_cast<int>(last_column), 1);
         const auto target = resources.state_images.continuation_hidden(destination);
         CUDA_CHECK(cudaMemcpyAsync(target.data, source.data, target.bytes(),
                                    cudaMemcpyDeviceToDevice, device.stream()));
     };
-    if (operation.packed) {
+    if (operation.packed || operation.mixed) {
         for (const auto& segment : operation.segments)
             publish(segment.token_offset + segment.tokens - 1, segment.destination_offset);
         return;

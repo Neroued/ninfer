@@ -51,7 +51,7 @@ void gather_conditioning(Resources& resources, int first, int batch, CudaExecuti
 } // namespace
 
 void RankProgramImpl::prepare_mtp_draft(ComputeOperation& operation) {
-    const auto& work  = std::get<DecodeWork>(operation.request.work.operation);
+    const auto& work  = decode_part(operation);
     auto& frame       = resources.frame;
     const auto batch  = static_cast<std::int32_t>(operation.batch);
     for (std::uint32_t step = 0; step < draft_window; ++step) {
@@ -113,10 +113,13 @@ void RankProgramImpl::run_mtp_draft(std::uint32_t batch_size, std::uint32_t step
 }
 
 void RankProgramImpl::begin_mtp_draft(ComputeOperation& operation) {
-    if (operation.drafts == 0) return;
+    // A mixed execution always verifies at the full width, so its first step must write the
+    // anchor's MTP history even when no row proposes a draft.
+    if (operation.drafts == 0 && !operation.mixed) return;
     std::uint32_t maximum = 1;
-    for (const auto& row : operation.rows) maximum = std::max(maximum, row.main_frontier);
-    run_mtp_draft(operation.batch, operation.drafts, maximum);
+    for (std::uint32_t row = 0; row < operation.batch; ++row)
+        maximum = std::max(maximum, operation.rows[row].main_frontier);
+    run_mtp_draft(operation.batch, std::max(operation.drafts, 1U), maximum);
 }
 
 void RankProgramImpl::align_mtp_history(ComputeOperation& operation) {
@@ -185,11 +188,19 @@ void RankProgramImpl::align_packed_mtp_history(ComputeOperation& operation) {
     const auto cuda          = device.execution_view();
     const auto mtp_execution = mtp_view(parameters, resources, cuda, proposal_head);
     const auto hidden        = execution::dimension(parameters.profile->config.text.hidden_size);
-    const auto total         = static_cast<std::int32_t>(operation.width);
-    const auto count         = static_cast<std::int32_t>(operation.segments.size());
-    const auto main          = frame.input_view(total, 1);
-    const auto main_rope     = causal_rope(main.rope_positions, total, 1);
-    const auto previous_rope = packed(frame.previous_rope, {count, 3});
+    const auto total = static_cast<std::int32_t>(operation.mixed ? operation.axis_tokens
+                                                                 : operation.width);
+    const auto count = static_cast<std::int32_t>(operation.segments.size());
+    const auto main      = frame.input_view(total, 1);
+    const auto main_rope = causal_rope(main.rope_positions, total, 1);
+    // The segments' previous RoPE block starts behind the rows that precede them (the decode
+    // rows of a mixed execution); a packed prefill has none.
+    const auto first_row     = static_cast<std::int32_t>(operation.segments.front().row);
+    const auto previous_skip = std::size_t(3) * first_row * sizeof(std::int32_t);
+    const Tensor previous_rope(
+        {static_cast<unsigned char*>(frame.previous_rope.data) + previous_skip,
+         frame.previous_rope.bytes() - previous_skip, frame.previous_rope.device},
+        DType::I32, {count, 3});
     for (const auto& segment : operation.segments) {
         const auto row     = static_cast<std::int32_t>(segment.row);
         const auto begin   = static_cast<std::int32_t>(segment.token_offset);
@@ -209,7 +220,7 @@ void RankProgramImpl::align_packed_mtp_history(ComputeOperation& operation) {
              main.ids.slice(0, begin, width),
              main.cache_positions.slice(0, begin, width),
              main_rope.slice(0, begin, width),
-             previous_rope.slice(0, row, 1).permute({1, 0, 2, 3}),
+             previous_rope.slice(0, row - first_row, 1).permute({1, 0, 2, 3}),
              frame.valid_columns.slice(0, row, 1),
              frame.history_skip.slice(0, row, 1),
              {}},
@@ -226,7 +237,7 @@ void RankProgramImpl::align_packed_mtp_history(ComputeOperation& operation) {
     }
 }
 
-void RankProgramImpl::rebuild_mtp_history(std::uint32_t batch_size) {
+void RankProgramImpl::rebuild_mtp_history(std::uint32_t batch_size, std::uint32_t column) {
     auto& frame       = resources.frame;
     auto& mtp         = *frame.mtp;
     const auto cuda   = device.execution_view();
@@ -234,7 +245,8 @@ void RankProgramImpl::rebuild_mtp_history(std::uint32_t batch_size) {
     const auto width  = static_cast<std::int32_t>(draft_window + 1);
     const auto count  = static_cast<std::int32_t>(draft_window);
     const auto hidden = execution::dimension(parameters.profile->config.text.hidden_size);
-    const auto main   = frame.decode_view(width, batch);
+    const auto main   = column ? frame.verify_view(static_cast<std::int32_t>(column), width, batch)
+                               : frame.decode_view(width, batch);
     auto conditioning = packed(mtp.history_conditioning, {hidden, count, batch});
     auto ids          = packed(mtp.history_ids, {count, batch});
     auto positions    = packed(mtp.history_positions, {count, batch});

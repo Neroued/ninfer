@@ -250,6 +250,23 @@ struct PrefillStart {
     std::uint32_t segments = 0;
 };
 
+// `segments` and `decode_rows` are the prefixes of the candidate lists the execution admitted,
+// which may be shorter than requested. Zero decode rows means the execution is an ordinary packed
+// prefill and reports a PrefillProgress.
+struct MixedStart {
+    runtime::ExecutionTicket ticket;
+    std::uint32_t segments    = 0;
+    std::uint32_t decode_rows = 0;
+};
+
+// The event members are the prefill segments followed by the decode rows. `prefill` follows the
+// segments; none of its rows carries a pending batch. `decode` covers the decode rows only and is
+// the object committed or discarded; the segments settle with it.
+struct MixedProgress {
+    PrefillProgress prefill;
+    PendingBatch decode;
+};
+
 struct CommitRowResult {
     runtime::CommitDisposition disposition = runtime::CommitDisposition::Active;
     SpeculativeStats speculative;
@@ -321,9 +338,9 @@ struct ScoreComplete {
 struct SessionEvent {
     runtime::ExecutionTicket ticket;
     std::vector<SequenceHandle> members;
-    std::variant<PrefillProgress, PendingBatch, ReplayProgress, ControlComplete, ScoreComplete,
-                 ContextProgress, runtime::DecisionRequest, runtime::DecisionConsumed,
-                 runtime::ExecutionComplete>
+    std::variant<PrefillProgress, PendingBatch, MixedProgress, ReplayProgress, ControlComplete,
+                 ScoreComplete, ContextProgress, runtime::DecisionRequest,
+                 runtime::DecisionConsumed, runtime::ExecutionComplete>
         result;
 };
 
@@ -462,6 +479,23 @@ public:
     // empty or parallel to `sequences`.
     [[nodiscard]] std::optional<PrefillStart>
     start_prefill(std::span<const SequenceHandle> sequences, std::span<const bool> constrained);
+    // Upper bound on the decode rows one start_mixed call carries; zero when this Session never
+    // mixes (offloaded experts, masked draft windows, scoring, a single lane).
+    [[nodiscard]] std::uint32_t mixed_decode_limit() const noexcept;
+    // True when the sequence's next prefill window can share an execution with decode rows: a
+    // non-final, text-only window that stays inside one prefix execution segment.
+    [[nodiscard]] bool prefill_mixable(SequenceHandle) const;
+    // Carries a packed prefill and decode rows in one execution. The first prefill segment must be
+    // mixable; later ones follow the packing rules and additionally need prefill_mixable, and the
+    // total stays within prefill_pack_tokens(). Decode rows are admitted in the given order up to
+    // mixed_decode_limit() and stop before the first constrained row. No admitted decode row makes
+    // this an ordinary packed prefill. `prefill_constrained` and `decode_constrained` are empty or
+    // parallel to their sequences.
+    [[nodiscard]] std::optional<MixedStart>
+    start_mixed(std::span<const SequenceHandle> prefill, std::span<const bool> prefill_constrained,
+                std::span<const SequenceHandle> decode,
+                std::span<const runtime::RoundBudget> budgets,
+                std::span<const bool> decode_constrained);
     [[nodiscard]] std::optional<runtime::ExecutionTicket> start_replay(SequenceHandle);
     [[nodiscard]] std::optional<runtime::ExecutionTicket>
     start_decode(std::span<const SequenceHandle>, std::span<const runtime::RoundBudget>,

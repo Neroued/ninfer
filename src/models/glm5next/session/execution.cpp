@@ -1,6 +1,7 @@
 #include "models/glm5next/session/internal.h"
 
 #include <algorithm>
+#include <stdexcept>
 
 namespace ninfer::models::glm5next {
 namespace {
@@ -21,6 +22,18 @@ void submit(detail::SessionImpl& session, runtime::ExecutionReservation reservat
 std::uint32_t Session::prefill_pack_limit() const noexcept { return 1; }
 
 std::uint32_t Session::prefill_pack_tokens() const noexcept { return impl_->shape.prefill_chunk; }
+
+std::uint32_t Session::mixed_decode_limit() const noexcept { return 0; }
+
+bool Session::prefill_mixable(SequenceHandle) const { return false; }
+
+std::optional<MixedStart> Session::start_mixed(std::span<const SequenceHandle>,
+                                               std::span<const bool>,
+                                               std::span<const SequenceHandle>,
+                                               std::span<const runtime::RoundBudget>,
+                                               std::span<const bool>) {
+    throw std::logic_error("this model does not mix decode rows into a prefill execution");
+}
 
 std::optional<PrefillStart> Session::start_prefill(std::span<const SequenceHandle> sequences,
                                                    std::span<const bool> constrained_rows) {

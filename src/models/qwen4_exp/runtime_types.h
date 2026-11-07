@@ -35,6 +35,7 @@ struct RuntimeTypes {
     using ContextProgress   = qwen4_exp::ContextProgress;
     using PendingBatch      = qwen4_exp::PendingBatch;
     using PrefillProgress   = qwen4_exp::PrefillProgress;
+    using MixedProgress     = qwen4_exp::MixedProgress;
     using ReplayProgress    = qwen4_exp::ReplayProgress;
     using ControlComplete   = qwen4_exp::ControlComplete;
     using ScoreComplete     = qwen4_exp::ScoreComplete;

@@ -153,6 +153,8 @@ SessionPlan plan_session(const SequencePlan& sequence) {
     out.prefill_chunk       = source.prefill_chunk;
     out.pack_tokens         = source.pack_tokens;
     out.pack_segments       = source.pack_segments;
+    out.mixed_decode_rows   = source.mixed_decode_rows;
+    out.mixed_tokens        = source.mixed_tokens;
     out.draft_window        = source.draft_window;
     out.speculative_backend = source.speculative_backend;
     out.context_cache       = source.context_cache;

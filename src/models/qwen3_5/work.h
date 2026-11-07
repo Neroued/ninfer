@@ -75,6 +75,14 @@ struct DecodeWork {
     std::vector<DecodeRow> rows;
 };
 
+// One execution that carries prefill segments and decode rows on a single token axis, ordered
+// [prefill segments | verify block]. `prefill` holds non-final text-only windows (no sampling,
+// no vision, no control tokens) and `decode` holds unconstrained rows; their members are distinct.
+struct MixedWork {
+    ForwardWork prefill;
+    DecodeWork decode;
+};
+
 // DFlash target features occupy a residency's persistent plane until this range is appended.
 struct NormalizeWork {
     std::vector<ExecutionRow> rows;
@@ -100,7 +108,8 @@ struct ScoreWork {
 
 struct Work {
     context::ContextActions context;
-    std::variant<ForwardWork, DecodeWork, NormalizeWork, ContextWork, ScoreWork> operation;
+    std::variant<ForwardWork, DecodeWork, MixedWork, NormalizeWork, ContextWork, ScoreWork>
+        operation;
 };
 
 struct GeneratedResult {
@@ -117,6 +126,13 @@ struct ForwardResult {
     std::optional<GeneratedResult> generated;
 };
 
+// The prefill part reports the processed tokens of every segment and never samples; the decode
+// part is the licensed prefix of every decode row.
+struct MixedResult {
+    ForwardResult prefill;
+    GeneratedResult decode;
+};
+
 struct ContextResult {
     std::vector<runtime::ContextTransferObservation> transfers;
 };
@@ -129,7 +145,8 @@ struct ScoreResult {
 };
 
 struct Result {
-    std::variant<ForwardResult, GeneratedResult, NormalizeResult, ContextResult, ScoreResult>
+    std::variant<ForwardResult, GeneratedResult, MixedResult, NormalizeResult, ContextResult,
+                 ScoreResult>
         output;
 };
 

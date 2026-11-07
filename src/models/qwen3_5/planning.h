@@ -69,8 +69,12 @@ struct SessionPlan {
     std::uint32_t prefill_chunk   = 0;
     // One prefill execution packs at most pack_segments sequence windows whose lengths sum to at
     // most pack_tokens (>= prefill_chunk).
-    std::uint32_t pack_tokens              = 0;
-    std::uint32_t pack_segments            = 0;
+    std::uint32_t pack_tokens   = 0;
+    std::uint32_t pack_segments = 0;
+    // A mixed execution carries a packed prefill followed by up to mixed_decode_rows decode rows
+    // on one token axis of at most mixed_tokens columns. Zero rows means the model does not mix.
+    std::uint32_t mixed_decode_rows        = 0;
+    std::uint32_t mixed_tokens             = 0;
     std::uint32_t draft_window             = 0;
     SpeculativeBackend speculative_backend = SpeculativeBackend::None;
     ContextCacheOptions context_cache;

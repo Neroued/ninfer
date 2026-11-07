@@ -384,6 +384,19 @@ std::optional<PrefillStart> Session::start_prefill(std::span<const SequenceHandl
     return impl_->start_prefill(sequences, constrained);
 }
 
+std::uint32_t Session::mixed_decode_limit() const noexcept { return impl_->mixed_decode_limit(); }
+
+bool Session::prefill_mixable(SequenceHandle h) const { return impl_->prefill_mixable(h); }
+
+std::optional<MixedStart> Session::start_mixed(std::span<const SequenceHandle> prefill,
+                                               std::span<const bool> prefill_constrained,
+                                               std::span<const SequenceHandle> decode,
+                                               std::span<const runtime::RoundBudget> budgets,
+                                               std::span<const bool> decode_constrained) {
+    const OperationWatch watch(*impl_);
+    return impl_->start_mixed(prefill, prefill_constrained, decode, budgets, decode_constrained);
+}
+
 std::optional<runtime::ExecutionTicket> Session::start_replay(SequenceHandle h) {
     const OperationWatch watch(*impl_);
     return impl_->start_replay(h);

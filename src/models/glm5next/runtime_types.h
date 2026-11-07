@@ -35,6 +35,7 @@ struct RuntimeTypes {
     using ContextProgress   = glm5next::ContextProgress;
     using PendingBatch      = glm5next::PendingBatch;
     using PrefillProgress   = glm5next::PrefillProgress;
+    using MixedProgress     = glm5next::MixedProgress;
     using ReplayProgress    = glm5next::ReplayProgress;
     using ControlComplete   = glm5next::ControlComplete;
     using ScoreComplete     = glm5next::ScoreComplete;

@@ -281,6 +281,133 @@ void RankProgramImpl::initialize_decode(ComputeOperation& operation, const Decod
     if (!graphs || resources.dflash) upload_ingress();
 }
 
+// A mixed execution lays its decode rows out as compact rows [0, D) of the ingress arrays, exactly
+// as a decode execution does, and its prefill segments as compact rows [D, D + S). The token axis
+// holds the segments first and the verify block ([W, D], width fastest) after them. Backend None
+// verifies the anchor alone (W = 1); MTP always verifies at the full draft width, each row valid
+// up to its own extent.
+void RankProgramImpl::initialize_mixed(ComputeOperation& operation, const MixedWork& work) {
+    auto& frame         = resources.frame;
+    *frame.host_ingress = {};
+    const auto rows     = static_cast<std::uint32_t>(work.decode.rows.size());
+    const auto count    = static_cast<std::uint32_t>(work.prefill.rows.size());
+    operation.mixed     = true;
+    operation.batch     = rows;
+    operation.speculative = backend == SpeculativeBackend::Mtp;
+    operation.width       = backend == SpeculativeBackend::Mtp ? draft_window + 1 : 1;
+    operation.rows.reserve(rows + count);
+    for (std::uint32_t i = 0; i < rows; ++i) {
+        const auto& row = work.decode.rows[i];
+        operation.rows.push_back(row.binding);
+        operation.sampling.push_back(row.sampling);
+        operation.drafts = std::max(operation.drafts, row.draft_extent);
+        bind_row(*frame.host_ingress, i, row.binding);
+        frame.host_ingress->anchors[i]                = row.anchor;
+        frame.host_ingress->extents[i]                = static_cast<int>(row.draft_extent);
+        frame.host_ingress->valid_columns[i]          = static_cast<int>(row.draft_extent + 1);
+        frame.host_ingress->proposal_valid_columns[i] = static_cast<int>(draft_window + 1);
+        frame.host_ingress->budgets[i]                = static_cast<int>(row.output_tokens_remaining);
+        frame.host_ingress->sampling[i]               = sampling_config(row.binding, row.sampling, i);
+        frame.host_ingress->history_skip[i]           = operation.speculative ? 1 : 0;
+        for (int axis = 0; axis < 3; ++axis)
+            frame.host_ingress->previous_rope[axis * rows + i] = row.binding.tail_rope_position[axis];
+    }
+    // Segment rows keep their own previous-RoPE block behind the decode rows' block.
+    const auto previous_rope = [&](std::uint32_t segment, int axis) -> std::int32_t& {
+        return frame.host_ingress->previous_rope[3 * rows + axis * count + segment];
+    };
+    operation.segments.clear();
+    operation.segments.reserve(count);
+    std::uint32_t total = 0;
+    for (std::uint32_t i = 0; i < count; ++i) {
+        const auto& row    = work.prefill.rows[i];
+        const auto columns = static_cast<std::uint32_t>(work.prefill.inputs[i].tokens.size());
+        operation.rows.push_back(row);
+        bind_row(*frame.host_ingress, rows + i, row);
+        frame.host_ingress->valid_columns[rows + i] = static_cast<std::int32_t>(columns);
+        for (int axis = 0; axis < 3; ++axis) previous_rope(i, axis) = row.tail_rope_position[axis];
+        operation.segments.push_back(
+            {rows + i, total, columns, row.state_offsets.source, row.state_offsets.destination});
+        total += columns;
+    }
+    operation.prefill_tokens = total;
+    operation.axis_tokens    = total + operation.width * rows;
+    operation.input_embeddings.reset();
+    auto host       = frame.host_input_view(static_cast<int>(operation.axis_tokens), 1);
+    auto* ids       = static_cast<TokenId*>(host.ids.data);
+    auto* positions = static_cast<std::int32_t*>(host.cache_positions.data);
+    auto* rope      = static_cast<std::int32_t*>(host.rope_positions.data);
+    for (const auto& segment : operation.segments) {
+        const auto& window = work.prefill.inputs[segment.row - rows];
+        const auto& row    = work.prefill.rows[segment.row - rows];
+        std::copy(window.tokens.begin(), window.tokens.end(), ids + segment.token_offset);
+        for (std::uint32_t i = 0; i < segment.tokens; ++i)
+            positions[segment.token_offset + i] = static_cast<std::int32_t>(row.main_frontier + i);
+        for (int axis = 0; axis < 3; ++axis)
+            std::copy_n(window.rope_positions.begin() + axis * segment.tokens, segment.tokens,
+                        rope + axis * operation.axis_tokens + segment.token_offset);
+    }
+    // The verify block: ids are the anchors (speculative ids are written on the device after the
+    // draft), positions clamp at each row's extent. The dense decode planes carry the same
+    // positions for the commit-side consumers.
+    auto dense          = frame.host_decode_view(static_cast<int>(operation.width),
+                                                 static_cast<int>(rows));
+    auto* dense_cache   = static_cast<std::int32_t*>(dense.cache_positions.data);
+    auto* dense_rope    = static_cast<std::int32_t*>(dense.rope_positions.data);
+    const auto columns  = operation.width * rows;
+    for (std::uint32_t row = 0; row < rows; ++row) {
+        const auto& decode = work.decode.rows[row];
+        for (std::uint32_t column = 0; column < operation.width; ++column) {
+            const auto local    = row * operation.width + column;
+            const auto index    = total + local;
+            const auto position = static_cast<std::int32_t>(
+                decode.binding.main_frontier + std::min(column, decode.draft_extent));
+            ids[index]       = decode.anchor;
+            positions[index] = position;
+            dense_cache[local] = position;
+            for (int axis = 0; axis < 3; ++axis) {
+                const auto value = position + decode.binding.rope_delta;
+                rope[axis * operation.axis_tokens + index] = value;
+                dense_rope[axis * columns + local]         = value;
+            }
+        }
+    }
+    if (operation.speculative) prepare_mtp_draft(operation);
+    upload_ingress();
+    upload_input(operation.axis_tokens, 1);
+}
+
+// The supported extent of a mixed execution is owned here: non-final text-only windows packed as
+// in a packed prefill, followed by unconstrained decode rows, within the planned token axis.
+void RankProgramImpl::validate_mixed(const MixedWork& work) const {
+    const auto& spec = resources.frame.spec;
+    if (spec.mixed_tokens == 0 || resources.dflash ||
+        (backend != SpeculativeBackend::None && backend != SpeculativeBackend::Mtp))
+        throw std::invalid_argument("Qwen3.5 mixed execution is not prepared");
+    const auto& prefill = work.prefill;
+    const auto& decode  = work.decode;
+    if (prefill.purpose != ForwardPurpose::Prefill || prefill.sample != SamplePurpose::None ||
+        !prefill.control_last_tokens.empty() || prefill.rows.empty() ||
+        prefill.rows.size() > spec.pack_segments || prefill.inputs.size() != prefill.rows.size() ||
+        decode.rows.empty() || decode.rows.size() > spec.mixed_decode_rows)
+        throw std::invalid_argument("Qwen3.5 mixed execution has unsupported membership");
+    std::uint64_t total = 0;
+    for (std::size_t i = 0; i < prefill.rows.size(); ++i) {
+        const auto& input = prefill.inputs[i];
+        if (input.tokens.empty() || input.visual || !input.execution_splits.empty() ||
+            input.tokens.size() > prefill_chunk ||
+            prefill.rows[i].main_frontier + input.tokens.size() > capacity)
+            throw std::invalid_argument("Qwen3.5 mixed prefill window cannot share an execution");
+        total += input.tokens.size();
+    }
+    for (const auto& row : decode.rows)
+        if (row.sampling.constrained)
+            throw std::invalid_argument("Qwen3.5 mixed decode rows cannot be constrained");
+    const auto width = backend == SpeculativeBackend::Mtp ? draft_window + 1ULL : 1ULL;
+    if (total > spec.pack_tokens || total + width * decode.rows.size() > spec.mixed_tokens)
+        throw std::invalid_argument("Qwen3.5 mixed execution exceeds its token capacity");
+}
+
 void RankProgramImpl::initialize_score(ComputeOperation& operation, const ScoreWork& work) {
     ForwardWork forward;
     forward.rows.push_back(work.row);
@@ -297,6 +424,8 @@ void RankProgramImpl::initialize_inputs(ComputeOperation& operation) {
         initialize_forward(operation, *work);
     else if (const auto* work = std::get_if<DecodeWork>(&operation.request.work.operation))
         initialize_decode(operation, *work);
+    else if (const auto* work = std::get_if<MixedWork>(&operation.request.work.operation))
+        initialize_mixed(operation, *work);
     else if (const auto* work = std::get_if<ScoreWork>(&operation.request.work.operation))
         initialize_score(operation, *work);
     else if (const auto* work = std::get_if<NormalizeWork>(&operation.request.work.operation)) {

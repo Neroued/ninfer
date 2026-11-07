@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <limits>
 #include <stdexcept>
 #include <string>
 
@@ -51,6 +52,25 @@ inline constexpr std::uint32_t kPrefillPackChunks = 2;
         kPrefillChunkAlignment;
     const std::uint64_t packed = std::uint64_t{prefill_chunk} * kPrefillPackChunks;
     return std::max(prefill_chunk, static_cast<std::uint32_t>(std::min(packed, aligned_context)));
+}
+
+// Upper bound of the token axis of one mixed execution: a packed prefill (at most `pack_tokens`)
+// followed by the verify block of up to `mixed_decode_rows` decode rows, each `draft_window + 1`
+// columns wide. Zero decode rows means the model does not mix and the result is zero. Planning
+// sizes the mixed workspace and the execution frame from it, and the Program admits work against
+// it; no other place derives this extent.
+[[nodiscard]] inline std::uint32_t resolve_mixed_tokens(std::uint32_t pack_tokens,
+                                                        std::uint32_t mixed_decode_rows,
+                                                        std::uint32_t draft_window) {
+    if (mixed_decode_rows == 0) return 0;
+    if (pack_tokens == 0 || pack_tokens % kPrefillChunkAlignment != 0)
+        throw std::invalid_argument("pack_tokens must be a nonzero multiple of " +
+                                    std::to_string(kPrefillChunkAlignment));
+    const std::uint64_t tokens =
+        std::uint64_t{pack_tokens} + std::uint64_t{mixed_decode_rows} * (draft_window + 1ULL);
+    if (tokens > std::numeric_limits<std::int32_t>::max())
+        throw std::invalid_argument("mixed token axis exceeds the Tensor domain");
+    return static_cast<std::uint32_t>(tokens);
 }
 
 } // namespace ninfer::models::qwen3_5

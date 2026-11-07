@@ -49,12 +49,14 @@ void RankProgramImpl::request_decision(ComputeOperation& operation) {
     events.emplace_back(runtime::DecisionNeeded{operation.request.ticket, std::move(request)});
 }
 
-void RankProgramImpl::project_decode(std::uint32_t batch_value, std::uint32_t width_value) {
+void RankProgramImpl::project_decode(std::uint32_t batch_value, std::uint32_t width_value,
+                                     std::uint32_t column) {
     auto& frame     = resources.frame;
     const int batch = static_cast<int>(batch_value), width = static_cast<int>(width_value);
     const int rows       = frame.spec.output_rows;
     const int vocabulary = execution::dimension(parameters.profile->public_tokens);
-    Tensor hidden        = frame.input_view(width, batch).hidden;
+    Tensor hidden = column ? frame.verify_view(static_cast<int>(column), width, batch).hidden
+                           : frame.input_view(width, batch).hidden;
     Tensor logits        = prefix(frame.logits, {rows, width, batch});
     Tensor flat_logits   = logits.view({rows, width * batch});
     execution::project(hidden.view({hidden.ne[0], width * batch}), parameters.text.output_head,
@@ -132,7 +134,7 @@ void RankProgramImpl::launch_decision(ComputeOperation& operation) {
         events.emplace_back(std::move(consumed));
     }
     resources.work.reset();
-    if (std::holds_alternative<DecodeWork>(operation.request.work.operation)) {
+    if (has_decode(operation)) {
         if (!operation.projected) {
             project_decode(operation.batch, operation.width);
             gpu_timer.end_target();
@@ -186,11 +188,10 @@ void RankProgramImpl::launch_decision(ComputeOperation& operation) {
 
 void RankProgramImpl::publish_result(ComputeOperation& operation) {
     gpu_timer.observe_result(operation.gpu);
-    if (std::holds_alternative<DecodeWork>(operation.request.work.operation))
-        gpu_timer.observe_decode(operation.gpu, operation.speculative);
+    if (has_decode(operation)) gpu_timer.observe_decode(operation.gpu, operation.speculative);
     Result result;
     const auto* forward  = std::get_if<ForwardWork>(&operation.request.work.operation);
-    const bool generated = std::holds_alternative<DecodeWork>(operation.request.work.operation) ||
+    const bool generated = has_decode(operation) ||
                            (forward && forward->sample != SamplePurpose::None);
     if (generated) {
         auto& output = *resources.frame.host_egress;
@@ -216,7 +217,13 @@ void RankProgramImpl::publish_result(ComputeOperation& operation) {
                         "Qwen3.5 sampling returned a token outside the vocabulary");
             }
         }
-        if (forward) {
+        if (operation.mixed) {
+            // Every segment completed in the one traversal; none samples.
+            ForwardResult prefill;
+            for (const auto& segment : operation.segments)
+                prefill.processed_tokens.push_back(segment.tokens);
+            result.output = MixedResult{std::move(prefill), std::move(value)};
+        } else if (forward) {
             auto info      = std::get<ForwardResult>(std::move(operation.result->output));
             info.generated = std::move(value);
             result.output  = std::move(info);

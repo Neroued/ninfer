@@ -43,6 +43,14 @@ enum class GdnWorkspacePath : std::uint8_t {
     ReplayRecord,
 };
 
+// The verify block that follows the prefill segments of a mixed traversal: `batch` decode rows of
+// `width` columns each, mixed in through `path`.
+struct MixedTail {
+    std::int32_t batch;
+    std::int32_t width;
+    GdnWorkspacePath path;
+};
+
 std::size_t checked_add(std::size_t a, std::size_t b, const char* label) {
     if (b > std::numeric_limits<std::size_t>::max() - a) { throw std::overflow_error(label); }
     return a + b;
@@ -115,6 +123,8 @@ ResourceLayout persistent_layout(const SequencePlanImpl& plan) {
         .prefill_chunk       = std::min(plan.prefill_chunk, plan.capacity),
         .pack_tokens         = plan.pack_tokens,
         .pack_segments       = plan.pack_segments,
+        .mixed_decode_rows   = plan.mixed_decode_rows,
+        .mixed_tokens        = plan.mixed_tokens,
         .batch_capacity      = plan.max_concurrency,
         .draft_window        = plan.draft_window,
         .backend             = plan.speculative_backend,
@@ -176,7 +186,8 @@ WorkspaceSpec build_workspace_plan(const SequencePlanImpl& plan) {
                                  std::int32_t last, TextPhase phase, GdnWorkspacePath path,
                                  std::int32_t batch_size, std::int32_t min_width,
                                  std::int32_t max_width,
-                                 ops::CausalAttentionExecutionEnvelope envelope) {
+                                 ops::CausalAttentionExecutionEnvelope envelope,
+                                 const MixedTail* tail = nullptr) {
         for (const auto& block : profile.text.layers) {
             {
                 auto stage = layout.scope();
@@ -186,12 +197,19 @@ WorkspaceSpec build_workspace_plan(const SequencePlanImpl& plan) {
                     scratch(layout, execution::attention_projection_workspace_bytes(*attention,
                                                                                     first, last));
                     (void)workspace::text_attention_results(layout, config, last);
-                    scratch(layout, ops::causal_softmax_attention_workspace_capacity_bytes(
-                                        {dimension(config.attention->head_dim),
-                                         dimension(config.attention->num_attention_heads),
-                                         dimension(config.attention->num_key_value_heads)},
-                                        plan.kv_storage, envelope, batch_size, min_width, max_width,
-                                        plan.multiprocessor_count));
+                    const auto attention_bytes = [&](std::int32_t batch, std::int32_t lo,
+                                                     std::int32_t hi) {
+                        return ops::causal_softmax_attention_workspace_capacity_bytes(
+                            {dimension(config.attention->head_dim),
+                             dimension(config.attention->num_attention_heads),
+                             dimension(config.attention->num_key_value_heads)},
+                            plan.kv_storage, envelope, batch, lo, hi, plan.multiprocessor_count);
+                    };
+                    // The prefill segments and the verify block call the Op one after the other.
+                    scratch(layout, std::max(attention_bytes(batch_size, min_width, max_width),
+                                             tail ? attention_bytes(tail->batch, tail->width,
+                                                                    tail->width)
+                                                  : std::size_t{0}));
                     add_scratch(layout, attention->output, first, last);
                 } else {
                     const auto& gdn = std::get<execution::GdnProfile>(block.mixer);
@@ -199,6 +217,13 @@ WorkspaceSpec build_workspace_plan(const SequencePlanImpl& plan) {
                     scratch(layout, ops::gdn_norm_control_proj_workspace_capacity_bytes(
                                         gdn.control, first, last));
                     (void)workspace::gdn_projection(layout, config, last);
+                    const auto tail_bytes = [&](const MixedTail& value) {
+                        return value.path == GdnWorkspacePath::ReplayRecord
+                                   ? execution::gdn_record_workspace_bytes(
+                                         gdn, value.batch, value.width, value.width)
+                                   : execution::gdn_snapshot_workspace_bytes(
+                                         gdn, value.batch, value.width, value.width);
+                    };
                     if (path == GdnWorkspacePath::Snapshot) {
                         scratch(layout, execution::gdn_snapshot_workspace_bytes(
                                             gdn, batch_size, min_width, max_width));
@@ -207,8 +232,9 @@ WorkspaceSpec build_workspace_plan(const SequencePlanImpl& plan) {
                                             gdn, batch_size, min_width, max_width));
                     } else {
                         (void)workspace::gdn_prefill_conv(layout, config, last);
-                        scratch(layout,
-                                execution::gdn_projection_workspace_bytes(gdn, first, last));
+                        scratch(layout, std::max(execution::gdn_projection_workspace_bytes(
+                                                     gdn, first, last),
+                                                 tail ? tail_bytes(*tail) : std::size_t{0}));
                     }
                     (void)workspace::gdn_recurrent_output(layout, config, last);
                     if (path == GdnWorkspacePath::Prefill) {
@@ -272,6 +298,24 @@ WorkspaceSpec build_workspace_plan(const SequencePlanImpl& plan) {
                 ops::sampling_workspace_capacity_bytes(dimension(profile.public_tokens), 1, 1));
     }
     out.text_prefill = finish(text_prefill);
+
+    // A mixed traversal runs the token-wise stages once over the prefill segments and the verify
+    // block together; the mixers handle the two parts one after the other.
+    if (plan.mixed_tokens != 0) {
+        const auto mixed = static_cast<std::int32_t>(plan.mixed_tokens);
+        for (std::int32_t rows = 1; rows <= static_cast<std::int32_t>(plan.mixed_decode_rows);
+             ++rows) {
+            const MixedTail tail{rows, verify,
+                                 plan.speculative_backend == SpeculativeBackend::Mtp
+                                     ? GdnWorkspacePath::ReplayRecord
+                                     : GdnWorkspacePath::Snapshot};
+            WorkspaceLayoutBuilder text_mixed;
+            text_common_root(text_mixed, mixed);
+            target_body(text_mixed, 1, mixed, qwen3_5::TextPhase::Prefill,
+                        GdnWorkspacePath::Prefill, 1, 1, chunk, text_envelope, &tail);
+            out.text_mixed = std::max(out.text_mixed, finish(text_mixed));
+        }
+    }
 
     if (plan.causal_scoring) {
         WorkspaceLayoutBuilder causal_score;
@@ -525,8 +569,8 @@ WorkspaceSpec build_workspace_plan(const SequencePlanImpl& plan) {
     }
 
     out.general_capacity =
-        std::max({out.text_prefill, out.ordinary_round, out.mtp_prefill, out.mtp_round,
-                  out.dflash_context, out.dflash_round, out.causal_score});
+        std::max({out.text_prefill, out.text_mixed, out.ordinary_round, out.mtp_prefill,
+                  out.mtp_round, out.dflash_context, out.dflash_round, out.causal_score});
     out.capacity = out.general_capacity;
     if (plan.features.vision) {
         out.vision =
@@ -607,6 +651,8 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->prefill_chunk                     = inputs.prefill_chunk;
     impl->pack_tokens                       = inputs.pack_tokens;
     impl->pack_segments                     = inputs.pack_segments;
+    impl->mixed_decode_rows                 = inputs.mixed_decode_rows;
+    impl->mixed_tokens                      = inputs.mixed_tokens;
     impl->draft_window                      = inputs.draft_window;
     impl->speculative_backend               = inputs.speculative_backend;
     impl->proposal_head                     = inputs.proposal_head;
@@ -661,6 +707,14 @@ make_sequence_planner_impl(std::shared_ptr<const execution::ModelProfile> profil
                                                   : resolve_prefill_pack_tokens(chunk,
                                                                                 options.max_context);
     const auto pack_segments = masked || scoring ? 1U : options.max_concurrency;
+    // Decode rows ride a prefill execution as a verify block. Every row is a distinct sequence
+    // and at least one prefill segment is present, so at most max_concurrency - 1 rows fit.
+    // Offloaded experts, masked draft windows and scoring never mix.
+    const auto mixed_rows = offload || masked || scoring || options.max_concurrency < 2
+                                ? 0U
+                                : options.max_concurrency - 1;
+    const auto mixed_tokens =
+        resolve_mixed_tokens(pack_tokens, mixed_rows, options.speculative.draft_tokens);
     SequencePlanningInputs inputs{
         .profile                    = std::move(profile),
         .moe                        = std::move(moe),
@@ -669,6 +723,8 @@ make_sequence_planner_impl(std::shared_ptr<const execution::ModelProfile> profil
         .prefill_chunk              = chunk,
         .pack_tokens                = pack_tokens,
         .pack_segments              = pack_segments,
+        .mixed_decode_rows          = mixed_rows,
+        .mixed_tokens               = mixed_tokens,
         .draft_window               = options.speculative.draft_tokens,
         .speculative_backend        = options.speculative.backend,
         .kv_storage                 = options.kv_cache,

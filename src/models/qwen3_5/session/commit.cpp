@@ -5,18 +5,21 @@
 
 namespace ninfer::models::qwen3_5::detail {
 
+// The pending batch covers the decode rows of the execution: all of them for a decode or a
+// first-token prefill, the members behind the segments for a mixed execution.
 PendingBatch SessionImpl::generated_pending(const GeneratedResult& generated) {
-    auto& current    = *execution;
-    const auto batch = current.members.size();
+    auto& current     = *execution;
+    const auto first  = current.decode_begin;
+    const auto batch  = current.members.size() - first;
     if (!generated.row_stride || generated.tokens.size() != batch * generated.row_stride ||
         generated.counts.size() != batch || generated.dead_positions.size() != batch)
         throw std::logic_error("generated result has an invalid shape");
-    if (current.kind == OperationKind::Decode &&
+    if ((current.kind == OperationKind::Decode || current.kind == OperationKind::Mixed) &&
         (generated.draft_extents.size() != batch || generated.accepted_drafts.size() != batch))
         throw std::logic_error("decode result omitted its proposal extents");
     PendingBatch out;
     out.ticket_    = current.ticket;
-    out.members_   = current.members;
+    out.members_.assign(current.members.begin() + first, current.members.end());
     out.tokens_    = generated.tokens;
     out.stride_    = generated.row_stride;
     out.execution_ = current.observed_result;
@@ -26,11 +29,18 @@ PendingBatch SessionImpl::generated_pending(const GeneratedResult& generated) {
             throw std::logic_error("generated result has an invalid licensed prefix");
         out.counts_.push_back(static_cast<std::int32_t>(count));
         out.failed_.push_back((generated.dead_positions[b] & ((1U << count) - 1)) != 0);
-        auto& state       = sequences[lane(current.members[b])];
+        auto& state       = sequences[lane(current.members[first + b])];
         auto& request     = requests[state.lane];
         request.lifecycle = Lifecycle::Pending;
     }
     return out;
+}
+
+bool SessionImpl::matches_pending(const PendingBatch& pending) const noexcept {
+    return execution && execution->members.size() - execution->decode_begin ==
+                            pending.members_.size() &&
+           std::equal(execution->members.begin() + execution->decode_begin,
+                      execution->members.end(), pending.members_.begin());
 }
 
 namespace {
@@ -45,6 +55,21 @@ ContinuationMetadata forward_metadata(ContinuationMetadata value, std::uint32_t 
                              : backend_pool                     ? value.execution_frontier
                                                                 : 0;
     return value;
+}
+
+// One prefill segment of a completed execution, reported before its settlement is adopted.
+PrefillRowProgress prefill_row(const SessionImpl& session, const SessionImpl::Execution& current,
+                               std::size_t b) {
+    const auto& request = session.requests[session.lane(current.members[b])];
+    const auto end      = current.completed[b].execution_frontier;
+    PrefillRowProgress row;
+    row.summary = {request.base->summary.prompt_tokens, request.prefill->base,
+                   request.prefill->reuse};
+    row.processed_prompt_tokens = current.columns[b];
+    row.capture_ready =
+        request.capture_reservation && request.capture_reservation->frontier == end;
+    row.complete = end == request.base->summary.prompt_tokens;
+    return row;
 }
 
 void prepare_identity(SequenceState& state, std::size_t count, std::optional<std::uint32_t> split) {
@@ -89,6 +114,29 @@ void SessionImpl::receive_result(runtime::ResultReady<ExecutionTypes>&& event) {
         events.push_back({current.ticket, current.members, std::move(pending)});
         return;
     }
+    if (auto* mixed = std::get_if<MixedResult>(&event.result.output)) {
+        const auto first = current.decode_begin;
+        if (current.kind != OperationKind::Mixed || !first || mixed->prefill.generated ||
+            mixed->prefill.processed_tokens.size() != first ||
+            !std::equal(mixed->prefill.processed_tokens.begin(),
+                        mixed->prefill.processed_tokens.end(), current.columns.begin()))
+            throw std::logic_error("mixed result changed its reserved input windows");
+        // The segments settle with the decode rows, so their metadata waits in `completed`.
+        MixedProgress progress;
+        progress.prefill.rows.reserve(first);
+        for (std::size_t b = 0; b < first; ++b) {
+            current.completed.push_back(forward_metadata(current.bases[b].metadata,
+                                                         current.columns[b], speculative_backend,
+                                                         has_backend_pool()));
+            progress.prefill.rows.push_back(prefill_row(*this, current, b));
+            if (progress.prefill.rows.back().complete)
+                throw std::logic_error("completed prefill omitted its first token");
+        }
+        current.generated.emplace(std::move(mixed->decode));
+        progress.decode = generated_pending(*current.generated);
+        events.push_back({current.ticket, current.members, std::move(progress)});
+        return;
+    }
     if (auto* forward = std::get_if<ForwardResult>(&event.result.output)) {
 
         if (forward->processed_tokens != current.columns)
@@ -101,16 +149,9 @@ void SessionImpl::receive_result(runtime::ResultReady<ExecutionTypes>&& event) {
             PrefillProgress progress;
             progress.rows.reserve(current.members.size());
             for (std::size_t b = 0; b < current.members.size(); ++b) {
-                const auto& request = requests[lane(current.members[b])];
-                const auto end      = current.completed[b].execution_frontier;
-                const bool capture =
-                    request.capture_reservation && request.capture_reservation->frontier == end;
-                auto& row   = progress.rows.emplace_back();
-                row.summary = {request.base->summary.prompt_tokens, request.prefill->base,
-                               request.prefill->reuse};
-                row.processed_prompt_tokens = current.columns[b];
-                row.capture_ready           = capture && !forward->generated;
-                row.complete                = end == request.base->summary.prompt_tokens;
+                progress.rows.push_back(prefill_row(*this, current, b));
+                progress.rows.back().capture_ready =
+                    progress.rows.back().capture_ready && !forward->generated;
             }
             if (forward->generated) {
                 if (progress.rows.size() != 1)
@@ -212,11 +253,11 @@ void SessionImpl::commit_completed_unit() {
 
 CommitResult SessionImpl::commit(PendingBatch&& pending,
                                  std::span<const runtime::CommitDecision> decisions) {
-    if (!execution || execution->ticket != pending.ticket_ ||
-        execution->members != pending.members_ || execution->committed || !execution->generated ||
-        decisions.size() != pending.row_count())
+    if (!execution || execution->ticket != pending.ticket_ || !matches_pending(pending) ||
+        execution->committed || !execution->generated || decisions.size() != pending.row_count())
         throw std::logic_error("generated commit has no matching transaction");
-    auto& current = *execution;
+    auto& current     = *execution;
+    const auto first  = current.decode_begin;
     for (std::size_t b = 0; b < decisions.size(); ++b) {
         const auto& d = decisions[b];
         if ((d.cancelled && d.failed) || (d.failed && !pending.failed_[b]) ||
@@ -235,19 +276,20 @@ CommitResult SessionImpl::commit(PendingBatch&& pending,
     CommitResult result;
     result.row_count = decisions.size();
     std::array<bool, kMaximumConcurrency> recovery{};
+    std::array<bool, kMaximumConcurrency> segment_recovery{};
     try {
         current.decisions.assign(decisions.begin(), decisions.end());
         current.settlement = std::make_unique<context::ContextTransaction>(directory);
-        if (current.kind == OperationKind::Decode) {
-            current.completed.reserve(decisions.size());
+        if (current.kind == OperationKind::Decode || current.kind == OperationKind::Mixed) {
+            current.completed.reserve(first + decisions.size());
             for (std::size_t b = 0; b < decisions.size(); ++b) {
                 auto metadata =
-                    forward_metadata(current.bases[b].metadata, decisions[b].accepted_tokens,
+                    forward_metadata(current.bases[first + b].metadata, decisions[b].accepted_tokens,
                                      speculative_backend, has_backend_pool());
                 if (is_masked_draft_backend(speculative_backend)) {
                     metadata.dflash_context_frontier =
                         decisions[b].terminal ? metadata.execution_frontier
-                                              : current.bases[b].metadata.execution_frontier;
+                                              : current.bases[first + b].metadata.execution_frontier;
                     metadata.backend_kv_valid =
                         has_backend_pool() ? metadata.dflash_context_frontier : 0;
                 }
@@ -256,9 +298,10 @@ CommitResult SessionImpl::commit(PendingBatch&& pending,
         }
         Commit physical;
         physical.rows.reserve(decisions.size());
+        if (current.kind == OperationKind::Mixed) prepare_segments(current, segment_recovery);
         for (std::size_t b = 0; b < decisions.size(); ++b) {
             const auto& d = decisions[b];
-            const auto l  = lane(current.members[b]);
+            const auto l  = lane(current.members[first + b]);
             auto& state   = sequences[l];
             result.rows[b].speculative.attempted_per_position.reserve(
                 requests[l].speculative_stats.attempted_per_position.size());
@@ -268,7 +311,8 @@ CommitResult SessionImpl::commit(PendingBatch&& pending,
             if (d.cancelled || d.failed) continue;
             prepare_identity(state, d.accepted_tokens, d.prefix_execution_split_after);
             recovery[b] = prepare_settlement(
-                l, current.completed[b], d.terminal ? Lifecycle::Finishable : Lifecycle::Active,
+                l, current.completed[first + b],
+                d.terminal ? Lifecycle::Finishable : Lifecycle::Active,
                 state.ledger.size() + d.accepted_tokens, *current.settlement);
         }
         current.settlement->prepare_actions();
@@ -281,14 +325,16 @@ CommitResult SessionImpl::commit(PendingBatch&& pending,
         executor().fail(error.what());
         throw;
     }
+    if (current.kind == OperationKind::Mixed) adopt_segments(current, segment_recovery);
     for (std::size_t b = 0; b < decisions.size(); ++b) {
         const auto& d = decisions[b];
-        const auto l  = lane(current.members[b]);
+        const auto l  = lane(current.members[first + b]);
         auto& state   = sequences[l];
         auto& request = requests[l];
         if (!d.cancelled && !d.failed) {
-            adopt_unit(l, current.completed[b],
-                       current.kind == OperationKind::Decode || current.columns[b] != 0,
+            adopt_unit(l, current.completed[first + b],
+                       current.kind == OperationKind::Decode ||
+                           current.kind == OperationKind::Mixed || current.columns[b] != 0,
                        recovery[b]);
             if (current.kind == OperationKind::Prefill)
                 request.prefill->cursor = current.completed[b].execution_frontier;
@@ -298,7 +344,8 @@ CommitResult SessionImpl::commit(PendingBatch&& pending,
             request.lifecycle = d.terminal ? Lifecycle::Finishable : Lifecycle::Active;
             request.capture_pending =
                 request.capture_reservation &&
-                request.capture_reservation->frontier == current.completed[b].execution_frontier;
+                request.capture_reservation->frontier ==
+                    current.completed[first + b].execution_frontier;
         }
         if (d.terminal) {
             request.capture_pending = false;
@@ -308,7 +355,7 @@ CommitResult SessionImpl::commit(PendingBatch&& pending,
             request.prefill.reset();
         }
         auto& stats = request.speculative_stats;
-        if (current.kind == OperationKind::Decode &&
+        if ((current.kind == OperationKind::Decode || current.kind == OperationKind::Mixed) &&
             speculative_backend != SpeculativeBackend::None) {
             const auto drafted  = current.generated->draft_extents.at(b);
             const auto accepted = current.generated->accepted_drafts.at(b);
@@ -335,16 +382,58 @@ CommitResult SessionImpl::commit(PendingBatch&& pending,
 }
 
 DiscardResult SessionImpl::discard(PendingBatch&& pending) noexcept {
-    if (!execution || execution->ticket != pending.ticket_ ||
-        execution->members != pending.members_ || execution->committed)
+    if (!execution || execution->ticket != pending.ticket_ || !matches_pending(pending) ||
+        execution->committed)
         return {};
     try {
-        executor().discard(execution->ticket);
-        execution->discarded = true;
-        execution->committed = true;
-        pending.ticket_      = {};
-        return {runtime::ConsumeStatus::Consumed, execution->members.size()};
+        auto& current    = *execution;
+        const auto first = current.decode_begin;
+        if (current.kind == OperationKind::Mixed) {
+            // The decode rows are dropped but their segments completed: commit every decode row
+            // as discarded so the segments' State and KV settle and keep their progress.
+            std::array<bool, kMaximumConcurrency> recovery{};
+            current.settlement = std::make_unique<context::ContextTransaction>(directory);
+            prepare_segments(current, recovery);
+            current.settlement->prepare_actions();
+            Commit physical;
+            physical.rows.assign(current.members.size() - first, CommitRow{0, true, true});
+            physical.context = current.settlement->actions();
+            (void)executor().commit(current.ticket, std::move(physical));
+            current.settlement->mark_submitted();
+            current.settlement->adopt();
+            adopt_segments(current, recovery);
+        } else {
+            executor().discard(current.ticket);
+        }
+        current.discarded = true;
+        current.committed = true;
+        pending.ticket_   = {};
+        return {runtime::ConsumeStatus::Consumed, current.members.size() - first};
     } catch (...) { return {}; }
+}
+
+// A mixed execution settles its prefill segments with its decode rows, because both share one
+// device commit. The segments advance exactly as a completed prefill would.
+void SessionImpl::prepare_segments(Execution& current,
+                                   std::array<bool, kMaximumConcurrency>& recovery) {
+    for (std::size_t b = 0; b < current.decode_begin; ++b) {
+        const auto l = lane(current.members[b]);
+        recovery[b]  = prepare_settlement(l, current.completed[b], requests[l].lifecycle,
+                                          sequences[l].ledger.size(), *current.settlement);
+    }
+}
+
+void SessionImpl::adopt_segments(Execution& current,
+                                 const std::array<bool, kMaximumConcurrency>& recovery) noexcept {
+    for (std::size_t b = 0; b < current.decode_begin; ++b) {
+        const auto l   = lane(current.members[b]);
+        auto& request  = requests[l];
+        const auto end = current.completed[b].execution_frontier;
+        adopt_unit(l, current.completed[b], current.columns[b] != 0, recovery[b]);
+        request.capture_pending =
+            request.capture_reservation && request.capture_reservation->frontier == end;
+        request.prefill->cursor = end;
+    }
 }
 
 void SessionImpl::retire(runtime::DeviceRetired event) {
@@ -403,11 +492,14 @@ void SessionImpl::retire(runtime::DeviceRetired event) {
                           runtime::ExecutionComplete{event.execution, current.members.size()}});
     for (std::size_t b = 0; b < current.members.size(); ++b) {
         if (!valid_sequence(current.members[b])) continue;
+        if (b < current.decode_begin) continue;
         const auto l  = lane(current.members[b]);
         auto& state   = sequences[l];
         auto& request = requests[l];
-        if (current.discarded || (!current.decisions.empty() &&
-                                  (current.decisions[b].cancelled || current.decisions[b].failed)))
+        const auto row = b - current.decode_begin;
+        if (current.discarded ||
+            (!current.decisions.empty() &&
+             (current.decisions[row].cancelled || current.decisions[row].failed)))
             clear_lane(state, request);
     }
     if (current.completion) events.push_back(std::move(*current.completion));

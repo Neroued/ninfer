@@ -10,7 +10,7 @@ namespace ninfer::models::qwen3_5::detail {
 void RankProgramImpl::launch_commit(ComputeOperation& operation) {
     auto& frame          = resources.frame;
     const auto& value    = *operation.commit;
-    const bool decode    = std::holds_alternative<DecodeWork>(operation.request.work.operation);
+    const bool decode    = has_decode(operation);
     const auto* forward  = std::get_if<ForwardWork>(&operation.request.work.operation);
     const bool generated = decode || (forward && forward->sample != SamplePurpose::None);
     const bool mtp       = decode && operation.speculative && backend == SpeculativeBackend::Mtp;
@@ -45,18 +45,25 @@ void RankProgramImpl::launch_commit(ComputeOperation& operation) {
                 return row.terminal && !row.discarded && row.accepted_tokens;
             });
         if (mtp) {
-            if (graphs)
+            // The commit graphs read the verify block at the head of the token axis; a mixed
+            // execution keeps it behind its prefill segments and commits eagerly.
+            if (graphs && !operation.mixed)
                 graphs->commit_mtp(operation.batch, mtp_history, count_tokens,
                                    device.execution_view());
             else
-                execute_mtp_commit(operation.batch, mtp_history, count_tokens);
+                execute_mtp_commit(operation.batch, mtp_history, count_tokens, nullptr, nullptr,
+                                   operation.prefill_tokens);
         } else {
             if (operation.speculative)
                 resources.replay_fold->execute(
                     frame.state_source_offsets.slice(0, 0, operation.batch),
                     frame.commit_destination_offsets.slice(0, 0, operation.batch),
                     frame.accepted_columns.slice(0, 0, operation.batch), device.execution_view());
-            const auto hidden = frame.decode_view(operation.width, operation.batch).hidden;
+            const auto hidden = operation.mixed
+                                    ? frame.verify_view(static_cast<int>(operation.prefill_tokens),
+                                                        operation.width, operation.batch)
+                                          .hidden
+                                    : frame.decode_view(operation.width, operation.batch).hidden;
             ops::scatter_batch_columns(
                 hidden, frame.last_columns.slice(0, 0, operation.batch),
                 resources.state_images.continuation_hidden(
@@ -110,18 +117,23 @@ void RankProgramImpl::launch_commit(ComputeOperation& operation) {
 
 void RankProgramImpl::execute_mtp_commit(std::uint32_t batch, bool repair, bool counts,
                                          DecodeGraphSection* repair_section,
-                                         DecodeGraphSection* counts_section) {
+                                         DecodeGraphSection* counts_section,
+                                         std::uint32_t column) {
     auto& frame     = resources.frame;
     const auto cuda = device.execution_view();
     resources.replay_fold->execute(frame.state_source_offsets.slice(0, 0, batch),
                                    frame.commit_destination_offsets.slice(0, 0, batch),
                                    frame.accepted_columns.slice(0, 0, batch), cuda);
-    const auto history = [&] { rebuild_mtp_history(batch); };
+    const auto history = [&] { rebuild_mtp_history(batch, column); };
     if (repair_section)
         repair_section->capture(cuda.stream(), history);
     else if (repair)
         history();
-    const auto hidden = frame.decode_view(draft_window + 1, batch).hidden;
+    const auto width  = static_cast<std::int32_t>(draft_window + 1);
+    const auto hidden = column ? frame.verify_view(static_cast<std::int32_t>(column), width,
+                                                   static_cast<std::int32_t>(batch))
+                                     .hidden
+                               : frame.decode_view(width, batch).hidden;
     ops::scatter_batch_columns(hidden, frame.last_columns.slice(0, 0, batch),
                                resources.state_images.continuation_hidden(
                                    frame.commit_destination_offsets.slice(0, 0, batch)),

@@ -397,6 +397,13 @@ public:
                                                   std::uint32_t end) const;
     [[nodiscard]] std::optional<PrefillStart> start_prefill(std::span<const SequenceHandle>,
                                                             std::span<const bool> constrained);
+    [[nodiscard]] std::uint32_t mixed_decode_limit() const noexcept;
+    [[nodiscard]] bool prefill_mixable(SequenceHandle) const;
+    [[nodiscard]] std::optional<MixedStart>
+    start_mixed(std::span<const SequenceHandle> prefill, std::span<const bool> prefill_constrained,
+                std::span<const SequenceHandle> decode,
+                std::span<const runtime::RoundBudget> budgets,
+                std::span<const bool> decode_constrained);
     [[nodiscard]] std::optional<runtime::ExecutionTicket> start_replay(SequenceHandle);
     [[nodiscard]] std::optional<runtime::ExecutionTicket>
     start_decode(std::span<const SequenceHandle>, std::span<const runtime::RoundBudget>,
@@ -476,11 +483,13 @@ public:
     void release_residency(runtime::ResidencyId);
     void submit_releases();
 
-    enum class OperationKind { Prefill, Replay, Decode, Control, Score, Normalize };
+    enum class OperationKind { Prefill, Replay, Decode, Mixed, Control, Score, Normalize };
 
     struct Execution {
         OperationKind kind;
         runtime::ExecutionTicket ticket;
+        // Prefill segments first, then decode rows. Every per-member vector follows this order; a
+        // Mixed execution's pending batch and decisions cover the members from `decode_begin` on.
         std::vector<SequenceHandle> members;
         std::vector<Continuation> bases;
         std::vector<ContinuationMetadata> completed;
@@ -494,6 +503,7 @@ public:
         std::optional<SessionEvent> completion;
         std::vector<runtime::CommitDecision> decisions;
         std::uint64_t vision_id = 0;
+        std::size_t decode_begin = 0;
         bool result_ready       = false;
         bool committed          = false;
         bool discarded          = false;
@@ -548,6 +558,18 @@ public:
     void commit_completed_unit();
     void advance_score();
     [[nodiscard]] PendingBatch generated_pending(const GeneratedResult&);
+    [[nodiscard]] bool matches_pending(const PendingBatch&) const noexcept;
+    // The end of the window the sequence's next prefill execution would cover, when that window
+    // can share an execution with decode rows.
+    [[nodiscard]] std::optional<std::uint32_t> mixable_end(const SequenceState&,
+                                                           const RequestControl&) const;
+    void append_prefill_row(Execution&, ForwardWork&, SequenceHandle, std::uint32_t begin,
+                            std::uint32_t end, bool constrained);
+    void append_decode_row(Execution&, DecodeWork&, SequenceHandle,
+                           const runtime::RoundBudget&, bool constrained);
+    // Settle and adopt the prefill segments of a mixed execution together with its decode rows.
+    void prepare_segments(Execution&, std::array<bool, kMaximumConcurrency>& recovery);
+    void adopt_segments(Execution&, const std::array<bool, kMaximumConcurrency>& recovery) noexcept;
     [[nodiscard]] std::optional<runtime::ExecutionTicket>
     submit_execution(Execution&&, runtime::ExecutionReservation, Work&&);
 

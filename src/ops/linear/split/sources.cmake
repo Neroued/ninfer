@@ -36,3 +36,8 @@ target_sources(ninfer_ops_non_rdc PRIVATE
 include("${CMAKE_CURRENT_LIST_DIR}/bf16/${NINFER_TARGET}/sources.cmake")
 
 include("${CMAKE_CURRENT_LIST_DIR}/q8/${NINFER_TARGET}/sources.cmake")
+
+if(NINFER_TARGET STREQUAL "dgx_spark")
+  include("${CMAKE_CURRENT_LIST_DIR}/mxfp8/dgx_spark/sources.cmake")
+  include("${CMAKE_CURRENT_LIST_DIR}/fp8_block_bf16/dgx_spark/sources.cmake")
+endif()

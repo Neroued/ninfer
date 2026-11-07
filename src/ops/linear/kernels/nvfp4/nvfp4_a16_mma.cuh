@@ -6,7 +6,7 @@
 #include "ops/common/quant/nvfp4.cuh"
 
 // NVFP4 codes multiplied by their raw E4M3 G16 scales are exactly representable
-// in BF16. The global weight divisor is applied to the complete FP32 reduction.
+// in BF16. The matrix coefficient is applied to the complete FP32 reduction.
 // Activations remain the represented public BF16 inputs.
 
 #include "ops/linear/common/epilogue.cuh"
@@ -41,12 +41,11 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a16_
     constexpr int THREADS = Schedule::kThreads;
 
     extern __shared__ __align__(16) unsigned char shared_raw[];
-    auto* weight_shared     = reinterpret_cast<__nv_bfloat16*>(shared_raw);
-    auto* activation_shared = weight_shared + BM * BK;
-    auto* code_shared =
-        reinterpret_cast<std::uint8_t*>(activation_shared + Schedule::kActivationStages * BN * BK);
-
-    auto* scale_shared = code_shared + BM * (BK / 2);
+    auto* weight_shared = reinterpret_cast<__nv_bfloat16*>(shared_raw);
+    auto* activation_shared =
+        reinterpret_cast<__nv_bfloat16*>(shared_raw + Schedule::kExpandedWeightBytes);
+    auto* code_shared  = shared_raw + Schedule::kExpandedWeightBytes + Schedule::kActivationBytes;
+    auto* scale_shared = code_shared + Schedule::kRawStages * Schedule::kCodeStageBytes;
 
     const int tid  = static_cast<int>(threadIdx.x);
     const int warp = tid >> 5;
@@ -56,8 +55,19 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a16_
     const int gid  = lane >> 2;
     const int lid  = lane & 3;
 
-    const int row_begin   = static_cast<int>(blockIdx.x) * (BM / (RowPolicy::kPaired ? 2 : 1));
-    const int token_begin = token_offset + static_cast<int>(blockIdx.y) * BN;
+    int row_tile = static_cast<int>(blockIdx.x), token_tile = static_cast<int>(blockIdx.y);
+    if constexpr (Schedule::kRasterGroupRows > 0) {
+        const int linear     = token_tile * static_cast<int>(gridDim.x) + row_tile;
+        const int group_span = Schedule::kRasterGroupRows * static_cast<int>(gridDim.y);
+        const int first_row  = linear / group_span * Schedule::kRasterGroupRows;
+        const int group_rows =
+            min(Schedule::kRasterGroupRows, static_cast<int>(gridDim.x) - first_row);
+        const int within = linear % group_span;
+        row_tile         = first_row + within % group_rows;
+        token_tile       = within / group_rows;
+    }
+    const int row_begin   = row_tile * (BM / (RowPolicy::kPaired ? 2 : 1));
+    const int token_begin = token_offset + token_tile * BN;
 
     float accumulators[MT][NT][4] = {};
 
@@ -91,20 +101,31 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a16_
         }
     };
 
+    const auto code_offset = [](int row, int byte) {
+        const int linear = row * (BK / 2) + byte;
+        // Preserve 16-byte copy alignment while giving the MMA's eight row
+        // groups distinct shared-memory banks for their packed code words.
+        if constexpr (Schedule::kSwizzleCodes) return linear ^ ((row & 7) * 16);
+        return linear;
+    };
+
     const auto stage_codes = [&](int k_tile) {
         const int k_begin = k_tile * BK;
+        const int slot    = k_tile % Schedule::kRawStages;
+        auto* codes       = code_shared + slot * Schedule::kCodeStageBytes;
+        auto* scales      = scale_shared + slot * Schedule::kScaleStageBytes;
         for (int item = tid; item < BM * (BK / 32); item += THREADS) {
             const int row = item / (BK / 32), chunk = item % (BK / 32);
             const int parent = row_policy.weight_row(row_begin, row, M);
             common::cp_async<16, Schedule::kWeightCache>(
-                code_shared + row * (BK / 2) + chunk * 16,
+                codes + code_offset(row, chunk * 16),
                 weight_codes + static_cast<std::int64_t>(parent) * (K / 2) + k_begin / 2 +
                     chunk * 16);
         }
         for (int item = tid; item < BM * (BK / 64); item += THREADS) {
             const int row = item / (BK / 64), tile = item % (BK / 64);
             const int parent = row_policy.weight_row(row_begin, row, M);
-            common::cp_async<4>(scale_shared + row * (BK / 16) + tile * 4,
+            common::cp_async<4>(scales + row * (BK / 16) + tile * 4,
                                 weight_scales + common::nvfp4_scale_byte_offset(
                                                     parent, k_begin / 16 + tile * 4, K));
         }
@@ -117,7 +138,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a16_
             for (int col32 = 0; col32 < BK; col32 += 32) {
                 const int col = col32 + half_lane * 2;
                 const unsigned widened =
-                    common::nvfp4_scaled_pair_bf16(code_shared[row * (BK / 2) + col / 2],
+                    common::nvfp4_scaled_pair_bf16(code_shared[code_offset(row, col / 2)],
                                                    scale_shared[row * (BK / 16) + col / 16]);
                 common::store_vec(weight_shared + row * BK + common::swizzle_xor_64(row, col),
                                   widened);
@@ -136,12 +157,16 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a16_
         common::cp_wait<0>();
         __syncthreads();
 
-        widen_codes();
-        __syncthreads();
+        if constexpr (!Schedule::kRegisterWeights) {
+            widen_codes();
+            __syncthreads();
+        }
 
         const int next = k_tile + 1;
         if (next < kTiles) {
             if constexpr (Schedule::kActivationStages == 2) { stage_activation(next & 1, next); }
+            // RegW reads raw codes throughout this MMA tile. The alternate compact slot
+            // keeps this prefetch disjoint; the loop's CTA barrier retires the reused slot.
             stage_codes(next);
             common::cp_commit();
         }
@@ -150,15 +175,37 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a16_
             Schedule::kFragmentPipeline == Nvfp4MmaFragmentPipeline::PingPong ? 2 : 1;
         unsigned a_fragments[kSlots][MT][4];
         unsigned b_fragments[kSlots][NT][2];
+        const auto* tile_codes =
+            code_shared + (k_tile % Schedule::kRawStages) * Schedule::kCodeStageBytes;
+        const auto* tile_scales =
+            scale_shared + (k_tile % Schedule::kRawStages) * Schedule::kScaleStageBytes;
         const auto load_fragments = [&](int slot, int k_step) {
 #pragma unroll
             for (int mma_row = 0; mma_row < MT; ++mma_row) {
-                const int row = wm * WM + mma_row * 16 + a_row_offset;
-                const int col = k_step * 16 + a_col_offset;
-                common::ldmatrix_x4(
-                    a_fragments[slot][mma_row][0], a_fragments[slot][mma_row][1],
-                    a_fragments[slot][mma_row][2], a_fragments[slot][mma_row][3],
-                    common::smem_addr(&weight_shared[row * BK + common::swizzle_xor_64(row, col)]));
+                if constexpr (Schedule::kRegisterWeights) {
+                    const int row         = wm * WM + mma_row * 16 + gid;
+                    const int col         = k_step * 16 + 2 * lid;
+                    const unsigned scale0 = tile_scales[row * (BK / 16) + k_step];
+                    const unsigned scale1 = tile_scales[(row + 8) * (BK / 16) + k_step];
+                    const unsigned sf0 = common::fp8_e4m3x2_to_bf16x2_bits(scale0 | (scale0 << 8));
+                    const unsigned sf1 = common::fp8_e4m3x2_to_bf16x2_bits(scale1 | (scale1 << 8));
+                    a_fragments[slot][mma_row][0] =
+                        common::nvfp4_pair_bf16_scaled(tile_codes[code_offset(row, col / 2)], sf0);
+                    a_fragments[slot][mma_row][1] = common::nvfp4_pair_bf16_scaled(
+                        tile_codes[code_offset(row + 8, col / 2)], sf1);
+                    a_fragments[slot][mma_row][2] = common::nvfp4_pair_bf16_scaled(
+                        tile_codes[code_offset(row, col / 2 + 4)], sf0);
+                    a_fragments[slot][mma_row][3] = common::nvfp4_pair_bf16_scaled(
+                        tile_codes[code_offset(row + 8, col / 2 + 4)], sf1);
+                } else {
+                    const int row = wm * WM + mma_row * 16 + a_row_offset;
+                    const int col = k_step * 16 + a_col_offset;
+                    common::ldmatrix_x4(
+                        a_fragments[slot][mma_row][0], a_fragments[slot][mma_row][1],
+                        a_fragments[slot][mma_row][2], a_fragments[slot][mma_row][3],
+                        common::smem_addr(
+                            &weight_shared[row * BK + common::swizzle_xor_64(row, col)]));
+                }
             }
 #pragma unroll
             for (int mma_token = 0; mma_token < NT; ++mma_token) {

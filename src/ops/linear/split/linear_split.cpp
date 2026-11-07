@@ -11,9 +11,10 @@ void execute(const Tensor& x, split::Weights weights, std::span<const Tensor> ou
              MemoryArena* workspace, CudaExecutionView execution) {
     const auto& shape = split::select_split_shape(
         {linear_profile({weights.first, weights.policy}),
-         weights.second ? std::optional{linear_profile({*weights.second})} : std::nullopt},
+         weights.second ? std::optional{linear_profile({*weights.second, weights.second_policy})}
+                        : std::nullopt},
         outputs);
-    split::validate_operands(x, weights, outputs, shape, execution);
+    split::validate_operands(x, weights, outputs, shape.segments, execution);
     const auto bytes = shape.capacity ? shape.capacity(weights.policy, x.ne[1], x.ne[1]) : 0;
     if (!bytes) {
         shape.launch(x, weights, outputs, nullptr, execution.stream());

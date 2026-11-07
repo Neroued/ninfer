@@ -88,7 +88,7 @@ std::unique_ptr<ModelShard> materialize_model(ResolvedLoadPlan&& plan, DeviceCon
         out->local_banks_         = bind_selected_experts(plan.selection_->weights, requests,
                                                           out->local_parents_, device.device());
         out->expert_descriptions_ = std::move(plan.selection_->weights.expert_descriptions);
-        auto& table = out->ple_.emplace<DevicePleTable>();
+        auto& table               = out->ple_.emplace<DevicePleTable>();
         table.decode =
             DeviceBuffer(device.device(), plan.selection_->ple.size() * sizeof(Nf4Bf16Lut));
         for (std::size_t i = 0; i < plan.selection_->ple.size(); ++i) {
@@ -99,7 +99,7 @@ std::unique_ptr<ModelShard> materialize_model(ResolvedLoadPlan&& plan, DeviceCon
             const auto offset   = i * sizeof(lut);
             table.decode.copy_from_host(&lut, sizeof(lut), offset);
             table.shards.push_back(
-                {{p.data, p.geometry.divisor_offset, device.device()},
+                {{p.data, p.geometry.matrix_scale_offset, device.device()},
                  Tensor(table.decode.span().subspan(offset, sizeof(lut)), DType::BF16, {16, 128}),
                  static_cast<std::uint32_t>(shard.row_end - shard.geometry.shape[0]),
                  static_cast<std::uint32_t>(shard.geometry.shape[0])});

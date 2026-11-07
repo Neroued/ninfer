@@ -61,7 +61,8 @@ class WeightJob:
 @dataclass(frozen=True, slots=True)
 class AuxiliaryReference:
     tensor: str
-    element: int
+    begin: int
+    end: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,6 +74,8 @@ class PreparedRecipe:
 
 
 def default_layout(format: str) -> str:
+    if format == "mxfp8":
+        return "row_group_scale_v1"
     kind = get_format(format)
     if isinstance(kind, DirectFormat):
         return "contiguous_le_v1"
@@ -97,7 +100,11 @@ def _slice_source(source: LogicalSource, begin: int, end: int) -> LogicalSource:
         return select_rows(source, ((begin // width, end // width),))
     shape = ((end - begin) // width, *source.shape[1:])
     return LogicalSource(
-        shape, source.label, lambda a, b: source.values(begin + a, begin + b)
+        shape,
+        source.label,
+        lambda a, b: source.values(begin + a, begin + b),
+        encoded_format=source.encoded_format,
+        matrix_sources=source.matrix_sources[begin // width : end // width],
     )
 
 
@@ -259,22 +266,29 @@ class Recipe:
             for role, value in auxiliaries.items():
                 if isinstance(value, AuxiliaryReference):
                     tensor = self.auxiliary_tensors[value.tensor]
-                    if tensor.format != "fp32" or not 0 <= value.element < prod(
-                        tensor.shape
+                    if (
+                        tensor.format != "fp32"
+                        or not 0 <= value.begin < value.end <= prod(tensor.shape)
                     ):
                         raise ValueError(
-                            "auxiliary reference requires one FP32 element"
+                            "auxiliary reference requires a nonempty FP32 range"
                         )
                     self.auxiliary_references[(*key, role)] = value
-                    value = AuxiliaryValue.activation_divisor(
-                        tensor.data[value.element * 4 : (value.element + 1) * 4]
+                    count = value.end - value.begin
+                    value = AuxiliaryValue(
+                        "fp32",
+                        () if count == 1 else (count,),
+                        tensor.data[value.begin * 4 : value.end * 4],
                     )
                 else:
                     self.auxiliary_references.pop((*key, role), None)
                 if not isinstance(value, AuxiliaryValue):
-                    if role != "activation_input_divisor":
+                    if role not in (
+                        "activation_input_divisor",
+                        "activation_input_multiplier",
+                    ):
                         raise TypeError("provide an AuxiliaryValue for this role")
-                    value = AuxiliaryValue.activation_divisor(value)
+                    value = AuxiliaryValue.activation_scale(value)
                 self.auxiliary_overrides[(*key, role)] = value
 
     def auxiliary_tensor(self, name: str, value: AuxiliaryValue) -> None:
@@ -388,6 +402,16 @@ class Recipe:
                 )
                 for _, value in items
             ]
+            sources = [
+                (
+                    source.reshape((prod(source.shape[:-1]), source.shape[-1]))
+                    if source.encoding() is not None
+                    and len(source.shape) > 2
+                    and not source.matrix_sources
+                    else source
+                )
+                for source in sources
+            ]
             size = sum(prod(source.shape) for source in sources)
             if chosen is not None:
                 if prod(chosen) != size:
@@ -421,10 +445,28 @@ class Recipe:
                 )
             dims, sources = parent_shape(items, chosen)
             selection = items[0][1]
-            layout = selection.layout or default_layout(selection.format)
-            encoded_size(layout, selection.format, dims)
+            native = [source.native_planes for source in sources]
+            layout = selection.layout or (
+                native[0].layout
+                if native[0] is not None
+                else default_layout(selection.format)
+            )
+            layout_parameters = None
+            if layout == "csf_32x2_v1":
+                if any(value is None or value.layout != layout for value in native):
+                    raise ValueError(
+                        "CSF parent requires native planes for every input"
+                    )
+                layout_parameters = {
+                    "exception_count": sum(value.exception_count for value in native)
+                }
+            encoded_size(layout, selection.format, dims, layout_parameters)
             spec = TensorSpec(
-                f"weight/{len(weights):06d}", dims, selection.format, layout
+                f"weight/{len(weights):06d}",
+                dims,
+                selection.format,
+                layout,
+                layout_parameters,
             )
             inputs = tuple(
                 MethodInput(
@@ -543,16 +585,19 @@ class Recipe:
             items = [(name, self.selections[name][0]) for name in names]
             if not compatible(items) or items[0][1].method not in standard:
                 continue
-            if items[0][1].format == "nvfp4" and items[0][1].method is import_encoded:
-                divisors = [
+            if (
+                items[0][1].format in ("nvfp4", "nvfp4_mul")
+                and items[0][1].method is import_encoded
+            ):
+                matrix_scales = [
                     (
-                        value.source.weight_divisor()
-                        if value.source.weight_divisor is not None
+                        value.source.weight_scale()
+                        if value.source.weight_scale is not None
                         else None
                     )
                     for _, value in items
                 ]
-                if None in divisors or len(set(divisors)) != 1:
+                if None in matrix_scales or len(set(matrix_scales)) != 1:
                     continue
             emit(items)
             used.update(names)
@@ -610,22 +655,50 @@ class Recipe:
         ]
         for (name, input_name), policy in self.policies.items():
             # Explicitly shared weights retain independent Use and calibration records.
-            key = (name, input_name, "activation_input_divisor")
             target = name
             while target in self.aliases:
                 target = self.aliases[target]
+            calibration_role = (
+                "activation_input_multiplier"
+                if any(s.format == "nvfp4_mul" for s in self.selections[target])
+                else "activation_input_divisor"
+            )
+            key = (name, input_name, calibration_role)
             if (
                 name in self.aliases
                 and policy == "AllowA4"
-                and any(s.format == "nvfp4" for s in self.selections[target])
+                and any(
+                    s.format in ("nvfp4", "nvfp4_mul") for s in self.selections[target]
+                )
                 and key not in auxiliary_values
             ):
-                raise ValueError(f"{name}: provide its independent activation divisor")
+                scale = (
+                    "multiplier"
+                    if calibration_role.endswith("multiplier")
+                    else "divisor"
+                )
+                raise ValueError(f"{name}: provide its independent activation {scale}")
             use = {"parameter": name, "input": input_name, "activation_policy": policy}
             referenced = {}
             for (parameter, source_input, role), value in auxiliary_values.items():
                 if (parameter, source_input) != (name, input_name):
                     continue
+                if role == "activation_input_multiplier":
+                    if value.format != "fp32" or len(value.shape) > 1:
+                        raise ValueError(
+                            f"{name}: activation multiplier must be FP32 scalar or vector"
+                        )
+                    for offset in range(0, len(value.data), 4):
+                        AuxiliaryValue.activation_scale(value.data[offset : offset + 4])
+                elif role == "activation_input_divisor":
+                    if value.format != "fp32" or value.shape != ():
+                        raise ValueError(
+                            f"{name}: activation divisor must be an FP32 scalar"
+                        )
+                    AuxiliaryValue.activation_scale(value.data)
+                layout = default_layout(value.format)
+                if len(value.data) != encoded_size(layout, value.format, value.shape):
+                    raise ValueError(f"{name}/{role}: auxiliary data length is invalid")
                 reference = self.auxiliary_references.get(
                     (parameter, source_input, role)
                 )
@@ -634,20 +707,11 @@ class Recipe:
                         "parts": [
                             {
                                 "object": f"auxiliary/shared/{reference.tensor}",
-                                "range": [reference.element, reference.element + 1],
+                                "range": [reference.begin, reference.end],
                             }
                         ]
                     }
                     continue
-                if role == "activation_input_divisor":
-                    if value.format != "fp32" or value.shape != ():
-                        raise ValueError(
-                            f"{name}: activation divisor must be an FP32 scalar"
-                        )
-                    AuxiliaryValue.activation_divisor(value.data)
-                layout = default_layout(value.format)
-                if len(value.data) != encoded_size(layout, value.format, value.shape):
-                    raise ValueError(f"{name}/{role}: auxiliary data length is invalid")
                 spec = TensorSpec(
                     f"auxiliary/{len(auxiliary_outputs):06d}",
                     value.shape,

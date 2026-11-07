@@ -44,7 +44,7 @@ Operands validate(const Tensor& x, const Tensor& weight, const Tensor* gate, flo
     if (gate) same_shape(x, *gate, op);
     require(weight.ne[0] == x.ne[0] && weight.ne[1] == 1 && weight.ne[2] == 1 && weight.ne[3] == 1,
             op, "weight must be a vector of the reduced dimension");
-    if (!count) return {x.ne[0], 0, false};
+    if (!count) return {x.ne[0], 0, false, false};
     const std::array<const Tensor*, 4> tensors{&x, &weight, &out, gate};
     std::uintptr_t addresses = 0;
     for (const auto* t : tensors) {
@@ -65,6 +65,6 @@ Operands validate(const Tensor& x, const Tensor& weight, const Tensor* gate, flo
         common::operand::disjoint(output, common::operand::range(gate->data, bytes, op), op);
     else
         common::operand::disjoint(input, gain, op);
-    return {x.ne[0], count / x.ne[0], (addresses & 3u) == 0};
+    return {x.ne[0], count / x.ne[0], (addresses & 3u) == 0, (addresses & 15u) == 0};
 }
 } // namespace ninfer::ops::detail::rmsnorm

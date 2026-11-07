@@ -35,10 +35,27 @@ Layout layout(const VisionConfig& c, const Profile& p, std::uint32_t features) {
         return ops::linear_workspace_capacity_bytes(profile.qtype, profile.n, profile.k,
                                                     profile.policy, 1, features);
     };
+    const auto biased = [&](const auto& weight, int columns) {
+        const auto profile = ops::linear_profile(weight);
+        return ops::linear_bias_workspace_capacity_bytes(profile.qtype, profile.n, profile.k,
+                                                         profile.policy, 1, columns);
+    };
     auto scratch  = std::max(linear(p.merger_projection), linear(p.merger_down));
     const auto gu = ops::linear_profile(p.merger_gate_up);
     scratch       = std::max(scratch, ops::linear_swiglu_workspace_capacity_bytes(
                                     gu.qtype, gu.n, gu.k, gu.policy, 1, features));
+    scratch       = std::max({scratch, biased(p.patch, n), biased(p.downsample, features)});
+    const std::array split_rows{dimension(c.hidden), dimension(c.hidden), dimension(c.hidden)};
+    for (const auto& layer : p.layers) {
+        const auto qkv         = ops::linear_profile(layer.qkv);
+        const auto gate_up     = ops::linear_profile(layer.gate_up);
+        const auto qkv_scratch = ops::linear_split_bias_workspace_capacity_bytes(
+            qkv.qtype, qkv.n, qkv.k, split_rows, qkv.policy, 1, n);
+        const auto gate_up_scratch = ops::linear_swiglu_bias_workspace_capacity_bytes(
+            gate_up.qtype, gate_up.n, gate_up.k, gate_up.policy, 1, n);
+        scratch = std::max({scratch, biased(layer.output, n), biased(layer.down, n), qkv_scratch,
+                            gate_up_scratch});
+    }
     scratch =
         std::max(scratch, ops::packed_softmax_attention_workspace_capacity_bytes(
                               {dimension(c.head_dim()), dimension(c.heads), dimension(c.heads)}, 1,
@@ -132,14 +149,16 @@ std::size_t encode(const VisionConfig& c, const execution::VisionParameters& p,
     };
     upload(input.positions.data(), positions);
     upload(input.cu_seqlens.data(), segments);
-    ops::linear_bias(patch, p.patch.weight, p.patch_bias, x, cuda);
+    MemoryArena scratch(l.scratch.bind(backing));
+    ops::linear_bias(patch, p.patch.weight, p.patch_bias, x, p.patch.policy, scratch, cuda);
     auto norm = z_matrix(0, h, n);
     ops::rmsnorm(x, p.layers.front().input_norm, c.norm_epsilon, false, norm, cuda);
     for (std::size_t i = 0; i < p.layers.size(); ++i) {
         const auto& layer = p.layers[i];
         std::array<Tensor, 3> qkv;
         for (int j = 0; j < 3; ++j) qkv[j] = z_matrix(std::uint64_t(j + 1) * h * n, h, n);
-        ops::linear_split(norm, layer.qkv.weight, layer.qkv_bias, qkv, cuda);
+        ops::linear_split(norm, layer.qkv.weight, layer.qkv_bias, qkv, layer.qkv.policy, scratch,
+                          cuda);
         auto q = qkv[0].view({dimension(c.head_dim()), dimension(c.heads), n});
         auto k = qkv[1].view({dimension(c.head_dim()), dimension(c.heads), n});
         auto v = qkv[2].view({dimension(c.head_dim()), dimension(c.heads), n});
@@ -151,42 +170,33 @@ std::size_t encode(const VisionConfig& c, const execution::VisionParameters& p,
         const auto scale = 1.0F / std::sqrt(float(c.head_dim()));
         if (equal_segments)
             ops::packed_softmax_attention(q, k, v, geometry, scale, segment_length, attended, cuda);
-        else {
-            MemoryArena attention(l.scratch.bind(backing));
-            ops::packed_softmax_attention(q, k, v, geometry, scale, segments, attention, attended,
+        else
+            ops::packed_softmax_attention(q, k, v, geometry, scale, segments, scratch, attended,
                                           cuda);
-        }
-        ops::linear_bias(y, layer.output.weight, layer.output_bias, norm, cuda);
+        ops::linear_bias(y, layer.output.weight, layer.output_bias, norm, layer.output.policy,
+                         scratch, cuda);
         ops::residual_add_rmsnorm(x, norm, layer.post_attention_norm, c.norm_epsilon, x, y, cuda);
         auto intermediate = z_matrix(0, dimension(c.intermediate), n);
         ops::linear_swiglu(y, layer.gate_up.weight, layer.gate_up_bias, intermediate,
-                           c.swiglu_limit, cuda);
-        ops::linear_bias(intermediate, layer.down.weight, layer.down_bias, y, cuda);
+                           c.swiglu_limit, layer.gate_up.policy, scratch, cuda);
+        ops::linear_bias(intermediate, layer.down.weight, layer.down_bias, y, layer.down.policy,
+                         scratch, cuda);
         const auto& gamma = i + 1 < p.layers.size() ? p.layers[i + 1].input_norm : p.post_norm;
         ops::residual_add_rmsnorm(x, y, gamma, c.norm_epsilon, x, norm, cuda);
     }
     auto merged = norm.view({dimension(c.merge_width()), f});
     auto first  = tensor(l.x, dimension(c.output_hidden), f);
     auto second = tensor(l.y, dimension(c.output_hidden), f);
-    ops::linear_bias(merged, p.downsample.weight, p.downsample_bias, first, cuda);
-    {
-        MemoryArena scratch(l.scratch.bind(backing));
-        ops::linear(first, p.merger_projection.weight, second, p.merger_projection.policy, scratch,
-                    cuda);
-    }
+    ops::linear_bias(merged, p.downsample.weight, p.downsample_bias, first, p.downsample.policy,
+                     scratch, cuda);
+    ops::linear(first, p.merger_projection.weight, second, p.merger_projection.policy, scratch,
+                cuda);
     ops::layer_norm(second, p.merger_norm_weight, p.merger_norm_bias, c.norm_epsilon, first, cuda);
     ops::gelu(first, ops::GeluMode::Exact, cuda);
     auto intermediate = z_matrix(0, dimension(c.merger_intermediate), f);
-    {
-        MemoryArena scratch(l.scratch.bind(backing));
-        ops::linear_swiglu(first, p.merger_gate_up.weight, intermediate, c.swiglu_limit,
-                           p.merger_gate_up.policy, scratch, cuda);
-    }
-    {
-        MemoryArena scratch(l.scratch.bind(backing));
-        ops::linear(intermediate, p.merger_down.weight, output, p.merger_down.policy, scratch,
-                    cuda);
-    }
+    ops::linear_swiglu(first, p.merger_gate_up.weight, intermediate, c.swiglu_limit,
+                       p.merger_gate_up.policy, scratch, cuda);
+    ops::linear(intermediate, p.merger_down.weight, output, p.merger_down.policy, scratch, cuda);
     return l.bytes;
 }
 

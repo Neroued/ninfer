@@ -71,6 +71,7 @@ bool report_has_activity(const ThroughputReport& report) {
            report.current.active_captures_aborted != report.previous.active_captures_aborted ||
            report.current.preemptions != report.previous.preemptions ||
            report.current.snapshot_restores != report.previous.snapshot_restores ||
+           report.current.direct_restores != report.previous.direct_restores ||
            report.current.replay_restores != report.previous.replay_restores ||
            report.current.replayed_tokens != report.previous.replayed_tokens ||
            report.current.root_selections != report.previous.root_selections ||
@@ -550,6 +551,8 @@ bool HttpServer::listen() {
 }
 
 void HttpServer::stop() {
+    // Wake generation handlers before cpp-httplib joins its HTTP worker queue.
+    if (service_) service_->request_stop();
     observations_.stop();
     server_.stop();
 }

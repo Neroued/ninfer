@@ -1,9 +1,10 @@
 #pragma once
 #include "ops/mhc/kernel/residual.cuh"
+#include "ops/mhc/kernel/coefficients.cuh"
 #include "ops/common/cuda/reduce.cuh"
 
 namespace ninfer::ops::detail::mhc {
-template <int Threads, int Values>
+template <class Gamma, int Threads, int Values>
 __global__ void post_mean_norm_vector_kernel(Operands o) {
     constexpr int Groups = kHidden / (Threads * Values);
     const auto m         = std::int64_t(blockIdx.x);
@@ -31,14 +32,12 @@ __global__ void post_mean_norm_vector_kernel(Operands o) {
     __syncthreads();
 #pragma unroll
     for (int group = 0; group < Groups; ++group) {
-        const int d = (group * Threads + tid) * Values;
-        const auto gamma =
-            common::Bf16Vector<Values>::load(static_cast<const __nv_bfloat16*>(o.gamma) + d);
+        const int d      = (group * Threads + tid) * Values;
+        const auto gamma = GammaVector<Gamma, Values>::load(static_cast<const Gamma*>(o.gamma) + d);
         common::Bf16Vector<Values> out;
 #pragma unroll
         for (int v = 0; v < Values; ++v)
-            out.word[v] =
-                __float2bfloat16_rn(__bfloat162float(gamma.word[v]) * values[group][v] * inverse);
+            out.word[v] = __float2bfloat16_rn(float(gamma.word[v]) * values[group][v] * inverse);
         out.store(static_cast<__nv_bfloat16*>(o.output) + m * kHidden + d);
     }
 }

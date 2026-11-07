@@ -1,4 +1,6 @@
 target_sources(ninfer_ops PRIVATE "${CMAKE_CURRENT_LIST_DIR}/linear_bias.cpp")
+include("${CMAKE_CURRENT_LIST_DIR}/mxfp8/sources.cmake")
+include("${CMAKE_CURRENT_LIST_DIR}/nvfp4_mul/sources.cmake")
 if(NINFER_TARGET STREQUAL "dgx_spark")
   target_sources(ninfer_ops_non_rdc PRIVATE
     "${CMAKE_CURRENT_LIST_DIR}/dgx_spark/shapes/n1024_k1176.cu"

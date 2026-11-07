@@ -32,10 +32,19 @@ __device__ __forceinline__ ScoreWork score_work(const IndexerArguments& a) {
         const auto span  = query_span(a, 0);
         const int groups = span.groups<Queries>();
         if (!groups) return {};
-        const int workers = gridDim.x / groups;
-        if (int(blockIdx.x) >= workers * groups) return {};
+        const int group = int(blockIdx.x) % groups;
+        int workers     = gridDim.x / groups;
+        if constexpr (Queries == 8) {
+            // Unequal strides use every resident CTA when K fits L2. Long
+            // streams retain equal strides so query groups reuse each key tile.
+            if (a.columns < 32768)
+                workers += group < int(gridDim.x) % groups;
+            else if (int(blockIdx.x) >= workers * groups)
+                return {};
+        } else if (int(blockIdx.x) >= workers * groups)
+            return {};
         return {0,
-                span.first + int(blockIdx.x) % groups * Queries,
+                span.first + group * Queries,
                 int(blockIdx.x) / groups * Keys,
                 workers * Keys,
                 span.live,

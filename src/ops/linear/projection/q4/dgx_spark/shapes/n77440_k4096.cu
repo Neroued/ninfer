@@ -6,12 +6,12 @@
 namespace ninfer::ops::detail {
 namespace {
 using Gemv =
-    Q4A16GemvSchedule<4, 2, 16, 1, Q4GemvActivationAccess::Direct, Q4GemvLaneMapping::PackedWord8,
+    Q4A16GemvSchedule<4, 4, 8, 2, Q4GemvActivationAccess::Direct, Q4GemvLaneMapping::PackedWord8,
                       Q4GemvDecodeMode::Fp16Mantissa, Q4GemvCodeTransfer::AsyncVector16,
                       Q4GemvScaleAccess::SharedPair32, Cache::ca, 64, 1>;
 template <int Tokens>
-using Few      = Q4A16SimtSchedule<4, Tokens, 2, 8, 2, Cache::ca, 1>;
-using Small16  = Q4A16SlicedKMmaSchedule<16, 16, 8, 1, Cache::cg, Cache::ca, 2, 4096, 16>;
+using Few      = Q4A16SimtSchedule<4, Tokens, 2, Tokens == 4 ? 8 : 16, 2, Cache::ca, 1>;
+using Small16  = Q4A16SlicedKMmaSchedule<16, 16, 8, 2, Cache::cg, Cache::ca, 2, 4096, 16>;
 using T48      = Q4A16TmaPrefetchSchedule<32, 48, 32, 8, 2, 4096, 1, 16, 4, 1, 128>;
 using T64      = Q4A16TmaPrefetchSchedule<32, 64, 32, 16, 3, 4096>;
 using T96      = Q4A16TmaPrefetchSchedule<64, 96, 32, 24, 2, 4096, 1, 16, 4, 1, 128, 1>;

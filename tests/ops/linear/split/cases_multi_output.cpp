@@ -47,16 +47,14 @@ void add_multi_output_cases(Suite& suite) {
         add_profile(suite, profile, std::move(calls));
     }
     {
-        Profile profile{5120,
-                        {{QType::NVFP4,
-                          14336,
-                          331U,
-                          {.weight_scale_divisor = 0.125F, .input_scale_divisor = 3.5F}}},
-                        segments,
-                        regions,
-                        a16,
-                        1.0 / 256.0,
-                        Binding::Nvfp4Inputs};
+        Profile profile{
+            5120,
+            {{QType::NVFP4, 14336, 331U, {.weight_scale = 0.125F, .input_scale = 3.5F}}},
+            segments,
+            regions,
+            a16,
+            1.0 / 256.0,
+            Binding::Nvfp4Inputs};
         std::vector<Invocation> calls;
         for (int t : {1, 2, 4, 8, 16, 20, 32, 33})
             calls.push_back({.t = t, .input_seed = 337U, .omit_divisors = t == 1});

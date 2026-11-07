@@ -79,12 +79,23 @@ int graph(bool fp8_index = false, int T = 129, int B = 3) {
     kp::IndexerFixture f(
         d.execution_view(), T, B, 262148, 1, false, ops::KpoolMlaStorage::BFloat16, {}, true,
         fp8_index ? KvCacheVectorFormat::Fp8E4m3fnGroup128Ue8m0 : KvCacheVectorFormat::BFloat16);
+    const std::array bounds{2051, 262148, 131108, 0, 8192};
+    // Capacity is for a fixed Host envelope; different envelopes may choose
+    // different windows. Reserve the union before capturing any child graph.
+    for (int bound : bounds)
+        f.workspace_bytes =
+            std::max(f.workspace_bytes, ops::kpool_indexer_workspace_capacity_bytes(
+                                            {32, 128}, f.cache.format, {unsigned(bound)}, B, 1, T,
+                                            d.execution_view().multiprocessor_count()));
+    f.scratch = DeviceBuffer(d.execution_view().device(), f.workspace_bytes + 512);
+    f.scratch.fill(0xa5);
+    f.workspace = std::make_unique<MemoryArena>(f.scratch.span().subspan(256, f.workspace_bytes));
     DecodeGraphDefinition outer;
     DecodeGraphExecutable graph;
     DecodeGraphChild child;
     std::optional<ops::KpoolGraphProfile> installed;
     int failures = 0;
-    for (int bound : {2051, 262148, 131108, 0, 8192}) {
+    for (int bound : bounds) {
         f.envelope.max_visible_tokens = bound;
         for (int b = 0; b < f.B; ++b) {
             f.valid.at(b)     = bound ? (b == 2 ? 0 : f.T) : 0;
@@ -109,7 +120,7 @@ int graph(bool fp8_index = false, int T = 129, int B = 3) {
         }
         // Relocate page mappings and turn another row into all-select after capture.
         for (int p = 0; p + 1 < f.P; p += 2) std::swap(f.tables.at(p, 0), f.tables.at(p + 1, 0));
-        if (bound > 2051) {
+        if (bound > 2051 && f.B > 1) {
             f.selectors.at(1) = -1;
             for (int t = 0; t < f.T; ++t) f.positions.at(t, 1) = t;
         }
@@ -167,6 +178,21 @@ int mixed_history() {
     f.launch(d.execution_view());
     d.synchronize();
     return verify(f);
+}
+
+int token_sweep(bool fp8) {
+    auto& d = cuda_environment().context;
+    kp::IndexerFixture f(
+        d.execution_view(), 17, 3, 8192, 1, false, ops::KpoolMlaStorage::BFloat16, {}, true,
+        fp8 ? KvCacheVectorFormat::Fp8E4m3fnGroup128Ue8m0 : KvCacheVectorFormat::BFloat16);
+    int failures = 0;
+    for (int tokens : {1, 3, 2, 17, 8}) {
+        f.reset_tokens(tokens, true, d.execution_view());
+        f.launch(d.execution_view());
+        d.synchronize();
+        failures += verify(f);
+    }
+    return failures;
 }
 
 int workspace_interval(bool fp8 = false) {
@@ -255,20 +281,25 @@ int main(int argc, char** argv) {
               {{"format", "bf16"}, {"execution", "eager"}});
     suite.add("kpool_indexer/graph", [] { return graph(); },
               {{"format", "bf16"}, {"execution", "graph"}});
+    suite.add("kpool_indexer/graph_single", [] { return graph(false, 129, 1); });
     suite.add("kpool_indexer/graph_growth", [] { return graph_growth(false); },
               {{"format", "bf16"}, {"execution", "graph"}});
     suite.add("kpool_indexer/workspace_interval", [] { return workspace_interval(); });
     suite.add("kpool_indexer/admission", admission);
+    suite.add("kpool_indexer/token_sweep", [] { return token_sweep(false); });
+    suite.add("kpool_indexer/exact_wide", [] { return run(8, 2, 131076, 0); });
     for (auto [T, B, E] :
-         {std::tuple{1, 1, 2051}, {1, 1, 2052},    {1, 1, 8192},    {2, 1, 16388},
-          {3, 1, 32768},          {4, 1, 32768},   {5, 1, 32768},   {8, 1, 65536},
-          {15, 1, 262144},        {16, 1, 262144}, {17, 1, 262144}, {31, 1, 131072},
-          {32, 1, 131072},        {33, 1, 131072}, {17, 3, 131108}, {1, 1, 1048576},
-          {16, 1, 1048576},       {127, 1, 65536}, {128, 1, 65536}, {129, 1, 65536},
-          {255, 1, 65536},        {256, 1, 65536}, {257, 1, 65536}, {65, 4, 262144},
-          {129, 8, 131108},       {7, 8, 262144},  {8, 8, 262144},  {9, 8, 262144},
-          {16, 8, 262144},        {17, 8, 65536},  {16, 5, 131072}, {128, 2, 262144},
-          {31, 4, 262144},        {32, 4, 262144}, {33, 4, 262144}, {17, 2, 0}})
+         {std::tuple{1, 1, 2051}, {1, 1, 2052},     {1, 1, 8192},      {2, 1, 16388},
+          {3, 1, 32768},          {4, 1, 32768},    {5, 1, 32768},     {8, 1, 65536},
+          {15, 1, 262144},        {16, 1, 262144},  {17, 1, 262144},   {31, 1, 131072},
+          {57, 1, 65536},         {60, 1, 65536},   {68, 1, 65536},    {100, 1, 65536},
+          {120, 1, 65536},        {33, 1, 1048576}, {127, 1, 1048576}, {128, 1, 1048576},
+          {32, 1, 131072},        {33, 1, 131072},  {17, 3, 131108},   {1, 1, 1048576},
+          {16, 1, 1048576},       {127, 1, 65536},  {128, 1, 65536},   {129, 1, 65536},
+          {255, 1, 65536},        {256, 1, 65536},  {257, 1, 65536},   {65, 4, 262144},
+          {129, 8, 131108},       {7, 8, 262144},   {8, 8, 262144},    {9, 8, 262144},
+          {16, 8, 262144},        {17, 8, 65536},   {16, 5, 131072},   {128, 2, 262144},
+          {31, 4, 262144},        {32, 4, 262144},  {33, 4, 262144},   {17, 2, 0}})
         suite.add("kpool_indexer/fp8/" + std::to_string(T) + "x" + std::to_string(B) + "/" +
                       std::to_string(E),
                   [=] { return run(T, B, E, -1, false, true); },
@@ -282,9 +313,14 @@ int main(int argc, char** argv) {
               {{"format", "fp8"}, {"execution", "graph"}});
     suite.add("kpool_indexer/fp8/graph_grouping", [] { return graph(true, 16, 8); },
               {{"format", "fp8"}, {"execution", "graph"}});
+    suite.add("kpool_indexer/fp8/graph_single", [] { return graph(true, 129, 1); });
     suite.add("kpool_indexer/fp8/graph_growth", [] { return graph_growth(true); },
               {{"format", "fp8"}, {"execution", "graph"}});
     suite.add("kpool_indexer/fp8/mixed_history", mixed_history, {{"format", "fp8"}});
+    suite.add("kpool_indexer/fp8/token_sweep", [] { return token_sweep(true); });
+    suite.add("kpool_indexer/fp8/exact_worker_tail",
+              [] { return run(100, 1, 65536, 0, false, true); });
+    suite.add("kpool_indexer/fp8/exact_wide", [] { return run(8, 2, 131076, 0, false, true); });
     suite.add("kpool_indexer/fp8/workspace_interval", [] { return workspace_interval(true); },
               {{"format", "fp8"}});
     return suite.main(argc, argv);

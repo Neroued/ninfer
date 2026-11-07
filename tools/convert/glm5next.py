@@ -12,6 +12,7 @@ from .model import Model, Parameter
 from .resources import TEXT_RESOURCES, load_resources
 from .sources.logical import LogicalSource, select_rows
 from .sources.modelopt_nvfp4 import ModelOptNvfp4
+from .sources.modelopt import ModelOptSource
 from .sources.safetensors import tensor_source
 
 
@@ -21,7 +22,21 @@ def text_config(source):
         ["Glm5NextForCausalLM"],
     ):
         raise ValueError("expected Glm5Next architecture")
-    raw = source.get("text_config", source)
+    raw = deepcopy(source.get("text_config", source))
+    if "linear_attn_config" in raw:
+        linear = raw["linear_attn_config"]
+        for key, nested in (
+            ("linear_num_heads", "num_heads"),
+            ("linear_head_dim", "head_dim"),
+            ("linear_conv_kernel_dim", "short_conv_kernel_size"),
+            ("linear_lower_bound", "gate_lower_bound"),
+        ):
+            if key in raw and raw[key] != linear[nested]:
+                raise ValueError(
+                    f"glm5next.{key}: conflicting linear attention configuration"
+                )
+            raw[key] = linear[nested]
+    raw.setdefault("bos_token_id", None)
     keys = (
         "hidden_size",
         "vocab_size",
@@ -121,8 +136,8 @@ def _nvfp4_source(store, prefix, shape):
         f"{store.path}:{prefix} (modelopt nvfp4)",
         lambda a, b: source().values(a, b),
         lambda a, b: source().read_encoded(a, b),
-        lambda: source().weight_divisor(),
-        lambda: source().input_divisor(),
+        lambda: source().weight_scale(),
+        lambda: source().activation_scale(),
         encoded_format="nvfp4",
     )
 
@@ -137,10 +152,18 @@ def bank_source(sources, shape):
             stop = min(end, (expert + 1) * width)
             parts.append(sources[expert].values(local, local + stop - begin))
             begin = stop
-        return torch.cat(parts) if parts else sources[0].values(0, 0)
+        return (
+            parts[0]
+            if len(parts) == 1
+            else torch.cat(parts) if parts else sources[0].values(0, 0)
+        )
 
     return LogicalSource(
-        shape, f"bank({sources[0].label}, {len(sources)} experts)", read
+        shape,
+        f"bank({sources[0].label}, {len(sources)} experts)",
+        read,
+        encoded_format=sources[0].encoded_format,
+        matrix_sources=tuple(sources),
     )
 
 
@@ -148,6 +171,10 @@ class Builder:
     def __init__(self, model, base, cfg):
         self.model, self.base, self.cfg = model, base, cfg
         self.consumed = set()
+        self.native = (
+            base.config.get("quantization_config", {}).get("quant_algo")
+            == "MIXED_PRECISION"
+        )
 
     def add(
         self,
@@ -156,7 +183,7 @@ class Builder:
         shape,
         *,
         inputs=(),
-        direct="bf16",
+        direct=None,
         source_shape=None,
         offset=0,
         rows=None,
@@ -164,20 +191,45 @@ class Builder:
     ):
         shape = tuple(shape)
         original = tuple(source_shape or shape)
-        dtype = {"bf16": "BF16", "fp32": "F32"}[direct]
+        info = self.base.describe(source)
+        encoded = self.native and info.dtype in ("U8", "F8_E4M3")
+        if encoded:
+            if (
+                not source.endswith(".weight")
+                or len(original) != 2
+                or axes is not None
+                or offset
+            ):
+                raise ValueError(
+                    f"{name}: encoded source requires complete matrix rows"
+                )
+            prefix = source.removesuffix(".weight")
+            direct = ModelOptSource(self.base).matrix(prefix, original).encoding()
+            self.consumed.update(ModelOptSource(self.base).names(prefix))
+        else:
+            direct = direct or {"BF16": "bf16", "F32": "fp32"}.get(info.dtype)
+            if direct is None:
+                raise ValueError(f"{source}: unsupported direct dtype {info.dtype}")
+        dtype = {"bf16": "BF16", "fp32": "F32"}.get(direct)
 
         def factory(store, format=None):
             if format not in (None, direct):
                 raise ValueError(f"{name}: source representation is {direct}")
             info = store.describe(source)
-            if info.shape != original or info.dtype != dtype:
+            if not encoded and (info.shape != original or info.dtype != dtype):
                 raise ValueError(
                     f"{source}: expected {dtype} {original}, got {info.dtype} {info.shape}"
                 )
-            ref = tensor_source(store, source, original)
+            ref = (
+                ModelOptSource(store).matrix(prefix, original)
+                if encoded
+                else tensor_source(store, source, original)
+            )
             if rows is not None:
                 ref = select_rows(ref, tuple(rows))
-                return LogicalSource(shape, ref.label, ref.read_values)
+                return ref.reshape(shape)
+            if encoded:
+                return ref.reshape(shape)
             if axes is not None:
                 # These transforms preserve each output row; read only requested rows.
                 if axes[0] != 0 or shape[0] != original[0]:
@@ -216,6 +268,9 @@ class Builder:
         self.model.packing_groups.append(tuple(names))
 
     def encoded(self, name, prefix, shape, *, inputs):
+        if self.native:
+            return self.add(name, prefix + ".weight", shape, inputs=inputs)
+
         def factory(store, format=None):
             if format not in (None, "nvfp4"):
                 raise ValueError(f"{name}: source representation is nvfp4")
@@ -280,14 +335,18 @@ class Builder:
         self.add(p + "kda/dt_bias", a + "dt_bias", (c,), direct="fp32")
         names = tuple(a + role + "_conv1d.weight" for role in ("q", "k", "v"))
         self.consumed.update(names)
+        conv_dtype = self.base.describe(names[0]).dtype
+        conv_format = {"BF16": "bf16", "F32": "fp32"}.get(conv_dtype)
+        if conv_format is None:
+            raise ValueError("KDA convolution requires BF16 or FP32 weights")
 
         def factory(store, format=None):
-            if format not in (None, "fp32"):
-                raise ValueError("KDA convolution preserves source FP32 words")
+            if format not in (None, conv_format):
+                raise ValueError("KDA convolution preserves its source words")
             for name in names:
                 info = store.describe(name)
-                if info.shape != (c, 1, taps) or info.dtype != "F32":
-                    raise ValueError(f"{name}: expected F32 {(c, 1, taps)}")
+                if info.shape != (c, 1, taps) or info.dtype != conv_dtype:
+                    raise ValueError(f"{name}: expected {conv_dtype} {(c, 1, taps)}")
 
             def read(begin, end):
                 values = torch.cat(
@@ -303,7 +362,7 @@ class Builder:
                 (taps, 3 * c),
                 factory(self.base),
                 source_factory=factory,
-                direct_format="fp32",
+                direct_format=conv_format,
                 residency=p.split("/")[0],
             )
         )
@@ -424,6 +483,9 @@ class Builder:
             shape = (e, *matrix)
             prefixes = tuple(s + f"mlp.experts.{j}.{role}_proj" for j in range(e))
             for prefix in prefixes:
+                if self.native:
+                    self.consumed.update(ModelOptSource(self.base).names(prefix))
+                    continue
                 self.consumed.update(
                     prefix + "." + field
                     for field in (
@@ -436,12 +498,16 @@ class Builder:
             def factory(
                 store, format=None, *, prefixes=prefixes, matrix=matrix, shape=shape
             ):
-                expected = "nvfp4" if encoded else "bf16"
+                expected = (
+                    "nvfp4_mul" if self.native else "nvfp4" if encoded else "bf16"
+                )
                 if format not in (None, expected):
                     raise ValueError(f"expert source representation is {expected}")
                 refs = []
                 for prefix in prefixes:
-                    if encoded:
+                    if self.native:
+                        refs.append(ModelOptSource(store).matrix(prefix, matrix))
+                    elif encoded:
                         refs.append(_nvfp4_source(store, prefix, matrix))
                     else:
                         info = store.describe(prefix + ".weight")
@@ -458,7 +524,9 @@ class Builder:
                     factory(self.base),
                     source_factory=factory,
                     inputs=(inp,),
-                    direct_format="nvfp4" if encoded else "bf16",
+                    direct_format=(
+                        "nvfp4_mul" if self.native else "nvfp4" if encoded else "bf16"
+                    ),
                     residency=p.split("/")[0],
                 )
             )
@@ -654,6 +722,7 @@ def build_model(
                     value.shape,
                     value.source,
                     inputs=("mtp/final_hidden",) if role == "output_head" else (),
+                    direct_format=value.direct_format,
                     residency="mtp",
                 )
             )

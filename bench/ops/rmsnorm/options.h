@@ -8,6 +8,8 @@ struct Options {
     measurement::Options timing;
     Op op         = Op::Plain;
     int dimension = 128, heads = 48, batch = 1;
+    int reserve_tokens = 0, condition_us = 0;
+    float epsilon = 1.0e-6F;
     std::vector<int> tokens{1};
 };
 
@@ -33,7 +35,8 @@ inline Options parse(int argc, char** argv) {
         if (flag == "--help" || flag == "-h") {
             std::cout
                 << "RMSNorm Op benchmark\n  --op rmsnorm|offset|silu-gated|sigmoid-gated\n"
-                   "  --dim D --heads H --batch B --tokens M[,M...] or --sweep START:END[:STEP]\n";
+                   "  --dim D --heads H --batch B --tokens M[,M...] or --sweep START:END[:STEP]\n"
+                   "  --reserve-tokens M --condition-us N --epsilon E\n";
             measurement::help();
             std::exit(0);
         }
@@ -55,7 +58,16 @@ inline Options parse(int argc, char** argv) {
             o.heads = measurement::integer(value);
         else if (flag == "--batch")
             o.batch = measurement::integer(value);
-        else if (flag == "--tokens") {
+        else if (flag == "--reserve-tokens")
+            o.reserve_tokens = measurement::integer(value);
+        else if (flag == "--condition-us")
+            o.condition_us = measurement::integer(value, 0);
+        else if (flag == "--epsilon") {
+            std::size_t end;
+            o.epsilon = std::stof(std::string(value), &end);
+            if (end != value.size() || !(o.epsilon > 0) || !std::isfinite(o.epsilon))
+                throw std::invalid_argument("epsilon must be positive and finite");
+        } else if (flag == "--tokens") {
             o.tokens    = measurement::integers(value);
             have_tokens = true;
         } else if (flag == "--sweep") {

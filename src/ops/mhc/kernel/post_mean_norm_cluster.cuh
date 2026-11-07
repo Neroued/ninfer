@@ -1,13 +1,14 @@
 #pragma once
 
 #include "ops/mhc/kernel/residual.cuh"
+#include "ops/mhc/kernel/coefficients.cuh"
 #include "ops/common/cuda/reduce.cuh"
 #include <cooperative_groups.h>
 
 namespace ninfer::ops::detail::mhc {
 // A small group of CTAs shares one token's RMS reduction. All mixed streams
 // cross the BF16 boundary in registers, and only the final hidden is published.
-template <int Cluster, int Threads, int Vector>
+template <class Gamma, int Cluster, int Threads, int Vector>
 __global__ void __cluster_dims__(Cluster, 1, 1) post_mean_norm_cluster_kernel(Operands o) {
     constexpr int Hidden = kHidden / Cluster, Groups = Hidden / (Threads * Vector);
     static_assert(Groups > 0 && Hidden % (Threads * Vector) == 0);
@@ -36,12 +37,11 @@ __global__ void __cluster_dims__(Cluster, 1, 1) post_mean_norm_cluster_kernel(Op
     square = common::block_reduce_sum<Threads>(square, sums);
     if (tid == 0) total = square;
     auto reduced = cluster.barrier_arrive();
-    common::Bf16Vector<Vector> gamma[Groups];
+    GammaVector<Gamma, Vector> gamma[Groups];
 #pragma unroll
     for (int group = 0; group < Groups; ++group)
-        gamma[group] =
-            common::Bf16Vector<Vector>::load(static_cast<const __nv_bfloat16*>(o.gamma) +
-                                             rank * Hidden + (group * Threads + tid) * Vector);
+        gamma[group] = GammaVector<Gamma, Vector>::load(
+            static_cast<const Gamma*>(o.gamma) + rank * Hidden + (group * Threads + tid) * Vector);
     cluster.barrier_wait(std::move(reduced));
     square              = lane < Cluster ? *cluster.map_shared_rank(&total, lane) : 0.F;
     square              = common::warp_sum(square);
@@ -53,8 +53,8 @@ __global__ void __cluster_dims__(Cluster, 1, 1) post_mean_norm_cluster_kernel(Op
         common::Bf16Vector<Vector> output;
 #pragma unroll
         for (int v = 0; v < Vector; ++v)
-            output.word[v] = __float2bfloat16_rn(__bfloat162float(gamma[group].word[v]) *
-                                                 values[group][v] * inverse);
+            output.word[v] =
+                __float2bfloat16_rn(float(gamma[group].word[v]) * values[group][v] * inverse);
         output.store(static_cast<__nv_bfloat16*>(o.output) + m * kHidden + rank * Hidden +
                      (group * Threads + tid) * Vector);
     }

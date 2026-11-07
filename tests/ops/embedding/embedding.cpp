@@ -730,6 +730,12 @@ void add_embedding_cases(ninfer::test::OpSuite& suite) {
                   {{"format", "bf16"}, {"execution", tokens == 48 ? "graph" : "eager"}});
     suite.add("embedding/bf16/d2560/unaligned", [] { return test_dense(2560, 9, 1); },
               {{"format", "bf16"}, {"execution", "eager"}});
+    for (int tokens : {1, 8, 17, 128, 257, 4097})
+        suite.add("embedding/bf16/d4096/t" + std::to_string(tokens),
+                  [=] { return test_dense(4096, tokens, 0, tokens == 17); },
+                  {{"format", "bf16"}, {"execution", tokens == 17 ? "graph" : "eager"}});
+    suite.add("embedding/bf16/d4096/unaligned", [] { return test_dense(4096, 9, 1); },
+              {{"format", "bf16"}, {"execution", "eager"}});
     add_quantized_cases<Q6Table>(suite, "q6", kQ6D, true, {{1}, {7}, {128}},
                                  [] { return Q6Table{}; });
     add_quantized_cases<Q8Table>(suite, "q8", kQ8VisionD, true, {{1}, {6}, {16}, {1024}},

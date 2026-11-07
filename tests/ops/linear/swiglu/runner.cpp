@@ -69,8 +69,11 @@ std::vector<std::uint16_t> make_activation(const Profile& profile, std::int32_t 
     // production staging or reduction behavior.
     const bool native_float_weight =
         profile.qtype == QType::NVFP4 || profile.qtype == QType::FP8_E4M3FN_ROW_BF16;
+    const bool local_float_weight = profile.qtype == QType::MXFP8 ||
+                                    profile.qtype == QType::FP8_E4M3FN_BLOCK128X128_FP32 ||
+                                    profile.qtype == QType::NVFP4_MUL;
     const float dense_scale =
-        profile.qtype == QType::BF16
+        profile.qtype == QType::BF16 || local_float_weight
             ? 2.0e-2F
             : (profile.qtype == QType::Q4_G64_FP16 ? 1.25e-4F
                                                    : (native_float_weight ? 1.0e-3F : 1.0e-5F));
@@ -85,7 +88,7 @@ std::vector<std::uint16_t> make_activation(const Profile& profile, std::int32_t 
 
     constexpr std::int32_t kNonzerosPerSparseToken = 4;
     const float sparse_scale =
-        profile.qtype == QType::BF16
+        profile.qtype == QType::BF16 || local_float_weight
             ? 5.0e-1F
             : (profile.qtype == QType::Q4_G64_FP16 ? 1.5e-2F
                                                    : (native_float_weight ? 2.0e-2F : 1.5e-3F));
@@ -240,8 +243,12 @@ static int run_profile(std::string_view label, const Profile& profile,
     }
     quantized_weight::PatternedWeightOptions weight_options;
     if (profile.qtype == QType::NVFP4) {
-        weight_options.weight_scale_divisor = 0.125F;
-        weight_options.input_scale_divisor  = 3.5F;
+        weight_options.weight_scale = 0.125F;
+        weight_options.input_scale  = 3.5F;
+    }
+    if (profile.qtype == QType::NVFP4_MUL) {
+        weight_options.weight_scale = 0.031713F;
+        weight_options.input_scale  = 0.01931F;
     }
     quantized_weight::PackedWeight host_weight =
         profile.qtype == QType::BF16
@@ -283,6 +290,7 @@ static int run_profile(std::string_view label, const Profile& profile,
                                              profile.qtype, profile.gate_up_rows,
                                              profile.input_rows, policy, 1, admitted_maximum);
     int failures                 = 0;
+    bool checked_workspace_alias = false;
     const auto run_case          = [&](const Invocation& call) {
         const auto tokens   = call.tokens;
         const auto replay   = call.graph;
@@ -333,6 +341,19 @@ static int run_profile(std::string_view label, const Profile& profile,
         const auto cuda =
             replay ? graph_context->execution_view() : cuda_environment().default_execution;
         const auto stream = cuda.stream();
+        if (profile.qtype == QType::MXFP8 && capacity && !checked_workspace_alias && !replay) {
+            checked_workspace_alias = true;
+            MemoryArena overlapping(device_activation.span());
+            try {
+                if (profile.clamp_limit > 0)
+                    ops::linear_swiglu(x, weight, destination, profile.clamp_limit, policy,
+                                                overlapping, cuda);
+                else
+                    ops::linear_swiglu(x, weight, destination, policy, overlapping, cuda);
+                ++failures;
+            } catch (const std::invalid_argument&) {}
+            if (overlapping.used() != 0) ++failures;
+        }
         const auto launch = [&] {
             if (profile.clamp_limit > 0)
                 ops::linear_swiglu(x, weight, destination, profile.clamp_limit, policy, workspace,

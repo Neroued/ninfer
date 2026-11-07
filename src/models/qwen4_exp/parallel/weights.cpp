@@ -18,8 +18,8 @@ WeightSelection select_weights(const artifact::Reader& reader, const ModelDefini
         if (definition.weights().mtp) append(definition.weights().mtp->layer.moe);
     }
     WeightSelection out;
-    out.weights = models::select_weights(reader, definition.parameters(), rank.assemblies,
-                                         partitions, device);
+    out.weights = models::select_weights(reader, definition.parameters(), definition.weight_data(),
+                                         rank.assemblies, partitions, device);
     if (rank.size > 1) {
         for (std::uint32_t i = rank.ple_shards.begin;
              i < rank.ple_shards.begin + rank.ple_shards.size; ++i) {

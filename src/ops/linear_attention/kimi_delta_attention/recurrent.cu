@@ -33,8 +33,11 @@ void launch_record(const Arguments& args, const std::int64_t* sources, const std
                    dim3(common::kWarpSize, kNumWarps), 0, stream>>>(args, sources, valid, records);
         };
 #if NINFER_TARGET_SPARK
-        if (select_record_rows(args.value_heads, args.tokens, batch) == 8)
+        const int rows = select_record_rows(args.value_heads, args.tokens, batch);
+        if (rows == 8)
             submit.template operator()<8>();
+        else if (rows == 2)
+            submit.template operator()<2>();
         else
 #endif
             submit.template operator()<4>();

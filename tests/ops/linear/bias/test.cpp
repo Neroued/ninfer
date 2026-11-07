@@ -11,6 +11,10 @@
 using namespace ninfer;
 using namespace ninfer::test;
 
+namespace ninfer::test::linear_bias {
+void add_native_cases(linear_suite::Suite& suite);
+}
+
 namespace {
 enum class Kind { Projection, Split, SwiGlu };
 enum class Recipe { Random, Cancellation, NegativeGate, AlternateLimit };
@@ -251,6 +255,7 @@ int validate(Kind kind) {
 
 int main(int argc, char** argv) {
     linear_suite::Suite suite;
+    linear_bias::add_native_cases(suite);
 #if NINFER_TARGET_SPARK
     for (auto kind : {Kind::Projection, Kind::Split, Kind::SwiGlu}) {
         const int n = kind == Kind::Projection ? 1024 : kind == Kind::Split ? 3072 : 8192;

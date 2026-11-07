@@ -4,6 +4,21 @@
 
 namespace ninfer::ops::detail::mhc {
 template <int Threads, int Values>
+__global__ void post_register_kernel(Operands o, std::int64_t tile_offset) {
+    constexpr int HiddenTile = Threads * Values;
+    const auto tile          = tile_offset + blockIdx.x;
+    const auto m             = tile / (kHidden / HiddenTile);
+    const int d              = (tile % (kHidden / HiddenTile)) * HiddenTile + threadIdx.x * Values;
+    const auto post          = common::F32Vector<4>::load(o.post + m * 4);
+    const auto mix           = common::F32Vector<16>::load(o.mix + m * 16);
+    common::Bf16Vector<Values> values[4];
+    mixed_vectors(o, m, d, post.word, mix.word, values);
+#pragma unroll
+    for (int j = 0; j < 4; ++j)
+        values[j].store(static_cast<__nv_bfloat16*>(o.updated) + m * kWidth + j * kHidden + d);
+}
+
+template <int Threads, int Values>
 __global__ void post_vector_kernel(Operands o, std::int64_t tile_offset) {
     constexpr int HiddenTile = Threads * Values;
     const auto tile          = tile_offset + blockIdx.x;

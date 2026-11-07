@@ -22,8 +22,8 @@ quantized_weight::PackedWeight make_first(Profile p, bool record) {
     }
     quantized_weight::PatternedWeightOptions options;
     if (p.format == QType::NVFP4) {
-        options.weight_scale_divisor = 0.125F;
-        options.input_scale_divisor  = 3.5F;
+        options.weight_scale = 0.125F;
+        options.input_scale  = 3.5F;
     }
     const int rows = p.format == QType::Q4_G64_FP16 ? 4096 : 2 * p.qk_rows + 2 * p.value_rows();
     return quantized_weight::make_patterned_weight(p.format, rows, p.hidden, seed, options);
@@ -49,7 +49,7 @@ Weights::Weights(Profile p, bool record) : profile(p), first(make_first(p, recor
 }
 
 ops::ProjectionWeights Weights::projection(ops::LinearPolicy policy) const {
-    if (second) return ops::PairedProjectionWeights{first.view(), second->view()};
+    if (second) return ops::PairedProjectionWeights{{first.view()}, {second->view()}};
     return ops::SingleProjectionWeight{first.view(), policy};
 }
 

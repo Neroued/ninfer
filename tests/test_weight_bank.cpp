@@ -64,8 +64,8 @@ void block_scales() {
             require(w.qdata == parent.data + (e * 256 + 128) * (nv ? 192 : 384));
             require(w.scales ==
                     parent.data + (nv ? 147456 + (e * 256 + 128) * 24 : 294912 + (e * 2 + 1) * 6));
-            require(!nv || (w.weight_scale_divisor == divisors[e] && w.input_scale_divisor == 7));
-            require(bank.divisor(e) == (nv ? divisors[e] : 1));
+            require(!nv || (w.weight_scale == divisors[e] && w.input_scale == 7));
+            require(bank.matrix_scale(e) == (nv ? divisors[e] : 1));
         }
         rejects([&] { (void)describe_weight_bank(g, {64, 1, 128, 256}); });
         if (nv) {
@@ -85,7 +85,7 @@ void fp8_blocks() {
         const auto g = weight_geometry(format, layout, std::array<std::uint64_t, 3>{3, n, k});
         require(g.code_bytes == 3 * n * k && g.scale_offset == g.code_bytes &&
                 g.scale_offset % 256 == 0 && g.scale_bytes == 3 * (n / block) * (k / block) * 2 &&
-                g.bytes == g.scale_offset + g.scale_bytes && !g.divisor_count &&
+                g.bytes == g.scale_offset + g.scale_bytes && !g.matrix_scale_count &&
                 g.padded_columns == k && g.scale_block_rows == block && g.group_size == block);
         HostBuffer storage(g.bytes);
         WeightParent parent{g, Device::cpu(), static_cast<const std::byte*>(storage.data())};
@@ -95,7 +95,7 @@ void fp8_blocks() {
                 bank.layout.codes.expert_stride == n * k &&
                 bank.layout.scales.expert_bytes == (n / block - 1) * (k / block) * 2 &&
                 bank.layout.scales.expert_stride == (n / block) * (k / block) * 2 &&
-                !bank.layout.has_divisors);
+                !bank.layout.has_matrix_scales);
         for (unsigned e = 0; e < 3; ++e) {
             const auto w   = matrix_weight(bank, e);
             const auto row = e * n + block;
@@ -105,8 +105,8 @@ void fp8_blocks() {
                     w.padded_shape[1] == k && w.scale_dtype == DType::BF16 &&
                     w.scale_ne[0] == k / block && w.scale_ne[1] == n / block - 1 &&
                     w.scale_nb[0] == 2 && w.scale_nb[1] == k / block * 2 &&
-                    w.scale_nb[2] == (n / block - 1) * (k / block) * 2 && !w.weight_scale_divisor &&
-                    !w.input_scale_divisor && bank.divisor(e) == 1);
+                    w.scale_nb[2] == (n / block - 1) * (k / block) * 2 && !w.weight_scale &&
+                    !w.input_scale && bank.matrix_scale(e) == 1);
             for (std::uint64_t r = row; r < row + n - block; ++r)
                 for (std::uint64_t c = 0; c < k / block; ++c)
                     require(weight_scale_offset(g, r, c) ==

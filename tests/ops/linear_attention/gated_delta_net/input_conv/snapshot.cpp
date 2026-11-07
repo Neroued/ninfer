@@ -542,13 +542,14 @@ int run_q4_q5_case(DevicePackedWeight& query_key, DevicePackedWeight& value_z_we
     Tensor v                          = value.tensor();
     Tensor z_output                   = z.tensor();
     const std::size_t workspace_bytes = ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
-        ops::PairedProjectionWeights{query_key.view(), value_z_weight.view()}, 1, tokens, tokens);
+        ops::PairedProjectionWeights{{query_key.view()}, {value_z_weight.view()}}, 1, tokens,
+        tokens);
     ninfer::DeviceBuffer workspace_storage(ninfer::test::cuda_environment().context.device(),
                                            std::max<std::size_t>(1, workspace_bytes));
     MemoryArena workspace(workspace_storage.span());
 
     ops::gdn_input_proj_conv_snapshot(
-        x, ops::PairedProjectionWeights{query_key.view(), value_z_weight.view()}, conv,
+        x, ops::PairedProjectionWeights{{query_key.view()}, {value_z_weight.view()}}, conv,
         {source, conv_state, snapshot_base}, Tensor{}, {q, k, v, z_output}, workspace,
         ninfer::test::cuda_environment().default_execution);
     cuda_synchronize();

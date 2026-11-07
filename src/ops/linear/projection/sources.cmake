@@ -9,3 +9,7 @@ include("${CMAKE_CURRENT_LIST_DIR}/q4/sources.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/q5/sources.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/q6/sources.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/q8/sources.cmake")
+
+include("${CMAKE_CURRENT_LIST_DIR}/mxfp8/sources.cmake")
+include("${CMAKE_CURRENT_LIST_DIR}/fp8_block/sources.cmake")
+include("${CMAKE_CURRENT_LIST_DIR}/nvfp4_mul/sources.cmake")

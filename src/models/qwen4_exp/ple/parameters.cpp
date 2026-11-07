@@ -29,7 +29,7 @@ LookupParameters load_lookup_parameters(const artifact::Reader& reader,
         result.rows = checked_add(result.rows, geometry.shape[0], "PLE rows");
         std::array<std::byte, 4> word{};
         reader.read_into(checked_add(reader.directory().tensor(part.object).offset,
-                                     geometry.divisor_offset, "PLE divisor offset"),
+                                     geometry.matrix_scale_offset, "PLE divisor offset"),
                          word);
         const auto divisor = std::bit_cast<float>(read_u32_le(word.data()));
         if (!(divisor > 0) || !std::isfinite(divisor)) {

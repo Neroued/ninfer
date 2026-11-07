@@ -92,10 +92,10 @@ struct Bank {
             weight_geometry(QType::NVFP4, QuantLayout::BatchedBlockScaleK16M128x4, dims);
         storage = HostBuffer(parent.geometry.bytes);
         for (int e = 0; e < E; ++e) divisors[e] = 1024.375F + ((e * 137 + seed) % 2048);
-        parent.device          = Device::cpu();
-        parent.data            = static_cast<const std::byte*>(storage.data());
-        parent.weight_divisors = divisors;
-        std::memcpy(static_cast<std::byte*>(storage.data()) + parent.geometry.divisor_offset,
+        parent.device        = Device::cpu();
+        parent.data          = static_cast<const std::byte*>(storage.data());
+        parent.matrix_scales = divisors;
+        std::memcpy(static_cast<std::byte*>(storage.data()) + parent.geometry.matrix_scale_offset,
                     divisors.data(), divisors.size() * sizeof(float));
         view = bind_weight_bank(
             parent,
@@ -272,7 +272,7 @@ void tiny_inputs(Fixture& f, CpuExecutor& executor) {
         m.decode_reference();
         bank->divisors.fill(1);
         std::memcpy(static_cast<std::byte*>(bank->storage.data()) +
-                        bank->parent.geometry.divisor_offset,
+                        bank->parent.geometry.matrix_scale_offset,
                     bank->divisors.data(), bank->divisors.size() * sizeof(float));
         for (int e : Bank::used_experts()) bank->publish(e, bank->matrices[e == 511]);
     }

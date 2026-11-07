@@ -3,6 +3,42 @@
 
 namespace ninfer::ops::detail {
 template <class Product>
+struct BasicSwiGluInterleavedMmaEpilogue {
+    Product product;
+
+    template <class S>
+    static constexpr int kSharedBytes = 0;
+
+    template <class Output>
+    __device__ __forceinline__ void apply_pair(Output out, int row, int token, float gate,
+                                               float up) const {
+        out.store(row, token, swiglu_product(product, row, gate, up));
+    }
+
+    template <class S, bool Full, class Output>
+    __device__ void finish_tile(Output out, unsigned char*,
+                                float (&acc)[S::kMmaRows][S::kMmaTokens][4], int row_begin,
+                                int token_begin, int rows, int tokens) const {
+        const int warp = threadIdx.x / 32, lane = threadIdx.x & 31;
+        const int wr = warp / S::kWarpsTokens, wt = warp % S::kWarpsTokens;
+#pragma unroll
+        for (int mi = 0; mi < S::kMmaRows; ++mi) {
+            const int row = row_begin + wr * (S::kWarpRows / 2) + mi * 8 + (lane >> 2);
+#pragma unroll
+            for (int ni = 0; ni < S::kMmaTokens; ++ni) {
+                const int token = token_begin + wt * S::kWarpTokens + ni * 8 + (lane & 3) * 2;
+                if (row < rows / 2 && (Full || token < tokens))
+                    out.store(row, token,
+                              swiglu_product(product, row, acc[mi][ni][0], acc[mi][ni][2]));
+                if (row < rows / 2 && (Full || token + 1 < tokens))
+                    out.store(row, token + 1,
+                              swiglu_product(product, row, acc[mi][ni][1], acc[mi][ni][3]));
+            }
+        }
+    }
+};
+
+template <class Product>
 struct BasicSwiGluRowMajorMmaEpilogue {
     Product product{};
     template <class Schedule>
@@ -74,13 +110,15 @@ struct BasicSwiGluRowMajorMmaEpilogue {
                 }
             }
         } else {
-            static_assert((Cfg::kBlockRows / Cfg::kWarpRows) == 2);
+            constexpr int gate_row_warps = Cfg::kBlockRows / Cfg::kWarpRows / 2;
+            static_assert((Cfg::kBlockRows / Cfg::kWarpRows) % 2 == 0);
+            const int paired_row = (wm % gate_row_warps) * Cfg::kWarpRows;
             auto* up_shared = reinterpret_cast<float*>(scratch);
             synchronize();
-            if (wm == 1) {
+            if (wm >= gate_row_warps) {
 #pragma unroll
                 for (int mi = 0; mi < MT; ++mi) {
-                    const int local_r0 = mi * 16 + gid;
+                    const int local_r0 = paired_row + mi * 16 + gid;
                     const int local_r1 = local_r0 + 8;
 #pragma unroll
                     for (int ni = 0; ni < NT; ++ni) {
@@ -95,10 +133,10 @@ struct BasicSwiGluRowMajorMmaEpilogue {
                 }
             }
             synchronize();
-            if (wm == 0) {
+            if (wm < gate_row_warps) {
 #pragma unroll
                 for (int mi = 0; mi < MT; ++mi) {
-                    const int local_r0 = mi * 16 + gid;
+                    const int local_r0 = paired_row + mi * 16 + gid;
                     const int local_r1 = local_r0 + 8;
                     const int r0       = m0 + local_r0;
                     const int r1       = m0 + local_r1;
@@ -113,7 +151,9 @@ struct BasicSwiGluRowMajorMmaEpilogue {
                         const float up01      = up_shared[local_r0 * BN + local_c1];
                         const float up10      = up_shared[local_r1 * BN + local_c0];
                         const float up11      = up_shared[local_r1 * BN + local_c1];
-                        if constexpr (Full) {
+                        // Most fragments in a partial tile still have four live
+                        // outputs. Share their bounds check before the product.
+                        if (Full || (gate_row_warps > 1 && r1 < m / 2 && c1 < n)) {
                             output_tile.store(r0, c0,
                                               swiglu_product(product, r0, gate_acc[0], up00));
                             output_tile.store(r0, c1,

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "kpool_fixture.h"
+#include "kpool_weight_fixture.h"
 #include "core/arena.h"
 #include "ninfer/ops/kpool_mla_layout.h"
 #include "paged_kv_fixture.h"
@@ -15,18 +16,43 @@ inline const char* name(Projection p) {
     return p == Projection::Full ? "full" : p == Projection::History ? "history" : "query_history";
 }
 
+inline ops::KpoolMlaPrepareProfile bf16_prepare_profile(Projection mode) {
+    const int q     = mode == Projection::History ? 0 : 1536;
+    const int heads = mode == Projection::Full ? 32 : 0;
+    return {mode,
+            {{QType::BF16, 768 + q + heads, 4096}, {}},
+            {{0, 0, 512}, {0, 512, 128}, {0, 640, 128}, {0, 768, q}, {0, 2304, heads}}};
+}
+
+enum class ProjectionFormat { BFloat16, BlockFp8, Mxfp8 };
+
+inline const char* name(ProjectionFormat format) {
+    switch (format) {
+    case ProjectionFormat::BFloat16:
+        return "bf16";
+    case ProjectionFormat::BlockFp8:
+        return "block-fp8";
+    case ProjectionFormat::Mxfp8:
+        return "mxfp8";
+    }
+    throw std::invalid_argument("Kpool projection fixture format");
+}
+
 struct Weights {
     Projection mode;
     int q, heads, rows;
     Buffer<std::uint16_t> weight, cn, qn, kn, kb, ape;
     ops::KpoolMlaPrepareParameters params;
+    ProjectionFormat format;
+    std::unique_ptr<EncodedWeight> encoded;
+    std::unique_ptr<Buffer<std::uint16_t>> auxiliary;
 
-    Weights(Device device, Projection p)
+    Weights(Device device, Projection p, ProjectionFormat f = ProjectionFormat::BFloat16)
         : mode(p), q(p == Projection::History ? 0 : 1536), heads(p == Projection::Full ? 32 : 0),
           rows(768 + q + heads), weight(device, DType::BF16, {4096, rows}),
           cn(device, DType::BF16, {512}), qn(device, DType::BF16, {1536}),
           kn(device, DType::BF16, {128}), kb(device, DType::BF16, {128}),
-          ape(device, DType::BF16, {128, 4}) {
+          ape(device, DType::BF16, {128, 4}), format(f) {
         for (std::size_t i = 0; i < weight.host.size(); ++i)
             weight.host[i] = sample(i + 171, 1.F / 16384);
         for (auto* v : {&cn, &qn, &kn})
@@ -35,19 +61,56 @@ struct Weights {
         for (std::size_t i = 0; i < kb.host.size(); ++i) kb.host[i] = sample(i + 111, 1.F / 2048);
         for (std::size_t i = 0; i < ape.host.size(); ++i) ape.host[i] = sample(i + 811, 1.F / 256);
         for (auto* v : {&weight, &cn, &qn, &kn, &kb, &ape}) v->upload();
-        Weight w{};
-        w.device  = device;
-        w.payload = w.qdata = weight.view.data;
-        w.payload_bytes     = weight.view.bytes();
-        w.qtype             = QType::BF16;
-        w.layout            = QuantLayout::Contiguous;
-        w.n = w.shape[0] = w.padded_shape[0] = rows;
-        w.k = w.shape[1] = w.padded_shape[1] = 4096;
-        w.ndim                               = 2;
-        params = {p, w, q ? qn.view : Tensor{}, cn.view, kn.view, kb.view, ape.view, 1e-5F, 1e-6F};
+        params = {p,
+                  ops::SingleProjectionWeight{dense_weight(weight.view, rows, 4096)},
+                  bf16_prepare_profile(p).rows,
+                  q ? qn.view : Tensor{},
+                  cn.view,
+                  kn.view,
+                  kb.view,
+                  ape.view,
+                  1e-5F,
+                  1e-6F};
+        if (format != ProjectionFormat::BFloat16) {
+            const bool mx          = format == ProjectionFormat::Mxfp8;
+            const int first_rows   = mx ? 640 + q + heads : 512 + q;
+            const int second_rows  = mx ? 128 : 256 + heads;
+            const auto logical_row = [&](bool first, int r) {
+                if (mx) return first ? (r < 640 ? r : r + 128) : 640 + r;
+                return first ? (r < 512 ? r : r + 256) : (r < 256 ? 512 + r : 2304 + r - 256);
+            };
+            std::vector<float> source(std::size_t(first_rows) * 4096);
+            for (int r = 0; r < first_rows; ++r)
+                for (int k = 0; k < 4096; ++k)
+                    source[std::size_t(r) * 4096 + k] = decode(weight.at(k, logical_row(true, r)));
+            encoded = std::make_unique<EncodedWeight>(
+                device, mx ? QType::MXFP8 : QType::FP8_E4M3FN_BLOCK128X128_FP32, first_rows, 4096,
+                source);
+            auxiliary = std::make_unique<Buffer<std::uint16_t>>(
+                device, DType::BF16, std::initializer_list<int>{4096, second_rows});
+            for (int r = 0; r < second_rows; ++r)
+                for (int k = 0; k < 4096; ++k)
+                    auxiliary->at(k, r) = weight.at(k, logical_row(false, r));
+            auxiliary->upload();
+            params.weights = ops::PairedProjectionWeights{
+                {encoded->weight, mx ? ops::LinearPolicy::AllowA8 : ops::LinearPolicy::A16Only},
+                {dense_weight(auxiliary->view, second_rows, 4096)}};
+            params.rows =
+                mx ? ops::KpoolMlaProjectionLayout{{0, 0, 512},
+                                                   {0, 512, 128},
+                                                   {1, 0, 128},
+                                                   {0, 640, q},
+                                                   {0, 2176, heads}}
+                   : ops::KpoolMlaProjectionLayout{
+                         {0, 0, 512}, {1, 0, 128}, {1, 128, 128}, {0, 512, q}, {1, 256, heads}};
+        }
     }
 
-    ops::KpoolMlaPrepareProfile profile() const { return {mode, 4096, 512, 128, q, heads, 4}; }
+    ops::KpoolMlaPrepareProfile profile() const { return ops::kpool_mla_prepare_profile(params); }
+
+    std::size_t bytes() const {
+        return encoded ? encoded->bytes() + auxiliary->view.bytes() : weight.view.bytes();
+    }
 };
 
 // Storage and input generation shared by tests/benchmarks. No implementation/oracle dependency.

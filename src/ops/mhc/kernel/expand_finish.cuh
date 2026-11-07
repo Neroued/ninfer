@@ -5,14 +5,15 @@
 namespace ninfer::ops::detail::mhc {
 // With four identical streams, collapse = sum(pre)*embedding. Its RMS follows
 // directly from the coefficient square sum, avoiding a residual reread and D reduction.
-template <int Threads, int Vector = 8, int StaticParts = 0, bool Dependent = false>
+template <class Gamma, int Threads, int Vector = 8, int StaticParts = 0, bool Dependent = false>
 __global__ void expand_finish_kernel(Operands o, const float* partial, int parts) {
     constexpr int Workers = Threads - 32, Chunk = Vector < 8 ? Vector : 8, Chunks = Vector / Chunk;
     constexpr int Groups = (kHidden + Workers * Vector - 1) / (Workers * Vector);
     const auto m         = std::int64_t(blockIdx.x);
     const int tid = threadIdx.x, warp = tid / 32;
     __shared__ float pre[4], gain;
-    common::Bf16Vector<Chunk> saved_embedding[Chunks], saved_gamma[Chunks];
+    common::Bf16Vector<Chunk> saved_embedding[Chunks];
+    GammaVector<Gamma, Chunk> saved_gamma[Chunks];
     if constexpr (Dependent) {
         static_assert(Workers * Vector == kHidden);
         // Both immutable inputs are independent of the projection's partials.
@@ -23,7 +24,7 @@ __global__ void expand_finish_kernel(Operands o, const float* partial, int parts
                 saved_embedding[c] = common::Bf16Vector<Chunk>::load(
                     static_cast<const __nv_bfloat16*>(o.residual) + m * kHidden + d);
                 saved_gamma[c] =
-                    common::Bf16Vector<Chunk>::load(static_cast<const __nv_bfloat16*>(o.gamma) + d);
+                    GammaVector<Gamma, Chunk>::load(static_cast<const Gamma*>(o.gamma) + d);
             }
         }
         cudaGridDependencySynchronize();
@@ -41,14 +42,10 @@ __global__ void expand_finish_kernel(Operands o, const float* partial, int parts
     }
     __syncthreads();
     if (warp == 0) {
-        if constexpr (Dependent) {
-            if (o.parameters.sinkhorn_iterations == 20)
-                sinkhorn<20>(o, logit, m);
-            else
-                sinkhorn(o, logit, m);
-        } else {
+        if (o.parameters.sinkhorn_iterations == 20)
+            sinkhorn<20>(o, logit, m);
+        else
             sinkhorn(o, logit, m);
-        }
     } else {
 #pragma unroll
         for (int group = 0; group < Groups; ++group) {
@@ -56,7 +53,8 @@ __global__ void expand_finish_kernel(Operands o, const float* partial, int parts
             if (d < kHidden) {
 #pragma unroll
                 for (int c = 0; c < Chunks; ++c) {
-                    common::Bf16Vector<Chunk> embedding, gamma;
+                    common::Bf16Vector<Chunk> embedding;
+                    GammaVector<Gamma, Chunk> gamma;
                     if constexpr (Dependent) {
                         embedding = saved_embedding[c];
                         gamma     = saved_gamma[c];
@@ -64,15 +62,14 @@ __global__ void expand_finish_kernel(Operands o, const float* partial, int parts
                         embedding = common::Bf16Vector<Chunk>::load(
                             static_cast<const __nv_bfloat16*>(o.residual) + m * kHidden + d +
                             c * Chunk);
-                        gamma = common::Bf16Vector<Chunk>::load(
-                            static_cast<const __nv_bfloat16*>(o.gamma) + d + c * Chunk);
+                        gamma = GammaVector<Gamma, Chunk>::load(static_cast<const Gamma*>(o.gamma) +
+                                                                d + c * Chunk);
                     }
                     common::Bf16Vector<Chunk> output;
 #pragma unroll
                     for (int v = 0; v < Chunk; ++v)
-                        output.word[v] =
-                            __float2bfloat16_rn(__bfloat162float(gamma.word[v]) *
-                                                __bfloat162float(embedding.word[v]) * gain);
+                        output.word[v] = __float2bfloat16_rn(
+                            float(gamma.word[v]) * __bfloat162float(embedding.word[v]) * gain);
                     output.store(static_cast<__nv_bfloat16*>(o.output) + m * kHidden + d +
                                  c * Chunk);
                 }

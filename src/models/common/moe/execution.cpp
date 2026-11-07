@@ -18,7 +18,7 @@ void execute(const Tensor& hidden, const Parameters& parameters,
         workspace_bytes(parameters.profile, epilogue, columns, columns, parameters.subset.kind));
     MemoryArena scratch(storage);
     const ops::MoeWeights weights{
-        parameters.control, {experts, parameters.activation_divisors}, parameters.shared};
+        parameters.control, {experts, parameters.activation_calibration}, parameters.shared};
     ops::topk_softmax_swiglu_moe(hidden, parameters.profile, weights, parameters.subset, epilogue,
                                  output, scratch, execution, hints);
 }

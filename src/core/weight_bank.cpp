@@ -27,7 +27,11 @@ WeightBankLayout describe_weight_bank(const WeightGeometry& g, const WeightBankR
         g.shape.back() > std::numeric_limits<std::int32_t>::max()) {
         throw std::invalid_argument("weight bank exceeds its parent or native matrix domain");
     }
-    const auto alignment = g.format == QType::NVFP4 ? 128 : g.scale_block_rows;
+    const auto alignment = g.layout == QuantLayout::Csf32 ? 32
+                           : g.layout == QuantLayout::BlockScaleK16M128x4 ||
+                                   g.layout == QuantLayout::BatchedBlockScaleK16M128x4
+                               ? 128
+                               : g.scale_block_rows;
     if (r.row_begin % alignment || r.rows % alignment || r.row_stride % alignment) {
         throw std::invalid_argument("weight bank splits a scale tile");
     }
@@ -42,31 +46,48 @@ WeightBankLayout describe_weight_bank(const WeightGeometry& g, const WeightBankR
     };
     out.codes = plane(0, g.code_bytes_per_row, 1);
     if (g.high_bytes) { out.high = plane(g.high_offset, g.high_bytes_per_row, 1); }
-    if (g.scale_bytes) {
+    if (g.layout == QuantLayout::Csf32) {
+        const auto rows = g.shape[g.shape.size() - 2];
+        if (r.rows != rows || r.row_begin % rows || r.row_stride % rows) {
+            throw std::invalid_argument("CSF bank entries must preserve complete matrix domains");
+        }
+        const auto& c     = g.csf;
+        const auto first  = r.row_begin / rows;
+        const auto stride = r.row_stride / rows;
+        const auto fixed  = [&](std::uint64_t offset, std::uint64_t bytes) {
+            return WeightBankPlane{offset + first * bytes, bytes, stride * bytes};
+        };
+        out.csf = {fixed(c.bases_offset, rows),
+                   fixed(c.nibbles_offset, c.nibble_bytes_per_matrix),
+                   fixed(c.offsets_offset, c.offsets_per_matrix * 2),
+                   fixed(c.page_bases_offset, c.pages_per_matrix * 4),
+                   c.exceptions_offset,
+                   c.exception_count};
+    } else if (g.scale_bytes) {
         out.scales = plane(g.scale_offset, g.scale_row_bytes, g.scale_block_rows);
     }
-    if (g.divisor_count) {
+    if (g.matrix_scale_count) {
         const auto domain      = g.shape[g.shape.size() - 2];
         const auto last        = r.row_begin + (r.count - 1) * r.row_stride + r.rows - 1;
         const bool same_domain = r.row_begin / domain == last / domain;
         if (r.row_begin % domain + r.rows > domain || (!same_domain && r.row_stride % domain)) {
-            throw std::invalid_argument("weight bank crosses matrix divisor domains");
+            throw std::invalid_argument("weight bank crosses matrix scale domains");
         }
-        out.has_divisors   = true;
-        out.divisor_begin  = r.row_begin / domain;
-        out.divisor_stride = same_domain ? 0 : r.row_stride / domain;
+        out.has_matrix_scales   = true;
+        out.matrix_scale_begin  = r.row_begin / domain;
+        out.matrix_scale_stride = same_domain ? 0 : r.row_stride / domain;
     }
     return out;
 }
 
 WeightBankView bind_weight_bank(const WeightParent& parent, const WeightBankLayout& layout) {
     if (!parent.data || layout != describe_weight_bank(parent.geometry, layout.region) ||
-        parent.weight_divisors.size() != parent.geometry.divisor_count) {
+        parent.matrix_scales.size() != parent.geometry.matrix_scale_count) {
         throw std::invalid_argument("weight bank backing differs from its layout");
     }
-    for (const auto value : parent.weight_divisors) {
+    for (const auto value : parent.matrix_scales) {
         if (!std::isfinite(value) || value <= 0) {
-            throw std::invalid_argument("weight bank divisor must be finite and positive");
+            throw std::invalid_argument("weight bank scalar must be finite and positive");
         }
     }
     return {&parent, layout};
@@ -82,18 +103,18 @@ ConstMemorySpan WeightBankView::plane(const WeightBankPlane& plane, std::uint32_
     return {parent->data + offset, static_cast<std::size_t>(plane.expert_bytes), parent->device};
 }
 
-float WeightBankView::divisor(std::uint32_t expert) const {
+float WeightBankView::matrix_scale(std::uint32_t expert) const {
     check_expert(*this, expert);
-    if (!layout.has_divisors) { return 1.0F; }
-    return parent->weight_divisors[layout.divisor_begin + expert * layout.divisor_stride];
+    if (!layout.has_matrix_scales) { return 1.0F; }
+    return parent->matrix_scales[layout.matrix_scale_begin + expert * layout.matrix_scale_stride];
 }
 
-Weight matrix_weight(const WeightBankView& bank, std::uint32_t expert, float input_divisor) {
+Weight matrix_weight(const WeightBankView& bank, std::uint32_t expert, float input_scale) {
     check_expert(bank, expert);
     const auto& r    = bank.layout.region;
     const auto k     = bank.layout.columns;
     const auto begin = (r.row_begin + expert * r.row_stride) * k;
-    return native_weight({{r.rows, k}, {{bank.parent, begin, begin + r.rows * k}}}, input_divisor);
+    return native_weight({{r.rows, k}, {{bank.parent, begin, begin + r.rows * k}}}, input_scale);
 }
 
 ExpertMatrixDeviceView device_weight_bank(const WeightBankView& bank) {
@@ -102,17 +123,25 @@ ExpertMatrixDeviceView device_weight_bank(const WeightBankView& bank) {
     }
     const auto& layout = bank.layout;
     ExpertMatrixDeviceView out;
-    out.codes        = static_cast<const std::byte*>(bank.plane(layout.codes, 0).data);
-    out.high         = static_cast<const std::byte*>(bank.plane(layout.high, 0).data);
-    out.scales       = static_cast<const std::byte*>(bank.plane(layout.scales, 0).data);
-    out.code_stride  = layout.codes.expert_stride;
-    out.high_stride  = layout.high.expert_stride;
-    out.scale_stride = layout.scales.expert_stride;
-    if (layout.has_divisors) {
-        out.divisors = reinterpret_cast<const float*>(bank.parent->data +
-                                                      bank.parent->geometry.divisor_offset) +
-                       layout.divisor_begin;
-        out.divisor_stride = layout.divisor_stride;
+    out.codes          = static_cast<const std::byte*>(bank.plane(layout.codes, 0).data);
+    out.high           = static_cast<const std::byte*>(bank.plane(layout.high, 0).data);
+    out.scales         = static_cast<const std::byte*>(bank.plane(layout.scales, 0).data);
+    out.code_stride    = layout.codes.expert_stride;
+    out.high_stride    = layout.high.expert_stride;
+    out.scale_stride   = layout.scales.expert_stride;
+    out.format         = layout.format;
+    out.layout         = layout.layout;
+    out.physical_count = layout.region.count;
+    if (layout.has_matrix_scales) {
+        out.matrix_scales = reinterpret_cast<const float*>(
+                                bank.parent->data + bank.parent->geometry.matrix_scale_offset) +
+                            layout.matrix_scale_begin;
+        out.matrix_scale_stride = layout.matrix_scale_stride;
+    }
+    if (layout.layout == QuantLayout::Csf32) {
+        const auto& c = layout.csf;
+        out.csf = {csf32_scale_view(*bank.parent, layout.matrix_scale_begin), c.bases.expert_stride,
+                   c.nibbles.expert_stride, c.offsets.expert_stride, c.page_bases.expert_stride};
     }
     return out;
 }
@@ -127,6 +156,9 @@ ExpertBankDeviceView device_expert_bank(const WeightBankView& gate_up, const Wei
 }
 
 ExpertMatrixEntryLayout plan_expert_matrix(LayoutBuilder& builder, const WeightBankLayout& matrix) {
+    if (matrix.layout == QuantLayout::Csf32) {
+        throw std::invalid_argument("CSF expert storage uses a compact bank and shared exceptions");
+    }
     const auto add = [&](const WeightBankPlane& plane) {
         return plane.expert_bytes ? builder.add(plane.expert_bytes, 16, "expert plane")
                                   : LayoutRegion{};
@@ -135,11 +167,11 @@ ExpertMatrixEntryLayout plan_expert_matrix(LayoutBuilder& builder, const WeightB
 }
 
 ExpertMatrixDeviceView indexed_weight_matrix(const WeightParent& parent,
-                                             const std::uint64_t* offsets, const float* divisors,
-                                             ConstMemorySpan storage) {
+                                             const std::uint64_t* offsets,
+                                             const float* matrix_scales, ConstMemorySpan storage) {
     const auto& g = parent.geometry;
     if (!parent.data || parent.device.type() != DeviceType::CUDA || !offsets ||
-        parent.device != storage.device || g.shape.size() != 2)
+        parent.device != storage.device || g.shape.size() != 2 || g.layout == QuantLayout::Csf32)
         throw std::invalid_argument("indexed expert matrix requires a resident encoded matrix");
     return {parent.data,
             g.high_bytes ? parent.data + g.high_offset : nullptr,
@@ -148,9 +180,11 @@ ExpertMatrixDeviceView indexed_weight_matrix(const WeightParent& parent,
             0,
             0,
             offsets,
-            divisors,
-            divisors ? 1U : 0U,
-            storage};
+            matrix_scales,
+            matrix_scales ? 1U : 0U,
+            storage,
+            g.format,
+            g.layout};
 }
 
 } // namespace ninfer

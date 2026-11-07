@@ -213,6 +213,10 @@ RequestSnapshot EngineCore<Instance>::observe_request(const Request& request) co
     out.capture_pending = request.capture_pending;
     out.resident        = request.lane && slots_[request.lane->value].get() == &request;
     out.preemptions     = request.preemption_count;
+    out.replayed_tokens  = request.replayed_tokens;
+    out.recovery         = request.recovery;
+    out.recovery_pending = request.recovery_pending;
+    if (request.last_progress) out.last_progress_ns = elapsed_ns({}, *request.last_progress);
     for (const auto* flight : {&compute_, &retiring_})
         if (*flight)
             for (const auto& member : (*flight)->requests)
@@ -329,6 +333,7 @@ void EngineCore<Instance>::publish_runtime_stats() {
     published_snapshot_.decode_by_batch.assign(batches.begin(), batches.end());
     published_snapshot_.in_flight = execution_observations_;
     published_snapshot_.status    = status;
+    published_snapshot_.progress_owner = scheduler_.progress_owner();
     published_requests_           = request_observations_;
     published_revision_           = published_revision;
     const auto ranks              = instance_.executor->observations();
@@ -403,6 +408,7 @@ void EngineCore<Instance>::record_first_output(const std::shared_ptr<Request>& r
     snapshot.scheduling        = {
                .preemptions       = request->preemption_count,
                .snapshot_restores = request->snapshot_restores,
+               .direct_restores   = request->direct_restores,
                .replay_restores   = request->replay_restores,
                .replayed_tokens   = request->replayed_tokens,
                .paused_ns =

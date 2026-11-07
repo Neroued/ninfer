@@ -12,6 +12,19 @@ public:
         return ops::prepare_linear_weight(inputs);
     }
 
+    ops::ProjectionWeights projection(std::initializer_list<WeightId> ids) const {
+        std::vector<ops::WeightInput> inputs;
+        for (const auto id : ids) inputs.push_back(model_.input(id));
+        return ops::prepare_projection_weights(inputs);
+    }
+
+    Weight factor(WeightId id) const {
+        auto view    = model_.weight(id).view;
+        const auto k = view.shape.back();
+        view.shape   = {weight_element_count(view.shape) / k, k};
+        return native_weight(view);
+    }
+
     Tensor tensor(WeightId id) const { return parameter_tensor(model_.weight(id)); }
 
     Tensor bias(std::initializer_list<WeightId> ids) const {
@@ -47,15 +60,13 @@ public:
     MlaParameters mla(const MlaWeights& w) const {
         const auto& c = model_.definition().config().text;
         MlaParameters out;
-        const std::array projections{
-            linear({w.latent, w.index_key, w.pool_gate, w.query_a, w.index_weight}),
-            linear({w.latent, w.index_key, w.pool_gate, w.query_a}),
-            linear({w.latent, w.index_key, w.pool_gate})};
         for (std::size_t i = 0; i < out.prepare.size(); ++i) {
-            const auto kind = static_cast<ops::KpoolMlaPrepareProjection>(i);
-            out.prepare[i]  = {
+            const auto kind   = static_cast<ops::KpoolMlaPrepareProjection>(i);
+            const auto inputs = mla_projection_inputs(model_.weight_data(), w, kind);
+            out.prepare[i]    = {
                 kind,
-                projections[i].weight,
+                ops::prepare_projection_weights(inputs.weights),
+                inputs.rows,
                 kind == ops::KpoolMlaPrepareProjection::History ? Tensor{} : tensor(w.query_norm),
                 tensor(w.latent_norm),
                 tensor(w.index_norm),
@@ -64,11 +75,10 @@ public:
                 c.norm_epsilon,
                 1e-6F};
         }
-        out.query_index = linear({w.query_b, w.index_query});
+        out.query_index = projection({w.query_b, w.index_query});
         out.query       = linear({w.query_b});
         out.output      = linear({w.output});
-        out.key_up      = tensor(w.key_up);
-        out.value_up    = tensor(w.value_up);
+        out.factors     = {factor(w.key_up), factor(w.value_up)};
         return out;
     }
 
@@ -76,16 +86,22 @@ public:
         return {linear({w.gate, w.up}), linear({w.down})};
     }
 
-    MoeParameters moe(const MoeWeights& w, const MoeProfile& profile) const {
+    MoeParameters moe(const MoeWeights& w) const {
         const auto& bank = model_.experts(w.bank);
-        return {{linear({w.router}).weight,
-                 tensor(w.correction_bias),
-                 {bank.view(), profile.activation_divisors},
-                 dense(w.shared)},
-                bank.subset()};
+        const auto view  = bank.view();
+        ops::ExpertInputUsage gate_up, down;
+        gate_up.include(model_.input(w.gate));
+        gate_up.include(model_.input(w.up));
+        down.include(model_.input(w.down));
+        return {
+            {linear({w.router}).weight,
+             tensor(w.correction_bias),
+             {view, {gate_up.calibration(view.gate_up.format), down.calibration(view.down.format)}},
+             dense(w.shared)},
+            bank.subset()};
     }
 
-    BlockParameters block(const BlockWeights& w, const BlockProfile& profile) const {
+    BlockParameters block(const BlockWeights& w) const {
         BlockParameters out;
         out.attention_hc = mhc(w.attention_hc, w.input_norm);
         out.mlp_hc       = mhc(w.mlp_hc, w.post_attention_norm);
@@ -96,7 +112,7 @@ public:
         if (const auto* d = std::get_if<DenseWeights>(&w.ffn))
             out.ffn = dense(*d);
         else
-            out.ffn = moe(std::get<MoeWeights>(w.ffn), std::get<MoeProfile>(profile.ffn));
+            out.ffn = moe(std::get<MoeWeights>(w.ffn));
         return out;
     }
 
@@ -138,7 +154,7 @@ Parameters::Parameters(const ModelShard& model, std::shared_ptr<const ModelProfi
     text.head       = p.linear({w.text.head});
     text.final_norm = p.tensor(w.text.final_norm);
     for (std::size_t i = 0; i < w.text.layers.size(); ++i)
-        text.layers.push_back(p.block(w.text.layers[i], this->profile->text.layers.at(i)));
+        text.layers.push_back(p.block(w.text.layers[i]));
     if (w.mtp) {
         const auto& m = *w.mtp;
         mtp           = {native_weight(model.weight(m.embedding).view),
@@ -150,7 +166,7 @@ Parameters::Parameters(const ModelShard& model, std::shared_ptr<const ModelProfi
                          p.tensor(m.post_attention_norm),
                          p.tensor(m.final_norm),
                          p.mla(m.attention),
-                         p.moe(m.moe, this->profile->mtp->moe)};
+                         p.moe(m.moe)};
     }
     if (w.vision) vision = p.vision(*w.vision);
 }

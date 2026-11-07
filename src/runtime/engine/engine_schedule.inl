@@ -171,13 +171,18 @@ void EngineCore<Instance>::resolve_context_progress(
         request->placement = instance_.session->placement(*request->sequence);
         request->placement_tokens =
             std::max(request->placement_tokens, instance_.session->load_tokens(*request->sequence));
-        request->model_state = progress.replaying ? EngineRequestState::Replay
-                               : control.resumed  ? request->resume_phase
-                                                  : EngineRequestState::Prefill;
+        request->model_state = progress.recovery.route == GenerationRecoveryRoute::Replay
+                                   ? EngineRequestState::Replay
+                               : control.resumed ? request->resume_phase
+                                                 : EngineRequestState::Prefill;
         if (control.resumed) {
-            if (!progress.replaying) {
+            request->recovery = progress.recovery;
+            if (progress.recovery.route == GenerationRecoveryRoute::Snapshot) {
                 ++cumulative_stats_.snapshot_restores;
                 ++request->snapshot_restores;
+            } else if (progress.recovery.route == GenerationRecoveryRoute::Direct) {
+                ++cumulative_stats_.direct_restores;
+                ++request->direct_restores;
             }
             request->suspended.reset();
             request->recovery_pending = instance_.session->recovery_pending(*request->sequence);
@@ -219,9 +224,6 @@ void EngineCore<Instance>::resolve_context_progress(
             request->placement_tokens = 0;
             request->suspended        = std::move(progress.paused);
             request->model_state      = EngineRequestState::Paused;
-            request->recovery_route   = request->suspended->has_snapshot()
-                                            ? GenerationRecoveryRoute::Snapshot
-                                            : GenerationRecoveryRoute::Replay;
             observe_scheduling(request, GenerationSchedulingTransition::Paused);
             paused_.push_back(request);
             std::sort(paused_.begin(), paused_.end(),
@@ -300,7 +302,7 @@ ReclaimProgress EngineCore<Instance>::reclaim(const ContextAssessment& assessmen
                 !instance_.session->revoke_snapshot(*(*owner)->suspended)) {
                 continue;
             }
-            (*owner)->recovery_route = GenerationRecoveryRoute::Replay;
+            (*owner)->recovery.reset();
             observe_scheduling(*owner, GenerationSchedulingTransition::SnapshotRevoked);
             changed = true;
         }
@@ -391,7 +393,7 @@ bool EngineCore<Instance>::pause_resident(std::uint32_t lane, PauseGoal goal,
                 !instance_.session->revoke_snapshot(*(*owner)->suspended)) {
                 throw std::logic_error("pause victim changed after preflight");
             }
-            (*owner)->recovery_route = GenerationRecoveryRoute::Replay;
+            (*owner)->recovery.reset();
             observe_scheduling(*owner, GenerationSchedulingTransition::SnapshotRevoked);
         }
         selected = option.action;
@@ -407,7 +409,7 @@ bool EngineCore<Instance>::pause_resident(std::uint32_t lane, PauseGoal goal,
     request->paused_at   = pause_started;
     ++request->preemption_count;
     ++cumulative_stats_.preemptions;
-    request->recovery_route = GenerationRecoveryRoute::None;
+    request->recovery.reset();
     observe_scheduling(request, GenerationSchedulingTransition::PauseStarted, pause_started);
     context_owner_ = request;
     capture_decisions_[lane].reset();
@@ -787,8 +789,9 @@ void EngineCore<Instance>::observe_scheduling(const std::shared_ptr<Request>& re
     if (!request->observation.scheduling) { return; }
     if (now == Clock::time_point{}) { now = Clock::now(); }
     const GenerationSchedulingObservation observation{
-        .transition              = transition,
-        .route                   = request->recovery_route,
+        .transition = transition,
+        .route      = request->recovery ? request->recovery->route : GenerationRecoveryRoute::None,
+        .phase      = observe_request(*request).phase,
         .engine_request_id       = request->id,
         .steady_ns               = elapsed_ns(Clock::time_point{}, now),
         .elapsed_ns              = elapsed_ns(request->submitted, now),

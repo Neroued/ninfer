@@ -27,7 +27,7 @@ constexpr ReductionCriterion rmsnorm_bf16_criterion() {
 
 std::vector<double> rmsnorm_oracle(const std::vector<float>& input,
                                    const std::vector<float>& weight, const Shape& shape,
-                                   bool unit_offset) {
+                                   bool unit_offset, float eps) {
     std::vector<double> output(input.size());
     const auto row_count = static_cast<std::int64_t>(shape.rows) * shape.tokens;
     for (std::int64_t row = 0; row < row_count; ++row) {
@@ -37,7 +37,7 @@ std::vector<double> rmsnorm_oracle(const std::vector<float>& input,
             const double value = input[base + column];
             sum_squares += value * value;
         }
-        const double inverse = 1.0 / std::sqrt(sum_squares / static_cast<double>(shape.d) + kEps);
+        const double inverse = 1.0 / std::sqrt(sum_squares / static_cast<double>(shape.d) + eps);
         for (std::int32_t column = 0; column < shape.d; ++column) {
             const double gain     = static_cast<double>(weight[column]) + (unit_offset ? 1.0 : 0.0);
             output[base + column] = static_cast<double>(input[base + column]) * inverse * gain;
@@ -48,7 +48,7 @@ std::vector<double> rmsnorm_oracle(const std::vector<float>& input,
 
 int run_case(const char* label, const Shape& shape, bool unit_offset, std::uint32_t seed,
              float input_scale = 4.0F, bool bf16x2_unaligned = false, bool replay = false,
-             int width = 0) {
+             int width = 0, int prefix_words = 0, float eps = kEps) {
     const std::size_t count = shape.elements();
     std::vector<float> input(count), weight(shape.d);
     fill_uniform(input, seed, -input_scale, input_scale);
@@ -58,9 +58,20 @@ int run_case(const char* label, const Shape& shape, bool unit_offset, std::uint3
     weight[0] =
         unit_offset ? -1.0F : 0.0F; // Exact zero gain, without an intermediate BF16 gain cast.
 
-    DeviceInput device_input  = make_input(input, bf16x2_unaligned);
-    DeviceInput device_weight = make_input(weight, bf16x2_unaligned);
-    const std::size_t leading = bf16x2_unaligned ? sizeof(std::uint16_t) : 0;
+    const std::size_t prefix = prefix_words ? prefix_words : bf16x2_unaligned ? 1 : 0;
+    const auto prepare_input = [&](const std::vector<float>& values) {
+        if (prefix <= 1) return make_input(values, prefix != 0);
+        DeviceInput result;
+        result.expected.resize(prefix + values.size(), 0x5a5aU);
+        for (std::size_t i = 0; i < values.size(); ++i)
+            result.expected[prefix + i] = f32_to_bf16(values[i]);
+        result.storage = to_device(result.expected);
+        result.memory  = result.storage.span().subspan(prefix * sizeof(std::uint16_t));
+        return result;
+    };
+    DeviceInput device_input  = prepare_input(input);
+    DeviceInput device_weight = prepare_input(weight);
+    const std::size_t leading = prefix * sizeof(std::uint16_t);
     GuardedDeviceBuffer output(leading + count * sizeof(std::uint16_t));
     output.fill(0xff);
     void* output_data = static_cast<std::uint8_t*>(output.data()) + leading;
@@ -78,15 +89,15 @@ int run_case(const char* label, const Shape& shape, bool unit_offset, std::uint3
     DecodeGraphDefinition definition;
     DecodeGraphExecutable graph;
     const auto launch = [&] {
-        ops::rmsnorm(input_tensor, weight_tensor, kEps, unit_offset, output_tensor,
+        ops::rmsnorm(input_tensor, weight_tensor, eps, unit_offset, output_tensor,
                      device.execution_view());
     };
     int failures = 0;
     for (int phase = 0; phase < (replay ? 2 : 1); ++phase) {
         if (phase) {
             for (auto& value : input) value = -value;
-            for (auto& value : weight) value = -value;
-            const std::size_t offset = bf16x2_unaligned ? 1 : 0;
+            for (auto& value : weight) value *= 0.5F;
+            const std::size_t offset = prefix;
             for (std::size_t i = 0; i < input.size(); ++i)
                 device_input.expected[i + offset] = f32_to_bf16(input[i]);
             for (std::size_t i = 0; i < weight.size(); ++i)
@@ -107,10 +118,14 @@ int run_case(const char* label, const Shape& shape, bool unit_offset, std::uint3
         else
             launch();
         cuda_synchronize(device.stream());
-        const auto reference = rmsnorm_oracle(input, weight, shape, unit_offset);
+        const auto reference = rmsnorm_oracle(input, weight, shape, unit_offset, eps);
         failures += verify_reduction(label, from_device_bf16(output_data, count), reference,
                                      rmsnorm_bf16_criterion());
         failures += verify_output_storage(std::string(label) + " output", output, bf16x2_unaligned);
+        if (prefix_words)
+            failures += verify_exact("RMSNorm output prefix",
+                                     from_device<std::uint16_t>(output.data(), prefix),
+                                     std::vector<std::uint16_t>(prefix, 0xffffU));
         failures += verify_preserved(std::string(label) + " preserves input", device_input);
         failures += verify_preserved(std::string(label) + " preserves weight", device_weight);
     }
@@ -154,6 +169,24 @@ int validate_contract() {
 
 void add_rmsnorm_cases(ninfer::test::OpSuite& suite) {
     suite.add("rmsnorm/contract", validate_contract);
+    for (int d : {1024, 4096}) {
+        for (int rows : {1, 17, 128, 288, 289, 4097})
+            suite.add("rmsnorm/glm/d" + std::to_string(d) + "/m" + std::to_string(rows), [=] {
+                return run_case("GLM RMSNorm", {d, 1, rows}, false, 2401U, 4.F, false,
+                                rows == 17 || rows == 289, 0, 0, 1.e-5F);
+            });
+        for (int prefix : {1, 2, 4})
+            suite.add("rmsnorm/glm/d" + std::to_string(d) + "/offset" + std::to_string(prefix * 2),
+                      [=] {
+                          return run_case("GLM RMSNorm alignment", {d, 1, 300}, false, 2402U, 4.F,
+                                          false, true, 0, prefix, 1.e-5F);
+                      });
+        for (float scale : {0.F, 1.e-5F, 4096.F})
+            suite.add("rmsnorm/glm/d" + std::to_string(d) + "/scale" + std::to_string(scale), [=] {
+                return run_case("GLM RMSNorm range", {d, 1, 3}, false, 2403U, scale, false, false,
+                                0, 0, 1.e-5F);
+            });
+    }
     const auto add = [&](const char* label, const Shape& shape, bool offset, std::uint32_t seed,
                          float scale = 4.0F, bool unaligned = false, bool graph = false,
                          int width = 0) {

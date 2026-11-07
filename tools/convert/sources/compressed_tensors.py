@@ -120,7 +120,7 @@ def compressed_matrix_source(
                 .float()
                 .repeat_interleave(16, dim=1)
             )
-            values = values * scales / struct.unpack("<f", words.weight_divisor)[0]
+            values = values * scales / struct.unpack("<f", words.weight_scale)[0]
         return values.reshape(-1)[begin - first * k : end - first * k]
 
     return LogicalSource(
@@ -176,7 +176,7 @@ def matrix_source(
         f"{store.path}:{name}",
         lambda begin, end: resolve().values(begin, end),
         encoded,
-        lambda: divisor("weight_divisor"),
-        lambda: divisor("input_divisor"),
+        lambda: divisor("weight_scale"),
+        lambda: divisor("activation_scale"),
         encoded_format=lambda: resolve().encoding(),
     )

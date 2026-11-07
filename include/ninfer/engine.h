@@ -120,6 +120,11 @@ public:
     [[nodiscard]] EngineSnapshot snapshot(SnapshotOptions options = {}) const;
     [[nodiscard]] bool is_available() const;
 
+    // Idempotent, thread-safe stop request. Rejects new work immediately. The worker
+    // terminates generation requests after draining their device consumers; accepted
+    // scoring work finishes before stopping. Handles remain valid for collecting results.
+    void request_stop() noexcept;
+
     // Synchronous boundaries on the execution thread. Previously submitted requests and their
     // cleanup complete before the boundary; concurrent submissions wait until it finishes.
     // Begin resets window peaks and optionally starts the profiler on every execution rank.

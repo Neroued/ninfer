@@ -15,11 +15,21 @@ struct Options {
     std::string op = "pre";
     std::vector<int> columns{1,  2,  3,  4,  5,   6,   7,   8,    12,   16,  24,
                              32, 48, 64, 96, 128, 256, 512, 1024, 2048, 4096};
-    bool alias       = false;
-    int sites        = 1;
-    int calls        = 0;
-    int condition_us = 200;
+    bool alias          = false;
+    int sites           = 1;
+    int calls           = 0;
+    int condition_us    = 200;
+    int reserve_columns = 0;
+    DType base_type = DType::BF16, scale_type = DType::BF16, gamma_type = DType::BF16;
 };
+
+const char* type_name(DType type) { return type == DType::FP32 ? "fp32" : "bf16"; }
+
+DType parameter_type(std::string_view value) {
+    if (value == "bf16") return DType::BF16;
+    if (value == "fp32") return DType::FP32;
+    throw std::invalid_argument("parameter type must be bf16 or fp32");
+}
 
 Options parse(int argc, char** argv) {
     Options o;
@@ -29,6 +39,8 @@ Options parse(int argc, char** argv) {
             std::cout << "mHC complete Op benchmark, D=4096 S=4\n"
                          "  --op pre|post|expand-pre|post-pre|post-mean-norm\n"
                          "  --columns M[,M...] --alias disjoint|inplace --sites N --calls N\n"
+                         "  --reserve-columns M  keep allocations fixed across a partial sweep\n"
+                         "  --base-type bf16|fp32 --scale-type bf16|fp32 --gamma-type bf16|fp32\n"
                          "  --condition-us N "
                          "(default 200)\n"
                          "Calls defaults to sites; it must be a positive multiple of sites.\n"
@@ -41,6 +53,14 @@ Options parse(int argc, char** argv) {
         const auto value = measurement::take(argc, argv, i);
         if (flag == "--op")
             o.op = value;
+        else if (flag == "--base-type")
+            o.base_type = parameter_type(value);
+        else if (flag == "--scale-type")
+            o.scale_type = parameter_type(value);
+        else if (flag == "--gamma-type")
+            o.gamma_type = parameter_type(value);
+        else if (flag == "--reserve-columns")
+            o.reserve_columns = measurement::integer(value);
         else if (flag == "--condition-us")
             o.condition_us = measurement::integer(value, 0);
         else if (flag == "--sites")
@@ -69,41 +89,52 @@ Options parse(int argc, char** argv) {
     return o;
 }
 
-std::size_t capacity(const std::string& op, int m) {
+std::size_t capacity(const std::string& op, int m, int first = 0) {
     if (op == "post") return 0;
     auto query = ops::mhc_pre_workspace_capacity_bytes;
     if (op == "expand-pre") query = ops::mhc_expand_pre_workspace_capacity_bytes;
     if (op == "post-pre") query = ops::mhc_post_pre_workspace_capacity_bytes;
     if (op == "post-mean-norm") query = ops::mhc_post_mean_norm_workspace_capacity_bytes;
-    return query({D, S}, device_context().multiprocessor_count(), m, m);
+    return query({D, S}, device_context().multiprocessor_count(), first ? first : m, m);
 }
 
-std::size_t semantic_bytes(const std::string& op, int m) {
+std::size_t semantic_bytes(const Options& options, int m) {
+    const auto& op          = options.op;
     const std::size_t block = std::size_t(D) * m * 2, residual = block * S,
-                      coeff   = std::size_t(20) * m * 4;
-    const std::size_t weights = std::size_t(N) * K * 2 + (D + N + 3) * 2;
+                      coeff       = std::size_t(20) * m * 4;
+    const std::size_t gamma_bytes = D * (options.gamma_type == DType::FP32 ? 4 : 2);
+    const std::size_t weights     = std::size_t(N) * K * 2 + gamma_bytes +
+                                N * (options.base_type == DType::FP32 ? 4 : 2) +
+                                3 * (options.scale_type == DType::FP32 ? 4 : 2);
     if (op == "post") return residual * 2 + block + coeff;
-    if (op == "post-mean-norm") return residual + 2 * block + coeff + D * 2;
+    if (op == "post-mean-norm") return residual + 2 * block + coeff + gamma_bytes;
     if (op == "expand-pre") return weights + residual + 2 * block + coeff;
     if (op == "pre") return weights + residual + block + coeff;
     return weights + 2 * residual + 2 * block + 2 * coeff;
+}
+
+DeviceBuffer parameter(DType type, std::size_t elements, unsigned seed, float lower, float upper) {
+    return type == DType::FP32 ? make_f32(elements, seed, lower, upper)
+                               : make_bf16(elements, seed, lower, upper);
 }
 
 struct Fixture {
     Fixture(const Options& o, int m, const std::vector<DirectBf16Weight>& projections)
         : options(o), projections(projections), m(m),
           x(make_bf16(std::size_t(K) * m, 7101, -2.F, 2.F)),
-          y(make_bf16(std::size_t(D) * m, 7103, -1.F, 1.F)), base(make_bf16(N, 7107, -0.5F, 0.5F)),
-          scale(make_bf16(3, 7109, 0.5F, 1.5F)), gamma(make_bf16(D, 7111, -1.F, 1.F)),
-          q(make_f32(S * m, 7113, 0.F, 2.F)), c(make_f32(S * S * m, 7117, 0.01F, 0.5F)),
-          r(make_zeros(std::size_t(K) * m * 2)), u(make_zeros(std::size_t(D) * m * 2)),
-          nq(make_zeros(S * m * 4)), nc(make_zeros(S * S * m * 4)),
-          backup(o.alias ? make_zeros(x.size()) : DeviceBuffer{}), capacity(::capacity(o.op, m)),
-          scratch(device_context().device(), capacity), arena(scratch.span()),
-          tx(x.span(), DType::BF16, {D, S, m}), ty(y.span(), DType::BF16, {D, m}),
+          y(make_bf16(std::size_t(D) * m, 7103, -1.F, 1.F)),
+          base(parameter(o.base_type, N, 7107, -0.5F, 0.5F)),
+          scale(parameter(o.scale_type, 3, 7109, 0.5F, 1.5F)),
+          gamma(parameter(o.gamma_type, D, 7111, -1.F, 1.F)), q(make_f32(S * m, 7113, 0.F, 2.F)),
+          c(make_f32(S * S * m, 7117, 0.01F, 0.5F)), r(make_zeros(std::size_t(K) * m * 2)),
+          u(make_zeros(std::size_t(D) * m * 2)), nq(make_zeros(S * m * 4)),
+          nc(make_zeros(S * S * m * 4)), backup(o.alias ? make_zeros(x.size()) : DeviceBuffer{}),
+          capacity(::capacity(o.op, m, 1)), scratch(device_context().device(), capacity),
+          arena(scratch.span()), tx(x.span(), DType::BF16, {D, S, m}),
+          ty(y.span(), DType::BF16, {D, m}),
           tr(o.alias ? x.span() : r.span(), DType::BF16, {D, S, m}),
-          weights{projections[0].weight, Tensor(base.span(), DType::BF16, {N}),
-                  Tensor(scale.span(), DType::BF16, {3}), Tensor(gamma.span(), DType::BF16, {D})},
+          weights{projections[0].weight, Tensor(base.span(), o.base_type, {N}),
+                  Tensor(scale.span(), o.scale_type, {3}), Tensor(gamma.span(), o.gamma_type, {D})},
           coefficients{Tensor(q.span(), DType::FP32, {S, m}),
                        Tensor(c.span(), DType::FP32, {S, S, m})},
           output{
@@ -113,11 +144,27 @@ struct Fixture {
             CUDA_CHECK(cudaMemcpy(backup.data(), x.data(), x.size(), cudaMemcpyDeviceToDevice));
     }
 
+    void reset_columns(int columns) {
+        if (columns <= 0 || std::size_t(columns) * K * 2 > x.size())
+            throw std::invalid_argument("mHC fixture column capacity");
+        m            = columns;
+        tx           = Tensor(x.span(), DType::BF16, {D, S, m});
+        ty           = Tensor(y.span(), DType::BF16, {D, m});
+        tr           = Tensor(options.alias ? x.span() : r.span(), DType::BF16, {D, S, m});
+        coefficients = {Tensor(q.span(), DType::FP32, {S, m}),
+                        Tensor(c.span(), DType::FP32, {S, S, m})};
+        output       = {
+            Tensor(u.span(), DType::BF16, {D, m}),
+            {Tensor(nq.span(), DType::FP32, {S, m}), Tensor(nc.span(), DType::FP32, {S, S, m})}};
+        capacity = ::capacity(options.op, m);
+        arena    = MemoryArena(scratch.span().subspan(0, capacity));
+    }
+
     void restore(CudaExecutionView e) {
         condition_gpu(e, options.condition_us);
         if (options.alias)
-            CUDA_CHECK(cudaMemcpyAsync(x.data(), backup.data(), x.size(), cudaMemcpyDeviceToDevice,
-                                       e.stream()));
+            CUDA_CHECK(cudaMemcpyAsync(x.data(), backup.data(), std::size_t(m) * K * 2,
+                                       cudaMemcpyDeviceToDevice, e.stream()));
     }
 
     void launch(CudaExecutionView e) {
@@ -160,11 +207,15 @@ int main(int argc, char** argv) {
         for (int i = 0; i < o.sites; ++i)
             projections.push_back(make_direct_bf16_weight(N, K, 7100 + i, 0.015625F));
         L2FlushBuffer flush(o.timing.flush_bytes);
-        measurement::Csv csv(o.timing.csv_out,
-                             "alias,semantic_bytes,logical_gb_s,bandwidth_reference_us,projection_"
-                             "flops,bf16_mma_reference_us,calls,sites");
+        measurement::Csv csv(
+            o.timing.csv_out,
+            "alias,semantic_bytes,logical_gb_s,bandwidth_reference_us,projection_"
+            "flops,bf16_mma_reference_us,calls,sites,base_type,scale_type,gamma_type");
+        Fixture f(
+            o, std::max(o.reserve_columns, *std::max_element(o.columns.begin(), o.columns.end())),
+            projections);
         for (int m : o.columns) {
-            Fixture f(o, m, projections);
+            f.reset_columns(m);
             for (const auto& execution :
                  measurement::selections(o.timing.execution, "graph", "eager"))
                 for (const auto& cache : measurement::selections(o.timing.cache, "cold", "warm")) {
@@ -188,7 +239,7 @@ int main(int argc, char** argv) {
                         timing->p95_us /= o.calls;
                     }
                     result.kernels /= o.calls;
-                    const std::size_t bytes = semantic_bytes(o.op, m);
+                    const std::size_t bytes = semantic_bytes(o, m);
                     const double flops =
                         (o.op == "post" || o.op == "post-mean-norm") ? 0 : double(2) * N * K * m;
                     csv.write(
@@ -201,7 +252,9 @@ int main(int argc, char** argv) {
                             "," + format_metric(bytes / (kRoofline.memory_gbs * 1000), 3, "") +
                             "," + format_metric(flops, 0, "") + "," +
                             format_metric(flops / (kRoofline.bf16_f32_tflops * 1.e6), 3, "") + "," +
-                            std::to_string(o.calls) + "," + std::to_string(o.sites));
+                            std::to_string(o.calls) + "," + std::to_string(o.sites) + "," +
+                            type_name(o.base_type) + "," + type_name(o.scale_type) + "," +
+                            type_name(o.gamma_type));
                 }
         }
     } catch (const std::exception& e) {

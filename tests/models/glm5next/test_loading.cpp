@@ -131,7 +131,7 @@ void selection_and_planning(const std::filesystem::path& directory) {
                         QType::Q8_G32_FP16,
                 "official recipe formats differ");
         require(full->uses(m.gate).front().policy == ops::LinearPolicy::AllowA4 &&
-                    full->uses(m.gate).front().activation_input_divisor == 0.5F &&
+                    full->uses(m.gate).front().calibration_view().scalar_divisor() == 0.5F &&
                     full->uses(w.mtp->moe.gate).front().policy == ops::LinearPolicy::AllowA8,
                 "expert use policy or activation divisor lost");
         source_words(reader, *full, directory);
@@ -241,7 +241,7 @@ void matrix_words(const BoundWeight& weight, const Encoded& expected, std::uint6
                   scale_offset(e, erow + row, column_start / group + i),
                   a.format == QType::NVFP4 ? 1 : 2);
     }
-    if (a.format == QType::NVFP4) equal(a.divisor_offset, e.divisor_offset, 4);
+    if (a.format == QType::NVFP4) equal(a.matrix_scale_offset, e.matrix_scale_offset, 4);
 }
 
 void materialization(const std::filesystem::path& directory, DeviceContext& device,
@@ -302,12 +302,15 @@ void materialization(const std::filesystem::path& directory, DeviceContext& devi
         std::get<glm::execution::MlaParameters>(parameters.text.layers[1].mixer);
     const auto& mla_config  = model->definition().config().text.mla;
     const auto history_rows = mla_config.latent_dim + 2 * mla_config.index_dim;
-    require(prepared_mla.prepare[0].a_projection.qdata ==
-                    prepared_mla.prepare[1].a_projection.qdata &&
-                prepared_mla.prepare[0].a_projection.qdata ==
-                    prepared_mla.prepare[2].a_projection.qdata &&
-                prepared_mla.prepare[2].a_projection.n == history_rows &&
-                prepared_mla.prepare[1].a_projection.n == history_rows + mla_config.query_lowrank,
+    const auto& full =
+        std::get<ops::SingleProjectionWeight>(prepared_mla.prepare[0].weights).weight;
+    const auto& query_history =
+        std::get<ops::SingleProjectionWeight>(prepared_mla.prepare[1].weights).weight;
+    const auto& history =
+        std::get<ops::SingleProjectionWeight>(prepared_mla.prepare[2].weights).weight;
+    require(full.qdata == query_history.qdata && full.qdata == history.qdata &&
+                history.n == history_rows &&
+                query_history.n == history_rows + mla_config.query_lowrank,
             "MLA preparation did not bind continuous history/query prefixes");
     require(parameters.text.embedding.qdata == parameters.mtp->embedding.qdata &&
                 (!optimized ? parameters.text.head.weight.qdata == parameters.mtp->head.weight.qdata
@@ -360,7 +363,7 @@ void materialization(const std::filesystem::path& directory, DeviceContext& devi
     for (const auto& e : expert_words) {
         const auto& bank = model->experts({e.bank}).view();
         require(bank.count == 2, "local EP bank lost the global routing domain");
-        const auto& matrix = e.down ? bank.down : bank.gate_up;
+        const auto& matrix      = e.down ? bank.down : bank.gate_up;
         const auto& description = model->expert_data()[e.bank];
         const auto& g           = e.down ? description.down : description.gate_up;
         const auto rows = g.shape[g.shape.size() - 2], columns = g.shape.back();
@@ -411,7 +414,7 @@ void materialization(const std::filesystem::path& directory, DeviceContext& devi
         }
         if (e.bank == 0) {
             float divisor = 0;
-            CUDA_CHECK(cudaMemcpy(&divisor, matrix.divisors + e.expert, sizeof(float),
+            CUDA_CHECK(cudaMemcpy(&divisor, matrix.matrix_scales + e.expert, sizeof(float),
                                   cudaMemcpyDeviceToHost));
             require(divisor == e.divisor, "resident expert divisor lost global-ID addressing");
         }

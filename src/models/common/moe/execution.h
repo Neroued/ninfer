@@ -9,7 +9,7 @@ struct Parameters {
     Weight control;
     ops::SwiGLUWeights shared;
     ExpertBankId bank;
-    ops::ExpertActivationDivisors activation_divisors;
+    ops::ExpertActivationCalibration activation_calibration;
     ExpertBankDeviceView resident;
     ops::ExpertSubset subset;
 };

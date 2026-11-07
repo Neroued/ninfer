@@ -36,22 +36,25 @@ CapacityQuery capacity_query(Form f) {
     throw std::logic_error("unknown mHC form");
 }
 
-Fixture::Fixture(Form form, int m, bool alias, std::size_t guard)
-    : form(form), m(m), alias(alias), x(std::size_t(K) * m), y(std::size_t(D) * m), f(N * K),
-      base(N), scale(3), gamma(D), q(S * m), c(S * S * m), dx(x.size() * 2, guard),
-      dy(y.size() * 2, guard), df(f.size() * 2, guard), db(N * 2, guard), ds(3 * 2, guard),
-      dg(D * 2, guard), dq(q.size() * 4, guard), dc(c.size() * 4, guard), dr(x.size() * 2, guard),
-      du(y.size() * 2, guard), dnq(q.size() * 4, guard), dnc(c.size() * 4, guard),
-      tx(dx.span(), DType::BF16, {D, S, m}), ty(dy.span(), DType::BF16, {D, m}),
-      tr(alias ? dx.span() : dr.span(), DType::BF16, {D, S, m}),
+Fixture::Fixture(Form form, int m, bool alias, std::size_t guard, DType base_type, DType scale_type,
+                 DType gamma_type)
+    : form(form), m(m), alias(alias), base_type(base_type), scale_type(scale_type),
+      gamma_type(gamma_type), x(std::size_t(K) * m), y(std::size_t(D) * m), f(N * K), base(N),
+      scale(3), gamma(D), q(S * m), c(S * S * m), dx(x.size() * 2, guard), dy(y.size() * 2, guard),
+      df(f.size() * 2, guard), db(N * (base_type == DType::FP32 ? 4 : 2), guard),
+      ds(3 * (scale_type == DType::FP32 ? 4 : 2), guard),
+      dg(D * (gamma_type == DType::FP32 ? 4 : 2), guard), dq(q.size() * 4, guard),
+      dc(c.size() * 4, guard), dr(x.size() * 2, guard), du(y.size() * 2, guard),
+      dnq(q.size() * 4, guard), dnc(c.size() * 4, guard), tx(dx.span(), DType::BF16, {D, S, m}),
+      ty(dy.span(), DType::BF16, {D, m}), tr(alias ? dx.span() : dr.span(), DType::BF16, {D, S, m}),
       capacity(form == Form::Post
                    ? 0
                    : capacity_query(form)({D, S}, cuda_environment().context.multiprocessor_count(),
                                           m, m)),
       scratch(capacity + 256), arena(scratch.span()) {
     direct_bf16_weight::HostWeight metadata{N, K, std::vector<std::uint16_t>(N * K)};
-    weights      = {metadata.device_weight(df.span()), Tensor(db.span(), DType::BF16, {N}),
-                    Tensor(ds.span(), DType::BF16, {3}), Tensor(dg.span(), DType::BF16, {D})};
+    weights      = {metadata.device_weight(df.span()), Tensor(db.span(), base_type, {N}),
+                    Tensor(ds.span(), scale_type, {3}), Tensor(dg.span(), gamma_type, {D})};
     coefficients = {Tensor(dq.span(), DType::FP32, {S, m}),
                     Tensor(dc.span(), DType::FP32, {S, S, m})};
     outputs      = {
@@ -67,7 +70,8 @@ void Fixture::set(Pattern pattern, int phase) {
     fill_uniform(f, 4107 + phase, -0.015625F, 0.015625F);
     fill_uniform(base, 4111 + phase, -0.8F, 0.8F);
     fill_uniform(gamma, 4117 + phase, -1.25F, 1.25F);
-    scale = {0.75F, 1.25F, 0.5F};
+    scale = scale_type == DType::BF16 ? std::vector<float>{0.75F, 1.25F, 0.5F}
+                                      : std::vector<float>{0.75137F, 1.25319F, 0.50073F};
     for (int t = 0; t < m; ++t) {
         for (int i = 0; i < S; ++i) {
             q[t * S + i] = 0.2F + 0.4F * ((i + phase) % S);
@@ -108,7 +112,10 @@ void Fixture::set(Pattern pattern, int phase) {
         for (auto& v : x) v *= 1.e-4F;
         for (auto& v : y) v *= 1.e-4F;
     }
-    for (auto* v : {&x, &y, &f, &base, &scale, &gamma}) round_to_bf16(*v);
+    for (auto* v : {&x, &y, &f}) round_to_bf16(*v);
+    if (base_type == DType::BF16) round_to_bf16(base);
+    if (scale_type == DType::BF16) round_to_bf16(scale);
+    if (gamma_type == DType::BF16) round_to_bf16(gamma);
 }
 
 namespace {
@@ -135,9 +142,16 @@ void Fixture::upload(cudaStream_t stream) {
     upload_bf16(dx, x);
     upload_bf16(dy, y);
     upload_bf16(df, f);
-    upload_bf16(db, base);
-    upload_bf16(ds, scale);
-    upload_bf16(dg, gamma);
+    const auto parameter = [](GuardedDeviceBuffer& buffer, const std::vector<float>& values,
+                              DType type) {
+        if (type == DType::FP32)
+            buffer.copy_from_host(values.data(), values.size() * sizeof(float));
+        else
+            upload_bf16(buffer, values);
+    };
+    parameter(db, base, base_type);
+    parameter(ds, scale, scale_type);
+    parameter(dg, gamma, gamma_type);
     dq.copy_from_host(q.data(), q.size() * 4);
     dc.copy_from_host(c.data(), c.size() * 4);
     cuda_synchronize(nullptr);
@@ -178,11 +192,12 @@ int Fixture::preserved(const std::string& label) const {
     for (auto* b : {&dx, &dy, &df, &db, &ds, &dg, &dq, &dc, &dr, &du, &dnq, &dnc, &scratch})
         failed += b->verify_guards(label);
     if (!alias) failed += unchanged(label + " input", dx, x, true);
-    failed +=
-        unchanged(label + " block", dy, y, true) + unchanged(label + " projection", df, f, true) +
-        unchanged(label + " base", db, base, true) + unchanged(label + " scale", ds, scale, true) +
-        unchanged(label + " gamma", dg, gamma, true) + unchanged(label + " q", dq, q, false) +
-        unchanged(label + " C", dc, c, false);
+    failed += unchanged(label + " block", dy, y, true) +
+              unchanged(label + " projection", df, f, true) +
+              unchanged(label + " base", db, base, base_type == DType::BF16) +
+              unchanged(label + " scale", ds, scale, scale_type == DType::BF16) +
+              unchanged(label + " gamma", dg, gamma, gamma_type == DType::BF16) +
+              unchanged(label + " q", dq, q, false) + unchanged(label + " C", dc, c, false);
     return failed;
 }
 } // namespace ninfer::test::mhc

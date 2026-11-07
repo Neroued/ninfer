@@ -13,6 +13,9 @@
 #include "core/weight_view.h"
 #include "core/buffer.h"
 #include "ninfer/ops/linear.h"
+#include "ops/linear/projection/mxfp8/dispatch.h"
+#include "ops/linear/projection/fp8_block/dispatch.h"
+#include "ops/linear/projection/nvfp4_mul/dispatch.h"
 
 #include "core/device.h"
 #include "direct_bf16_weight.cuh"
@@ -152,6 +155,7 @@ struct Result {
     std::uint64_t x_bytes                = 0;
     std::uint64_t out_bytes              = 0;
     std::uint64_t model_bytes            = 0;
+    std::uint64_t scratch_traffic_bytes  = 0;
     double useful_flops                  = 0.0;
     double median_us                     = 0.0;
     double min_us                        = 0.0;
@@ -165,6 +169,10 @@ struct Result {
     double tensor_peak_pct               = std::numeric_limits<double>::quiet_NaN();
     double memory_floor_us               = 0.0;
     double memory_floor_pct              = 0.0;
+    double sustained_memory_floor_us     = std::numeric_limits<double>::quiet_NaN();
+    double compute_floor_us              = std::numeric_limits<double>::quiet_NaN();
+    double roofline_floor_us             = std::numeric_limits<double>::quiet_NaN();
+    double roofline_pct                  = std::numeric_limits<double>::quiet_NaN();
     double t1_linear_extrapolation       = std::numeric_limits<double>::quiet_NaN();
     double delta_pct                     = std::numeric_limits<double>::quiet_NaN();
     int warmup                           = 0;
@@ -225,6 +233,12 @@ const char* qtype_name(QType qtype) {
         return "NVFP4";
     case QType::FP8_E4M3FN_ROW_BF16:
         return "FP8";
+    case QType::MXFP8:
+        return "MXFP8";
+    case QType::FP8_E4M3FN_BLOCK128X128_FP32:
+        return "FP8_BLOCK_FP32";
+    case QType::NVFP4_MUL:
+        return "NVFP4_MUL";
     default:
         break;
     }
@@ -246,6 +260,9 @@ QType parse_qtype(std::string_view text) {
     if (value == "q8" || value == "q8_g32_fp16") { return QType::Q8_G32_FP16; }
     if (value == "bf16") { return QType::BF16; }
     if (value == "nvfp4") { return QType::NVFP4; }
+    if (value == "mxfp8") return QType::MXFP8;
+    if (value == "fp8_block_fp32") return QType::FP8_E4M3FN_BLOCK128X128_FP32;
+    if (value == "nvfp4_mul") return QType::NVFP4_MUL;
     if (value == "fp8" || value == "fp8_e4m3fn_row_bf16") { return QType::FP8_E4M3FN_ROW_BF16; }
     throw std::invalid_argument("unknown qtype: " + std::string(text));
 }
@@ -261,10 +278,13 @@ LinearPolicy parse_policy(std::string_view text) {
 void usage(const char* argv0) {
     std::fprintf(stderr,
                  "Usage:\n"
-                 "  %s --qtype Q4|Q5|Q6|Q8|BF16|NVFP4|FP8 --n N --k K --t T [options]\n"
-                 "  %s --qtype Q4|Q5|Q6|Q8|BF16|NVFP4|FP8 --n N --k K --sweep START:END[:STEP] "
+                 "  %s --qtype Q4|Q5|Q6|Q8|BF16|NVFP4|FP8|MXFP8|FP8_BLOCK_FP32|NVFP4_MUL --n N --k "
+                 "K --t T [options]\n"
+                 "  %s --qtype Q4|Q5|Q6|Q8|BF16|NVFP4|FP8|MXFP8|FP8_BLOCK_FP32|NVFP4_MUL --n N --k "
+                 "K --sweep START:END[:STEP] "
                  "[options]\n"
-                 "  %s --qtype Q4|Q5|Q6|Q8|BF16|NVFP4|FP8 --n N --k K --tokens T1,T2,... "
+                 "  %s --qtype Q4|Q5|Q6|Q8|BF16|NVFP4|FP8|MXFP8|FP8_BLOCK_FP32|NVFP4_MUL --n N --k "
+                 "K --tokens T1,T2,... "
                  "[options]\n"
                  "  %s --suite qwen3_6_27b|qwen3_6_35b_a3b|all [options]\n\n"
                  "Options:\n"
@@ -499,6 +519,14 @@ LinearBenchWeight make_weight(QType qtype, std::int32_t n, std::int32_t k) {
         const std::uint64_t model_bytes     = packed.model_weight_bytes();
         return {std::move(packed.storage), packed.weight, model_bytes};
     }
+    if (qtype == QType::MXFP8 || qtype == QType::FP8_E4M3FN_BLOCK128X128_FP32 ||
+        qtype == QType::NVFP4_MUL) {
+        auto packed      = qtype == QType::MXFP8       ? bench::make_mxfp8_weight(n, k)
+                           : qtype == QType::NVFP4_MUL ? bench::make_nvfp4_mul_weight(n, k)
+                                                       : bench::make_fp8_block_weight(n, k);
+        const auto bytes = packed.model_weight_bytes();
+        return {std::move(packed.storage), packed.weight, bytes};
+    }
     const std::uint64_t padded_k_u64 = align_up(static_cast<std::uint64_t>(k), 128);
     if (padded_k_u64 > static_cast<std::uint64_t>(std::numeric_limits<std::int32_t>::max())) {
         throw std::overflow_error("padded K does not fit int32");
@@ -525,6 +553,35 @@ std::string join_labels(const std::vector<std::string>& labels) {
 }
 
 double registered_tensor_peak_tflops(const BenchPoint& point, const char*& profile) {
+    if (point.qtype == QType::MXFP8) {
+        const auto compute =
+            ops::detail::select_mxfp8_linear_route(point.n, point.k, point.t, point.policy).compute;
+        if (compute == ops::detail::Mxfp8LinearCompute::Simt) {
+            profile = "";
+            return std::numeric_limits<double>::quiet_NaN();
+        }
+        profile = compute == ops::detail::Mxfp8LinearCompute::A8 ? "MXFP8_F32ACC" : "BF16_F32ACC";
+        return compute == ops::detail::Mxfp8LinearCompute::A8 ? bench::kRoofline.mxfp8_f32_tflops
+                                                              : bench::kRoofline.bf16_f32_tflops;
+    }
+    if (point.qtype == QType::FP8_E4M3FN_BLOCK128X128_FP32 &&
+        ops::detail::select_fp8_block_linear_route(point.n, point.k, point.t, point.policy)
+            .tensor_core) {
+        profile = "BF16_F32ACC";
+        return bench::kRoofline.bf16_f32_tflops;
+    }
+    if (point.qtype == QType::BF16 && (((point.n == 128 && point.k == 4096 && point.t > 8) ||
+                                        (point.n == 256 && point.k == 4096 && point.t > 4)) ||
+                                       (point.n == 4096 && point.k == 1536 && point.t > 1))) {
+        profile = "BF16_F32ACC";
+        return bench::kRoofline.bf16_f32_tflops;
+    }
+    if (point.qtype == QType::NVFP4_MUL &&
+        ops::detail::select_nvfp4_mul_route(point.n, point.k, point.t, point.policy).tensor_core) {
+        profile = "BF16_F32ACC";
+        return bench::kRoofline.bf16_f32_tflops;
+    }
+
     // Report Tensor Core utilization only when the exact registered problem and extent determine
     // that the public route executes the named MMA profile.
     if (point.qtype == QType::Q4_G64_FP16 && point.k == 2560 &&
@@ -549,7 +606,7 @@ double registered_tensor_peak_tflops(const BenchPoint& point, const char*& profi
         profile = "BF16_F32ACC";
         return bench::kRoofline.bf16_f32_tflops;
     }
-    if (point.qtype == QType::BF16 && point.n == 4096 && point.k == 8192 && point.t > 8) {
+    if (point.qtype == QType::BF16 && point.n == 4096 && point.k == 8192 && point.t >= 2) {
         profile = "BF16_F32ACC";
         return bench::kRoofline.bf16_f32_tflops;
     }
@@ -681,11 +738,26 @@ Result make_result(const BenchPoint& point, const LinearBenchWeight& weight,
     const std::uint64_t out_bytes   = checked_mul(out_elements, 2, "output bytes");
     const std::uint64_t model_bytes = checked_add(
         checked_add(weight.model_weight_bytes(), x_bytes, "model bytes"), out_bytes, "model bytes");
+    std::uint64_t scratch_traffic = 0;
+    if (point.qtype == QType::MXFP8) {
+        const auto& route = ops::detail::select_mxfp8_linear_route(
+            point.n, point.k, point.t, point.policy);
+        if (route.compute == ops::detail::Mxfp8LinearCompute::A8) {
+            const auto code_elements = checked_mul(static_cast<std::uint64_t>(point.k),
+                                                   route.code_tokens(point.t), "code elements");
+            scratch_traffic = 2 * code_elements + 2 * x_elements / 32;
+        }
+    } else if (point.qtype == QType::FP8_E4M3FN_BLOCK128X128_FP32) {
+        scratch_traffic = ops::detail::select_fp8_block_linear_route(
+                              point.n, point.k, point.t, point.policy)
+                              .scratch_traffic_bytes;
+    }
+    const auto required_bytes = checked_add(model_bytes, scratch_traffic, "required traffic");
     const double useful_flops = 2.0 * static_cast<double>(point.n) * static_cast<double>(point.k) *
                                 static_cast<double>(point.t);
     const double seconds = timing.median_us * 1.0e-6;
     const double memory_floor_us =
-        static_cast<double>(model_bytes) / (bench::kRoofline.memory_gbs * 1.0e9) * 1.0e6;
+        static_cast<double>(required_bytes) / (bench::kRoofline.memory_gbs * 1.0e9) * 1.0e6;
 
     Result result;
     result.labels                   = join_labels(point.labels);
@@ -698,19 +770,31 @@ Result make_result(const BenchPoint& point, const LinearBenchWeight& weight,
     result.x_bytes                  = x_bytes;
     result.out_bytes                = out_bytes;
     result.model_bytes              = model_bytes;
+    result.scratch_traffic_bytes    = scratch_traffic;
     result.workspace_capacity_bytes = ops::linear_workspace_capacity_bytes(
         point.qtype, point.n, point.k, point.policy, point.t, point.t);
     result.useful_flops       = useful_flops;
     result.median_us          = timing.median_us;
     result.min_us             = timing.min_us;
     result.p95_us             = timing.p95_us;
-    result.effective_gbs      = static_cast<double>(model_bytes) / seconds / 1.0e9;
+    result.effective_gbs      = static_cast<double>(required_bytes) / seconds / 1.0e9;
     result.dram_spec_pct      = result.effective_gbs / bench::kRoofline.memory_gbs * 100.0;
     result.sustained_read_pct = result.effective_gbs / bench::kRoofline.sustained_read_gbs * 100.0;
     result.useful_tflops      = useful_flops / seconds / 1.0e12;
     result.tensor_peak_tflops = registered_tensor_peak_tflops(point, result.tensor_profile);
     if (std::isfinite(result.tensor_peak_tflops)) {
         result.tensor_peak_pct = result.useful_tflops / result.tensor_peak_tflops * 100.0;
+        result.compute_floor_us = useful_flops / (result.tensor_peak_tflops * 1.0e6);
+    }
+    if (opt.cold && opt.graph_calls == 1 &&
+        std::isfinite(bench::kRoofline.sustained_read_gbs)) {
+        result.sustained_memory_floor_us =
+            static_cast<double>(required_bytes) / (bench::kRoofline.sustained_read_gbs * 1.0e3);
+        if (std::isfinite(result.compute_floor_us)) {
+            result.roofline_floor_us =
+                std::max(result.sustained_memory_floor_us, result.compute_floor_us);
+            result.roofline_pct = result.roofline_floor_us / timing.median_us * 100.0;
+        }
     }
     result.memory_floor_us  = memory_floor_us;
     result.memory_floor_pct = memory_floor_us / timing.median_us * 100.0;
@@ -945,7 +1029,8 @@ void write_csv(const std::filesystem::path& path, const std::vector<Result>& res
            "tensor_peak_tflops,tensor_peak_pct,memory_floor_us,memory_floor_pct,"
            "t1_linear_extrapolation,delta_pct,"
            "warmup,repeat,flush_bytes,execution,graph_nodes,graph_calls,cache,timer_scope,"
-           "workspace_capacity_bytes\n";
+           "workspace_capacity_bytes,scratch_traffic_bytes,sustained_memory_floor_us,"
+           "compute_floor_us,roofline_floor_us,roofline_pct\n";
     for (const Result& result : results) {
         out << csv_quote(result.labels) << ',' << result.qtype_name << ',' << result.policy_name
             << ',' << result.n << ',' << result.k << ',' << result.t << ',' << result.weight_bytes
@@ -970,7 +1055,11 @@ void write_csv(const std::filesystem::path& path, const std::vector<Result>& res
             << result.execution << ',';
         if (result.graph_nodes) out << result.graph_nodes;
         out << ',' << result.graph_calls << ',' << result.cache << ',' << result.timer_scope << ','
-            << result.workspace_capacity_bytes << '\n';
+            << result.workspace_capacity_bytes << ',' << result.scratch_traffic_bytes << ','
+            << bench::format_metric(result.sustained_memory_floor_us, 6, "") << ','
+            << bench::format_metric(result.compute_floor_us, 6, "") << ','
+            << bench::format_metric(result.roofline_floor_us, 6, "") << ','
+            << bench::format_metric(result.roofline_pct, 6, "") << '\n';
     }
 }
 

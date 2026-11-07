@@ -17,9 +17,18 @@ struct RawField {
     std::int64_t column_stride = 0, row_stride = 0;
 };
 
+struct PrepareWeight {
+    const void *codes = nullptr, *scales = nullptr;
+    QType format        = QType::BF16;
+    LinearPolicy policy = LinearPolicy::A16Only;
+    int rows            = 0;
+};
+
 struct PrepareArguments {
     const __nv_bfloat16* x;
-    const __nv_bfloat16* weight;
+    PrepareWeight weights[2];
+    KpoolMlaProjectionLayout mapping;
+    std::uint8_t *activation_codes, *activation_scales;
     const __nv_bfloat16 *latent_norm, *query_norm, *key_norm, *key_bias, *ape;
     const int *positions, *valid, *table_rows, *record_offsets;
     const std::int64_t* page_offsets;
@@ -41,5 +50,6 @@ struct PrepareArguments {
     bool update, fp8_index, fp8_latent;
 };
 
-void launch_prepare(const PrepareArguments& args, int window_columns, cudaStream_t stream);
+void launch_prepare(const PrepareArguments& args, const PrepareGeometry& geometry,
+                    int window_columns, cudaStream_t stream);
 } // namespace ninfer::ops::detail::kpool

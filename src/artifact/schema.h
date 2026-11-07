@@ -37,6 +37,7 @@ struct TensorObject {
     std::string layout;
     std::uint64_t offset = 0;
     std::uint64_t bytes  = 0;
+    std::optional<std::uint64_t> exception_count;
 };
 
 struct ResourceObject {

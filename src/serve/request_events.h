@@ -105,6 +105,16 @@ struct ThroughputReport {
     ninfer::RuntimeStats previous;
     ninfer::RuntimeStats current;
     bool final_interval = false;
+
+    [[nodiscard]] std::uint64_t replayed_tokens() const noexcept {
+        return current.replayed_tokens >= previous.replayed_tokens
+                   ? current.replayed_tokens - previous.replayed_tokens
+                   : 0;
+    }
+
+    [[nodiscard]] double replay_tokens_per_second() const noexcept {
+        return interval_seconds > 0 ? double(replayed_tokens()) / interval_seconds : 0;
+    }
 };
 
 RequestLogContext make_request_log_context(std::uint64_t id, std::string protocol,

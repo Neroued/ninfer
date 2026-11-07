@@ -91,7 +91,7 @@ def test_expert_parents_preserve_bank_order_and_shared_auxiliary(tmp_path):
             role,
             "hidden",
             auxiliaries={
-                "activation_input_divisor": AuxiliaryReference("layer_scales", 0)
+                "activation_input_divisor": AuxiliaryReference("layer_scales", 0, 1)
             },
         )
     # Deliberately insert reverse order; placement and Binding order are independent.
@@ -305,7 +305,7 @@ def test_incompatible_nvfp4_divisors_keep_default_parents_separate():
     recipe.assign("*", format="nvfp4", method=import_encoded)
     assert len(recipe.prepare(device="cpu").weights) == 2
     recipe.group(("gate", "up"))
-    with pytest.raises(ValueError, match="weight divisors differ"):
+    with pytest.raises(ValueError, match="weight scales differ"):
         recipe.prepare(device="cpu")
 
 

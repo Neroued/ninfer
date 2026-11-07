@@ -22,7 +22,8 @@ using Bulk =
 } // namespace
 
 void launch_bf16_bias_n3072_k1024(const Tensor& x, const Weight& weight, const Tensor& bias,
-                                  std::span<const Tensor> outputs, cudaStream_t stream) {
+                                  std::span<const Tensor> outputs, LinearPolicy, MemoryArena*,
+                                  cudaStream_t stream) {
     const auto p = bf16_a16_operands(x, weight);
     const LinearBf16SegmentedOutput<1024, 1024, 1024> out{
         {static_cast<__nv_bfloat16*>(outputs[0].data), static_cast<__nv_bfloat16*>(outputs[1].data),
@@ -40,4 +41,6 @@ void launch_bf16_bias_n3072_k1024(const Tensor& x, const Weight& weight, const T
     launch_bf16_a16_tma_mma<Bulk>(p, out, warp, stream);
 }
 
+const SplitBiasShape kBf16SplitBiasN3072K1024{3072, 1024, kSplitRows<1024, 1024, 1024>,
+                                              launch_bf16_bias_n3072_k1024};
 } // namespace ninfer::ops::detail::linear_split

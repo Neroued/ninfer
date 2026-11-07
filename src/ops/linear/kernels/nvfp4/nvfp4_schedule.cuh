@@ -177,7 +177,8 @@ enum class Nvfp4MmaFragmentPipeline : std::uint8_t {
 template <int BlockRows, int BlockTokens, int BlockK, int WarpRows, int WarpTokens,
           int ActivationStages, int MinBlocksPerSm, Cache WeightCache = Cache::cg,
           Cache ActivationCache                     = Cache::cg,
-          Nvfp4MmaFragmentPipeline FragmentPipeline = Nvfp4MmaFragmentPipeline::PingPong>
+          Nvfp4MmaFragmentPipeline FragmentPipeline = Nvfp4MmaFragmentPipeline::PingPong,
+          bool RegisterWeights = false, int RasterGroupRows = 0, bool SwizzleCodes = false>
 struct Nvfp4A16MmaSchedule {
     static constexpr int kStaticK           = 0;
     static constexpr auto kFragmentPipeline = FragmentPipeline;
@@ -190,6 +191,9 @@ struct Nvfp4A16MmaSchedule {
     static constexpr int kMinBlocksPerSm    = MinBlocksPerSm;
     static constexpr Cache kWeightCache     = WeightCache;
     static constexpr Cache kActivationCache = ActivationCache;
+    static constexpr bool kRegisterWeights  = RegisterWeights;
+    static constexpr int kRasterGroupRows   = RasterGroupRows;
+    static constexpr bool kSwizzleCodes     = SwizzleCodes;
 
     static constexpr int kWarpsRows   = kBlockRows / kWarpRows;
     static constexpr int kWarpsTokens = kBlockTokens / kWarpTokens;
@@ -198,16 +202,22 @@ struct Nvfp4A16MmaSchedule {
     static constexpr int kMmaRows     = kWarpRows / 16;
     static constexpr int kMmaTokens   = kWarpTokens / 8;
     static constexpr int kMmaK        = kBlockK / 16;
+    static constexpr int kRawStages   = kRegisterWeights ? 2 : 1;
+    static constexpr int kExpandedWeightBytes =
+        kRegisterWeights ? 0 : kBlockRows * kBlockK * sizeof(__nv_bfloat16);
+    static constexpr int kActivationBytes =
+        kActivationStages * kBlockTokens * kBlockK * sizeof(__nv_bfloat16);
+    static constexpr int kCodeStageBytes  = kBlockRows * (kBlockK / 2);
+    static constexpr int kScaleStageBytes = kBlockRows * (kBlockK / 16);
     static constexpr int kSharedBytes =
-        kBlockRows * kBlockK * static_cast<int>(sizeof(__nv_bfloat16)) +
-        kActivationStages * kBlockTokens * kBlockK * static_cast<int>(sizeof(__nv_bfloat16)) +
-        kBlockRows * (kBlockK / 2 + kBlockK / 16);
+        kExpandedWeightBytes + kActivationBytes + kRawStages * (kCodeStageBytes + kScaleStageBytes);
 
     static_assert(kBlockRows > 0 && kBlockTokens > 0 && kBlockK > 0);
     static_assert((kBlockRows % kWarpRows) == 0 && (kBlockTokens % kWarpTokens) == 0);
     static_assert((kWarpRows % 16) == 0 && (kWarpTokens % 8) == 0);
     static_assert(kBlockK == 64 || kBlockK == 128);
     static_assert(kActivationStages == 1 || kActivationStages == 2);
+    static_assert(kRasterGroupRows >= 0);
     static_assert(kMinBlocksPerSm > 0);
     static_assert(kWarps >= 1 && kThreads <= 1024);
     static_assert(kSharedBytes <= 99 * 1024);

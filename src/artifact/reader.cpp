@@ -15,8 +15,9 @@ struct Reader::Impl {
     std::filesystem::path entry;
     Directory directory;
     ArtifactId id{};
-    std::uint64_t entry_payload_start = 0;
-    std::uint64_t file_bytes          = 0;
+    std::uint64_t entry_payload_start        = 0;
+    std::uint64_t file_bytes                 = 0;
+    mutable std::uint64_t payload_read_bytes = 0;
     std::array<std::byte, kHeaderBytes> entry_header{};
     mutable std::vector<std::unique_ptr<io::ReadOnlyFile>> files;
     mutable std::vector<std::optional<WeightGeometry>> geometries;
@@ -120,6 +121,8 @@ const ArtifactId& Reader::artifact_id() const noexcept { return impl_->id; }
 
 std::uint64_t Reader::file_bytes() const noexcept { return impl_->file_bytes; }
 
+std::uint64_t Reader::payload_read_bytes() const noexcept { return impl_->payload_read_bytes; }
+
 ObjectHandle Reader::find(std::string_view id) const {
     const auto found = directory().object_index.find(id);
     if (found == directory().object_index.end()) {
@@ -177,6 +180,7 @@ void Reader::read_into(std::uint64_t offset, std::span<std::byte> destination) c
                     segment.file_offset,
                     destination.subspan(static_cast<std::size_t>(segment.destination_offset),
                                         static_cast<std::size_t>(segment.bytes)));
+            impl_->payload_read_bytes += segment.bytes;
         }
     } catch (const std::system_error& e) { throw ArtifactError(e.what()); }
 }

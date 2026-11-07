@@ -5,10 +5,14 @@
 
 #include <cstddef>
 #include <limits>
-#include <optional>
+#include <memory>
 #include <span>
 #include <string>
 #include <vector>
+
+namespace ninfer::artifact {
+struct Binding;
+}
 
 namespace ninfer::models {
 
@@ -22,10 +26,26 @@ struct WeightUseId {
     std::size_t use_index = std::numeric_limits<std::size_t>::max();
 };
 
+struct ActivationCalibrationData {
+    ops::ActivationScaleOperation operation = ops::ActivationScaleOperation::Divide;
+    std::vector<float> values;
+};
+
 struct WeightUse {
     std::string input;
     ops::LinearPolicy policy = ops::LinearPolicy::A16Only;
-    std::optional<float> activation_input_divisor;
+    std::shared_ptr<const ActivationCalibrationData> calibration;
+    std::shared_ptr<const artifact::Binding> calibration_source;
+    ConstMemorySpan calibration_device;
+
+    [[nodiscard]] ops::ActivationCalibrationView calibration_view() const {
+        if (!calibration) return {};
+        if (calibration->values.size() == 1)
+            return ops::ActivationCalibrationView::broadcast(calibration->operation,
+                                                             calibration->values.front());
+        return ops::ActivationCalibrationView::per_matrix(calibration->operation,
+                                                          calibration->values, calibration_device);
+    }
 };
 
 struct BoundWeight {

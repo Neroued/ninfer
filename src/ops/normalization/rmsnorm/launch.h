@@ -16,6 +16,9 @@ enum class Instance {
     CtaMedium,
     CtaWide,
     CtaWidePrefetch,
+    D1024Vector,
+    D4096,
+    D4096Vector,
     Generic
 };
 

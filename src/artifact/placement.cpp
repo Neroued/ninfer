@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace ninfer::artifact {
 
@@ -43,12 +44,23 @@ std::size_t tensor_hash(const EncodedTensor& t) {
         mix(c.source_stride);
         mix(c.destination_stride);
     }
+    mix(t.geometry.csf.exception_count);
+    for (const auto& s : t.csf_slices) {
+        mix(s.object.index);
+        mix(s.row);
+        mix(s.column);
+        mix(s.rows);
+        mix(s.columns);
+        mix(s.destination_row);
+        mix(s.destination_column);
+    }
     return value;
 }
 
 bool same_tensor(const EncodedTensor& a, const EncodedTensor& b) {
     return a.geometry.format == b.geometry.format && a.geometry.layout == b.geometry.layout &&
-           a.geometry.shape == b.geometry.shape && a.copies == b.copies;
+           a.geometry.shape == b.geometry.shape && a.copies == b.copies &&
+           a.geometry.csf == b.geometry.csf && a.csf_slices == b.csf_slices;
 }
 } // namespace
 
@@ -73,10 +85,15 @@ MaterializationPlan plan_materialization(const Reader& reader,
     out.objects.resize(out.object_count);
     out.resources = std::move(resources);
     std::unordered_multimap<std::size_t, StorageId> catalog;
+    std::unordered_set<const EncodedPreparationStats*> preparations;
     std::vector<bool> host, registered, device;
     std::vector<std::uint64_t> domains;
     bool has_device = false;
     for (const auto& request : requests) {
+        const auto& preparation = request.tensor.preparation;
+        if (preparation && preparations.insert(preparation.get()).second)
+            out.preparation_read_bytes = checked_add(
+                out.preparation_read_bytes, preparation->read_bytes, "encoded preparation reads");
         const auto key =
             tensor_hash(request.tensor) ^ std::hash<std::uint64_t>{}(request.storage_domain);
         const auto [begin, end] = catalog.equal_range(key);

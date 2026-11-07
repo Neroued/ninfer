@@ -66,6 +66,7 @@ class TensorSpec:
     shape: tuple[int, ...]
     format: str
     layout: str
+    layout_parameters: dict[str, int] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,10 +84,14 @@ class TensorObject:
     layout: str
     offset: int
     bytes: int
+    layout_parameters: dict[str, int] | None = None
     kind: ClassVar[str] = "tensor"
 
     def to_json(self) -> dict:
-        return {**asdict(self), "shape": list(self.shape), "kind": self.kind}
+        result = {**asdict(self), "shape": list(self.shape), "kind": self.kind}
+        if self.layout_parameters is None:
+            del result["layout_parameters"]
+        return result
 
 
 @dataclass(frozen=True, slots=True)
@@ -146,7 +151,7 @@ def validate_encoding(obj: ArtifactObject) -> None:
             )
         return
     try:
-        size = encoded_size(obj.layout, obj.format, obj.shape)
+        size = encoded_size(obj.layout, obj.format, obj.shape, obj.layout_parameters)
         alignment = get_layout(obj.layout).alignment
     except (TypeError, ValueError) as error:
         raise ArtifactError(f"{obj.id}: {error}") from error
@@ -171,10 +176,17 @@ def plan_objects(specs: Sequence[ObjectSpec]) -> tuple[ArtifactObject, ...]:
             dims = shape(spec.shape, name)
             try:
                 start = align_up(offset, get_layout(spec.layout).alignment)
-                size = encoded_size(spec.layout, spec.format, dims)
+                size = encoded_size(
+                    spec.layout, spec.format, dims, spec.layout_parameters
+                )
             except (TypeError, ValueError) as error:
                 raise ArtifactError(f"{name}: {error}") from error
-            obj = TensorObject(name, dims, spec.format, spec.layout, start, size)
+            parameters = (
+                None if spec.layout_parameters is None else dict(spec.layout_parameters)
+            )
+            obj = TensorObject(
+                name, dims, spec.format, spec.layout, start, size, parameters
+            )
         elif isinstance(spec, ResourceSpec):
             obj = ResourceObject(name, spec.encoding, offset, spec.bytes)
         else:
@@ -196,7 +208,12 @@ def _parse_object(value: object) -> ArtifactObject:
     common = {"id", "kind", "offset", "bytes"}
     kind = value.get("kind")
     if kind == "tensor":
-        members(value, common | {"shape", "format", "layout"}, set(), "tensor")
+        members(
+            value,
+            common | {"shape", "format", "layout"},
+            {"layout_parameters"},
+            "tensor",
+        )
     elif kind == "resource":
         members(value, common | {"encoding"}, set(), "resource")
     else:
@@ -207,6 +224,14 @@ def _parse_object(value: object) -> ArtifactObject:
     integer(offset + size, f"{name} end")
     if kind == "resource":
         return ResourceObject(name, identifier(value["encoding"], name), offset, size)
+    parameters = value.get("layout_parameters")
+    if "layout_parameters" in value:
+        if not isinstance(parameters, dict):
+            raise ArtifactError(f"{name}: layout_parameters must be an object")
+        parameters = {
+            identifier(key, f"{name} layout parameter"): integer(item, f"{name}/{key}")
+            for key, item in parameters.items()
+        }
     return TensorObject(
         name,
         shape(value["shape"], name),
@@ -214,6 +239,7 @@ def _parse_object(value: object) -> ArtifactObject:
         identifier(value["layout"], name),
         offset,
         size,
+        parameters,
     )
 
 

@@ -16,11 +16,12 @@ struct Operands {
     const void* base       = nullptr;
     const void* scale      = nullptr;
     const void* gamma      = nullptr;
-    void* updated          = nullptr;
-    void* output           = nullptr;
-    float* next_post       = nullptr;
-    float* next_mix        = nullptr;
-    int columns            = 0;
+    DType base_type = DType::BF16, scale_type = DType::BF16, gamma_type = DType::BF16;
+    void* updated    = nullptr;
+    void* output     = nullptr;
+    float* next_post = nullptr;
+    float* next_mix  = nullptr;
+    int columns      = 0;
     MhcPreParameters parameters{};
 };
 

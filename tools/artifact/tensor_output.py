@@ -10,9 +10,11 @@ import numpy as np
 import torch
 
 from .codecs.direct import encode_direct
-from .codecs.fp8_block import encode_fp8_block_scaled
+from .codecs.fp8_block import validate_fp8_block_words
 from .codecs.fp8_row import encode_fp8_row_scaled
-from .codecs.nvfp4 import encode_nvfp4
+from .codecs.nvfp4 import matrix_scale_words, swizzle_nvfp4_scales
+from .codecs.mxfp8 import validate_mxfp8_words
+from .codecs._tensor_bytes import _exact_uint8_matrix
 from .codecs.nf4 import divisor_word, nf4_rows
 from .codecs.row_split import encode_row_split, split_row_planes
 from .formats import (
@@ -20,6 +22,7 @@ from .formats import (
     Fp8BlockFormat,
     Fp8RowFormat,
     Nvfp4Format,
+    Mxfp8Format,
     Nf4Format,
     QuantFormat,
     get_format,
@@ -30,6 +33,8 @@ from .layouts import (
     row_scale_geometry,
     row_split_geometry,
     row_paged_geometry,
+    row_group_scale_geometry,
+    csf32_geometry,
 )
 from .schema import TensorObject
 from .writer import ArtifactWriter
@@ -44,7 +49,7 @@ class TensorOutput:
         self.object = obj
         self.format = get_format(obj.format)
         self._padding_initialized = False
-        self._divisors: dict[int, bytes] = {}
+        self._matrix_scales: dict[int, bytes] = {}
         self._next_row = 0
         self._pending_rows = None
         self._pages_written = 0
@@ -65,7 +70,14 @@ class TensorOutput:
         if self._padding_initialized:
             return
         obj = self.object
-        if isinstance(self.format, QuantFormat):
+        if obj.layout == "csf_32x2_v1":
+            g = csf32_geometry(obj.shape, obj.layout_parameters["exception_count"])
+            previous = 0
+            gaps = []
+            for _, offset, size in g.planes:
+                gaps.append((previous, offset))
+                previous = offset + size
+        elif isinstance(self.format, QuantFormat):
             g = row_split_geometry(self.format, obj.shape)
             gaps = (
                 (g.base_bytes, g.high_offset),
@@ -77,6 +89,9 @@ class TensorOutput:
         elif isinstance(self.format, Fp8BlockFormat):
             g = fp8_block_geometry(self.format, obj.shape)
             gaps = ((g.code_plane_bytes, g.scale_plane_offset),)
+        elif isinstance(self.format, Mxfp8Format):
+            g = row_group_scale_geometry(self.format, obj.shape)
+            gaps = ((g.code_plane_bytes, g.scale_plane_offset),)
         elif isinstance(self.format, Nvfp4Format):
             g = block_scale_geometry(self.format, obj.shape)
             gaps = ((g.code_plane_bytes, g.scale_plane_offset),)
@@ -87,16 +102,34 @@ class TensorOutput:
                 self.writer.write_zeros(obj.id, begin, end - begin)
         self._padding_initialized = True
 
+    def write_csf_plane(
+        self, name: str, byte_offset: int, data: bytes | bytearray | memoryview
+    ) -> None:
+        if self.object.layout != "csf_32x2_v1":
+            raise TypeError("CSF plane writes require a CSF tensor")
+        g = csf32_geometry(
+            self.object.shape, self.object.layout_parameters["exception_count"]
+        )
+        offset, size = g.plane(name)
+        raw = memoryview(data).cast("B")
+        if byte_offset < 0 or byte_offset > size or len(raw) > size - byte_offset:
+            raise ValueError(f"CSF {name} write exceeds its plane")
+        self._padding()
+        if raw:
+            self.write_bytes(offset + byte_offset, raw)
+
     def write_codes(
         self,
         row_begin: int,
         codes: torch.Tensor,
         scales: torch.Tensor,
-        weight_divisor: bytes | None = None,
+        weight_scale: bytes | None = None,
         *,
         matrix: int = 0,
     ) -> None:
         obj = self.object
+        if obj.layout == "csf_32x2_v1":
+            raise TypeError("CSF output requires compressed plane writes")
         matrices = obj.shape[0] if len(obj.shape) == 3 else 1
         if len(obj.shape) not in (2, 3) or not 0 <= matrix < matrices:
             raise ValueError(f"{obj.id}: invalid encoded matrix index {matrix}")
@@ -109,7 +142,7 @@ class TensorOutput:
         parent_row = matrix * n + row_begin
         self._padding()
         if isinstance(self.format, Nf4Format):
-            self._write_nf4(row_begin, codes, scales, weight_divisor)
+            self._write_nf4(row_begin, codes, scales, weight_scale)
         elif isinstance(self.format, QuantFormat):
             g = row_split_geometry(self.format, obj.shape)
             block = encode_row_split(codes, scales, self.format, (rows, k))
@@ -133,34 +166,59 @@ class TensorOutput:
                     f"{obj.id}: FP8 block output needs whole 128-row tiles"
                 )
             g = fp8_block_geometry(self.format, obj.shape)
-            local = fp8_block_geometry(self.format, (rows, k))
-            block = memoryview(encode_fp8_block_scaled(codes, scales, (rows, k)))
-            self.write_bytes(parent_row * k, block[: local.code_plane_bytes])
+            q = _exact_uint8_matrix(codes, (rows, k), "block-scaled FP8 codes")
+            dtype = (
+                torch.bfloat16 if self.format.scale_format == "bf16" else torch.float32
+            )
+            if scales.dtype != dtype or tuple(scales.shape) != (
+                rows // 128,
+                g.scale_columns,
+            ):
+                raise TypeError(
+                    "block-scaled FP8 scales differ from their format or geometry"
+                )
+            s = scales.detach().contiguous().cpu()
+            validate_fp8_block_words(q, s)
+            self.write_bytes(parent_row * k, memoryview(q.numpy()).cast("B"))
             self.write_bytes(
-                g.scale_plane_offset + parent_row // 128 * g.scale_columns * 2,
-                block[local.scale_plane_offset :],
+                g.scale_plane_offset
+                + parent_row // 128 * g.scale_columns * self.format.scale_bytes,
+                memoryview(s.view(torch.uint8).numpy()).cast("B"),
+            )
+        elif isinstance(self.format, Mxfp8Format):
+            g = row_group_scale_geometry(self.format, obj.shape)
+            q = _exact_uint8_matrix(codes, (rows, k), "MXFP8 codes")
+            s = _exact_uint8_matrix(scales, (rows, g.groups_per_row), "MXFP8 scales")
+            validate_mxfp8_words(q, s)
+            self.write_bytes(parent_row * k, memoryview(q.numpy()).cast("B"))
+            self.write_bytes(
+                g.scale_plane_offset + parent_row * g.groups_per_row,
+                memoryview(s.numpy()).cast("B"),
             )
         elif isinstance(self.format, Nvfp4Format):
-            if row_begin % 128 or rows % 128 or weight_divisor is None:
+            if row_begin % 128 or rows % 128 or weight_scale is None:
                 raise ValueError(
-                    f"{obj.id}: NVFP4 output needs whole 128-row tiles and weight divisor"
+                    f"{obj.id}: NVFP4 output needs whole 128-row tiles and weight scalar"
                 )
             g = block_scale_geometry(self.format, obj.shape)
-            local = block_scale_geometry(self.format, (rows, k))
-            block = memoryview(encode_nvfp4(codes, scales, weight_divisor, (rows, k)))
-            divisor = bytes(block[local.weight_divisor_offset :])
-            if matrix in self._divisors and self._divisors[matrix] != divisor:
+            q = _exact_uint8_matrix(codes, (rows, k // 2), "NVFP4 codes")
+            s = _exact_uint8_matrix(scales, (rows, k // 16), "NVFP4 scales")
+            if bool((s > 126).any()):
+                raise ValueError("NVFP4 scales must be nonnegative finite E4M3FN words")
+            scalar = matrix_scale_words(weight_scale, 1)
+            swizzled = swizzle_nvfp4_scales(s, (rows, k))
+            if matrix in self._matrix_scales and self._matrix_scales[matrix] != scalar:
                 raise ValueError(
-                    f"{obj.id}: matrix weight divisor changed between row blocks"
+                    f"{obj.id}: matrix weight scalar changed between row blocks"
                 )
-            self.write_bytes(parent_row * (k // 2), block[: local.code_plane_bytes])
+            self.write_bytes(parent_row * (k // 2), memoryview(q.numpy()).cast("B"))
             self.write_bytes(
                 g.scale_plane_offset + parent_row * (k // 16),
-                block[local.scale_plane_offset : local.weight_divisor_offset],
+                memoryview(swizzled.numpy()).cast("B"),
             )
-            if matrix not in self._divisors:
-                self.write_bytes(g.weight_divisor_offset + matrix * 4, divisor)
-                self._divisors[matrix] = divisor
+            if matrix not in self._matrix_scales:
+                self.write_bytes(g.matrix_scale_offset + matrix * 4, scalar)
+                self._matrix_scales[matrix] = scalar
         else:
             raise TypeError(f"{obj.id}: direct format does not accept quantized codes")
 
@@ -169,9 +227,9 @@ class TensorOutput:
         if row_begin != self._next_row:
             raise ValueError("NF4 streaming output requires consecutive rows")
         divisor = divisor_word(weight_divisor)
-        if 0 in self._divisors and self._divisors[0] != divisor:
+        if 0 in self._matrix_scales and self._matrix_scales[0] != divisor:
             raise ValueError("NF4 divisor changed between row blocks")
-        self._divisors[0] = divisor
+        self._matrix_scales[0] = divisor
         rows = nf4_rows(codes, scales, g.k)
         self._next_row += rows.shape[0]
         if self._pending_rows is not None:

@@ -19,7 +19,7 @@ struct ExpandClusterTile {
 // Fold native weights on chip into a high/low BF16 pair, accumulate both products
 // in FP32, and retain the embedding until the expanded residual and branch output
 // are published. Projection, coefficient reduction and output share one cluster allocation.
-template <int Threads, int BK>
+template <class Gamma, int Threads, int BK>
 __global__ __launch_bounds__(Threads, 3) void __cluster_dims__(8, 1, 1)
     expand_cluster_kernel(Operands o, std::int64_t tile_offset) {
     constexpr int H = 512, Tokens = 8, KParts = ExpandClusterTile<Threads, BK>::KParts;
@@ -32,6 +32,8 @@ __global__ __launch_bounds__(Threads, 3) void __cluster_dims__(8, 1, 1)
     auto* data   = reinterpret_cast<float*>(a);
     auto cluster = cooperative_groups::this_cluster();
     int rank = cluster.block_rank(), tid = threadIdx.x, lane = tid & 31, warp = tid / 32;
+    __shared__ ClusterBarrier gate_ready[Tokens];
+    if (tid < Tokens) init_cluster_barrier(gate_ready + tid, 1);
     const std::int64_t m0 = (tile_offset + std::int64_t(blockIdx.x / 8)) * Tokens;
     for (int i = tid * 8; i < Tokens * H; i += Threads * 8) {
         int t = i / H, d = i % H;
@@ -110,8 +112,6 @@ __global__ __launch_bounds__(Threads, 3) void __cluster_dims__(8, 1, 1)
             data[i] = value;
         }
     }
-    auto* ready = reinterpret_cast<unsigned*>(data + KParts * Tokens * 32);
-    if (!tid) *ready = 0;
     cluster.sync();
     auto* pre  = data + Tokens * 32;
     auto* gain = pre + 4;
@@ -126,22 +126,24 @@ __global__ __launch_bounds__(Threads, 3) void __cluster_dims__(8, 1, 1)
         float square = __shfl_sync(0xffffffffu, value, 24),
               logit  = activate_coefficients(o, value, m0 + rank, pre, m0 + rank < o.columns);
         __syncwarp();
-        if (!lane) {
-            float gate = (pre[0] + pre[1]) + (pre[2] + pre[3]);
-            *gain      = gate * rsqrtf(gate * gate * square / kWidth + o.parameters.branch_epsilon);
-            publish_cluster_value(ready);
+        float gate   = (pre[0] + pre[1]) + (pre[2] + pre[3]);
+        float factor = gate * rsqrtf(gate * gate * square / kWidth + o.parameters.branch_epsilon);
+        if (lane < Tokens) {
+            cluster.map_shared_rank(gain, lane)[rank] = factor;
+            arrive_cluster_barrier(cluster.map_shared_rank(gate_ready, lane) + rank);
         }
         if (m0 + rank < o.columns) sinkhorn(o, logit, m0 + rank);
     } else {
         for (int i = (tid - 32) * 8; i < Tokens * H; i += (Threads - 32) * 8) {
             int t = i / H, d = i % H;
-            common::Bf16Vector<8> v, gamma;
+            common::Bf16Vector<8> v;
+            GammaVector<Gamma, 8> gamma;
             if (m0 + t < o.columns) {
                 // Expansion is independent of the coefficients. Stream these large
                 // residual writes while the owner finishes the branch gain.
-                v     = common::Bf16Vector<8>::load(x + t * H + projection_shared_column(t, d));
-                gamma = common::Bf16Vector<8>::load(static_cast<const __nv_bfloat16*>(o.gamma) +
-                                                    rank * H + d);
+                v = common::Bf16Vector<8>::load(x + t * H + projection_shared_column(t, d));
+                gamma =
+                    GammaVector<Gamma, 8>::load(static_cast<const Gamma*>(o.gamma) + rank * H + d);
                 const auto bits = common::load_vec<uint4>(&v);
 #pragma unroll
                 for (int s = 0; s < 4; ++s) {
@@ -152,20 +154,20 @@ __global__ __launch_bounds__(Threads, 3) void __cluster_dims__(8, 1, 1)
                                  : "memory");
                 }
             }
-            wait_cluster_value(cluster.map_shared_rank(ready, t));
-            float factor = *cluster.map_shared_rank(gain, t);
+            wait_cluster_barrier(gate_ready + t, 0);
+            float factor = gain[t];
             if (m0 + t < o.columns) {
                 common::Bf16Vector<8> out;
 #pragma unroll
                 for (int j = 0; j < 8; ++j)
                     out.word[j] = __float2bfloat16_rn(__bfloat162float(v.word[j]) *
-                                                      __bfloat162float(gamma.word[j]) * factor);
+                                                      float(gamma.word[j]) * factor);
                 out.store(static_cast<__nv_bfloat16*>(o.output) + (m0 + t) * kHidden + rank * H +
                           d);
             }
         }
     }
-    // Remote gain readers must finish before their owner's shared memory retires.
+    // All DSM producers and consumers finish before any CTA retires shared memory.
     cluster.sync();
 }
 } // namespace ninfer::ops::detail::mhc

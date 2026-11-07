@@ -54,10 +54,11 @@ struct MaterializationPlan {
     const Reader* source     = nullptr;
     std::size_t object_count = 0;
     Device device;
-    std::size_t device_capacity_bytes = 0;
-    std::size_t host_capacity_bytes   = 0;
-    std::size_t host_alignment        = 256;
-    std::size_t registered_host_bytes = 0; // Aligned prefix of the Host backing.
+    std::size_t device_capacity_bytes    = 0;
+    std::size_t host_capacity_bytes      = 0;
+    std::size_t host_alignment           = 256;
+    std::size_t registered_host_bytes    = 0; // Aligned prefix of the Host backing.
+    std::uint64_t preparation_read_bytes = 0;
     std::vector<EncodedTensor> tensors;
     std::vector<StorageId> requests;
     std::vector<std::optional<StorageId>> objects;

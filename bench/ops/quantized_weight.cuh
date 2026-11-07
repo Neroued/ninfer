@@ -3,6 +3,7 @@
 #include "core/buffer.h"
 #include "core/weight.h"
 #include "ninfer_bench_common.h"
+#include "../../tests/ops/quantized_weight.h"
 
 #include <cuda_runtime.h>
 #include <cuda_fp8.h>
@@ -18,14 +19,16 @@ namespace ninfer::bench {
 struct PackedQuantizedWeight {
     DeviceBuffer storage;
     Weight weight{};
-    std::uint64_t low_bytes    = 0;
-    std::uint64_t high_offset  = 0;
-    std::uint64_t high_bytes   = 0;
-    std::uint64_t scale_offset = 0;
-    std::uint64_t scale_bytes  = 0;
+    std::uint64_t low_bytes       = 0;
+    std::uint64_t high_offset     = 0;
+    std::uint64_t high_bytes      = 0;
+    std::uint64_t scale_offset    = 0;
+    std::uint64_t scale_bytes     = 0;
+    std::uint64_t metadata_bytes  = 0;
+    std::uint64_t exception_bytes = 0;
 
     [[nodiscard]] std::uint64_t model_weight_bytes() const noexcept {
-        return low_bytes + high_bytes + scale_bytes;
+        return low_bytes + high_bytes + scale_bytes + metadata_bytes + exception_bytes;
     }
 };
 
@@ -212,10 +215,10 @@ inline PackedQuantizedWeight make_row_split_weight(QType qtype, std::int32_t n, 
                                               : static_cast<const std::uint8_t*>(result.storage.data()) +
                                          result.high_offset;
     weight.scales = static_cast<const std::uint8_t*>(result.storage.data()) + result.scale_offset;
-    weight.n           = n;
-    weight.k           = k;
-    weight.group       = geometry.group_size;
-    weight.layout      = QuantLayout::RowSplit;
+    weight.n      = n;
+    weight.k      = k;
+    weight.group  = geometry.group_size;
+    weight.layout = QuantLayout::RowSplit;
     weight.scale_dtype = DType::FP16;
     return result;
 }
@@ -231,10 +234,10 @@ inline PackedQuantizedWeight make_nvfp4_weight(std::int32_t n, std::int32_t k,
     const std::uint64_t code_bytes   = elements / 2;
     const std::uint64_t scale_offset = detail::align_up(code_bytes, 256);
     const std::uint64_t scale_bytes  = elements / 16;
-    const std::uint64_t divisor_offset =
+    const std::uint64_t matrix_scale_offset =
         detail::checked_add(scale_offset, scale_bytes, "benchmark NVFP4 divisor offset overflow");
-    const std::uint64_t payload_bytes =
-        detail::checked_add(divisor_offset, sizeof(float), "benchmark NVFP4 payload size overflow");
+    const std::uint64_t payload_bytes = detail::checked_add(
+        matrix_scale_offset, sizeof(float), "benchmark NVFP4 payload size overflow");
     if (payload_bytes > std::numeric_limits<std::size_t>::max()) {
         throw std::overflow_error("benchmark NVFP4 payload does not fit size_t");
     }
@@ -257,30 +260,31 @@ inline PackedQuantizedWeight make_nvfp4_weight(std::int32_t n, std::int32_t k,
         kWeightDivisor);
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
-    CUDA_CHECK(cudaMemcpy(static_cast<std::uint8_t*>(result.storage.data()) + divisor_offset,
+    CUDA_CHECK(cudaMemcpy(static_cast<std::uint8_t*>(result.storage.data()) + matrix_scale_offset,
                           &kWeightDivisor, sizeof(kWeightDivisor), cudaMemcpyHostToDevice));
 
-    Weight& weight              = result.weight;
-    weight.device               = result.storage.device();
-    weight.payload              = result.storage.data();
-    weight.payload_bytes        = payload_bytes;
-    weight.qtype                = QType::NVFP4;
-    weight.layout               = QuantLayout::BlockScaleK16M128x4;
-    weight.scale_dtype          = DType::FP8_E4M3FN;
-    weight.group_size           = 16;
-    weight.group                = 16;
-    weight.ndim                 = 2;
-    weight.shape[0]             = n;
-    weight.shape[1]             = k;
-    weight.padded_shape[0]      = n;
-    weight.padded_shape[1]      = k;
-    weight.qdata                = result.storage.data();
-    weight.qhigh                = nullptr;
-    weight.scales               = static_cast<std::uint8_t*>(result.storage.data()) + scale_offset;
-    weight.n                    = n;
-    weight.k                    = k;
-    weight.weight_scale_divisor = kWeightDivisor;
-    weight.input_scale_divisor  = 3.5F;
+    Weight& weight         = result.weight;
+    weight.device          = result.storage.device();
+    weight.payload         = result.storage.data();
+    weight.payload_bytes   = payload_bytes;
+    weight.qtype           = QType::NVFP4;
+    weight.layout          = QuantLayout::BlockScaleK16M128x4;
+    weight.scale_dtype     = DType::FP8_E4M3FN;
+    weight.group_size      = 16;
+    weight.group           = 16;
+    weight.ndim            = 2;
+    weight.shape[0]        = n;
+    weight.shape[1]        = k;
+    weight.padded_shape[0] = n;
+    weight.padded_shape[1] = k;
+    weight.qdata           = result.storage.data();
+    weight.qhigh           = nullptr;
+    weight.scales          = static_cast<std::uint8_t*>(result.storage.data()) + scale_offset;
+    weight.n               = n;
+    weight.k               = k;
+    weight.weight_scale    = kWeightDivisor;
+    weight.input_scale     = 3.5F;
+    result.metadata_bytes  = sizeof(float);
     return result;
 }
 
@@ -346,7 +350,79 @@ inline PackedQuantizedWeight make_fp8_weight(std::int32_t n, std::int32_t k,
     return result;
 }
 
+inline PackedQuantizedWeight upload_native_weight(test::quantized_weight::PackedWeight host) {
+    PackedQuantizedWeight result;
+    result.storage = DeviceBuffer(device_context().device(), host.payload.size());
+    result.storage.copy_from_host(host.payload.data(), host.payload.size());
+    result.weight       = host.device_weight(result.storage.span());
+    result.low_bytes    = host.code_plane_bytes;
+    result.scale_offset = host.scale_plane_offset;
+    const auto& g       = host.geometry;
+    if (g.layout == QuantLayout::Csf32) {
+        result.scale_bytes     = g.shape[0] + g.csf.nibble_bytes_per_matrix;
+        result.metadata_bytes  = g.csf.offsets_per_matrix * 2 + g.csf.pages_per_matrix * 4 + 4;
+        result.exception_bytes = g.csf.exception_count * 2;
+    } else {
+        result.scale_bytes    = g.scale_bytes;
+        result.metadata_bytes = g.matrix_scale_count * 4;
+    }
+    return result;
+}
+
+inline PackedQuantizedWeight make_mxfp8_weight(std::int32_t n, std::int32_t k,
+                                               std::uint64_t seed = 0x51U, float extent = 0.05F) {
+    return upload_native_weight(test::quantized_weight::make_patterned_weight(
+        QType::MXFP8, n, k, static_cast<std::uint32_t>(seed), {.native_extent = extent}));
+}
+
+inline PackedQuantizedWeight make_fp8_block_weight(std::int32_t n, std::int32_t k,
+                                                   std::uint64_t seed = 0x51U,
+                                                   float extent       = 0.05F) {
+    return upload_native_weight(test::quantized_weight::make_patterned_weight(
+        QType::FP8_E4M3FN_BLOCK128X128_FP32, n, k, static_cast<std::uint32_t>(seed),
+        {.native_extent = extent}));
+}
+
+inline PackedQuantizedWeight
+make_nvfp4_mul_weight(std::int32_t n, std::int32_t k, std::uint64_t seed = 0x51U,
+                      float extent = 0.05F, QuantLayout layout = QuantLayout::BlockScaleK16M128x4,
+                      std::uint32_t exception_period = 389) {
+    return upload_native_weight(test::quantized_weight::make_patterned_weight(
+        QType::NVFP4_MUL, n, k, static_cast<std::uint32_t>(seed),
+        {.weight_scale         = 0.0156257F * (extent / 0.05F),
+         .layout               = layout,
+         .csf_exception_period = exception_period}));
+}
+
 inline Weight row_view(const Weight& parent, std::int32_t row_begin, std::int32_t rows) {
+    if (row_begin < 0 || rows <= 0 || row_begin > parent.n - rows)
+        throw std::invalid_argument("benchmark row view is out of range");
+    if (parent.qtype == QType::MXFP8 || parent.qtype == QType::NVFP4_MUL ||
+        parent.qtype == QType::FP8_E4M3FN_BLOCK128X128_FP32) {
+        Weight view         = parent;
+        const auto code_row = parent.qtype == QType::NVFP4_MUL ? parent.k / 2 : parent.k;
+        view.qdata =
+            static_cast<const std::uint8_t*>(parent.qdata) + std::uint64_t(row_begin) * code_row;
+        if (parent.layout == QuantLayout::Csf32) {
+            if (row_begin % 32 || rows % 32)
+                throw std::invalid_argument("CSF row view splits a block");
+            view.csf.row_begin += row_begin;
+        } else if (parent.qtype == QType::MXFP8) {
+            view.scales = static_cast<const std::uint8_t*>(parent.scales) +
+                          std::uint64_t(row_begin) * (parent.k / 32);
+            view.scale_ne[1] = rows;
+        } else {
+            if (row_begin % 128 || rows % 128)
+                throw std::invalid_argument("native row view splits a scale tile");
+            const auto bytes = parent.qtype == QType::NVFP4_MUL
+                                   ? std::uint64_t(row_begin) * (parent.k / 16)
+                                   : std::uint64_t(row_begin / 128) * (parent.k / 128) * 4;
+            view.scales      = static_cast<const std::uint8_t*>(parent.scales) + bytes;
+            if (parent.qtype == QType::FP8_E4M3FN_BLOCK128X128_FP32) view.scale_ne[1] = rows / 128;
+        }
+        view.n = view.shape[0] = view.padded_shape[0] = rows;
+        return view;
+    }
     if (parent.layout != QuantLayout::RowSplit || row_begin < 0 || rows <= 0 ||
         row_begin > parent.n - rows) {
         throw std::invalid_argument("benchmark RowSplit row view is out of range");

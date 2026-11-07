@@ -90,8 +90,7 @@ std::string prefill_signature(const ModelDefinition& model, const moe::Plan* moe
         }
         for (const auto& use : weight->uses) {
             if (!use.input.starts_with("text/") && !use.input.starts_with("vision/")) { continue; }
-            item["uses"].push_back(
-                {use.input, use.policy, use.activation_input_divisor.has_value()});
+            item["uses"].push_back({use.input, use.policy, bool(use.calibration)});
         }
         inventory.push_back(std::move(item));
     }

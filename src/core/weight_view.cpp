@@ -77,13 +77,16 @@ std::uint64_t weight_element_count(std::span<const std::uint64_t> shape) {
     return count;
 }
 
-WeightGeometry weight_geometry(QType format, QuantLayout layout,
-                               std::span<const std::uint64_t> shape) {
-    WeightGeometry out;
-    out.format = format;
-    out.layout = layout;
-    out.shape.assign(shape.begin(), shape.end());
+WeightStorageGeometry weight_storage_geometry(QType format, QuantLayout layout,
+                                              std::span<const std::uint64_t> shape,
+                                              WeightLayoutParameters parameters) {
+    WeightStorageGeometry out;
+    out.format   = format;
+    out.layout   = layout;
     out.elements = weight_element_count(shape);
+    if (parameters.exception_count.has_value() != (layout == QuantLayout::Csf32)) {
+        throw std::invalid_argument("CSF layout requires its exception count exclusively");
+    }
     if (layout == QuantLayout::Contiguous) {
         out.bytes = out.code_bytes = mul(out.elements, word_bytes(format));
         if (shape.size() >= 2) {
@@ -95,15 +98,51 @@ WeightGeometry weight_geometry(QType format, QuantLayout layout,
     const bool nvfp4_bank = layout == QuantLayout::BatchedBlockScaleK16M128x4;
     const bool fp8_block =
         layout == QuantLayout::BlockScaleM128K128 || layout == QuantLayout::BlockScaleM64K64;
+    const bool matrix_bank =
+        fp8_block || layout == QuantLayout::Csf32 || layout == QuantLayout::RowGroupScale;
     if ((nvfp4_bank && shape.size() != 3) ||
-        (fp8_block && shape.size() != 2 && shape.size() != 3) ||
-        (!nvfp4_bank && !fp8_block && shape.size() != 2)) {
+        (matrix_bank && shape.size() != 2 && shape.size() != 3) ||
+        (!nvfp4_bank && !matrix_bank && shape.size() != 2)) {
         throw std::invalid_argument("quantized weight rank differs from its layout");
     }
     const auto n        = shape[shape.size() - 2];
     const auto k        = shape.back();
     const auto matrices = shape.size() == 3 ? shape[0] : 1;
     out.padded_columns  = k;
+    if (layout == QuantLayout::Csf32) {
+        if (format != QType::NVFP4_MUL || n % 32 || k % 16) {
+            throw std::invalid_argument("CSF32 requires multiplier NVFP4 with N%32=0 and K%16=0");
+        }
+        const auto columns      = k / 16;
+        const auto pairs        = add(columns, 1) / 2;
+        const auto tiles        = mul(add(n / 32, 3) / 4, add(pairs, 1) / 2);
+        out.group_size          = 16;
+        out.code_bytes_per_row  = k / 2;
+        out.code_bytes          = out.elements / 2;
+        out.matrix_scale_offset = aligned(out.code_bytes, 256);
+        out.matrix_scale_count  = matrices;
+        auto& c                 = out.csf;
+        c.exception_count       = *parameters.exception_count;
+        if (c.exception_count > out.elements / 16 || mul(c.exception_count, 2) >= (1ULL << 32)) {
+            throw std::invalid_argument("CSF exceptions exceed their scale or byte-address domain");
+        }
+        c.blocks_per_matrix       = mul(n / 32, pairs);
+        c.pages_per_matrix        = add(tiles, 31) / 32;
+        c.offsets_per_matrix      = add(c.blocks_per_matrix, c.pages_per_matrix);
+        c.nibble_bytes_per_matrix = mul(n, columns) / 2;
+        c.bases_offset            = aligned(add(out.matrix_scale_offset, mul(matrices, 4)), 256);
+        c.nibbles_offset          = aligned(add(c.bases_offset, mul(matrices, n)), 256);
+        c.offsets_offset =
+            aligned(add(c.nibbles_offset, mul(matrices, c.nibble_bytes_per_matrix)), 256);
+        c.page_bases_offset =
+            aligned(add(c.offsets_offset, mul(mul(matrices, c.offsets_per_matrix), 2)), 256);
+        c.exceptions_offset =
+            aligned(add(c.page_bases_offset, mul(mul(matrices, c.pages_per_matrix), 4)), 256);
+        out.bytes        = add(c.exceptions_offset, mul(c.exception_count, 2));
+        out.scale_offset = c.bases_offset;
+        out.scale_bytes  = out.bytes - out.scale_offset;
+        return out;
+    }
     if (layout == QuantLayout::RowPagedG16_4K) {
         if (format != QType::NF4_G16_E4M3FN || k % 16) {
             throw std::invalid_argument("paged NF4 requires K%16=0");
@@ -112,15 +151,16 @@ WeightGeometry weight_geometry(QType format, QuantLayout layout,
         out.group_size         = 16;
         out.code_bytes_per_row = k / 2;
         out.scale_row_bytes    = k / 16;
+        out.scale_word_bytes   = 1;
         out.row_bytes          = add(k / 2, k / 16);
         out.rows_per_page      = 4096 / out.row_bytes;
         if (!out.rows_per_page) { throw std::invalid_argument("NF4 row exceeds page"); }
-        out.page_count     = add(n, out.rows_per_page - 1) / out.rows_per_page;
-        out.code_bytes     = mul(n, out.code_bytes_per_row);
-        out.scale_bytes    = mul(n, out.scale_row_bytes);
-        out.divisor_offset = mul(out.page_count, 4096);
-        out.divisor_count  = 1;
-        out.bytes          = add(out.divisor_offset, 4);
+        out.page_count          = add(n, out.rows_per_page - 1) / out.rows_per_page;
+        out.code_bytes          = mul(n, out.code_bytes_per_row);
+        out.scale_bytes         = mul(n, out.scale_row_bytes);
+        out.matrix_scale_offset = mul(out.page_count, 4096);
+        out.matrix_scale_count  = 1;
+        out.bytes               = add(out.matrix_scale_offset, 4);
         return out;
     }
     if (layout == QuantLayout::RowSplit) {
@@ -148,6 +188,7 @@ WeightGeometry weight_geometry(QType format, QuantLayout layout,
         out.code_bytes_per_row = mul(groups, 32);
         out.high_bytes_per_row = mul(groups, high_per_group);
         out.scale_row_bytes    = mul(groups, 2);
+        out.scale_word_bytes   = 2;
         out.code_bytes         = mul(n, out.code_bytes_per_row);
         out.high_offset        = aligned(out.code_bytes, 256);
         out.high_bytes         = mul(n, out.high_bytes_per_row);
@@ -159,29 +200,43 @@ WeightGeometry weight_geometry(QType format, QuantLayout layout,
         out.group_size         = k;
         out.code_bytes_per_row = k;
         out.scale_row_bytes    = 2;
+        out.scale_word_bytes   = 2;
+        out.code_bytes         = out.elements;
+        out.scale_offset       = aligned(out.code_bytes, 256);
+    } else if (layout == QuantLayout::RowGroupScale) {
+        if (format != QType::MXFP8 || k % 32) {
+            throw std::invalid_argument("MXFP8 requires K%32=0");
+        }
+        out.group_size         = 32;
+        out.code_bytes_per_row = k;
+        out.scale_row_bytes    = k / 32;
+        out.scale_word_bytes   = 1;
         out.code_bytes         = out.elements;
         out.scale_offset       = aligned(out.code_bytes, 256);
     } else if (fp8_block) {
         const auto block = layout == QuantLayout::BlockScaleM64K64 ? 64U : 128U;
         const auto expected =
             block == 64 ? QType::FP8_E4M3FN_BLOCK64X64_BF16 : QType::FP8_E4M3FN_BLOCK128X128_BF16;
-        if (format != expected || n % block || k % block) {
+        const bool fp32 = block == 128 && format == QType::FP8_E4M3FN_BLOCK128X128_FP32;
+        if ((!fp32 && format != expected) || n % block || k % block) {
             throw std::invalid_argument(
                 "block-scaled FP8 format or matrix block alignment differs");
         }
         out.group_size         = block;
         out.scale_block_rows   = block;
         out.code_bytes_per_row = k;
-        out.scale_row_bytes    = mul(k / block, 2);
+        out.scale_word_bytes   = fp32 ? 4 : 2;
+        out.scale_row_bytes    = mul(k / block, out.scale_word_bytes);
         out.code_bytes         = out.elements;
         out.scale_offset       = aligned(out.code_bytes, 256);
     } else if (layout == QuantLayout::BlockScaleK16M128x4 || nvfp4_bank) {
-        if (format != QType::NVFP4 || n % 128 || k % 64) {
+        if ((format != QType::NVFP4 && format != QType::NVFP4_MUL) || n % 128 || k % 64) {
             throw std::invalid_argument("NVFP4 BlockScale requires N%128=0 and K%64=0");
         }
         out.group_size         = 16;
         out.code_bytes_per_row = k / 2;
         out.scale_row_bytes    = k / 16;
+        out.scale_word_bytes   = 1;
         out.code_bytes         = out.elements / 2;
         out.scale_offset       = aligned(out.code_bytes, 256);
     } else {
@@ -189,12 +244,91 @@ WeightGeometry weight_geometry(QType format, QuantLayout layout,
     }
     out.scale_bytes = mul(mul(matrices, n / out.scale_block_rows), out.scale_row_bytes);
     out.bytes       = add(out.scale_offset, out.scale_bytes);
-    if (format == QType::NVFP4) {
-        out.divisor_offset = out.bytes;
-        out.divisor_count  = matrices;
-        out.bytes          = add(out.bytes, mul(matrices, 4));
+    if (format == QType::NVFP4 || format == QType::NVFP4_MUL) {
+        out.matrix_scale_offset = out.bytes;
+        out.matrix_scale_count  = matrices;
+        out.bytes               = add(out.bytes, mul(matrices, 4));
     }
     return out;
+}
+
+WeightGeometry weight_geometry(QType format, QuantLayout layout,
+                               std::span<const std::uint64_t> shape,
+                               WeightLayoutParameters parameters) {
+    return {weight_storage_geometry(format, layout, shape, parameters),
+            {shape.begin(), shape.end()}};
+}
+
+Csf32Block csf32_block(const WeightGeometry& g, std::uint64_t ordinal) {
+    if (g.layout != QuantLayout::Csf32 || ordinal >= g.csf.blocks_per_matrix) {
+        throw std::out_of_range("CSF block is outside its matrix");
+    }
+    const auto row_blocks = g.shape[g.shape.size() - 2] / 32;
+    const auto columns    = g.shape.back() / 16;
+    const auto pairs      = (columns + 1) / 2;
+    const auto row_tile   = ordinal / (4 * pairs);
+    const auto local      = ordinal % (4 * pairs);
+    const auto tile_rows  = std::min<std::uint64_t>(4, row_blocks - row_tile * 4);
+    const auto pair       = local / (2 * tile_rows) * 2 + local % (2 * tile_rows) / tile_rows;
+    const auto row_block  = row_tile * 4 + local % tile_rows;
+    const auto width      = std::min<std::uint64_t>(2, columns - pair * 2);
+    const auto tile       = row_tile * ((pairs + 1) / 2) + pair / 2;
+    const auto page       = tile / 32;
+    const auto nibble =
+        (row_tile * 128 * columns + pair * 64 * tile_rows + (row_block % 4) * 32 * width) / 2;
+    return {row_block * 32, pair * 2, width, ordinal, page, ordinal + page, nibble};
+}
+
+std::uint64_t csf32_block_index(const WeightGeometry& g, std::uint64_t row, std::uint64_t column) {
+    if (g.layout != QuantLayout::Csf32 || row >= g.shape[g.shape.size() - 2] ||
+        column >= g.shape.back() / 16) {
+        throw std::out_of_range("CSF scale coordinate is outside its matrix");
+    }
+    const auto rows      = g.shape[g.shape.size() - 2];
+    const auto pairs     = (g.shape.back() / 16 + 1) / 2;
+    const auto row_block = row / 32;
+    const auto pair      = column / 2;
+    const auto row_tile  = row_block / 4;
+    const auto tile_rows = std::min<std::uint64_t>(4, rows / 32 - row_tile * 4);
+    return row_tile * 4 * pairs + pair / 2 * 2 * tile_rows + pair % 2 * tile_rows + row_block % 4;
+}
+
+Csf32Page csf32_page(const WeightGeometry& g, std::uint64_t page) {
+    if (g.layout != QuantLayout::Csf32 || page >= g.csf.pages_per_matrix) {
+        throw std::out_of_range("CSF page is outside its matrix");
+    }
+    const auto rows      = g.shape[g.shape.size() - 2] / 32;
+    const auto pairs     = (g.shape.back() / 16 + 1) / 2;
+    const auto tile_cols = (pairs + 1) / 2;
+    const auto tiles     = ((rows + 3) / 4) * tile_cols;
+    const auto first     = [&](std::uint64_t tile) {
+        if (tile >= tiles) return g.csf.blocks_per_matrix;
+        const auto row = tile / tile_cols * 4;
+        return row * pairs + tile % tile_cols * 2 * std::min<std::uint64_t>(4, rows - row);
+    };
+    const auto begin = first(page * 32);
+    return {begin, first((page + 1) * 32), begin + page};
+}
+
+Csf32ScaleView csf32_scale_view(const WeightParent& parent, std::uint64_t matrix) {
+    const auto& g = parent.geometry;
+    if (!parent.data || g.layout != QuantLayout::Csf32 || matrix >= g.matrix_scale_count) {
+        throw std::invalid_argument("CSF view requires a resident matrix");
+    }
+    const auto& c   = g.csf;
+    const auto rows = g.shape[g.shape.size() - 2];
+    return {reinterpret_cast<const std::uint8_t*>(parent.data + c.bases_offset) + matrix * rows,
+            reinterpret_cast<const std::uint8_t*>(parent.data + c.nibbles_offset) +
+                matrix * c.nibble_bytes_per_matrix,
+            reinterpret_cast<const std::uint16_t*>(parent.data + c.offsets_offset) +
+                matrix * c.offsets_per_matrix,
+            reinterpret_cast<const std::uint32_t*>(parent.data + c.page_bases_offset) +
+                matrix * c.pages_per_matrix,
+            reinterpret_cast<const std::uint16_t*>(parent.data + c.exceptions_offset),
+            rows,
+            g.shape.back() / 16,
+            0,
+            c.exception_count};
 }
 
 WeightRegion contiguous_weight_region(const WeightView& view) {
@@ -245,6 +379,9 @@ std::uint64_t weight_scale_offset(const WeightGeometry& geometry, std::uint64_t 
     if (geometry.layout == QuantLayout::RowPagedG16_4K) {
         return weight_paged_row_offset(geometry, row) + geometry.code_bytes_per_row + group;
     }
+    if (geometry.layout == QuantLayout::Csf32) {
+        throw std::invalid_argument("compressed scales require CSF block addressing");
+    }
     if (geometry.layout == QuantLayout::BlockScaleK16M128x4 ||
         geometry.layout == QuantLayout::BatchedBlockScaleK16M128x4) {
         const auto inner = row % 128;
@@ -253,15 +390,15 @@ std::uint64_t weight_scale_offset(const WeightGeometry& geometry, std::uint64_t 
                inner / 32 * 4 + group % 4;
     }
     return geometry.scale_offset + row / geometry.scale_block_rows * geometry.scale_row_bytes +
-           group * 2;
+           group * geometry.scale_word_bytes;
 }
 
 WeightRowPlanes weight_row_planes(const WeightRegion& region) {
     validate_region(region);
     const auto& parent = *region.parent;
     const auto& g      = parent.geometry;
-    if (g.layout == QuantLayout::RowPagedG16_4K) {
-        throw std::invalid_argument("paged weights require per-row encoded addressing");
+    if (g.layout == QuantLayout::RowPagedG16_4K || g.layout == QuantLayout::Csf32) {
+        throw std::invalid_argument("encoded weight layout requires its native addressing");
     }
     if (!parent.data || g.shape.size() < 2 || region.begin % g.shape.back() ||
         region.end % g.shape.back()) {
@@ -304,7 +441,7 @@ Tensor weight_tensor(const WeightView& view, std::initializer_list<std::int32_t>
     return out;
 }
 
-Weight native_weight(const WeightView& view, float input_divisor) {
+Weight native_weight(const WeightView& view, float input_scale) {
     const auto region = contiguous_weight_region(view);
     const auto& g     = region.parent->geometry;
     if (view.shape.size() != 2 || !region.parent->data) {
@@ -327,35 +464,51 @@ Weight native_weight(const WeightView& view, float input_divisor) {
     if (g.shape.size() < 2 || view.shape[1] != g.shape.back()) {
         throw std::invalid_argument("quantized native Weight requires unchanged parent K");
     }
+    if (region.begin % g.shape.back() || region.end % g.shape.back()) {
+        throw std::invalid_argument("native Weight requires complete encoded rows");
+    }
+    const auto row_begin = region.begin / g.shape.back();
+    const auto row_count = (region.end - region.begin) / g.shape.back();
+    out.input_scale      = input_scale;
+    if (g.matrix_scale_count) {
+        const auto rows_per_matrix = g.shape[g.shape.size() - 2];
+        const auto matrix          = row_begin / rows_per_matrix;
+        if (region.parent->matrix_scales.size() != g.matrix_scale_count ||
+            (row_begin + row_count - 1) / rows_per_matrix != matrix) {
+            throw std::invalid_argument(
+                "native weight has an incomplete or split matrix scale domain");
+        }
+        out.weight_scale = region.parent->matrix_scales[matrix];
+        if (!std::isfinite(out.weight_scale) || out.weight_scale <= 0) {
+            throw std::invalid_argument("native weight requires a positive finite matrix scale");
+        }
+    }
+    if (g.layout == QuantLayout::Csf32) {
+        if (row_begin % 32 || row_count % 32) {
+            throw std::invalid_argument("CSF native weight view splits a 32-row block");
+        }
+        const auto rows = g.shape[g.shape.size() - 2];
+        out.qdata       = region.parent->data + row_begin * g.code_bytes_per_row;
+        out.group_size = out.group = 16;
+        out.scale_dtype            = DType::FP8_E4M3FN;
+        out.csf                    = csf32_scale_view(*region.parent, row_begin / rows);
+        out.csf.row_begin          = row_begin % rows;
+        return out;
+    }
     const auto planes = weight_row_planes(region);
     if (g.layout == QuantLayout::RowScale && !is_complete_weight(view)) {
         throw std::invalid_argument("row-scaled FP8 native input requires a complete parent");
     }
-    const auto row_alignment = g.format == QType::NVFP4 ? 128 : g.scale_block_rows;
+    const auto row_alignment = planes.swizzled_scales ? 128 : g.scale_block_rows;
     if (planes.row_begin % row_alignment || planes.row_count % row_alignment) {
         throw std::invalid_argument("native weight view splits a scale tile");
     }
-    out.padded_shape[1]     = dimension(g.padded_columns);
-    out.qdata               = planes.codes;
-    out.qhigh               = planes.high;
-    out.scales              = planes.scales;
-    out.group_size          = static_cast<std::uint32_t>(g.group_size);
-    out.group               = g.group_size ? dimension(g.group_size) : 0;
-    out.input_scale_divisor = input_divisor;
-    if (g.divisor_count) {
-        const auto rows_per_matrix = g.shape[g.shape.size() - 2];
-        const auto matrix          = planes.row_begin / rows_per_matrix;
-        if (region.parent->weight_divisors.size() != g.divisor_count) {
-            throw std::invalid_argument("native weight has incomplete divisor metadata");
-        }
-        if ((planes.row_begin + planes.row_count - 1) / rows_per_matrix != matrix) {
-            throw std::invalid_argument("native weight view crosses matrix divisor domains");
-        }
-        out.weight_scale_divisor = region.parent->weight_divisors[matrix];
-        if (!std::isfinite(out.weight_scale_divisor) || out.weight_scale_divisor <= 0) {
-            throw std::invalid_argument("native weight requires a positive finite divisor");
-        }
-    }
+    out.padded_shape[1] = dimension(g.padded_columns);
+    out.qdata           = planes.codes;
+    out.qhigh           = planes.high;
+    out.scales          = planes.scales;
+    out.group_size      = static_cast<std::uint32_t>(g.group_size);
+    out.group           = g.group_size ? dimension(g.group_size) : 0;
     if (g.layout == QuantLayout::RowSplit) {
         out.scale_dtype = DType::FP16;
         out.scale_ne[0] = dimension(g.padded_columns / g.group_size);
@@ -368,12 +521,19 @@ Weight native_weight(const WeightView& view, float input_divisor) {
         out.scale_ne[0] = out.n;
         out.scale_nb[0] = 2;
         out.scale_nb[1] = out.scale_nb[2] = out.scale_nb[3] = static_cast<std::int64_t>(out.n) * 2;
+    } else if (g.layout == QuantLayout::RowGroupScale) {
+        out.scale_dtype = DType::U8;
+        out.scale_ne[0] = dimension(g.padded_columns / g.group_size);
+        out.scale_ne[1] = out.n;
+        out.scale_nb[0] = 1;
+        out.scale_nb[1] = static_cast<std::int64_t>(g.scale_row_bytes);
+        out.scale_nb[2] = out.scale_nb[3] = out.scale_nb[1] * out.n;
     } else if (g.layout == QuantLayout::BlockScaleM128K128 ||
                g.layout == QuantLayout::BlockScaleM64K64) {
-        out.scale_dtype = DType::BF16;
+        out.scale_dtype = g.scale_word_bytes == 4 ? DType::FP32 : DType::BF16;
         out.scale_ne[0] = dimension(g.padded_columns / g.group_size);
         out.scale_ne[1] = out.n / dimension(g.scale_block_rows);
-        out.scale_nb[0] = 2;
+        out.scale_nb[0] = static_cast<std::int64_t>(g.scale_word_bytes);
         out.scale_nb[1] = static_cast<std::int64_t>(g.scale_row_bytes);
         out.scale_nb[2] = out.scale_nb[3] = out.scale_nb[1] * out.scale_ne[1];
     } else if (planes.swizzled_scales) {

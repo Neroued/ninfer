@@ -47,6 +47,30 @@ linear_finish_row(const Output& output, const Epilogue& epilogue, int row, int t
     }
 }
 
+template <bool FullTokens, class Output, class Epilogue, bool FullRows = true>
+__device__ __forceinline__ void
+linear_finish_mma_fragment(const Output& output, const Epilogue& epilogue, int row, int token,
+                           float4 value, int rows, int tokens) {
+    if constexpr (requires { epilogue.store_fragment(output, row, token, value, rows, tokens); }) {
+        static_assert(FullRows, "row-tail MMA requires a scalar epilogue");
+        // A fragment consumer receives the atom origin and owns its token-tail predicates.
+        epilogue.store_fragment(output, row, token, value, rows, tokens);
+    } else {
+        if (FullTokens || token < tokens) {
+            if (FullRows || row < rows)
+                output.store(row, token, epilogue.apply(row, token, value.x));
+            if (FullRows || row + 8 < rows)
+                output.store(row + 8, token, epilogue.apply(row + 8, token, value.z));
+        }
+        if (FullTokens || token + 1 < tokens) {
+            if (FullRows || row < rows)
+                output.store(row, token + 1, epilogue.apply(row, token + 1, value.y));
+            if (FullRows || row + 8 < rows)
+                output.store(row + 8, token + 1, epilogue.apply(row + 8, token + 1, value.w));
+        }
+    }
+}
+
 template <class Schedule, class Epilogue>
 inline constexpr int linear_epilogue_bytes = [] {
     if constexpr (requires { Epilogue::template kSharedBytes<Schedule>; })

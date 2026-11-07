@@ -80,32 +80,32 @@ LinearPolicy common_policy(std::span<const WeightInput> inputs) {
 SingleProjectionWeight single(const WeightView& view, std::span<const WeightInput> inputs) {
     const auto region = contiguous_weight_region(view);
     const auto policy = common_policy(inputs);
-    float divisor     = 0;
-    if (region.parent->geometry.format == QType::NVFP4) {
+    float input_scale = 0;
+    const auto format = region.parent->geometry.format;
+    if (format == QType::NVFP4 || format == QType::NVFP4_MUL) {
+        const auto operation = format == QType::NVFP4 ? ActivationScaleOperation::Divide
+                                                      : ActivationScaleOperation::Multiply;
         for (const auto& input : inputs) {
-            if (!input.activation_input_divisor) {
-                require(!allows_a4(policy), "NVFP4 A4 native input requires an activation divisor");
+            const auto values = input.calibration.values();
+            if (values.empty()) {
+                require(!allows_a4(policy), "NVFP4 A4 input requires activation calibration");
                 continue;
             }
-            require(std::isfinite(*input.activation_input_divisor) &&
-                        *input.activation_input_divisor > 0,
-                    "NVFP4 native input requires a positive activation divisor");
-            if (divisor == 0) {
-                // A16 does not read this auxiliary; retain a stored positive value for the ABI.
-                divisor = *input.activation_input_divisor;
+            require(
+                input.calibration.operation == operation && values.size() == 1 &&
+                    std::isfinite(values.front()) && values.front() > 0,
+                "NVFP4 matrix input requires a positive scalar calibration in its scale domain");
+            if (input_scale == 0) {
+                input_scale = values.front();
             } else if (allows_a4(policy)) {
-                // Current NVFP4 consumers use A16 for AllowA8 as well. Only their A4 route
-                // quantizes the shared activation and therefore requires a common divisor.
-                require(std::bit_cast<std::uint32_t>(divisor) ==
-                            std::bit_cast<std::uint32_t>(*input.activation_input_divisor),
-                        "shared NVFP4 native input requires identical activation divisors");
+                require(std::bit_cast<std::uint32_t>(input_scale) ==
+                            std::bit_cast<std::uint32_t>(values.front()),
+                        "shared NVFP4 A4 input requires identical calibration");
             }
         }
-        // The legacy native ABI validates this field even on A16, where it is never read.
-        // Keep that ABI detail out of the artifact's optional Use auxiliaries.
-        if (divisor == 0) { divisor = 1.0F; }
+        if (input_scale == 0) { input_scale = 1.0F; }
     }
-    return {native_weight(view, divisor), policy};
+    return {native_weight(view, input_scale), policy};
 }
 
 SingleProjectionWeight single(std::span<const WeightInput> inputs) {
@@ -181,7 +181,6 @@ LinearProfile describe_linear_weight(std::span<const WeightInput> rows) {
 ProjectionProfile describe_projection_weights(std::span<const WeightInput> rows) {
     auto banks = projection_regions(rows, describe_single);
     if (banks.size() == 1) return {banks[0], {}};
-    banks[0].policy = banks[1].policy = LinearPolicy::A16Only;
     return {banks[0], banks[1]};
 }
 
@@ -191,7 +190,7 @@ ProjectionWeights prepare_projection_weights(std::span<const WeightInput> rows) 
             return single(view, inputs);
         });
     if (banks.size() == 1) return banks[0];
-    return PairedProjectionWeights{banks[0].weight, banks[1].weight};
+    return PairedProjectionWeights{banks[0], banks[1]};
 }
 
 ProjectionWeights prepare_gdn_control_proj_weights(const WeightInput& a, const WeightInput& b) {
@@ -213,7 +212,7 @@ ProjectionWeights prepare_gdn_control_proj_weights(const WeightInput& a, const W
     const auto second = prepare_linear_weight(b);
     require(first.weight.qtype == QType::BF16 && second.weight.qtype == QType::BF16,
             "GDN control requires BF16 weights");
-    return PairedProjectionWeights{first.weight, second.weight};
+    return PairedProjectionWeights{first, second};
 }
 
 SingleProjectionWeight prepare_linear_swiglu_weight(const WeightInput& gate,

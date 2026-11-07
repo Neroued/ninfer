@@ -327,6 +327,10 @@ OperationalRecord render_throughput(const ThroughputReport& report) {
         out << " | decode " << product::format_pretty_rate(decode_rate, "tok") << " ("
             << product::format_pretty_count(report.committed_decode_tokens) << " tok)";
     }
+    if (report.replayed_tokens() || report.current.replaying_requests) {
+        out << " | replay " << product::format_pretty_rate(report.replay_tokens_per_second(), "tok")
+            << " (" << product::format_pretty_count(report.replayed_tokens()) << " tok)";
+    }
     out << " | running " << report.current.running_requests;
     if (report.current.prefilling_requests != 0 || report.current.decode_ready_requests != 0) {
         out << " (";
@@ -364,12 +368,14 @@ OperationalRecord render_throughput(const ThroughputReport& report) {
             << static_cast<double>(report.decode_row_rounds) /
                    static_cast<double>(report.decode_rounds);
     }
-    for (const auto kind : {ExecutionKind::Prefill, ExecutionKind::Decode}) {
+    for (const auto kind : {ExecutionKind::Prefill, ExecutionKind::Decode, ExecutionKind::Replay}) {
         const auto i = static_cast<std::size_t>(kind);
         const auto value =
             product::execution_window(report.previous_execution[i], report.current_execution[i]);
         if (auto mean = value.mean_seconds())
-            out << (kind == ExecutionKind::Prefill ? " | chunk " : " | step ")
+            out << (kind == ExecutionKind::Prefill  ? " | chunk "
+                    : kind == ExecutionKind::Replay ? " | replay-chunk "
+                                                    : " | step ")
                 << product::format_pretty_duration(*mean);
     }
     const auto drafts =

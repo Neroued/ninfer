@@ -5,17 +5,13 @@
 
 namespace ninfer::ops::detail {
 
-inline void validate_bf16_projection(const Tensor& x, const Weight& w,
-                                     std::span<const Tensor> outputs, const Tensor* bias,
-                                     CudaExecutionView execution, const char* op) {
+inline void validate_projection_operands(const Tensor& x, const Weight& w,
+                                         std::span<const Tensor> outputs, const Tensor* bias,
+                                         CudaExecutionView execution, const char* op) {
     namespace operand = common::operand;
     operand::device(w.device, execution.device(), op, "weight");
-    if (w.qtype != QType::BF16 || w.ndim != 2 || w.n <= 0 || w.k <= 0 || w.shape[0] != w.n ||
-        w.shape[1] != w.k || w.padded_shape[0] != w.n || w.padded_shape[1] != w.k ||
-        w.layout != QuantLayout::Contiguous || w.group != 0 || w.group_size != 0 || w.scales ||
-        w.qhigh || w.high_plane_bytes || w.payload_bytes < std::uint64_t(w.n) * w.k * 2 ||
-        !operand::aligned(w.qdata, 16))
-        throw std::invalid_argument(std::string(op) + ": invalid contiguous BF16 weight");
+    if (w.n <= 0 || w.k <= 0)
+        throw std::invalid_argument(std::string(op) + ": weight dimensions must be positive");
     if (x.ne[1] <= 0) throw std::invalid_argument(std::string(op) + ": columns must be positive");
     operand::tensor(x, DType::BF16, {w.k, x.ne[1]}, 16, op, "input", execution.device());
     if (bias) operand::tensor(*bias, DType::BF16, {w.n}, 2, op, "bias", execution.device());
@@ -26,12 +22,39 @@ inline void validate_bf16_projection(const Tensor& x, const Weight& w,
                         execution.device());
         const auto range = operand::range(out, op);
         operand::disjoint(range, operand::range(x, op), op);
-        operand::disjoint(range, operand::range(w.qdata, std::size_t(w.n) * w.k * 2, op), op);
         if (w.payload) operand::disjoint(range, operand::range(w.payload, w.payload_bytes, op), op);
         if (bias) operand::disjoint(range, operand::range(*bias, op), op);
         for (std::size_t j = 0; j < i; ++j)
             operand::disjoint(range, operand::range(outputs[j], op), op);
     }
+}
+
+inline void validate_bf16_projection(const Tensor& x, const Weight& w,
+                                     std::span<const Tensor> outputs, const Tensor* bias,
+                                     CudaExecutionView execution, const char* op) {
+    namespace operand = common::operand;
+    if (w.qtype != QType::BF16 || w.ndim != 2 || w.n <= 0 || w.k <= 0 || w.shape[0] != w.n ||
+        w.shape[1] != w.k || w.padded_shape[0] != w.n || w.padded_shape[1] != w.k ||
+        w.layout != QuantLayout::Contiguous || w.group != 0 || w.group_size != 0 || w.scales ||
+        w.qhigh || w.high_plane_bytes || w.payload_bytes < std::uint64_t(w.n) * w.k * 2 ||
+        !operand::aligned(w.qdata, 16))
+        throw std::invalid_argument(std::string(op) + ": invalid contiguous BF16 weight");
+    validate_projection_operands(x, w, outputs, bias, execution, op);
+    for (const auto& out : outputs)
+        operand::disjoint(operand::range(out, op),
+                          operand::range(w.qdata, std::size_t(w.n) * w.k * 2, op), op);
+}
+
+inline void validate_projection_scratch(const Tensor& x, const Weight& weight,
+                                        std::span<const Tensor> outputs, const Tensor* bias,
+                                        MemorySpan scratch, const char* op) {
+    namespace operand = common::operand;
+    operand::device(scratch.device, x.device, op, "workspace");
+    const auto range = operand::range(scratch.data, scratch.bytes, op);
+    operand::disjoint(range, operand::range(x, op), op);
+    operand::disjoint(range, operand::range(weight.payload, weight.payload_bytes, op), op);
+    if (bias) operand::disjoint(range, operand::range(*bias, op), op);
+    for (const auto& output : outputs) operand::disjoint(range, operand::range(output, op), op);
 }
 
 } // namespace ninfer::ops::detail

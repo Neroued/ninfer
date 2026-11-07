@@ -28,8 +28,8 @@ struct Weights {
             native = ops::SingleProjectionWeight{weight(first.span(), 2 * o.heads, o.input_rows)};
         else {
             second = make_bf16(std::size_t(o.heads) * o.input_rows, 105, -0.015F, 0.015F);
-            native = ops::PairedProjectionWeights{weight(first.span(), o.heads, o.input_rows),
-                                                  weight(second.span(), o.heads, o.input_rows)};
+            native = ops::PairedProjectionWeights{{weight(first.span(), o.heads, o.input_rows)},
+                                                  {weight(second.span(), o.heads, o.input_rows)}};
         }
     }
 

@@ -20,13 +20,26 @@ Storage allocate(Arena& arena, const Plan& plan, int tokens, bool routed, bool p
             return static_cast<int*>(arena.alloc(DType::I32, {count}).data);
         };
         const bool fp8    = plan.format == QType::FP8_E4M3FN_BLOCK128X128_BF16;
+        const bool a16    = plan.arithmetic == Nvfp4Arithmetic::MultiplyA16;
+        const int inputs  = plan.arithmetic == Nvfp4Arithmetic::MultiplyA4 ? assignments : tokens;
         const int packing = fp8 ? 1 : 2, scale_group = fp8 ? 128 : 16;
         const auto scale_bytes = fp8 ? sizeof(float) : sizeof(std::uint8_t);
-        out.input_codes        = bytes(std::size_t(tokens) * kHidden / packing);
-        out.input_scales       = bytes(std::size_t(tokens) * (kHidden / scale_group) * scale_bytes);
-        out.product_codes      = bytes(std::size_t(assignments) * plan.intermediate / packing);
-        out.product_scales =
-            bytes(std::size_t(assignments) * (plan.intermediate / scale_group) * scale_bytes);
+        if (a16) {
+            out.a16_product.values = static_cast<std::uint16_t*>(
+                arena
+                    .alloc(plan.a16.fp16_product ? DType::FP32 : DType::BF16,
+                           {plan.intermediate, assignments})
+                    .data);
+            if (!plan.a16.fp16_product)
+                out.a16_product.residual = static_cast<std::uint16_t*>(
+                    arena.alloc(DType::BF16, {plan.intermediate, assignments}).data);
+        } else {
+            out.input_codes   = bytes(std::size_t(inputs) * kHidden / packing);
+            out.input_scales  = bytes(std::size_t(inputs) * (kHidden / scale_group) * scale_bytes);
+            out.product_codes = bytes(std::size_t(assignments) * plan.intermediate / packing);
+            out.product_scales =
+                bytes(std::size_t(assignments) * (plan.intermediate / scale_group) * scale_bytes);
+        }
         if (plan.atomic_output && !partial_output) {
             out.routed_sum = static_cast<float*>(arena.alloc(DType::FP32, {kHidden, tokens}).data);
         } else if (!plan.atomic_output) {
@@ -42,8 +55,8 @@ Storage allocate(Arena& arena, const Plan& plan, int tokens, bool routed, bool p
         g.job_experts      = integers(max_jobs);
         g.job_columns      = integers(max_jobs);
         g.jobs             = integers(fp8 ? 4 : 2);
-        if (plan.dense.gate_columns || plan.dense_down_columns || (fp8 && plan.fp8.k_step == 0) ||
-            plan.pool_expert_limit)
+        if (plan.format == QType::NVFP4_MUL || plan.dense.gate_columns || plan.dense_down_columns ||
+            (fp8 && plan.fp8.k_step == 0) || plan.pool_expert_limit)
             g.load_range = integers(3);
         g.assignments = integers(assignments);
         if (!plan.atomic_output || (fp8 && plan.fp8.dense_down) || plan.dense_down_columns ||

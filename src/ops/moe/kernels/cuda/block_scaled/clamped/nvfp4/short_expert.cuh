@@ -298,6 +298,8 @@ __global__ __launch_bounds__(256, Columns == 1 ? 4 : 3) void contract(
                         carry[part] = next_codes[part];
                 }
             }
+            // Finish every lane's scale reads before lane 0 reuses the storage for products.
+            if constexpr (Gate) __syncwarp();
 #pragma unroll
             for (int col = 0; col < Columns; ++col) {
                 if (begin + col >= end) continue;

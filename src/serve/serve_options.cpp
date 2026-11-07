@@ -287,6 +287,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--prefill-miss-dump DIR [--prefill-miss-min-tokens N] [--prefill-miss-min-match F]] "
            "[--response-store-max-records N] [--response-store-max-mib N] "
            "[--kv-dtype bf16|int8|fp8|nvfp4|k8v4] [--spec mtp|dflash2|off --draft-tokens N] "
+           "[--rope-yarn-factor F] [--rope-original-max-position N] "
            "[--default-max-tokens N] [--default-thinking-budget N] "
            "[--vision|--no-vision] [--vision-device N] [--max-vision-tokens N] [--no-cuda-graph] "
            "[--no-tp-mailbox] [--embedding-host] [--host-pinned-max-gib G] [--no-prefix-reuse] "
@@ -708,6 +709,22 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.tp = product::parse_tp(require_value("--tp"));
         } else if (arg == "--devices") {
             options.devices = product::parse_devices(require_value("--devices"));
+        } else if (arg == "--rope-yarn-factor") {
+            options.rope_yarn_factor = std::stof(require_value("--rope-yarn-factor"));
+            // PORT NOTE (2026-10-24): the upstream patch allowed [1,8]; the follow-up commit
+            // caps it at 4 because the attention visible-keys ceiling cannot serve more, so a
+            // factor that cannot work is refused at the command line, not at engine start.
+            if (!(options.rope_yarn_factor >= 1.0F) || options.rope_yarn_factor > 4.0F) {
+                throw std::invalid_argument(
+                    "--rope-yarn-factor must be in [1,4] (1 disables YaRN; 4 is the attention "
+                    "visible-keys ceiling)");
+            }
+        } else if (arg == "--rope-original-max-position") {
+            options.rope_original_max_position = static_cast<std::uint32_t>(
+                std::stoul(require_value("--rope-original-max-position")));
+            if (options.rope_original_max_position == 0) {
+                throw std::invalid_argument("--rope-original-max-position must be positive");
+            }
         } else if (arg == "--kv-dtype") {
             options.kv_cache = parse_kv_dtype(require_value("--kv-dtype"));
         } else if (arg == "--spec") {

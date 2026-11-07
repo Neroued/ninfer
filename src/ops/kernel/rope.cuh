@@ -23,6 +23,10 @@ enum class RopeKernelMode : std::int32_t {
 
 inline constexpr int kRopeMaxHalf = 128;
 
+// YaRN attention scaling (HF: attention_factor = 0.1*ln(factor)+1). 1.0F means disabled;
+// multiplying by 1.0F is exact in IEEE-754, so the disabled path is bit-identical.
+static __device__ __constant__ float kTextRopeAttentionScale = 1.0F;
+
 static __device__ __constant__ float kTextRopeInvFrequency[32] = {
     1.000000000e+00F, 6.042963902e-01F, 3.651741273e-01F, 2.206734069e-01F, 1.333521432e-01F,
     8.058421878e-02F, 4.869675252e-02F, 2.942727176e-02F, 1.778279410e-02F, 1.074607828e-02F,
@@ -64,6 +68,10 @@ __device__ __forceinline__ void fixed_sincos(const std::int32_t* positions, int 
             static_cast<float>(positions[static_cast<std::int64_t>(axis) * tokens + token]) *
             frequency;
         sincosf(angle, sine, cosine);
+        // YaRN attention scaling, HF-style: applied to cos/sin rather than to the softmax
+        // scale. Exactly 1.0F unless a YaRN table was installed.
+        *sine *= kTextRopeAttentionScale;
+        *cosine *= kTextRopeAttentionScale;
     }
 }
 

@@ -13,7 +13,10 @@
 
 namespace ninfer::ops {
 
-inline constexpr std::uint32_t kCausalAttentionMaximumVisibleKeys = 262144;
+// Four times the Qwen3.8 native window, matching the largest --rope-yarn-factor. Splits
+// are clamped to SmallTMaximumSplits so this cannot widen a launch; per-split page
+// spans grow instead, which is why the decode kernels read block_table directly.
+inline constexpr std::uint32_t kCausalAttentionMaximumVisibleKeys = 1048576;
 
 struct CausalAttentionExecutionEnvelope {
     std::uint32_t min_visible_keys = 0;

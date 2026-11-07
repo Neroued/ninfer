@@ -1094,6 +1094,8 @@ upstream startup example selects a long-context FP8/MTP3 configuration.
 | `--kv-dtype bf16\|int8\|fp8\|nvfp4\|k8v4` | KV-cache storage | `bf16` |
 | `--spec mtp\|dflash2` | speculative backend | off |
 | `--draft-tokens N` | MTP `1..5`; DFlash2 `1..15` | unset |
+| `--rope-yarn-factor F` | YaRN RoPE context extension, `[1,4]`: raises the accepted `max-context` ceiling to native × F (native stays 262,144). `1` installs nothing and leaves greedy output byte-identical; above 1 it costs perplexity and is experimental. Opt-in, ported from @splickz's work ([#28](https://github.com/ValerioDolci/capy-flash/issues/28), [PR #29](https://github.com/ValerioDolci/capy-flash/pull/29)) | `1.0` |
+| `--rope-original-max-position N` | the native window YaRN scales from, used only when `--rope-yarn-factor` > 1 | `262144` |
 | `--lm-head-draft` | optimized proposal head | off |
 | `--default-max-tokens N` | output limit when omitted by a request | `8192` |
 | `--default-thinking-budget N` | positive thinking cap inherited by thinking-enabled requests | unset |

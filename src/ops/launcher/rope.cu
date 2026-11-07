@@ -5,6 +5,9 @@
 #include "ops/kernel/rope.cuh"
 
 #include <cstdint>
+#include <cmath>
+#include <stdexcept>
+#include <string>
 
 namespace ninfer::ops::detail {
 namespace {
@@ -180,6 +183,32 @@ void launch_generic(const Tensor& positions, int rotary_dim, float theta, Tensor
 }
 
 } // namespace
+
+void rope_install_text_inv_frequency(const float* host_inv_freq, int count) {
+    if (host_inv_freq == nullptr || count != 32) {
+        throw std::invalid_argument(
+            "rope_install_text_inv_frequency: expected exactly 32 entries (rotary_dim 64)");
+    }
+    const cudaError_t status = cudaMemcpyToSymbol(
+        kTextRopeInvFrequency, host_inv_freq, static_cast<std::size_t>(count) * sizeof(float),
+        0, cudaMemcpyHostToDevice);
+    if (status != cudaSuccess) {
+        throw std::runtime_error(std::string("rope_install_text_inv_frequency: ") +
+                                 cudaGetErrorString(status));
+    }
+}
+
+void rope_install_text_attention_scale(float scale) {
+    if (!(scale > 0.0F) || !std::isfinite(scale)) {
+        throw std::invalid_argument("rope_install_text_attention_scale: scale must be finite and > 0");
+    }
+    const cudaError_t status = cudaMemcpyToSymbol(kTextRopeAttentionScale, &scale,
+                                                  sizeof(float), 0, cudaMemcpyHostToDevice);
+    if (status != cudaSuccess) {
+        throw std::runtime_error(std::string("rope_install_text_attention_scale: ") +
+                                 cudaGetErrorString(status));
+    }
+}
 
 void rope_launch(const Tensor& positions, int rotary_dim, float theta, Tensor& q, Tensor& k,
                  cudaStream_t stream) {

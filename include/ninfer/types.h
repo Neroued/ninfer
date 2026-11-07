@@ -384,6 +384,10 @@ struct EngineOptions {
     // the whole max_tokens at admission, as before the lease.
     std::uint32_t kv_lease_window_tokens = 4096;
     KvCacheStorage kv_cache              = KvCacheStorage::BFloat16;
+    // YaRN RoPE extension factor. 1.0 = disabled and leaves every compiled-in RoPE
+    // constant untouched. Above 1 it raises the addressable context ceiling to
+    // factor x the variant native window; the serve layer installs the tables.
+    float rope_yarn_factor             = 1.0F;
     SpeculativeOptions speculative;
     std::size_t media_cache_bytes = kDefaultMediaCacheBytes;
     std::size_t media_live_bytes  = kDefaultMediaLiveBytes;

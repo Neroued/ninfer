@@ -242,3 +242,9 @@ ninfer_add_test(ninfer_host_gguf_isa_test
   LIBRARIES ninfer_host_moe ninfer::json)
 set_tests_properties(ninfer_host_gguf_isa_test PROPERTIES SKIP_RETURN_CODE 77)
 ninfer_op_oracle_options(ninfer_host_gguf_isa_test)
+
+# gate on the YaRN frequency table (ported 2026-10-24): factor 1 must reproduce the shipped
+# kTextRopeInvFrequency exactly; a wrong table does not crash, it silently stops finding things.
+ninfer_add_op_test(ninfer_yarn_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_yarn.cpp"
+  LIBRARIES ninfer_ops)

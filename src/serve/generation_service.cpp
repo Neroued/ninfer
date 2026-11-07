@@ -1,3 +1,5 @@
+#include "ops/kernel/yarn.h"
+#include "ops/launcher/rope.h"
 #include "serve/generation_service.h"
 #include "serve/prompt_overlap.h"
 #include "serve/turn_anchors.h"
@@ -288,6 +290,7 @@ GenerationService::GenerationService(ServeOptions options, StartupObserver start
     if (options_.stream_min_tokens) {
         engine_options.routed_experts.stream_min_tokens = *options_.stream_min_tokens;
     }
+    engine_options.rope_yarn_factor         = options_.rope_yarn_factor;
     engine_options.enable_vision            = options_.enable_vision;
     engine_options.vision_device            = options_.vision_device;
     engine_options.max_vision_tokens        = options_.max_vision_tokens;
@@ -303,6 +306,20 @@ GenerationService::GenerationService(ServeOptions options, StartupObserver start
     engine_options.media_preprocess_threads = options_.media_preprocess_threads;
     engine_options.startup_observer         = std::move(startup_observer);
     engine_ = std::make_unique<ninfer::Engine>(std::move(engine_options));
+    // YaRN tables go in BEFORE the first forward pass: the rope kernel reads the __constant__
+    // table at launch, so installing after construction is correct and factor 1 never calls this.
+    if (options_.rope_yarn_factor > 1.0F) {
+        ninfer::rope::YarnParams yarn;
+        yarn.factor                = options_.rope_yarn_factor;
+        yarn.original_max_position = static_cast<int>(options_.rope_original_max_position);
+        // rotary_dim 64 and rope_theta 1e7 are this family's geometry: the 27B and Flash-Next both
+        // declare partial_rotary_factor 0.25 on head_dim 256, i.e. 32 frequency pairs.
+        const auto freqs = ninfer::rope::yarn_inv_freq(yarn, yarn.rotary_dim);
+        ninfer::ops::detail::rope_install_text_inv_frequency(
+            freqs.data(), static_cast<int>(freqs.size()));
+        ninfer::ops::detail::rope_install_text_attention_scale(
+            ninfer::rope::yarn_attention_scale(yarn));
+    }
     turn_anchors_ =
         resolve_turn_anchors(options_.turn_anchors, engine_->load_summary().architecture);
     if (options_.reasoning_close_retry) {

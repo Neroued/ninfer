@@ -22,7 +22,7 @@
 
 namespace {
 
-constexpr std::uint32_t kOutputTokens    = 256;
+constexpr std::uint32_t kOutputTokens    = 512;
 constexpr std::size_t kSnapshotHostBytes = 512ULL << 20;
 const ninfer::GenerationObservationOptions kObservations{
     .constraint_timings = true, .live_timings = true, .prompt_progress = true};
@@ -310,7 +310,7 @@ void exercise(const std::filesystem::path& artifact, ninfer::SpeculativeBackend 
               CancelStage cancel_stage = CancelStage::None) {
     auto options = engine_options(artifact, selected, snapshot);
     const auto prompt_tokens =
-        ninfer::test::qwen3_5::configure_two_request_pressure(options, kOutputTokens);
+        ninfer::test::qwen3_5::configure_two_request_pressure(options, kOutputTokens, true);
     ninfer::Engine engine(options);
     const auto before = engine.snapshot().runtime;
     const auto device =
@@ -386,7 +386,7 @@ void exercise(const std::filesystem::path& artifact, ninfer::SpeculativeBackend 
         throw std::runtime_error("first admission never submitted the second request");
     }
     const auto cancellation_target = second.request_id();
-    bool cancellation_requested = false;
+    bool cancellation_requested    = false;
     ninfer::RuntimeStats cancellation_observed;
     std::uint32_t committed_at_cancellation = 0;
     const ninfer::CancellationView cancellation([&] {
@@ -461,6 +461,7 @@ void exercise(const std::filesystem::path& artifact, ninfer::SpeculativeBackend 
         totals.preemptions += result->stats.scheduling.preemptions;
         totals.replay_restores += result->stats.scheduling.replay_restores;
         totals.snapshot_restores += result->stats.scheduling.snapshot_restores;
+        totals.direct_restores += result->stats.scheduling.direct_restores;
         totals.replayed_tokens += result->stats.scheduling.replayed_tokens;
         totals.paused_ns += result->stats.scheduling.paused_ns;
         totals.device_to_host_bytes += result->stats.scheduling.device_to_host_bytes;
@@ -496,6 +497,7 @@ void exercise(const std::filesystem::path& artifact, ninfer::SpeculativeBackend 
     require(totals.preemptions != 0, "growth pressure never preempted a request");
     require(after.preemptions - before.preemptions == totals.preemptions &&
                 after.snapshot_restores - before.snapshot_restores == totals.snapshot_restores &&
+                after.direct_restores - before.direct_restores == totals.direct_restores &&
                 after.replay_restores - before.replay_restores == totals.replay_restores &&
                 after.replayed_tokens - before.replayed_tokens == totals.replayed_tokens,
             "request and Engine scheduling counters disagree");
@@ -528,7 +530,8 @@ void exercise(const std::filesystem::path& artifact, ninfer::SpeculativeBackend 
                 "Host=0 did not rebuild prompt and already published output without a snapshot");
     }
     if (cancel_stage == CancelStage::None) {
-        require(totals.snapshot_restores + totals.replay_restores == totals.preemptions,
+        require(totals.snapshot_restores + totals.replay_restores + totals.direct_restores ==
+                    totals.preemptions,
                 "growth pressure did not restore every affected request");
     }
 

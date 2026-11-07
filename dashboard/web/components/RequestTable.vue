@@ -69,7 +69,10 @@ function trace(row: RequestRow): string {
             ></span
           >
           <span class="request-speed mono"
-            >{{ number(row.speed) }}<small v-if="row.speed !== null"> tok/s</small></span
+            >{{ number(row.phase === 'replay' ? row.replaySpeed : row.speed)
+            }}<small v-if="(row.phase === 'replay' ? row.replaySpeed : row.speed) != null">
+              tok/s</small
+            ></span
           >
           <span class="request-ttft mono">{{ ms(row.ttftMs) }}</span>
           <span class="request-gen mono" data-priority="optional">{{ tokens(row.generatedTokens) }}</span>

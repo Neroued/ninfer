@@ -116,12 +116,17 @@ public:
     }
 
     ~EngineCore() noexcept {
+        request_stop();
+        if (worker_.joinable()) { worker_.join(); }
+    }
+
+    // May be called while consumers are waiting; only the worker releases model resources.
+    void request_stop() noexcept {
         {
             std::lock_guard lock(queue_mutex_);
             stopping_ = true;
         }
         queue_cv_.notify_all();
-        if (worker_.joinable()) { worker_.join(); }
     }
 
     EngineCore(const EngineCore&)            = delete;

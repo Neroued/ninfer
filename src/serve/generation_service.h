@@ -132,7 +132,12 @@ public:
 
     void warmup();
 
+    void request_stop() noexcept { engine_->request_stop(); }
+
 private:
+    [[nodiscard]] std::function<bool()>
+    preparation_cancellation(std::function<bool()> external) const;
+
     enum class CacheParticipation : std::uint8_t {
         Disabled,
         ReadWrite,

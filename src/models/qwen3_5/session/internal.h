@@ -220,7 +220,7 @@ struct BindOperation {
     StateBindingAction state_action = StateBindingAction::Root;
     bool consume_source             = false;
     bool take_private               = false;
-    bool resume_snapshot            = false;
+    bool resume_without_replay      = false;
     bool source_tail_hidden         = false;
 };
 

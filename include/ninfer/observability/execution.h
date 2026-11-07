@@ -247,6 +247,7 @@ struct GenerationEngineTiming {
 struct GenerationSchedulingStats {
     std::uint64_t preemptions          = 0;
     std::uint64_t snapshot_restores    = 0;
+    std::uint64_t direct_restores      = 0;
     std::uint64_t replay_restores      = 0;
     std::uint64_t replayed_tokens      = 0;
     std::uint64_t paused_ns            = 0;

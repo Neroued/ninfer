@@ -126,7 +126,12 @@ public:
     q35::SequenceHandle bind(const q35::RequestBasePlan& base, std::uint32_t lane = 0,
                              q35::ResumeState* resume           = nullptr,
                              q35::ExecutionUnitKind resume_kind = q35::ExecutionUnitKind::Decode) {
-        const bool needs_replay = resume && !resume->has_snapshot();
+        const bool needs_replay   = resume && !resume->has_snapshot() && resume->frontier() != 0;
+        const auto expected_route = !resume                  ? GenerationRecoveryRoute::None
+                                    : needs_replay           ? GenerationRecoveryRoute::Replay
+                                    : resume->has_snapshot() ? GenerationRecoveryRoute::Snapshot
+                                                             : GenerationRecoveryRoute::Direct;
+        const auto target         = resume ? resume->frontier() : 0;
         require(static_cast<bool>(program_.start_binding(
                     base, {lane}, source_for(base, resume), resume, resume_kind,
                     resume_kind == q35::ExecutionUnitKind::Prefill ? 0 : 1)),
@@ -135,8 +140,18 @@ public:
         require(progress.published && progress.sequence.has_value() && progress.residency,
                 "binding did not publish a lane");
         last_binding_ = progress.residency;
+        require(progress.recovery.route == expected_route &&
+                    progress.recovery.target_frontier == target,
+                "binding misreported its restoration source or target");
+        if (expected_route == GenerationRecoveryRoute::Direct)
+            require(progress.recovery.begin_frontier == 0 && progress.recovery.frontier == 0,
+                    "direct restoration reported historical work");
         if (needs_replay) {
-            require(progress.replaying, "snapshot-free binding did not enter replay");
+            require((progress.recovery.route == GenerationRecoveryRoute::Replay),
+                    "snapshot-free binding did not enter replay");
+        } else if (resume && !resume->has_snapshot()) {
+            require(!(progress.recovery.route == GenerationRecoveryRoute::Replay),
+                    "binding entered replay without committed input");
         }
         return *progress.sequence;
     }
@@ -632,7 +647,7 @@ public:
                 "A could not select independently computed B as its replay source");
         auto rebound = settle();
         paused.paused.reset();
-        require(rebound.sequence && rebound.replaying &&
+        require(rebound.sequence && (rebound.recovery.route == GenerationRecoveryRoute::Replay) &&
                     rebound.private_points == std::vector<q35::CheckpointHandle>{input_a} &&
                     program_.physical_usage().state_objects == before_bind.state_objects + 1,
                 "Replay did not transfer A's original point with exactly one new active writer");
@@ -655,7 +670,8 @@ public:
                 "cross-source snapshot could not restore with its independent input point");
         auto restored = settle();
         snapshot.paused.reset();
-        require(restored.sequence && !restored.replaying &&
+        require(restored.sequence &&
+                    !(restored.recovery.route == GenerationRecoveryRoute::Replay) &&
                     restored.private_points == std::vector<q35::CheckpointHandle>{input_a},
                 "snapshot restore cloned or replaced A's owned input point");
         check_independent();
@@ -1012,6 +1028,7 @@ public:
             reserve(resumed, q35::ExecutionUnitKind::Replay);
             const auto progress = driver_.replay(resumed);
             replayed += progress.processed_tokens;
+            require(progress.frontier == replayed, "replay progress lost its completed frontier");
             if (progress.complete) {
                 complete = true;
                 break;
@@ -1045,6 +1062,30 @@ public:
                 "paused replay cancellation lost its request target");
         cancelled.paused.reset();
         expect_empty("destroyed paused replay retained Context resources");
+        next_request();
+    }
+
+    void pause_before_first_prefill_chunk() {
+        auto base           = request(kPromptTokens);
+        const auto original = bind(base);
+        require(program_.start_pause(original, {runtime::PauseKind::ReleaseAndReplay, {0}}),
+                "unstarted prefill pause was not accepted");
+        auto paused = settle();
+        require(paused.paused && !paused.paused->has_snapshot() && paused.paused->frontier() == 0,
+                "unstarted prefill pause did not preserve its empty frontier");
+        expect_empty("unstarted prefill pause retained execution resources");
+        const auto resumed = bind(base, 1, &*paused.paused, q35::ExecutionUnitKind::Prefill);
+        paused.paused.reset();
+        require(resumed == original && program_.recovery_pending(resumed),
+                "unstarted prefill resume changed identity or lost recovery protection");
+        prefill_prefix(resumed, kChunk);
+        require(!program_.recovery_pending(resumed),
+                "first resumed prefill chunk did not release recovery protection");
+        const auto summary = finish_prefill(resumed, kPromptTokens - kChunk, false);
+        require(summary == runtime::BeginSummary{kPromptTokens, 0, PrefixReusePath::Root},
+                "unstarted prefill resume changed initial prompt accounting");
+        decode_and_finish(resumed);
+        expect_empty("unstarted prefill resume retained resources after finishing");
         next_request();
     }
 
@@ -1820,7 +1861,8 @@ void replay_sampling_counts(std::shared_ptr<const q35::ModelDefinition> definiti
         auto progress = settle();
         require(progress.published && progress.sequence,
                   "sampling-count fixture did not publish a sequence");
-        require(!resume || progress.replaying, "sampling-count resume did not enter replay");
+        require(!resume || (progress.recovery.route == GenerationRecoveryRoute::Replay),
+                "sampling-count resume did not enter replay");
         return *progress.sequence;
     };
     const auto reserve = [&](q35::SequenceHandle sequence, q35::ExecutionUnitKind kind,
@@ -2039,6 +2081,7 @@ int main(int argc, char** argv) {
             fixture.cancel_gpu_binding();
             fixture.cancel_host_restore();
             fixture.replay_pause_and_resume();
+            fixture.pause_before_first_prefill_chunk();
             fixture.independent_physical_demotions();
             fixture.demotion_holder_changes();
             fixture.release_set_union();

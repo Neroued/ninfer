@@ -156,6 +156,13 @@ export interface HistoryResult {
   summary: Summary;
 }
 
+export interface RecoveryProgress {
+  route: 'direct' | 'snapshot' | 'replay';
+  begin_frontier: number;
+  frontier: number;
+  target_frontier: number;
+}
+
 export interface RequestRow {
   instanceId: string;
   id: number;
@@ -178,6 +185,12 @@ export interface RequestRow {
   speed: number | null;
   placement: number | null;
   preemptions: number;
+  recovery: RecoveryProgress | null;
+  recoveryPending: boolean;
+  replayedTokens: number | null;
+  replaySpeed: number | null;
+  progressOwner: boolean;
+  lastProgressAt: number | null;
   trace: { at: number; speed: number }[];
 }
 

@@ -147,10 +147,19 @@ public:
     //    (inferred from flights of a few hundred tokens) that the measured ns/token spreads over
     //    its tokens.
     //  - Time-derived units are multiples of kUnitGranularity, the chunk alignment.
+    //  - Debt: a decode round takes 4-6 ms alone, but a lane that shares every cycle with 100 ms
+    //    of prefill decodes at about a twentieth of its solo rate, for as long as the prefill
+    //    lasts (tens of seconds at 128K-200K contexts). The Scheduler counts the prefill time
+    //    that ran beside a waiting lane as a debt. kInterleaveDebtCapNs lets a short request
+    //    prefill without waiting (three 100 ms cycles), and each Interleave cycle repays
+    //    kInterleaveRepayNs, about a quarter of a 15-20 ms decode-only cycle, so a long prefill
+    //    keeps about a fifth of the time while a lane decodes.
     static constexpr std::uint64_t kInterleaveNs         = 100'000'000;
     static constexpr std::uint32_t kInterleaveChunks     = 2;
     static constexpr std::uint32_t kInterleaveColdTokens = 1024;
     static constexpr std::uint32_t kUnitGranularity      = 128;
+    static constexpr std::uint64_t kInterleaveDebtCapNs  = 300'000'000;
+    static constexpr std::uint64_t kInterleaveRepayNs    = 4'000'000;
 
     [[nodiscard]] static PrefillPacing prefill_pacing(std::uint32_t pack_tokens,
                                                       std::uint32_t prefill_chunk,
@@ -166,6 +175,8 @@ public:
         pacing.interleave_tokens_per_cycle = kInterleaveChunks * prefill_chunk;
         pacing.interleave_cold_tokens      = std::min(prefill_chunk, kInterleaveColdTokens);
         pacing.unit_granularity            = kUnitGranularity;
+        pacing.interleave_debt_cap_ns      = kInterleaveDebtCapNs;
+        pacing.interleave_repay_ns         = kInterleaveRepayNs;
         return pacing;
     }
 
@@ -698,6 +709,14 @@ private:
                                  bool restoring);
 
     bool try_admit_one(bool restoring);
+
+    // Longest an admission that waits for capacity keeps the Engine in begin_cycle to chain its
+    // reclaim steps (see begin_cycle).
+    static constexpr std::chrono::milliseconds kAdmissionBurst{50};
+
+    // Polls until the running context operation finishes or `deadline` passes. True when no
+    // context operation remains.
+    bool await_context_operation(HostPhaseMeasurement& boundary, Clock::time_point deadline);
 
     void observe_scheduling(const std::shared_ptr<Request>& request,
                             GenerationSchedulingTransition transition, Clock::time_point now = {});

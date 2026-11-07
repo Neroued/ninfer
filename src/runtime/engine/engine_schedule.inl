@@ -1167,7 +1167,8 @@ void EngineCore<Instance>::begin_cycle(HostPhaseMeasurement& boundary) {
     // round; the cycle's prefill allowance depends on it.
     scheduler_.begin_prefill_cycle(decode_waiting());
     reserve_resident_units();
-    if (!scheduler_.progress_owner() && paused_.empty() && !context_owner_ && !recovering) {
+    const auto run_admission = [&] {
+        if (scheduler_.progress_owner() || !paused_.empty() || context_owner_ || recovering) return;
         if (!admission_decision_ && consume_admission_check()) {
             ++admission_generation_;
             scheduler_.begin_admission_scan();
@@ -1175,12 +1176,40 @@ void EngineCore<Instance>::begin_cycle(HostPhaseMeasurement& boundary) {
         if (admission_decision_ || scheduler_.admission_scan_pending()) {
             (void)try_admit_one(false);
         }
+    };
+    run_admission();
+    // A request that waits for capacity advances one reclaim step per attempt, and a step is
+    // an asynchronous context operation that finishes within milliseconds. Waiting for it
+    // here lets the next step start before resident growth or a capture takes what it freed,
+    // instead of spending a whole cycle (a prefill unit plus a decode round) on every step.
+    // The burst is bounded so one admission never holds back the cycle for longer than that.
+    const auto burst_end = Clock::now() + kAdmissionBurst;
+    bool context_settled = false;
+    while (admission_decision_ && !admission_decision_->restoring && !materializing_ &&
+           instance_.session->has_context_operation() && Clock::now() < burst_end) {
+        if (!await_context_operation(boundary, burst_end)) break;
+        context_settled = true;
+        run_admission();
     }
     if (instance_.session->has_context_operation()) {
         (void)poll_execution(boundary);
-        if (!instance_.session->has_context_operation()) reserve_resident_units();
+        context_settled = context_settled || !instance_.session->has_context_operation();
     }
+    // Units reserved before a context operation ended may have been invalidated by it.
+    if (context_settled && !instance_.session->has_context_operation()) reserve_resident_units();
     cycle_step_ = CycleStep::Control;
+}
+
+template <class Instance>
+bool EngineCore<Instance>::await_context_operation(HostPhaseMeasurement& boundary,
+                                                   Clock::time_point deadline) {
+    while (instance_.session->has_context_operation()) {
+        (void)poll_execution(boundary);
+        if (!instance_.session->has_context_operation()) break;
+        if (Clock::now() >= deadline) return false;
+        std::this_thread::yield();
+    }
+    return true;
 }
 
 template <class Instance>

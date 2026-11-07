@@ -41,6 +41,14 @@ struct PrefillPacing {
     // on one granule only when the unit is the first of its cycle. Truncation by the token
     // allowance or by a lane's own limit is exact and may produce any length.
     std::uint32_t unit_granularity = 1;
+    // Prefill debt. While a lane waits for a decode round, every unit that ran adds its
+    // wall-clock time to a debt, and every Interleave cycle repays `interleave_repay_ns` of it.
+    // A cycle that starts with more than `interleave_debt_cap_ns` of debt runs the decode round
+    // alone. The cap is the prefill burst a short request is let through at once; the repayment
+    // is the share of time prefill keeps once a long prefill has used the burst. The default cap
+    // never holds a cycle.
+    std::uint64_t interleave_debt_cap_ns = std::numeric_limits<std::uint64_t>::max();
+    std::uint64_t interleave_repay_ns    = 0;
 };
 
 // Tokens of the next prefill/replay unit of each lane, indexed by lane. As an input
@@ -207,9 +215,19 @@ public:
     //    interleave_tokens_per_cycle, and the predicted time of the units admitted after the
     //    first never exceeds interleave_ns. Under Throughput the tokens never exceed
     //    throughput_tokens_per_cycle.
+    //  - Debt: a decode round costs a few milliseconds, but every prefill unit in front of it
+    //    adds its flight time, so a lane that decodes beside a long prefill runs at a small
+    //    fraction of its solo rate for as long as the prefill lasts. Under Interleave the
+    //    Scheduler therefore keeps the wall-clock time of the units that ran as a debt that each
+    //    Interleave cycle repays by interleave_repay_ns (see PrefillPacing). While the debt
+    //    exceeds interleave_debt_cap_ns no lane receives a cap, and the cycle runs the decode
+    //    round alone. A request whose prefill fits the cap is not delayed; a long one is limited
+    //    to the share the repayment allows. A Throughput cycle ends the overlap and clears the
+    //    debt.
     //  - Progress: with k eligible prefilling lanes, each lane advances at least one unit
-    //    within k cycles, because the first unit of each cycle goes to the lane the cursor
-    //    points at and the cursor passes it afterwards.
+    //    within k allowance cycles, because the first unit of each such cycle goes to the lane
+    //    the cursor points at and the cursor passes it afterwards. Held cycles separate two
+    //    allowance cycles by at most the debt of one allowance divided by interleave_repay_ns.
     // A cycle ends by allowance whether or not a decode-ready lane exists, so the Engine's
     // begin_cycle runs on schedule.
     void configure_prefill(PrefillPacing pacing) {
@@ -218,6 +236,9 @@ public:
         pacing.interleave_tokens_per_cycle = std::max(pacing.interleave_tokens_per_cycle, 1U);
         pacing.interleave_cold_tokens      = std::max(pacing.interleave_cold_tokens, 1U);
         pacing.unit_granularity            = std::max(pacing.unit_granularity, 1U);
+        // A finite cap needs a repayment, or the first cycle over it would hold forever.
+        if (pacing.interleave_debt_cap_ns != std::numeric_limits<std::uint64_t>::max())
+            pacing.interleave_repay_ns = std::max<std::uint64_t>(pacing.interleave_repay_ns, 1);
         prefill_pacing_                    = pacing;
         begin_prefill_cycle(false);
     }
@@ -228,9 +249,17 @@ public:
         prefill_regime_ = decode_waiting ? PrefillRegime::Interleave : PrefillRegime::Throughput;
         prefill_units_started_ = 0;
         if (decode_waiting) {
-            prefill_tokens_left_ = prefill_pacing_.interleave_tokens_per_cycle;
-            prefill_ns_left_     = prefill_pacing_.interleave_ns;
+            prefill_debt_ns_ -= std::min(prefill_debt_ns_, prefill_pacing_.interleave_repay_ns);
+            if (prefill_debt_ns_ > prefill_pacing_.interleave_debt_cap_ns) {
+                // A held cycle runs the decode round alone: no lane receives a cap.
+                prefill_tokens_left_ = 0;
+                prefill_ns_left_     = 0;
+            } else {
+                prefill_tokens_left_ = prefill_pacing_.interleave_tokens_per_cycle;
+                prefill_ns_left_     = prefill_pacing_.interleave_ns;
+            }
         } else {
+            prefill_debt_ns_     = 0;
             prefill_tokens_left_ = prefill_pacing_.throughput_tokens_per_cycle;
             prefill_ns_left_     = std::numeric_limits<std::uint64_t>::max();
         }
@@ -343,8 +372,12 @@ public:
         if (prefill_units_started_ < std::numeric_limits<std::uint32_t>::max())
             ++prefill_units_started_;
         prefill_tokens_left_ = tokens >= prefill_tokens_left_ ? 0U : prefill_tokens_left_ - tokens;
-        if (prefill_regime_ == PrefillRegime::Interleave)
+        if (prefill_regime_ == PrefillRegime::Interleave) {
             prefill_ns_left_ = elapsed_ns >= prefill_ns_left_ ? 0U : prefill_ns_left_ - elapsed_ns;
+            prefill_debt_ns_ = elapsed_ns > std::numeric_limits<std::uint64_t>::max() - prefill_debt_ns_
+                                   ? std::numeric_limits<std::uint64_t>::max()
+                                   : prefill_debt_ns_ + elapsed_ns;
+        }
         if (lane < kMaximumConcurrency && tokens != 0 && elapsed_ns != 0) {
             const std::uint64_t sample =
                 std::max<std::uint64_t>(1, (elapsed_ns + tokens / 2) / tokens);
@@ -523,6 +556,8 @@ private:
     std::uint32_t prefill_units_started_ = 0;
     std::uint32_t prefill_tokens_left_   = std::numeric_limits<std::uint32_t>::max();
     std::uint64_t prefill_ns_left_       = std::numeric_limits<std::uint64_t>::max();
+    // Prefill time run since the last cycle without a waiting lane, less what was repaid.
+    std::uint64_t prefill_debt_ns_ = 0;
     // ns/token estimate per lane; 0 = none.
     std::array<std::uint64_t, kMaximumConcurrency> prefill_cost_ns_{};
 

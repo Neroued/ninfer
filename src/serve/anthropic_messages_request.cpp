@@ -851,7 +851,7 @@ void lower_tools(const Json& body, GenerationRequest& request) {
 }
 
 void parse_thinking(const Json& body, GenerationRequest& request, ParsePurpose purpose,
-                    std::uint32_t effective_max_tokens) {
+                    std::uint32_t effective_max_tokens, ThinkingDisplay& display) {
     if (!body.contains("thinking") || body.at("thinking").is_null()) { return; }
     const Json& thinking = body.at("thinking");
     if (!thinking.is_object() || !thinking.contains("type") || !thinking.at("type").is_string()) {
@@ -879,17 +879,23 @@ void parse_thinking(const Json& body, GenerationRequest& request, ParsePurpose p
 
     if (thinking.contains("display") && !thinking.at("display").is_null()) {
         if (!thinking.at("display").is_string()) {
-            bad_request("thinking.display must be 'summarized' or 'omitted'", "thinking");
+            bad_request("thinking.display must be 'summarized', 'updates', or 'omitted'",
+                        "thinking");
         }
-        const std::string display = thinking.at("display").get<std::string>();
-        if (display != "summarized" && display != "omitted") {
-            bad_request("thinking.display must be 'summarized' or 'omitted'", "thinking");
+        const std::string display_name = thinking.at("display").get<std::string>();
+        if (display_name == "summarized") {
+            display = ThinkingDisplay::Summarized;
+        } else if (display_name == "updates") {
+            display = ThinkingDisplay::Updates;
+        } else if (display_name != "omitted") {
+            bad_request("thinking.display must be 'summarized', 'updates', or 'omitted'",
+                        "thinking");
         }
         if (type == "disabled") {
             bad_request("thinking.display is valid only when thinking is adaptive or enabled",
                         "thinking");
         }
-        if (purpose == ParsePurpose::Messages && display == "omitted") {
+        if (purpose == ParsePurpose::Messages && display_name == "omitted") {
             bad_request("thinking.display='omitted' requires encrypted hidden-reasoning restore "
                         "semantics that NInfer does not provide",
                         "thinking", "thinking_display_not_supported");
@@ -1022,11 +1028,11 @@ void apply_anthropic_prompt_cache_policy(const Json& body, GenerationRequest& re
 }
 
 void parse_common_prompt(const Json& body, GenerationRequest& request, ParsePurpose purpose,
-                         std::uint32_t effective_max_tokens) {
+                         std::uint32_t effective_max_tokens, ThinkingDisplay& display) {
     lower_tools(body, request);
     parse_system(body, request);
     parse_messages(body, request);
-    parse_thinking(body, request, purpose, effective_max_tokens);
+    parse_thinking(body, request, purpose, effective_max_tokens, display);
     parse_effort(body, request, purpose);
     apply_anthropic_prompt_cache_policy(body, request);
     if (body.contains("container") && !body.at("container").is_null()) {
@@ -1044,6 +1050,12 @@ void parse_common_prompt(const Json& body, GenerationRequest& request, ParsePurp
             bad_request("preserve_thinking must be a boolean", "preserve_thinking");
         }
         request.preserve_thinking = body.at("preserve_thinking").get<bool>();
+        if (purpose == ParsePurpose::Messages && request.preserve_thinking &&
+            display == ThinkingDisplay::Updates) {
+            bad_request("thinking.display='updates' withholds reasoning text and cannot honor "
+                        "preserve_thinking=true",
+                        "thinking", "thinking_display_not_supported");
+        }
     }
 }
 
@@ -1072,7 +1084,7 @@ AnthropicMessagesRequest parse_anthropic_messages_request(const Json& body,
     }
 
     parse_common_prompt(body, result.generation, ParsePurpose::Messages,
-                        result.generation.max_tokens);
+                        result.generation.max_tokens, result.thinking_display);
     if (body.contains("tools") && body.at("tools").is_array()) {
         for (const auto& tool : body.at("tools")) {
             if (tool.contains("name") && tool.at("name").is_string() &&
@@ -1092,8 +1104,9 @@ AnthropicCountTokensRequest parse_anthropic_count_tokens_request(const Json& bod
     AnthropicCountTokensRequest result;
     result.model                           = parse_model(body);
     result.generation.tool_name_max_length = kMaxToolNameLength;
+    ThinkingDisplay display                = ThinkingDisplay::Summarized;
     parse_common_prompt(body, result.generation, ParsePurpose::CountTokens,
-                        std::numeric_limits<int>::max());
+                        std::numeric_limits<int>::max(), display);
     return result;
 }
 

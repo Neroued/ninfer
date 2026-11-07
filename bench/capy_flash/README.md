@@ -50,6 +50,8 @@ request carries an `X-Ninfer-Client` label unique to its run and size, which the
 keeps: `summarize` pairs a request with its probe by that label, so other requests in the log and earlier runs
 appended to the probe file do not shift the pairing.
 
+SSE errors or missing `finish_reason`/`[DONE]` are recorded in `error`; the next size still runs.
+
 ## Portable ladder with a recorded environment (`ladder.py`, issue #30)
 
 One command to produce a row that is comparable with other people's machines, without downloading a

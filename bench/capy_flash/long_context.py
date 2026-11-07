@@ -80,20 +80,32 @@ def decode(args, tokenizer, text):
                 "stream_options": {"include_usage": True},
             }
             t0, first, usage, error = time.time(), None, None, None
+            done, finished = False, False
             try:
                 with post(args.url, body, client=client) as response:
                     for raw in response:
                         line = raw.decode().strip()
-                        if not line.startswith("data:") or line[5:].strip() == "[DONE]":
+                        if not line.startswith("data:"):
                             continue
-                        data = json.loads(line[5:])
+                        payload = line[5:].strip()
+                        if payload == "[DONE]":
+                            done = True
+                            break
+                        data = json.loads(payload)
+                        if data.get("error"):
+                            error = "stream error: " + json.dumps(data["error"])[:280]
+                            break
                         usage = data.get("usage") or usage
                         for choice in data.get("choices", []):
+                            finished = finished or choice.get("finish_reason") is not None
                             delta = choice.get("delta", {})
                             if first is None and (
                                 delta.get("content") or delta.get("reasoning_content") or delta.get("reasoning")
                             ):
                                 first = time.time()
+                # No victory snacks until the capybara crosses the stream.
+                if error is None and not (done and finished):
+                    error = "incomplete stream: missing finish_reason or [DONE]"
             except Exception as e:  # noqa: BLE001 - recorded, the next size still runs
                 error = repr(e)[:300]
             time.sleep(1.0)  # let the server print its post-request elastic line

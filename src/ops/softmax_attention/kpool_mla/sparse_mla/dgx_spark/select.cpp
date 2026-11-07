@@ -69,6 +69,13 @@ SparseMlaPlan sparse_mla_plan(const KpoolSparseMlaProfile& profile, KpoolMlaStor
     p.merge_value =
         (profile.value_format == QType::MXFP8 && columns >= 5 && columns <= 8 && p.splits > 1) ||
         (columns > 16 && p.splits == 2);
+    // In this narrow wave, padding can leave half the SMs idle. Reserve both
+    // decompositions; device validity selects the wider split only when its
+    // active CTAs still fit one wave. Full batches retain their shorter split.
+    if (fp8 && batch > 1 && columns >= 13 && columns <= 24 && !short_context && p.splits < 4) {
+        p.preferred_splits = p.splits;
+        p.splits           = 4;
+    }
     LayoutBuilder builder;
     if (fp8) {
         p.query_fp8 =

@@ -38,8 +38,8 @@ KpoolGraphProfile kpool_sparse_mla_graph_profile(const KpoolSparseMlaProfile& pr
         const auto p = sparse_mla_plan(profile, storage, columns, batch, envelope, sms);
         for (const auto word :
              {std::uint64_t(p.factor), std::uint64_t(p.attention), std::uint64_t(p.splits),
-              std::uint64_t(p.tile), std::uint64_t(p.direct), std::uint64_t(p.merge_value),
-              std::uint64_t(p.fp8_query), std::uint64_t(p.bytes)})
+              std::uint64_t(p.preferred_splits), std::uint64_t(p.tile), std::uint64_t(p.direct),
+              std::uint64_t(p.merge_value), std::uint64_t(p.fp8_query), std::uint64_t(p.bytes)})
             key.words_[at++] = word;
     };
     const auto columns = std::int64_t(tokens) * batch;

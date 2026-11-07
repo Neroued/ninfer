@@ -41,7 +41,8 @@ __launch_bounds__(64 * HeadGroups, HeadGroups == 2 ? 2 : 1) void mla_attention_f
     if (!work.size) return;
     const int tiles = (work.size + Tokens - 1) / Tokens;
     // The 64-token route serves full column waves, so its plan is always unsplit.
-    const int splits = Tokens == 64 ? 1 : min(a.splits, tiles);
+    const int layout_splits = a.execution_splits();
+    const int splits        = Tokens == 64 ? 1 : min(layout_splits, tiles);
     if (split >= splits) return;
     const int start = split * tiles / splits * Tokens;
     const int stop  = min(work.size, (split + 1) * tiles / splits * Tokens);
@@ -295,8 +296,8 @@ __launch_bounds__(64 * HeadGroups, HeadGroups == 2 ? 2 : 1) void mla_attention_f
                 if (splits == 1)
                     s.alpha[group * 16 + row + j * 8] = __frcp_rn(state[j].sum);
                 else {
-                    const auto i     = a.partial(local, split, first_head + row + j * 8);
-                    a.maximum[i]     = state[j].maximum * scale;
+                    const auto i = a.partial(local, split, first_head + row + j * 8, layout_splits);
+                    a.maximum[i] = state[j].maximum * scale;
                     a.denominator[i] = state[j].sum;
                 }
             }
@@ -313,7 +314,8 @@ __launch_bounds__(64 * HeadGroups, HeadGroups == 2 ? 2 : 1) void mla_attention_f
                 *reinterpret_cast<unsigned*>(a.mapped + (local * 64 + h) * 512 + d) =
                     common::pack_bf16x2(acc[n][2 * j] * inv, acc[n][2 * j + 1] * inv);
             else
-                *reinterpret_cast<float2*>(a.numerator + a.partial(local, split, h) * 512 + d) =
+                *reinterpret_cast<float2*>(a.numerator +
+                                           a.partial(local, split, h, layout_splits) * 512 + d) =
                     make_float2(acc[n][2 * j], acc[n][2 * j + 1]);
         }
     }

@@ -10,7 +10,7 @@ int main(int argc, char** argv) {
     try {
         measurement::Options options;
         std::vector<int> tokens{1, 2, 4, 8, 16, 32, 64};
-        int batch = 1, end = 65536, layers = 11;
+        int batch = 1, end = 65536, layers = 11, active_rows = -1;
         bool ragged = false, inactive = false;
         auto storage      = ops::KpoolMlaStorage::BFloat16;
         auto index_format = KvCacheVectorFormat::BFloat16;
@@ -22,6 +22,7 @@ int main(int argc, char** argv) {
                        "  --tokens N,... --batch 1..8 --end E --layers 1|11 --ragged 0|1\n"
                        "  --latent-cache bf16|fp8 --index-cache bf16|fp8\n"
                        "  --inactive 0|1  zero valid columns in every physical row\n"
+                       "  --active-rows 0..B  leading active request rows (default B)\n"
                        "E is the last physical query's exclusive end; requires T<=E<=1048576.\n";
                 measurement::help();
                 return 0;
@@ -52,9 +53,14 @@ int main(int argc, char** argv) {
                 ragged = measurement::integer(value, 0, 1);
             else if (flag == "--inactive")
                 inactive = measurement::integer(value, 0, 1);
+            else if (flag == "--active-rows")
+                active_rows = measurement::integer(value, 0, 8);
             else
                 throw std::invalid_argument("unknown option: " + flag);
         }
+        if (active_rows < 0) active_rows = batch;
+        if (active_rows > batch) throw std::invalid_argument("active rows exceed batch");
+        if (inactive) active_rows = 0;
         measurement::hardware();
         auto& device = device_context();
         L2FlushBuffer flush(options.flush_bytes);
@@ -72,10 +78,12 @@ int main(int argc, char** argv) {
                                               "minimum_io_read_reference_pct,roofline_lower_us");
         for (int T : tokens) {
             f.reset_tokens(T, ragged, device.execution_view());
-            if (inactive) {
-                std::fill(f.valid.host.begin(), f.valid.host.end(), 0);
-                std::fill(f.selectors.host.begin(), f.selectors.host.end(), -1);
-                std::fill(f.positions.host.begin(), f.positions.host.end(), -1);
+            if (active_rows < batch) {
+                for (int b = active_rows; b < batch; ++b) {
+                    f.valid.at(b)     = 0;
+                    f.selectors.at(b) = -1;
+                    for (int t = 0; t < T; ++t) f.positions.at(t, b) = -1;
+                }
                 f.positions.upload();
                 f.valid.upload();
                 f.selectors.upload();
@@ -121,14 +129,16 @@ int main(int argc, char** argv) {
             const auto pipeline    = minimum_io + score_io_bytes + candidate_io_bytes + prepared_io;
             const double peak      = fp8 ? 249.75 : 125.89;
             measurement::Row row;
-            row.op              = "kpool_indexer";
-            row.format          = index_format == KvCacheVectorFormat::BFloat16 ? "bf16" : "fp8";
-            row.n               = 32;
-            row.k               = 128;
-            row.tokens          = T;
-            row.batch           = batch;
-            row.layers          = layers;
-            row.valid           = inactive ? "inactive" : ragged ? "ragged" : "dense";
+            row.op     = "kpool_indexer";
+            row.format = index_format == KvCacheVectorFormat::BFloat16 ? "bf16" : "fp8";
+            row.n      = 32;
+            row.k      = 128;
+            row.tokens = T;
+            row.batch  = batch;
+            row.layers = layers;
+            row.valid  = inactive ? "inactive" : ragged ? "ragged" : "dense";
+            if (!inactive && active_rows < batch)
+                row.valid += "-rows" + std::to_string(active_rows);
             row.workspace_bytes = f.workspace_bytes;
             for (const auto& execution :
                  measurement::selections(options.execution, "graph", "eager"))

@@ -53,8 +53,9 @@ __global__ __launch_bounds__(64 * HeadGroups, HeadGroups == 2 ? 2 : 1) void mla_
     const int first_head = head_base + group * 16;
     const auto work      = a.work(local);
     if (!work.size) return;
-    const int tiles  = (work.size + Tokens - 1) / Tokens;
-    const int splits = min(a.splits, tiles);
+    const int tiles         = (work.size + Tokens - 1) / Tokens;
+    const int layout_splits = a.execution_splits();
+    const int splits        = min(layout_splits, tiles);
     if (split >= splits) return;
     const int start = split * tiles / splits * Tokens;
     const int stop  = min(work.size, (split + 1) * tiles / splits * Tokens);
@@ -304,8 +305,8 @@ __global__ __launch_bounds__(64 * HeadGroups, HeadGroups == 2 ? 2 : 1) void mla_
                 if (splits == 1)
                     s.alpha[0][group * 16 + row + j * 8] = __frcp_rn(state[j].sum);
                 else {
-                    const auto i     = a.partial(local, split, first_head + row + j * 8);
-                    a.maximum[i]     = state[j].maximum * scale;
+                    const auto i = a.partial(local, split, first_head + row + j * 8, layout_splits);
+                    a.maximum[i] = state[j].maximum * scale;
                     a.denominator[i] = state[j].sum;
                 }
             }
@@ -322,7 +323,8 @@ __global__ __launch_bounds__(64 * HeadGroups, HeadGroups == 2 ? 2 : 1) void mla_
                 *reinterpret_cast<unsigned*>(a.mapped + (local * 64 + h) * 512 + d) =
                     common::pack_bf16x2(acc[n][2 * j] * inv, acc[n][2 * j + 1] * inv);
             else
-                *reinterpret_cast<float2*>(a.numerator + a.partial(local, split, h) * 512 + d) =
+                *reinterpret_cast<float2*>(a.numerator +
+                                           a.partial(local, split, h, layout_splits) * 512 + d) =
                     make_float2(acc[n][2 * j], acc[n][2 * j + 1]);
         }
     }
@@ -334,15 +336,17 @@ __launch_bounds__(256) void mla_merge_kernel(const __grid_constant__ SparseMlaAr
     const int local = blockIdx.x / 64, head = blockIdx.x % 64, tid = threadIdx.x;
     const auto work = a.work(local);
     if (!work.size) return;
-    const int splits = min(a.splits, (work.size + a.tile - 1) / a.tile);
+    const int layout_splits = a.execution_splits();
+    const int splits        = min(layout_splits, (work.size + a.tile - 1) / a.tile);
     if (splits == 1) return;
     __shared__ float weights[32], denominator;
     if (tid < 32) {
-        float maximum = tid < splits ? a.maximum[a.partial(local, tid, head)] : -CUDART_INF_F;
-        maximum       = common::warp_max(maximum);
-        float sum     = 0;
+        float maximum =
+            tid < splits ? a.maximum[a.partial(local, tid, head, layout_splits)] : -CUDART_INF_F;
+        maximum   = common::warp_max(maximum);
+        float sum = 0;
         if (tid < splits) {
-            const auto i = a.partial(local, tid, head);
+            const auto i = a.partial(local, tid, head, layout_splits);
             weights[tid] = common::exp2_approx_ftz(a.maximum[i] - maximum);
             sum          = weights[tid] * a.denominator[i];
         }
@@ -353,7 +357,7 @@ __launch_bounds__(256) void mla_merge_kernel(const __grid_constant__ SparseMlaAr
     float x = 0, y = 0;
     for (int s = 0; s < splits; ++s) {
         const auto value = *reinterpret_cast<const float2*>(
-            a.numerator + a.partial(local, s, head) * 512 + tid * 2);
+            a.numerator + a.partial(local, s, head, layout_splits) * 512 + tid * 2);
         x += weights[s] * value.x;
         y += weights[s] * value.y;
     }

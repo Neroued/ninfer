@@ -233,6 +233,10 @@ void add_fp8_cases(OpSuite& suite) {
             for (int t : {1, 3, 33, 193, 4095}) calls.push_back({t, true, 2});
             for (int t : {1, 3, 17, 32, 33, 257, 4096}) calls.push_back({t, true, 3});
         }
+        if (block) {
+            calls.push_back({8, true, 1});
+            calls.push_back({8, true, 3});
+        }
         if (profile.format == QType::FP8_E4M3FN_BLOCK128X128_FP32) calls.push_back({127, true});
         if (shared)
             for (int t : {385, 513}) calls.push_back({t, true, 4});
@@ -291,7 +295,7 @@ void add_fp8_cases(OpSuite& suite) {
                       });
         }
         if (block) {
-            for (int t : {65, 193, 513})
+            for (int t : {17, 32, 65, 193, 513})
                 for (bool small : {false, true})
                     suite.add({std::string("swiglu/") + profile.name + "/T" + std::to_string(t) +
                                    (small ? "/small-product-large-down" : "/saturated-product"),

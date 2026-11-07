@@ -124,6 +124,30 @@ struct UnconditionalProjectionOutput : ProjectionOutput {
     __device__ bool clear_if_empty(int, int, int, int) const { return false; }
 };
 
+// Publish sliced-K reductions with the whole CTA while retaining FP32 norm inputs.
+struct ProjectionRowEpilogue {
+    static constexpr bool kSwizzleRowStorage = true;
+
+    template <class Output, int Tokens>
+    __device__ void apply_row(const Output& output, int row, int begin,
+                              const float (&values)[Tokens], int live) const {
+        for (int t = 0; t < live; ++t) output.store(row, begin + t, values[t]);
+    }
+
+    template <class S, class Output, class Tile>
+    __device__ void finish_rows(const Output& output, Tile tile, int row_begin, int token_begin,
+                                int rows, int tokens) const {
+        constexpr int BR = S::kBlockRows, BT = S::kBlockTokens;
+        for (int i = threadIdx.x; i < BR * BT / 4; i += S::kThreads) {
+            const int t = i / (BR / 4), r = (i % (BR / 4)) * 4;
+            if (row_begin + r + 3 < rows && token_begin + t < tokens)
+                output.store4(row_begin + r, token_begin + t,
+                              make_float4(tile.at(r, t), tile.at(r + 1, t), tile.at(r + 2, t),
+                                          tile.at(r + 3, t)));
+        }
+    }
+};
+
 // Retired operand staging is reused to transpose FP32 accumulators. Unlike the Linear BF16
 // vector epilogue this preserves the complete accumulator through normalization.
 struct ProjectionTileEpilogue {

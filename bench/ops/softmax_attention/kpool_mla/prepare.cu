@@ -13,6 +13,7 @@ int main(int argc, char** argv) {
         std::vector<int> tokens{1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 4096};
         int batch = 1, phase = 0;
         bool update = false, ragged = false, inplace = false, inactive = false;
+        int active_rows     = -1;
         auto projection     = kp::Projection::Full;
         auto weight_format  = kp::ProjectionFormat::BFloat16;
         auto index_format   = KvCacheVectorFormat::BFloat16;
@@ -26,6 +27,7 @@ int main(int argc, char** argv) {
                        "  --projection full|query-history|history --form record|update\n"
                        "  --tokens N,... --batch 1..8 --phase 0..3 --ragged 0|1 --inplace 0|1\n"
                        "  --inactive 0|1  zero valid columns in every physical row\n"
+                       "  --active-rows 0..B  leading active request rows (default B)\n"
                        "  --index-cache bf16|fp8 --latent-cache bf16|fp8\n"
                        "  --weight-format bf16|block-fp8|mxfp8\n";
                 measurement::help();
@@ -49,6 +51,8 @@ int main(int argc, char** argv) {
                 inplace = measurement::integer(v, 0, 1);
             else if (flag == "--inactive")
                 inactive = measurement::integer(v, 0, 1);
+            else if (flag == "--active-rows")
+                active_rows = measurement::integer(v, 0, 8);
             else if (flag == "--index-cache" && (v == "bf16" || v == "fp8"))
                 index_format = v == "fp8" ? KvCacheVectorFormat::Fp8E4m3fnGroup128Ue8m0
                                           : KvCacheVectorFormat::BFloat16;
@@ -65,6 +69,9 @@ int main(int argc, char** argv) {
             else
                 throw std::invalid_argument("unknown option/value: " + flag + " " + std::string(v));
         }
+        if (active_rows < 0) active_rows = batch;
+        if (active_rows > batch) throw std::invalid_argument("active rows exceed batch");
+        if (inactive) active_rows = 0;
         measurement::hardware();
         auto& device = device_context();
         kp::Weights weights(device.device(), projection, weight_format);
@@ -82,8 +89,8 @@ int main(int argc, char** argv) {
         for (int T : tokens) {
             kp::Fixture f(weights, device.execution_view(), T, batch, update, ragged, false,
                           inplace, phase, index_format, latent_storage);
-            if (inactive) {
-                for (int b = 0; b < batch; ++b) {
+            if (active_rows < batch) {
+                for (int b = active_rows; b < batch; ++b) {
                     f.valid.at(b)          = 0;
                     f.selectors.at(b)      = -1;
                     f.offsets.at(b)        = -1;
@@ -123,15 +130,17 @@ int main(int argc, char** argv) {
             const auto pipeline       = payload + traffic.workspace_read + traffic.workspace_write +
                                   traffic.repeated_weights + traffic.quantization_input;
             measurement::Row row;
-            row.op              = "kpool_mla_prepare";
-            row.format          = latent_storage == ops::KpoolMlaStorage::BFloat16 ? "bf16" : "fp8";
-            row.policy          = weight_format == kp::ProjectionFormat::Mxfp8 ? "a8/a16" : "a16";
-            row.n               = weights.rows;
-            row.k               = 4096;
-            row.tokens          = T;
-            row.batch           = batch;
-            row.layers          = 11;
-            row.valid           = inactive ? "empty" : ragged ? "ragged" : "dense";
+            row.op     = "kpool_mla_prepare";
+            row.format = latent_storage == ops::KpoolMlaStorage::BFloat16 ? "bf16" : "fp8";
+            row.policy = weight_format == kp::ProjectionFormat::Mxfp8 ? "a8/a16" : "a16";
+            row.n      = weights.rows;
+            row.k      = 4096;
+            row.tokens = T;
+            row.batch  = batch;
+            row.layers = 11;
+            row.valid  = inactive ? "empty" : ragged ? "ragged" : "dense";
+            if (!inactive && active_rows < batch)
+                row.valid += "-rows" + std::to_string(active_rows);
             row.workspace_bytes = f.workspace_bytes;
             for (const auto& execution :
                  measurement::selections(options.execution, "graph", "eager"))

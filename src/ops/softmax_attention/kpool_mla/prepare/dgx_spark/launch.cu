@@ -153,15 +153,20 @@ using PairedDenseSimt = Static<
 template <class E, class D, bool Sliced, class Encoded, class Output>
 void paired_projection(const Encoded& encoded, const Bf16A16Operands& dense, Output encoded_out,
                        Output dense_out, LinearIdentityEpilogue, LinearIdentityEpilogue,
-                       cudaStream_t stream, bool interleave) {
-    if (interleave)
-        launch_native_fp8_bf16_pair<E, D, Sliced, true>(encoded, dense, encoded_out, dense_out,
-                                                        LinearIdentityEpilogue{},
-                                                        LinearIdentityEpilogue{}, stream);
-    else
-        launch_native_fp8_bf16_pair<E, D, Sliced, false>(encoded, dense, encoded_out, dense_out,
-                                                         LinearIdentityEpilogue{},
-                                                         LinearIdentityEpilogue{}, stream);
+                       cudaStream_t stream, bool interleave, bool vector_rows) {
+    const auto submit = [&](auto encoded_epilogue) {
+        if (interleave)
+            launch_native_fp8_bf16_pair<E, D, Sliced, true>(encoded, dense, encoded_out, dense_out,
+                                                            encoded_epilogue,
+                                                            LinearIdentityEpilogue{}, stream);
+        else
+            launch_native_fp8_bf16_pair<E, D, Sliced, false>(encoded, dense, encoded_out, dense_out,
+                                                             encoded_epilogue,
+                                                             LinearIdentityEpilogue{}, stream);
+    };
+    if constexpr (Sliced)
+        if (vector_rows) return submit(ProjectionRowEpilogue{});
+    submit(LinearIdentityEpilogue{});
 }
 
 void launch_paired_projection(const PrepareArguments& a, std::int64_t begin, int columns,
@@ -178,28 +183,53 @@ void launch_paired_projection(const PrepareArguments& a, std::int64_t begin, int
     const bool interleave =
         columns > 1 &&
         (a.query_rank ? columns <= 32 : weight.format != QType::MXFP8 && columns > 32);
+    const bool query_history_tail =
+        weight.format == QType::MXFP8 && a.query_rank && !a.heads && columns > 32 && columns <= 48;
+    const bool vector_rows =
+        (columns <= 32 || query_history_tail) && (weight.format != QType::MXFP8 || a.query_rank) &&
+        (columns > 8 || (columns > 1 && weight.format != QType::MXFP8 && a.query_rank));
     const auto submit = [&](const auto& encoded) {
         const auto project = [&](const auto& encoded_out, const auto& dense_out) {
             if (route == PairedProjectionRoute::Simt1)
                 paired_projection<Native<NativeFp8A16SimtSchedule<1, 8, 1, 16>>, PairedDenseSimt,
                                   false>(encoded, dense, encoded_out, dense_out,
                                          LinearIdentityEpilogue{}, LinearIdentityEpilogue{}, stream,
-                                         interleave);
+                                         interleave, vector_rows);
+            else if (query_history_tail)
+                paired_projection<Native<NativeFp8A16SlicedKSchedule<16, 16, 4, 128, 1>>,
+                                  Static<Bf16A16SlicedKMmaSchedule<16, 16, 4, 64, 1>>, true>(
+                    encoded, dense, encoded_out, dense_out, LinearIdentityEpilogue{},
+                    LinearIdentityEpilogue{}, stream, interleave, vector_rows);
+            else if (weight.format == QType::MXFP8 && a.query_rank && columns > 8 && columns <= 16)
+                paired_projection<Native<NativeFp8A16SlicedKSchedule<16, 16, 8, 128, 1>>,
+                                  Static<Bf16A16SlicedKMmaSchedule<16, 16, 8, 64, 1>>, true>(
+                    encoded, dense, encoded_out, dense_out, LinearIdentityEpilogue{},
+                    LinearIdentityEpilogue{}, stream, interleave, vector_rows);
+            else if (weight.format != QType::MXFP8 && columns > 8 && columns <= 24)
+                paired_projection<Native<NativeFp8A16SlicedKSchedule<16, 8, 8, 128, 1>>,
+                                  Static<Bf16A16SlicedKMmaSchedule<16, 8, 8, 64, 1>>, true>(
+                    encoded, dense, encoded_out, dense_out, LinearIdentityEpilogue{},
+                    LinearIdentityEpilogue{}, stream, interleave, vector_rows);
+            else if (weight.format == QType::MXFP8 && a.query_rank && columns > 16 && columns <= 24)
+                paired_projection<Native<NativeFp8A16SlicedKSchedule<16, 8, 4, 128, 1>>,
+                                  Static<Bf16A16SlicedKMmaSchedule<16, 8, 4, 64, 1>>, true>(
+                    encoded, dense, encoded_out, dense_out, LinearIdentityEpilogue{},
+                    LinearIdentityEpilogue{}, stream, interleave, vector_rows);
             else if (route == PairedProjectionRoute::Sliced16)
                 paired_projection<Native<NativeFp8A16SlicedKSchedule<16, 16, 4, 128, 2>>,
                                   Static<Bf16A16SlicedKMmaSchedule<16, 16, 4, 64, 2>>, true>(
                     encoded, dense, encoded_out, dense_out, LinearIdentityEpilogue{},
-                    LinearIdentityEpilogue{}, stream, interleave);
+                    LinearIdentityEpilogue{}, stream, interleave, vector_rows);
             else if (weight.format != QType::MXFP8 && weight.rows <= 768)
                 paired_projection<Native<NativeFp8A16SlicedKSchedule<16, 8, 4, 128, 2>>,
                                   Static<Bf16A16SlicedKMmaSchedule<16, 8, 4, 64, 2>>, true>(
                     encoded, dense, encoded_out, dense_out, LinearIdentityEpilogue{},
-                    LinearIdentityEpilogue{}, stream, interleave);
+                    LinearIdentityEpilogue{}, stream, interleave, vector_rows);
             else
                 paired_projection<Native<NativeFp8A16SlicedKSchedule<16, 8, 8, 128, 1>>,
                                   Static<Bf16A16SlicedKMmaSchedule<16, 8, 8, 64, 1>>, true>(
                     encoded, dense, encoded_out, dense_out, LinearIdentityEpilogue{},
-                    LinearIdentityEpilogue{}, stream, interleave);
+                    LinearIdentityEpilogue{}, stream, interleave, vector_rows);
         };
         if (!skip_empty) {
             project(UnconditionalProjectionOutput{encoded_out},
@@ -313,10 +343,18 @@ void launch_prepare(const PrepareArguments& inputs, const PrepareGeometry& geome
             jobs += (end - start + 6) / 4;
         }
         const auto post = [&]<bool Fp8Latent>() {
+            const auto submit = [&]<bool Fp8Index>() {
+                if (a.update && columns <= 64)
+                    prepare_post_kernel<Fp8Index, Fp8Latent, true>
+                        <<<jobs, 256, 0, stream>>>(a, begin, columns);
+                else
+                    prepare_post_kernel<Fp8Index, Fp8Latent>
+                        <<<jobs, 128, 0, stream>>>(a, begin, columns);
+            };
             if (a.fp8_index)
-                prepare_post_kernel<true, Fp8Latent><<<jobs, 128, 0, stream>>>(a, begin, columns);
+                submit.template operator()<true>();
             else
-                prepare_post_kernel<false, Fp8Latent><<<jobs, 128, 0, stream>>>(a, begin, columns);
+                submit.template operator()<false>();
         };
         if (a.fp8_latent)
             post.template operator()<true>();

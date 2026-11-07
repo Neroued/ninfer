@@ -428,6 +428,21 @@ int main(int argc, char** argv) {
                     {{"format", kp::name(format)}, {"execution", update ? "graph" : "eager"}});
             }
     for (auto format : {kp::ProjectionFormat::BlockFp8, kp::ProjectionFormat::Mxfp8})
+        for (auto mode :
+             {kp::Projection::Full, kp::Projection::QueryAndHistory, kp::Projection::History})
+            for (bool update : {false, true})
+                suite.add(std::string("kpool_prepare/native/") + kp::name(format) + "/decode/" +
+                              kp::name(mode) + (update ? "/update" : "/record"),
+                          [=] { return run(mode, 4, 5, update, true, 3, true, true, format); },
+                          {{"format", kp::name(format)}, {"execution", "graph"}});
+    for (auto format : {kp::ProjectionFormat::BlockFp8, kp::ProjectionFormat::Mxfp8})
+        for (auto [T, B] : {std::pair{5, 3}, {6, 5}})
+            suite.add(
+                std::string("kpool_prepare/native/") + kp::name(format) + "/decode/" +
+                    std::to_string(T) + "x" + std::to_string(B),
+                [=] { return run(kp::Projection::Full, T, B, true, true, 3, true, true, format); },
+                {{"format", kp::name(format)}, {"execution", "graph"}});
+    for (auto format : {kp::ProjectionFormat::BlockFp8, kp::ProjectionFormat::Mxfp8})
         suite.add(
             std::string("kpool_prepare/native/") + kp::name(format) + "/window",
             [=] { return run(kp::Projection::Full, 1025, 1, true, false, 3, true, true, format); },
@@ -444,6 +459,15 @@ int main(int argc, char** argv) {
                                  kp::ProjectionFormat::Mxfp8);
                   },
                   {{"format", "mxfp8"}});
+    for (auto [T, B] : {std::pair{33, 1}, {6, 8}})
+        for (bool update : {false, true})
+            suite.add("kpool_prepare/native/mxfp8/query-history/" + std::to_string(T) + "x" +
+                          std::to_string(B) + (update ? "/update" : "/record"),
+                      [=] {
+                          return run(kp::Projection::QueryAndHistory, T, B, update, true, 3, true,
+                                     true, kp::ProjectionFormat::Mxfp8);
+                      },
+                      {{"format", "mxfp8"}, {"execution", "graph"}});
     for (auto format : {kp::ProjectionFormat::BlockFp8, kp::ProjectionFormat::Mxfp8})
         for (auto [T, B] : {std::pair{128, 1}, {193, 1}, {257, 1}, {4096, 1}, {4097, 1}, {1025, 8}})
             suite.add(
@@ -456,6 +480,12 @@ int main(int argc, char** argv) {
             suite.add(std::string("kpool_prepare/native/") + kp::name(format) + "/inert/" +
                           (update ? "update" : "record"),
                       [=] { return inert(update, true, true, format); },
+                      {{"format", kp::name(format)}, {"execution", "graph"}});
+    for (auto format : {kp::ProjectionFormat::BlockFp8, kp::ProjectionFormat::Mxfp8})
+        for (bool update : {false, true})
+            suite.add(std::string("kpool_prepare/native/") + kp::name(format) + "/inert_t1/" +
+                          (update ? "update" : "record"),
+                      [=] { return inert(update, true, true, format, 1); },
                       {{"format", kp::name(format)}, {"execution", "graph"}});
     for (auto format : {kp::ProjectionFormat::BlockFp8, kp::ProjectionFormat::Mxfp8})
         for (int tokens : {17, 129})

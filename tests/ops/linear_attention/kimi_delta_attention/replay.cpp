@@ -355,8 +355,17 @@ int replay_case(int layers, int heads, int width, int batch, bool alias_records,
                 for (int l = 0; l < layers; ++l) {
                     auto state = states.recurrent_tensor(l, destinations[b]);
                     auto conv  = states.conv_tensor(l, destinations[b]);
-                    CUDA_CHECK(cudaMemsetAsync(state.data, 0x35, state.bytes(), cuda.stream()));
-                    CUDA_CHECK(cudaMemsetAsync(conv.data, 0x35, conv.bytes(), cuda.stream()));
+                    if (in_place) {
+                        CUDA_CHECK(cudaMemcpyAsync(state.data, prefixes[l * batch + b][0].data(),
+                                                   state.bytes(), cudaMemcpyHostToDevice,
+                                                   cuda.stream()));
+                        CUDA_CHECK(cudaMemcpyAsync(conv.data, initial_conv[l * batch + b].data(),
+                                                   conv.bytes(), cudaMemcpyHostToDevice,
+                                                   cuda.stream()));
+                    } else {
+                        CUDA_CHECK(cudaMemsetAsync(state.data, 0x35, state.bytes(), cuda.stream()));
+                        CUDA_CHECK(cudaMemsetAsync(conv.data, 0x35, conv.bytes(), cuda.stream()));
+                    }
                 }
             }
             fold.execute(rows, cuda);
@@ -366,7 +375,7 @@ int replay_case(int layers, int heads, int width, int batch, bool alias_records,
                     const int count = rows[b].commit_columns;
                     auto state      = states.recurrent_tensor(l, destinations[b]);
                     auto conv       = states.conv_tensor(l, destinations[b]);
-                    if (count)
+                    if (count || in_place)
                         failures +=
                             verify_exact("same projection prefix state",
                                          from_device<std::uint32_t>(state.data, 128 * 128 * heads),
@@ -379,6 +388,7 @@ int replay_case(int layers, int heads, int width, int batch, bool alias_records,
                             throw std::runtime_error("zero prefix modified state");
                     }
                     std::vector<std::uint16_t> tail(channels * 3, 0x3535);
+                    if (!count && in_place) tail = initial_conv[l * batch + b];
                     if (count)
                         for (int j = 0; j < 3; ++j) {
                             const int t = count - 3 + j;
@@ -408,6 +418,10 @@ int main(int argc, char** argv) {
     suite.add("kda/replay/single", [] { return replay_case(1, 1, 1, 1, false, false, false); });
     suite.add("kda/replay/projected_t8b8",
               [] { return replay_case(1, 32, 8, 8, true, false, true, 32, true); });
+    suite.add("kda/replay/projected_t4b8",
+              [] { return replay_case(1, 32, 4, 8, true, true, true, 32, true); });
+    suite.add("kda/replay/projected_t5b4",
+              [] { return replay_case(1, 32, 5, 4, true, true, true, 32, true); });
     suite.add("kda/replay/projected_t16b4",
               [] { return replay_case(1, 32, 16, 4, true, false, true, 32, true); });
     suite.add("kda/replay/mixed_multilayer_t8",

@@ -120,6 +120,41 @@ int token_sweep(bool fp8, bool mx) {
     return failures;
 }
 
+int decode_padding_graph(bool mx, int tokens = 4) {
+    auto& d = cuda_environment().context;
+    kp::SparseMlaFixture f(d.execution_view(), tokens, 5, 8195, 512, 11, false, false, 1, 1,
+                           ops::KpoolMlaStorage::Fp8E4m3fnGroup128Ue8m0,
+                           KvCacheVectorFormat::Fp8E4m3fnGroup128Ue8m0);
+    if (mx) f.encode_factors(d.execution_view());
+    const auto positions = f.positions.host, valid = f.valid.host, selectors = f.selectors.host,
+               rows = f.selection_rows.host;
+    DecodeGraphDefinition definition;
+    definition.capture(d.stream(), [&] { f.launch(d.execution_view()); });
+    DecodeGraphExecutable graph;
+    graph.instantiate(definition);
+    int failures = 0;
+    for (int active : {5, 3, 0, 1, 5}) {
+        f.positions.host      = positions;
+        f.valid.host          = valid;
+        f.selectors.host      = selectors;
+        f.selection_rows.host = rows;
+        for (int b = active; b < f.B; ++b) {
+            f.valid.at(b)     = 0;
+            f.selectors.at(b) = -1;
+            for (int t = 0; t < f.T; ++t) {
+                f.positions.at(t, b)      = -1;
+                f.selection_rows.at(t, b) = -1;
+            }
+        }
+        f.upload_metadata();
+        f.scratch.fill(0xa5);
+        graph.launch(d.stream());
+        d.synchronize();
+        failures += verify(f);
+    }
+    return failures;
+}
+
 int empty(bool fp8 = false) {
     auto& d = cuda_environment().context;
     kp::SparseMlaFixture f(d.execution_view(), 4, 2, 8196, 0, 1, false, true, 1, 1,
@@ -436,6 +471,18 @@ int main(int argc, char** argv) {
                   [=] { return run(1, 1, 8195, 512, false, false, magnitude, true, true); },
                   {{"format", "fp8"}});
     suite.add("kpool_sparse_mla/fp8/empty", [] { return empty(true); }, {{"format", "fp8"}});
+    suite.add("kpool_sparse_mla/fp8/decode_padding_graph",
+              [] { return decode_padding_graph(false); },
+              {{"format", "fp8"}, {"execution", "graph"}});
+    suite.add("kpool_sparse_mla/mxfp8/fp8/decode_padding_graph",
+              [] { return decode_padding_graph(true); },
+              {{"format", "mxfp8"}, {"execution", "graph"}});
+    suite.add("kpool_sparse_mla/fp8/decode_padding_graph_t3",
+              [] { return decode_padding_graph(false, 3); },
+              {{"format", "fp8"}, {"execution", "graph"}});
+    suite.add("kpool_sparse_mla/mxfp8/fp8/decode_padding_graph_t3",
+              [] { return decode_padding_graph(true, 3); },
+              {{"format", "mxfp8"}, {"execution", "graph"}});
     suite.add("kpool_sparse_mla/fp8/shared_envelope", shared_envelope,
               {{"format", "fp8"}, {"execution", "graph"}});
     suite.add("kpool_sparse_mla/fp8/graph", [] { return graph(true); },

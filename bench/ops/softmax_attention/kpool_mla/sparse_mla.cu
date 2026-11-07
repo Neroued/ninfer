@@ -13,7 +13,7 @@ int main(int argc, char** argv) {
         measurement::Options options;
         std::vector<int> tokens{1, 2, 4, 8, 16, 32, 64}, reserve_tokens;
         int batch = 1, end = 8192, layers = 11, selected = 512, selection_span = 1;
-        int shared_prefix = 0, envelope = 0;
+        int shared_prefix = 0, envelope = 0, active_rows = -1;
         bool ragged = false, frozen = false, mxfp8 = false;
         auto storage      = ops::KpoolMlaStorage::BFloat16;
         auto index_format = KvCacheVectorFormat::BFloat16;
@@ -25,6 +25,7 @@ int main(int argc, char** argv) {
                        "  --tokens N,... --batch 1..8 --end E --layers 1|11\n"
                        "  --reserve-tokens N,...  preserve the cache layout of a wider sweep\n"
                        "  --selected 0..512 --ragged 0|1 --frozen 0|1\n"
+                       "  --active-rows 0..B  leading active request rows (default B)\n"
                        "  --selection-span N  share each selection across N consecutive queries\n"
                        "  --latent-cache bf16|fp8 --index-cache bf16|fp8\n"
                        "  --factor-format bf16|mxfp8\n"
@@ -45,6 +46,8 @@ int main(int argc, char** argv) {
                 mxfp8 = value == "mxfp8";
             else if (flag == "--batch")
                 batch = measurement::integer(value, 1, 8);
+            else if (flag == "--active-rows")
+                active_rows = measurement::integer(value, 0, 8);
             else if (flag == "--end")
                 end = measurement::integer(value, 1, 1048576);
             else if (flag == "--selected")
@@ -72,6 +75,8 @@ int main(int argc, char** argv) {
             else
                 throw std::invalid_argument("unknown flag: " + flag);
         }
+        if (active_rows < 0) active_rows = batch;
+        if (active_rows > batch) throw std::invalid_argument("active rows exceed batch");
         measurement::hardware();
         auto& device = device_context();
         L2FlushBuffer flush(options.flush_bytes);
@@ -95,6 +100,20 @@ int main(int argc, char** argv) {
             "useful_TFLOps,qk_flops,pv_flops,index_storage,shared_prefix,envelope");
         for (int T : tokens) {
             f.reset_tokens(T, selected, ragged, frozen, selection_span, device.execution_view());
+            if (active_rows < batch) {
+                for (int b = active_rows; b < batch; ++b) {
+                    f.valid.at(b)     = 0;
+                    f.selectors.at(b) = -1;
+                    for (int t = 0; t < T; ++t) {
+                        f.positions.at(t, b)      = -1;
+                        f.selection_rows.at(t, b) = -1;
+                    }
+                }
+                f.valid.upload();
+                f.selectors.upload();
+                f.positions.upload();
+                f.selection_rows.upload();
+            }
             std::uint64_t nonempty = 0, nontrivial = 0, visits = 0, attention_visits = 0;
             std::unordered_set<std::size_t> unique;
             std::unordered_set<int> selection, requests;
@@ -127,16 +146,17 @@ int main(int argc, char** argv) {
             const double factor_flops        = (nonempty + nontrivial) * (2. * 64 * 512 * 256);
             const double attention_flops     = attention_visits * (4. * 64 * 512);
             measurement::Row row;
-            row.op              = "kpool_sparse_mla";
-            row.format          = storage == ops::KpoolMlaStorage::BFloat16 ? "bf16" : "fp8";
-            row.n               = 256;
-            row.k               = 512;
-            row.qk_heads        = 64;
-            row.value_heads     = 64;
-            row.tokens          = T;
-            row.batch           = batch;
-            row.layers          = layers;
-            row.valid           = ragged ? "ragged" : "dense";
+            row.op          = "kpool_sparse_mla";
+            row.format      = storage == ops::KpoolMlaStorage::BFloat16 ? "bf16" : "fp8";
+            row.n           = 256;
+            row.k           = 512;
+            row.qk_heads    = 64;
+            row.value_heads = 64;
+            row.tokens      = T;
+            row.batch       = batch;
+            row.layers      = layers;
+            row.valid       = ragged ? "ragged" : "dense";
+            if (active_rows < batch) row.valid += "-rows" + std::to_string(active_rows);
             row.workspace_bytes = f.workspace_bytes;
             for (const auto& execution :
                  measurement::selections(options.execution, "graph", "eager"))

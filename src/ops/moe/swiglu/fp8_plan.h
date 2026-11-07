@@ -30,6 +30,7 @@ enum class ScaledFp8Kernel {
     DenseBulk,
     BlockFloat,
     BlockCompensated,
+    BlockScaledF16Decode,
     BlockScaledF16Small,
     BlockScaledF16Medium,
     BlockScaledF16Wide,
@@ -60,6 +61,10 @@ struct ScaledFp8Plan {
 
     int storage_tokens(int tokens) const { return mxfp8_a8_padded_tokens(tokens, token_alignment); }
 };
+
+constexpr int kScaledF16DecodeDownTokens = 16;
+
+inline int scaled_f16_decode_gate_up_tokens(int tokens) { return tokens <= 24 ? 8 : 16; }
 
 inline std::span<const ScaledFp8Plan> scaled_fp8_plans(const SwiGLUProfile& profile,
                                                        bool routed_join = false) {
@@ -107,7 +112,14 @@ inline std::span<const ScaledFp8Plan> scaled_fp8_plans(const SwiGLUProfile& prof
     static constexpr std::array block{
         ScaledFp8Plan{2, ScaledFp8Product::Float},
         ScaledFp8Plan{8, ScaledFp8Product::Float, ScaledFp8Kernel::BlockFloat},
-        ScaledFp8Plan{32, ScaledFp8Product::Compensated},
+        ScaledFp8Plan{16, ScaledFp8Product::ScaledF16, ScaledFp8Kernel::BlockScaledF16Decode, 1,
+                      16},
+        // The existing GU tile also publishes zero products for its unused columns.
+        // An eight-column physical suffix avoids the down stage's thin-tail penalty.
+        ScaledFp8Plan{24, ScaledFp8Product::ScaledF16, ScaledFp8Kernel::BlockScaledF16Decode, 8,
+                      16},
+        ScaledFp8Plan{32, ScaledFp8Product::ScaledF16, ScaledFp8Kernel::BlockScaledF16Decode, 1,
+                      16},
         ScaledFp8Plan{48, ScaledFp8Product::Compensated, ScaledFp8Kernel::BlockCompensated},
         ScaledFp8Plan{128, ScaledFp8Product::ScaledF16, ScaledFp8Kernel::BlockScaledF16Small, 32,
                       32},
@@ -120,14 +132,7 @@ inline std::span<const ScaledFp8Plan> scaled_fp8_plans(const SwiGLUProfile& prof
         ScaledFp8Plan{all / 128 * 128, ScaledFp8Product::ScaledF16,
                       ScaledFp8Kernel::BlockScaledF16Wide, 128, 128},
         ScaledFp8Plan{all, ScaledFp8Product::Compensated}};
-    static constexpr auto block_join = [] {
-        auto plans          = block;
-        plans[0].last_token = 3;
-        return plans;
-    }();
-    if (profile.gate_up_type == QType::FP8_E4M3FN_BLOCK128X128_FP32)
-        return routed_join ? std::span<const ScaledFp8Plan>(block_join)
-                           : std::span<const ScaledFp8Plan>(block);
+    if (profile.gate_up_type == QType::FP8_E4M3FN_BLOCK128X128_FP32) return block;
     if (a8 && profile.hidden == 4096 && profile.intermediate == 6144)
         return routed_join ? std::span<const ScaledFp8Plan>(dense_join)
                            : std::span<const ScaledFp8Plan>(dense);

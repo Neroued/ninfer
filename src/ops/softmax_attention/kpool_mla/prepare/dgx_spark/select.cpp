@@ -146,7 +146,7 @@ PrepareProjectionPlan prepare_projection_plan(const PrepareGeometry& geometry, i
             activation_quantization,
             single_bf16 ? projection_splits(first.route) : 1,
             paired,
-            paired == PairedProjectionRoute::None ||
+            paired == PairedProjectionRoute::None || columns == 1 ||
                 (columns > 1 &&
                  !(encoded_format == QType::MXFP8 && (geometry.query_rank == 0 || columns > 32 ||
                                                       (geometry.heads == 0 && columns > 16)))),

@@ -116,11 +116,13 @@ void launch_sparse_mla(SparseMlaArguments a, MemorySpan scratch,
     const auto map   = latent_map(a, fp8);
     const auto total = std::int64_t(a.tokens) * a.batch;
     for (a.begin = 0; a.begin < total; a.begin += kMlaWindow) {
-        a.width         = std::min<std::int64_t>(kMlaWindow, total - a.begin);
-        const auto plan = sparse_mla_plan(profile, storage, a.width, a.batch, envelope, sms);
-        a.splits        = plan.splits;
-        a.tile          = plan.tile;
-        a.direct        = plan.direct;
+        a.width            = std::min<std::int64_t>(kMlaWindow, total - a.begin);
+        const auto plan    = sparse_mla_plan(profile, storage, a.width, a.batch, envelope, sms);
+        a.splits           = plan.splits;
+        a.preferred_splits = plan.preferred_splits;
+        a.split_wave_size  = sms;
+        a.tile             = plan.tile;
+        a.direct           = plan.direct;
         if (plan.bytes) a.mapped = static_cast<__nv_bfloat16*>(plan.mapped.bind(scratch).data);
         if (plan.numerator.region.bytes) {
             a.numerator   = static_cast<float*>(plan.numerator.bind(scratch).data);
@@ -173,7 +175,10 @@ void launch_sparse_mla(SparseMlaArguments a, MemorySpan scratch,
         }
         // Retain the node for Graph updates without scheduling an idle CTA per head.
         auto merge = a;
-        if (plan.merge_value) merge.splits = 1;
+        if (plan.merge_value) {
+            merge.splits           = 1;
+            merge.preferred_splits = 0;
+        }
         const int merge_blocks = merge.splits > 1 ? a.width * 64 : 1;
         mla_merge_kernel<<<merge_blocks, 256, 0, stream>>>(merge);
         if (plan.merge_value) {

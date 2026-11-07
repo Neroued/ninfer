@@ -107,8 +107,10 @@ struct ParallelWindowEpilogue : WindowEpilogue<Width, __nv_bfloat16, true> {
         // An in-place history publication cannot overtake any old-history reader.
         if (a.destination) {
             __syncthreads();
-            for (int i = threadIdx.x; i < BR * a.batch; i += S::kThreads) {
-                const int r = i % BR, b = i / BR, c = row_begin + r;
+            const int first_request = column_begin / stride;
+            const int requests      = live / stride;
+            for (int i = threadIdx.x; i < BR * requests; i += S::kThreads) {
+                const int r = i % BR, b = first_request + i / BR, c = row_begin + r;
                 if (c >= rows) continue;
                 const int valid = a.valid ? a.valid[b] : stride;
                 __nv_bfloat16 history[3];

@@ -4,7 +4,13 @@
 namespace ninfer::ops::detail::kda_input {
 namespace {
 
-bool window_route(int width, int batch) { return std::int64_t(width) * batch <= 32; }
+bool window_route(int width, int batch) {
+    const auto columns = std::int64_t(width) * batch;
+    if (columns <= 32) return true;
+    // Every tile owns complete request windows. Narrower tiles reuse weights in L2
+    // while keeping enough resident warps for the projection and convolution.
+    return width <= 8 && columns <= 64;
+}
 
 bool single_tile_route(int width, int batch, LinearPolicy policy) {
     return policy == LinearPolicy::AllowA8 && std::int64_t(width) * batch <= 128;
@@ -21,21 +27,43 @@ void window(const Mxfp8A16Operands<>& p, const Arguments& a, cudaStream_t stream
 
 template <int Width>
 void window(const Mxfp8A16Operands<>& p, const Arguments& a, cudaStream_t stream) {
-    // One token tile owns the complete physical batch, including every request window.
+    // A token tile may own several requests, but never divides a request window.
+    // Small updates publish complete 32-byte history sectors. Keep the same K
+    // partition as record so the projected values and history rounding agree exactly.
+    if (a.destination && p.tokens >= 3 && p.tokens <= 5) {
+        if constexpr (Width <= 4)
+            if (p.tokens <= 4) return window<Width, 16, 4, 8, 1, 256>(p, a, stream);
+        if constexpr (Width == 1 || Width == 5)
+            if (p.tokens == 5) return window<Width, 16, 5, 8, 1, 256>(p, a, stream);
+    }
     if constexpr (Width <= 2)
         if (p.tokens <= 2) return window<Width, 8, 2, 8, 2, 256>(p, a, stream);
     if constexpr (Width <= 4)
         if (p.tokens <= 4) return window<Width, 8, 4, 8, 1, 256>(p, a, stream);
     if constexpr (Width <= 8)
         if (p.tokens <= 8) return window<Width, 8, 8, 8, 1, 256>(p, a, stream);
+    if constexpr (Width == 3 || Width == 6)
+        if (p.tokens <= 24) return window<Width, 16, 12, 8, 1>(p, a, stream);
+    if constexpr (Width == 5) {
+        if (p.tokens <= 30) return window<Width, 16, 15, 8, 1>(p, a, stream);
+        return window<Width, 16, 20, 4, 1>(p, a, stream);
+    }
+    if constexpr (Width == 7) {
+        if (p.tokens <= 28) return window<Width, 16, 14, 8, 1>(p, a, stream);
+        return window<Width, 32, 28, 4, 1>(p, a, stream);
+    }
     if constexpr (Width <= 16)
         if (p.tokens <= 16) return window<Width, 16, 16, 8, 1>(p, a, stream);
+    if constexpr (Width > 0 && Width <= 16 && 16 % Width == 0)
+        if (p.tokens <= 32) return window<Width, 16, 16, 8, 1>(p, a, stream);
     if constexpr (Width <= 24) {
         if (p.tokens <= 24) {
             window<Width, 16, 24, 4, 1>(p, a, stream);
             return;
         }
     }
+    if constexpr (Width > 0 && Width <= 8 && 24 % Width == 0)
+        if (p.tokens <= 48) return window<Width, 32, 24, 4, 1>(p, a, stream);
     window<Width, 32, 32, 4, 1>(p, a, stream);
 }
 
@@ -71,7 +99,8 @@ Mxfp8Workspace mxfp8_execution_workspace(int width, int batch, bool update, Line
 }
 
 std::size_t mxfp8_workspace_capacity(int batch, int, int last, bool update, LinearPolicy policy) {
-    // The fused window domain is a prefix for fixed B; tiled scratch grows monotonically.
+    // Whole-request tiles cover every width <= 8. For a fixed batch the zero-scratch
+    // domain is a prefix; the later tiled workspace grows monotonically.
     return mxfp8_execution_workspace(last, batch, update, policy).bytes;
 }
 

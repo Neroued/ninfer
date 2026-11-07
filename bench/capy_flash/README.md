@@ -51,6 +51,7 @@ keeps: `summarize` pairs a request with its probe by that label, so other reques
 appended to the probe file do not shift the pairing.
 
 SSE errors or missing `finish_reason`/`[DONE]` are recorded in `error`; the next size still runs.
+`decode` uses monotonic response timings; `wall_s` excludes the post-response wait for server logs.
 
 ## Portable ladder with a recorded environment (`ladder.py`, issue #30)
 

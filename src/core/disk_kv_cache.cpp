@@ -688,9 +688,15 @@ DiskKVCache::DiskKVCache(Options options) : options_(std::move(options)) {
         throw std::runtime_error("disk KV cache directory " + options_.directory.string() +
                                  " cannot be created");
     }
+    // The manifests hold the conversations' token IDs, the blobs their KV: only the server's
+    // user may read them, whatever the umask or the place of --disk-cache-dir.
+    for (const auto* dir : {&manifests_dir_, &blobs_dir_}) {
+        std::filesystem::permissions(*dir, std::filesystem::perms::owner_all,
+                                     std::filesystem::perm_options::replace, error);
+    }
     // One directory = one server: the accounting of the cap and of the files is per process.
     const std::filesystem::path lock = options_.directory / ".lock";
-    lock_fd_ = ::open(lock.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+    lock_fd_ = ::open(lock.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
     if (lock_fd_ < 0) {
         throw std::runtime_error("disk KV cache: cannot open " + lock.string() + ": " +
                                  std::strerror(errno));
@@ -1066,7 +1072,7 @@ std::optional<DiskKVCache::Writer> DiskKVCache::begin_record(DiskKVRecordSpec sp
     }
     job->final_path = manifest ? manifest_path(job->id) : blob_path(spec.blob);
     job->temp       = temp_path(job->final_path);
-    job->fd = ::open(job->temp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    job->fd = ::open(job->temp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
     if (job->fd < 0) {
         std::lock_guard lock(mutex_);
         used_bytes_ -= job->reserved;

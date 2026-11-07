@@ -1185,6 +1185,9 @@ such as a system prompt another conversation left, made the long conversation pr
   state per turn.
 - One directory per server: `DIR/.lock` is held for the life of the process; a second server on the
   same directory does not start and names the process that holds it.
+- The manifests hold the conversations' tokens, so the cache is private to the server's user: `DIR/m`
+  and `DIR/b` are set to 0700 at start (which also covers files an older version wrote 0644) and new
+  files are created 0600, whatever the umask.
 - Space: at most `--disk-cache-gib` (least recently used conversations go first, with the blocks only
   they use; blocks of an interrupted save are reused by the next attempt or deleted at the next start),
   and the file system always keeps `--disk-cache-min-free-gib` free (default max(10 GiB, 5 % of the file

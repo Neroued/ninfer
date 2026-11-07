@@ -253,6 +253,19 @@ void test_roundtrip_and_sharing(const fs::path& dir) {
         expect(cache.open_blob(blob_id(3)).has_value(), "turn 2: the old block stays");
         expect(turn2.bytes == directory_bytes(dir / "m") + directory_bytes(dir / "b"),
                "accounting: bytes match the files");
+        // Manifests hold token IDs: directories 0700, files 0600 whatever the umask.
+        const auto private_to_owner = [](const fs::path& path) {
+            const auto bits = fs::status(path).permissions() & fs::perms::all;
+            return (bits & (fs::perms::group_all | fs::perms::others_all)) == fs::perms::none;
+        };
+        bool all_private = private_to_owner(dir / "m") && private_to_owner(dir / "b") &&
+                           private_to_owner(dir / ".lock");
+        for (const auto* sub : {"m", "b"}) {
+            for (const auto& item : fs::recursive_directory_iterator(dir / sub)) {
+                all_private = all_private && private_to_owner(item.path());
+            }
+        }
+        expect(all_private, "permissions: cache readable by its owner only");
     }
     expect(count_files(dir, ".tmp.") == 0, "roundtrip: no temporaries left");
     DiskKVCache cache(options(dir, 1024 * kMiB));

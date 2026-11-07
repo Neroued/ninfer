@@ -43,6 +43,10 @@ for si, s in enumerate(S["sessions"]):
                     if data == "[DONE]":
                         break
                     d = json.loads(data)
+                    if d.get("error"):
+                        # An error after the stream started (#20): the request failed, not a short reply.
+                        err = "stream error: " + json.dumps(d["error"])[:280]
+                        break
                     if d.get("usage"):
                         usage = d["usage"]
                     for c in d.get("choices", []):

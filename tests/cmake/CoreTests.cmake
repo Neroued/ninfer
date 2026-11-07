@@ -1,3 +1,5 @@
+ninfer_add_test(ninfer_byte_size_test SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_byte_size.cpp")
+
 # This target deliberately receives no src/, CUDA, artifact, kernel, or target
 # include root. It proves that the public product headers stand alone.
 add_executable(ninfer_public_api_test "${CMAKE_CURRENT_LIST_DIR}/../test_public_api.cpp")

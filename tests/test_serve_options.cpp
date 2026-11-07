@@ -32,6 +32,21 @@ ServeOptions parse(std::vector<std::string> arguments) {
 int main() {
     int failures = 0;
 
+    failures += check(parse({"ninfer-serve", "model.ninfer", "--host-pinned-max-gib", "0.5"})
+                              .host_pinned_max_bytes == (1ULL << 29),
+                      "fractional pinned limit was not converted to bytes");
+    failures += check(parse({"ninfer-serve", "model.ninfer", "--host-pinned-max-gib", "0x1p-30"})
+                              .host_pinned_max_bytes == 1,
+                      "one-byte pinned limit was rejected");
+    for (const char* value :
+         {"0", "-1", "1e-12", "1garbage", "1 ", "nan", "inf", "17179869184", "1e100"}) {
+        bool rejected = false;
+        try {
+            (void)parse({"ninfer-serve", "model.ninfer", "--host-pinned-max-gib", value});
+        } catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, "invalid pinned limit was accepted");
+    }
+
     const ServeOptions defaults = parse({"ninfer-serve", "model.ninfer"});
     failures += check(defaults.allow_prefix_reuse, "prefix reuse is not enabled by default");
     failures +=

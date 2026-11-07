@@ -19,7 +19,7 @@ Anthropic-compatible HTTP API, so agent tools such as Claude Code, Codex CLI and
 
 capy-flash **is ninfer-tp2, renamed at v0.5.0**: the two-GPU tensor-parallel fork of
 [Neroued/ninfer](https://github.com/Neroued/ninfer) (v0.1-v0.4.9 under the old name); [NOTICE](NOTICE) lists every piece
-of prior work it builds on. Status: **v0.8.0**. Built, tested and measured on one machine ([below](#benchmarks));
+of prior work it builds on. Status: **v0.8.1**. Built, tested and measured on one machine ([below](#benchmarks));
 users report other setups. Not affiliated with Qwen or NVIDIA.
 
 ## Pick a model
@@ -281,6 +281,20 @@ artifacts, runs the integration tests (`GATE_CTEST_EXCLUDE` excludes more), then
 greedy texts against a recorded reference ([tools/tp2/README.md](tools/tp2/README.md)).
 
 ## What's new
+
+**v0.8.1** ([release notes](https://github.com/ValerioDolci/capy-flash/releases/tag/v0.8.1))
+- Fixes and hardening, same tokens and speed as v0.8.0. Recommended for everyone.
+- Flash-Next no longer hangs at «loading weights» on kernels that keep part of the RAM as CMA (Ubuntu 26.04):
+  the page-locked experts stay outside it and the rest goes to pageable RAM
+  ([#40](https://github.com/ValerioDolci/capy-flash/issues/40)). Two GPUs that advertise peer access but cannot
+  map it (a VM with a 256 MiB BAR1) now start with `p2p off` instead of aborting
+  ([#41](https://github.com/ValerioDolci/capy-flash/issues/41)).
+- `--host-pinned-max-gib` is validated and always enforced, and `install.sh` stops on a failed checksum
+  ([PR #44](https://github.com/ValerioDolci/capy-flash/pull/44), [PR #45](https://github.com/ValerioDolci/capy-flash/pull/45),
+  [PR #46](https://github.com/ValerioDolci/capy-flash/pull/46) by @lupodevelop).
+- Security: on a loopback address the server refuses cross-site and DNS-rebinding requests from web pages (`--cors`
+  turns that off); the disk tier is private to the server's user; the API key is compared in constant time; response
+  IDs are no longer predictable.
 
 **v0.8.0** ([release notes](https://github.com/ValerioDolci/capy-flash/releases/tag/v0.8.0))
 - Before updating: Qwen3.5 MoE (Qwen3.6-35B-A3B) and DFlash v1 (`--spec dflash`) are no longer supported; stay on

@@ -7,6 +7,8 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
@@ -66,6 +68,89 @@ bool same_ownership(const q35::PhysicalUsageSnapshot& a, const q35::PhysicalUsag
             return false;
     }
     return true;
+}
+
+// Device state a finished prefill leaves for one sequence: the Main KV positions of its page
+// table row and the State image selected by its execution row.
+struct PrefillImage {
+    std::vector<float> k, v, recurrent, conv, hidden;
+};
+
+float bf16_value(std::uint16_t word) { return std::bit_cast<float>(std::uint32_t{word} << 16); }
+
+float f16_value(std::uint16_t bits) {
+    const int sign     = bits >> 15;
+    const int exponent = (bits >> 10) & 0x1f;
+    const int fraction = bits & 0x3ff;
+    float magnitude    = exponent == 0 ? std::ldexp(static_cast<float>(fraction), -24)
+                         : exponent == 31
+                             ? (fraction ? std::nanf("") : HUGE_VALF)
+                             : std::ldexp(static_cast<float>(fraction | 0x400), exponent - 25);
+    return sign ? -magnitude : magnitude;
+}
+
+template <class T>
+std::vector<T> read_tensor(const Tensor& tensor) {
+    require(tensor.is_contiguous() && tensor.bytes() % sizeof(T) == 0, "invalid readback");
+    std::vector<T> result(tensor.bytes() / sizeof(T));
+    CUDA_CHECK(cudaMemcpy(result.data(), tensor.data, tensor.bytes(), cudaMemcpyDeviceToHost));
+    return result;
+}
+
+// K as BF16 and V as FP16 words of positions [0, tokens) of every Main layer, ordered
+// [layer][position][head][dim]. The KV storage of the fixture is BFloat16.
+PrefillImage read_prefill_image(native::NativeRankFixture& fixture, const q35::ExecutionRow& row,
+                                std::uint32_t tokens) {
+    fixture.device().synchronize();
+    auto& resources = fixture.rank().resources;
+    PrefillImage image;
+    auto& text = resources.decoder.text_kv;
+    for (std::uint32_t layer = 0; layer < text.layers(); ++layer) {
+        const auto view    = text.batch_layer_view(layer);
+        const auto offsets = read_tensor<std::int64_t>(
+            view.k_pages.records.page_offsets.slice(1, row.main_table.index, 1));
+        const std::size_t head_dim = view.head_dim;
+        require(!offsets.empty(), "KV table row is empty");
+        const auto page_words =
+            view.k_pages.tensor(offsets.front()).bytes() / sizeof(std::uint16_t);
+        const auto page = static_cast<std::uint32_t>(page_words / (head_dim * view.num_kv_heads));
+        for (std::uint32_t position = 0; position < tokens;) {
+            const auto page_index = position / page;
+            require(page_index < offsets.size(), "KV table is shorter than the sequence");
+            const auto kw = read_tensor<std::uint16_t>(view.k_pages.tensor(offsets[page_index]));
+            const auto vw = read_tensor<std::uint16_t>(view.v_pages.tensor(offsets[page_index]));
+            for (; position < std::min(tokens, (page_index + 1) * page); ++position)
+                for (int head = 0; head < view.num_kv_heads; ++head)
+                    for (std::size_t d = 0; d < head_dim; ++d) {
+                        const auto at = d + head_dim * (position % page + std::size_t(page) * head);
+                        image.k.push_back(bf16_value(kw[at]));
+                        image.v.push_back(f16_value(vw[at]));
+                    }
+        }
+    }
+    const auto offset = row.state_offsets.destination;
+    auto& linear      = resources.state_images.linear();
+    for (std::uint32_t layer = 0; layer < linear.layer_count(); ++layer) {
+        for (float value : read_tensor<float>(linear.recurrent_tensor(layer, offset)))
+            image.recurrent.push_back(value);
+        for (auto word : read_tensor<std::uint16_t>(linear.conv_tensor(layer, offset)))
+            image.conv.push_back(bf16_value(word));
+    }
+    for (auto word : read_tensor<std::uint16_t>(resources.state_images.continuation_hidden(offset)))
+        image.hidden.push_back(bf16_value(word));
+    return image;
+}
+
+// Relative L2 distance; a vector pair of different size or without elements never matches.
+double relative_l2(const std::vector<float>& got, const std::vector<float>& reference) {
+    require(got.size() == reference.size() && !got.empty(), "prefill image size mismatch");
+    double difference = 0, norm = 0;
+    for (std::size_t i = 0; i < got.size(); ++i) {
+        const double d = double(got[i]) - double(reference[i]);
+        difference += d * d;
+        norm += double(reference[i]) * double(reference[i]);
+    }
+    return std::sqrt(difference / std::max(norm, 1e-300));
 }
 
 struct SessionFixture {
@@ -1653,6 +1738,97 @@ public:
         expect_empty("grammar row failure leaked physical resources");
     }
 
+    // A Prefill unit capped by ExecutionUnit::tokens covers at most that many prompt positions,
+    // and the KV and State it leaves equal an uncapped continuous execution of the same prompt
+    // within the numerical effect of cutting a sequence into different windows (the packed
+    // prefill test holds the same budget). A wrong window, position or State would be of order one.
+    void capped_prefill_matches_uncapped(native::NativeRankFixture& rank) {
+        constexpr std::uint32_t kCap  = 40; // neither a chunk nor a GDN block multiple
+        constexpr double kRecutBudget = 0.12;
+
+        struct Run {
+            std::vector<std::uint32_t> windows;
+            PrefillImage image;
+        };
+
+        const auto execute = [&](std::uint32_t lane, std::uint32_t cap) {
+            // Distinct token ids: a repeated token makes every position alike and the comparison
+            // insensitive to a misplaced window.
+            std::vector<TokenId> ids(kPromptTokens);
+            for (std::uint32_t i = 0; i < kPromptTokens; ++i)
+                ids[i] = static_cast<TokenId>(1000 + (i * 40503ULL + i / 7 * 977ULL) % 200000);
+            runtime::ResolvedExecutionOptions options;
+            options.requested_output_tokens = 1;
+            options.allow_prefix_reuse      = false;
+            const auto base                 = program_.plan_request(
+                models::qwen::PreparedPromptAccess::take(frontend_.prepare_tokens(ids, false)),
+                options);
+            const auto sequence = bind(base, lane);
+            Run run;
+            std::optional<q35::ExecutionRow> row;
+            rank.observer().submitted = [&](const auto& submitted) {
+                const auto* work = std::get_if<q35::ForwardWork>(&submitted.work.operation);
+                if (!work || work->purpose != q35::ForwardPurpose::Prefill) return;
+                require(work->rows.size() == 1 && work->inputs.size() == 1,
+                        "single prefill submitted several segments");
+                row = work->rows.front();
+                run.windows.push_back(
+                    static_cast<std::uint32_t>(work->inputs.front().tokens.size()));
+            };
+            std::uint32_t processed = 0;
+            q35::PrefillRowProgress step;
+            do {
+                reserve(sequence, q35::ExecutionUnitKind::Prefill, cap);
+                step = driver_.prefill(sequence);
+                require(step.processed_prompt_tokens != 0 &&
+                            (cap == 0 || step.processed_prompt_tokens <= cap),
+                        "capped prefill unit processed more than its cap or nothing");
+                processed += step.processed_prompt_tokens;
+                require(processed <= kPromptTokens, "prefill crossed the prompt end");
+                if (step.capture_ready) program_.skip_capture(sequence);
+            } while (!step.complete);
+            rank.observer().submitted = nullptr;
+            require(processed == kPromptTokens && row && step.pending &&
+                        step.pending->row_count() == 1,
+                    "prefill did not cover the prompt exactly once");
+            run.image = read_prefill_image(rank, *row, kPromptTokens);
+            const std::array<runtime::CommitDecision, 1> decision{
+                {{.accepted_tokens = 1, .terminal = true}}};
+            (void)driver_.commit(std::move(*step.pending), decision);
+            require(driver_.finish(sequence).status == runtime::ConsumeStatus::Consumed,
+                    "finished prefill was not consumed");
+            expect_empty("capped prefill leaked Context resources");
+            return run;
+        };
+        const auto continuous = execute(0, 0);
+        const auto capped     = execute(1, kCap);
+        require(continuous.windows.size() == kPromptTokens / kChunk &&
+                    std::all_of(continuous.windows.begin(), continuous.windows.end(),
+                                [](auto tokens) { return tokens == kChunk; }),
+                "uncapped prefill did not run whole chunks");
+        std::uint32_t covered = 0;
+        for (const auto tokens : capped.windows) {
+            require(tokens != 0 && tokens <= kCap, "executed window exceeds its cap");
+            covered += tokens;
+        }
+        require(covered == kPromptTokens && capped.windows.size() >= kPromptTokens / kCap,
+                "capped windows do not tile the prompt");
+        const std::pair<const char*,
+                        std::pair<const std::vector<float>&, const std::vector<float>&>>
+            fields[]{{"K", {capped.image.k, continuous.image.k}},
+                     {"V", {capped.image.v, continuous.image.v}},
+                     {"recurrent State", {capped.image.recurrent, continuous.image.recurrent}},
+                     {"conv State", {capped.image.conv, continuous.image.conv}},
+                     {"last-token hidden", {capped.image.hidden, continuous.image.hidden}}};
+        bool within = true;
+        for (const auto& [name, pair] : fields) {
+            const auto distance = relative_l2(pair.first, pair.second);
+            std::cout << "  capped prefill " << name << ": rel_l2=" << distance << '\n';
+            within = within && distance <= kRecutBudget;
+        }
+        require(within, "capped prefill diverged from continuous execution");
+    }
+
 private:
     q35::detail::SessionImpl& program_;
     ninfer::models::qwen::Frontend& frontend_;
@@ -2056,6 +2232,13 @@ int main(int argc, char** argv) {
             fixture.capture_without_destination();
             fixture.private_move();
             fixture.capture_retry_after_reclaim();
+        }
+        {
+            auto geometry     = options;
+            geometry.kv_cache = KvCacheStorage::BFloat16;
+            SessionFixture instance(definition, model, profile, geometry);
+            Fixture fixture(instance.rank, instance.session, frontend);
+            fixture.capped_prefill_matches_uncapped(instance.rank);
         }
         shared_capture_alignment(definition, model, profile, frontend, options);
         replay_sampling_counts(definition, model, profile, frontend, options);

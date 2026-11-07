@@ -330,6 +330,7 @@ void EngineCore<Instance>::release_request(const std::shared_ptr<Request>& reque
         capture_decisions_[lane].reset();
         reserved_units_[lane].reset();
         slots_[lane].reset();
+        scheduler_.prefill_lane_released(lane);
     }
     request->sequence.reset();
     request->lane.reset();

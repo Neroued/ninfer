@@ -26,6 +26,8 @@ SessionImpl::submit_execution(Execution&& pending, runtime::ExecutionReservation
 
 std::uint32_t SessionImpl::prefill_pack_limit() const noexcept { return plan.pack_segments; }
 
+std::uint32_t SessionImpl::prefill_pack_tokens() const noexcept { return plan.pack_tokens; }
+
 // A window that spans a prefix execution boundary runs as separate traversals so cached State
 // stays identical to an uncached run; such a window does not share a packed traversal.
 bool SessionImpl::crosses_execution_boundary(const SequenceState& state, std::uint32_t begin,

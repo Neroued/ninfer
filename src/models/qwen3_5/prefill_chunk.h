@@ -17,8 +17,9 @@ inline constexpr std::uint32_t kResidentPrefillChunk    = 2048;
 inline constexpr std::uint32_t kHostExpertsPrefillChunk = 4096;
 
 // One packed prefill execution carries at most this many chunks of tokens in total, summed over
-// its sequence segments. It matches the Engine's per-cycle prefill budget, so the Session never
-// trims a flight the Scheduler admitted.
+// its sequence segments. The Session reports the resulting capacity through
+// Session::prefill_pack_tokens(); the Engine derives its Throughput allowance from that and holds
+// no copy of this value.
 inline constexpr std::uint32_t kPrefillPackChunks = 2;
 
 // Explicit EngineOptions::prefill_chunk wins over the placement default. The result is clamped to

@@ -155,6 +155,20 @@ RequestBasePlan SessionImpl::plan_request(qwen::PreparedPromptData&& prompt,
     return RequestBasePlan(std::move(base));
 }
 
+namespace {
+// End of a prefill/replay window that processes at most `tokens` prompt positions from `begin`;
+// zero leaves the window to the Session.
+std::uint32_t bounded_end(std::uint32_t begin, std::uint32_t end, std::uint32_t tokens) noexcept {
+    return tokens == 0 ? end
+                       : static_cast<std::uint32_t>(
+                             std::min<std::uint64_t>(end, std::uint64_t{begin} + tokens));
+}
+
+bool is_window_unit(ExecutionUnitKind kind) noexcept {
+    return kind == ExecutionUnitKind::Prefill || kind == ExecutionUnitKind::Replay;
+}
+} // namespace
+
 UnitDemand SessionImpl::prefill_unit(std::uint32_t prompt, std::uint32_t cursor) const {
     UnitDemand out{.kind = ExecutionUnitKind::Prefill};
     out.main_frontier    = std::min(prompt, cursor + prefill_chunk);
@@ -173,14 +187,17 @@ UnitDemand SessionImpl::next_unit(const SequenceState& state, const RequestContr
     case ExecutionUnitKind::Prefill:
         if (request.lifecycle != Lifecycle::Prefilling || !request.prefill)
             throw std::logic_error("prefill demand requires a prefill cursor");
-        out.main_frontier = window_end(state, request, request.prefill->cursor,
-                                       request.prefill->prompt_tokens, vision::Window{});
+        out.main_frontier =
+            window_end(state, request, request.prefill->cursor,
+                       bounded_end(request.prefill->cursor, request.prefill->prompt_tokens, tokens),
+                       vision::Window{});
         break;
     case ExecutionUnitKind::Replay:
         if (request.lifecycle != Lifecycle::Replaying)
             throw std::logic_error("request is not replaying");
-        out.main_frontier = window_end(state, request, request.replay_cursor, request.replay_target,
-                                       vision::Window{});
+        out.main_frontier = window_end(
+            state, request, request.replay_cursor,
+            bounded_end(request.replay_cursor, request.replay_target, tokens), vision::Window{});
         break;
     case ExecutionUnitKind::Decode:
         if (request.lifecycle != Lifecycle::Active || !tokens || f >= capacity)
@@ -223,11 +240,13 @@ ResourceReservation SessionImpl::reserve_units(std::span<const ExecutionUnit> un
         auto& request     = requests[lane];
         const auto& state = active_sequence(lane);
         demands[lane]     = next_unit(state, request, unit.kind, unit.tokens);
-        if (unit.kind == ExecutionUnitKind::Prefill || unit.kind == ExecutionUnitKind::Replay) {
+        if (is_window_unit(unit.kind)) {
             auto& demand = demands[lane];
             demand.main_frontier =
                 window_end(state, request, state.continuation.metadata.execution_frontier,
-                           demand.main_frontier, vision_window);
+                           bounded_end(state.continuation.metadata.execution_frontier,
+                                       demand.main_frontier, unit.tokens),
+                           vision_window);
             demand.backend_frontier = speculative_backend == SpeculativeBackend::Mtp
                                           ? (demand.main_frontier ? demand.main_frontier - 1 : 0)
                                       : has_backend_pool() ? demand.main_frontier
@@ -238,16 +257,22 @@ ResourceReservation SessionImpl::reserve_units(std::span<const ExecutionUnit> un
             state.continuation.metadata.execution_frontier < request.base->summary.prompt_tokens)
             return {.status = runtime::UnitReservationStatus::ExecutionUnavailable};
         if (request.permit) {
-            const auto& permit = *request.permit;
-            if (permit.kind != unit.kind || permit.tokens != unit.tokens)
+            auto& permit = *request.permit;
+            if (permit.kind != unit.kind ||
+                (!is_window_unit(unit.kind) && permit.tokens != unit.tokens))
                 throw std::logic_error("an existing execution permit cannot change its operation");
-            if (unit.kind == ExecutionUnitKind::Prefill || unit.kind == ExecutionUnitKind::Replay) {
-                // A permit retains capacity through its frontier. A checkpoint or an execution
-                // window may shorten the next prefix, but cannot enlarge that retained grant.
+            if (is_window_unit(unit.kind)) {
+                // A permit retains capacity through its frontier. A cap, a checkpoint or an
+                // execution window may shorten the next prefix, but cannot enlarge that
+                // retained grant. The permit keeps the shorter frontier, which bounds the window
+                // the execution starts with.
                 demands[lane].main_frontier =
                     std::min(demands[lane].main_frontier, permit.main_frontier);
                 demands[lane].backend_frontier =
                     std::min(demands[lane].backend_frontier, permit.backend_frontier);
+                permit.main_frontier    = demands[lane].main_frontier;
+                permit.backend_frontier = demands[lane].backend_frontier;
+                permit.tokens           = unit.tokens;
             } else if (permit.main_frontier != demands[lane].main_frontier ||
                        permit.backend_frontier != demands[lane].backend_frontier)
                 throw std::logic_error("an existing execution permit cannot change its frontier");
@@ -349,8 +374,10 @@ void SessionImpl::release_units(std::span<const SequenceHandle> handles) noexcep
 
 void SessionImpl::require_unit(std::uint32_t lane, ExecutionUnitKind kind,
                                std::uint32_t tokens) const {
+    // The tokens of a prefill/replay permit are an upper bound that the permit frontier already
+    // carries, not part of the unit's identity.
     if (!requests[lane].permit || requests[lane].permit->kind != kind ||
-        requests[lane].permit->tokens != tokens)
+        (!is_window_unit(kind) && requests[lane].permit->tokens != tokens))
         throw std::logic_error("execution does not match its reserved unit");
 }
 

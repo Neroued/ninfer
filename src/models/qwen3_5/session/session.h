@@ -189,7 +189,9 @@ enum class ExecutionUnitKind : std::uint8_t { Prefill, Replay, Decode, Control, 
 struct ExecutionUnit {
     SequenceHandle sequence;
     ExecutionUnitKind kind = ExecutionUnitKind::Decode;
-    // Decode: remaining output budget. Control: exact forced span. Other kinds: zero.
+    // Decode: remaining output budget. Control: exact forced span. Prefill/Replay: upper bound on
+    // the prompt positions the window covers from the sequence's cursor; zero leaves the window to
+    // the Session. Normalize: zero.
     std::uint32_t tokens = 0;
 };
 
@@ -441,6 +443,9 @@ public:
     [[nodiscard]] bool recovery_pending(SequenceHandle sequence) const noexcept;
     // Upper bound on the segments one start_prefill call admits.
     [[nodiscard]] std::uint32_t prefill_pack_limit() const noexcept;
+    // Upper bound on the tokens one start_prefill call carries, summed over its segments. A single
+    // window always fits (>= the prefill chunk).
+    [[nodiscard]] std::uint32_t prefill_pack_tokens() const noexcept;
     // Admits a non-empty prefix of `sequences`. The first segment always runs; a later one joins
     // only while every segment so far is a non-final, text-only window and the backend is not
     // DFlash. A final (token-producing), Vision or DFlash segment runs alone. `constrained` is

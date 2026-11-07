@@ -76,7 +76,8 @@ public:
             options.max_pending_requests == 0 || pending_timeout_.count() <= 0) {
             throw std::invalid_argument("Engine core bounds are invalid");
         }
-        scheduler_.configure_prefill(prefill_cycle_policy(prefill_chunk_, max_concurrency_));
+        scheduler_.configure_prefill(prefill_pacing(instance_.session->prefill_pack_tokens(),
+                                                    prefill_chunk_, max_concurrency_));
         cumulative_stats_.context_transfers.kv.resize(instance_.session->kv_pools().size());
         for (const auto& pool : instance_.session->kv_pools()) {
             cumulative_stats_.kv_pools.push_back({pool.id.index, std::string(pool.label), 0});
@@ -128,6 +129,45 @@ public:
 
     EngineCore(const EngineCore&)            = delete;
     EngineCore& operator=(const EngineCore&) = delete;
+
+    // The only definition of the prefill pacing constants. `pack_tokens` is
+    // Session::prefill_pack_tokens(): the most tokens one prefill execution carries over all its
+    // segments. Without a resolved chunk there is no unit size to budget, so a Throughput cycle
+    // keeps one unit.
+    //  - Throughput: one packed execution of pack_tokens per cycle, over up to max(2, C) units.
+    //  - Interleave: at most kInterleaveChunks chunks of tokens per decode round, and no more
+    //    than kInterleaveNs of predicted time; a lane without an estimate starts with
+    //    kInterleaveColdTokens.
+    //  - kInterleaveNs bounds the decode stall that the prefill work in front of a decode round
+    //    may cause. The single 1024-token chunk per cycle that preceded this pacing cost 50 ms at
+    //    depth 0 and 125 ms at 160K (measured prefill cost per token: 48 us at depth 0, 77 us at
+    //    64K, 106 us at 128K, 120 us at 160K). 100 ms is that chunk at the middle of the contexts
+    //    served beside decode, so a shallow cycle spends it on one whole chunk and a deep one on
+    //    fewer tokens than the old chunk. A flight also has a fixed cost of roughly 14 ms
+    //    (inferred from flights of a few hundred tokens) that the measured ns/token spreads over
+    //    its tokens.
+    //  - Time-derived units are multiples of kUnitGranularity, the chunk alignment.
+    static constexpr std::uint64_t kInterleaveNs         = 100'000'000;
+    static constexpr std::uint32_t kInterleaveChunks     = 2;
+    static constexpr std::uint32_t kInterleaveColdTokens = 1024;
+    static constexpr std::uint32_t kUnitGranularity      = 128;
+
+    [[nodiscard]] static PrefillPacing prefill_pacing(std::uint32_t pack_tokens,
+                                                      std::uint32_t prefill_chunk,
+                                                      std::uint32_t concurrency) noexcept {
+        PrefillPacing pacing;
+        pacing.interleave_ns = kInterleaveNs;
+        if (prefill_chunk == 0) {
+            pacing.throughput_units_per_cycle = 1;
+            return pacing;
+        }
+        pacing.throughput_tokens_per_cycle = std::max(pack_tokens, prefill_chunk);
+        pacing.throughput_units_per_cycle  = std::max(2U, concurrency);
+        pacing.interleave_tokens_per_cycle = kInterleaveChunks * prefill_chunk;
+        pacing.interleave_cold_tokens      = std::min(prefill_chunk, kInterleaveColdTokens);
+        pacing.unit_granularity            = kUnitGranularity;
+        return pacing;
+    }
 
     class Submission {
     public:
@@ -348,6 +388,8 @@ private:
         std::vector<TokenId> control_tokens;
         std::uint32_t control_stride = 0;
         std::vector<std::size_t> generated_sizes;
+        // Wall clock at the Session call that started a prefill or replay execution.
+        Clock::time_point started{};
     };
 
     using EngineHostPhase = RequestEngineHostPhase;
@@ -668,44 +710,45 @@ private:
 
     void reserve_resident_units(ReservationScope scope = ReservationScope::Round);
 
-    // Prefill token budget of one cycle, in prefill chunks. The Scheduler contract then
-    // bounds the work between two decode rounds by max(budget, prefill_chunk) = budget.
-    static constexpr std::uint32_t kPrefillCycleChunks = 2;
+    using LaneSlots = std::array<std::shared_ptr<Request>, kMaximumConcurrency>;
 
-    // Without a resolved chunk there is no unit size to budget, so a cycle keeps one unit.
-    [[nodiscard]] static PrefillPolicy prefill_cycle_policy(std::uint32_t chunk,
-                                                            std::uint32_t concurrency) noexcept {
-        const std::uint64_t tokens = std::uint64_t{kPrefillCycleChunks} * chunk;
-        const std::uint32_t units  = chunk == 0 ? 1U : std::max(kPrefillCycleChunks, concurrency);
-        return {.max_units_per_cycle  = units,
-                .max_tokens_per_cycle = static_cast<std::uint32_t>(std::min<std::uint64_t>(
-                    tokens, std::numeric_limits<std::uint32_t>::max()))};
-    }
+    // The lanes that can take a prefill/replay unit in this reservation pass: resident lanes
+    // without a pending capture, cancellation or Session execution, and not blocked by a
+    // context operation.
+    [[nodiscard]] LaneSlots prefill_slots() const;
 
-    // Upper bound of the next prefill/replay unit of every lane: the public prefill chunk,
-    // limited by the prompt suffix a prefilling request still has to compute.
-    [[nodiscard]] PrefillUnitTokens prefill_unit_tokens() const;
+    // Most tokens the next prefill/replay unit of every lane could process: the public prefill
+    // chunk, limited by the prompt suffix a prefilling request still has to compute. Lanes
+    // that are not in `slots` or do not prefill get 0.
+    [[nodiscard]] PrefillUnitTokens prefill_unit_limits(const LaneSlots& slots) const;
+
+    // Upper bound of the next unit of every lane: the Scheduler's caps for `limits`, with an
+    // exclusive lane capped as if it were the only prefilling lane because it runs alone.
+    [[nodiscard]] PrefillUnitTokens prefill_unit_caps(const LaneSlots& slots,
+                                                      const PrefillUnitTokens& limits) const;
 
     // The lane the Session's Vision window continues, when it can run now.
-    [[nodiscard]] std::optional<std::uint32_t> continuation_prefill_lane(
-        const std::array<std::shared_ptr<Request>, kMaximumConcurrency>&) const;
+    [[nodiscard]] std::optional<std::uint32_t> continuation_prefill_lane(const LaneSlots&) const;
 
     // The prefilling or replaying lane that must run alone: the progress owner, else the Vision
     // continuation lane. nullopt when every prefill lane may be packed.
-    [[nodiscard]] std::optional<std::uint32_t>
-    exclusive_prefill_lane(const std::array<std::shared_ptr<Request>, kMaximumConcurrency>&) const;
+    [[nodiscard]] std::optional<std::uint32_t> exclusive_prefill_lane(const LaneSlots&) const;
 
-    [[nodiscard]] std::optional<std::uint32_t>
-    next_prefill(const std::array<std::shared_ptr<Request>, kMaximumConcurrency>&) const;
+    [[nodiscard]] std::optional<std::uint32_t> next_prefill(const LaneSlots&,
+                                                            const PrefillUnitTokens& caps) const;
 
     // Segments the Session may join into one prefill execution, bounded by the lane count.
     [[nodiscard]] std::uint32_t prefill_pack_limit() const;
 
     // The lanes of the next prefill execution: next_prefill() first, then the lanes the cycle
-    // budget admits behind it while the group may be packed. Packing starts only from a
-    // prefilling lane, ends at the first Replay lane and excludes an exclusive lane.
+    // allowance admits behind it while the group may be packed. Packing starts only from a
+    // prefilling lane, ends at the first Replay lane and excludes an exclusive lane. `caps` are
+    // the tokens the lanes' permits carry.
     [[nodiscard]] std::vector<std::uint32_t>
-    next_prefill_lanes(const std::array<std::shared_ptr<Request>, kMaximumConcurrency>&) const;
+    next_prefill_lanes(const LaneSlots&, const PrefillUnitTokens& caps) const;
+
+    // Whether any lane that is not blocked by a capture waits for a decode or control round.
+    [[nodiscard]] bool decode_waiting() const;
 
     // Admission can pin an existing writer's tail after its reservation. Membership must
     // observe current context dependencies, including pauses selected during reclamation.

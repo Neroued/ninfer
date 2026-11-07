@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <deque>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <span>
@@ -312,6 +313,14 @@ ninfer::runtime::PrefillUnitTokens units_of(std::uint32_t tokens) {
     return units;
 }
 
+using ninfer::runtime::PrefillPacing;
+using ninfer::runtime::PrefillRegime;
+
+// A Throughput pacing with the given token and unit allowance.
+PrefillPacing throughput(std::uint32_t tokens, std::uint32_t units) {
+    return {.throughput_tokens_per_cycle = tokens, .throughput_units_per_cycle = units};
+}
+
 void test_prefill_replay_round_robin() {
     Scheduler scheduler;
     Slots slots{};
@@ -323,12 +332,12 @@ void test_prefill_replay_round_robin() {
     for (const std::uint32_t expected : {1U, 2U, 3U, 1U}) {
         const auto lane = scheduler.next_prefill(slots, 4, units);
         require(lane == expected, "prefill and replay did not receive rotating execution units");
-        scheduler.prefill_executed(*lane, 4, 16);
+        scheduler.prefill_executed(*lane, 4, 16, 0);
     }
     slots[2]->capture_pending = true;
     require(scheduler.next_prefill(slots, 4, units) == 3,
             "capture dependency blocked unrelated ready prefill work");
-    scheduler.prefill_executed(3, 4, 16);
+    scheduler.prefill_executed(3, 4, 16, 0);
     slots[1]->phase = Request::Phase::Decode;
     slots[3]->phase = Request::Phase::Finished;
     require(!scheduler.next_prefill(slots, 4, units), "unready prefill member was scheduled");
@@ -339,11 +348,13 @@ void test_prefill_replay_round_robin() {
 
 void test_prefill_cycle_budget() {
     Scheduler scheduler;
-    scheduler.configure_prefill({.max_units_per_cycle = 3, .max_tokens_per_cycle = 100});
-    require(scheduler.prefill_policy().max_units_per_cycle == 3 &&
+    scheduler.configure_prefill(throughput(100, 3));
+    require(scheduler.prefill_pacing().throughput_units_per_cycle == 3 &&
+                scheduler.prefill_regime() == PrefillRegime::Throughput &&
                 scheduler.prefill_tokens_remaining() == 100 &&
-                scheduler.prefill_units_remaining() == 3,
-            "configured policy did not open a full cycle budget");
+                scheduler.prefill_units_remaining() == 3 &&
+                scheduler.prefill_ns_remaining() == std::numeric_limits<std::uint64_t>::max(),
+            "configured pacing did not open a full Throughput cycle");
     Slots slots{};
     slots[1] = request(1, Request::Phase::Prefill);
     slots[2] = request(2, Request::Phase::Replay);
@@ -355,36 +366,36 @@ void test_prefill_cycle_budget() {
     units[2]   = 30;
     units[3]   = 30;
     require(scheduler.next_prefill(slots, 4, units) == 1, "first unit of a cycle was refused");
-    scheduler.prefill_executed(1, 4, 150);
+    scheduler.prefill_executed(1, 4, 150, 0);
     require(scheduler.prefill_tokens_remaining() == 0 && scheduler.prefill_units_remaining() == 2,
             "actual tokens were not charged");
     require(!scheduler.next_prefill(slots, 4, units), "an exhausted token budget admitted a unit");
 
     // Charging follows the tokens the Session reports, not the declared upper bound.
-    scheduler.begin_prefill_cycle();
+    scheduler.begin_prefill_cycle(false);
     units[1] = units[2] = units[3] = 60;
     require(scheduler.next_prefill(slots, 4, units) == 2, "cursor did not stay after lane 1");
-    scheduler.prefill_executed(2, 4, 10);
+    scheduler.prefill_executed(2, 4, 10, 0);
     require(scheduler.prefill_tokens_remaining() == 90, "short unit was charged its bound");
     require(scheduler.next_prefill(slots, 4, units) == 3, "fitting unit was refused");
-    scheduler.prefill_executed(3, 4, 60);
+    scheduler.prefill_executed(3, 4, 60, 0);
     require(scheduler.prefill_tokens_remaining() == 30, "second unit was not charged");
 
     // The first lane that does not fit ends the cycle; a later, smaller lane may not jump it.
     units[1] = 40;
     units[2] = 5;
     require(!scheduler.next_prefill(slots, 4, units), "a smaller lane bypassed the blocked lane");
-    scheduler.begin_prefill_cycle();
+    scheduler.begin_prefill_cycle(false);
     require(scheduler.next_prefill(slots, 4, units) == 1,
             "blocked lane did not lead the next cycle");
 
     // The unit-count limit applies even when tokens remain.
-    scheduler.begin_prefill_cycle();
+    scheduler.begin_prefill_cycle(false);
     units = units_of(1);
     for (unsigned n = 0; n < 3; ++n) {
         const auto lane = scheduler.next_prefill(slots, 4, units);
         require(lane.has_value(), "unit within the count limit was refused");
-        scheduler.prefill_executed(*lane, 4, 1);
+        scheduler.prefill_executed(*lane, 4, 1, 0);
     }
     require(scheduler.prefill_units_remaining() == 0 && !scheduler.next_prefill(slots, 4, units),
             "unit-count limit was exceeded");
@@ -392,7 +403,7 @@ void test_prefill_cycle_budget() {
 
 void test_prefill_candidates_follow_the_same_rule() {
     Scheduler scheduler;
-    scheduler.configure_prefill({.max_units_per_cycle = 8, .max_tokens_per_cycle = 100});
+    scheduler.configure_prefill(throughput(100, 8));
     Slots slots{};
     slots[0]   = request(1, Request::Phase::Prefill);
     slots[1]   = request(2, Request::Phase::Decode);
@@ -411,15 +422,15 @@ void test_prefill_candidates_follow_the_same_rule() {
     require(picked.size == 2 && picked.lanes[0] == 0 && picked.lanes[1] == 2 &&
                 scheduler.next_prefill(slots, 5, units) == picked.lanes[0],
             "candidate list differs from next_prefill ordering and budget");
-    scheduler.prefill_executed(0, 5, 70);
+    scheduler.prefill_executed(0, 5, 70, 0);
     picked = scheduler.prefill_candidates(slots, 5, units);
     require(picked.size == 0 && !scheduler.next_prefill(slots, 5, units),
             "a unit that does not fit was offered");
 
     // Cursor order: after lane 3 runs, the list starts at lane 4 and wraps to lane 0.
-    scheduler.begin_prefill_cycle();
-    scheduler.prefill_executed(3, 5, 5);
-    scheduler.begin_prefill_cycle();
+    scheduler.begin_prefill_cycle(false);
+    scheduler.prefill_executed(3, 5, 5, 0);
+    scheduler.begin_prefill_cycle(false);
     units[2] = 30;
     picked   = scheduler.prefill_candidates(slots, 5, units);
     require(picked.size == 4 && picked.lanes[0] == 4 && picked.lanes[1] == 0 &&
@@ -427,54 +438,269 @@ void test_prefill_candidates_follow_the_same_rule() {
             "candidate list ignored the cursor or repeated a lane");
 }
 
+// Runs prefill cycles over `lanes` prefilling lanes whose prompts are `left` tokens long. Each
+// unit is limited by `chunk`, sized by prefill_unit_caps and costs `cost[lane]` ns per token.
+// `regime_of(cycle)` selects the regime. Returns false when a bound or the progress guarantee
+// is violated.
+struct CycleRun {
+    std::uint32_t lanes = 0;
+    std::uint32_t chunk = 0;
+    std::array<std::uint32_t, 6> left{};
+    std::array<std::uint64_t, 6> cost{};
+};
+
+void run_cycles(Scheduler& scheduler, CycleRun run, bool (*waiting)(std::uint32_t),
+                const char* tag) {
+    Slots slots{};
+    for (std::uint32_t lane = 0; lane < run.lanes; ++lane)
+        slots[lane] = request(lane + 1, Request::Phase::Prefill);
+    std::array<std::uint32_t, 6> last{};
+    const auto pacing = scheduler.prefill_pacing();
+    for (std::uint32_t cycle = 1; cycle <= 600; ++cycle) {
+        const bool decode_waiting = waiting(cycle);
+        scheduler.begin_prefill_cycle(decode_waiting);
+        std::uint32_t tokens = 0;
+        std::uint64_t ns     = 0;
+        for (;;) {
+            auto limits = units_of(0);
+            for (std::uint32_t lane = 0; lane < run.lanes; ++lane)
+                if (slots[lane]) limits[lane] = std::min(run.chunk, run.left[lane]);
+            const auto caps = scheduler.prefill_unit_caps(limits);
+            const auto lane = scheduler.next_prefill(slots, run.lanes, caps);
+            if (!lane) break;
+            require(caps[*lane] != 0 && caps[*lane] <= limits[*lane], tag);
+            // The Session may process fewer tokens than the cap.
+            const std::uint32_t done    = caps[*lane] > ((cycle + *lane) % 3)
+                                              ? caps[*lane] - (cycle + *lane) % 3
+                                              : caps[*lane];
+            const std::uint64_t elapsed = std::uint64_t{done} * run.cost[*lane];
+            run.left[*lane] -= done;
+            tokens += done;
+            ns += elapsed;
+            last[*lane] = cycle;
+            scheduler.prefill_executed(*lane, run.lanes, done, elapsed);
+            if (run.left[*lane] == 0) {
+                slots[*lane].reset();
+                scheduler.prefill_lane_released(*lane);
+            }
+        }
+        if (decode_waiting) {
+            require(tokens <= pacing.interleave_tokens_per_cycle, tag);
+        } else {
+            require(tokens <= pacing.throughput_tokens_per_cycle, tag);
+        }
+        bool live = false;
+        for (std::uint32_t lane = 0; lane < run.lanes; ++lane) {
+            if (!slots[lane]) continue;
+            live = true;
+            require(cycle - last[lane] <= run.lanes, tag);
+        }
+        if (!live) return;
+    }
+    throw std::runtime_error(tag);
+}
+
 void test_prefill_progress_and_decode_gap_bounds() {
-    constexpr std::uint32_t chunk = 64;
-    for (const std::uint32_t budget : {0U, 40U, 64U, 100U, 200U, 512U}) {
+    for (const std::uint32_t budget : {16U, 40U, 64U, 100U, 200U, 512U}) {
         for (const std::uint32_t units_cap : {1U, 2U, 5U}) {
             Scheduler scheduler;
-            scheduler.configure_prefill(
-                {.max_units_per_cycle = units_cap, .max_tokens_per_cycle = budget});
-            constexpr std::uint32_t lanes = 5;
-            Slots slots{};
-            std::array<std::uint32_t, lanes> left{300, 64, 10, 200, 130};
-            for (std::uint32_t lane = 0; lane < lanes; ++lane)
-                slots[lane] = request(lane + 1, Request::Phase::Prefill);
-            std::array<std::uint32_t, lanes> last_progress{};
-            for (std::uint32_t cycle = 1; cycle <= 200; ++cycle) {
-                scheduler.begin_prefill_cycle();
-                std::uint32_t executed = 0;
-                while (true) {
-                    auto units = units_of(0);
-                    for (std::uint32_t lane = 0; lane < lanes; ++lane)
-                        if (slots[lane]) units[lane] = std::min(chunk, left[lane]);
-                    const auto lane = scheduler.next_prefill(slots, lanes, units);
-                    if (!lane) break;
-                    // The Session may process fewer tokens than the bound.
-                    const std::uint32_t shrink = (cycle + *lane) % 3;
-                    const std::uint32_t done =
-                        units[*lane] > shrink ? units[*lane] - shrink : units[*lane];
-                    left[*lane] -= std::min(left[*lane], done);
-                    executed += done;
-                    last_progress[*lane] = cycle;
-                    scheduler.prefill_executed(*lane, lanes, done);
-                    if (left[*lane] == 0) slots[*lane].reset();
-                }
-                require(executed <= std::max(budget, chunk),
-                        "cycle prefill tokens exceeded max(budget, unit bound)");
-                bool live = false;
-                for (std::uint32_t lane = 0; lane < lanes; ++lane) {
-                    if (!slots[lane]) continue;
-                    live = true;
-                    require(cycle - last_progress[lane] <= lanes,
-                            "a prefilling lane waited more than k cycles");
-                }
-                if (!live) break;
-            }
-            require(std::all_of(slots.begin(), slots.begin() + lanes,
-                                [](const auto& value) { return value == nullptr; }),
-                    "prefill lanes starved");
+            scheduler.configure_prefill(throughput(budget, units_cap));
+            CycleRun run{.lanes = 5, .chunk = 64, .left = {300, 64, 10, 200, 130}, .cost = {}};
+            run_cycles(
+                scheduler, run, [](std::uint32_t) { return false; },
+                "Throughput prefill violated its allowance or starved a lane");
         }
     }
+}
+
+void test_interleave_bounds_tokens_and_time() {
+    constexpr std::uint64_t cost = 20'000; // ns per token
+    Scheduler scheduler;
+    scheduler.configure_prefill({.throughput_tokens_per_cycle = 4096,
+                                 .throughput_units_per_cycle  = 8,
+                                 .interleave_ns               = 10'000'000,
+                                 .interleave_tokens_per_cycle = 1000,
+                                 .interleave_cold_tokens      = 256,
+                                 .unit_granularity            = 64});
+    scheduler.begin_prefill_cycle(true);
+    require(scheduler.prefill_regime() == PrefillRegime::Interleave &&
+                scheduler.prefill_tokens_remaining() == 1000 &&
+                scheduler.prefill_ns_remaining() == 10'000'000 &&
+                scheduler.prefill_units_remaining() == std::numeric_limits<std::uint32_t>::max(),
+            "an Interleave cycle did not open with the Interleave allowance");
+
+    Slots slots{};
+    for (std::uint32_t lane = 0; lane < 3; ++lane)
+        slots[lane] = request(lane + 1, Request::Phase::Prefill);
+    // Teach every lane its cost, then start a new cycle.
+    for (std::uint32_t lane = 0; lane < 3; ++lane)
+        scheduler.prefill_executed(lane, 3, 100, 100 * cost);
+    scheduler.begin_prefill_cycle(true);
+
+    // 10 ms at 20 us/token affords 500 tokens: below the 1000-token cap, so time binds, and the
+    // unit is a multiple of the 64-token granularity.
+    auto limits = units_of(0);
+    limits.fill(2048);
+    auto caps = scheduler.prefill_unit_caps(limits);
+    require(caps[0] == 448, "a time-bound unit was not the largest granule multiple that fits");
+    // The lane behind it only gets what is left of the time: 56 tokens is below one granule.
+    require(caps[1] == 0 && caps[2] == 0, "a unit below one granule followed the first unit");
+
+    std::uint32_t tokens = 0;
+    std::uint64_t ns     = 0;
+    while (const auto lane =
+               scheduler.next_prefill(slots, 3, scheduler.prefill_unit_caps(limits))) {
+        const auto cap = scheduler.prefill_unit_caps(limits)[*lane];
+        tokens += cap;
+        ns += cap * cost;
+        scheduler.prefill_executed(*lane, 3, cap, cap * cost);
+    }
+    require(tokens <= 1000 && ns <= 10'000'000, "Interleave exceeded its token or time bound");
+
+    // With cheap tokens the token allowance binds, shared in cursor order and exact (not rounded).
+    Scheduler cheap;
+    cheap.configure_prefill(scheduler.prefill_pacing());
+    cheap.begin_prefill_cycle(true);
+    for (std::uint32_t lane = 0; lane < 3; ++lane)
+        cheap.prefill_executed(lane, 3, 1000, 1000 * 1000);
+    cheap.begin_prefill_cycle(true);
+    limits    = units_of(0);
+    limits[0] = limits[1] = limits[2] = 700;
+    caps                              = cheap.prefill_unit_caps(limits);
+    require(caps[0] == 700 && caps[1] == 300 && caps[2] == 0,
+            "the token allowance was not handed out in cursor order");
+    require(cheap.prefill_candidates(slots, 3, caps).size == 2,
+            "an Interleave flight did not follow the caps");
+
+    // The first unit of a cycle gets a granule even when it does not fit the time allowance.
+    scheduler.begin_prefill_cycle(true);
+    scheduler.prefill_executed(0, 3, 1, 5'000'000);
+    scheduler.begin_prefill_cycle(true);
+    limits    = units_of(0);
+    limits[0] = 2048;
+    caps      = scheduler.prefill_unit_caps(limits);
+    require(caps[0] == 64, "the first unit made no progress under a tight time allowance");
+}
+
+void test_throughput_admits_packed_flights() {
+    Scheduler scheduler;
+    scheduler.configure_prefill(throughput(4096, 6));
+    scheduler.begin_prefill_cycle(false);
+    Slots slots{};
+    for (std::uint32_t lane = 0; lane < 6; ++lane)
+        slots[lane] = request(lane + 1, Request::Phase::Prefill);
+
+    // Unequal windows, including 1 and non-multiples of 128, share one flight.
+    auto limits = units_of(0);
+    limits[0]   = 1000;
+    limits[1]   = 300;
+    limits[2]   = 1;
+    limits[3]   = 777;
+    limits[4]   = 2048;
+    limits[5]   = 2048;
+    auto caps   = scheduler.prefill_unit_caps(limits);
+    require(caps[0] == 1000 && caps[1] == 300 && caps[2] == 1 && caps[3] == 777 &&
+                caps[4] == 2018 && caps[5] == 0,
+            "Throughput caps are not the limits truncated by the remaining allowance");
+    const auto flight = scheduler.prefill_candidates(slots, 6, caps);
+    require(flight.size == 5 && flight.lanes[0] == 0 && flight.lanes[4] == 4,
+            "a Throughput flight did not carry every capped segment");
+    std::uint64_t sum = 0;
+    for (const auto lane : flight.lane_span()) sum += caps[lane];
+    require(sum <= 4096, "a packed flight exceeded the Throughput token allowance");
+
+    // Full windows pack as many lanes as the allowance holds; the unit count binds beyond that.
+    scheduler.configure_prefill(throughput(1 << 20, 3));
+    limits.fill(512);
+    caps = scheduler.prefill_unit_caps(limits);
+    require(scheduler.prefill_candidates(slots, 6, caps).size == 3 &&
+                std::count_if(caps.begin(), caps.end(), [](auto cap) { return cap != 0; }) == 3,
+            "the Throughput unit allowance was not applied to the caps");
+}
+
+void test_no_lane_starves_across_regimes() {
+    for (std::uint32_t lanes = 2; lanes <= 6; ++lanes) {
+        Scheduler scheduler;
+        scheduler.configure_prefill({.throughput_tokens_per_cycle = 256,
+                                     .throughput_units_per_cycle  = 4,
+                                     .interleave_ns               = 3'000'000,
+                                     .interleave_tokens_per_cycle = 128,
+                                     .interleave_cold_tokens      = 32,
+                                     .unit_granularity            = 16});
+        CycleRun run{.lanes = lanes,
+                     .chunk = 128,
+                     .left  = {900, 128, 40, 513, 300, 1024},
+                     .cost  = {20'000, 5'000, 80'000, 1'000, 40'000, 10'000}};
+        run_cycles(
+            scheduler, run, [](std::uint32_t) { return true; },
+            "Interleave starved a lane or exceeded its allowance");
+        run_cycles(
+            scheduler, run, [](std::uint32_t cycle) { return cycle % 3 != 0; },
+            "alternating regimes starved a lane or exceeded their allowance");
+    }
+}
+
+void test_cost_estimate_takes_effect() {
+    Scheduler scheduler;
+    scheduler.configure_prefill({.interleave_ns               = 8'000'000,
+                                 .interleave_tokens_per_cycle = 4096,
+                                 .interleave_cold_tokens      = 128,
+                                 .unit_granularity            = 1});
+    require(!scheduler.prefill_cost_ns_per_token(0), "a lane had a cost before any unit ran");
+    scheduler.begin_prefill_cycle(true);
+    scheduler.prefill_executed(0, 2, 200, 200 * 10'000); // 10 us/token
+    scheduler.prefill_executed(1, 2, 200, 200 * 40'000); // 40 us/token
+    require(scheduler.prefill_cost_ns_per_token(0) == 10'000 &&
+                scheduler.prefill_cost_ns_per_token(1) == 40'000,
+            "the first sample did not become the estimate");
+
+    scheduler.begin_prefill_cycle(true);
+    auto limits = units_of(0);
+    limits[0]   = 4096;
+    limits[1]   = 4096;
+    auto caps   = scheduler.prefill_unit_caps(limits);
+    require(caps[0] == 800 && caps[1] == 0, "the cap did not follow the lane's cost");
+    scheduler.begin_prefill_cycle(true);
+    scheduler.prefill_executed(0, 2, 100, 0);
+    limits[0] = 0;
+    caps      = scheduler.prefill_unit_caps(limits);
+    require(caps[1] > 0 && caps[1] <= 8'000'000 / 40'000,
+            "an expensive lane exceeded the time its estimate affords");
+
+    // A new sample moves the estimate toward it, and release forgets it.
+    scheduler.begin_prefill_cycle(true);
+    scheduler.prefill_executed(1, 2, 100, 100 * 20'000);
+    const auto blended = scheduler.prefill_cost_ns_per_token(1);
+    require(blended && *blended > 20'000 && *blended < 40'000,
+            "a new sample did not move the estimate");
+    scheduler.prefill_lane_released(1);
+    require(!scheduler.prefill_cost_ns_per_token(1), "a released lane kept its estimate");
+}
+
+void test_cold_lane_uses_cold_tokens() {
+    Scheduler scheduler;
+    scheduler.configure_prefill({.interleave_ns               = 50'000'000,
+                                 .interleave_tokens_per_cycle = 4096,
+                                 .interleave_cold_tokens      = 192,
+                                 .unit_granularity            = 64});
+    scheduler.begin_prefill_cycle(true);
+    auto limits = units_of(0);
+    limits[0]   = 2048;
+    limits[1]   = 100;
+    limits[2]   = 2048;
+    auto caps   = scheduler.prefill_unit_caps(limits);
+    require(caps[0] == 192 && caps[1] == 100 && caps[2] == 192,
+            "lanes without an estimate were not capped at the cold tokens");
+
+    // Warming lane 0 lifts only its own cap; lane 2 stays cold. Throughput ignores cold tokens.
+    scheduler.prefill_executed(0, 3, 192, 192 * 1'000);
+    scheduler.begin_prefill_cycle(true);
+    caps = scheduler.prefill_unit_caps(limits);
+    require(caps[0] > 192 && caps[2] == 192, "a warm lane stayed at the cold tokens");
+    scheduler.begin_prefill_cycle(false);
+    require(scheduler.prefill_unit_caps(limits)[2] == 2048 ||
+                scheduler.prefill_unit_caps(limits)[2] > 192,
+            "Throughput applied the Interleave cold tokens");
 }
 
 void test_decode_and_control_membership() {
@@ -519,6 +745,11 @@ int main() {
         test_prefill_cycle_budget();
         test_prefill_candidates_follow_the_same_rule();
         test_prefill_progress_and_decode_gap_bounds();
+        test_interleave_bounds_tokens_and_time();
+        test_throughput_admits_packed_flights();
+        test_no_lane_starves_across_regimes();
+        test_cost_estimate_takes_effect();
+        test_cold_lane_uses_cold_tokens();
         test_decode_and_control_membership();
         std::cout << "ok\n";
         return 0;

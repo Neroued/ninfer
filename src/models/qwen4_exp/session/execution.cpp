@@ -30,6 +30,8 @@ std::optional<PlePrefetch> prefetch(const detail::SessionImpl& p, const detail::
 
 std::uint32_t Session::prefill_pack_limit() const noexcept { return 1; }
 
+std::uint32_t Session::prefill_pack_tokens() const noexcept { return impl_->shape.prefill_chunk; }
+
 std::optional<PrefillStart> Session::start_prefill(std::span<const SequenceHandle> sequences,
                                                    std::span<const bool> constrained_rows) {
     if (sequences.empty() ||
@@ -43,8 +45,12 @@ std::optional<PrefillStart> Session::start_prefill(std::span<const SequenceHandl
     if (s.phase != detail::Phase::Prefill || !s.permit || s.capture_pending)
         throw std::logic_error("prefill has no executable unit");
     const auto frontier = s.continuation.metadata.main_frontier;
+    // The permitted frontier holds the reserved capacity; the permit's tokens cap the window.
     const auto end =
-        p.window_end(s, frontier, std::min(s.permitted_frontier, s.request->summary.prompt_tokens));
+        p.window_end(s, frontier,
+                     detail::capped_end(
+                         frontier, std::min(s.permitted_frontier, s.request->summary.prompt_tokens),
+                         s.permit->tokens));
     const bool capture = s.capture && s.captures[s.next_capture].frontier == end;
     const bool sample  = end == s.request->summary.prompt_tokens && !capture;
     auto reservation   = p.executor->try_reserve(runtime::FrameKind::Compute);
@@ -80,7 +86,10 @@ std::optional<runtime::ExecutionTicket> Session::start_replay(SequenceHandle han
     if (s.phase != detail::Phase::Replay || !s.permit || s.capture_pending)
         throw std::logic_error("replay has no executable unit");
     const auto begin = s.continuation.metadata.main_frontier;
-    const auto end   = p.window_end(s, begin, std::min(s.permitted_frontier, s.replay_target));
+    const auto end =
+        p.window_end(s, begin,
+                     detail::capped_end(begin, std::min(s.permitted_frontier, s.replay_target),
+                                        s.permit->tokens));
     if (end <= begin) throw std::logic_error("replay has no missing input window");
     auto reservation = p.executor->try_reserve(runtime::FrameKind::Compute);
     if (!reservation) return {};

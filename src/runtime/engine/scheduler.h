@@ -17,19 +17,37 @@
 
 namespace ninfer::runtime {
 
-// Per-cycle prefill budget. A cycle is the span between two begin_prefill_cycle() calls; the
-// Engine runs one Decode round per cycle, so this budget bounds the prefill work between two
-// consecutive decode rounds.
-struct PrefillPolicy {
-    // Unit count that may start in one cycle, including the unconditional first unit.
-    std::uint32_t max_units_per_cycle = std::numeric_limits<std::uint32_t>::max();
-    // Token allowance for the units that follow the first one in the same cycle.
-    std::uint32_t max_tokens_per_cycle = std::numeric_limits<std::uint32_t>::max();
+// Which budget a prefill cycle runs under. A cycle is the span between two begin_prefill_cycle()
+// calls; the Engine runs one Decode round per cycle.
+//  - Throughput: no lane is waiting for a decode round, so prefill is bounded only by the
+//    throughput token and unit allowance (the Session's pack capacity), never by time.
+//  - Interleave: at least one lane waits for the next decode round, so the prefill work in front
+//    of it is bounded by a token allowance and by a predicted wall-clock allowance.
+enum class PrefillRegime : std::uint8_t { Throughput, Interleave };
+
+// Per-cycle prefill allowance. The Engine derives it once (EngineCore::prefill_pacing); the
+// Scheduler only applies it.
+struct PrefillPacing {
+    // Throughput cycle: tokens and units (a packed segment counts as one unit) that may start.
+    std::uint32_t throughput_tokens_per_cycle = std::numeric_limits<std::uint32_t>::max();
+    std::uint32_t throughput_units_per_cycle  = std::numeric_limits<std::uint32_t>::max();
+    // Interleave cycle: wall-clock allowance and token allowance of the prefill work between two
+    // consecutive decode rounds.
+    std::uint64_t interleave_ns               = std::numeric_limits<std::uint64_t>::max();
+    std::uint32_t interleave_tokens_per_cycle = std::numeric_limits<std::uint32_t>::max();
+    // Interleave tokens for a lane that has no cost estimate yet (first unit after binding).
+    std::uint32_t interleave_cold_tokens = std::numeric_limits<std::uint32_t>::max();
+    // A unit sized by the time allowance is a multiple of this; below it the allowance is spent
+    // on one granule only when the unit is the first of its cycle. Truncation by the token
+    // allowance or by a lane's own limit is exact and may produce any length.
+    std::uint32_t unit_granularity = 1;
 };
 
-// Upper bound of tokens the next prefill/replay unit of each lane may process, indexed by
-// lane. The Engine fills it from its prefill chunk and the lane's remaining suffix; entries of
-// lanes that are not prefilling are ignored.
+// Tokens of the next prefill/replay unit of each lane, indexed by lane. As an input
+// (`limits`) it is the most a lane could process: the Engine fills it from its prefill chunk and
+// the lane's remaining suffix, and 0 marks a lane that takes no part. As an output
+// (`prefill_unit_caps`) it is the upper bound the unit may process; 0 means the allowance
+// admits no unit for that lane in this cycle.
 using PrefillUnitTokens = std::array<std::uint32_t, kMaximumConcurrency>;
 
 struct PrefillMembership {
@@ -49,7 +67,8 @@ class Scheduler {
 public:
     using RequestPtr        = std::shared_ptr<Request>;
     using SequenceHandle    = typename Request::SequenceHandle;
-    using PrefillPolicy     = ::ninfer::runtime::PrefillPolicy;
+    using PrefillPacing     = ::ninfer::runtime::PrefillPacing;
+    using PrefillRegime     = ::ninfer::runtime::PrefillRegime;
     using PrefillUnitTokens = ::ninfer::runtime::PrefillUnitTokens;
     using PrefillMembership = ::ninfer::runtime::PrefillMembership;
 
@@ -154,56 +173,143 @@ public:
         return membership;
     }
 
-    // Prefill cycle contract (the Engine runs Decode once per cycle and Prefill after it):
-    //  - Admission: the first unit of a cycle is always admitted. A later unit is admitted
-    //    only when its declared tokens fit prefill_tokens_remaining() and fewer than
-    //    max_units_per_cycle units have started.
-    //  - Order: lanes are visited round-robin from the cursor, which moves past a lane only
-    //    when prefill_executed() reports it. The first eligible lane that does not fit ends
-    //    the cycle and keeps the cursor, so the next cycle starts with it (no skipping).
-    //  - Charging: prefill_executed() charges the tokens the Session actually processed.
-    //  - Bound: prefill tokens executed in one cycle <= max(max_tokens_per_cycle, largest
-    //    unit_tokens). Every unit_tokens <= prefill_chunk, so with a decode-ready lane the
-    //    prefill work between two consecutive decode rounds is at most
-    //    max(max_tokens_per_cycle, prefill_chunk).
+    // Prefill pacing contract. The Engine runs Control, then Decode, then Prefill in a cycle; the
+    // Scheduler bounds how much Prefill work follows between two consecutive decode rounds.
+    //  - Regime: begin_prefill_cycle(decode_waiting) fixes the regime of the cycle.
+    //    decode_waiting is true when a lane that is not blocked by a capture waits for a decode
+    //    or control round. Interleave then, Throughput otherwise.
+    //  - Allowance: a Throughput cycle may start throughput_units_per_cycle units and
+    //    throughput_tokens_per_cycle tokens. An Interleave cycle may process
+    //    interleave_tokens_per_cycle tokens and spend interleave_ns of wall-clock time. Both
+    //    are charged with what prefill_executed() reports, so the allowance left is
+    //    prefill_tokens_remaining(), prefill_units_remaining() and prefill_ns_remaining().
+    //    Units are unbounded and time is unlimited where the regime does not use them.
+    //  - Caps: prefill_unit_caps(limits) hands the remaining allowance to the lanes in
+    //    round-robin order from the cursor. A lane gets min(limit, tokens left); under
+    //    Interleave also the tokens its predicted cost (prefill_cost_ns_per_token) fits into the
+    //    time left, rounded down to unit_granularity, or interleave_cold_tokens while the lane
+    //    has no estimate. The caps of one call add up to at most the allowance, and the
+    //    first unit of a cycle always receives at least one granule, so a cycle makes
+    //    progress whatever its lanes cost. The Engine passes a cap to the Session as the
+    //    unit's token upper bound.
+    //  - Admission: next_prefill() and prefill_candidates() visit eligible lanes round-robin
+    //    from the cursor. A lane is admitted when its cap is non-zero and it fits what is left
+    //    behind the lanes ahead of it: units, tokens and, under Interleave, predicted time. The
+    //    first unit of a cycle is always admitted. The first eligible lane that does not fit
+    //    ends the cycle and keeps the cursor, so the next cycle starts with it (no skipping).
+    //  - Charging: prefill_executed() charges the tokens the Session actually processed and the
+    //    wall-clock time of the unit, and moves the cursor past the lane. The elapsed time of
+    //    a packed flight is attributed to its segments in proportion to their tokens by the
+    //    caller. It also updates the lane's ns/token estimate (exponential average, the first
+    //    sample taken as is). prefill_lane_released() forgets the estimate when the lane no
+    //    longer belongs to the request that produced it.
+    //  - Bound: under Interleave the tokens processed in a cycle never exceed
+    //    interleave_tokens_per_cycle, and the predicted time of the units admitted after the
+    //    first never exceeds interleave_ns. Under Throughput the tokens never exceed
+    //    throughput_tokens_per_cycle.
     //  - Progress: with k eligible prefilling lanes, each lane advances at least one unit
     //    within k cycles, because the first unit of each cycle goes to the lane the cursor
     //    points at and the cursor passes it afterwards.
-    // A cycle ends by budget whether or not a decode-ready lane exists, so the Engine's
+    // A cycle ends by allowance whether or not a decode-ready lane exists, so the Engine's
     // begin_cycle runs on schedule.
-    void configure_prefill(PrefillPolicy policy) {
-        prefill_policy_ = policy;
-        begin_prefill_cycle();
+    void configure_prefill(PrefillPacing pacing) {
+        pacing.throughput_tokens_per_cycle = std::max(pacing.throughput_tokens_per_cycle, 1U);
+        pacing.throughput_units_per_cycle  = std::max(pacing.throughput_units_per_cycle, 1U);
+        pacing.interleave_tokens_per_cycle = std::max(pacing.interleave_tokens_per_cycle, 1U);
+        pacing.interleave_cold_tokens      = std::max(pacing.interleave_cold_tokens, 1U);
+        pacing.unit_granularity            = std::max(pacing.unit_granularity, 1U);
+        prefill_pacing_                    = pacing;
+        begin_prefill_cycle(false);
     }
 
-    [[nodiscard]] const PrefillPolicy& prefill_policy() const noexcept { return prefill_policy_; }
+    [[nodiscard]] const PrefillPacing& prefill_pacing() const noexcept { return prefill_pacing_; }
 
-    void begin_prefill_cycle() noexcept {
+    void begin_prefill_cycle(bool decode_waiting) noexcept {
+        prefill_regime_ = decode_waiting ? PrefillRegime::Interleave : PrefillRegime::Throughput;
         prefill_units_started_ = 0;
-        prefill_tokens_left_   = prefill_policy_.max_tokens_per_cycle;
+        if (decode_waiting) {
+            prefill_tokens_left_ = prefill_pacing_.interleave_tokens_per_cycle;
+            prefill_ns_left_     = prefill_pacing_.interleave_ns;
+        } else {
+            prefill_tokens_left_ = prefill_pacing_.throughput_tokens_per_cycle;
+            prefill_ns_left_     = std::numeric_limits<std::uint64_t>::max();
+        }
     }
+
+    [[nodiscard]] PrefillRegime prefill_regime() const noexcept { return prefill_regime_; }
 
     [[nodiscard]] std::uint32_t prefill_tokens_remaining() const noexcept {
         return prefill_tokens_left_;
     }
 
+    // Units that may still start. Interleave does not count units: it returns the maximum.
     [[nodiscard]] std::uint32_t prefill_units_remaining() const noexcept {
-        return prefill_units_started_ >= prefill_policy_.max_units_per_cycle
+        if (prefill_regime_ == PrefillRegime::Interleave)
+            return std::numeric_limits<std::uint32_t>::max();
+        return prefill_units_started_ >= prefill_pacing_.throughput_units_per_cycle
                    ? 0U
-                   : prefill_policy_.max_units_per_cycle - prefill_units_started_;
+                   : prefill_pacing_.throughput_units_per_cycle - prefill_units_started_;
+    }
+
+    // Wall-clock time left under Interleave. Throughput is not time-bounded: the maximum.
+    [[nodiscard]] std::uint64_t prefill_ns_remaining() const noexcept { return prefill_ns_left_; }
+
+    // The ns/token estimate of a lane; nullopt until a unit of the lane has been reported.
+    [[nodiscard]] std::optional<std::uint64_t>
+    prefill_cost_ns_per_token(std::uint32_t lane) const noexcept {
+        if (lane >= kMaximumConcurrency || prefill_cost_ns_[lane] == 0) return std::nullopt;
+        return prefill_cost_ns_[lane];
+    }
+
+    // The most each lane's next unit may process when the lanes run back to back from the cursor
+    // in this cycle. `limits[lane] == 0` leaves a lane out. A lane the allowance no longer
+    // reaches gets 0, and so does every lane behind it.
+    [[nodiscard]] PrefillUnitTokens
+    prefill_unit_caps(const PrefillUnitTokens& limits) const noexcept {
+        PrefillUnitTokens caps{};
+        const bool interleave     = prefill_regime_ == PrefillRegime::Interleave;
+        const std::uint64_t grain = prefill_pacing_.unit_granularity;
+        std::uint64_t tokens_left = prefill_tokens_left_;
+        std::uint64_t ns_left     = prefill_ns_left_;
+        std::uint64_t units_left  = prefill_units_remaining();
+        bool first                = prefill_units_started_ == 0;
+        for (std::uint32_t offset = 0; offset < kMaximumConcurrency; ++offset) {
+            const std::uint32_t lane = (prefill_cursor_ + offset) % kMaximumConcurrency;
+            if (limits[lane] == 0) continue;
+            if (units_left == 0 || tokens_left == 0 || (!first && interleave && ns_left == 0))
+                break;
+            std::uint64_t cap        = std::min<std::uint64_t>(limits[lane], tokens_left);
+            const std::uint64_t cost = prefill_cost_ns_[lane];
+            if (interleave && cost == 0) {
+                cap = std::min<std::uint64_t>(cap, prefill_pacing_.interleave_cold_tokens);
+            } else if (interleave) {
+                const std::uint64_t affordable = ns_left / cost;
+                if (affordable < cap) {
+                    const std::uint64_t rounded = affordable - affordable % grain;
+                    cap = rounded != 0 ? rounded : (first ? std::min(cap, grain) : 0);
+                }
+            }
+            if (cap == 0) break;
+            caps[lane] = static_cast<std::uint32_t>(cap);
+            tokens_left -= cap;
+            --units_left;
+            if (interleave && cost != 0) ns_left -= std::min(ns_left, saturating_mul(cap, cost));
+            first = false;
+        }
+        return caps;
     }
 
     // The lane that runs next in this cycle; nullopt when no lane is eligible or the first
-    // eligible lane does not fit the remaining budget.
+    // eligible lane does not fit the allowance left.
     template <class Slots>
     [[nodiscard]] std::optional<std::uint32_t>
     next_prefill(const Slots& slots, std::uint32_t concurrency,
-                 const PrefillUnitTokens& unit_tokens) const noexcept {
+                 const PrefillUnitTokens& caps) const noexcept {
         for (std::uint32_t offset = 0; offset < concurrency; ++offset) {
             const std::uint32_t lane = (prefill_cursor_ + offset) % concurrency;
             if (!prefill_eligible(slots[lane])) continue;
-            return prefill_admits(unit_tokens[lane], 0, 0) ? std::optional<std::uint32_t>(lane)
-                                                           : std::nullopt;
+            return prefill_admits(lane, caps[lane], 0, 0, 0) ? std::optional<std::uint32_t>(lane)
+                                                             : std::nullopt;
         }
         return std::nullopt;
     }
@@ -213,26 +319,43 @@ public:
     template <class Slots>
     [[nodiscard]] PrefillMembership
     prefill_candidates(const Slots& slots, std::uint32_t concurrency,
-                       const PrefillUnitTokens& unit_tokens) const noexcept {
+                       const PrefillUnitTokens& caps) const noexcept {
         PrefillMembership membership;
-        std::uint64_t charged = 0;
+        std::uint64_t charged_tokens = 0;
+        std::uint64_t charged_ns     = 0;
         for (std::uint32_t offset = 0; offset < concurrency; ++offset) {
             const std::uint32_t lane = (prefill_cursor_ + offset) % concurrency;
             if (!prefill_eligible(slots[lane])) continue;
-            if (!prefill_admits(unit_tokens[lane], charged, membership.size)) break;
+            if (!prefill_admits(lane, caps[lane], charged_tokens, charged_ns, membership.size))
+                break;
             membership.lanes[membership.size++] = lane;
-            charged += unit_tokens[lane];
+            charged_tokens += caps[lane];
+            charged_ns += predicted_ns(lane, caps[lane]);
         }
         return membership;
     }
 
-    // Reports a finished unit with the tokens it actually processed.
-    void prefill_executed(std::uint32_t lane, std::uint32_t concurrency,
-                          std::uint32_t tokens) noexcept {
-        prefill_cursor_ = (lane + 1U) % concurrency;
+    // Reports a finished unit: the tokens it actually processed and the wall-clock time it took.
+    // For a segment of a packed flight the caller passes its token share of the flight's time.
+    void prefill_executed(std::uint32_t lane, std::uint32_t concurrency, std::uint32_t tokens,
+                          std::uint64_t elapsed_ns) noexcept {
+        prefill_cursor_ = concurrency == 0 ? 0U : (lane + 1U) % concurrency;
         if (prefill_units_started_ < std::numeric_limits<std::uint32_t>::max())
             ++prefill_units_started_;
         prefill_tokens_left_ = tokens >= prefill_tokens_left_ ? 0U : prefill_tokens_left_ - tokens;
+        if (prefill_regime_ == PrefillRegime::Interleave)
+            prefill_ns_left_ = elapsed_ns >= prefill_ns_left_ ? 0U : prefill_ns_left_ - elapsed_ns;
+        if (lane < kMaximumConcurrency && tokens != 0 && elapsed_ns != 0) {
+            const std::uint64_t sample =
+                std::max<std::uint64_t>(1, (elapsed_ns + tokens / 2) / tokens);
+            auto& cost = prefill_cost_ns_[lane];
+            cost       = cost == 0 ? sample : std::max<std::uint64_t>(1, (cost + sample + 1) / 2);
+        }
+    }
+
+    // The lane no longer belongs to the request whose units produced its estimate.
+    void prefill_lane_released(std::uint32_t lane) noexcept {
+        if (lane < kMaximumConcurrency) prefill_cost_ns_[lane] = 0;
     }
 
     // Queue/capacity changes start a bounded pass. Ordinary decode cycles only continue
@@ -393,11 +516,15 @@ public:
     static constexpr std::uint64_t maximum_service_ns = 4 * service_quantum_ns;
 
 private:
-    PrefillPolicy prefill_policy_;
+    PrefillPacing prefill_pacing_;
+    PrefillRegime prefill_regime_ = PrefillRegime::Throughput;
     std::uint32_t prefill_cursor_ = 0;
     // Units reported finished in this cycle, and the allowance they left behind.
     std::uint32_t prefill_units_started_ = 0;
     std::uint32_t prefill_tokens_left_   = std::numeric_limits<std::uint32_t>::max();
+    std::uint64_t prefill_ns_left_       = std::numeric_limits<std::uint64_t>::max();
+    // ns/token estimate per lane; 0 = none.
+    std::array<std::uint64_t, kMaximumConcurrency> prefill_cost_ns_{};
 
     template <class Slot>
     [[nodiscard]] static bool prefill_eligible(const Slot& request) noexcept {
@@ -405,15 +532,34 @@ private:
                !request->capture_pending;
     }
 
-    // `earlier_units`/`earlier_tokens` are units already placed ahead of this one in the
-    // same candidate list, on top of what finished earlier in the cycle.
-    [[nodiscard]] bool prefill_admits(std::uint32_t tokens, std::uint64_t earlier_tokens,
+    [[nodiscard]] static std::uint64_t saturating_mul(std::uint64_t a, std::uint64_t b) noexcept {
+        return a != 0 && b > std::numeric_limits<std::uint64_t>::max() / a
+                   ? std::numeric_limits<std::uint64_t>::max()
+                   : a * b;
+    }
+
+    // Predicted time of a unit; 0 for a lane without an estimate, whose size is bounded by
+    // interleave_cold_tokens instead.
+    [[nodiscard]] std::uint64_t predicted_ns(std::uint32_t lane,
+                                             std::uint32_t tokens) const noexcept {
+        return saturating_mul(tokens, prefill_cost_ns_[lane]);
+    }
+
+    // `earlier_*` are the tokens, predicted time and units already placed ahead of this one in
+    // the same candidate list, on top of what finished earlier in the cycle.
+    [[nodiscard]] bool prefill_admits(std::uint32_t lane, std::uint32_t tokens,
+                                      std::uint64_t earlier_tokens, std::uint64_t earlier_ns,
                                       std::uint64_t earlier_units) const noexcept {
+        if (tokens == 0) return false;
         if (prefill_units_started_ == 0 && earlier_units == 0) return true;
-        if (prefill_units_started_ + earlier_units >= prefill_policy_.max_units_per_cycle)
+        if (earlier_units >= prefill_units_remaining()) return false;
+        if (earlier_tokens > prefill_tokens_left_ || tokens > prefill_tokens_left_ - earlier_tokens)
             return false;
-        return earlier_tokens <= prefill_tokens_left_ &&
-               tokens <= prefill_tokens_left_ - earlier_tokens;
+        if (prefill_regime_ == PrefillRegime::Interleave) {
+            if (prefill_ns_left_ == 0 || earlier_ns > prefill_ns_left_) return false;
+            if (predicted_ns(lane, tokens) > prefill_ns_left_ - earlier_ns) return false;
+        }
+        return true;
     }
 
     std::uint64_t scan_after_          = 0;

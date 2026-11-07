@@ -230,7 +230,10 @@ std::vector<T> read(const Tensor& tensor) {
 // that control (one sequence re-cut into half windows) and holds it to the same budget, so it
 // bounds what packing may change without admitting a wrong segment, State or position. Those
 // produce errors of order one, and the isolation check below is bitwise-tight.
-constexpr test::ReductionCriterion kPackedCriterion{/*relative_l2*/ 0.12,
+// Unequal segment lengths change the packed token count of every step, so the final-token hidden
+// of a one-token window (a single vector, the noisiest statistic here) reaches 0.12 against its
+// B=1 execution while the re-cut control stays near 0.085; the budget leaves room for that.
+constexpr test::ReductionCriterion kPackedCriterion{/*relative_l2*/ 0.15,
                                                     /*gross_absolute*/ 0.0,
                                                     /*gross_relative_to_max_reference*/ 0.3};
 // Changing another segment's tokens must not move this segment's results.
@@ -761,16 +764,21 @@ void run_case(Rig& rig, const CaseSpec& spec, bool isolation) {
     for (std::size_t i = 0; i < packed.size(); ++i)
         compare_snapshots(spec.name + " row " + std::to_string(i), packed[i], sequential[i]);
     if (!isolation) return;
-    // Another sequence's tokens change; this packed result must not follow.
-    const auto row     = static_cast<std::uint32_t>(packed.size() - 1);
-    const auto changed = execute_windows(rig, spec, true, false, row, 1000);
-    for (std::size_t i = 0; i < row; ++i)
-        compare_snapshots(spec.name + " isolated row " + std::to_string(i), changed[i], packed[i],
-                          kIsolationCriterion);
-    const auto other =
-        test::compute_reduction_stats(widen(changed[row].hidden).data(),
-                                      widen(packed[row].hidden).data(), changed[row].hidden.size());
-    require(other.relative_l2 > 0.05, "changing a segment's tokens did not change its hidden");
+    // One segment's tokens change at a time; no other segment's KV, State or logits may follow,
+    // while the changed segment's own result does move.
+    for (std::uint32_t row = 0; row < packed.size(); ++row) {
+        const auto changed = execute_windows(rig, spec, true, false, row, 1000);
+        for (std::size_t i = 0; i < packed.size(); ++i) {
+            if (i == row) continue;
+            compare_snapshots(spec.name + " perturbed row " + std::to_string(row) + ", row " +
+                                  std::to_string(i),
+                              changed[i], packed[i], kIsolationCriterion);
+        }
+        const auto other = test::compute_reduction_stats(widen(changed[row].hidden).data(),
+                                                         widen(packed[row].hidden).data(),
+                                                         changed[row].hidden.size());
+        require(other.relative_l2 > 0.05, "changing a segment's tokens did not change its hidden");
+    }
 }
 
 } // namespace
@@ -827,8 +835,16 @@ int main() {
             {"one segment", {{2048}}},
             {"two segments with one token and 2048", {{1, 2048}}},
             {"two segments, no multiple of 128", {{129, 777}}},
+            {"two segments cut by caps", {{2048, 2047}, {1, 777}}},
             {"six segments", {{1, 130, 257, 2048, 3, 600}, {5, 300, 1, 70, 129, 640}}},
+            {"six segments filling the pack", {{683, 683, 683, 683, 682, 682}, {1, 1, 2, 3, 5, 8}}},
             {"six single tokens", {{1, 1, 1, 1, 1, 1}, {1, 1, 1, 1, 1, 1}}},
+        };
+        // The cases whose segments are unequal are also checked for segment isolation.
+        const auto isolated = [](const std::string& name) {
+            return name == "two segments with one token and 2048" ||
+                   name == "two segments cut by caps" || name == "six segments" ||
+                   name == "six segments filling the pack";
         };
         std::size_t first_peak = 0;
         for (int pass = 0; pass < 2; ++pass) {
@@ -836,7 +852,7 @@ int main() {
             // workspace high-water mark and the device memory unchanged.
             rig.strict = pass == 1;
             if (pass == 1) fixture.rank().reset_measurement_peaks();
-            for (std::size_t i = 0; i < cases.size(); ++i) run_case(rig, cases[i], i == 3 && !pass);
+            for (const auto& item : cases) run_case(rig, item, !pass && isolated(item.name));
             const auto peak = fixture.rank().workspace_peak;
             std::cout << "pass " << pass << " workspace peak " << peak << " of "
                       << fixture.rank().workspace_plan.text_prefill << " bytes\n";

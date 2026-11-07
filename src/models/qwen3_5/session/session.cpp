@@ -331,6 +331,8 @@ bool Session::has_context_operation() const noexcept { return impl_->has_context
 
 std::uint32_t Session::prefill_pack_limit() const noexcept { return impl_->prefill_pack_limit(); }
 
+std::uint32_t Session::prefill_pack_tokens() const noexcept { return impl_->prefill_pack_tokens(); }
+
 std::optional<PrefillStart> Session::start_prefill(std::span<const SequenceHandle> sequences,
                                                    std::span<const bool> constrained) {
     return impl_->start_prefill(sequences, constrained);

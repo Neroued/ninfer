@@ -143,7 +143,10 @@ enum class ExecutionUnitKind : std::uint8_t { Prefill, Replay, Decode, Control }
 struct ExecutionUnit {
     SequenceHandle sequence;
     ExecutionUnitKind kind = ExecutionUnitKind::Decode;
-    std::uint32_t tokens   = 0;
+    // Decode: remaining output budget. Control: exact forced span. Prefill/Replay: upper bound on
+    // the prompt positions the window covers from the sequence's frontier; zero leaves the window
+    // to the Session.
+    std::uint32_t tokens = 0;
 };
 
 class PendingBatch {
@@ -401,6 +404,8 @@ public:
 
     // This model runs one prefill window per execution.
     [[nodiscard]] std::uint32_t prefill_pack_limit() const noexcept;
+    // The window is one prefill chunk at most, so that is the capacity of an execution.
+    [[nodiscard]] std::uint32_t prefill_pack_tokens() const noexcept;
     // Admits the first sequence of `sequences`; `constrained` is empty or parallel to it.
     [[nodiscard]] std::optional<PrefillStart>
     start_prefill(std::span<const SequenceHandle> sequences, std::span<const bool> constrained);

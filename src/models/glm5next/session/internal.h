@@ -9,6 +9,16 @@
 #include <deque>
 
 namespace ninfer::models::glm5next::detail {
+
+// End of a prefill/replay window that covers at most `tokens` prompt positions from `begin`;
+// zero leaves the window to the Session.
+[[nodiscard]] inline std::uint32_t capped_end(std::uint32_t begin, std::uint32_t end,
+                                              std::uint32_t tokens) noexcept {
+    return tokens == 0 ? end
+                       : static_cast<std::uint32_t>(
+                             std::min<std::uint64_t>(end, std::uint64_t{begin} + tokens));
+}
+
 using Image        = context::StateId;
 using Continuation = context::Continuation<ContinuationMetadata>;
 

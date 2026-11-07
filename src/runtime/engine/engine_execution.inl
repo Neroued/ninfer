@@ -258,10 +258,19 @@ void EngineCore<Instance>::resolve_prefill_flight(
     if (progress.rows.size() != flight.requests.size() || progress.rows.empty()) {
         throw std::logic_error("prefill result changed its frozen membership");
     }
+    // The wall clock of the whole flight is shared by its segments in proportion to their tokens.
+    const auto elapsed            = elapsed_ns(flight.started, Clock::now());
+    std::uint64_t unshared_ns     = elapsed;
+    std::uint64_t unshared_tokens = 0;
+    for (const auto& row : progress.rows) unshared_tokens += row.processed_prompt_tokens;
     for (std::size_t row = 0; row < progress.rows.size(); ++row) {
-        scheduler_.prefill_executed(flight.lanes[row], max_concurrency_,
-                                    progress.rows[row].processed_prompt_tokens);
-        flight.progressed[row] = progress.rows[row].processed_prompt_tokens != 0;
+        const std::uint32_t tokens = progress.rows[row].processed_prompt_tokens;
+        const std::uint64_t share =
+            unshared_tokens == 0 ? 0 : unshared_ns * tokens / unshared_tokens;
+        scheduler_.prefill_executed(flight.lanes[row], max_concurrency_, tokens, share);
+        unshared_ns -= share;
+        unshared_tokens -= tokens;
+        flight.progressed[row] = tokens != 0;
     }
     record_service(flight);
     for (std::size_t row = 0; row < progress.rows.size(); ++row) {
@@ -363,6 +372,7 @@ template <class Instance>
     }
     std::optional<ExecutionTicket> ticket;
     std::size_t segments = 1;
+    flight.started       = Clock::now();
     ExecutionCallScope call(*this);
     if (replay) {
         ticket = instance_.session->start_replay(flight.sequences.front());
@@ -618,7 +628,8 @@ template <class Instance>
                        std::get_if<typename ModelContract::ReplayProgress>(&event->result)) {
             const auto& request = flight.requests.front();
             scheduler_.prefill_executed(flight.lanes.front(), max_concurrency_,
-                                        replay->processed_tokens);
+                                        replay->processed_tokens,
+                                        elapsed_ns(flight.started, Clock::now()));
             request->replayed_tokens += replay->processed_tokens;
             cumulative_stats_.replayed_tokens += replay->processed_tokens;
             if (replay->capture_ready) reserve_active_capture(request, EngineRequestState::Replay);

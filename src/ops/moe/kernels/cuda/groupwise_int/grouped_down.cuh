@@ -5,8 +5,6 @@
 #include "ops/common/cuda/mma.cuh"
 
 namespace ninfer::ops::detail::moe_cuda::groupwise_int {
-using common::Q5MmaDecodeAtom;
-using common::Q6MmaDecodeAtom;
 using common::store_vec;
 using common::cp_async;
 using common::cp_async_zfill;
@@ -17,14 +15,46 @@ using common::mma_bf16;
 using common::ldmatrix_x2;
 using common::ldmatrix_x4;
 
+// `lo` and `hi` carry, in four byte lanes, the low and high nibbles of four code bytes together
+// with the code's remaining high bits, as offset-binary integers u. Offset-binary values are
+// formed in the low mantissa bits of BF16 128.0 + u, so subtracting `bias` = 128 + offset yields
+// the signed integers exactly, as BF16 pairs in weight order.
+__device__ __forceinline__ void offset_pairs(unsigned lo, unsigned hi, unsigned bias,
+                                             unsigned (&out)[4]) {
+    constexpr unsigned kMagic = 0x43004300u; // BF16 128.0 in both halves
+    const unsigned even       = __byte_perm(lo, hi, 0x5140);
+    const unsigned odd        = __byte_perm(lo, hi, 0x7362);
+    const unsigned biased[4]  = {__byte_perm(even, kMagic, 0x7150),
+                                 __byte_perm(even, kMagic, 0x7372),
+                                 __byte_perm(odd, kMagic, 0x7150),
+                                 __byte_perm(odd, kMagic, 0x7372)};
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const __nv_bfloat162 value = __hsub2(*reinterpret_cast<const __nv_bfloat162*>(&biased[i]),
+                                             *reinterpret_cast<const __nv_bfloat162*>(&bias));
+        out[i]                     = *reinterpret_cast<const unsigned*>(&value);
+    }
+}
+
+// A codec decodes eight codes (four packed bytes plus their high-bit bytes) into the unscaled
+// signed integers; the kernel applies the group scale to its FP32 partial sums.
 struct Q5DownMma {
     static constexpr int kCodeBytes    = common::Q5RowSplitStorage::kCodeBytesPerGroup;
     static constexpr int kHighBytes    = common::Q5RowSplitStorage::kHighBytesPerGroup;
     static constexpr int kHighPerChunk = common::Q5RowSplitStorage::kHighBytesPerChunk;
 
-    __device__ static __forceinline__ void
-    decode_eight(unsigned word, const std::uint8_t* high_chunk, float scale, unsigned (&out)[4]) {
-        Q5MmaDecodeAtom::decode_eight(word, high_chunk, scale, out);
+    __device__ static __forceinline__ void decode_eight(unsigned word,
+                                                        const std::uint8_t* high_chunk,
+                                                        unsigned (&out)[4]) {
+        // Bit 4 of a code is its sign bit; the complemented plane makes the codes offset binary.
+        const unsigned high = ~static_cast<unsigned>(high_chunk[0]) & 0xffu;
+        // Plane bit 2i belongs to the low nibble of byte i and bit 2i + 1 to its high nibble.
+        // The product moves bit 2i to bit 8i + 4; the other partial products add carries only
+        // into bits that the mask drops.
+        const unsigned spread_lo = ((high & 0x55u) * 0x00410410u) & 0x10101010u;
+        const unsigned spread_hi = (((high >> 1) & 0x55u) * 0x00410410u) & 0x10101010u;
+        offset_pairs((word & 0x0f0f0f0fu) | spread_lo, ((word >> 4) & 0x0f0f0f0fu) | spread_hi,
+                     0x43104310u, out); // 128 + 16
     }
 };
 
@@ -33,36 +63,61 @@ struct Q6DownMma {
     static constexpr int kHighBytes    = common::Q6RowSplitStorage::kHighBytesPerGroup;
     static constexpr int kHighPerChunk = common::Q6RowSplitStorage::kHighBytesPerChunk;
 
-    __device__ static __forceinline__ void
-    decode_eight(unsigned word, const std::uint8_t* high_chunk, float scale, unsigned (&out)[4]) {
-        Q6MmaDecodeAtom::decode_eight(word, high_chunk, scale, out);
+    __device__ static __forceinline__ void decode_eight(unsigned word,
+                                                        const std::uint8_t* high_chunk,
+                                                        unsigned (&out)[4]) {
+        // Each byte owns four plane bits: two for its low nibble, then two for its high nibble.
+        // The top bit of a field is the sign bit, so the complement makes the codes offset binary.
+        const unsigned plane = (static_cast<unsigned>(high_chunk[0]) |
+                                (static_cast<unsigned>(high_chunk[1]) << 8)) ^
+                               0xaaaau;
+        const auto spread = [](unsigned fields) {
+            return ((fields << 4) & 0x00000030u) | ((fields << 8) & 0x00003000u) |
+                   ((fields << 12) & 0x00300000u) | ((fields << 16) & 0x30000000u);
+        };
+        offset_pairs((word & 0x0f0f0f0fu) | spread(plane),
+                     ((word >> 4) & 0x0f0f0f0fu) | spread(plane >> 2), 0x43204320u,
+                     out); // 128 + 32
     }
 };
 
-template <class Shape, class Codec, class Access, int ExpertWarps, int ExpertBN>
-__global__ __launch_bounds__(ExpertWarps * 32, 3) void grouped_integer_down(
+// One CTA computes `BM = 64 * RowTiles` output rows of one column job of one expert. Warps tile the
+// CTA as WarpsM x WarpsN with 32 rows (two MMA row tiles) each. The weights of a k tile are decoded
+// once into shared memory; the group scale is applied to the per-tile FP32 partial sums.
+template <class Shape, class Codec, class Access, int ExpertWarps, int ExpertBN, int RowTiles>
+__global__ __launch_bounds__(ExpertWarps * 32, (RowTiles == 1 ? 3 : 2)) void grouped_integer_down(
     const __nv_bfloat16* __restrict__ activation, const int* __restrict__ expert_offsets,
     const int* __restrict__ route_job_experts, const int* __restrict__ route_job_columns,
     const GroupedInfo* __restrict__ info, Access weights, __nv_bfloat16* __restrict__ output) {
-    constexpr int BM = 64, BK = 64, Stages = 2;
+    constexpr int BM = 64 * RowTiles, BK = 64, Stages = 2;
     if (info->direct) { return; }
     constexpr int ExpertThreads = ExpertWarps * 32;
     constexpr int GroupsPerRow  = Shape::intermediate / 64;
+    constexpr int KTiles        = GroupsPerRow;
+    constexpr int WarpsM        = BM / 32;
+    constexpr int WarpsN        = ExpertWarps / WarpsM;
+    constexpr int WarpCols      = ExpertBN / WarpsN;
+    constexpr int WarpNT        = WarpCols / 8;
+    static_assert(ExpertWarps % WarpsM == 0 && ExpertBN % WarpsN == 0 && WarpCols % 16 == 0,
+                  "a warp covers whole pairs of 8-column MMA tiles");
     __shared__ __align__(16) __nv_bfloat16 As[BM * BK];
     __shared__ __align__(16) __nv_bfloat16 Bs[Stages][ExpertBN * BK];
     __shared__ __align__(16) std::uint8_t Cr[Stages][BM * 32];
     __shared__ __align__(16) std::uint8_t Hr[Stages][BM * Codec::kHighBytes];
     __shared__ __align__(16) std::uint8_t Sr[BM * GroupsPerRow * 2];
 
-    const int tid  = static_cast<int>(threadIdx.x);
-    const int warp = tid >> 5;
-    const int lane = tid & 31;
+    const int tid    = static_cast<int>(threadIdx.x);
+    const int warp   = tid >> 5;
+    const int lane   = tid & 31;
+    const int warp_m = warp / WarpsN;
+    const int warp_n = warp % WarpsN;
 
-    const int a_mat          = lane >> 3;
-    const int a_rin          = lane & 7;
-    const int a_rowoff       = a_rin + ((a_mat & 1) << 3);
-    const int a_coloff       = (a_mat >> 1) << 3;
-    const int b_rin          = lane & 7;
+    const int a_mat    = lane >> 3;
+    const int a_rin    = lane & 7;
+    const int a_rowoff = a_rin + ((a_mat & 1) << 3);
+    const int a_coloff = (a_mat >> 1) << 3;
+    // x4 ldmatrix serves two adjacent 8-column tiles: lanes 0-15 address the first, 16-31 the next.
+    const int b_rowoff       = ((lane >> 4) << 3) + (lane & 7);
     const int b_koff         = ((lane >> 3) & 1) << 3;
     const int gid            = lane >> 2;
     const int lid            = lane & 3;
@@ -82,7 +137,7 @@ __global__ __launch_bounds__(ExpertWarps * 32, 3) void grouped_integer_down(
         const int count       = expert_offsets[expert + 1] - begin;
         const int column_base = route_job_columns[route_job];
         const int cols        = count - column_base < ExpertBN ? count - column_base : ExpertBN;
-        float acc[4][4]       = {};
+        float acc[2][WarpNT][4] = {};
 
         auto stage_scales = [&] {
             for (int row = tid; row < BM; row += ExpertThreads) {
@@ -126,20 +181,21 @@ __global__ __launch_bounds__(ExpertWarps * 32, 3) void grouped_integer_down(
             }
         };
 
-        auto decode_weight = [&](int stage, int kt) {
+        auto decode_weight = [&](int stage) {
             constexpr int CodeChunksPerRow = Codec::kCodeBytes / 4;
             constexpr int HighPerChunk     = Codec::kHighPerChunk;
             static_assert(CodeChunksPerRow * 8 == BK,
                           "a row of codes must decode to exactly the tile's k width");
-            for (int item = tid; item < BM * CodeChunksPerRow; item += ExpertThreads) {
-                const int row     = item / CodeChunksPerRow;
-                const int chunk   = item - row * CodeChunksPerRow;
-                const float scale = __half2float(__ushort_as_half(
-                    *reinterpret_cast<const std::uint16_t*>(&Sr[(row * GroupsPerRow + kt) * 2])));
+            static_assert(BM * CodeChunksPerRow % ExpertThreads == 0);
+#pragma unroll
+            for (int i = 0; i < BM * CodeChunksPerRow / ExpertThreads; ++i) {
+                const int item  = tid + i * ExpertThreads;
+                const int row   = item / CodeChunksPerRow;
+                const int chunk = item - row * CodeChunksPerRow;
                 unsigned decoded[4];
                 Codec::decode_eight(
                     *reinterpret_cast<const unsigned*>(&Cr[stage][row * 32 + chunk * 4]),
-                    &Hr[stage][row * Codec::kHighBytes + chunk * HighPerChunk], scale, decoded);
+                    &Hr[stage][row * Codec::kHighBytes + chunk * HighPerChunk], decoded);
                 store_vec(&As[row * BK + common::swizzle_xor_64(row, chunk * 8)],
                           make_int4(static_cast<int>(decoded[0]), static_cast<int>(decoded[1]),
                                     static_cast<int>(decoded[2]), static_cast<int>(decoded[3])));
@@ -154,71 +210,108 @@ __global__ __launch_bounds__(ExpertWarps * 32, 3) void grouped_integer_down(
             cp_commit();
         }
 
-#pragma unroll
-        for (int kt = 0; kt < Shape::intermediate / BK; ++kt) {
-            const int stage = kt & 1;
-            cp_wait<Stages - 1>();
+        // Two barriers per k tile. The first proves every warp has finished the previous tile's
+        // MMAs, which frees both the decoded tile and the stage that tile read, so the refill of
+        // that stage is issued behind it.
+#pragma unroll 1
+        for (int kt = 0; kt < KTiles; ++kt) {
+            const int stage = kt % Stages;
+            if (kt == 0) {
+                cp_wait<Stages - 1>();
+            } else {
+                cp_wait<Stages - 2>();
+            }
             __syncthreads();
-            decode_weight(stage, kt);
+            if (kt > 0) {
+                const int next = kt - 1 + Stages;
+                if (next < KTiles) { stage_inputs((kt - 1) % Stages, next); }
+                cp_commit();
+            }
+            decode_weight(stage);
             __syncthreads();
 
-            if (warp * 8 < cols) {
+            if (warp_n * WarpCols < cols) {
+                float partial[2][WarpNT][4] = {};
 #pragma unroll
                 for (int ki = 0; ki < BK / 16; ++ki) {
-                    unsigned af[4][4];
-                    unsigned bf[2];
+                    unsigned af[2][4];
+                    unsigned bf[WarpNT][2];
 #pragma unroll
-                    for (int mi = 0; mi < 4; ++mi) {
-                        const int row = mi * 16 + a_rowoff;
+                    for (int mi = 0; mi < 2; ++mi) {
+                        const int row = warp_m * 32 + mi * 16 + a_rowoff;
                         const int col = ki * 16 + a_coloff;
                         ldmatrix_x4(af[mi][0], af[mi][1], af[mi][2], af[mi][3],
                                     smem_addr(&As[row * BK + common::swizzle_xor_64(row, col)]));
                     }
-                    const int brow = warp * 8 + b_rin;
-                    const int bcol = ki * 16 + b_koff;
-                    ldmatrix_x2(
-                        bf[0], bf[1],
-                        smem_addr(&Bs[stage][brow * BK + common::swizzle_xor_64(brow, bcol)]));
 #pragma unroll
-                    for (int mi = 0; mi < 4; ++mi) {
-                        mma_bf16(acc[mi][0], acc[mi][1], acc[mi][2], acc[mi][3], af[mi][0],
-                                 af[mi][1], af[mi][2], af[mi][3], bf[0], bf[1]);
+                    for (int np = 0; np < WarpNT / 2; ++np) {
+                        const int brow = warp_n * WarpCols + np * 16 + b_rowoff;
+                        const int bcol = ki * 16 + b_koff;
+                        ldmatrix_x4(
+                            bf[2 * np][0], bf[2 * np][1], bf[2 * np + 1][0], bf[2 * np + 1][1],
+                            smem_addr(&Bs[stage][brow * BK + common::swizzle_xor_64(brow, bcol)]));
+                    }
+#pragma unroll
+                    for (int ni = 0; ni < WarpNT; ++ni) {
+                        // Tiles past the job's last column carry only zero-filled activations.
+                        if (warp_n * WarpCols + ni * 8 < cols) {
+#pragma unroll
+                            for (int mi = 0; mi < 2; ++mi) {
+                                mma_bf16(partial[mi][ni][0], partial[mi][ni][1],
+                                         partial[mi][ni][2], partial[mi][ni][3], af[mi][0],
+                                         af[mi][1], af[mi][2], af[mi][3], bf[ni][0], bf[ni][1]);
+                            }
+                        }
+                    }
+                }
+#pragma unroll
+                for (int mi = 0; mi < 2; ++mi) {
+                    const int r0 = warp_m * 32 + mi * 16 + gid;
+                    const int r1 = r0 + 8;
+                    const float scale0 = __half2float(__ushort_as_half(
+                        *reinterpret_cast<const std::uint16_t*>(&Sr[(r0 * GroupsPerRow + kt) * 2])));
+                    const float scale1 = __half2float(__ushort_as_half(
+                        *reinterpret_cast<const std::uint16_t*>(&Sr[(r1 * GroupsPerRow + kt) * 2])));
+#pragma unroll
+                    for (int ni = 0; ni < WarpNT; ++ni) {
+                        acc[mi][ni][0] = fmaf(partial[mi][ni][0], scale0, acc[mi][ni][0]);
+                        acc[mi][ni][1] = fmaf(partial[mi][ni][1], scale0, acc[mi][ni][1]);
+                        acc[mi][ni][2] = fmaf(partial[mi][ni][2], scale1, acc[mi][ni][2]);
+                        acc[mi][ni][3] = fmaf(partial[mi][ni][3], scale1, acc[mi][ni][3]);
                     }
                 }
             }
-
-            __syncthreads();
-            const int next = kt + Stages;
-            if (next < Shape::intermediate / BK) { stage_inputs(stage, next); }
-            cp_commit();
         }
         cp_wait<0>();
+        // Every warp has finished reading this job's tiles before the next job restages them.
         __syncthreads();
 
-        if (warp * 8 < cols) {
+        if (warp_n * WarpCols < cols) {
 #pragma unroll
-            for (int mi = 0; mi < 4; ++mi) {
-                const int output_row0 = row0 + mi * 16 + gid;
+            for (int mi = 0; mi < 2; ++mi) {
+                const int output_row0 = row0 + warp_m * 32 + mi * 16 + gid;
                 const int output_row1 = output_row0 + 8;
-                const int col0        = begin + column_base + warp * 8 + 2 * lid;
-                const int col1        = col0 + 1;
-                const int local_col0  = warp * 8 + 2 * lid;
-                const int local_col1  = local_col0 + 1;
-                if (local_col0 < cols) {
-                    output[static_cast<std::int64_t>(col0) * Shape::hidden + output_row0] =
-                        __float2bfloat16_rn(acc[mi][0]);
-                    output[static_cast<std::int64_t>(col0) * Shape::hidden + output_row1] =
-                        __float2bfloat16_rn(acc[mi][2]);
-                }
-                if (local_col1 < cols) {
-                    output[static_cast<std::int64_t>(col1) * Shape::hidden + output_row0] =
-                        __float2bfloat16_rn(acc[mi][1]);
-                    output[static_cast<std::int64_t>(col1) * Shape::hidden + output_row1] =
-                        __float2bfloat16_rn(acc[mi][3]);
+#pragma unroll
+                for (int ni = 0; ni < WarpNT; ++ni) {
+                    const int local_col0 = warp_n * WarpCols + ni * 8 + 2 * lid;
+                    const int local_col1 = local_col0 + 1;
+                    const int col0       = begin + column_base + local_col0;
+                    const int col1       = col0 + 1;
+                    if (local_col0 < cols) {
+                        output[static_cast<std::int64_t>(col0) * Shape::hidden + output_row0] =
+                            __float2bfloat16_rn(acc[mi][ni][0]);
+                        output[static_cast<std::int64_t>(col0) * Shape::hidden + output_row1] =
+                            __float2bfloat16_rn(acc[mi][ni][2]);
+                    }
+                    if (local_col1 < cols) {
+                        output[static_cast<std::int64_t>(col1) * Shape::hidden + output_row0] =
+                            __float2bfloat16_rn(acc[mi][ni][1]);
+                        output[static_cast<std::int64_t>(col1) * Shape::hidden + output_row1] =
+                            __float2bfloat16_rn(acc[mi][ni][3]);
+                    }
                 }
             }
         }
-        __syncthreads();
     }
 }
 

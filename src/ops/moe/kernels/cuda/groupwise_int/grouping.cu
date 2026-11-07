@@ -26,56 +26,82 @@ __global__ void count_assignments(const int* ids, const int* mask, int member, i
     }
 }
 
+// One block of Shape::experts * kScanSplits threads: the tile axis of the per-tile counters is cut
+// into kScanSplits contiguous slices that are summed (and later turned into bases) concurrently,
+// so the scan latency does not grow with the token count.
+inline constexpr int kScanSplits = 4;
+
 template <class Shape>
-__global__ void scan_assignments(GroupedStorage out, int tiles, GroupedPlan plan) {
+__global__ __launch_bounds__(Shape::experts* kScanSplits) void scan_assignments(
+    GroupedStorage out, int tiles, GroupedPlan plan) {
     __shared__ int scan[Shape::experts];
-    const int e = threadIdx.x;
-    int count   = 0;
-    for (int tile = 0; tile < tiles; ++tile) {
-        count += out.tile_counts[tile * Shape::experts + e];
+    __shared__ int slice_sum[kScanSplits][Shape::experts];
+    const int e        = threadIdx.x % Shape::experts;
+    const int slice    = threadIdx.x / Shape::experts;
+    const int per      = (tiles + kScanSplits - 1) / kScanSplits;
+    const int tile_end = min(tiles, (slice + 1) * per);
+    int part           = 0;
+#pragma unroll 8
+    for (int tile = slice * per; tile < tile_end; ++tile) {
+        part += out.tile_counts[tile * Shape::experts + e];
     }
-    scan[e] = count;
+    slice_sum[slice][e] = part;
+    __syncthreads();
+    int count = 0, before = 0;
+#pragma unroll
+    for (int s = 0; s < kScanSplits; ++s) {
+        count += slice_sum[s][e];
+        before += s < slice ? slice_sum[s][e] : 0;
+    }
+    const bool leader = slice == 0;
+    if (leader) { scan[e] = count; }
     __syncthreads();
 #pragma unroll
     for (int d = 1; d < Shape::experts; d <<= 1) {
-        const int value = e >= d ? scan[e - d] : 0;
+        const int value = leader && e >= d ? scan[e - d] : 0;
         __syncthreads();
-        scan[e] += value;
+        if (leader) { scan[e] += value; }
         __syncthreads();
     }
     const int begin       = e ? scan[e - 1] : 0;
     const int assignments = scan[Shape::experts - 1];
-    out.offsets[e]        = begin;
-    if (e == Shape::experts - 1) { out.offsets[Shape::experts] = assignments; }
-    int cursor = begin;
-    for (int tile = 0; tile < tiles; ++tile) {
+    if (leader) {
+        out.offsets[e] = begin;
+        if (e == Shape::experts - 1) { out.offsets[Shape::experts] = assignments; }
+    }
+    int cursor = begin + before;
+#pragma unroll 8
+    for (int tile = slice * per; tile < tile_end; ++tile) {
         const int index       = tile * Shape::experts + e;
+        const int tile_count  = out.tile_counts[index];
         out.tile_bases[index] = cursor;
-        cursor += out.tile_counts[index];
+        cursor += tile_count;
     }
     __syncthreads();
     const int jobs = (count + plan.columns - 1) / plan.columns;
-    scan[e]        = jobs;
+    if (leader) { scan[e] = jobs; }
     __syncthreads();
 #pragma unroll
     for (int d = 1; d < Shape::experts; d <<= 1) {
-        const int value = e >= d ? scan[e - d] : 0;
+        const int value = leader && e >= d ? scan[e - d] : 0;
         __syncthreads();
-        scan[e] += value;
+        if (leader) { scan[e] += value; }
         __syncthreads();
     }
-    const int active = __syncthreads_count(count > 0);
+    const int active = __syncthreads_count(leader && count > 0);
     const int first  = e ? scan[e - 1] : 0;
-    for (int job = 0; job < jobs; ++job) {
-        out.job_experts[first + job] = e;
-        out.job_columns[first + job] = job * plan.columns;
-    }
-    if (e == Shape::experts - 1) {
-        const int total = scan[e];
-        *out.info       = {total,
-                           int(plan.adaptive &&
-                         total * plan.direct_denominator > plan.direct_numerator * assignments),
-                           int(total * plan.spread_denominator < plan.spread_numerator * active)};
+    if (leader) {
+        for (int job = 0; job < jobs; ++job) {
+            out.job_experts[first + job] = e;
+            out.job_columns[first + job] = job * plan.columns;
+        }
+        if (e == Shape::experts - 1) {
+            const int total = scan[e];
+            *out.info       = {total,
+                               int(plan.adaptive &&
+                             total * plan.direct_denominator > plan.direct_numerator * assignments),
+                               int(total * plan.spread_denominator < plan.spread_numerator * active)};
+        }
     }
 }
 
@@ -118,8 +144,8 @@ void launch_group_count(const ExpertRoutes& routes, ExpertSubset subset,
 void launch_group_scan(const ExpertRoutes& routes, const GroupedPlan& plan,
                        const GroupedStorage& storage, CudaExecutionView execution) {
     using S = SwiGLUH2048I512E256K8;
-    scan_assignments<S>
-        <<<1, S::experts, 0, execution.stream()>>>(storage, (routes.ids.ne[1] + 7) / 8, plan);
+    scan_assignments<S><<<1, S::experts * kScanSplits, 0, execution.stream()>>>(
+        storage, (routes.ids.ne[1] + 7) / 8, plan);
     CUDA_CHECK(cudaGetLastError());
 }
 

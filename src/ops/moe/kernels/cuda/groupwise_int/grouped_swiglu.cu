@@ -102,23 +102,35 @@ void launch_grouped_swiglu(const Tensor& x, const RoutedSwiGLUProfile& profile,
     auto* values          = static_cast<__nv_bfloat16*>(storage.grouped_io);
     const int limit       = execution.multiprocessor_count() * plan.queued_ctas_per_sm;
     const int jobs        = S::top_k * x.ne[1] / plan.columns + S::experts;
-    const int gate_blocks = std::min(jobs * (S::intermediate / 32), limit);
-    const int down_blocks = std::min(jobs * (S::hidden / 64), limit);
+    // The wide kernels (two row tiles per CTA) halve the synchronization per MMA but need enough
+    // work items to fill the GPU; below kWideMinTokens the narrow kernels measure faster.
+    constexpr int kWideRowTiles  = 2;
+    constexpr int kWideMinTokens = 2048;
+    const bool wide              = plan.columns == 64 && x.ne[1] >= kWideMinTokens;
+    const int gate_blocks        = std::min(jobs * (S::intermediate / 32), limit);
+    const int wide_gate_blocks   = std::min(jobs * (S::intermediate / (32 * kWideRowTiles)), limit);
+    const int down_blocks        = std::min(jobs * (S::hidden / 64), limit);
+    const int wide_down_blocks   = std::min(jobs * (S::hidden / (64 * kWideRowTiles)), limit);
     with_expert_addresses(experts, profile, [&](auto gate_up, auto down) {
         using Access = decltype(gate_up);
         if (profile.ffn.gate_up_type == QType::Q4_G64_FP16) {
-            if (plan.columns == 64) {
-                grouped_q4_gate_up<S, Access, 8, 64, 2, GateUpDensity::Any>
+            if (wide) {
+                grouped_q4_gate_up<S, Access, 8, 64, 2, GateUpDensity::Any, kWideRowTiles>
+                    <<<wide_gate_blocks, 256, 0, stream>>>(input, group.tokens, group.offsets,
+                                                           group.job_experts, group.job_columns,
+                                                           group.info, gate_up, activation);
+            } else if (plan.columns == 64) {
+                grouped_q4_gate_up<S, Access, 8, 64, 2, GateUpDensity::Any, 1>
                     <<<gate_blocks, 256, 0, stream>>>(input, group.tokens, group.offsets,
                                                       group.job_experts, group.job_columns,
                                                       group.info, gate_up, activation);
             } else {
-                grouped_q4_gate_up<S, Access, 4, 32, 2, GateUpDensity::Packed>
+                grouped_q4_gate_up<S, Access, 4, 32, 2, GateUpDensity::Packed, 1>
                     <<<gate_blocks, 128, 0, stream>>>(input, group.tokens, group.offsets,
                                                       group.job_experts, group.job_columns,
                                                       group.info, gate_up, activation);
                 CUDA_CHECK(cudaGetLastError());
-                grouped_q4_gate_up<S, Access, 4, 32, 6, GateUpDensity::Spread>
+                grouped_q4_gate_up<S, Access, 4, 32, 6, GateUpDensity::Spread, 1>
                     <<<gate_blocks, 128, 0, stream>>>(input, group.tokens, group.offsets,
                                                       group.job_experts, group.job_columns,
                                                       group.info, gate_up, activation);
@@ -136,14 +148,19 @@ void launch_grouped_swiglu(const Tensor& x, const RoutedSwiGLUProfile& profile,
             shared_gate_up(x, *shared, storage, group.info, plan.shared_columns, stream);
         }
         const auto integer_down = [&]<class Codec>() {
-            if (plan.columns == 64) {
-                grouped_integer_down<S, Codec, Access, 8, 64>
+            if (wide) {
+                grouped_integer_down<S, Codec, Access, 8, 64, kWideRowTiles>
+                    <<<wide_down_blocks, 256, 0, stream>>>(activation, group.offsets,
+                                                           group.job_experts, group.job_columns,
+                                                           group.info, down, values);
+            } else if (plan.columns == 64) {
+                grouped_integer_down<S, Codec, Access, 8, 64, 1>
                     <<<down_blocks, 256, 0, stream>>>(activation, group.offsets, group.job_experts,
                                                       group.job_columns, group.info, down, values);
             } else {
-                grouped_integer_down<S, Codec, Access, 4, 32>
-                    <<<down_blocks, 128, 0, stream>>>(activation, group.offsets, group.job_experts,
-                                                      group.job_columns, group.info, down, values);
+                grouped_integer_down<S, Codec, Access, 4, 32, 1><<<down_blocks, 128, 0, stream>>>(
+                    activation, group.offsets, group.job_experts, group.job_columns, group.info,
+                    down, values);
             }
         };
         switch (profile.ffn.down_type) {

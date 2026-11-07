@@ -19,7 +19,7 @@ Anthropic-compatible HTTP API, so agent tools such as Claude Code, Codex CLI and
 
 capy-flash **is ninfer-tp2, renamed at v0.5.0**: the two-GPU tensor-parallel fork of
 [Neroued/ninfer](https://github.com/Neroued/ninfer) (v0.1-v0.4.9 under the old name); [NOTICE](NOTICE) lists every piece
-of prior work it builds on. Status: **v0.8.1**. Built, tested and measured on one machine ([below](#benchmarks));
+of prior work it builds on. Status: **v0.8.2**. Built, tested and measured on one machine ([below](#benchmarks));
 users report other setups. Not affiliated with Qwen or NVIDIA.
 
 ## Pick a model
@@ -281,6 +281,16 @@ artifacts, runs the integration tests (`GATE_CTEST_EXCLUDE` excludes more), then
 greedy texts against a recorded reference ([tools/tp2/README.md](tools/tp2/README.md)).
 
 ## What's new
+
+**v0.8.2** ([release notes](https://github.com/ValerioDolci/capy-flash/releases/tag/v0.8.2))
+- Two opt-in community contributions, nothing changed at the default (greedy output identical to v0.8.1).
+- Long context with YaRN: `--rope-yarn-factor F` (1-4) raises the accepted `--max-context` to native × F,
+  up to 1,048,576 tokens on Flash-Next (`--kv-dtype nvfp4` on two 16 GB cards). Experimental; 4× costs
+  perplexity. @splickz's work, ported and measured by @Hazelhof
+  ([#28](https://github.com/ValerioDolci/capy-flash/issues/28), [PR #29](https://github.com/ValerioDolci/capy-flash/pull/29)).
+- A portable benchmark, `bench/capy_flash/ladder.py`: one command, a fixed prefill/decode ladder with the
+  machine and the server's P2P state recorded, so rows compare across setups
+  ([#30](https://github.com/ValerioDolci/capy-flash/issues/30), by @Zeppe79).
 
 **v0.8.1** ([release notes](https://github.com/ValerioDolci/capy-flash/releases/tag/v0.8.1))
 - Fixes and hardening, same tokens and speed as v0.8.0. Recommended for everyone.

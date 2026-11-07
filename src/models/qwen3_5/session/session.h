@@ -433,6 +433,16 @@ public:
     start_demote(const ContextDemotion&, std::span<const CheckpointHandle> host_victims = {});
     [[nodiscard]] bool start_pause(SequenceHandle sequence, runtime::PauseAction);
     [[nodiscard]] bool has_context_operation() const noexcept;
+    // Advances when the retained checkpoint set, the placements of its records, the pins of a
+    // context operation or the operation itself change, and when capacity is handed back by a
+    // release. Pages that execution steps take from or return to the free pool do not advance it.
+    // Two equal values mean the set of releasable checkpoints and their ranking inputs are the
+    // same, so a reclaim ranking derived from one may be reused at the other.
+    [[nodiscard]] std::uint64_t context_epoch() const noexcept;
+    // True while an in-flight context operation depends on this checkpoint (a lease, or its own
+    // source, carried, retired, captured or demoted set). A pinned checkpoint is not released
+    // until the operation completes; every other checkpoint may be released during it.
+    [[nodiscard]] bool context_pins(CheckpointHandle) const noexcept;
     void cancel_context() noexcept;
     [[nodiscard]] bool context_blocks(SequenceHandle sequence) const noexcept;
     [[nodiscard]] bool execution_pending(SequenceHandle sequence) const noexcept;

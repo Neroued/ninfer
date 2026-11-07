@@ -50,6 +50,12 @@ struct RequestBasePlanImpl {
     [[nodiscard]] bool accepts_capture(std::uint32_t frontier) const noexcept;
     [[nodiscard]] CaptureGroup capture_group(std::uint32_t frontier) const;
 };
+// How far past its frontier a decode unit reserves KV growth when the pool allows it. A pool that
+// cannot hold the whole horizon still grants the unit's own minimum, and a pool that cannot hold
+// the minimum is reclaimed up to the horizon, so one reclaim serves many decode steps. The
+// reservation is released when the unit commits.
+inline constexpr std::uint32_t kDecodeGrowthReserveTokens = 1024;
+
 enum class Lifecycle : std::uint8_t {
     Empty,
     Binding,
@@ -250,6 +256,8 @@ struct MaintenanceOperation {
 
 struct DemoteOperation {
     static constexpr auto kind = ContextOperationKind::Demote;
+    // The checkpoints whose pages and State images this transfer reads.
+    std::vector<CheckpointHandle> sources;
 };
 
 struct PauseOperation {
@@ -370,6 +378,14 @@ public:
                    const ContextAssessment&, runtime::ExecutionReservation);
     [[nodiscard]] bool start_pause(SequenceHandle sequence, runtime::PauseAction);
     [[nodiscard]] bool has_context_operation() const noexcept;
+    [[nodiscard]] std::uint64_t context_epoch() const noexcept;
+    [[nodiscard]] bool context_pins(CheckpointHandle) const noexcept;
+
+    // Called by Session entry points that change the retained set, its placements or pins, or
+    // hand capacity back. Checkpoint publication and retirement advance the epoch through the
+    // store; a context operation starting or ending advances it through Session's watch.
+    void note_context_change() noexcept { ++context_mutations_; }
+
     [[nodiscard]] bool context_blocks(SequenceHandle sequence) const noexcept;
     [[nodiscard]] bool execution_pending(SequenceHandle sequence) const noexcept;
     [[nodiscard]] bool terminal_blocked(SequenceHandle sequence) const noexcept;
@@ -428,6 +444,7 @@ public:
     std::array<RequestControl, kMaximumConcurrency> requests;
     std::array<std::uint64_t, kMaximumConcurrency> lane_epochs{};
     std::uint64_t next_sequence = 1;
+    std::uint64_t context_mutations_ = 0;
     mutable context::RecoveryIndex<> recovery_index{directory.metadata_budget()};
     Checkpoints checkpoints;
     context::MetadataAccount count_storage{directory.metadata_budget()};

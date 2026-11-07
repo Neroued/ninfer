@@ -394,6 +394,16 @@ public:
     start_demote(const ContextDemotion&, std::span<const CheckpointHandle> host_victims = {});
     [[nodiscard]] bool start_pause(SequenceHandle, runtime::PauseAction);
     [[nodiscard]] bool has_context_operation() const noexcept;
+    // This Session does not track directory mutations, so every query reports a new epoch and
+    // no reclaim plan derived from an earlier one is reused.
+    [[nodiscard]] std::uint64_t context_epoch() const noexcept { return ++context_queries_; }
+
+    // Conservative: an in-flight context operation pins every checkpoint, so nothing is released
+    // until it completes.
+    [[nodiscard]] bool context_pins(CheckpointHandle) const noexcept {
+        return has_context_operation();
+    }
+
     [[nodiscard]] bool context_blocks(SequenceHandle) const noexcept;
     [[nodiscard]] bool recovery_pending(SequenceHandle) const noexcept;
     [[nodiscard]] bool execution_pending(SequenceHandle) const noexcept;
@@ -429,6 +439,7 @@ public:
 
 private:
     std::unique_ptr<detail::SessionImpl> impl_;
+    mutable std::uint64_t context_queries_ = 0;
 };
 
 } // namespace ninfer::models::glm5next

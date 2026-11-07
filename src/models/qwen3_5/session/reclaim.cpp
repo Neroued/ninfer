@@ -218,8 +218,9 @@ ContextReclaimPlan SessionImpl::plan_reclaim(std::span<const CheckpointHandle> a
     ContextReclaimPlan result;
     result.impl_     = std::make_shared<ReclaimPlan>(*this, allowed, excluded, demand);
     result.inventory = result.impl_->facts.inventory;
-    if (has_context_operation()) return result;
-    const bool demote = host_context_enabled &&
+    // While a context operation is in flight only pure releases are quoted: a demotion needs the
+    // transaction slot. `allowed` already omits what the caller found pinned by that operation.
+    const bool demote = !has_context_operation() && host_context_enabled &&
                         (demand.empty() || demand.uses_memory(context::ContextMemory::Device));
     auto selection = result.inventory->select();
     for (const auto& group : result.impl_->facts.groups) {
@@ -400,7 +401,8 @@ runtime::ContextStart SessionImpl::submit_demotion(const ContextDemotion& quote,
                                                    context::ContextReservation targets,
                                                    runtime::ExecutionReservation frame) {
     const auto& plan = *quote.impl;
-    auto transaction = std::make_unique<PendingContext>(directory, DemoteOperation{});
+    auto transaction = std::make_unique<PendingContext>(
+        directory, DemoteOperation{.sources = plan.allowed});
     transaction->reservation.emplace(std::move(frame));
     auto& migration = transaction->transaction;
     auto state_targets =

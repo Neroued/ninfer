@@ -1,5 +1,6 @@
 #include "models/qwen3_5/session/internal.h"
 
+#include <algorithm>
 #include <stdexcept>
 #include <type_traits>
 
@@ -8,6 +9,45 @@ namespace ninfer::models::qwen3_5::detail {
 bool SessionImpl::has_context_operation() const noexcept {
     return context_operation_ != nullptr || normalizing_pause_.has_value() || !releases.empty() ||
            release_ticket.has_value();
+}
+
+std::uint64_t SessionImpl::context_epoch() const noexcept {
+    return context_mutations_ + checkpoints.revision();
+}
+
+bool SessionImpl::context_pins(CheckpointHandle handle) const noexcept {
+    // Residency releases and pause normalization read no checkpoint; only a transaction does.
+    if (!context_operation_ || !checkpoints.valid(handle)) return false;
+    const auto has = [&](const auto& handles) {
+        return std::find(handles.begin(), handles.end(), handle) != handles.end();
+    };
+    if (checkpoints[handle.index].pins != 0 ||
+        state_store->source_pins(checkpoints.at(handle).continuation().image) != 0)
+        return true;
+    return std::visit(
+        [&](const auto& action) -> bool {
+            using Action = std::decay_t<decltype(action)>;
+            if constexpr (std::is_same_v<Action, BindOperation>) {
+                return (action.source && *action.source == handle) || has(action.carried_points) ||
+                       has(action.retired_points) ||
+                       std::any_of(action.carried_clones.begin(), action.carried_clones.end(),
+                                   [&](const auto& pair) {
+                                       return pair.first == handle || pair.second == handle;
+                                   });
+            } else if constexpr (std::is_same_v<Action, CaptureOperation>) {
+                return std::any_of(action.points.begin(), action.points.end(),
+                                   [&](const auto& point) { return point.first == handle; });
+            } else if constexpr (std::is_same_v<Action, DemoteOperation>) {
+                return has(action.sources);
+            } else if constexpr (std::is_same_v<Action, PauseOperation>) {
+                return action.paused.impl_ && action.paused.impl_->snapshot == handle;
+            } else {
+                // Maintenance may relocate any record, and carries the demotion or pause that
+                // follows it.
+                return true;
+            }
+        },
+        context_operation_->action);
 }
 
 runtime::ContextStart SessionImpl::start_maintenance(const ContextAssessment& assessment) {

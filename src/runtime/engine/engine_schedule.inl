@@ -1058,8 +1058,7 @@ void EngineCore<Instance>::reserve_resident_units(ReservationScope scope) {
             }
             // A lane that only joins another execution never forces reclamation or a pause.
             if (joining) break;
-            if (result.status == UnitReservationStatus::ExecutionUnavailable ||
-                instance_.session->has_context_operation()) {
+            if (result.status == UnitReservationStatus::ExecutionUnavailable) {
                 if (priority == lane) return;
                 break;
             }
@@ -1071,8 +1070,12 @@ void EngineCore<Instance>::reserve_resident_units(ReservationScope scope) {
             if (!cursor) cursor.emplace(resources_.begin_reclaim(*instance_.session));
             const auto reclaimed = reclaim(result.assessment, false, {}, &*cursor);
             if (reclaimed == ReclaimProgress::Transferring ||
-                reclaimed == ReclaimProgress::Deferred)
+                reclaimed == ReclaimProgress::Deferred) {
+                // A running context operation holds back only the lane whose shortage it could
+                // not cover with releases; the other lanes keep their units.
+                if (instance_.session->has_context_operation() && priority != lane) break;
                 return;
+            }
             if (reclaimed == ReclaimProgress::Changed || reclaimed == ReclaimProgress::Retry)
                 continue;
             if (request->recovery_pending)

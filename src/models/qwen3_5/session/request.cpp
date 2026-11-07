@@ -228,6 +228,9 @@ ResourceReservation SessionImpl::reserve_units(std::span<const ExecutionUnit> un
     std::array<UnitDemand, kMaximumConcurrency> coverage{};
     std::array<std::uint32_t, kMaximumConcurrency> old_main{}, old_backend{};
     std::array<std::uint32_t, kMaximumConcurrency> add_main{}, add_backend{};
+    // Growth of a decode unit out to the reserve horizon; only lanes in `horizon` use it.
+    std::array<std::uint32_t, kMaximumConcurrency> horizon_main{}, horizon_backend{};
+    std::array<bool, kMaximumConcurrency> horizon{};
     std::array<bool, kMaximumConcurrency> seen{};
     for (std::size_t index = 0; index < units.size(); ++index) {
         const auto& unit = units[index];
@@ -295,22 +298,80 @@ ResourceReservation SessionImpl::reserve_units(std::span<const ExecutionUnit> un
                 backend_kv_histories->reserved_growth_pages(state.kv->backend->handle());
             add_backend[lane] = backend > old_backend[lane] ? backend - old_backend[lane] : 0;
         }
+        // A decode unit also asks for the pages of the next kDecodeGrowthReserveTokens positions,
+        // so one reclaim serves many steps. A recovering lane already holds its full coverage.
+        const auto current = state.continuation.metadata.execution_frontier;
+        const auto target = std::min<std::uint64_t>(capacity, std::uint64_t{current} +
+                                                                  kDecodeGrowthReserveTokens);
+        if (unit.kind == ExecutionUnitKind::Decode && !request.permit && !request.recovery &&
+            target > demands[lane].main_frontier) {
+            const auto main_target = static_cast<std::uint32_t>(target);
+            const auto backend_target = speculative_backend == SpeculativeBackend::Mtp
+                                            ? main_target - 1
+                                        : has_backend_pool() ? main_target
+                                                             : 0;
+            const auto main = text_kv_histories->write_pages(
+                state.kv->text.handle(), state.continuation.metadata.text_kv_valid, main_target);
+            horizon_main[lane] = main > old_main[lane] ? main - old_main[lane] : 0;
+            horizon_backend[lane] = add_backend[lane];
+            if (state.kv->backend) {
+                const auto backend = backend_kv_histories->write_pages(
+                    state.kv->backend->handle(), backend_kv_valid(state), backend_target);
+                horizon_backend[lane] = backend > old_backend[lane] ? backend - old_backend[lane] : 0;
+            }
+            horizon[lane] = true;
+        }
     }
-    ContextDemand bundle;
-    std::array<context::ContextDemandId, kMaximumConcurrency> main_ids, backend_ids;
-    for (const auto& unit : units) {
-        const auto lane = this->lane(unit.sequence);
-        if (requests[lane].permit) continue;
-        const auto& state = active_sequence(lane);
-        main_ids[lane] =
-            bundle.add_growth(*text_kv_histories, state.kv->text.handle(), add_main[lane]);
-        if (state.kv->backend)
-            backend_ids[lane] = bundle.add_growth(*backend_kv_histories,
-                                                  state.kv->backend->handle(), add_backend[lane]);
+    struct Bundle {
+        ContextDemand demand;
+        std::array<context::ContextDemandId, kMaximumConcurrency> main, backend;
+    };
+
+    const auto build = [&](bool with_horizon) {
+        Bundle bundle;
+        for (const auto& unit : units) {
+            const auto lane = this->lane(unit.sequence);
+            if (requests[lane].permit) continue;
+            const auto& state = active_sequence(lane);
+            const bool wide   = with_horizon && horizon[lane];
+            bundle.main[lane] = bundle.demand.add_growth(
+                *text_kv_histories, state.kv->text.handle(),
+                wide ? horizon_main[lane] : add_main[lane]);
+            if (state.kv->backend)
+                bundle.backend[lane] = bundle.demand.add_growth(
+                    *backend_kv_histories, state.kv->backend->handle(),
+                    wide ? horizon_backend[lane] : add_backend[lane]);
+        }
+        return bundle;
+    };
+    const bool any_horizon = std::any_of(horizon.begin(), horizon.end(), [](bool v) { return v; });
+    std::optional<Bundle> chosen;
+    std::optional<ContextAssessment> wanted;
+    if (any_horizon) {
+        auto wide      = build(true);
+        auto affordable = directory.assess(wide.demand);
+        if (affordable.ready())
+            chosen = std::move(wide);
+        else
+            wanted = std::move(affordable);
     }
-    auto assessment = directory.assess(bundle);
-    if (!assessment.ready()) return {.assessment = std::move(assessment)};
-    auto reserved = directory.reserve(bundle);
+    if (!chosen) {
+        // The horizon is a preference; the minimum is the requirement.
+        auto narrow     = build(false);
+        auto assessment = directory.assess(narrow.demand);
+        if (!assessment.ready()) {
+            // When the minimum is short, let one reclaim cover the horizon as well, unless that
+            // larger demand needs something the minimum does not.
+            if (wanted && wanted->status == context::ContextAvailability::NeedsReclaim)
+                return {.assessment = std::move(*wanted)};
+            return {.assessment = std::move(assessment)};
+        }
+        chosen = std::move(narrow);
+    }
+    auto& bundle   = *chosen;
+    auto& main_ids = bundle.main;
+    auto& backend_ids = bundle.backend;
+    auto reserved = directory.reserve(bundle.demand);
     if (!reserved) return {.assessment = std::move(reserved.assessment)};
     std::array<bool, kMaximumConcurrency> added{};
     try {

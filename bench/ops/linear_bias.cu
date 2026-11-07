@@ -132,11 +132,12 @@ void run(const Options& options, Fixture& fixture) {
                 // Peak usage includes initialized code rows beyond the logical token extent.
                 const auto workspace_bytes = a8 ? 2ULL * row.workspace_peak : 0ULL;
                 const auto bytes           = operand_bytes + workspace_bytes;
-                bool tensor                = weight.qtype == QType::MXFP8 ? true
-                                             : weight.qtype == QType::NVFP4_MUL ? options.form != "projection" ||
-                                                   ops::detail::select_nvfp4_mul_bias_route(
-                                                       n, k, t, policy).tensor_core
-                                                                                : t > 1;
+                bool tensor =
+                    weight.qtype == QType::MXFP8 ? true
+                    : weight.qtype == QType::NVFP4_MUL
+                        ? options.form != "projection" ||
+                              ops::detail::select_nvfp4_mul_bias_route(n, k, t, policy).tensor_core
+                        : t > 1;
                 if (weight.qtype == QType::MXFP8 && options.form == "projection") {
                     tensor = ops::detail::select_mxfp8_bias_route(n, k, t, policy).tensor_core;
                 } else if (weight.qtype == QType::MXFP8 && options.form == "split") {

@@ -115,8 +115,8 @@ void add_native_cases(Suite& suite) {
         }
         if (n == 2048 && k == 4096) {
             add_workspace_cases(suite, QType::MXFP8, n, k);
-            for (int t : {1, 4, 8, 16, 32, 48, 49, 64, 128, 192, 193, 256, 257, 384, 512, 768,
-                          1024, 1536})
+            for (int t :
+                 {1, 4, 8, 16, 32, 48, 49, 64, 128, 192, 193, 256, 257, 384, 512, 768, 1024, 1536})
                 calls.push_back({t, CallForm::Policy, ops::LinearPolicy::AllowA8});
             for (int t : {2, 9, 65, 385, 769, 1025, 1537, 4096})
                 calls.push_back({t, CallForm::Policy, ops::LinearPolicy::AllowA8, true});
@@ -151,32 +151,32 @@ void add_native_cases(Suite& suite) {
         }
         if (n == 20480 && k == 1536) {
             add_workspace_cases(suite, QType::MXFP8, n, k);
-            for (int t : {1, 4, 8, 16, 32, 48, 64, 80, 88, 127, 128, 192, 193, 384, 512, 640,
-                          768, 1024, 2048})
+            for (int t : {1, 4, 8, 16, 32, 48, 64, 80, 88, 127, 128, 192, 193, 384, 512, 640, 768,
+                          1024, 2048})
                 calls.push_back({t, CallForm::Policy, ops::LinearPolicy::AllowA8});
             for (int t : {2, 9, 65, 385, 641, 769, 1025, 2049, 4096})
                 calls.push_back({t, CallForm::Policy, ops::LinearPolicy::AllowA8, true});
         }
         if (n == 16384 && k == 1536) {
             add_workspace_cases(suite, QType::MXFP8, n, k);
-            for (int t : {1, 4, 8, 16, 32, 64, 96, 128, 192, 193, 256, 257, 384, 512, 640,
-                          768, 1024, 2048, 2049, 3712})
+            for (int t : {1,   4,   8,   16,  32,  64,  96,   128,  192,  193,
+                          256, 257, 384, 512, 640, 768, 1024, 2048, 2049, 3712})
                 calls.push_back({t, CallForm::Policy, ops::LinearPolicy::AllowA8});
             for (int t : {2, 9, 65, 385, 641, 769, 1025, 3713, 4096})
                 calls.push_back({t, CallForm::Policy, ops::LinearPolicy::AllowA8, true});
         }
         if (n == 4096 && k == 16384) {
             add_workspace_cases(suite, QType::MXFP8, n, k);
-            for (int t : {1, 2, 4, 8, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512, 640,
-                          768, 1024, 1152, 1280, 1536, 2048, 3072})
+            for (int t : {1,   2,   4,   8,   16,  24,   32,   48,   64,   96,   128, 192,
+                          256, 384, 512, 640, 768, 1024, 1152, 1280, 1536, 2048, 3072})
                 calls.push_back({t, CallForm::Policy, ops::LinearPolicy::AllowA8});
             for (int t : {9, 49, 65, 385, 641, 769, 1025, 1153, 1281, 1537, 2049, 3073, 4096})
                 calls.push_back({t, CallForm::Policy, ops::LinearPolicy::AllowA8, true});
         }
         if (n == 3072 && k == 1024) {
             add_workspace_cases(suite, QType::MXFP8, n, k);
-            for (int t : {1, 4, 8, 32, 64, 96, 128, 192, 256, 257, 384, 512, 1024, 1152, 2048,
-                          3072})
+            for (int t :
+                 {1, 4, 8, 32, 64, 96, 128, 192, 256, 257, 384, 512, 1024, 1152, 2048, 3072})
                 calls.push_back({t, CallForm::Policy, ops::LinearPolicy::AllowA8});
             for (int t : {2, 65, 129, 385, 1025, 1153, 2049, 3073, 4096})
                 calls.push_back({t, CallForm::Policy, ops::LinearPolicy::AllowA8, true});
@@ -201,8 +201,8 @@ void add_native_cases(Suite& suite) {
              {{2048, 4096}, {512, 4096}, {16384, 1536}, {4096, 16384}, {4096, 1024}}}) {
         std::vector<Invocation> calls(a16_calls.begin(), a16_calls.end());
         if (n == 2048 && k == 4096) {
-            for (int t : {3, 4, 8, 16, 32, 64, 96, 128, 192, 256, 384, 512, 640, 768, 896, 960, 1024,
-                          2048, 4096})
+            for (int t : {3, 4, 8, 16, 32, 64, 96, 128, 192, 256, 384, 512, 640, 768, 896, 960,
+                          1024, 2048, 4096})
                 calls.push_back({t, CallForm::Policy, ops::LinearPolicy::A16Only});
             for (int t : {2, 65, 129, 193, 257, 385, 641, 769, 897, 961, 1025})
                 calls.push_back({t, CallForm::Policy, ops::LinearPolicy::A16Only, true});
@@ -230,8 +230,8 @@ void add_native_cases(Suite& suite) {
         }
         if (n == 4096 && k == 16384) {
             add_workspace_cases(suite, QType::FP8_E4M3FN_BLOCK128X128_FP32, n, k);
-            for (int t : {4, 8, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024,
-                          2048, 4096})
+            for (int t :
+                 {4, 8, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 2048, 4096})
                 calls.push_back({t, CallForm::Policy, ops::LinearPolicy::A16Only});
             for (int t : {17, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 2049})
                 calls.push_back({t, CallForm::Policy, ops::LinearPolicy::A16Only, true});
@@ -239,8 +239,7 @@ void add_native_cases(Suite& suite) {
                 calls.push_back({t, CallForm::Policy, ops::LinearPolicy::A16Only, true});
             for (int t : {641, 1409})
                 calls.push_back({t, CallForm::Policy, ops::LinearPolicy::A16Only});
-            for (int t : {640, 1408})
-                calls.push_back({t, CallForm::A16Convenience});
+            for (int t : {640, 1408}) calls.push_back({t, CallForm::A16Convenience});
             const std::array<Invocation, 3> unaligned_calls{{
                 {257, CallForm::Policy, ops::LinearPolicy::A16Only, true},
                 {640, CallForm::Policy, ops::LinearPolicy::A16Only, true},
@@ -277,40 +276,104 @@ void add_native_cases(Suite& suite) {
                   {n, k, 1457U, Comparison::Sampled, true, calls});
     }
     const std::array<Invocation, 12> short_k_calls{
-        {{1, CallForm::A16Convenience}, {2}, {4}, {5}, {16}, {17}, {32},
+        {{1, CallForm::A16Convenience},
+         {2},
+         {4},
+         {5},
+         {16},
+         {17},
+         {32},
          {33, CallForm::Policy, ops::LinearPolicy::A16Only, true},
-         {64}, {65}, {129}, {4096}}};
-    add_shape(suite, QType::NVFP4_MUL, ActivationRecipe::Hashed,
-              native_weight<QType::NVFP4_MUL>,
+         {64},
+         {65},
+         {129},
+         {4096}}};
+    add_shape(suite, QType::NVFP4_MUL, ActivationRecipe::Hashed, native_weight<QType::NVFP4_MUL>,
               {8192, 1024, 1459U, Comparison::Sampled, true, short_k_calls});
     const std::array<Invocation, 16> narrow_n_calls{
-        {{1, CallForm::A16Convenience}, {2}, {65}, {96},
+        {{1, CallForm::A16Convenience},
+         {2},
+         {65},
+         {96},
          {97, CallForm::Policy, ops::LinearPolicy::A16Only, true},
-         {192}, {193}, {384}, {385}, {512}, {768}, {769}, {1024}, {1152}, {1153}, {4096}}};
-    add_shape(suite, QType::NVFP4_MUL, ActivationRecipe::Hashed,
-              native_weight<QType::NVFP4_MUL>,
+         {192},
+         {193},
+         {384},
+         {385},
+         {512},
+         {768},
+         {769},
+         {1024},
+         {1152},
+         {1153},
+         {4096}}};
+    add_shape(suite, QType::NVFP4_MUL, ActivationRecipe::Hashed, native_weight<QType::NVFP4_MUL>,
               {1024, 4096, 1459U, Comparison::Sampled, true, narrow_n_calls});
     const std::array<Invocation, 20> square_calls{
-        {{1, CallForm::A16Convenience}, {2}, {8}, {9}, {16}, {17}, {32}, {33}, {64}, {65},
-         {72}, {73}, {96}, {97}, {128},
+        {{1, CallForm::A16Convenience},
+         {2},
+         {8},
+         {9},
+         {16},
+         {17},
+         {32},
+         {33},
+         {64},
+         {65},
+         {72},
+         {73},
+         {96},
+         {97},
+         {128},
          {129, CallForm::Policy, ops::LinearPolicy::A16Only, true},
-         {193}, {257}, {513}, {4096}}};
-    add_shape(suite, QType::NVFP4_MUL, ActivationRecipe::Hashed,
-              native_weight<QType::NVFP4_MUL>,
+         {193},
+         {257},
+         {513},
+         {4096}}};
+    add_shape(suite, QType::NVFP4_MUL, ActivationRecipe::Hashed, native_weight<QType::NVFP4_MUL>,
               {4096, 4096, 1459U, Comparison::Sampled, true, square_calls});
     const std::array<Invocation, 16> wide_n_calls{
-        {{1, CallForm::A16Convenience}, {2}, {3}, {4}, {5}, {16}, {17}, {32}, {33}, {64},
+        {{1, CallForm::A16Convenience},
+         {2},
+         {3},
+         {4},
+         {5},
+         {16},
+         {17},
+         {32},
+         {33},
+         {64},
          {65, CallForm::Policy, ops::LinearPolicy::A16Only, true},
-         {96}, {128}, {129}, {256}, {4096}}};
-    add_shape(suite, QType::NVFP4_MUL, ActivationRecipe::Hashed,
-              native_weight<QType::NVFP4_MUL>,
+         {96},
+         {128},
+         {129},
+         {256},
+         {4096}}};
+    add_shape(suite, QType::NVFP4_MUL, ActivationRecipe::Hashed, native_weight<QType::NVFP4_MUL>,
               {20480, 4096, 1459U, Comparison::Sampled, true, wide_n_calls});
     const std::array<Invocation, 21> long_k_calls{
-        {{1, CallForm::A16Convenience}, {2}, {4}, {8}, {9}, {16}, {17}, {32},
+        {{1, CallForm::A16Convenience},
+         {2},
+         {4},
+         {8},
+         {9},
+         {16},
+         {17},
+         {32},
          {33, CallForm::Policy, ops::LinearPolicy::A16Only, true},
-         {64}, {65}, {96}, {97}, {128}, {129}, {192}, {193}, {256}, {257}, {512}, {4096}}};
-    add_shape(suite, QType::NVFP4_MUL, ActivationRecipe::Hashed,
-              native_weight<QType::NVFP4_MUL>,
+         {64},
+         {65},
+         {96},
+         {97},
+         {128},
+         {129},
+         {192},
+         {193},
+         {256},
+         {257},
+         {512},
+         {4096}}};
+    add_shape(suite, QType::NVFP4_MUL, ActivationRecipe::Hashed, native_weight<QType::NVFP4_MUL>,
               {4096, 10240, 1459U, Comparison::Sampled, true, long_k_calls});
 #endif
 }

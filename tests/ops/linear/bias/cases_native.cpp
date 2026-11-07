@@ -186,8 +186,8 @@ void add_native_cases(linear_suite::Suite& suite) {
     add(suite, QType::MXFP8, 1024, 1024, false, ops::LinearPolicy::AllowA8, mx_tokens);
     add(suite, QType::MXFP8, 1024, 1024, false, ops::LinearPolicy::A16Only, std::array{17, 257});
     add(suite, QType::NVFP4_MUL, 1024, 4096, false, ops::LinearPolicy::A16Only,
-        std::array{1, 2, 8, 16, 17, 32, 65, 96, 97, 192, 193, 384, 385, 768, 769,
-                   1152, 1153, 4096});
+        std::array{1, 2, 8, 16, 17, 32, 65, 96, 97, 192, 193, 384, 385, 768, 769, 1152, 1153,
+                   4096});
     add(suite, QType::NVFP4_MUL, 8192, 1024, true, ops::LinearPolicy::A16Only,
         std::array{1, 2, 7, 8, 9, 16, 17, 64, 65, 128, 129, 513});
 #endif

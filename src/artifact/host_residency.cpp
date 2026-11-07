@@ -70,4 +70,16 @@ HostResidency plan_host_residency(std::span<const HostMappedPlacement> placement
     return out;
 }
 
+std::uint64_t cma_pinned_limit(std::uint64_t total_bytes, std::uint64_t available_bytes,
+                               std::uint64_t cma_free_bytes, std::uint64_t host_mapped_bytes,
+                               std::uint64_t reserved_bytes, std::uint64_t engine_bytes) noexcept {
+    if (cma_free_bytes == 0 || available_bytes == 0) { return 0; }
+    const std::uint64_t outside = available_bytes > cma_free_bytes ? available_bytes - cma_free_bytes
+                                                                   : 0;
+    const std::uint64_t keep    = std::max<std::uint64_t>(2ULL << 30, total_bytes / 20) +
+                               engine_bytes;
+    const std::uint64_t limit = outside > keep ? outside - keep : 1;
+    return limit >= host_mapped_bytes + reserved_bytes ? 0 : limit;
+}
+
 } // namespace ninfer::artifact

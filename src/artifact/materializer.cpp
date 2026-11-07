@@ -42,27 +42,45 @@ namespace {
 // Without enough free RAM the populate + registration stalls in reclaim and systemd-oomd kills the
 // server or a neighbour (measured: 35 GiB held by another process -> memory pressure 36 % while
 // loading). Refuse up front, with the numbers, unless NINFER_RAM_GUARD=0.
-void require_host_memory(std::uint64_t bytes) {
+bool ram_guard_enabled() {
+    const char* guard = std::getenv("NINFER_RAM_GUARD");
+    return guard == nullptr || guard[0] != '0';
+}
+
+// MemTotal, MemAvailable and CmaFree of /proc/meminfo in bytes (0 when unreadable or absent).
+struct HostMemInfo {
+    std::uint64_t total     = 0;
+    std::uint64_t available = 0;
+    std::uint64_t cma_free  = 0;
+};
+
+HostMemInfo read_host_meminfo() {
+    HostMemInfo out;
 #if defined(__linux__)
-    if (const char* guard = std::getenv("NINFER_RAM_GUARD"); guard != nullptr && guard[0] == '0') {
-        return;
-    }
     std::ifstream meminfo("/proc/meminfo");
-    std::uint64_t total_kib = 0, available_kib = 0;
     for (std::string line; std::getline(meminfo, line);) {
         std::istringstream fields(line);
         std::string key;
         std::uint64_t value = 0;
         fields >> key >> value;
-        if (key == "MemTotal:") { total_kib = value; }
-        if (key == "MemAvailable:") { available_kib = value; }
+        if (key == "MemTotal:") { out.total = value * 1024; }
+        if (key == "MemAvailable:") { out.available = value * 1024; }
+        if (key == "CmaFree:") { out.cma_free = value * 1024; }
     }
-    if (total_kib == 0 || available_kib == 0) {
+#endif
+    return out;
+}
+
+void require_host_memory(std::uint64_t bytes) {
+#if defined(__linux__)
+    if (!ram_guard_enabled()) { return; }
+    const HostMemInfo memory = read_host_meminfo();
+    if (memory.total == 0 || memory.available == 0) {
         return;
     } // unreadable: no guard rather than a false refusal
     constexpr std::uint64_t kGiB  = 1ULL << 30;
-    const std::uint64_t total     = total_kib * 1024;
-    const std::uint64_t available = available_kib * 1024;
+    const std::uint64_t total     = memory.total;
+    const std::uint64_t available = memory.available;
     const std::uint64_t reserve   = std::max<std::uint64_t>(2 * kGiB, total / 20);
     if (available >= bytes + reserve) { return; }
     const auto gib = [](std::uint64_t value) {
@@ -561,8 +579,23 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
         }
         require_host_memory(plan.host_mapped_bytes);
         const std::span<const HostMappedPlacement> placements(plan.host_mapped_objects);
-        const std::uint64_t pinned_limit = host_pinned_limit(plan);
-        const std::uint64_t reserved     = plan.host_pinned_reserved_bytes;
+        std::uint64_t pinned_limit   = host_pinned_limit(plan);
+        const std::uint64_t reserved = plan.host_pinned_reserved_bytes;
+        if (pinned_limit == 0 && ram_guard_enabled()) {
+            // #40: without an explicit limit, keep the page-locked part outside free CMA memory.
+            const HostMemInfo memory = read_host_meminfo();
+            pinned_limit             = cma_pinned_limit(memory.total, memory.available,
+                                                        memory.cma_free, plan.host_mapped_bytes,
+                                                        reserved, kPinnedReserveBytes);
+            if (pinned_limit != 0) {
+                std::fprintf(stderr,
+                             "host-mapped weights: %s of the available RAM is CMA (CmaFree), which "
+                             "cannot be page-locked; page-locked limit %s (the kernel option "
+                             "kho=off, or cma=0, frees it; --host-pinned-max-gib sets the limit "
+                             "by hand)\n",
+                             gib_text(memory.cma_free).c_str(), gib_text(pinned_limit).c_str());
+            }
+        }
         if (pinned_limit != 0 && reserved >= pinned_limit) {
             const auto mib = [](std::uint64_t bytes) {
                 return std::to_string((bytes + (1ULL << 20) - 1) >> 20) + " MiB";

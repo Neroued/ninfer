@@ -64,9 +64,12 @@ void require_host_tier_fits_ram(std::uint64_t state_bytes, std::uint64_t kv_byte
         guard != nullptr && std::string_view(guard) == "0") {
         return;
     }
-    const std::uint64_t available = meminfo_bytes("MemAvailable");
+    // #40: free CMA counts in MemAvailable but cannot be page-locked.
+    const std::uint64_t free_ram  = meminfo_bytes("MemAvailable");
+    const std::uint64_t cma_free  = meminfo_bytes("CmaFree");
+    const std::uint64_t available = free_ram > cma_free ? free_ram - cma_free : 0;
     const std::uint64_t total     = meminfo_bytes("MemTotal");
-    if (available == 0 || total == 0) { return; }
+    if (free_ram == 0 || total == 0) { return; }
     const std::uint64_t reserve = std::max<std::uint64_t>(4ULL << 30, total / 20U);
     if (available >= pinned + reserve) { return; }
     const auto gib = [](std::uint64_t bytes) {
@@ -79,7 +82,7 @@ void require_host_tier_fits_ram(std::uint64_t state_bytes, std::uint64_t kv_byte
     throw std::invalid_argument(
         "the Host context tiers would pin " + gib(pinned) + " GiB of RAM (state " +
         gib(state_bytes) + " GiB, KV " + gib(kv_bytes) + " GiB) but only " + gib(available) +
-        " GiB are available and " + gib(reserve) +
+        " GiB are available outside CMA and " + gib(reserve) +
         " GiB must stay free: lower --host-kv-mib (at most " + std::to_string(fits >> 20) +
         " MiB with these state slots) or --host-state-slots, or set "
         "NINFER_HOST_TIER_RAM_GUARD=0 to skip this check");

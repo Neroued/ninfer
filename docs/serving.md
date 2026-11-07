@@ -71,6 +71,14 @@ uses `flash-next` with `--host-kv-mib 1024 --host-state-slots 2` (smaller RAM ca
   `--profile flash-next` on a 96 GB machine the two checks add up to about 75 GiB free at startup; `install.sh` fails
   below 70 GiB in total and warns below 70 GiB free (56 GiB for the 64 GB edition). The 27B needs no RAM beyond its
   context cache.
+- **CMA memory (Ubuntu 26.04, Linux 7.0).** The kernel may hold part of the RAM as CMA (`CmaTotal` / `CmaFree` in
+  `/proc/meminfo`; the kexec-handover scratch takes about 9 GiB on a 64 GiB machine). Free CMA counts in MemAvailable
+  but cannot be page-locked, and pinning more than the RAM outside it stalls the load in reclaim until systemd-oomd
+  kills the server (#40). Without `--host-pinned-max-gib` the server caps the page-locked weights at the available RAM
+  outside CMA minus max(2 GiB, 5 % of MemTotal) and 8 GiB for its other page-locked buffers, keeps the rest of the
+  expert banks in pageable RAM (slower on those layers) and prints the cap; the Host tier check also leaves CMA out.
+  To page-lock everything, boot with `kho=off` (or `cma=0`) on the kernel command line. `NINFER_RAM_GUARD=0` turns
+  the cap off together with the RAM check.
 - **Context cache in RAM (Host KV and Host StateImages).** On one GPU (`--tp 1`) they are on by default: 8 Host
   StateImages and 8 GiB of pinned Host KV. At `--tp 2` an unset `--host-kv-mib` or `--host-state-slots` becomes 0.
   The profiles set them: `flash-next` 4096 MiB + 8 states, `flash-next-1gpu` 1024 MiB + 8, `27b` 8192 MiB + 8,

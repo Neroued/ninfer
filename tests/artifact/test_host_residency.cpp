@@ -174,9 +174,34 @@ void test_order() {
     check(no_mtp.size() == 48 && no_mtp[12] == 0, "without MTP");
 }
 
+// #40: free CMA memory caps the page-locked limit; no CMA or enough RAM outside it = no limit.
+void test_cma_limit() {
+    const auto mib = [](std::uint64_t v) { return v << 20; };
+    const std::uint64_t host = mib(49'962); // 48.79 GiB: Flash-Next 64 GB edition experts
+    check(cma_pinned_limit(mib(64'184), mib(57'000), 0, host, 0, 8 * kGiB) == 0, "no CMA");
+    // The #40 machine: 62.68 GiB, 7.8 GiB CMA free, 47.8 GiB available outside it.
+    const std::uint64_t total = mib(64'184), cma = mib(8'000), outside = mib(48'947);
+    const std::uint64_t keep  = total / 20 + 8 * kGiB;
+    check(cma_pinned_limit(total, outside + cma, cma, host, 0, 8 * kGiB) == outside - keep,
+          "the #40 machine: outside CMA minus 5 % and the engine's room");
+    check(cma_pinned_limit(total, outside + cma, cma, host, 0, 8 * kGiB) < host - 10 * kGiB,
+          "the #40 machine: well below the 48.79 GiB that hung");
+    // 96 GiB, 9 GiB CMA: 65.2 GiB of experts still fit outside it.
+    check(cma_pinned_limit(96 * kGiB, 90 * kGiB, 9 * kGiB, mib(66'765), 0, 8 * kGiB) == 0,
+          "fits outside CMA");
+    check(cma_pinned_limit(96 * kGiB, 90 * kGiB, 9 * kGiB, mib(66'765), 4 * kGiB, 8 * kGiB) != 0,
+          "the reserved Host KV planes count against the room outside CMA");
+    check(cma_pinned_limit(64 * kGiB, 12 * kGiB, 9 * kGiB, host, 0, 8 * kGiB) == 1,
+          "nothing left outside CMA: smallest limit, never 0");
+    check(cma_pinned_limit(64 * kGiB, 4 * kGiB, 9 * kGiB, host, 0, 8 * kGiB) == 1,
+          "CMA above MemAvailable");
+    check(cma_pinned_limit(64 * kGiB, 0, 9 * kGiB, host, 0, 8 * kGiB) == 0, "unreadable meminfo");
+}
+
 } // namespace
 
 int main() {
+    test_cma_limit();
     test_whole_fits();
     test_split();
     test_skip_rank_that_does_not_fit();

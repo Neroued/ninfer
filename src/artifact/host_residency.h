@@ -47,4 +47,20 @@ struct HostResidency {
 // True when some placement may be pageable (pageable_rank > 0).
 [[nodiscard]] bool any_pageable_candidate(std::span<const HostMappedPlacement> placements) noexcept;
 
+// #40: the page-locked limit that free CMA memory implies. Linux counts free CMA pages in
+// MemAvailable (Ubuntu 26.04's kernel 7.0 reserves its kexec-handover scratch as CMA: 9.2 GiB on
+// a 64 GiB machine) and ordinary pageable pages may use them, but cudaHostRegister pins with
+// FOLL_LONGTERM, which must first migrate every page out of CMA. A page-locked buffer larger than
+// the RAM outside CMA never finishes registering: reclaim thrashes until systemd-oomd kills the
+// process. Returns the limit for the weights and the page-locked bytes reserved after them
+// (`reserved_bytes`, MaterializationPlan::host_pinned_reserved_bytes) together: the available RAM
+// outside CMA minus max(2 GiB, 5 % of MemTotal) for the system and `engine_bytes` for the Engine's
+// other page-locked buffers; at least 1. Returns 0 (no limit) without CMA or when the weights fit.
+[[nodiscard]] std::uint64_t cma_pinned_limit(std::uint64_t total_bytes,
+                                             std::uint64_t available_bytes,
+                                             std::uint64_t cma_free_bytes,
+                                             std::uint64_t host_mapped_bytes,
+                                             std::uint64_t reserved_bytes,
+                                             std::uint64_t engine_bytes) noexcept;
+
 } // namespace ninfer::artifact

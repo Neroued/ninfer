@@ -100,7 +100,7 @@ __device__ __forceinline__ void bf16_simt_compute_rows(
     int warp_in_row, int lane,
     float (&accumulators)[Schedule::kRowsPerWarp][ActiveTokens][Schedule::kAccumulatorChains],
     int live_tokens, int input_rows) {
-    const int K                   = Schedule::kStaticK ? Schedule::kStaticK : input_rows;
+    const int K = Schedule::kStaticK ? Schedule::kStaticK : input_rows;
     constexpr int kValuesPerPhase =
         Schedule::kWarpsPerRow * common::kWarpSize * Schedule::kValuesPerLane;
     const int kPhases =
@@ -184,25 +184,23 @@ __device__ __forceinline__ void bf16_simt_compute_rows(
 }
 
 template <class Schedule, class Output, class Epilogue>
-__global__
-__launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_a16_simt_kernel(
-    const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ weight, Output output,
-    Epilogue epilogue, int input_rows, int tokens, int token_offset) {
+__device__ __forceinline__ void
+bf16_a16_simt_body(const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ weight,
+                   Output output, Epilogue epilogue, int input_rows, int tokens, int row_tile,
+                   int token_begin,
+                   Bf16SimtSharedStorage<Schedule, Schedule::kBlockTokens>& shared) {
     constexpr int ActiveTokens = Schedule::kBlockTokens;
     const int K                = Schedule::kStaticK ? Schedule::kStaticK : input_rows;
     // A whole-call specialization must not carry an unused token-grid offset through its
     // unrolled load loop: that extends register lifetimes at the small-T occupancy boundary.
     constexpr bool whole_call = Schedule::kTokenCapacity > 0;
-    const int token_begin =
-        whole_call ? 0 : token_offset + static_cast<int>(blockIdx.y) * ActiveTokens;
-    const int live_tokens = Schedule::kExactTokens
-                                ? ActiveTokens
-                                : (whole_call ? tokens : min(ActiveTokens, tokens - token_begin));
-    __shared__ Bf16SimtSharedStorage<Schedule, ActiveTokens> shared;
+    const int live_tokens     = Schedule::kExactTokens
+                                    ? ActiveTokens
+                                    : (whole_call ? tokens : min(ActiveTokens, tokens - token_begin));
     const int lane = threadIdx.x & 31, warp = threadIdx.x / 32;
     const int row_group    = warp / Schedule::kWarpsPerRow;
     const int warp_in_row  = warp % Schedule::kWarpsPerRow;
-    const int cta_row0     = blockIdx.x * Schedule::kBlockRows;
+    const int cta_row0     = row_tile * Schedule::kBlockRows;
     const int row0         = cta_row0 + row_group * Schedule::kRowsPerWarp;
     const auto destination = linear_output_tile<Schedule::kBlockRows>(output, cta_row0);
     float accumulators[Schedule::kRowsPerWarp][ActiveTokens][Schedule::kAccumulatorChains] = {};
@@ -277,5 +275,19 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_a16_s
             }
         }
     }
+}
+
+template <class Schedule, class Output, class Epilogue>
+__global__
+__launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_a16_simt_kernel(
+    const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ weight, Output output,
+    Epilogue epilogue, int input_rows, int tokens, int token_offset) {
+    __shared__ Bf16SimtSharedStorage<Schedule, Schedule::kBlockTokens> shared;
+    const int token_begin =
+        Schedule::kTokenCapacity > 0
+            ? 0
+            : token_offset + static_cast<int>(blockIdx.y) * Schedule::kBlockTokens;
+    bf16_a16_simt_body<Schedule>(x, weight, output, epilogue, input_rows, tokens, blockIdx.x,
+                                 token_begin, shared);
 }
 } // namespace ninfer::ops::detail

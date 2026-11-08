@@ -176,6 +176,16 @@ int main() {
               constrained.find("ninfer_constraint_mask_upload_bytes_total 128\n") !=
                   std::string::npos,
           "interrupted complete constraint lost its state or actual work");
+    running.progress_owner          = 19;
+    running.runtime.direct_restores = 2;
+    running.requests                = std::vector<RequestSnapshot>{
+        {.id               = 19,
+                        .phase            = RequestPhase::Replay,
+                        .preemptions      = 2,
+                        .replayed_tokens  = 640,
+                        .recovery         = RecoveryProgress{GenerationRecoveryRoute::Replay, 128, 256, 512},
+                        .last_progress_ns = 900,
+                        .recovery_pending = true}};
     const auto normalized = observations.normalize(running);
     const auto json       = product::observation_json(normalized, 1000);
     check(json["runtime"]["generated_tokens"] == 5 &&
@@ -184,6 +194,18 @@ int main() {
     check(json["runtime"]["prefix_cache"]["shared_prefix"]["adopted"] == 3 &&
               json["runtime"]["prefix_cache"]["shared_prefix"]["reused_tokens"] == 512,
           "prefix JSON lost normalized adoption counters");
+    check(json["progress_owner"] == 19 && json["runtime"]["direct_restores"] == 2 &&
+              json["requests"][0]["recovery"] == nlohmann::json{{"route", "replay"},
+                                                                {"begin_frontier", 128},
+                                                                {"frontier", 256},
+                                                                {"target_frontier", 512}} &&
+              json["requests"][0]["recovery_pending"] == true &&
+              json["requests"][0]["replayed_tokens"] == 640 &&
+              json["requests"][0]["last_progress_ns"] == 900,
+          "monitor omitted recovery progress, ownership or last completed work");
+    check(metrics.render(normalized, observations.snapshot(), false)
+                  .find("ninfer_direct_restores_total 2\n") != std::string::npos,
+          "direct restores were omitted from metrics");
     RankSnapshot sampled;
     sampled.received_ns      = 700;
     sampled.stamp.sampled_ns = 400;
@@ -205,6 +227,13 @@ int main() {
     auto subscriber = live_service.events.subscribe();
     check(subscriber && !subscriber->next(std::chrono::milliseconds(0)),
           "new monitor subscription must not replay historical events");
+    live_service.scheduling(7, {.transition = GenerationSchedulingTransition::Restored,
+                                .route      = GenerationRecoveryRoute::Direct,
+                                .phase      = RequestPhase::Prefill});
+    const auto restored = subscriber->next(std::chrono::milliseconds(0));
+    check(restored && restored->find("\"phase\":\"prefill\"") != std::string::npos &&
+              restored->find("\"route\":\"direct\"") != std::string::npos,
+          "restoration event lost its actual phase or source");
     live_service.failed(8, false);
     const auto event = subscriber->next(std::chrono::milliseconds(0));
     check(event && event->find("request_failed") != std::string::npos &&

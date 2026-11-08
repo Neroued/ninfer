@@ -20,8 +20,9 @@ struct LocalWeightBinding {
 };
 
 struct ExpertSelection {
-    struct Affine {
+    struct Packed {
         std::size_t gate_up, down;
+        std::vector<std::uint32_t> logical_ids;
     };
 
     struct Entry {
@@ -30,7 +31,11 @@ struct ExpertSelection {
     };
 
     std::vector<Entry> entries;
-    std::optional<Affine> affine;
+    std::optional<Packed> packed;
+};
+
+struct CalibrationSelection {
+    std::size_t parameter, use, request;
 };
 
 struct SelectedWeights {
@@ -38,6 +43,7 @@ struct SelectedWeights {
     std::vector<LocalWeightBinding> bindings;
     std::vector<ExpertSelection> experts;
     std::vector<moe::ExpertDescription> expert_descriptions;
+    std::vector<CalibrationSelection> calibrations;
 };
 
 struct ExpertWeightPartition {
@@ -46,10 +52,11 @@ struct ExpertWeightPartition {
     ExpertPartition partition;
 };
 
-// References and bound descriptions retain their WeightId order. Expert partitions select
-// either indexed entries or affine, intermediate-sharded banks.
+// Parameters and Uses retain their WeightId order. Expert partitions produce indexed
+// entries or packed banks; calibration retains the logical matrix domain.
 [[nodiscard]] SelectedWeights select_weights(const artifact::Reader&,
                                              std::span<const artifact::ParameterReference>,
+                                             std::span<const BoundWeight>,
                                              std::span<const ParameterAssembly>,
                                              std::span<const ExpertWeightPartition>, Device);
 [[nodiscard]] std::vector<BoundWeight> bind_selected_weights(std::span<const BoundWeight>,

@@ -217,7 +217,7 @@ void enqueue_gpu(const Tensor& hidden, const PreparedExecution& call, Tensor& ou
         host.host_ready.record_external(transfer.stream());
     else
         host.host_ready.record(transfer.stream());
-    ops::routed_swiglu(hidden, p.profile.routed, {call.bank, p.activation_divisors},
+    ops::routed_swiglu(hidden, p.profile.routed, {call.bank, p.activation_calibration},
                        frame.device_routes, call.partition.gpu(), {p.shared, frame.shared},
                        ops::MoeEpilogue::Write, frame.gpu_partial, scratch, execution);
 }

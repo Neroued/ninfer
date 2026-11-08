@@ -3,6 +3,7 @@
 #include "ops/normalization/rmsnorm/kernel/warp.cuh"
 #include "ops/normalization/rmsnorm/kernel/cta.cuh"
 #include "ops/normalization/rmsnorm/kernel/generic.cuh"
+#include "ops/normalization/rmsnorm/kernel/vector.cuh"
 #include "core/device.h"
 
 #include <stdexcept>
@@ -29,6 +30,29 @@ void launch_instance(const Tensor& x, const Tensor& weight, const Tensor* gate, 
     const auto* g2  = gate ? static_cast<const __nv_bfloat162*>(gate->data) : nullptr;
     auto* out2      = static_cast<__nv_bfloat162*>(out.data);
     switch (instance) {
+    case Instance::D1024Vector:
+    case Instance::D4096Vector:
+        if constexpr (Kind == Epilogue::Plain) {
+            const auto* input = static_cast<const __nv_bfloat16*>(x.data);
+            const auto* gain  = static_cast<const __nv_bfloat16*>(weight.data);
+            auto* output      = static_cast<__nv_bfloat16*>(out.data);
+            if (instance == Instance::D1024Vector)
+                rmsnorm_vector_kernel<1024, 128>
+                    <<<static_cast<unsigned>(rows), 128, 0, stream>>>(input, gain, output, eps);
+            else
+                rmsnorm_vector_kernel<4096, 256>
+                    <<<static_cast<unsigned>(rows), 256, 0, stream>>>(input, gain, output, eps);
+            return;
+        }
+        break;
+    case Instance::D4096:
+        if constexpr (Kind == Epilogue::Plain) {
+            rmsnorm_cta_bf16x2_kernel<Kind, 512, 4, true, 4096>
+                <<<static_cast<unsigned>(rows), 512, 0, stream>>>(x2, w2, nullptr, out2, d, rows,
+                                                                  eps);
+            return;
+        }
+        break;
     case Instance::D128Block128:
         if constexpr (is_gated<Kind> || Kind == Epilogue::Plain) {
             launch_d128<Kind, 128>(x2, w2, g2, out2, rows, eps, stream);

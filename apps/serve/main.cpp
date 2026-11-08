@@ -15,16 +15,15 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 
 namespace {
 
-std::atomic<ninfer::serve::HttpServer*> g_server{nullptr};
+static_assert(std::atomic<bool>::is_always_lock_free);
+std::atomic<bool> g_stop_requested{false};
 
-void handle_signal(int) {
-    ninfer::serve::HttpServer* server = g_server.load();
-    if (server != nullptr) { server->stop(); }
-}
+void handle_signal(int) { g_stop_requested.store(true, std::memory_order_relaxed); }
 
 } // namespace
 
@@ -83,7 +82,6 @@ int main(int argc, char** argv) {
             std::chrono::duration<double>(Clock::now() - warmup_started).count());
         server.attach(service);
 
-        g_server.store(&server);
         std::signal(SIGINT, handle_signal);
         std::signal(SIGTERM, handle_signal);
 
@@ -91,8 +89,16 @@ int main(int argc, char** argv) {
         operational_log.server_ready(options.host, options.port, server.public_model_id(),
                                      !options.api_key.empty());
 
+        std::jthread stop_monitor([&server](std::stop_token stop) {
+            while (!stop.stop_requested()) {
+                if (g_stop_requested.load(std::memory_order_relaxed)) {
+                    server.stop();
+                    return;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+        });
         const bool ok = server.listen();
-        g_server.store(nullptr);
         if (!ok) {
             operational_log.listen_failure(options.host, options.port);
             return 1;
@@ -100,7 +106,6 @@ int main(int argc, char** argv) {
         operational_log.server_stopped();
         return 0;
     } catch (const std::exception& exception) {
-        g_server.store(nullptr);
         operational_log.server_failure(serving, exception.what());
         return 1;
     }

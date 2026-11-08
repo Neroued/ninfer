@@ -8,6 +8,7 @@ struct Operands {
     std::int32_t dimension;
     std::int64_t rows;
     bool aligned_pairs;
+    bool aligned_vectors;
 };
 
 Operands validate(const Tensor& x, const Tensor& weight, const Tensor* gate, float eps,

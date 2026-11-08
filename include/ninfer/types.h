@@ -694,14 +694,13 @@ enum class GenerationSchedulingTransition : std::uint8_t {
     Terminal,
 };
 
-enum class GenerationRecoveryRoute : std::uint8_t { None, Snapshot, Replay };
-
 // Sparse lifecycle observations captured by the Engine worker and delivered by wait() on the
 // consumer thread. Counter deltas between boundaries, less the request's own deltas, measure
 // other requests' completed work during recovery. Decode includes forced control tokens.
 struct GenerationSchedulingObservation {
     GenerationSchedulingTransition transition = GenerationSchedulingTransition::PauseStarted;
     GenerationRecoveryRoute route             = GenerationRecoveryRoute::None;
+    RequestPhase phase                        = RequestPhase::Waiting;
     std::uint64_t engine_request_id           = 0;
     std::uint64_t steady_ns                   = 0;
     std::uint64_t elapsed_ns                  = 0;

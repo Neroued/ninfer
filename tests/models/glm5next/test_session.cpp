@@ -39,6 +39,10 @@ public:
     std::atomic<bool> hold_poll{false};
     std::atomic<bool> fail_poll{false};
     std::uint64_t unit_time_ns = 0;
+    unsigned defer_binding = 0, bindings = 0;
+    std::optional<rt::DeviceRetired> deferred_context;
+    bool compute_retired = false;
+    std::function<void()> replay_submitted;
     std::vector<std::uint32_t> accept;
     glm::ComputeResult computed;
 
@@ -81,9 +85,13 @@ public:
             for (const auto& action : actions.operations)
                 peer_copies += std::holds_alternative<ctx::PeerCopy>(action);
         last = std::move(work);
-        if (std::holds_alternative<glm::ContextWork>(last.operation)) {
+        if (const auto* context = std::get_if<glm::ContextWork>(&last.operation)) {
             events.emplace_back(rt::ResultReady<glm::ExecutionTypes>{ticket, glm::ContextResult{}});
-            events.emplace_back(rt::DeviceRetired{ticket, {next}, {}});
+            const rt::DeviceRetired retired{ticket, {next}, {}};
+            if (!context->bindings.empty() && ++bindings == defer_binding)
+                deferred_context = retired;
+            else
+                events.emplace_back(retired);
         } else {
             glm::ComputeResult result;
             const auto* forward = std::get_if<glm::ForwardWork>(&last.operation);
@@ -102,6 +110,8 @@ public:
                     r.tokens = {static_cast<TokenId>(row.member.sequence.value % 2)};
                 result.rows.push_back(std::move(r));
             }
+            if (forward && forward->kind == glm::ForwardKind::Replay && replay_submitted)
+                replay_submitted();
             computed = result;
             events.emplace_back(rt::ResultReady<glm::ExecutionTypes>{ticket, std::move(result)});
         }
@@ -130,16 +140,27 @@ public:
         auto e = std::move(events.front());
         events.pop_front();
         if (auto* retired = std::get_if<rt::DeviceRetired>(&e)) {
+            if (deferred_context && retired->ticket.frame.kind == rt::FrameKind::Compute)
+                compute_retired = true;
             pool.retire(retired->ticket.frame);
             retired->execution.latency.total_ns = unit_time_ns;
         }
         return e;
     }
 
-    void flush() override {}
+    void flush() override {
+        // Model an asynchronous binding retiring after resident compute has progressed.
+        // Publishing at flush keeps the new lane unavailable until the next scheduling boundary.
+        if (deferred_context && compute_retired) {
+            events.emplace_back(std::move(*deferred_context));
+            deferred_context.reset();
+            compute_retired = false;
+        }
+    }
 
     void drain() override {
         events.clear();
+        deferred_context.reset();
         pool.retire_submitted();
     }
 
@@ -449,7 +470,8 @@ void mtp_transactions(std::shared_ptr<const glm::ModelDefinition> definition) {
 // Real EngineCore + real Session/Directory, with deterministic executor completions.
 // The four-page catalog fits either full request but not both requests' next growth.
 // No model arithmetic or GPU is involved in this scheduling/lifecycle check.
-void engine_pressure(std::shared_ptr<const glm::ModelDefinition> definition, bool inject_failure) {
+void engine_pressure(std::shared_ptr<const glm::ModelDefinition> definition, bool inject_failure,
+                     bool stop_during_replay = false) {
     Fixture f(definition, true);
 
     struct Instance {
@@ -464,14 +486,15 @@ void engine_pressure(std::shared_ptr<const glm::ModelDefinition> definition, boo
     options.max_concurrency       = 3;
     options.context_cache.enabled = false;
     f.executor.unit_time_ns       = 500'000'000;
+    f.executor.defer_binding      = 3;
     f.executor.hold_poll          = true;
     rt::EngineCore<Instance> engine(instance, options, {});
     using Submission = decltype(engine)::Submission;
-    std::array<Submission, 2> submitted;
-    std::array<GenerationResult, 2> results;
-    std::array<std::exception_ptr, 2> errors;
-    std::array<std::vector<GenerationSchedulingObservation>, 2> observations;
-    for (unsigned row = 0; row < 2; ++row) {
+    std::array<Submission, 3> submitted;
+    std::array<GenerationResult, 3> results;
+    std::array<std::exception_ptr, 3> errors;
+    std::array<std::vector<GenerationSchedulingObservation>, 3> observations;
+    for (unsigned row = 0; row < submitted.size(); ++row) {
         auto prompt        = f.frontend.prepare_tokens(std::vector<TokenId>(128, row), true);
         const auto summary = prompt.summary();
         rt::ResolvedRequestOptions request;
@@ -484,11 +507,17 @@ void engine_pressure(std::shared_ptr<const glm::ModelDefinition> definition, boo
         submitted[row]     = engine.submit(std::move(prompt), summary, 0, request,
                                            OutputConsumerMode::Aggregate, observe);
     }
+    std::atomic<bool> replay_blocked{false};
+    if (stop_during_replay)
+        f.executor.replay_submitted = [&] {
+            f.executor.hold_poll = true;
+            replay_blocked       = true;
+        };
     if (inject_failure) f.executor.fail_poll = true;
     f.executor.hold_poll = false;
     const auto deadline  = std::chrono::steady_clock::now() + std::chrono::seconds(10);
-    std::array<std::jthread, 2> consumers;
-    for (unsigned row = 0; row < 2; ++row)
+    std::array<std::jthread, 3> consumers;
+    for (unsigned row = 0; row < submitted.size(); ++row)
         consumers[row] = std::jthread([&, row] {
             try {
                 results[row] = submitted[row].wait(
@@ -496,14 +525,22 @@ void engine_pressure(std::shared_ptr<const glm::ModelDefinition> definition, boo
                     CancellationView([&] { return std::chrono::steady_clock::now() >= deadline; }));
             } catch (...) { errors[row] = std::current_exception(); }
         });
+    if (stop_during_replay) {
+        while (!replay_blocked && std::chrono::steady_clock::now() < deadline)
+            std::this_thread::yield();
+        engine.request_stop();
+    }
     for (auto& consumer : consumers) consumer.join();
-    if (inject_failure) {
+    if (stop_during_replay) require(replay_blocked, "stop fixture did not enter replay");
+    if (inject_failure || stop_during_replay) {
         for (auto error : errors) {
             require(bool(error), "worker failure did not terminate every request");
             try {
                 std::rethrow_exception(error);
             } catch (const std::exception& cause) {
-                require(std::string(cause.what()) == "injected executor polling failure",
+                require(std::string(cause.what()) == (stop_during_replay
+                                                          ? "inference engine is shutting down"
+                                                          : "injected executor polling failure"),
                         "failure cleanup replaced the first cause");
             }
         }
@@ -521,7 +558,7 @@ void engine_pressure(std::shared_ptr<const glm::ModelDefinition> definition, boo
     } else {
         for (auto error : errors)
             if (error) std::rethrow_exception(error);
-        for (unsigned row = 0; row < 2; ++row) {
+        for (unsigned row = 0; row < submitted.size(); ++row) {
             require(results[row].finish_reason == FinishReason::OutputLimit &&
                         results[row].generated_token_ids.size() == 120,
                     "pressure request did not finish within its original budget");
@@ -529,19 +566,80 @@ void engine_pressure(std::shared_ptr<const glm::ModelDefinition> definition, boo
             std::uint64_t frontier = 0;
             for (const auto& event : observations[row]) {
                 if (event.transition != GenerationSchedulingTransition::RecoveryComplete) continue;
-                require(event.request_decode_tokens > frontier,
+                require(event.request_prefill_tokens + event.request_decode_tokens > frontier,
                         "recovery repeated an old frontier without new progress");
-                frontier = event.request_decode_tokens;
+                frontier = event.request_prefill_tokens + event.request_decode_tokens;
                 ++recoveries;
             }
             require(recoveries >= 2, "old resident or paused request monopolized service");
         }
         require(engine.is_available(), "ordinary Context pressure failed the Engine");
+        require(engine.snapshot().runtime.direct_restores != 0,
+                "pressure fixture did not restore a request paused before its first chunk");
+        bool direct_prefill = false;
+        for (const auto& row : observations)
+            for (const auto& event : row)
+                if (event.transition == GenerationSchedulingTransition::Restored &&
+                    event.route == GenerationRecoveryRoute::Direct) {
+                    require(event.phase == RequestPhase::Prefill &&
+                                event.request_prefill_tokens == 0,
+                            "zero-frontier restoration did not resume prefill");
+                    direct_prefill = true;
+                }
+        require(direct_prefill, "direct restoration did not publish its actual phase");
     }
     const auto snapshot = engine.snapshot().runtime;
     require(!snapshot.running_requests && !snapshot.waiting_requests && !snapshot.paused_requests &&
                 !snapshot.state_objects && !snapshot.history_objects,
             "Engine pressure/failure cleanup retained requests or Context objects");
+}
+
+void engine_stop(std::shared_ptr<const glm::ModelDefinition> definition) {
+    Fixture f(definition, true);
+
+    struct Instance {
+        using ModelContract = glm::RuntimeTypes;
+        glm::Frontend& frontend;
+        Executor* executor;
+        glm::Session* session;
+    } instance{f.frontend, &f.executor, &f.session};
+
+    EngineOptions options;
+    options.max_context           = 256;
+    options.max_concurrency       = 3;
+    options.context_cache.enabled = false;
+    f.executor.hold_poll          = true;
+    rt::EngineCore<Instance> engine(instance, options, {});
+    auto prompt        = f.frontend.prepare_tokens(std::vector<TokenId>(128, 0), true);
+    const auto summary = prompt.summary();
+    rt::ResolvedRequestOptions request;
+    request.execution.requested_output_tokens = 100;
+    request.output.raw                        = true;
+    auto submission =
+        engine.submit(std::move(prompt), summary, 0, request, OutputConsumerMode::Aggregate, {});
+    // Published residency/execution proves the worker, rather than just the pending queue,
+    // must settle this request when stopping. The executor is deliberately not making progress.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (engine.snapshot().in_flight.empty() &&
+           !engine.snapshot().runtime.materializing_requests &&
+           std::chrono::steady_clock::now() < deadline)
+        std::this_thread::yield();
+    require(engine.snapshot().runtime.materializing_requests != 0 ||
+                !engine.snapshot().in_flight.empty(),
+            "stop fixture never submitted work");
+    engine.request_stop();
+    engine.request_stop();
+    require(!engine.is_available(), "stop did not immediately close admission");
+    bool stopped = false;
+    try {
+        (void)submission.wait(nullptr, {});
+    } catch (const RequestError& error) { stopped = error.kind() == RequestErrorKind::Unavailable; }
+    require(stopped, "stop did not release a waiting generation consumer");
+    const auto snapshot = engine.snapshot();
+    require(snapshot.status == EngineStatus::Stopping && !snapshot.runtime.running_requests &&
+                !snapshot.runtime.waiting_requests && !snapshot.runtime.state_objects &&
+                !snapshot.runtime.history_objects && !f.executor.has_pending_work(),
+            "stop retained pending work or Context ownership");
 }
 
 } // namespace
@@ -553,6 +651,8 @@ int main(int argc, char** argv) {
         transactions(glm::read_definition(reader, {}));
         engine_pressure(glm::read_definition(reader, {}), false);
         engine_pressure(glm::read_definition(reader, {}), true);
+        engine_stop(glm::read_definition(reader, {}));
+        engine_pressure(glm::read_definition(reader, {}), false, true);
         auto mtp = glm::read_definition(reader, {.speculative = SpeculativeBackend::Mtp});
         mtp_transactions(std::move(mtp));
         std::cout << "PASS GLM ADP binding, continuation, conversion, relocation and retirement\n";

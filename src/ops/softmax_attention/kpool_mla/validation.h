@@ -14,6 +14,30 @@ inline void require(bool condition, const char* message) {
     if (!condition) throw std::invalid_argument(std::string(kOperation) + ": " + message);
 }
 
+inline std::array<operand::Range, 2> weight_operands(const Weight& w, int rows, int columns,
+                                                     Device device) {
+    operand::device(w.device, device, kOperation, "matrix weight");
+    require(w.n == rows && w.k == columns, "matrix weight dimensions");
+    if (w.qtype != QType::BF16) {
+        const auto geometry = w.qtype == QType::MXFP8
+                                  ? common::validate_mxfp8_weight(w, kOperation)
+                                  : common::validate_fp8_block_fp32_weight(w, kOperation);
+        return {operand::range(w.qdata, geometry.code_plane_bytes, kOperation),
+                operand::range(w.scales, geometry.scale_plane_bytes, kOperation)};
+    }
+    require(w.layout == QuantLayout::Contiguous && w.ndim == 2 && w.shape[0] == rows &&
+                w.shape[1] == columns && w.shape[2] == 1 && w.shape[3] == 1 &&
+                std::equal(w.shape, w.shape + 4, w.padded_shape) && !w.qhigh && !w.scales &&
+                w.high_plane_bytes == 0 && w.group_size == 0 && w.group == 0 && w.payload &&
+                operand::aligned(w.qdata, 16),
+            "contiguous BF16 matrix weight");
+    const auto backing = operand::range(w.payload, w.payload_bytes, kOperation);
+    const auto data    = operand::range(w.qdata, std::size_t(rows) * columns * 2, kOperation);
+    require(data.begin >= backing.begin && data.end <= backing.end,
+            "matrix weight exceeds backing");
+    return {data, {}};
+}
+
 // Check represented extents without imposing a contiguous outer layout. Sorting active axes
 // accepts permuted/padded records while keeping features contiguous and fields nonoverlapping.
 inline std::size_t strided(const Tensor& t, DType type, std::array<int, 4> shape, Device device,

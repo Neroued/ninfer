@@ -75,9 +75,9 @@ public:
                     dimension(std::get<MoeConfig>(profile_.config.text.ffn).num_experts_per_tok),
                     gate_up.policy(), down.policy()),
                 ops::swiglu_profile(out.shared)};
-            out.bank                = w.bank;
-            out.activation_divisors = {gate_up.activation_divisor(source.gate_up.layout.format),
-                                       down.activation_divisor(source.down.layout.format)};
+            out.bank                   = w.bank;
+            out.activation_calibration = {gate_up.calibration(source.gate_up.layout.format),
+                                          down.calibration(source.down.layout.format)};
             if (source.gate_up.parent->device.type() == DeviceType::CUDA) {
                 out.resident = device_expert_bank(source.gate_up, source.down);
             }
@@ -129,9 +129,10 @@ public:
 
     ops::MoeExecutionHints prefetch(const ops::ProjectionWeights& projection,
                                     WeightId query) const {
-        const auto* single = std::get_if<LinearParameters>(&projection);
-        const auto& weight =
-            single ? single->weight : std::get<ops::PairedProjectionWeights>(projection).first;
+        const auto* single   = std::get_if<LinearParameters>(&projection);
+        const auto& weight   = single
+                                   ? single->weight
+                                   : std::get<ops::PairedProjectionWeights>(projection).first.weight;
         const auto& geometry = model_.weight(query).view.parts.front().parent->geometry;
         const auto row_bytes = geometry.layout == QuantLayout::Contiguous
                                    ? std::uint64_t(weight.k) * dtype_size(DType::BF16)

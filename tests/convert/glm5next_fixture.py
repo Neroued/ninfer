@@ -6,7 +6,7 @@ import json
 from math import prod
 from pathlib import Path
 
-from safetensors.torch import save_file
+from safetensors.torch import load_file, save_file
 import torch
 
 from tools.convert.sources.safetensors import SafetensorsSource
@@ -241,8 +241,15 @@ def build_checkpoint(path: Path) -> SafetensorsSource:
         )
     ]
     tokenizer["added_tokens"].append(
-        dict(id=3, content="</think>", special=False, single_word=False,
-             normalized=False, lstrip=False, rstrip=False)
+        dict(
+            id=3,
+            content="</think>",
+            special=False,
+            single_word=False,
+            normalized=False,
+            lstrip=False,
+            rstrip=False,
+        )
     )
     processor = dict(
         do_rescale=True,
@@ -266,4 +273,183 @@ def build_checkpoint(path: Path) -> SafetensorsSource:
     }.items():
         (path / name).write_text(json.dumps(content))
     (path / "chat_template.jinja").write_text("{{ messages }}")
+    return SafetensorsSource(path)
+
+
+def build_native_checkpoint(path: Path) -> SafetensorsSource:
+    """Small native checkpoint with independent expert calibrations and CSF exceptions."""
+    with build_checkpoint(path):
+        pass
+    tensors = load_file(path / "model.safetensors")
+    config = json.loads((path / "config.json").read_text())
+    text = config["text_config"]
+    text["linear_attn_config"] = {
+        "num_heads": text.pop("linear_num_heads"),
+        "head_dim": text.pop("linear_head_dim"),
+        "short_conv_kernel_size": text.pop("linear_conv_kernel_dim"),
+        "gate_lower_bound": text.pop("linear_lower_bound"),
+        "kda_layers": [0],
+        "full_attn_layers": [1],
+    }
+    text.pop("bos_token_id")
+    config["quantization_config"] = {
+        "quant_algo": "MIXED_PRECISION",
+        "quant_method": "modelopt",
+    }
+
+    def encode(prefix, format, *, multiplier=1.0, activation=None):
+        weight = tensors[prefix + ".weight"]
+        n, k = weight.shape
+        if weight.dtype == torch.uint8:
+            k *= 2
+        for name in tuple(tensors):
+            if name.startswith(prefix + ".") and name.rsplit(".", 1)[-1] != "bias":
+                tensors.pop(name)
+        if format == "mxfp8":
+            tensors[prefix + ".weight"] = torch.ones(n, k).to(torch.float8_e4m3fn)
+            tensors[prefix + ".weight_scale"] = torch.full(
+                (n, k // 32), 127, dtype=torch.uint8
+            )
+        elif format == "block":
+            tensors[prefix + ".weight"] = torch.ones(n, k).to(torch.float8_e4m3fn)
+            tensors[prefix + ".weight_scale"] = torch.full(
+                (n // 128, 1, k // 128, 1), 1.000123, dtype=torch.float32
+            )
+        else:
+            tensors[prefix + ".weight"] = torch.full(
+                (n, k // 2), 0x21, dtype=torch.uint8
+            )
+            tensors[prefix + ".weight_scale_2"] = torch.tensor(
+                multiplier, dtype=torch.float32
+            )
+            if activation is not None:
+                tensors[prefix + ".input_scale"] = torch.tensor(
+                    activation, dtype=torch.float32
+                )
+            if format == "csf":
+                # All words are 0x38 except the first block's first lane (0x40).
+                blocks = n // 32 * (k // 32)
+                assert blocks < 256
+                base = prefix + ".weight_scale."
+                tensors[base + "csf32_bases"] = torch.full(
+                    (n,), 0x38, dtype=torch.uint8
+                )
+                tensors[base + "csf32_codes"] = torch.zeros(
+                    n * k // 32, dtype=torch.uint8
+                )
+                offsets = torch.ones(blocks + 1, dtype=torch.int32)
+                offsets[0] = 0
+                tensors[base + "csf32_offsets"] = offsets.to(torch.uint16)
+                tensors[base + "csf32_page_bases"] = torch.zeros(1, dtype=torch.uint32)
+                tensors[base + "csf32_exceptions"] = torch.tensor(
+                    [0x4000], dtype=torch.uint16
+                )
+            else:
+                tensors[prefix + ".weight_scale"] = torch.ones(n, k // 16).to(
+                    torch.float8_e4m3fn
+                )
+
+    encode("lm_head", "mxfp8")
+    for layer in range(2):
+        p = f"model.language_model.layers.{layer}."
+        for name in (
+            "post_attention_layernorm.weight",
+            "hc_attn_base",
+            "hc_attn_scale",
+            "hc_ffn_base",
+            "hc_ffn_scale",
+        ):
+            tensors[p + name] = tensors[p + name].float() + 0.000123
+    tensors["model.language_model.norm.weight"] = (
+        tensors["model.language_model.norm.weight"].float() + 0.000123
+    )
+    p = "model.language_model.layers.0."
+    for role in ("q", "k", "v", "o"):
+        encode(p + "self_attn." + role + "_proj", "mxfp8")
+        if role != "o":
+            name = p + "self_attn." + role + "_conv1d.weight"
+            tensors[name] = tensors[name].bfloat16()
+    for role in ("gate", "up", "down"):
+        encode(p + "mlp." + role + "_proj", "mxfp8")
+    for layer in (1, 2):
+        p = f"model.language_model.layers.{layer}."
+        projections = ["kv_a_proj_with_mqa", "q_a_proj", "q_b_proj", "o_proj"]
+        if layer == 2:
+            projections += [
+                "kv_b_proj",
+                "indexer.wk",
+                "indexer.wq_b",
+                "indexer.weights_proj",
+            ]
+        for name in projections:
+            encode(p + "self_attn." + name, "block" if layer == 1 else "mxfp8")
+        for role in ("gate", "up", "down"):
+            encode(
+                p + "mlp.shared_experts." + role + "_proj",
+                "block" if layer == 1 else "mxfp8",
+            )
+            for expert in range(2):
+                encode(
+                    p + f"mlp.experts.{expert}.{role}_proj",
+                    "csf" if layer == 1 else "nvfp4",
+                    multiplier=expert + 1.25,
+                    activation=(
+                        (expert + 1.5 + (role == "down")) if layer == 1 else None
+                    ),
+                )
+    # Keep the Vision mathematics while using N128 matrices for its native NVFP4 projections.
+    config["vision_config"]["hidden_size"] = 128
+    config["vision_config"]["num_heads"] = 2
+    shapes = {
+        "model.visual.patch_embed.proj.weight": (128, 3, 2, 2, 2),
+        "model.visual.patch_embed.proj.bias": (128,),
+        "model.visual.post_layernorm.weight": (128,),
+        "model.visual.downsample.weight": (128, 128, 2, 2),
+    }
+    v = "model.visual.blocks.0."
+    shapes.update(
+        {
+            v + name: dims
+            for name, dims in {
+                "norm1.weight": (128,),
+                "norm2.weight": (128,),
+                "attn.qkv.weight": (384, 128),
+                "attn.qkv.bias": (384,),
+                "attn.proj.weight": (128, 128),
+                "attn.proj.bias": (128,),
+                "mlp.gate_proj.weight": (128, 128),
+                "mlp.up_proj.weight": (128, 128),
+                "mlp.down_proj.weight": (128, 128),
+                "mlp.down_proj.bias": (128,),
+            }.items()
+        }
+    )
+    for name, shape in shapes.items():
+        tensors[name] = torch.ones(shape, dtype=torch.bfloat16)
+    for name in ("attn.qkv", "attn.proj"):
+        encode(v + name, "mxfp8")
+    for name in ("mlp.gate_proj", "mlp.up_proj", "mlp.down_proj"):
+        encode(v + name, "nvfp4", multiplier=1.25)
+    for name in ("proj", "gate_proj", "up_proj", "down_proj"):
+        encode("model.visual.merger." + name, "nvfp4", multiplier=1.25)
+    nested = {name: value for name, value in tensors.items() if ".q_b_proj." in name}
+    main = {name: value for name, value in tensors.items() if name not in nested}
+    (path / "tensors").mkdir()
+    save_file(main, path / "model.safetensors")
+    save_file(nested, path / "tensors/native-QB.safetensors")
+    (path / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "weight_map": {
+                    name: (
+                        "tensors/native-QB.safetensors"
+                        if name in nested
+                        else "model.safetensors"
+                    )
+                    for name in tensors
+                }
+            }
+        )
+    )
+    (path / "config.json").write_text(json.dumps(config))
     return SafetensorsSource(path)

@@ -2,9 +2,20 @@
 #include "ops/mhc/implementation.h"
 #include "ops/common/cuda/reduce.cuh"
 #include "ops/common/numeric/math.cuh"
+#include "ops/common/numeric/convert.cuh"
 #include <cuda_bf16.h>
+#include <type_traits>
 
 namespace ninfer::ops::detail::mhc {
+template <class Scalar, int Width>
+using GammaVector = std::conditional_t<std::is_same_v<Scalar, float>, common::F32Vector<Width>,
+                                       common::Bf16Vector<Width>>;
+
+__device__ __forceinline__ float coefficient(const void* data, DType type, int index) {
+    return type == DType::FP32 ? static_cast<const float*>(data)[index]
+                               : __bfloat162float(static_cast<const __nv_bfloat16*>(data)[index]);
+}
+
 // Each warp reduces a disjoint subset of the K partitions, preserving coalesced reads.
 // The first warp receives all 24 logits and the full residual square sum.
 template <int Threads, int StaticParts = 0>
@@ -50,8 +61,8 @@ __device__ __forceinline__ float activate_coefficients(Operands o, float value, 
     float logit    = 0;
     if (lane < 24) {
         const int group = lane < 4 ? 0 : lane < 8 ? 1 : 2;
-        logit = fmaf(__bfloat162float(static_cast<const __nv_bfloat16*>(o.scale)[group]), value * r,
-                     __bfloat162float(static_cast<const __nv_bfloat16*>(o.base)[lane]));
+        logit           = fmaf(coefficient(o.scale, o.scale_type, group), value * r,
+                               coefficient(o.base, o.base_type, lane));
     }
     if (lane < 4)
         pre[lane] =

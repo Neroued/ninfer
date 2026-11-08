@@ -56,7 +56,9 @@ BindingPlan SessionImpl::plan_binding(const RequestBasePlan& base, runtime::Lane
     transaction.backend_frontier = source ? checkpoint(*source).backend_frontier() : 0;
     transaction.source_tail_hidden =
         source && checkpoint(*source).continuation().metadata.tail_hidden_valid;
-    transaction.resume_snapshot = resume && source && actual->reused_tokens == resume->frontier();
+    // Root at frontier zero already covers a request paused before its first chunk.
+    // Only missing committed history requires replay; a snapshot is not required.
+    transaction.resume_without_replay = resume && actual->reused_tokens == resume->frontier();
     transaction.take_private    = candidate.take_private;
     transaction.carried_points  = actual->private_points;
     transaction.state_action    = actual->state_action;
@@ -71,7 +73,7 @@ BindingPlan SessionImpl::plan_binding(const RequestBasePlan& base, runtime::Lane
     UnitDemand first;
     if (!resume)
         first = prefill_unit(base.summary().prompt_tokens, transaction.reuse_frontier);
-    else if (!transaction.resume_snapshot) {
+    else if (!transaction.resume_without_replay) {
         first                  = {.kind = ExecutionUnitKind::Replay,
                                   .main_frontier =
                                       std::min(transaction.reuse_frontier + prefill_chunk, resume->frontier())};
@@ -321,7 +323,9 @@ void SessionImpl::install_binding(BindOperation& tx) {
         state.continuation.metadata =
             tx.source ? checkpoint(*tx.source).continuation().metadata : ContinuationMetadata{};
         state.continuation.metadata.rope_delta = rope_delta;
-        if (!tx.resume_snapshot) {
+        if (!tx.resume_without_replay) {
+            if (tx.reuse_frontier >= saved.frontier)
+                throw std::logic_error("replay binding has no missing committed history");
             request.resume_lifecycle                            = request.lifecycle;
             request.lifecycle                                   = Lifecycle::Replaying;
             request.replay_target                               = saved.frontier;
@@ -349,6 +353,16 @@ void SessionImpl::install_binding(BindOperation& tx) {
 
 void SessionImpl::complete_binding(BindOperation& tx, context::ContextTransaction& migration,
                                    ContextProgress& out) {
+    if (tx.resume) {
+        out.recovery = {
+            .route           = !tx.resume_without_replay ? GenerationRecoveryRoute::Replay
+                               : tx.source               ? GenerationRecoveryRoute::Snapshot
+                                                         : GenerationRecoveryRoute::Direct,
+            .begin_frontier  = tx.reuse_frontier,
+            .frontier        = tx.reuse_frontier,
+            .target_frontier = tx.resume->frontier(),
+        };
+    }
     install_binding(tx);
     auto& state = sequences[tx.lane];
     const auto source_image =
@@ -396,7 +410,6 @@ void SessionImpl::complete_binding(BindOperation& tx, context::ContextTransactio
     out.retired_checkpoints = std::move(tx.retired_points);
     out.sequence            = sequence_handle(tx.lane);
     out.residency           = state.residency;
-    out.replaying           = requests[tx.lane].lifecycle == Lifecycle::Replaying;
 }
 
 } // namespace ninfer::models::qwen3_5::detail

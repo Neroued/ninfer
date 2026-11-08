@@ -90,8 +90,7 @@ struct Matrix {
                 }
             } else {
                 auto p = quantized_weight::make_patterned_weight(
-                    QType::NVFP4, n, k, seed + slot,
-                    {.weight_scale_divisor = 1, .input_scale_divisor = 1});
+                    QType::NVFP4, n, k, seed + slot, {.weight_scale = 1, .input_scale = 1});
                 for (std::size_t b = 0; b < p.code_plane_bytes; ++b) {
                     p.payload[b] =
                         quantized_weight::detail::mix64(b + seed + slot * 998123ULL) & 255;
@@ -137,12 +136,12 @@ struct Matrix {
 
     ExpertMatrixDeviceView view() const {
         ExpertMatrixDeviceView result;
-        result.codes           = static_cast<const std::byte*>(data.data());
-        result.scales          = result.codes + scale_offset;
-        result.offsets         = static_cast<const std::uint64_t*>(offsets.data());
-        result.indexed_storage = data.span();
-        result.divisors        = static_cast<const float*>(divisors.data());
-        result.divisor_stride  = fp8 ? 0 : 1;
+        result.codes               = static_cast<const std::byte*>(data.data());
+        result.scales              = result.codes + scale_offset;
+        result.offsets             = static_cast<const std::uint64_t*>(offsets.data());
+        result.indexed_storage     = data.span();
+        result.matrix_scales       = static_cast<const float*>(divisors.data());
+        result.matrix_scale_stride = fp8 ? 0 : 1;
         return result;
     }
 };
@@ -225,12 +224,18 @@ struct Fixture {
         control_d     = to_device_bf16(control);
         shared_gu_d   = to_device_bf16(shared_gu);
         shared_down_d = to_device_bf16(shared_down);
-        weights       = {dense(control_d, E + 1, H),
-                         {{gu.view(), down.view(), E, control_d.device()},
-                    fp8 ? ops::ExpertActivationDivisors{}
-                              : ops::ExpertActivationDivisors{719.7991333F, 313.927002F}},
-                         {{dense(shared_gu_d, 2 * shared_intermediate, H)},
-                          {dense(shared_down_d, H, shared_intermediate)}}};
+        weights       = {
+            dense(control_d, E + 1, H),
+            {{gu.view(), down.view(), E, control_d.device()},
+             fp8 ? ops::ExpertActivationCalibration{}
+                       : ops::ExpertActivationCalibration{ops::ActivationCalibrationView::broadcast(
+                                                        ops::ActivationScaleOperation::Divide,
+                                                        719.7991333F),
+                                                    ops::ActivationCalibrationView::broadcast(
+                                                        ops::ActivationScaleOperation::Divide,
+                                                        313.927002F)}},
+            {{dense(shared_gu_d, 2 * shared_intermediate, H)},
+                   {dense(shared_down_d, H, shared_intermediate)}}};
     }
 
     const std::vector<double>& expert(int p, int e, bool flip) {

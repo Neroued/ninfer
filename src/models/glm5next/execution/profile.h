@@ -17,7 +17,8 @@ struct KdaProfile {
 
 struct MlaProfile {
     std::array<ops::KpoolMlaPrepareProfile, 3> prepare;
-    ops::LinearProfile query_index, query, output;
+    ops::ProjectionProfile query_index;
+    ops::LinearProfile query, output;
     std::array<std::int32_t, 2> query_rows;
     ops::KpoolIndexerProfile indexer;
     ops::KpoolSparseMlaProfile attention;
@@ -30,9 +31,18 @@ struct DenseProfile {
 struct MoeProfile {
     ops::SigmoidMoeProfile math;
     ExpertBankId bank;
-    ops::ExpertActivationDivisors activation_divisors;
     ops::ExpertSubsetKind subset = ops::ExpertSubsetKind::All;
 };
+
+// Preserve native contiguous parents while mapping MLA's semantic projection roles.
+struct MlaProjectionInputs {
+    std::vector<ops::WeightInput> weights;
+    ops::KpoolMlaProjectionLayout rows;
+};
+
+[[nodiscard]] MlaProjectionInputs mla_projection_inputs(std::span<const BoundWeight>,
+                                                        const MlaWeights&,
+                                                        ops::KpoolMlaPrepareProjection);
 
 struct BlockProfile {
     std::variant<KdaProfile, MlaProfile> mixer;

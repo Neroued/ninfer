@@ -2,6 +2,7 @@
 
 #include "core/buffer.h"
 #include "core/tensor.h"
+#include "core/weight.h"
 
 #include <algorithm>
 #include <array>
@@ -26,6 +27,19 @@ inline std::uint32_t hash(std::uint32_t x) {
 
 inline std::uint16_t sample(std::uint32_t x, float scale) {
     return encode((int(hash(x) % 1025) - 512) * scale);
+}
+
+inline Weight dense_weight(const Tensor& tensor, int rows, int columns) {
+    Weight w{};
+    w.device  = tensor.device;
+    w.payload = w.qdata = tensor.data;
+    w.payload_bytes     = tensor.bytes();
+    w.qtype             = QType::BF16;
+    w.layout            = QuantLayout::Contiguous;
+    w.ndim              = 2;
+    w.n = w.shape[0] = w.padded_shape[0] = rows;
+    w.k = w.shape[1] = w.padded_shape[1] = columns;
+    return w;
 }
 
 template <class T>

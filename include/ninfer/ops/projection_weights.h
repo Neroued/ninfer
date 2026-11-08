@@ -31,9 +31,9 @@ struct SingleProjectionWeight {
     LinearPolicy policy = LinearPolicy::A16Only;
 };
 
-// The registered paired forms use A16 for both parents.
+// Each parent retains the activation permission of its own mathematical Uses.
 struct PairedProjectionWeights {
-    Weight first, second;
+    SingleProjectionWeight first, second;
 };
 
 using ProjectionWeights = std::variant<SingleProjectionWeight, PairedProjectionWeights>;
@@ -49,7 +49,7 @@ using ProjectionWeights = std::variant<SingleProjectionWeight, PairedProjectionW
         return {linear_profile(*single), {}};
     }
     const auto& pair = std::get<PairedProjectionWeights>(weights);
-    return {linear_profile({pair.first}), linear_profile({pair.second})};
+    return {linear_profile(pair.first), linear_profile(pair.second)};
 }
 
 } // namespace ninfer::ops

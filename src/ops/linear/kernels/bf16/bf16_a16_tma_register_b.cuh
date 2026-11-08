@@ -40,7 +40,17 @@ __global__ __launch_bounds__(
     const int tiles_r = bf16_predicated_rows<Schedule> ? (rows + BR - 1) / BR : rows / BR;
     int tile_r, tile_t;
     bf16_mma_tile_coordinates<Schedule>(blockIdx.x, tiles_r, (count + BT - 1) / BT, tile_r, tile_t);
-    const int row_begin = tile_r * BR, token_begin = token_offset + tile_t * BT;
+    const int row_begin = tile_r * BR, first_token = token_offset + tile_t * BT;
+    constexpr bool shift_token_tail = [] {
+        if constexpr (requires { Schedule::kShiftTokenTail; })
+            return Schedule::kShiftTokenTail;
+        else
+            return false;
+    }();
+    // A shifted final tile reads a complete, valid input window. Its epilogue
+    // must suppress the overlapping prefix owned by the preceding tile.
+    const int token_begin =
+        shift_token_tail && count >= BT ? min(first_token, token_offset + count - BT) : first_token;
     const int warp = threadIdx.x / 32, lane = threadIdx.x & 31;
     const int wm = warp / Schedule::kWarpsTokens, wn = warp % Schedule::kWarpsTokens;
     extern __shared__ __align__(128) unsigned char storage[];
@@ -115,6 +125,14 @@ __global__ __launch_bounds__(
         asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
         __syncthreads();
         if (threadIdx.x == 0 && kt + 2 < tiles_k) load_a(kt + 2);
+    }
+    if constexpr (shift_token_tail) {
+        if (token_begin != first_token) {
+            epilogue.template finish_token_window<Schedule, false>(
+                output, storage, accum, row_begin, token_begin, rows, token_offset + count,
+                first_token);
+            return;
+        }
     }
     bf16_finish_mma_tile<Schedule, FullTokens>(output, epilogue, storage, accum, row_begin,
                                                token_begin, rows, token_offset + count, warp, lane);

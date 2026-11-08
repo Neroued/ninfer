@@ -5,25 +5,66 @@
 
 namespace ninfer::ops::detail::kpool {
 
+struct ProjectionRowMap {
+    int begin[5]{}, end[5]{}, destination[5]{};
+
+    __device__ __forceinline__ int operator()(int row) const {
+#pragma unroll
+        for (int i = 0; i < 5; ++i)
+            if (row >= begin[i] && row < end[i]) return destination[i] + row - begin[i];
+        return -1;
+    }
+};
+
+inline ProjectionRowMap projection_row_map(const KpoolMlaProjectionLayout& rows, int parent) {
+    const KpoolProjectionRows roles[]{rows.latent, rows.index_key, rows.pool_gate, rows.query,
+                                      rows.coefficients};
+    constexpr int destinations[]{0, 512, 640, 768, 2304};
+    ProjectionRowMap out;
+    for (int i = 0; i < 5; ++i)
+        if (roles[i].rows && roles[i].parent == parent) {
+            out.begin[i]       = roles[i].row_begin;
+            out.end[i]         = roles[i].row_begin + roles[i].rows;
+            out.destination[i] = destinations[i];
+        }
+    return out;
+}
+
 struct ProjectionPartialOutput {
     float* data;
     int rows, columns;
+    ProjectionRowMap mapping;
 
     __device__ __forceinline__ void store(int row, int column, float value) const {
-        data[(std::int64_t(blockIdx.z) * columns + column) * rows + row] = value;
+        data[(std::int64_t(blockIdx.z) * columns + column) * rows + mapping(row)] = value;
     }
 
     __device__ __forceinline__ void store4(int row, int column, float4 value) const {
         *reinterpret_cast<float4*>(data + (std::int64_t(blockIdx.z) * columns + column) * rows +
-                                   row) = value;
+                                   mapping(row)) = value;
     }
 };
 
 struct ProjectionOutput {
     PrepareArguments args;
     std::int64_t begin;
+    ProjectionRowMap mapping;
+
+    __device__ bool clear_if_empty(int first_row, int first_column, int rows, int columns) const {
+        if (__ldg(args.valid)) return false;
+        for (int b = 1; b < args.batch; ++b)
+            if (__ldg(args.valid + b)) return false;
+        const int first = max(first_row, mapping.begin[4]);
+        const int count = min(first_row + rows, mapping.end[4]) - first;
+        if (count <= 0) return true;
+        for (int i = threadIdx.x; i < count * columns; i += blockDim.x)
+            args.coefficients[(begin + first_column + i / count) * 32 + first - mapping.begin[4] +
+                              i % count] = 0.F;
+        return true;
+    }
 
     __device__ __forceinline__ void store(int row, int column, float value) const {
+        row          = mapping(row);
         const auto m = begin + column;
         int b, t;
         coordinate(args, column, b, t);
@@ -49,6 +90,7 @@ struct ProjectionOutput {
     }
 
     __device__ __forceinline__ void store4(int row, int column, float4 value) const {
+        row          = mapping(row);
         const auto m = begin + column;
         int b, t;
         coordinate(args, column, b, t);
@@ -77,43 +119,60 @@ struct ProjectionOutput {
     }
 };
 
+// Some small paired shapes are faster without the extra device-length dependency.
+struct UnconditionalProjectionOutput : ProjectionOutput {
+    __device__ bool clear_if_empty(int, int, int, int) const { return false; }
+};
+
 // Retired operand staging is reused to transpose FP32 accumulators. Unlike the Linear BF16
 // vector epilogue this preserves the complete accumulator through normalization.
-struct ProjectionTmaEpilogue {
+struct ProjectionTileEpilogue {
     static constexpr bool kTmaCollective  = true;
     static constexpr bool kPredicatedRows = true;
     template <class S>
-    static constexpr int kSharedBytes = ((S::kBlockRows + 63) / 64 * 64) * S::kBlockTokens * 4;
+    static constexpr int kSharedBytes = 64 * S::kBlockTokens * sizeof(float);
 
     template <class S, bool FullTokens, class Output>
     __device__ __forceinline__ void finish_tile(const Output& output, unsigned char* scratch,
                                                 float (&accum)[S::kMmaRows][S::kMmaTokens][4],
                                                 int row_begin, int token_begin, int rows,
                                                 int tokens) const {
-        constexpr int BR = S::kBlockRows, BT = S::kBlockTokens, PR = (BR + 63) / 64 * 64;
+        constexpr int BR = S::kBlockRows, BT = S::kBlockTokens;
+        constexpr int Producers = [] {
+            if constexpr (requires { S::kProducerThreads; }) return S::kProducerThreads;
+            return 0;
+        }();
         auto* tile    = reinterpret_cast<float*>(scratch);
-        const auto at = [&](int r, int t) { return tile + t * PR + (r ^ ((t & 7) << 3)); };
-        if (threadIdx.x >= S::kProducerThreads) {
-            const int tid = threadIdx.x - S::kProducerThreads, warp = tid / 32, lane = tid & 31;
-            const int wm = warp / S::kWarpsTokens, wn = warp % S::kWarpsTokens;
+        const auto at = [&](int r, int t) { return tile + t * 64 + (r ^ ((t & 7) << 3)); };
 #pragma unroll
-            for (int mi = 0; mi < S::kMmaRows; ++mi) {
-                const int r = wm * S::kWarpRows + mi * 16 + (lane >> 2);
+        for (int first = 0; first < BR; first += 64) {
+            if (first) __syncthreads();
+            if (threadIdx.x >= Producers) {
+                const int tid = threadIdx.x - Producers, warp = tid / 32, lane = tid & 31;
+                const int wm = warp / S::kWarpsTokens, wn = warp % S::kWarpsTokens;
 #pragma unroll
-                for (int ni = 0; ni < S::kMmaTokens; ++ni) {
-                    const int t       = wn * S::kWarpTokens + ni * 8 + 2 * (lane & 3);
-                    *at(r, t)         = accum[mi][ni][0];
-                    *at(r, t + 1)     = accum[mi][ni][1];
-                    *at(r + 8, t)     = accum[mi][ni][2];
-                    *at(r + 8, t + 1) = accum[mi][ni][3];
+                for (int mi = 0; mi < S::kMmaRows; ++mi) {
+                    const int r = wm * S::kWarpRows + mi * 16 + (lane >> 2) - first;
+                    if (r >= 0 && r < 64) {
+#pragma unroll
+                        for (int ni = 0; ni < S::kMmaTokens; ++ni) {
+                            const int t       = wn * S::kWarpTokens + ni * 8 + 2 * (lane & 3);
+                            *at(r, t)         = accum[mi][ni][0];
+                            *at(r, t + 1)     = accum[mi][ni][1];
+                            *at(r + 8, t)     = accum[mi][ni][2];
+                            *at(r + 8, t + 1) = accum[mi][ni][3];
+                        }
+                    }
                 }
             }
-        }
-        __syncthreads();
-        for (int i = threadIdx.x; i < BR * BT / 4; i += S::kThreads) {
-            const int t = i / (BR / 4), r = (i % (BR / 4)) * 4;
-            if (row_begin + r < rows && (FullTokens || token_begin + t < tokens))
-                output.store4(row_begin + r, token_begin + t, *reinterpret_cast<float4*>(at(r, t)));
+            __syncthreads();
+            const int active = min(64, BR - first);
+            for (int i = threadIdx.x; i < active * BT / 4; i += S::kThreads) {
+                const int t = i / (active / 4), r = i % (active / 4) * 4;
+                if (row_begin + first + r < rows && (FullTokens || token_begin + t < tokens))
+                    output.store4(row_begin + first + r, token_begin + t,
+                                  *reinterpret_cast<float4*>(at(r, t)));
+            }
         }
     }
 };

@@ -51,6 +51,12 @@ int validate(Form form, CudaExecutionView e) {
         f.weights.projection.layout = QuantLayout::RowSplit;
         rejects([&] { f.invoke(e); });
         f.weights = w;
+        for (auto* parameter : {&f.weights.base, &f.weights.scale, &f.weights.gamma}) {
+            const auto saved_parameter = *parameter;
+            parameter->dtype           = DType::I32;
+            rejects([&] { f.invoke(e); });
+            *parameter = saved_parameter;
+        }
     }
     if (f.capacity > 0) {
         MemoryArena tiny({f.scratch.data(), f.capacity - 1, e.device()});
@@ -96,13 +102,16 @@ int validate(Form form, CudaExecutionView e) {
         const auto gamma      = f.weights.gamma;
         f.weights.gamma.ne[0] = D - 1;
         rejects([&] { f.invoke(e); });
+        f.weights.gamma       = gamma;
+        f.weights.gamma.dtype = DType::I32;
+        rejects([&] { f.invoke(e); });
         f.weights.gamma = gamma;
     }
     if (auto query = capacity_query(form)) {
         const int sm = e.multiprocessor_count();
-        for (const auto interval :
-             {std::pair{1, 17}, std::pair{7, 128}, std::pair{15, 17}, std::pair{127, 129},
-              std::pair{511, 513}, std::pair{607, 609}, std::pair{1023, 1025}}) {
+        for (const auto interval : {std::pair{1, 4097}, std::pair{1, 17}, std::pair{7, 128},
+                                    std::pair{15, 17}, std::pair{127, 129}, std::pair{511, 513},
+                                    std::pair{607, 609}, std::pair{1023, 1025}}) {
             std::size_t maximum = 0;
             for (int m = interval.first; m <= interval.second; ++m)
                 maximum = std::max(maximum, query({D, S}, sm, m, m));

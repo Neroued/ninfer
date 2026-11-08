@@ -27,8 +27,11 @@ endfunction()
 
 ninfer_linear_suite(projection
   test.cpp runner.cpp cases_bf16.cpp cases_q4.cpp cases_q5.cpp cases_q6.cpp cases_q8.cpp
-  cases_fp8.cpp cases_nvfp4.cpp cases_bank.cpp)
+  cases_fp8.cpp cases_nvfp4.cpp cases_bank.cpp cases_native.cpp)
 ninfer_linear_format_tests(projection bf16 q4 q5 q6 q8 fp8 nvfp4)
+if(NINFER_TARGET STREQUAL "dgx_spark")
+  ninfer_linear_format_tests(projection mxfp8 fp8_block_fp32 nvfp4_mul)
+endif()
 
 ninfer_linear_suite(split
   test.cpp runner.cpp cases_segmented.cpp cases_two_output.cpp cases_multi_output.cpp cases_bank.cpp)
@@ -40,10 +43,11 @@ ninfer_linear_suite(add
 ninfer_linear_format_tests(add bf16 q4 q5 q8 fp8 nvfp4)
 
 ninfer_linear_suite(swiglu
-  test.cpp runner.cpp cases_bf16.cpp cases_q4.cpp cases_q8.cpp cases_nvfp4.cpp cases_fp8.cpp cases_bank.cpp)
+  test.cpp runner.cpp cases_bf16.cpp cases_q4.cpp cases_q8.cpp cases_nvfp4.cpp cases_fp8.cpp cases_bank.cpp
+  cases_native.cpp)
 ninfer_linear_format_tests(swiglu q4 q8 fp8 nvfp4)
 if(NINFER_TARGET STREQUAL "dgx_spark")
-  ninfer_linear_format_tests(swiglu bf16)
+  ninfer_linear_format_tests(swiglu bf16 mxfp8 fp8_block_fp32 nvfp4_mul)
 endif()
 
 ninfer_linear_suite(pair test.cpp)
@@ -52,7 +56,7 @@ ninfer_linear_format_tests(pair q8)
 ninfer_linear_suite(topk test.cpp)
 ninfer_linear_format_tests(topk q4 q8 fp8)
 
-ninfer_linear_suite(bias test.cpp)
+ninfer_linear_suite(bias test.cpp cases_native.cpp)
 if(NINFER_TARGET STREQUAL "dgx_spark")
-  ninfer_linear_format_tests(bias bf16)
+  ninfer_linear_format_tests(bias bf16 mxfp8 nvfp4_mul)
 endif()

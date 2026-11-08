@@ -74,10 +74,16 @@ inline std::int32_t round_even_to_i32(float value) {
 }
 
 inline float decode_e4m3fn_positive(std::uint8_t code) {
+    if (code == 0x7fU) return std::numeric_limits<float>::quiet_NaN();
     const int exponent = (code >> 3) & 0x0f;
     const int mantissa = code & 0x07;
     if (exponent == 0) return std::ldexp(static_cast<float>(mantissa), -9);
     return std::ldexp(1.0f + static_cast<float>(mantissa) / 8.0f, exponent - 7);
+}
+
+inline double decode_ue8m0(std::uint8_t code) {
+    return code == 255 ? std::numeric_limits<double>::quiet_NaN()
+                       : std::ldexp(1.0, static_cast<int>(code) - 127);
 }
 
 inline float decode_e4m3fn(std::uint8_t code) {

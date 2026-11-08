@@ -32,7 +32,17 @@ inline Nvfp4A16Operands nvfp4_a16_operands(const Tensor& x, const Weight& w) {
             w.n,
             w.k,
             x.ne[1],
-            1.0f / w.weight_scale_divisor};
+            1.0f / w.weight_scale};
+}
+
+inline Nvfp4A16Operands nvfp4_mul_a16_operands(const Tensor& x, const Weight& w) {
+    return {static_cast<const __nv_bfloat16*>(x.data),
+            static_cast<const std::uint8_t*>(w.qdata),
+            static_cast<const std::uint8_t*>(w.scales),
+            w.n,
+            w.k,
+            x.ne[1],
+            w.weight_scale};
 }
 
 inline Nvfp4A4Operands nvfp4_a4_operands(const Weight& w, Nvfp4A4Workspace x, int tokens,
@@ -44,7 +54,7 @@ inline Nvfp4A4Operands nvfp4_a4_operands(const Weight& w, Nvfp4A4Workspace x, in
             w.n,
             w.k,
             tokens,
-            1.0f / (w.input_scale_divisor * w.weight_scale_divisor),
+            1.0f / (w.input_scale * w.weight_scale),
             layout};
 }
 

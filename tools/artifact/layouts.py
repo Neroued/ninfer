@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from math import prod
 import operator
 from types import MappingProxyType
-from typing import Sequence
+from typing import Mapping, Sequence
 
 
 from .formats import (
@@ -19,6 +19,7 @@ from .formats import (
     Fp8BlockFormat,
     Fp8RowFormat,
     Nvfp4Format,
+    Mxfp8Format,
     Nf4Format,
     NumericFormat,
     QuantFormat,
@@ -66,7 +67,7 @@ class BlockScaleGeometry:
     code_plane_bytes: int
     scale_plane_offset: int
     scale_plane_bytes: int
-    weight_divisor_offset: int
+    matrix_scale_offset: int
     payload_bytes: int
 
 
@@ -91,6 +92,38 @@ class RowScaleGeometry:
     scale_plane_offset: int
     scale_plane_bytes: int
     payload_bytes: int
+
+
+@dataclass(frozen=True, slots=True)
+class RowGroupScaleGeometry:
+    matrices: int
+    n: int
+    k: int
+    groups_per_row: int
+    code_plane_bytes: int
+    scale_plane_offset: int
+    scale_plane_bytes: int
+    payload_bytes: int
+
+
+@dataclass(frozen=True, slots=True)
+class Csf32Geometry:
+    matrices: int
+    n: int
+    k: int
+    scale_columns: int
+    blocks_per_matrix: int
+    pages_per_matrix: int
+    offsets_per_matrix: int
+    exception_count: int
+    planes: tuple[tuple[str, int, int], ...]
+    payload_bytes: int
+
+    def plane(self, name: str) -> tuple[int, int]:
+        for key, offset, size in self.planes:
+            if key == name:
+                return offset, size
+        raise ValueError(f"unknown CSF plane: {name!r}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -119,15 +152,15 @@ ROW_SPLIT_K128_V1 = Layout(
 BLOCK_SCALE_K16_M128X4_V1 = Layout(
     "block_scale_k16_m128x4_v1",
     256,
-    frozenset(("nvfp4",)),
+    frozenset(("nvfp4", "nvfp4_mul")),
 )
 BATCHED_BLOCK_SCALE_K16_M128X4_V1 = Layout(
-    "batched_block_scale_k16_m128x4_v1", 256, frozenset(("nvfp4",))
+    "batched_block_scale_k16_m128x4_v1", 256, frozenset(("nvfp4", "nvfp4_mul"))
 )
 BLOCK_SCALE_M128_K128_V1 = Layout(
     "block_scale_m128_k128_v1",
     256,
-    frozenset(("fp8_e4m3fn_block128x128_bf16",)),
+    frozenset(("fp8_e4m3fn_block128x128_bf16", "fp8_e4m3fn_block128x128_fp32")),
 )
 ROW_SCALE_V1 = Layout(
     "row_scale_v1",
@@ -137,6 +170,8 @@ ROW_SCALE_V1 = Layout(
 ROW_PAGED_G16_4K_V1 = Layout(
     "row_paged_g16_4k_v1", 4096, frozenset(("nf4_g16_e4m3fn",))
 )
+ROW_GROUP_SCALE_V1 = Layout("row_group_scale_v1", 256, frozenset(("mxfp8",)))
+CSF_32X2_V1 = Layout("csf_32x2_v1", 256, frozenset(("nvfp4_mul",)))
 
 LAYOUTS = MappingProxyType(
     {
@@ -149,6 +184,8 @@ LAYOUTS = MappingProxyType(
             BLOCK_SCALE_M128_K128_V1,
             ROW_SCALE_V1,
             ROW_PAGED_G16_4K_V1,
+            ROW_GROUP_SCALE_V1,
+            CSF_32X2_V1,
         )
     }
 )
@@ -263,7 +300,7 @@ def block_scale_geometry(
     code_plane_bytes = matrices * n * k // 2
     scale_plane_offset = align_up(code_plane_bytes, PLANE_ALIGNMENT)
     scale_plane_bytes = matrices * n * k // spec.group_size
-    weight_divisor_offset = scale_plane_offset + scale_plane_bytes
+    matrix_scale_offset = scale_plane_offset + scale_plane_bytes
     return BlockScaleGeometry(
         matrices=matrices,
         n=n,
@@ -273,8 +310,8 @@ def block_scale_geometry(
         code_plane_bytes=code_plane_bytes,
         scale_plane_offset=scale_plane_offset,
         scale_plane_bytes=scale_plane_bytes,
-        weight_divisor_offset=weight_divisor_offset,
-        payload_bytes=weight_divisor_offset + 4 * matrices,
+        matrix_scale_offset=matrix_scale_offset,
+        payload_bytes=matrix_scale_offset + 4 * matrices,
     )
 
 
@@ -294,7 +331,7 @@ def fp8_block_geometry(
     code_bytes = matrices * n * k
     offset = align_up(code_bytes, PLANE_ALIGNMENT)
     scale_rows, scale_columns = n // spec.block_rows, k // spec.block_columns
-    scale_bytes = matrices * scale_rows * scale_columns * 2
+    scale_bytes = matrices * scale_rows * scale_columns * spec.scale_bytes
     return Fp8BlockGeometry(
         matrices,
         n,
@@ -346,13 +383,92 @@ def row_paged_geometry(
     )
 
 
+def row_group_scale_geometry(
+    format: str | Mxfp8Format, shape: Sequence[int]
+) -> RowGroupScaleGeometry:
+    spec = _format(format)
+    if not isinstance(spec, Mxfp8Format):
+        raise ValueError("row_group_scale_v1 requires MXFP8")
+    dims = _shape(shape)
+    if len(dims) not in (2, 3):
+        raise ValueError("MXFP8 requires [N,K] or [E,N,K]")
+    n, k = dims[-2:]
+    if k % spec.group_size:
+        raise ValueError("MXFP8 requires K divisible by 32")
+    matrices = dims[0] if len(dims) == 3 else 1
+    codes = matrices * n * k
+    scales = matrices * n * (k // spec.group_size)
+    offset = align_up(codes, PLANE_ALIGNMENT)
+    return RowGroupScaleGeometry(
+        matrices, n, k, k // spec.group_size, codes, offset, scales, offset + scales
+    )
+
+
+def csf32_geometry(shape: Sequence[int], exception_count: int) -> Csf32Geometry:
+    dims = _shape(shape)
+    if len(dims) not in (2, 3):
+        raise ValueError("CSF requires [N,K] or [E,N,K]")
+    n, k = dims[-2:]
+    matrices = dims[0] if len(dims) == 3 else 1
+    if n % 32 or k % 16:
+        raise ValueError("CSF requires N divisible by 32 and K divisible by 16")
+    columns = k // 16
+    if (
+        type(exception_count) is not int
+        or not 0 <= exception_count <= matrices * n * columns
+        or 2 * exception_count >= 1 << 32
+    ):
+        raise ValueError("CSF exception count exceeds its logical or U32 byte domain")
+    row_blocks, column_pairs = n // 32, (columns + 1) // 2
+    blocks = row_blocks * column_pairs
+    tiles = ((row_blocks + 3) // 4) * ((column_pairs + 1) // 2)
+    pages = (tiles + 31) // 32
+    sizes = (
+        ("codes", matrices * n * k // 2),
+        ("matrix_scale", matrices * 4),
+        ("bases", matrices * n),
+        ("nibbles", matrices * n * columns // 2),
+        ("offsets", matrices * (blocks + pages) * 2),
+        ("page_bases", matrices * pages * 4),
+        ("exceptions", exception_count * 2),
+    )
+    offset, planes = 0, []
+    for name, size in sizes:
+        offset = align_up(offset, PLANE_ALIGNMENT)
+        planes.append((name, offset, size))
+        offset += size
+    return Csf32Geometry(
+        matrices,
+        n,
+        k,
+        columns,
+        blocks,
+        pages,
+        blocks + pages,
+        exception_count,
+        tuple(planes),
+        offset,
+    )
+
+
 def encoded_size(
     layout: str | Layout,
     format: str | NumericFormat,
     shape: Sequence[int],
+    layout_parameters: Mapping[str, int] | None = None,
 ) -> int:
     layout_spec = _layout(layout)
     numeric_spec = _format(format)
+    parameters = {} if layout_parameters is None else layout_parameters
+    if not isinstance(parameters, Mapping):
+        raise TypeError("layout parameters must be a mapping")
+    if layout_spec is CSF_32X2_V1:
+        if set(parameters) != {"exception_count"}:
+            raise ValueError(
+                "CSF requires exactly the exception_count layout parameter"
+            )
+    elif parameters:
+        raise ValueError(f"{layout_spec.name} does not accept layout parameters")
     if numeric_spec.name not in layout_spec.formats:
         raise ValueError(
             f"layout {layout_spec.name!r} does not accept format {numeric_spec.name!r}"
@@ -381,4 +497,8 @@ def encoded_size(
         return row_scale_geometry(numeric_spec, shape).payload_bytes
     if layout_spec is ROW_PAGED_G16_4K_V1:
         return row_paged_geometry(numeric_spec, shape).payload_bytes
+    if layout_spec is ROW_GROUP_SCALE_V1:
+        return row_group_scale_geometry(numeric_spec, shape).payload_bytes
+    if layout_spec is CSF_32X2_V1:
+        return csf32_geometry(shape, parameters["exception_count"]).payload_bytes
     raise ValueError(f"unsupported tensor layout: {layout_spec.name!r}")

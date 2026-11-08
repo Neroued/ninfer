@@ -1,4 +1,4 @@
-import type { EngineInfo, Numbers } from '../shared/types.js';
+import type { EngineInfo, Numbers, RecoveryProgress } from '../shared/types.js';
 
 export interface EngineRequest {
   id: number;
@@ -13,6 +13,10 @@ export interface EngineRequest {
   generated_tokens: number;
   logical_context_tokens: number;
   preemptions: number;
+  recovery: RecoveryProgress | null;
+  recovery_pending: boolean;
+  replayed_tokens: number;
+  last_progress_ns: number | null;
 }
 
 export interface ServiceRequest {
@@ -96,6 +100,7 @@ export interface NinferSnapshot {
     sampled_ns: number;
     sample_age_ns: number;
     status: string;
+    progress_owner: number | null;
     runtime: {
       [key: string]: unknown;
       requests: Numbers;

@@ -267,6 +267,7 @@ struct ReplayProgress {
     bool capture_ready             = false;
     std::uint32_t processed_tokens = 0;
     bool complete                  = false;
+    std::uint32_t frontier         = 0;
 };
 
 struct CapturePreparation {
@@ -287,7 +288,7 @@ struct ContextProgress {
     std::optional<SequenceHandle> sequence;
     std::optional<runtime::ResidencyId> residency;
     std::optional<ResumeState> paused;
-    bool replaying = false;
+    RecoveryProgress recovery;
     std::vector<CheckpointHandle> private_points;
     std::vector<CheckpointHandle> retired_checkpoints;
     std::vector<CheckpointHandle> captured_checkpoints;

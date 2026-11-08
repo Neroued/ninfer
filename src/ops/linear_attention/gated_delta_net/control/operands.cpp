@@ -64,6 +64,7 @@ Geometry describe_profile(const ProjectionProfile& weights) {
         return {a.n / 2, a.k};
     }
     const auto& b = *weights.second;
+    require(valid_linear_policy(b.policy), "invalid activation permission");
     require(a.qtype == QType::BF16 && b.qtype == QType::BF16 && a.n == 48 && a.k == 5120 &&
                 b.n == 48 && b.k == 5120,
             "unsupported paired geometry");
@@ -78,9 +79,9 @@ Weights describe_weights(const ProjectionWeights& weights) {
         return {geometry, &w, nullptr};
     }
     const auto& pair = std::get<PairedProjectionWeights>(weights);
-    describe_matrix(pair.first, 48, 5120);
-    describe_matrix(pair.second, 48, 5120);
-    return {geometry, &pair.first, &pair.second};
+    describe_matrix(pair.first.weight, 48, 5120);
+    describe_matrix(pair.second.weight, 48, 5120);
+    return {geometry, &pair.first.weight, &pair.second.weight};
 }
 
 void validate_weights(const Weights& weights) {

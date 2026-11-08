@@ -74,6 +74,7 @@ struct RuntimeStats {
     std::uint64_t active_captures_aborted   = 0;
     std::uint64_t preemptions               = 0;
     std::uint64_t snapshot_restores         = 0;
+    std::uint64_t direct_restores           = 0;
     std::uint64_t replay_restores           = 0;
     std::uint64_t replayed_tokens           = 0;
 
@@ -212,6 +213,7 @@ struct EngineSnapshot {
     std::vector<ExecutionCounters> decode_by_batch;
     std::vector<ExecutionProgress> in_flight;
     EngineStatus status = EngineStatus::Ready;
+    std::optional<std::uint64_t> progress_owner;
     // Absent unless explicitly requested; an empty included vector means no live requests.
     std::optional<std::vector<RequestSnapshot>> requests;
     ScoringStatistics scoring;

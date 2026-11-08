@@ -9,7 +9,7 @@ ops::WeightInput weight_input(std::span<const BoundWeight> weights, WeightUseId 
     if (id.parameter.index >= weights.size()) throw std::out_of_range("weight parameter index");
     const auto& parameter = weights[id.parameter.index];
     const auto& use       = parameter.uses.at(id.use_index);
-    return {parameter.view, use.policy, use.activation_input_divisor};
+    return {parameter.view, use.policy, use.calibration_view()};
 }
 
 ops::WeightInput weight_input(std::span<const BoundWeight> weights, WeightId id) {

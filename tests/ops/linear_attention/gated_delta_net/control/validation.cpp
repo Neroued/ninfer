@@ -75,14 +75,15 @@ int validate(Profile p, bool normalize_input, CudaExecutionView execution) {
     const auto saved_weights = f.weights.prepared;
     auto& w = std::holds_alternative<ops::SingleProjectionWeight>(f.weights.prepared)
                   ? std::get<ops::SingleProjectionWeight>(f.weights.prepared).weight
-                  : std::get<ops::PairedProjectionWeights>(f.weights.prepared).first;
+                  : std::get<ops::PairedProjectionWeights>(f.weights.prepared).first.weight;
     w.qtype = QType::Q8_G32_FP16;
     failed += rejects(name + " weight format", launch);
     f.weights.prepared = saved_weights;
     auto mutate        = [&](auto change) {
-        auto& weight = std::holds_alternative<ops::SingleProjectionWeight>(f.weights.prepared)
-                                  ? std::get<ops::SingleProjectionWeight>(f.weights.prepared).weight
-                                  : std::get<ops::PairedProjectionWeights>(f.weights.prepared).first;
+        auto& weight =
+            std::holds_alternative<ops::SingleProjectionWeight>(f.weights.prepared)
+                       ? std::get<ops::SingleProjectionWeight>(f.weights.prepared).weight
+                       : std::get<ops::PairedProjectionWeights>(f.weights.prepared).first.weight;
         change(weight);
         failed += rejects(name + " weight metadata", launch);
         f.weights.prepared = saved_weights;
@@ -134,7 +135,7 @@ int validate(Profile p, bool normalize_input, CudaExecutionView execution) {
         a.shape[0] = b.shape[0] = 48;
         a.padded_shape[0] = b.padded_shape[0] = 48;
         b.qdata                     = static_cast<const std::byte*>(a.qdata) + 48 * 2560 * 2;
-        ops::ProjectionWeights pair = ops::PairedProjectionWeights{a, b};
+        ops::ProjectionWeights pair = ops::PairedProjectionWeights{{a}, {b}};
         failed +=
             rejects(name + " pair domain", [&] { (void)workspace_capacity(pair, false, 1, 8); });
     }
@@ -150,8 +151,8 @@ int validate_capacity(Profile p, bool normalize_input) {
                 value.weight.qdata   = nullptr;
                 value.weight.payload = nullptr;
             } else {
-                value.first.qdata = value.second.qdata = nullptr;
-                value.first.payload = value.second.payload = nullptr;
+                value.first.weight.qdata = value.second.weight.qdata = nullptr;
+                value.first.weight.payload = value.second.weight.payload = nullptr;
             }
         },
         metadata);

@@ -127,6 +127,8 @@ std::string Metrics::render(const EngineSnapshot& snapshot, const ServiceSnapsho
     COUNTER(preemptions, "preemptions_total", "Resource-pressure pauses.");
     COUNTER(snapshot_restores, "snapshot_restores_total",
             "Restores from complete paused snapshots.");
+    COUNTER(direct_restores, "direct_restores_total",
+            "Restorations needing neither a snapshot nor replay.");
     COUNTER(replay_restores, "replay_restores_total", "Recovery operations that rebuild history.");
     COUNTER(root_selections, "root_selections_total", "Initial bindings without checkpoint reuse.");
     COUNTER(checkpoint_selections, "checkpoint_selections_total",

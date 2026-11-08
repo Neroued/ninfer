@@ -35,32 +35,31 @@ struct RoutedSwiGLUProfile {
     std::int32_t experts = 0, top_k = 0;
 };
 
-// NVFP4 A4 calibration divisors for x and the FP32 SiLU(gate)*up product, respectively.
-// Matrix divisors remain independently addressed by logical expert in the bank.
-// Block-FP8 weights and their dynamic activation groups have no tensor divisors.
-struct ExpertActivationDivisors {
-    std::optional<float> gate_up, down;
+// Calibration for x and the FP32 activation(gate)*up product, by logical expert ID.
+// Weight scales belong to the bank. Dynamic block-FP8 activation scales are not calibration.
+struct ExpertActivationCalibration {
+    ActivationCalibrationView gate_up, down;
 };
 
 // Combines activation permissions and calibration across Uses evaluated by one expert call.
-// NVFP4 A4 requires the same positive divisor for every included input.
+// Fused Uses must agree on the calibration of each logical matrix when A4 is allowed.
 class ExpertInputUsage {
 public:
     void include(const WeightInput&);
 
     [[nodiscard]] LinearPolicy policy() const noexcept { return policy_; }
 
-    [[nodiscard]] std::optional<float> activation_divisor(QType format) const;
+    [[nodiscard]] ActivationCalibrationView calibration(QType format) const;
 
 private:
     LinearPolicy policy_ = LinearPolicy::AllowA4;
-    std::optional<float> divisor_;
-    bool missing_divisor_ = false, unequal_divisors_ = false;
+    ActivationCalibrationView calibration_;
+    bool missing_calibration_ = false, unequal_calibrations_ = false;
 };
 
 struct CudaSwiGLUExperts {
     ExpertBankDeviceView bank;
-    ExpertActivationDivisors activation_divisors;
+    ExpertActivationCalibration activation_calibration;
 };
 
 struct CpuSwiGLUExperts {
@@ -78,8 +77,6 @@ struct SwiGLUWeights {
 // rounding boundary, residual, routes or coefficient tensor. Writes every destination cell.
 // Capacity covers the inclusive extent interval.
 // No hidden allocation/transfer/readback; enqueues on execution and supports Graph replay.
-// Supports registered BF16, Q8-G32/FP16 and NVFP4 profiles with an explicit finite positive clamp
-// limit.
 [[nodiscard]] std::size_t swiglu_workspace_capacity_bytes(const SwiGLUProfile& profile,
                                                           std::int32_t min_tokens,
                                                           std::int32_t max_tokens);
@@ -181,8 +178,6 @@ struct SigmoidMoeWeights {
 
 // Complete local contribution: routed_swiglu(topk_sigmoid_route(x),subset,x)+shared(x).
 // Shared is unscaled, exactly once, including zero routed hits. Only final output is BF16.
-// Supports registered block-scaled routed and native BF16 or Q8-G32/FP16 shared profiles,
-// both with explicit finite positive clamp limits.
 // Destination is contiguous BF16[H,T], Write; no residual, rank, communication or shared gate.
 // Router, native bank/subset and shared semantics follow the profiles above; all matrices and
 // control inputs are immutable and disjoint from output/live caller scratch. Graph replay may
@@ -200,8 +195,9 @@ void topk_sigmoid_swiglu_moe(const Tensor&, const SigmoidMoeProfile&, const Sigm
 // Sum coefficient[j,t]*F_ids[j,t](x[:,t]) over subset. Registered clamped block-scaled
 // geometries support Write to BF16 or FP32, without a scaled shared term.
 // The shared overload adds coefficients[t]*F_shared(x[:,t]) exactly once, including for None.
-// x is contiguous BF16 [H,T], destination is contiguous FP32 or BF16 [H,T], T>0. Both,
-// routes and encoded planes are 16-byte aligned; mask/shared coefficients are 4-byte aligned.
+// x is contiguous BF16 [H,T], destination is contiguous FP32 or BF16 [H,T], T>0. Both
+// and routes are 16-byte aligned; encoded planes follow their layout alignment, and
+// mask/shared coefficients are 4-byte aligned.
 // Write reads no old destination; AddResidual requires BF16 and adds its old value before
 // final rounding. None writes zero without accessing routed weights/routes (or computes shared).
 // Route IDs are in [0,E); unselected weights and index entries are never read. Callers publish

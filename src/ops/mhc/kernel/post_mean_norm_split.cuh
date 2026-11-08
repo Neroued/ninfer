@@ -1,5 +1,6 @@
 #pragma once
 #include "ops/mhc/kernel/residual.cuh"
+#include "ops/mhc/kernel/coefficients.cuh"
 #include "ops/common/cuda/reduce.cuh"
 
 namespace ninfer::ops::detail::mhc {
@@ -27,7 +28,7 @@ __global__ void post_mean_norm_partial_kernel(Operands o, float* work) {
     if (tid == 0) work[std::int64_t(o.columns) * kHidden + m * Parts + part] = ss;
 }
 
-template <int Parts, int Threads, int V>
+template <class Gamma, int Parts, int Threads, int V>
 __global__ void post_mean_norm_finish_kernel(Operands o, const float* work) {
     constexpr int H = Threads * V;
     auto m          = std::int64_t(blockIdx.x / (kHidden / H));
@@ -38,12 +39,12 @@ __global__ void post_mean_norm_finish_kernel(Operands o, const float* work) {
         ss += work[std::int64_t(o.columns) * kHidden + m * Parts + i];
     ss               = common::warp_sum(ss);
     float inv        = rsqrtf(ss / kHidden + o.parameters.branch_epsilon);
-    const auto gamma = common::Bf16Vector<V>::load(static_cast<const __nv_bfloat16*>(o.gamma) + d);
+    const auto gamma = GammaVector<Gamma, V>::load(static_cast<const Gamma*>(o.gamma) + d);
     common::Bf16Vector<V> output;
 #pragma unroll
     for (int v = 0; v < V; ++v)
         output.word[v] =
-            __float2bfloat16_rn(__bfloat162float(gamma.word[v]) * work[m * kHidden + d + v] * inv);
+            __float2bfloat16_rn(float(gamma.word[v]) * work[m * kHidden + d + v] * inv);
     output.store(static_cast<__nv_bfloat16*>(o.output) + m * kHidden + d);
 }
 } // namespace ninfer::ops::detail::mhc

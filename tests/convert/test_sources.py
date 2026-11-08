@@ -57,7 +57,7 @@ def test_nvfp4_source_preserves_words_and_decodes_independently(tmp_path):
         source = matrix_source(store, "proj.weight", (2, 16))
         words = source.read_encoded(0, 2)
         assert torch.equal(words.codes, codes) and torch.equal(words.scales, scales)
-        assert words.weight_divisor == struct.pack("<f", 2.0)
+        assert words.weight_scale == struct.pack("<f", 2.0)
         expected = torch.tensor(
             [
                 0.0,
@@ -80,7 +80,7 @@ def test_nvfp4_source_preserves_words_and_decodes_independently(tmp_path):
         )
         expected = torch.stack((expected / 2, expected))
         assert torch.equal(source.values().reshape(2, 16), expected)
-        assert source.input_divisor() == struct.pack("<f", 1.5)
+        assert source.activation_scale() == struct.pack("<f", 1.5)
         assert source.values(16, 16).numel() == 0
 
 
@@ -124,11 +124,11 @@ def test_modelopt_preserves_words_and_converts_multiplier_to_divisor(tmp_path):
         source = ModelOptNvfp4(store).matrix("proj", (1, 16))
         words = source.read_encoded(0, 1)
         assert torch.equal(words.codes, codes) and torch.equal(words.scales, scales)
-        assert words.weight_divisor == struct.pack("<f", 1 / 0.375)
-        assert source.input_divisor() == struct.pack("<f", 8.0)
+        assert words.weight_scale == struct.pack("<f", 1 / 0.375)
+        assert source.activation_scale() == struct.pack("<f", 8.0)
         expected = torch.tensor(
             [0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6],
             dtype=torch.float64,
         )
-        expected *= 2.0 / struct.unpack("<f", words.weight_divisor)[0]
+        expected *= 2.0 / struct.unpack("<f", words.weight_scale)[0]
         assert torch.equal(source.values(), expected)

@@ -125,7 +125,7 @@ void SessionImpl::receive_result(runtime::ResultReady<ExecutionTypes>&& event) {
             current.completion.emplace(
                 SessionEvent{current.ticket, current.members,
                              ReplayProgress{capture, current.columns[0],
-                                            end == request.replay_target && !capture}});
+                                            end == request.replay_target && !capture, end}});
         } else if (current.kind == OperationKind::Control) {
             current.completion.emplace(
                 SessionEvent{current.ticket, current.members, ControlComplete{}});

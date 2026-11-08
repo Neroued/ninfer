@@ -358,7 +358,9 @@ int metadata(bool fp8, bool q8 = false) {
         if (field == 13)
             bad.shared.down.weight.qdata =
                 static_cast<const std::byte*>(bad.shared.down.weight.qdata) + 2;
-        if (field == 14) bad.routed.activation_divisors.down = 0;
+        if (field == 14)
+            bad.routed.activation_calibration.down =
+                ops::ActivationCalibrationView::broadcast(ops::ActivationScaleOperation::Divide, 0);
         reject([&] {
             ops::topk_sigmoid_swiglu_moe(x, p, bad, f.bank.subset(), y, ws,
                                          cuda_environment().default_execution);

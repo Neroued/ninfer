@@ -11,7 +11,7 @@ struct Weights {
         if (o.format == "q4q5") {
             first  = make_row_split_weight(QType::Q4_G64_FP16, 4096, o.k, o.k, 501U);
             second = make_row_split_weight(QType::Q5_G64_FP16, 12288, o.k, o.k, 503U);
-            native = ops::PairedProjectionWeights{first.weight, second.weight};
+            native = ops::PairedProjectionWeights{{first.weight}, {second.weight}};
         } else {
             if (o.format == "q8")
                 first = make_row_split_weight(QType::Q8_G32_FP16, o.n, o.k, o.k, 501U);

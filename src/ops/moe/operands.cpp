@@ -18,7 +18,7 @@ struct MatrixBytes {
 };
 
 MatrixBytes matrix_bytes(QType type, QuantLayout layout, int rows, int columns) {
-    const auto geometry = weight_geometry(
+    const auto geometry = weight_storage_geometry(
         type, layout, std::array<std::uint64_t, 2>{std::uint64_t(rows), std::uint64_t(columns)});
     return {geometry.code_bytes, geometry.high_bytes, geometry.scale_bytes};
 }
@@ -40,10 +40,15 @@ void validate_expert_profile(const RoutedSwiGLUProfile& p) {
         const bool fp8 = f.gate_up_type == QType::FP8_E4M3FN_BLOCK128X128_BF16 &&
                          f.gate_up_layout == QuantLayout::BlockScaleM128K128 &&
                          f.gate_up_policy == LinearPolicy::AllowA8;
+        const bool native = f.gate_up_type == QType::NVFP4_MUL &&
+                            (f.gate_up_layout == QuantLayout::Csf32 ||
+                             f.gate_up_layout == QuantLayout::BlockScaleK16M128x4) &&
+                            valid_linear_policy(f.gate_up_policy);
         require((f.intermediate == 2048 || f.intermediate == 1024) && p.experts == 288 &&
                     p.top_k == 8 && f.clamp_limit && std::isfinite(*f.clamp_limit) &&
-                    *f.clamp_limit > 0 && (nvfp4 || fp8) && f.down_type == f.gate_up_type &&
-                    f.down_layout == f.gate_up_layout && f.down_policy == f.gate_up_policy,
+                    *f.clamp_limit > 0 && (nvfp4 || fp8 || native) &&
+                    f.down_type == f.gate_up_type && f.down_layout == f.gate_up_layout &&
+                    f.down_policy == f.gate_up_policy,
                 "routed SwiGLU: unsupported clamped block-scaled profile");
         return;
 #else
@@ -204,28 +209,121 @@ void MoeOperands::experts(const CudaSwiGLUExperts& w, const RoutedSwiGLUProfile&
     require(w.bank.count == std::uint32_t(p.experts) &&
                 bool(w.bank.gate_up.offsets) == bool(w.bank.down.offsets),
             "MoE: expert bank count or addressing differs");
-    for (const auto divisor : {w.activation_divisors.gate_up, w.activation_divisors.down}) {
-        require(!divisor || (std::isfinite(*divisor) && *divisor > 0),
-                "MoE: activation divisor must be finite and positive");
+    for (const auto& calibration :
+         {w.activation_calibration.gate_up, w.activation_calibration.down}) {
+        const auto values = calibration.values();
+        if (values.size() == 1)
+            require(std::isfinite(values.front()) && values.front() > 0,
+                    "MoE: activation scale must be finite and positive");
     }
     if (p.ffn.gate_up_type == QType::NVFP4) {
-        require(w.activation_divisors.gate_up && w.activation_divisors.down,
-                "MoE: NVFP4 A4 requires both activation divisors");
+        (void)w.activation_calibration.gate_up.scalar_divisor();
+        (void)w.activation_calibration.down.scalar_divisor();
+    } else if (p.ffn.gate_up_type == QType::NVFP4_MUL) {
+        for (const auto* calibration :
+             {&w.activation_calibration.gate_up, &w.activation_calibration.down}) {
+            const auto count = calibration->values().size();
+            require(count || !allows_a4(p.ffn.gate_up_policy),
+                    "MoE: native A4 requires per-expert calibration");
+            if (!count) continue;
+            require(calibration->operation == ActivationScaleOperation::Multiply &&
+                        (count == 1 || count == std::size_t(p.experts)),
+                    "MoE: native calibration differs from the logical expert domain");
+            if (count > 1) {
+                operand::device(calibration->device_values.device, device_, op_, "calibration");
+                require(operand::aligned(calibration->device_values.data, alignof(float)) &&
+                            calibration->device_values.bytes == count * sizeof(float),
+                        "MoE: invalid device calibration table");
+                read(calibration->device_values.data, calibration->device_values.bytes);
+            }
+        }
     } else if (p.ffn.gate_up_type == QType::FP8_E4M3FN_BLOCK128X128_BF16 ||
                p.ffn.gate_up_type == QType::FP8_E4M3FN_BLOCK64X64_BF16) {
-        require(!w.activation_divisors.gate_up && !w.activation_divisors.down,
+        require(w.activation_calibration.gate_up.empty() && w.activation_calibration.down.empty(),
                 "MoE: block FP8 has no activation divisors");
     }
     const auto matrix = [&](const ExpertMatrixDeviceView& view, QType type, QuantLayout layout,
                             int n, int k) {
+        if (type == QType::NVFP4_MUL) {
+            const auto physical_layout = view.layout == QuantLayout::BatchedBlockScaleK16M128x4
+                                             ? QuantLayout::BlockScaleK16M128x4
+                                             : view.layout;
+            require(view.format == type && physical_layout == layout && !view.high &&
+                        !view.high_stride,
+                    "MoE: native bank representation differs");
+            const bool indexed = view.offsets != nullptr;
+            const auto count   = indexed ? std::uint32_t(p.experts) : view.physical_count;
+            require(count && count <= std::uint32_t(p.experts) &&
+                        !(indexed && view.expert_indices) &&
+                        (indexed || count == std::uint32_t(p.experts) || view.expert_indices),
+                    "MoE: invalid native expert addressing");
+            if (view.expert_indices) {
+                require(operand::aligned(view.expert_indices, 4), "MoE: invalid expert index map");
+                read(view.expert_indices, std::size_t(p.experts) * 4);
+            }
+            require(operand::aligned(view.matrix_scales, 4) &&
+                        view.matrix_scale_stride <= (SIZE_MAX / 4 - 1) / std::max(1U, count - 1),
+                    "MoE: invalid native matrix multipliers");
+            read(view.matrix_scales, ((count - 1) * view.matrix_scale_stride + 1) * 4);
+            const auto plane = [&](const void* data, std::size_t bytes, std::uint64_t stride,
+                                   std::size_t alignment) {
+                require(operand::aligned(data, alignment), "MoE: invalid native weight plane");
+                if (indexed) {
+                    const auto backing =
+                        operand::range(view.indexed_storage.data, view.indexed_storage.bytes, op_);
+                    const auto span = operand::range(data, bytes, op_);
+                    require(span.begin >= backing.begin && span.end <= backing.end,
+                            "MoE: native indexed plane exceeds backing");
+                } else {
+                    require(stride >= bytes && stride % alignment == 0 &&
+                                stride <= (SIZE_MAX - bytes) / std::max(1U, count - 1),
+                            "MoE: invalid native plane stride");
+                    read(data, (count - 1) * stride + bytes);
+                }
+            };
+            if (indexed) {
+                require(layout == QuantLayout::BlockScaleK16M128x4 &&
+                            operand::aligned(view.offsets, 8),
+                        "MoE: invalid indexed native layout");
+                read(view.offsets, std::size_t(p.experts) * 8);
+                operand::device(view.indexed_storage.device, device_, op_, "native expert storage");
+                require(view.indexed_storage.data && view.indexed_storage.bytes,
+                        "MoE: missing native expert storage");
+                read(view.indexed_storage.data, view.indexed_storage.bytes);
+            }
+            plane(view.codes, std::size_t(n) * k / 2, view.code_stride, 16);
+            if (layout == QuantLayout::Csf32) {
+                const auto& c = view.csf;
+                require(!view.scales && !view.scale_stride && c.first.rows == std::uint64_t(n) &&
+                            c.first.columns == std::uint64_t(k / 16) && !c.first.row_begin,
+                        "MoE: compressed scale geometry differs");
+                const auto g = weight_storage_geometry(
+                    type, layout,
+                    std::array<std::uint64_t, 3>{count, std::uint64_t(n), std::uint64_t(k)},
+                    {.exception_count = c.first.exception_count});
+                plane(c.first.bases, n, c.bases_stride, 16);
+                plane(c.first.nibbles, g.csf.nibble_bytes_per_matrix, c.nibbles_stride, 16);
+                plane(c.first.offsets, g.csf.offsets_per_matrix * 2, c.offsets_stride, 2);
+                plane(c.first.page_bases, g.csf.pages_per_matrix * 4, c.page_bases_stride, 4);
+                if (c.first.exception_count) {
+                    require(operand::aligned(c.first.exceptions, 2), "MoE: invalid CSF exceptions");
+                    read(c.first.exceptions, c.first.exception_count * 2);
+                }
+            } else {
+                plane(view.scales, std::size_t(n) * k / 16, view.scale_stride, 16);
+            }
+            return;
+        }
         const auto bytes = matrix_bytes(type, layout, n, k);
         if (type == QType::NVFP4) {
-            require(operand::aligned(view.divisors, alignof(float)) &&
-                        view.divisor_stride <= (SIZE_MAX / sizeof(float) - 1) / (p.experts - 1),
+            require(operand::aligned(view.matrix_scales, alignof(float)) &&
+                        view.matrix_scale_stride <=
+                            (SIZE_MAX / sizeof(float) - 1) / (p.experts - 1),
                     "MoE: invalid NVFP4 matrix divisors");
-            read(view.divisors, ((p.experts - 1) * view.divisor_stride + 1) * sizeof(float));
+            read(view.matrix_scales,
+                 ((p.experts - 1) * view.matrix_scale_stride + 1) * sizeof(float));
         } else {
-            require(!view.divisors && view.divisor_stride == 0,
+            require(!view.matrix_scales && view.matrix_scale_stride == 0,
                     "MoE: this weight format has no matrix divisors");
         }
         if (view.offsets) {
@@ -271,6 +369,14 @@ void MoeOperands::experts(const CudaSwiGLUExperts& w, const RoutedSwiGLUProfile&
 
 void MoeOperands::matrix(const Weight& w, int rows, int columns, QType type) {
     operand::device(w.device, device_, op_, "shared weight");
+    if (type == QType::MXFP8 || type == QType::FP8_E4M3FN_BLOCK128X128_FP32) {
+        require(w.n == rows && w.k == columns, "MoE: shared matrix shape differs");
+        const auto geometry = type == QType::MXFP8 ? common::validate_mxfp8_weight(w, op_)
+                                                   : common::validate_fp8_block_fp32_weight(w, op_);
+        read(w.qdata, geometry.code_plane_bytes);
+        read(w.scales, geometry.scale_plane_bytes);
+        return;
+    }
     require((type == QType::BF16 || type == QType::Q8_G32_FP16) && w.qtype == type && w.n == rows &&
                 w.k == columns && w.ndim == 2 && w.shape[0] == rows && w.shape[1] == columns &&
                 w.shape[2] == 1 && w.shape[3] == 1 && w.padded_shape[0] == rows &&

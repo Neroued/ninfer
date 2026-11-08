@@ -16,11 +16,11 @@ __device__ __forceinline__ float2 decode_nvfp4_e2m1x2(std::uint8_t storage) {
     return static_cast<float2>(value);
 }
 
-__device__ __forceinline__ unsigned nvfp4_scaled_pair_bf16(std::uint8_t code, std::uint8_t scale) {
+__device__ __forceinline__ unsigned nvfp4_pair_bf16_scaled(std::uint8_t code, unsigned scale_bits) {
 #if __CUDACC_VER_MAJOR__ > 13 || (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ >= 2)
     // PTX 9.2 exposes native pair widening. E2M1 times a finite E4M3 scale needs
     // at most six significand bits, so the BF16 multiplication is exact.
-    unsigned values, multiplier, result;
+    unsigned values, result;
     asm("{\n"
         ".reg .b8 packed;\n"
         "mov.b32 {packed, _, _, _}, %1;\n"
@@ -28,23 +28,26 @@ __device__ __forceinline__ unsigned nvfp4_scaled_pair_bf16(std::uint8_t code, st
         "}\n"
         : "=r"(values)
         : "r"(static_cast<unsigned>(code)));
-    const auto scale_pair = static_cast<std::uint16_t>(scale | (static_cast<unsigned>(scale) << 8));
-    multiplier            = fp8_e4m3x2_to_bf16x2_bits(scale_pair);
-    asm("mul.rn.bf16x2 %0, %1, %2;" : "=r"(result) : "r"(values), "r"(multiplier));
+    asm("mul.rn.bf16x2 %0, %1, %2;" : "=r"(result) : "r"(values), "r"(scale_bits));
     return result;
 #else
     // CUDA 13.1 retains the exact FP32 expansion.
-    const float2 values    = decode_nvfp4_e2m1x2(code);
-    const float multiplier = decode_e4m3(scale);
+    const float2 values = decode_nvfp4_e2m1x2(code);
+    const float2 scale  = bf16x2_bits_to_float2(scale_bits);
 
     union {
         __nv_bfloat162 pair;
         unsigned bits;
     } result;
 
-    result.pair = __floats2bfloat162_rn(values.x * multiplier, values.y * multiplier);
+    result.pair = __floats2bfloat162_rn(values.x * scale.x, values.y * scale.y);
     return result.bits;
 #endif
+}
+
+__device__ __forceinline__ unsigned nvfp4_scaled_pair_bf16(std::uint8_t code, std::uint8_t scale) {
+    const auto pair = static_cast<std::uint16_t>(scale | (static_cast<unsigned>(scale) << 8));
+    return nvfp4_pair_bf16_scaled(code, fp8_e4m3x2_to_bf16x2_bits(pair));
 }
 
 struct alignas(8) Nvfp4QuantizedK16 {
@@ -105,7 +108,7 @@ __device__ __forceinline__ std::uint8_t quantize_nvfp4_activation_pair(float2 va
 // BF16 input, group size 16, explicit tensor divisor. Codes use the rounded E4M3
 // group scale; a scale that rounds to zero produces zero codes.
 __device__ __forceinline__ Nvfp4QuantizedK16 quantize_nvfp4_k16(const __nv_bfloat16* source,
-                                                                float input_scale_divisor) {
+                                                                float input_scale) {
     const uint4 packed0                = load_vec<uint4>(source);
     const uint4 packed1                = load_vec<uint4>(source + 8);
     const std::uint32_t represented[8] = {
@@ -122,13 +125,13 @@ __device__ __forceinline__ Nvfp4QuantizedK16 quantize_nvfp4_k16(const __nv_bfloa
     }
 
     Nvfp4QuantizedK16 result{};
-    result.scale = nvfp4_activation_scale(max_abs, input_scale_divisor);
+    result.scale = nvfp4_activation_scale(max_abs, input_scale);
     if (result.scale == 0) { return result; }
 
     const float decoded_scale = decode_e4m3(result.scale);
 #pragma unroll
     for (int pair = 0; pair < 8; ++pair) {
-        values[pair] = nvfp4_activation_values(values[pair], input_scale_divisor, decoded_scale);
+        values[pair] = nvfp4_activation_values(values[pair], input_scale, decoded_scale);
     }
     pack_nvfp4_e2m1x16(values, result.codes_lo, result.codes_hi);
     return result;
@@ -153,6 +156,68 @@ __device__ __forceinline__ Nvfp4QuantizedK16 quantize_nvfp4_k16(const float* sou
         values[pair] = nvfp4_activation_values(values[pair], divisor, scale);
     pack_nvfp4_e2m1x16(values, result.codes_lo, result.codes_hi);
     return result;
+}
+
+// Native multiplier calibration: x = E2M1 * E4M3 * multiplier. The two divisions
+// retain the original multiplier and the rounded scale as separate numeric boundaries.
+__device__ __forceinline__ std::uint8_t nvfp4_mul_activation_scale(float maximum,
+                                                                   float multiplier) {
+    const float normalized = __fdiv_rn(maximum, multiplier);
+    return __nv_cvt_float_to_fp8(__fdiv_rn(normalized, 6.0F), __NV_SATFINITE, __NV_E4M3);
+}
+
+__device__ __forceinline__ float2 nvfp4_mul_activation_values(float2 values, float multiplier,
+                                                              float decoded_scale) {
+    return make_float2(__fdiv_rn(__fdiv_rn(values.x, multiplier), decoded_scale),
+                       __fdiv_rn(__fdiv_rn(values.y, multiplier), decoded_scale));
+}
+
+__device__ __forceinline__ std::uint8_t
+quantize_nvfp4_mul_activation_pair(float2 values, float multiplier, std::uint8_t scale) {
+    if (!scale) return 0;
+    return __nv_cvt_float2_to_fp4x2(
+        nvfp4_mul_activation_values(values, multiplier, decode_e4m3(scale)), __NV_E2M1,
+        cudaRoundNearest);
+}
+
+__device__ __forceinline__ Nvfp4QuantizedK16 quantize_nvfp4_mul_k16(float2 (&values)[8],
+                                                                    float multiplier) {
+    float maximum = 0.0F;
+#pragma unroll
+    for (int pair = 0; pair < 8; ++pair)
+        maximum = fmaxf(maximum, fmaxf(fabsf(values[pair].x), fabsf(values[pair].y)));
+    Nvfp4QuantizedK16 result{};
+    result.scale = nvfp4_mul_activation_scale(maximum, multiplier);
+    if (!result.scale) return result;
+    const float scale = decode_e4m3(result.scale);
+#pragma unroll
+    for (int pair = 0; pair < 8; ++pair)
+        values[pair] = nvfp4_mul_activation_values(values[pair], multiplier, scale);
+    pack_nvfp4_e2m1x16(values, result.codes_lo, result.codes_hi);
+    return result;
+}
+
+__device__ __forceinline__ Nvfp4QuantizedK16 quantize_nvfp4_mul_k16(const __nv_bfloat16* source,
+                                                                    float multiplier) {
+    const uint4 lo = load_vec<uint4>(source), hi = load_vec<uint4>(source + 8);
+    const unsigned packed[8]{lo.x, lo.y, lo.z, lo.w, hi.x, hi.y, hi.z, hi.w};
+    float2 values[8];
+#pragma unroll
+    for (int pair = 0; pair < 8; ++pair) values[pair] = bf16x2_bits_to_float2(packed[pair]);
+    return quantize_nvfp4_mul_k16(values, multiplier);
+}
+
+__device__ __forceinline__ Nvfp4QuantizedK16 quantize_nvfp4_mul_k16(const float* source,
+                                                                    float multiplier) {
+    float2 values[8];
+#pragma unroll
+    for (int pair = 0; pair < 8; ++pair) values[pair] = load_vec<float2>(source + pair * 2);
+    return quantize_nvfp4_mul_k16(values, multiplier);
+}
+
+__device__ __forceinline__ std::uint8_t nvfp4_raw_scale(const std::uint8_t* scales, int row,
+                                                        int group, int k) {
+    return scales[nvfp4_scale_byte_offset(row, group, k)];
 }
 
 // FP32 input, no tensor divisor. For a nonzero group, clamp its E4M3 scale to
@@ -217,9 +282,7 @@ struct Nvfp4F16x16 {
     int4 hi;
 };
 
-__device__ __forceinline__ Nvfp4F16x16 nvfp4_dequant_f16x16(const std::uint8_t* codes,
-                                                            std::uint8_t scale_code) {
-    const int2 packed         = load_vec<int2>(codes);
+__device__ __forceinline__ Nvfp4F16x16 nvfp4_dequant_f16x16(int2 packed, std::uint8_t scale_code) {
     const std::uint8_t* bytes = reinterpret_cast<const std::uint8_t*>(&packed);
     __nv_fp8_e4m3 encoded_scale;
     encoded_scale.__x    = scale_code;
@@ -239,6 +302,11 @@ __device__ __forceinline__ Nvfp4F16x16 nvfp4_dequant_f16x16(const std::uint8_t* 
         make_int4(static_cast<int>(half_bits[4]), static_cast<int>(half_bits[5]),
                   static_cast<int>(half_bits[6]), static_cast<int>(half_bits[7])),
     };
+}
+
+__device__ __forceinline__ Nvfp4F16x16 nvfp4_dequant_f16x16(const std::uint8_t* codes,
+                                                            std::uint8_t scale_code) {
+    return nvfp4_dequant_f16x16(load_vec<int2>(codes), scale_code);
 }
 
 } // namespace ninfer::ops::common

@@ -25,7 +25,9 @@ inline constexpr ReductionCriterion kFusedCoefficients{1.e-3, 2.e-6, 2.e-3, 2.e-
 inline constexpr ReductionCriterion kFinalHidden{4.e-3, 2.e-6, 1.2e-2};
 
 struct Fixture {
-    Fixture(Form form, int columns, bool in_place, std::size_t tensor_guard_bytes = 256);
+    Fixture(Form form, int columns, bool in_place, std::size_t tensor_guard_bytes = 256,
+            DType base_type = DType::BF16, DType scale_type = DType::BF16,
+            DType gamma_type = DType::BF16);
     void set(Pattern pattern, int phase = 0);
     void upload(cudaStream_t stream);
     void invoke(CudaExecutionView e, MemoryArena* workspace = nullptr);
@@ -34,6 +36,7 @@ struct Fixture {
     Form form;
     int m;
     bool alias;
+    DType base_type, scale_type, gamma_type;
     ops::MhcPreParameters parameters{1.e-5F, 1.e-5F, 1.e-6F, 1.e-6F, 2.F, 20};
     std::vector<float> x, y, f, base, scale, gamma, q, c;
     GuardedDeviceBuffer dx, dy, df, db, ds, dg, dq, dc, dr, du, dnq, dnc;

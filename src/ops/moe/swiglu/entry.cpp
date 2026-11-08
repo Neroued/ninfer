@@ -5,6 +5,7 @@
 #include "ops/linear/kernels/nvfp4/nvfp4_a4_plan.h"
 #include "ops/moe/swiglu/dispatch.h"
 #include "ops/moe/swiglu/q8_plan.h"
+#include "ops/moe/swiglu/fp8_plan.h"
 #include "ops/moe/operands.h"
 #include <cmath>
 #include <stdexcept>
@@ -35,7 +36,19 @@ void profile(const SwiGLUProfile& p) {
         p.down_type == QType::Q8_G32_FP16 && p.gate_up_layout == QuantLayout::RowSplit &&
         p.down_layout == QuantLayout::RowSplit && p.gate_up_policy == LinearPolicy::A16Only &&
         p.down_policy == LinearPolicy::A16Only;
-    require(nvfp4 || bf16 || q8, "swiglu: unsupported profile");
+    const bool mxfp8 = p.hidden == 4096 && (p.intermediate == 1024 || p.intermediate == 6144) &&
+                       p.gate_up_type == QType::MXFP8 && p.down_type == QType::MXFP8 &&
+                       p.gate_up_layout == QuantLayout::RowGroupScale &&
+                       p.down_layout == QuantLayout::RowGroupScale &&
+                       valid_linear_policy(p.gate_up_policy) && valid_linear_policy(p.down_policy);
+    const bool block_fp8 = p.hidden == 4096 && p.intermediate == 1024 &&
+                           p.gate_up_type == QType::FP8_E4M3FN_BLOCK128X128_FP32 &&
+                           p.down_type == QType::FP8_E4M3FN_BLOCK128X128_FP32 &&
+                           p.gate_up_layout == QuantLayout::BlockScaleM128K128 &&
+                           p.down_layout == QuantLayout::BlockScaleM128K128 &&
+                           p.gate_up_policy == LinearPolicy::A16Only &&
+                           p.down_policy == LinearPolicy::A16Only;
+    require(nvfp4 || bf16 || q8 || mxfp8 || block_fp8, "swiglu: unsupported profile");
     require(p.clamp_limit && std::isfinite(*p.clamp_limit) && *p.clamp_limit > 0,
             "swiglu: clamp limit must be finite and positive");
 #else
@@ -45,6 +58,8 @@ void profile(const SwiGLUProfile& p) {
 
 std::size_t capacity(const SwiGLUProfile& p, int tokens) {
     WorkspaceLayoutBuilder layout;
+    if (detail::swiglu_ffn::scaled_fp8_format(p.gate_up_type))
+        return detail::swiglu_ffn::scaled_fp8_workspace_bytes(p, tokens);
     if (p.gate_up_type == QType::Q8_G32_FP16) return detail::swiglu_ffn::q8_workspace_bytes(tokens);
     if (p.gate_up_type == QType::BF16) {
         (void)layout.alloc_bytes(std::size_t(p.intermediate) * tokens * sizeof(float));
@@ -64,6 +79,8 @@ std::size_t capacity(const SwiGLUProfile& p, int tokens) {
 std::size_t swiglu_workspace_capacity_bytes(const SwiGLUProfile& p, int first, int last) {
     profile(p);
     require(first > 0 && last >= first, "swiglu: invalid token interval");
+    if (detail::swiglu_ffn::scaled_fp8_format(p.gate_up_type))
+        return detail::swiglu_ffn::scaled_fp8_workspace_capacity_bytes(p, first, last);
     if (p.gate_up_type == QType::Q8_G32_FP16)
         return detail::swiglu_ffn::q8_workspace_capacity_bytes(first, last);
     auto result = std::max(capacity(p, first), capacity(p, last));
@@ -81,7 +98,8 @@ void swiglu(const Tensor& x, const SwiGLUProfile& p, const SwiGLUWeights& weight
     const auto bytes = capacity(p, tokens);
     auto scope       = ws.scope();
     MemoryArena work(ws.alloc_bytes(bytes));
-    if (p.gate_up_type == QType::BF16 || p.gate_up_type == QType::Q8_G32_FP16) {
+    if (p.gate_up_type == QType::BF16 || p.gate_up_type == QType::Q8_G32_FP16 ||
+        detail::swiglu_ffn::scaled_fp8_format(p.gate_up_type)) {
         detail::MoeOperands operands(op, execution);
         (void)operands.input(x, p.hidden);
         require(out.dtype == DType::BF16, "swiglu: destination must be BF16");
@@ -115,6 +133,11 @@ void swiglu(const Tensor& x, const SwiGLUProfile& p, const SwiGLUWeights& weight
         }
     }
 #if NINFER_TARGET_SPARK
+    if (detail::swiglu_ffn::scaled_fp8_format(p.gate_up_type)) {
+        detail::swiglu_ffn::launch_scaled_fp8_ffn(x, weights, out, *p.clamp_limit, work,
+                                                  execution.stream());
+        return;
+    }
     if (p.gate_up_type == QType::Q8_G32_FP16) {
         detail::swiglu_ffn::launch_q8_ffn(x, weights, out, *p.clamp_limit, work,
                                           execution.stream());
@@ -142,16 +165,19 @@ void swiglu(const Tensor& x, const SwiGLUProfile& p, const SwiGLUWeights& weight
 
 #if NINFER_TARGET_SPARK
 namespace detail::swiglu_ffn {
-void launch_a16_ffn_join(const Tensor& x, const SwiGLUWeights& weights, Tensor& output,
-                         RoutedSwiGLUContribution routed, float limit, MemoryArena& workspace,
-                         cudaStream_t stream) {
+void launch_ffn_join(const Tensor& x, const SwiGLUWeights& weights, Tensor& output,
+                     RoutedSwiGLUContribution routed, float limit, MemoryArena& workspace,
+                     cudaStream_t stream) {
     switch (weights.gate_up.weight.qtype) {
     case QType::BF16:
         return launch_bf16_ffn_join(x, weights, output, routed, limit, workspace, stream);
     case QType::Q8_G32_FP16:
         return launch_q8_ffn_join(x, weights, output, routed, limit, workspace, stream);
+    case QType::MXFP8:
+    case QType::FP8_E4M3FN_BLOCK128X128_FP32:
+        return launch_scaled_fp8_ffn_join(x, weights, output, routed, limit, workspace, stream);
     default:
-        throw std::invalid_argument("swiglu join: unsupported native A16 format");
+        throw std::invalid_argument("swiglu join: unsupported weight format");
     }
 }
 } // namespace detail::swiglu_ffn

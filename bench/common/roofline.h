@@ -16,6 +16,7 @@ struct Roofline {
     const char* target;
     double memory_gbs;
     double sustained_read_gbs = std::numeric_limits<double>::quiet_NaN();
+    double fp32_f32_tflops    = std::numeric_limits<double>::quiet_NaN();
     double bf16_f32_tflops    = std::numeric_limits<double>::quiet_NaN();
     double fp8_f16_tflops     = std::numeric_limits<double>::quiet_NaN();
     double fp8_f32_tflops     = std::numeric_limits<double>::quiet_NaN();
@@ -40,11 +41,14 @@ inline constexpr Roofline kRoofline{
     .target             = "dgx_spark",
     .memory_gbs         = 273.0,
     .sustained_read_gbs = 257.42,
-    .bf16_f32_tflops    = 125.89,
-    .fp8_f16_tflops     = 250.80,
-    .fp8_f32_tflops     = 249.75,
-    .mxfp8_f32_tflops   = 249.52,
-    .nvfp4_f32_tflops   = 499.02,
+    // 2026-11-04: 256-FFMA loop body, 16 independent FP32 accumulators;
+    // 256 threads, 3/4/6/12 CTAs per SM all sustain 30.15 TF/s.
+    .fp32_f32_tflops  = 30.153148,
+    .bf16_f32_tflops  = 125.89,
+    .fp8_f16_tflops   = 250.80,
+    .fp8_f32_tflops   = 249.75,
+    .mxfp8_f32_tflops = 249.52,
+    .nvfp4_f32_tflops = 499.02,
 };
 #endif
 

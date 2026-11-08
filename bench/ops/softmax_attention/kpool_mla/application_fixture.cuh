@@ -116,7 +116,10 @@ struct Fixture : kp::ChainFixture {
         if (phase == Phase::Full) return p;
         p.projection =
             phase == Phase::History ? kp::Projection::History : kp::Projection::QueryAndHistory;
-        p.a_projection = prefix(p.a_projection, phase == Phase::History ? 768 : 2304);
+        auto& weight             = std::get<ops::SingleProjectionWeight>(p.weights).weight;
+        weight                   = prefix(weight, phase == Phase::History ? 768 : 2304);
+        p.rows.coefficients.rows = 0;
+        if (phase == Phase::History) p.rows.query.rows = 0;
         if (phase == Phase::History) p.query_norm = {};
         return p;
     }
@@ -129,9 +132,7 @@ struct Fixture : kp::ChainFixture {
                                        : ops::kpool_mla_prepare_update_workspace_capacity_bytes;
         for (auto phase : {Phase::Full, Phase::Reuse, Phase::History}) {
             const auto p = params(phase);
-            cap          = std::max(cap, prepare_capacity({p.projection, 4096, 512, 128,
-                                                  phase == Phase::History ? 0 : 1536,
-                                                  phase == Phase::Full ? 32 : 0, 4},
+            cap          = std::max(cap, prepare_capacity(ops::kpool_mla_prepare_profile(p),
                                                           cache.latent.storage, cache.index.format, index.B,
                                                           1, index.T, cuda.multiprocessor_count()));
         }

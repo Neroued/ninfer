@@ -109,7 +109,7 @@ struct Bank {
                 }
                 divisors.resize(E);
                 for (auto& d : divisors) { d = 511.75F + random_word(seed) % 1024; }
-                std::memcpy(data + g.divisor_offset, divisors.data(),
+                std::memcpy(data + g.matrix_scale_offset, divisors.data(),
                             divisors.size() * sizeof(float));
             } else {
                 auto* scales = reinterpret_cast<std::uint16_t*>(data + g.scale_offset);
@@ -117,9 +117,9 @@ struct Bank {
                     scales[s] = 0x1400 + (random_word(seed) & 2047);
                 }
             }
-            parent.device          = Device::cpu();
-            parent.data            = data;
-            parent.weight_divisors = divisors;
+            parent.device        = Device::cpu();
+            parent.data          = data;
+            parent.matrix_scales = divisors;
             return bind_weight_bank(
                 parent, describe_weight_bank(g, {0, unsigned(E), unsigned(rows), unsigned(rows)}));
         };

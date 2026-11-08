@@ -244,7 +244,7 @@ def logged_campaign(tmp_path, records, events, *, required=()):
 
 def done_event(service_id, wire_id, response_id, *, preemptions=0, replay=0):
     return {
-        "artifact_type": "ninfer_serve_request_log", "schema_version": 31,
+        "artifact_type": "ninfer_serve_request_log", "schema_version": 32,
         "event": "request_done", "server_instance_id": "serve-test",
         "request": {"request_id": service_id, "http_request_id": wire_id,
                     "response_id": response_id},
@@ -252,7 +252,7 @@ def done_event(service_id, wire_id, response_id, *, preemptions=0, replay=0):
         "generation": {
             "engine_request_id": service_id + 10,
             "scheduling": {
-                "preemptions": preemptions, "snapshot_restores": 0,
+                "preemptions": preemptions, "snapshot_restores": 0, "direct_restores": 0,
                 "replay_restores": replay, "replayed_tokens": 192 if replay else 0,
                 "paused_ns": 100_000_000 if preemptions else 0,
                 "device_to_host_bytes": 0, "host_to_device_bytes": 0,
@@ -317,7 +317,7 @@ def test_mechanism_not_observed_keeps_valid_performance(tmp_path):
     assert summary["ttft_groups"][0]["median_ttft_ns"] == 4_000_000
 
 
-def runtime_interval(*, schema=31, final=None, state_bytes=0, main_bytes=0,
+def runtime_interval(*, schema=32, final=None, state_bytes=0, main_bytes=0,
                      host_seconds=0.0, occupied=0, peak=None):
     pool = {"rank": 0, "domain": "host", "capacity_bytes": 2048, "block_bytes": 256,
             "live_bytes": occupied, "reserved_bytes": 0, "pending_retirement_bytes": 0,
@@ -487,7 +487,7 @@ def first_output_event():
         "engine": {"queue_wait_seconds": 0.030,
                    "host_exposed_seconds": {"engine_boundary": 0.003, "total": 0.004},
                    "scheduler_yield_exposed_seconds": 0.011},
-        "scheduling": {"paused_ns": 5_000_000, "preemptions": 1, "snapshot_restores": 1,
+        "scheduling": {"paused_ns": 5_000_000, "preemptions": 1, "snapshot_restores": 1, "direct_restores": 0,
                        "replay_restores": 0, "replayed_tokens": 0},
         "computed_prefill_tokens": 20,
         "prefill": {"result": {"count": 1, "total_ns": 2_000_000},
@@ -678,7 +678,7 @@ def test_replay_progress_uses_engine_interval_and_subtracts_self(tmp_path, other
     done = done_event(1, "req_wire", "response-a", preemptions=1, replay=1)
     def transition(name, at, replayed, decoded):
         return {
-            "artifact_type": "ninfer_serve_request_log", "schema_version": 31,
+            "artifact_type": "ninfer_serve_request_log", "schema_version": 32,
             "event": "request_scheduling", "server_instance_id": "serve-test",
             "request": {"request_id": 1, "http_request_id": "req_wire"},
             "engine_request_id": 11, "preemption_index": 1, "route": "replay",
@@ -705,6 +705,19 @@ def test_replay_progress_uses_engine_interval_and_subtracts_self(tmp_path, other
     assert interval["other_replayed_tokens"] == 0
 
 
+def test_direct_restore_is_preserved_without_snapshot_or_replay(tmp_path):
+    measured = record([output(5_000_000), ProtocolEvent("terminal", "done", 15_000_000)])
+    measured.update(wire_request_id="req_wire", response_id="response-a")
+    done = done_event(1, "req_wire", "response-a", preemptions=1)
+    done["generation"]["scheduling"]["direct_restores"] = 1
+    summary = summarize_campaign(logged_campaign(tmp_path, [measured], [done]))
+    row = summary["stream_observations"][0]
+    assert row["direct_restores"] == 1
+    assert row["snapshot_restores"] == 0
+    assert row["replay_restores"] == 0
+    assert row["replayed_tokens"] == 0
+
+
 def test_engine_ticket_order_uses_exact_identity_not_client_send_order(tmp_path):
     a = record([output(5_000_000), ProtocolEvent("terminal", "done", 15_000_000)])
     a.update(role="older", wire_request_id="wire-a", response_id="response-a")
@@ -723,7 +736,7 @@ def test_replay_evidence_missing_events_cannot_prove_no_other_progress(tmp_path,
     measured["response_id"] = "response-a"
     done = done_event(1, "req_wire", "response-a", preemptions=1, replay=1)
     event = {
-        "artifact_type": "ninfer_serve_request_log", "schema_version": 31,
+        "artifact_type": "ninfer_serve_request_log", "schema_version": 32,
         "event": "request_scheduling", "server_instance_id": "serve-test",
         "request": {"request_id": 1, "http_request_id": "req_wire"},
         "engine_request_id": 11, "preemption_index": 1, "route": "replay",

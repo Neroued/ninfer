@@ -13,7 +13,10 @@ export class Requests {
   private readonly active = new Map<number, RequestRow>();
   private recent: RequestRow[] = [];
   private instanceId = '';
-  private readonly samples = new Map<number, { at: number; tokens: number }>();
+  private readonly samples = new Map<
+    number,
+    { at: number; tokens: number; replayed: number; preemptions: number }
+  >();
   private readonly eventTimes = new Map<number, number>();
 
   constructor(
@@ -55,6 +58,12 @@ export class Requests {
         speed: null,
         placement: null,
         preemptions: 0,
+        recovery: null,
+        recoveryPending: false,
+        replayedTokens: null,
+        replaySpeed: null,
+        progressOwner: false,
+        lastProgressAt: null,
         trace: [],
       }
     );
@@ -92,6 +101,7 @@ export class Requests {
       const value = engine.get(request.engine_request_id);
       if (!newerEvent) row.phase = request.preparing ? 'preparing' : (value?.phase ?? 'submitted');
       row.speed = null;
+      row.replaySpeed = null;
       if (value) {
         row.promptTokens = value.prompt_tokens;
         row.reusedTokens = value.reused_prompt_tokens;
@@ -100,6 +110,23 @@ export class Requests {
         row.contextTokens = value.logical_context_tokens;
         row.placement = value.placement;
         row.preemptions = value.preemptions;
+        row.recovery = value.recovery;
+        row.recoveryPending = value.recovery_pending;
+        row.replayedTokens = value.replayed_tokens;
+        row.progressOwner = snapshot.engine.progress_owner === value.id;
+        row.lastProgressAt =
+          value.last_progress_ns === null
+            ? null
+            : at - Math.max(0, steadyNow - value.last_progress_ns) / 1e6;
+        if (
+          value.phase === 'replay' &&
+          previous &&
+          at > previous.at &&
+          previous.preemptions === value.preemptions
+        ) {
+          row.replaySpeed =
+            (Math.max(0, value.replayed_tokens - previous.replayed) * 1000) / (at - previous.at);
+        }
         if (row.ttftMs === null && value.first_token_ns !== null) {
           row.ttftMs = Math.max(0, value.first_token_ns - request.received_ns) / 1e6;
         }
@@ -108,7 +135,12 @@ export class Requests {
             (Math.max(0, value.generated_tokens - previous.tokens) * 1000) / (at - previous.at);
           row.trace = [...row.trace, { at, speed: row.speed }].slice(-60);
         }
-        this.samples.set(row.id, { at, tokens: value.generated_tokens });
+        this.samples.set(row.id, {
+          at,
+          tokens: value.generated_tokens,
+          replayed: value.replayed_tokens,
+          preemptions: value.preemptions,
+        });
       }
       this.save(row);
     }
@@ -118,6 +150,7 @@ export class Requests {
         row.phase = 'unknown';
         row.terminal = true;
         row.speed = null;
+        row.replaySpeed = null;
         this.save(row);
       }
     }
@@ -142,22 +175,17 @@ export class Requests {
     else if (terminalKinds[event.kind]) {
       row.terminal = true;
       row.phase = terminalKinds[event.kind];
+      row.progressOwner = false;
+      row.recoveryPending = false;
       row.endedAt = event.at;
       row.speed = null;
+      row.replaySpeed = null;
       if (typeof details.prompt_tokens === 'number') row.promptTokens = details.prompt_tokens;
       if (typeof details.completion_tokens === 'number')
         row.generatedTokens = details.completion_tokens;
     } else if (!row.terminal) {
-      const phases: Record<string, string> = {
-        pause_started: 'pausing',
-        paused: 'paused',
-        restore_started: 'materializing',
-        restored: 'replay',
-        replay_complete: 'decode',
-        recovery_complete: 'decode',
-        terminal: 'finishing',
-      };
-      if (phases[event.kind]) row.phase = phases[event.kind];
+      // The producer owns the phase: restoring can resume prefill, decode or control.
+      if (typeof details.phase === 'string') row.phase = details.phase;
     }
     this.save(row);
   }
@@ -167,6 +195,7 @@ export class Requests {
       row.phase = 'unknown';
       row.terminal = true;
       row.speed = null;
+      row.replaySpeed = null;
       this.save(row);
     }
   }
@@ -175,6 +204,7 @@ export class Requests {
     this.samples.clear();
     for (const row of this.active.values()) {
       row.speed = null;
+      row.replaySpeed = null;
       row.trace = [];
     }
   }

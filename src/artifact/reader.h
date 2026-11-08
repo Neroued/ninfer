@@ -32,6 +32,7 @@ public:
     [[nodiscard]] const Directory& directory() const noexcept;
     [[nodiscard]] const ArtifactId& artifact_id() const noexcept;
     [[nodiscard]] std::uint64_t file_bytes() const noexcept;
+    [[nodiscard]] std::uint64_t payload_read_bytes() const noexcept;
     [[nodiscard]] ObjectHandle find(std::string_view id) const;
     [[nodiscard]] const WeightGeometry& geometry(ObjectHandle handle) const;
     void validate_object(ObjectHandle handle) const;

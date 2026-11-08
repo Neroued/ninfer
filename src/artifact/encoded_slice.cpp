@@ -1,6 +1,7 @@
 #include "artifact/encoded_slice.h"
 
 #include "artifact/reader.h"
+#include "artifact/csf_selection.h"
 
 #include <algorithm>
 
@@ -25,6 +26,7 @@ EncodedTensor slice_tensor(const Reader& reader, std::span<const std::uint64_t> 
     const auto& source = reader.geometry(slices.front().object);
     auto format        = source.format;
     auto layout        = source.layout;
+    if (layout == QuantLayout::Csf32) return select_csf_tensor(reader, shape, slices);
     if (nvfp4(layout))
         layout = shape.size() == 3 ? QuantLayout::BatchedBlockScaleK16M128x4
                                    : QuantLayout::BlockScaleK16M128x4;
@@ -46,7 +48,8 @@ EncodedTensor slice_tensor(const Reader& reader, std::span<const std::uint64_t> 
         throw ArtifactError("paged NF4 selection requires complete source shards");
     const auto dk = columns(d), dn = d.elements / dk;
     std::uint64_t covered = 0;
-    std::vector<std::optional<std::pair<ObjectHandle, std::uint64_t>>> divisors(d.divisor_count);
+    std::vector<std::optional<std::pair<ObjectHandle, std::uint64_t>>> matrix_scales(
+        d.matrix_scale_count);
     for (std::size_t i = 0; i < slices.size(); ++i) {
         const auto& s = slices[i];
         const auto& g = reader.geometry(s.object);
@@ -142,14 +145,14 @@ EncodedTensor slice_tensor(const Reader& reader, std::span<const std::uint64_t> 
             for (std::uint64_t row = 0; row < s.rows;) {
                 const auto sr = s.row + row, dr = s.destination_row + row;
                 const auto source_matrix = sr / source_rows, target_matrix = dr / target_rows;
-                const auto origin = std::pair{s.object, source_matrix};
-                auto& divisor     = divisors[target_matrix];
-                if (divisor && *divisor != origin)
-                    throw ArtifactError("NVFP4 assembly mixes matrix divisor domains");
-                if (!divisor)
-                    copy(g.divisor_offset + source_matrix * 4, d.divisor_offset + target_matrix * 4,
-                         4, 1, 0, 0);
-                divisor = origin;
+                const auto origin  = std::pair{s.object, source_matrix};
+                auto& matrix_scale = matrix_scales[target_matrix];
+                if (matrix_scale && *matrix_scale != origin)
+                    throw ArtifactError("NVFP4 assembly mixes matrix scale domains");
+                if (!matrix_scale)
+                    copy(g.matrix_scale_offset + source_matrix * 4,
+                         d.matrix_scale_offset + target_matrix * 4, 4, 1, 0, 0);
+                matrix_scale = origin;
                 row += std::min(
                     {s.rows - row, source_rows - sr % source_rows, target_rows - dr % target_rows});
             }

@@ -8,8 +8,11 @@ namespace ninfer::models {
 
 SelectedWeights select_weights(const artifact::Reader& reader,
                                std::span<const artifact::ParameterReference> references,
+                               std::span<const BoundWeight> descriptions,
                                std::span<const ParameterAssembly> assemblies,
                                std::span<const ExpertWeightPartition> experts, Device device) {
+    if (descriptions.size() != references.size())
+        throw std::logic_error("weight calibration descriptions differ from parameters");
     SelectedWeights out;
     out.bindings.resize(references.size());
     std::vector<bool> selected(references.size());
@@ -57,27 +60,32 @@ SelectedWeights select_weights(const artifact::Reader& reader,
                 throw artifact::ArtifactError("expert partition has invalid or duplicate IDs");
             selected_ids[id] = true;
         }
-        auto& selection = out.experts[bank];
-        if (partition.ids.size() == count) {
-            if (!std::is_sorted(partition.ids.begin(), partition.ids.end()))
+        auto& selection       = out.experts[bank];
+        const bool complete   = partition.ids.size() == count;
+        const bool compressed = source.gate_up.layout.layout == QuantLayout::Csf32 ||
+                                source.down.layout.layout == QuantLayout::Csf32;
+        if (complete || compressed) {
+            if (complete && !std::is_sorted(partition.ids.begin(), partition.ids.end()))
                 throw artifact::ArtifactError("affine expert partition requires global ID order");
             std::vector<artifact::MatrixSlice> gu, down;
-            for (const auto id : partition.ids) {
+            for (std::size_t slot = 0; slot < partition.ids.size(); ++slot) {
+                const auto id  = partition.ids[slot];
                 const auto& g  = source.gate_up;
                 const auto& d  = source.down;
                 const auto row = g.layout.region.row_begin + id * g.layout.region.row_stride;
-                gu.push_back({g.object, row + range.begin, 0, range.size, hidden,
-                              std::uint64_t(id) * 2 * range.size, 0});
+                gu.push_back(
+                    {g.object, row + range.begin, 0, range.size, hidden, slot * 2 * range.size, 0});
                 gu.push_back({g.object, row + intermediate + range.begin, 0, range.size, hidden,
-                              (std::uint64_t(id) * 2 + 1) * range.size, 0});
+                              (slot * 2 + 1) * range.size, 0});
                 down.push_back({d.object,
                                 d.layout.region.row_begin + id * d.layout.region.row_stride,
-                                range.begin, hidden, range.size, std::uint64_t(id) * hidden, 0});
+                                range.begin, hidden, range.size, slot * hidden, 0});
             }
-            const artifact::Shape gu_shape{count, 2ULL * range.size, hidden};
-            const artifact::Shape down_shape{count, hidden, range.size};
-            selection.affine = {add(artifact::slice_tensor(reader, gu_shape, gu), bank + 1),
-                                add(artifact::slice_tensor(reader, down_shape, down), bank + 1)};
+            const artifact::Shape gu_shape{partition.ids.size(), 2ULL * range.size, hidden};
+            const artifact::Shape down_shape{partition.ids.size(), hidden, range.size};
+            selection.packed = {add(artifact::slice_tensor(reader, gu_shape, gu), bank + 1),
+                                add(artifact::slice_tensor(reader, down_shape, down), bank + 1),
+                                complete ? std::vector<std::uint32_t>{} : partition.ids};
         } else {
             if (range.begin != 0 || range.size != intermediate)
                 throw artifact::ArtifactError("indexed expert partition requires whole experts");
@@ -96,11 +104,11 @@ SelectedWeights select_weights(const artifact::Reader& reader,
             }
         }
         const auto gu =
-            selection.affine ? selection.affine->gate_up : selection.entries.front().gate_up;
-        const auto dn = selection.affine ? selection.affine->down : selection.entries.front().down;
+            selection.packed ? selection.packed->gate_up : selection.entries.front().gate_up;
+        const auto dn = selection.packed ? selection.packed->down : selection.entries.front().down;
         out.expert_descriptions.push_back(
             {out.requests[gu].tensor.geometry, out.requests[dn].tensor.geometry, count,
-             selection.affine ? ops::ExpertSubsetKind::All : ops::ExpertSubsetKind::MaskOnes});
+             complete ? ops::ExpertSubsetKind::All : ops::ExpertSubsetKind::MaskOnes});
     }
     for (std::size_t i = 0; i < references.size(); ++i) {
         if (selected[i]) continue;
@@ -110,6 +118,22 @@ SelectedWeights select_weights(const artifact::Reader& reader,
         for (const auto& part : reference.binding.parts)
             binding.parts.push_back(
                 {add(artifact::whole_tensor(reader, part.object)), part.begin, part.end});
+    }
+    for (std::size_t parameter = 0; parameter < descriptions.size(); ++parameter) {
+        const auto& weight = descriptions[parameter];
+        for (std::size_t use = 0; use < weight.uses.size(); ++use) {
+            const auto& calibration = weight.uses[use];
+            if (!calibration.calibration_source || !calibration.calibration ||
+                calibration.calibration->values.size() <= 1)
+                continue;
+            const auto& binding = *calibration.calibration_source;
+            const artifact::ParameterReference source{
+                weight.name + "/activation_calibration", {binding.elements}, binding};
+            std::vector<artifact::MatrixSlice> slices;
+            append_parameter_slice(slices, reader, source, {{}, 0, 0, 1, binding.elements, 0, 0});
+            out.calibrations.push_back(
+                {parameter, use, add(artifact::slice_tensor(reader, source.shape, slices))});
+        }
     }
     return out;
 }
@@ -133,6 +157,17 @@ std::vector<BoundWeight> bind_selected_weights(std::span<const BoundWeight> desc
         }
         out.push_back(std::move(weight));
     }
+    for (const auto& calibration : selection.calibrations) {
+        const auto& parent = parents[requests[calibration.request].index];
+        const auto count =
+            out[calibration.parameter].uses[calibration.use].calibration->values.size();
+        if (parent.geometry.format != QType::FP32 ||
+            parent.geometry.layout != QuantLayout::Contiguous || parent.geometry.elements != count)
+            throw artifact::ArtifactError("activation calibration materialization differs");
+        if (parent.data)
+            out[calibration.parameter].uses[calibration.use].calibration_device = {
+                parent.data, count * sizeof(float), parent.device};
+    }
     return out;
 }
 
@@ -147,8 +182,13 @@ bind_selected_experts(const SelectedWeights& selection,
     out.reserve(selection.experts.size());
     for (std::size_t i = 0; i < selection.experts.size(); ++i) {
         const auto& bank = selection.experts[i];
-        if (bank.affine) {
-            out.emplace_back(parent(bank.affine->gate_up), parent(bank.affine->down));
+        if (bank.packed) {
+            if (bank.packed->logical_ids.empty())
+                out.emplace_back(parent(bank.packed->gate_up), parent(bank.packed->down));
+            else
+                out.emplace_back(parent(bank.packed->gate_up), parent(bank.packed->down),
+                                 bank.packed->logical_ids, selection.expert_descriptions[i].count,
+                                 device);
         } else {
             std::vector<moe::ResidentExpertEntry> entries;
             for (const auto& e : bank.entries)

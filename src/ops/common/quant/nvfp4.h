@@ -16,7 +16,7 @@ __host__ __device__
            ((row & 127) >> 5) * 4 + (group & 3);
 }
 
-// Exact E2M1 * nonnegative finite E4M3FN, before the matrix divisor.
+// Exact E2M1 * nonnegative finite E4M3FN, before the matrix scalar.
 struct Nvfp4Tables {
     alignas(64) std::array<std::array<float, 16>, 128> fp32{};
     alignas(64) std::array<std::array<std::uint16_t, 16>, 128> bf16{};

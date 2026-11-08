@@ -56,12 +56,12 @@ static Json mtp_round(CudaExecutionView cuda, const Json& c, int repeats, int wa
     history_positions.upload();
     valid.upload();
     main.accepted.upload();
+    const auto history_params   = draft.params(app::Phase::History);
     const auto history_capacity = ops::kpool_mla_prepare_update_workspace_capacity_bytes(
-        {kp::Projection::History, 4096, 512, 128, 0, 0, 4}, draft.cache.latent.storage,
+        ops::kpool_mla_prepare_profile(history_params), draft.cache.latent.storage,
         draft.cache.index.format, B, 1, HW, cuda.multiprocessor_count());
     DeviceBuffer history_scratch(cuda.device(), history_capacity);
     MemoryArena history_arena(history_scratch.span());
-    const auto history_params = draft.params(app::Phase::History);
     std::vector<cudaEvent_t> events(S + 5);
     for (auto& e : events) CUDA_CHECK(cudaEventCreate(&e));
     auto body = [&](CudaExecutionView v, bool diagnostic) {

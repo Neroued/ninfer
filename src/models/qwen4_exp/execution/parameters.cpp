@@ -73,11 +73,11 @@ public:
             p.output  = linear({q.output});
             out.mixer = std::move(p);
         }
-        const auto& m               = w.moe;
-        out.moe.profile             = profile.moe.math;
-        out.moe.bank                = m.bank;
-        out.moe.activation_divisors = profile.moe.activation_divisors;
-        out.moe.control             = linear({m.router, m.shared_score}).weight;
+        const auto& m                  = w.moe;
+        out.moe.profile                = profile.moe.math;
+        out.moe.bank                   = m.bank;
+        out.moe.activation_calibration = profile.moe.activation_calibration;
+        out.moe.control                = linear({m.router, m.shared_score}).weight;
         out.moe.shared = {linear({m.shared_gate, m.shared_up}), linear({m.shared_down})};
         if (const auto* bank = model_.resident_experts(m.bank)) {
             out.moe.resident = bank->view();

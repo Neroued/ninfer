@@ -81,6 +81,14 @@ ninfer_add_test(ninfer_http_transport_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_http_transport.cpp"
   LIBRARIES ninfer_serve)
 
+if(TARGET ninfer-serve)
+  add_test(NAME ninfer_serve_shutdown_real_test
+    COMMAND ${Python3_EXECUTABLE} -B "${CMAKE_CURRENT_LIST_DIR}/../test_serve_shutdown_real.py"
+      $<TARGET_FILE:ninfer-serve>)
+  set_tests_properties(ninfer_serve_shutdown_real_test PROPERTIES
+    SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real" TIMEOUT 150)
+endif()
+
 ninfer_add_test(ninfer_tool_streaming_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_tool_streaming.cpp"
   LIBRARIES ninfer_serve ninfer_model_execution ninfer::json)

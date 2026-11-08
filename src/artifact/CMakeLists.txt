@@ -7,6 +7,7 @@ add_library(ninfer_artifact STATIC
   binder.cpp
   placement.cpp
   encoded_slice.cpp
+  csf_selection.cpp
   materializer.cpp
   views.cpp
 )

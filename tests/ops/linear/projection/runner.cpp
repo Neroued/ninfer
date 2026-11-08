@@ -296,8 +296,12 @@ static int run_shape(std::string_view label, ActivationRecipe recipe, WeightGene
         Tensor destination(output.span(), DType::BF16, {shape.n, invocation.t});
         const std::size_t capacity = ops::linear_workspace_capacity_bytes(
             weight.qtype, shape.n, shape.k, invocation.policy, invocation.t, invocation.t);
-        GuardedDeviceBuffer workspace_storage(capacity);
+        GuardedDeviceBuffer workspace_storage(capacity + shape.workspace_prefix);
         MemoryArena workspace(workspace_storage.span());
+        if (shape.workspace_prefix) {
+            workspace_storage.fill(kOutputGuardByte);
+            (void)workspace.alloc_bytes(shape.workspace_prefix, 1);
+        }
         std::unique_ptr<DeviceContext> graph_context;
         DecodeGraphDefinition graph_definition;
         DecodeGraphExecutable graph;
@@ -332,13 +336,24 @@ static int run_shape(std::string_view label, ActivationRecipe recipe, WeightGene
                 else
                     launch();
                 cuda_check(cudaStreamSynchronize(stream), "synchronize linear");
-                if (workspace.peak_used() > capacity || workspace.used() != 0) {
+                if (workspace.peak_used() > capacity + shape.workspace_prefix ||
+                    workspace.used() != shape.workspace_prefix) {
                     std::cerr << case_label << ": workspace query/scope mismatch\n";
                     ++failures;
                 }
 
                 failures += output.verify_guards(case_label);
                 failures += workspace_storage.verify_guards(case_label + " workspace");
+                if (shape.workspace_prefix) {
+                    std::vector<std::uint8_t> prefix(shape.workspace_prefix);
+                    cuda_check(cudaMemcpy(prefix.data(), workspace_storage.data(), prefix.size(),
+                                          cudaMemcpyDeviceToHost), "read caller workspace prefix");
+                    if (!std::all_of(prefix.begin(), prefix.end(),
+                                     [](auto byte) { return byte == kOutputGuardByte; })) {
+                        std::cerr << case_label << ": modified caller workspace prefix\n";
+                        ++failures;
+                    }
+                }
                 const std::vector<std::int32_t> columns =
                     shape.comparison == Comparison::Full ? all_indices(invocation.t)
                     : shape.column_sampler               ? shape.column_sampler(invocation.t)
@@ -453,21 +468,44 @@ void add_workspace_cases(Suite& suite, QType format, int n, int k) {
 
 int verify_workspace_envelopes(QType qtype, std::int32_t n, std::int32_t k) {
     int failures = 0;
+    std::vector<std::pair<int, int>> intervals{
+        {1, 4}, {2, 4}, {1, 128}, {9, 25}, {24, 129}};
+    const bool block_tail =
+        qtype == QType::FP8_E4M3FN_BLOCK128X128_FP32 && n == 4096 && k == 16384;
+    if (block_tail) {
+        intervals.insert(intervals.end(), {{1, 4096}, {512, 641}, {641, 896}, {641, 897},
+                                           {1024, 1409}, {2049, 2433},
+                                           {std::numeric_limits<int>::max() - 512,
+                                            std::numeric_limits<int>::max()}});
+    }
     for (auto policy :
          {ops::LinearPolicy::A16Only, ops::LinearPolicy::AllowA8, ops::LinearPolicy::AllowA4}) {
-        for (auto [first, last] : {std::pair{1, 4}, std::pair{2, 4}, std::pair{1, 128},
-                                   std::pair{9, 25}, std::pair{24, 129}}) {
+        std::size_t observed_peak = 0;
+        for (auto [first, last] : intervals) {
             const auto capacity =
                 ops::linear_workspace_capacity_bytes(qtype, n, k, policy, first, last);
-            for (int t = first; t <= last; ++t) {
+            std::size_t interval_peak = 0;
+            for (int t = first;; ++t) {
                 const auto point = ops::linear_workspace_capacity_bytes(qtype, n, k, policy, t, t);
+                interval_peak = std::max(interval_peak, point);
                 if (point > capacity) {
                     std::cerr << "Linear workspace interval [" << first << ',' << last
                               << "] cannot cover T=" << t << " for [" << n << ',' << k << "]\n";
                     ++failures;
                     break;
                 }
+                if (t == last) break;
             }
+            observed_peak = std::max(observed_peak, interval_peak);
+            if (block_tail && capacity != interval_peak) {
+                std::cerr << "Block-FP8 workspace interval does not match its point high-water mark\n";
+                ++failures;
+            }
+        }
+        if (block_tail && ops::linear_workspace_capacity_bytes(
+                              qtype, n, k, policy, 1, std::numeric_limits<int>::max()) != observed_peak) {
+            std::cerr << "Block-FP8 full token range misses transient workspace\n";
+            ++failures;
         }
     }
     return failures;

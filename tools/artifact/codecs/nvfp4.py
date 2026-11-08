@@ -1,4 +1,4 @@
-"""Exact NVFP4 codes, scale swizzling, and the stored FP32 weight divisor."""
+"""Exact NVFP4 codes, scale swizzling, and the stored FP32 matrix scalar."""
 
 from __future__ import annotations
 
@@ -65,33 +65,34 @@ def unswizzle_nvfp4_scales(
     )
 
 
-def _divisor_words(
+def matrix_scale_words(
     value: torch.Tensor | bytes | bytearray | memoryview, count: int
 ) -> bytes:
     if isinstance(value, torch.Tensor):
         if value.dtype != torch.float32 or value.numel() != count:
-            raise TypeError("NVFP4 requires one FP32 weight divisor per matrix")
+            raise TypeError("NVFP4 requires one FP32 weight scalar per matrix")
         raw = encode_direct(value.reshape(-1), "fp32")
     else:
         raw = bytes(value)
         if len(raw) != 4 * count:
-            raise TypeError("NVFP4 requires one FP32 weight divisor per matrix")
+            raise TypeError("NVFP4 requires one FP32 weight scalar per matrix")
     if any(
         not valid_positive_fp32_word(word) for (word,) in struct.iter_unpack("<I", raw)
     ):
-        raise ValueError("NVFP4 weight divisor must be finite and positive")
+        raise ValueError("NVFP4 weight scalar must be finite and positive")
     return raw
 
 
 def encode_nvfp4(
     packed_codes: torch.Tensor,
     natural_scales: torch.Tensor,
-    weight_divisor: torch.Tensor | bytes | bytearray | memoryview,
+    weight_scale: torch.Tensor | bytes | bytearray | memoryview,
     shape: Sequence[int],
+    format: str = "nvfp4",
 ) -> bytes:
     """Encode exact source NVFP4 words without numerical conversion."""
 
-    geometry = block_scale_geometry("nvfp4", shape)
+    geometry = block_scale_geometry(format, shape)
     codes = _exact_uint8_matrix(
         packed_codes,
         (*shape[:-1], geometry.k // 2),
@@ -105,7 +106,7 @@ def encode_nvfp4(
     invalid = ((scales & 0x80) != 0) | (scales == 0x7F)
     if bool(invalid.any()):
         raise ValueError("NVFP4 scales must be nonnegative finite E4M3FN words")
-    divisor = _divisor_words(weight_divisor, geometry.matrices)
+    scalar = matrix_scale_words(weight_scale, geometry.matrices)
     swizzled = swizzle_nvfp4_scales(scales, shape)
     payload = bytearray(geometry.payload_bytes)
     payload[: geometry.code_plane_bytes] = codes.numpy().tobytes()
@@ -113,17 +114,18 @@ def encode_nvfp4(
         geometry.scale_plane_offset : geometry.scale_plane_offset
         + geometry.scale_plane_bytes
     ] = swizzled.numpy().tobytes()
-    payload[geometry.weight_divisor_offset :] = divisor
+    payload[geometry.matrix_scale_offset :] = scalar
     return bytes(payload)
 
 
 def decode_nvfp4_words(
     payload: Payload,
     shape: Sequence[int],
+    format: str = "nvfp4",
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Decode exact packed code, natural scale, and divisor words."""
+    """Decode exact packed code, natural scale, and matrix scalar words."""
 
-    geometry = block_scale_geometry("nvfp4", shape)
+    geometry = block_scale_geometry(format, shape)
     if _payload_length(payload) != geometry.payload_bytes:
         raise ValueError(
             f"NVFP4 payload has {_payload_length(payload)} bytes, "
@@ -141,10 +143,10 @@ def decode_nvfp4_words(
     invalid = ((scales & 0x80) != 0) | (scales == 0x7F)
     if bool(invalid.any()):
         raise ValueError("NVFP4 scales must be nonnegative finite E4M3FN words")
-    divisor_bytes = _divisor_words(
-        bytes(raw[geometry.weight_divisor_offset :].numpy()), geometry.matrices
+    scalar_bytes = matrix_scale_words(
+        bytes(raw[geometry.matrix_scale_offset :].numpy()), geometry.matrices
     )
-    divisor = torch.frombuffer(bytearray(divisor_bytes), dtype=torch.float32).reshape(
+    scalar = torch.frombuffer(bytearray(scalar_bytes), dtype=torch.float32).reshape(
         tuple(shape[:-2])
     )
-    return codes, scales, divisor
+    return codes, scales, scalar

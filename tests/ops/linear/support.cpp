@@ -42,6 +42,12 @@ std::string_view format_name(QType type) {
         return "fp8";
     case QType::NVFP4:
         return "nvfp4";
+    case QType::MXFP8:
+        return "mxfp8";
+    case QType::FP8_E4M3FN_BLOCK128X128_FP32:
+        return "fp8_block_fp32";
+    case QType::NVFP4_MUL:
+        return "nvfp4_mul";
     default:
         throw std::invalid_argument("unknown Linear fixture format");
     }

@@ -399,6 +399,8 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
                            runtime::context_length_error_message(prompt_summary.prompt_tokens,
                                                                  impl_->options.max_context));
     }
+    if (!is_available())
+        throw RequestError(RequestErrorKind::Unavailable, "inference engine is unavailable");
     const double prepare_seconds = prompt.impl_->prepare.seconds;
     if (resolved_options.execution.requested_output_tokens == 0) {
         struct ImmediateSubmission {
@@ -501,6 +503,16 @@ EngineSnapshot Engine::snapshot(SnapshotOptions options) const {
         std::visit([](const auto& instance) { return instance->frontend.media_cache_summary(); },
                    impl_->active);
     return result;
+}
+
+void Engine::request_stop() noexcept {
+    if (!impl_) return;
+    std::visit(
+        [](auto& core) {
+            using State = std::remove_cvref_t<decltype(core)>;
+            if constexpr (!std::is_same_v<State, std::monostate>) core->request_stop();
+        },
+        impl_->core);
 }
 
 bool Engine::is_available() const {

@@ -1,4 +1,5 @@
 #include "ops/moe/tp2_fixture.h"
+#include "ops/moe/native_fixture.h"
 #include "ops/op_tester.h"
 #include "ops/suite.h"
 #include "core/decode_graph.h"
@@ -437,5 +438,6 @@ int main(int argc, char** argv) {
     ninfer::test::moe_tp2::add_profile(suite, ninfer::test::moe_tp2::kM2, "m2");
     ninfer::test::moe_tp2::add_profile(suite, ninfer::test::moe_tp2::kM3, "m3");
     ninfer::test::moe_tp2::add_profile(suite, ninfer::test::moe_tp2::kM4, "m4");
+    ninfer::test::native_moe::add_native_cases(suite);
     return suite.main(argc, argv);
 }

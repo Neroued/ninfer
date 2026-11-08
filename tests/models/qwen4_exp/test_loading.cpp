@@ -56,7 +56,7 @@ void bank_binding() {
     const auto bank = models::moe::describe_bank(reader, models::moe::ExpertBinding{g, u, d});
     require(bank.gate_up.layout.codes.expert_stride == 16384 &&
                 bank.gate_up.layout.scales.expert_stride == 2048 &&
-                bank.gate_up.layout.divisor_stride == 1 &&
+                bank.gate_up.layout.matrix_scale_stride == 1 &&
                 bank.down.layout.codes.expert_stride == 8192,
             "rank-3 bank plane strides");
     const std::array requests{artifact::PlacementRequest{bank.gate_up.object, Device::cpu()},
@@ -67,8 +67,7 @@ void bank_binding() {
     for (unsigned e = 0; e < 3; ++e) {
         const auto gu = matrix_weight(sources[0].gate_up, e);
         const auto dn = matrix_weight(sources[0].down, e);
-        require(gu.weight_scale_divisor == float(1U << e) &&
-                    dn.weight_scale_divisor == float(8U << e),
+        require(gu.weight_scale == float(1U << e) && dn.weight_scale == float(8U << e),
                 "per-expert divisors collapsed");
         require(static_cast<const std::byte*>(gu.qdata) - sources[0].gate_up.parent->data ==
                     e * 16384,

@@ -170,7 +170,9 @@ void ServiceObservations::scheduling(std::uint64_t id,
     event(transitions[static_cast<unsigned>(value.transition)], id,
           {{"engine_request_id", value.engine_request_id},
            {"steady_ns", value.steady_ns},
-           {"preemption_index", value.preemption_index}});
+           {"preemption_index", value.preemption_index},
+           {"phase", request_phase_name(value.phase)},
+           {"route", recovery_route_name(value.route)}});
 }
 
 void ServiceObservations::done(std::uint64_t id, const GenerationOutcome& outcome) {

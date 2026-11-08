@@ -37,8 +37,9 @@ void launch_mma(const Tensor& x, const CudaSwiGLUExperts& experts, const ExpertR
         Gate ? s.input_codes : s.product_codes,
         static_cast<const std::uint8_t*>(Gate ? s.input_scales : s.product_scales),
         Gate ? experts.bank.gate_up : experts.bank.down,
-        Gate ? *experts.activation_divisors.gate_up : *experts.activation_divisors.down,
-        *experts.activation_divisors.down, s.groups, s.product_codes,
+        Gate ? experts.activation_calibration.gate_up.scalar_divisor()
+             : experts.activation_calibration.down.scalar_divisor(),
+        experts.activation_calibration.down.scalar_divisor(), s.groups, s.product_codes,
         static_cast<std::uint8_t*>(s.product_scales), s.contributions,
         static_cast<const float*>(routes.coefficients.data), s.routed_sum, subtiles);
     CUDA_CHECK(cudaGetLastError());
@@ -73,8 +74,9 @@ void launch_input(const Tensor& x, const CudaSwiGLUExperts& experts, const Stora
     const auto stream = execution.stream();
     quantize_input<<<(std::max(x.ne[1] * (kHidden / 16), kExperts) + 255) / 256, 256, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(x.data), s.input_codes,
-        static_cast<std::uint8_t*>(s.input_scales), *experts.activation_divisors.gate_up, x.ne[1],
-        s.groups.counts, s.routed_sum, clear_counts);
+        static_cast<std::uint8_t*>(s.input_scales),
+        experts.activation_calibration.gate_up.scalar_divisor(), x.ne[1], s.groups.counts,
+        s.routed_sum, clear_counts);
     CUDA_CHECK(cudaGetLastError());
 }
 

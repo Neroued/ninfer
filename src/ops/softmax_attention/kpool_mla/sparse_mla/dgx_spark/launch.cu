@@ -32,9 +32,9 @@ CUtensorMap latent_map(const SparseMlaArguments& a, bool fp8) {
     return map;
 }
 
-template <bool Key, bool Direct, int Queries, int Rows, int K, bool Merge = false, bool Fp8 = false>
-void factor(SparseMlaArguments a, cudaStream_t stream) {
-    constexpr auto kernel = mla_factor_kernel<Key, Queries, Rows, K, Direct, Merge, Fp8>;
+template <bool Key, bool Direct, int Queries, int Rows, int K, bool Merge, bool Fp8, bool Mxfp8>
+void factor_format(SparseMlaArguments a, cudaStream_t stream) {
+    constexpr auto kernel = mla_factor_kernel<Key, Queries, Rows, K, Direct, Merge, Fp8, Mxfp8>;
     constexpr int stages  = K == (Key ? 256 : 512) ? 1 : 2;
     constexpr int bytes   = stages * (Rows + Queries) * K * 2;
     const int shared      = common::prepare_shared<bytes, kernel, true>();
@@ -42,12 +42,46 @@ void factor(SparseMlaArguments a, cudaStream_t stream) {
         Key && a.direct
             ? dim3(1)
             : dim3(((a.width + Queries - 1) / Queries) * ((Key ? 512 : 256) / Rows), 64);
-    constexpr int threads = Rows > 64 ? 256 : 128;
+    constexpr int threads = Rows > 128 ? 512 : Rows > 64 ? 256 : 128;
     kernel<<<grid, threads, shared, stream>>>(a);
+}
+
+template <bool Key, bool Direct, int Queries, int Rows, int K, bool Merge = false, bool Fp8 = false>
+void factor(SparseMlaArguments a, cudaStream_t stream) {
+    if (Key ? a.key_mxfp8 : a.value_mxfp8)
+        factor_format<Key, Direct, Queries, Rows, K, Merge, Fp8, true>(a, stream);
+    else
+        factor_format<Key, Direct, Queries, Rows, K, Merge, Fp8, false>(a, stream);
 }
 
 template <bool Key, bool Direct = false, bool Fp8 = false>
 void factor(SparseMlaArguments a, MlaFactorSchedule schedule, cudaStream_t stream) {
+    if constexpr (Key) {
+        if (a.key_mxfp8 && a.width >= 9 && a.width <= 32) {
+            factor<Key, Direct, 32, 128, 64, false, Fp8>(a, stream);
+            return;
+        }
+        if (a.key_mxfp8 && a.width >= 33 && a.width <= 64) {
+            factor<Key, Direct, 64, 128, 64, false, Fp8>(a, stream);
+            return;
+        }
+    }
+    if (!Key && a.value_mxfp8 && a.width >= 25 && a.width <= 32) {
+        factor<Key, Direct, 32, 64, 64, false, Fp8>(a, stream);
+        return;
+    }
+    if (!Key && a.value_mxfp8 && a.width >= 33 && a.width <= 48) {
+        factor<Key, Direct, 16, 64, 64, false, Fp8>(a, stream);
+        return;
+    }
+    if ((Key ? a.key_mxfp8 : a.value_mxfp8) && a.width <= 8) {
+        factor<Key, Direct, 8, 64, 64, false, Fp8>(a, stream);
+        return;
+    }
+    if (!Key && a.value_mxfp8 && a.width >= 33 && a.width <= 64) {
+        factor<Key, Direct, 64, 128, 64, false, Fp8>(a, stream);
+        return;
+    }
     switch (schedule) {
     case MlaFactorSchedule::Small:
         factor<Key, Direct, 16, 32, 256, false, Fp8>(a, stream);
@@ -73,7 +107,8 @@ void attention(SparseMlaArguments a, const CUtensorMap& map, cudaStream_t stream
 }
 } // namespace
 
-void launch_sparse_mla(SparseMlaArguments a, MemorySpan scratch, KpoolMlaStorage storage,
+void launch_sparse_mla(SparseMlaArguments a, MemorySpan scratch,
+                       const KpoolSparseMlaProfile& profile, KpoolMlaStorage storage,
                        KpoolExecutionEnvelope envelope, int sms, cudaStream_t stream) {
     // By-value kernel parameters own the descriptor during asynchronous execution
     // and Graph replay. Encoding uses no device allocation or persistent host state.
@@ -82,7 +117,7 @@ void launch_sparse_mla(SparseMlaArguments a, MemorySpan scratch, KpoolMlaStorage
     const auto total = std::int64_t(a.tokens) * a.batch;
     for (a.begin = 0; a.begin < total; a.begin += kMlaWindow) {
         a.width         = std::min<std::int64_t>(kMlaWindow, total - a.begin);
-        const auto plan = sparse_mla_plan(storage, a.width, a.batch, envelope, sms);
+        const auto plan = sparse_mla_plan(profile, storage, a.width, a.batch, envelope, sms);
         a.splits        = plan.splits;
         a.tile          = plan.tile;
         a.direct        = plan.direct;
@@ -101,10 +136,16 @@ void launch_sparse_mla(SparseMlaArguments a, MemorySpan scratch, KpoolMlaStorage
                                  : static_cast<std::uint8_t*>(plan.query_scales.bind(scratch).data);
             switch (plan.fp8_query) {
             case MlaFactorSchedule::Small:
-                factor<true, false, 16, 128, 128, false, true>(a, stream);
+                if (a.key_mxfp8 && a.width <= 8)
+                    factor<true, false, 8, 128, 64, false, true>(a, stream);
+                else
+                    factor<true, false, 16, 128, 128, false, true>(a, stream);
                 break;
             case MlaFactorSchedule::Medium:
-                factor<true, false, 32, 128, 128, false, true>(a, stream);
+                if (a.key_mxfp8)
+                    factor<true, false, 32, 128, 64, false, true>(a, stream);
+                else
+                    factor<true, false, 32, 128, 128, false, true>(a, stream);
                 break;
             case MlaFactorSchedule::Bulk:
                 factor<true, false, 32, 128, 64, false, true>(a, stream);
@@ -135,9 +176,14 @@ void launch_sparse_mla(SparseMlaArguments a, MemorySpan scratch, KpoolMlaStorage
         if (plan.merge_value) merge.splits = 1;
         const int merge_blocks = merge.splits > 1 ? a.width * 64 : 1;
         mla_merge_kernel<<<merge_blocks, 256, 0, stream>>>(merge);
-        if (plan.merge_value)
-            factor<false, false, 8, 64, 128, true>(a, stream);
-        else if (a.direct) {
+        if (plan.merge_value) {
+            if (a.width <= 8)
+                factor<false, false, 8, 256, 64, true>(a, stream);
+            else if (fp8 && a.value_mxfp8)
+                factor<false, false, 32, 128, 64, true>(a, stream);
+            else
+                factor<false, false, 8, 64, 128, true>(a, stream);
+        } else if (a.direct) {
             if (fp8)
                 factor<false, true, true>(a, plan.factor, stream);
             else

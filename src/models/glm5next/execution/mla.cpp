@@ -12,7 +12,7 @@ ops::KpoolIndexerProfile index_geometry(const MlaReadout& r) {
 }
 
 ops::KpoolSparseMlaProfile attention_geometry(const MlaReadout& r) {
-    return {r.query.ne[1], r.query.ne[0], r.output.ne[0], r.factors.key_up.ne[0]};
+    return ops::kpool_sparse_mla_profile(r.factors, r.query.ne[1]);
 }
 } // namespace
 
@@ -97,7 +97,7 @@ MlaReadout MlaRun::readout() {
                  reuse_ ? Tensor{} : buffers_.coefficients.view({dimension(m.index_heads), t, b}),
                  buffers_.output.view({dimension(m.value_dim), dimension(m.heads), t, b}),
                  selection_rows_,
-                 {parameters_.key_up, parameters_.value_up},
+                 parameters_.factors,
                  cache_,
                  batch_,
                  selection_,

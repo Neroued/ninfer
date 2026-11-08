@@ -122,12 +122,12 @@ struct Bank {
 
     ExpertMatrixDeviceView view() const {
         ExpertMatrixDeviceView v;
-        v.codes          = static_cast<const std::byte*>(codes.data());
-        v.scales         = static_cast<const std::byte*>(scales.data());
-        v.code_stride    = code_bytes;
-        v.scale_stride   = scale_bytes;
-        v.divisors       = static_cast<const float*>(divisors.data());
-        v.divisor_stride = fp8 ? 0 : 1;
+        v.codes               = static_cast<const std::byte*>(codes.data());
+        v.scales              = static_cast<const std::byte*>(scales.data());
+        v.code_stride         = code_bytes;
+        v.scale_stride        = scale_bytes;
+        v.matrix_scales       = static_cast<const float*>(divisors.data());
+        v.matrix_scale_stride = fp8 ? 0 : 1;
         return v;
     }
 };
@@ -162,11 +162,15 @@ struct Fixture {
         std::vector<std::uint16_t> router(std::size_t(E + 1) * H);
         for (int e = 0; e <= E; ++e) { router[std::size_t(e) * H + e] = bench::f32_to_bf16(2); }
         control.copy_from_host(router.data(), control.size());
-        const auto activation_divisors =
-            fp8 ? ops::ExpertActivationDivisors{}
-                : ops::ExpertActivationDivisors{719.7991333F, 313.927002F};
+        const auto activation_calibration =
+            fp8 ? ops::ExpertActivationCalibration{}
+                : ops::ExpertActivationCalibration{
+                      ops::ActivationCalibrationView::broadcast(
+                          ops::ActivationScaleOperation::Divide, 719.7991333F),
+                      ops::ActivationCalibrationView::broadcast(
+                          ops::ActivationScaleOperation::Divide, 313.927002F)};
         weights         = {dense(control, E + 1, H),
-                           {{gu.view(), down.view(), E, control.device()}, activation_divisors},
+                           {{gu.view(), down.view(), E, control.device()}, activation_calibration},
                            {{dense(shared_gu, 2 * shared_intermediate, H)},
                             {dense(shared_down, H, shared_intermediate)}}};
         const auto type = fp8 ? QType::FP8_E4M3FN_BLOCK128X128_BF16 : QType::NVFP4;

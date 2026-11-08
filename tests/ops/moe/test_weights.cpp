@@ -1,5 +1,6 @@
 #include "ninfer/ops/moe.h"
 
+#include <algorithm>
 #include <array>
 #include <limits>
 #include <stdexcept>
@@ -19,36 +20,69 @@ void rejects(F&& call) {
     throw std::runtime_error("invalid expert activation usage was accepted");
 }
 
+ops::ActivationCalibrationView divisor(float value) {
+    return ops::ActivationCalibrationView::broadcast(ops::ActivationScaleOperation::Divide, value);
+}
+
 } // namespace
 
 int test_weights() {
     const WeightView weight;
     ops::ExpertInputUsage usage;
-    usage.include({weight, ops::LinearPolicy::AllowA4, 2.0F});
-    usage.include({weight, ops::LinearPolicy::AllowA4, 2.0F});
+    usage.include({weight, ops::LinearPolicy::AllowA4, divisor(2.0F)});
+    usage.include({weight, ops::LinearPolicy::AllowA4, divisor(2.0F)});
     require(usage.policy() == ops::LinearPolicy::AllowA4 &&
-                usage.activation_divisor(QType::NVFP4) == 2.0F,
+                usage.calibration(QType::NVFP4).scalar_divisor() == 2.0F,
             "matching expert calibration was not preserved");
-    require(!usage.activation_divisor(QType::Q4_G64_FP16),
+    require(usage.calibration(QType::Q4_G64_FP16).empty(),
             "non-NVFP4 input acquired an activation divisor");
     usage.include({weight, ops::LinearPolicy::AllowA8, {}});
-    require(usage.policy() == ops::LinearPolicy::AllowA8 && !usage.activation_divisor(QType::NVFP4),
+    require(usage.policy() == ops::LinearPolicy::AllowA8 && usage.calibration(QType::NVFP4).empty(),
             "A8 restriction did not remove incomplete A4 calibration");
-    usage.include({weight, ops::LinearPolicy::A16Only, 3.0F});
-    usage.include({weight, ops::LinearPolicy::AllowA4, 2.0F});
-    require(usage.policy() == ops::LinearPolicy::A16Only && !usage.activation_divisor(QType::NVFP4),
+    usage.include({weight, ops::LinearPolicy::A16Only, divisor(3.0F)});
+    usage.include({weight, ops::LinearPolicy::AllowA4, divisor(2.0F)});
+    require(usage.policy() == ops::LinearPolicy::A16Only && usage.calibration(QType::NVFP4).empty(),
             "expert permissions were widened or unequal calibration was retained");
 
-    for (const auto divisor : {std::optional<float>{}, std::optional<float>{3.0F}}) {
+    for (const auto calibration : {ops::ActivationCalibrationView{}, divisor(3.0F)}) {
         ops::ExpertInputUsage invalid;
-        invalid.include({weight, ops::LinearPolicy::AllowA4, 2.0F});
-        invalid.include({weight, ops::LinearPolicy::AllowA4, divisor});
-        rejects([&] { (void)invalid.activation_divisor(QType::NVFP4); });
+        invalid.include({weight, ops::LinearPolicy::AllowA4, divisor(2.0F)});
+        invalid.include({weight, ops::LinearPolicy::AllowA4, calibration});
+        rejects([&] { (void)invalid.calibration(QType::NVFP4); });
     }
-    rejects([&] { (void)ops::ExpertInputUsage{}.activation_divisor(QType::NVFP4); });
-    for (const auto divisor : {0.0F, -1.0F, std::numeric_limits<float>::infinity(),
-                               std::numeric_limits<float>::quiet_NaN()})
-        rejects([&] { usage.include({weight, ops::LinearPolicy::AllowA4, divisor}); });
+    rejects([&] { (void)ops::ExpertInputUsage{}.calibration(QType::NVFP4); });
+    for (const auto value : {0.0F, -1.0F, std::numeric_limits<float>::infinity(),
+                             std::numeric_limits<float>::quiet_NaN()})
+        rejects([&] { usage.include({weight, ops::LinearPolicy::AllowA4, divisor(value)}); });
+
+    const std::array per_expert{0.125F, 0.25F, 0.0625F};
+    const auto multipliers = ops::ActivationCalibrationView::per_matrix(
+        ops::ActivationScaleOperation::Multiply, per_expert);
+    ops::ExpertInputUsage native;
+    native.include({weight, ops::LinearPolicy::AllowA4, multipliers});
+    native.include({weight, ops::LinearPolicy::AllowA4, multipliers});
+    const auto selected = native.calibration(QType::NVFP4_MUL);
+    require(selected.operation == ops::ActivationScaleOperation::Multiply &&
+                selected.values().size() == per_expert.size() &&
+                std::equal(selected.values().begin(), selected.values().end(), per_expert.begin()),
+            "per-expert multipliers changed or collapsed to one value");
+    rejects([&] { (void)selected.scalar_divisor(); });
+    rejects([&] { (void)native.calibration(QType::NVFP4); });
+    auto differing = per_expert;
+    differing[1] *= 2;
+    native.include({weight, ops::LinearPolicy::AllowA4,
+                    ops::ActivationCalibrationView::per_matrix(
+                        ops::ActivationScaleOperation::Multiply, differing)});
+    rejects([&] { (void)native.calibration(QType::NVFP4_MUL); });
+
+    const std::array uniform{2.0F, 2.0F, 2.0F};
+    ops::ExpertInputUsage broadcast;
+    broadcast.include({weight, ops::LinearPolicy::AllowA4, divisor(2.0F)});
+    broadcast.include({weight, ops::LinearPolicy::AllowA4,
+                       ops::ActivationCalibrationView::per_matrix(
+                           ops::ActivationScaleOperation::Divide, uniform)});
+    require(broadcast.calibration(QType::NVFP4).values().size() == uniform.size(),
+            "broadcast calibration did not preserve the matrix domain");
 
     const auto gu =
         weight_geometry(QType::FP8_E4M3FN_BLOCK64X64_BF16, QuantLayout::BlockScaleM64K64,
@@ -68,7 +102,7 @@ int test_weights() {
                 profile.ffn.down_layout == QuantLayout::BlockScaleM64K64 &&
                 profile.ffn.gate_up_policy == ops::LinearPolicy::AllowA8 &&
                 profile.ffn.down_policy == ops::LinearPolicy::AllowA8 &&
-                !usage.activation_divisor(QType::FP8_E4M3FN_BLOCK64X64_BF16),
+                usage.calibration(QType::FP8_E4M3FN_BLOCK64X64_BF16).empty(),
             "block64 expert geometry, policy or calibration differs");
     return 0;
 }

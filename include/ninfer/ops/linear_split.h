@@ -20,9 +20,7 @@ namespace ninfer::ops {
  * aligned. Outputs are mutually disjoint and overlap neither X nor any weight plane.
  * Inputs and weights are preserved. Logical and padded weight dimensions agree.
  *
- * Registered forms include BF16, Q8-G32/FP16, FP8 row-scale, NVFP4 block-scale and
- * paired Q4-G64/FP16 + Q5-G64/FP16. Single-parent activation permissions follow
- * LinearPolicy; paired forms use A16.
+ * Each native parent retains its own LinearPolicy activation permission.
  * Workspace is caller-owned, call-scoped and disjoint from all operands. The Op
  * allocates no hidden device memory, owns no persistent state and supports Graph replay.
  */
@@ -35,13 +33,17 @@ void linear_split(const Tensor& x, const Weight& weight, std::span<const Tensor>
                   CudaExecutionView execution);
 
 /**
- * Y_s[r,t] = sum_k W[begin_s+r,k] * X[k,t] + bias[begin_s+r].
+ * Y_s[r,t] = sum_k decode(W)[begin_s+r,k] * X[k,t] + bias[begin_s+r].
  *
- * Single-parent BF16/A16 form with contiguous, naturally aligned BF16 bias [N].
+ * Single-parent form with contiguous, naturally aligned BF16 bias [N].
  * Bias is added before output rounding. Output mapping, alignment and disjointness
- * follow linear_split; outputs also overlap no bias storage. Supports registered
- * BF16 geometries/segmentations, without workspace or hidden allocations.
+ * follow linear_split; outputs and workspace also overlap no bias storage.
  */
+void linear_split(const Tensor& x, const Weight& weight, const Tensor& bias,
+                  std::span<const Tensor> outputs, LinearPolicy policy, MemoryArena& workspace,
+                  CudaExecutionView execution);
+
+/** BF16/A16 biased form without transient workspace. */
 void linear_split(const Tensor& x, const Weight& weight, const Tensor& bias,
                   std::span<const Tensor> outputs, CudaExecutionView execution);
 
@@ -55,6 +57,11 @@ void linear_split(const Tensor& x, const Weight& weight, const Tensor& bias,
 linear_split_workspace_capacity_bytes(const ProjectionProfile& weights,
                                       std::span<const std::int32_t> output_rows,
                                       std::int32_t min_columns, std::int32_t max_columns);
+
+[[nodiscard]] std::size_t linear_split_bias_workspace_capacity_bytes(
+    QType type, std::int32_t output_rows, std::int32_t input_rows,
+    std::span<const std::int32_t> segment_rows, LinearPolicy policy, std::int32_t min_columns,
+    std::int32_t max_columns);
 
 [[nodiscard]] inline std::size_t
 linear_split_workspace_capacity_bytes(const ProjectionWeights& weights,

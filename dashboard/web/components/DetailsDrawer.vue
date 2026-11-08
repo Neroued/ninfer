@@ -441,6 +441,33 @@ function closeOnBackdrop(event: MouseEvent) {
           <dd>{{ request.placement ?? '—' }}</dd>
           <dt>Preemptions</dt>
           <dd>{{ request.preemptions }}</dd>
+          <dt>Recovery</dt>
+          <dd>
+            {{ request.recovery ? label(request.recovery.route) : '—'
+            }}<template
+              v-if="
+                request.recoveryPending &&
+                request.recovery?.frontier === request.recovery?.target_frontier
+              "
+            >
+              · awaiting new progress</template
+            >
+          </dd>
+          <template v-if="request.recovery?.route === 'replay'">
+            <dt>Replay progress</dt>
+            <dd>
+              {{ tokens(request.recovery.frontier - request.recovery.begin_frontier) }} /
+              {{ tokens(request.recovery.target_frontier - request.recovery.begin_frontier) }}
+            </dd>
+            <dt>Replay remaining</dt>
+            <dd>{{ tokens(request.recovery.target_frontier - request.recovery.frontier) }}</dd>
+          </template>
+          <dt>Total replayed</dt>
+          <dd>{{ tokens(request.replayedTokens) }}</dd>
+          <dt>Last progress</dt>
+          <dd>{{ request.lastProgressAt == null ? '—' : clock(request.lastProgressAt, true) }}</dd>
+          <dt>Service priority</dt>
+          <dd>{{ request.progressOwner ? 'Current owner' : '—' }}</dd>
           <dt>Response transport</dt>
           <dd>{{ request.responseFailed ? 'failed' : '—' }}</dd>
         </dl>

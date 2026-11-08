@@ -42,10 +42,31 @@ int recurrence_window_peak(int heads, int first, int last) {
 }
 
 int select_record_rows(int heads, int tokens, int batch) {
+    if (heads == 32) {
+        if (batch >= 2 && tokens <= 4) return 2;
+        if (batch == 1 && (tokens == 2 || tokens >= 5)) return 8;
+    }
     return heads == 32 && tokens >= 12 && batch != 2 ? 8 : 4;
 }
 
 FoldSchedule select_fold_schedule(int layers, int heads, int width, int batch, int sms) {
+    if (heads == 32) {
+        if (layers == 1) {
+            if (width == 1)
+                return batch == 1  ? FoldSchedule{4, 4}
+                       : batch < 8 ? FoldSchedule{4, 2}
+                                   : FoldSchedule{16, 2};
+            if (width == 2) return batch <= 2 ? FoldSchedule{4, 2} : FoldSchedule{4, 4};
+            if (width < 12) return {4, 4, 4};
+            if (batch == 1) return {4, 8, 4};
+            if (batch == 2) return {4, 4, 4};
+            if (batch >= 8) return {4, 16, 4};
+            return {4, 8, 8};
+        }
+        if (width == 2) return {4, 2};
+        if (width >= 12) return {4, 16, 4};
+        if (width >= 5) return {4, 4, 4};
+    }
     if (std::int64_t(layers) * heads * batch < 2LL * sms) return {4, 4};
     return width <= 2 ? FoldSchedule{16, 2} : FoldSchedule{4, 8};
 }

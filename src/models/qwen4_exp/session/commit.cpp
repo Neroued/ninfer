@@ -101,10 +101,10 @@ void SessionImpl::finish_result(ComputeResult result) {
         tx.event.emplace(SessionEvent{tx.ticket, tx.members, std::move(progress)});
     } else if (tx.kind == Kind::Replay) {
         const auto& s = sequence(tx.members[0]);
-        tx.event.emplace(
-            SessionEvent{tx.ticket, tx.members,
-                         ReplayProgress{false, tx.result->rows[0].processed,
-                                        completed[0].main_frontier == s.replay_target}});
+        tx.event.emplace(SessionEvent{tx.ticket, tx.members,
+                                      ReplayProgress{false, tx.result->rows[0].processed,
+                                                     completed[0].main_frontier == s.replay_target,
+                                                     completed[0].main_frontier}});
     } else if (tx.kind == Kind::Control) {
         tx.event.emplace(SessionEvent{tx.ticket, tx.members, ControlComplete{}});
     } else {

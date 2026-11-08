@@ -276,6 +276,11 @@ public:
 
     void evict(CudaExecutionView cuda) {
         const auto stream = cuda.stream();
+        // evict_last lines survive normal read traffic. Finish preceding work
+        // before resetting their priority so every cold sample starts with the
+        // same cache state, including after kernels using L2 retention hints.
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        CUDA_CHECK(cudaCtxResetPersistingL2Cache());
         detail::
             read_eviction_buffer<<<detail::kEvictionBlocks, detail::kEvictionThreads, 0, stream>>>(
                 static_cast<const uint4*>(data()), size() / sizeof(uint4),

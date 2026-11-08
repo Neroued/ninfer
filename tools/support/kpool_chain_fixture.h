@@ -163,10 +163,12 @@ struct ChainFixture {
     }
 
     void attend(CudaExecutionView cuda) {
-        ops::kpool_sparse_mla(query.view, {key_up.view, value_up.view}, cache.latent,
-                              {index.positions.view, index.valid.view, index.selectors.view},
-                              index.selection, selection_rows.view, scale, index.envelope,
-                              *index.workspace, output.view, cuda);
+        ops::kpool_sparse_mla(
+            query.view,
+            {dense_weight(key_up.view, 16384, 512), dense_weight(value_up.view, 16384, 512)},
+            cache.latent, {index.positions.view, index.valid.view, index.selectors.view},
+            index.selection, selection_rows.view, scale, index.envelope, *index.workspace,
+            output.view, cuda);
     }
 
     void launch(CudaExecutionView cuda) {

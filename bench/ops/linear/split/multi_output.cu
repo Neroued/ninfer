@@ -45,6 +45,9 @@ enum class Format : std::uint8_t {
     Bf16,
     Nvfp4,
     Fp8,
+    Mxfp8,
+    Mxfp8Bias,
+    Fp8BlockBf16,
     All
 };
 enum class CacheMode : std::uint8_t { Cold, Warm, Both };
@@ -85,18 +88,19 @@ struct Measurement {
 };
 
 [[noreturn]] void usage(const char* message) {
-    std::fprintf(
-        stderr,
-        "error: %s\n"
-        "usage: ninfer_linear_split_multi_output_bench "
-        "[--format "
-        "q4q5|q8-qgkv|q8-qkv|q8-dflash2-qkv|q8-segmented|bf16-segmented|bf16|nvfp4|fp8|all] "
-        "[--n N --k K --rows R1,R2,... (segmented)] "
-        "[--nvfp4-policy a16|a4] [--fp8-policy a16|a8] "
-        "[--tokens T,...] [--cache cold|warm|both] [--execution eager|graph] "
-        "Graph measurements time the captured GPU body. "
-        "[--warmup N] [--repeat N] [--profile] [--csv-out PATH]\n",
-        message);
+    std::fprintf(stderr,
+                 "error: %s\n"
+                 "usage: ninfer_linear_split_multi_output_bench "
+                 "[--format "
+                 "q4q5|q8-qgkv|q8-qkv|q8-dflash2-qkv|q8-segmented|bf16-segmented|bf16|nvfp4|fp8|"
+                 "mxfp8|mxfp8-bias|fp8-block-bf16|all] "
+                 "[--n N --k K --rows R1,R2,... (segmented)] "
+                 "[--nvfp4-policy a16|a4] [--fp8-policy a16|a8] "
+                 "[--tokens T,... | --sweep START:END[:STEP]] [--cache cold|warm|both] "
+                 "[--execution eager|graph] "
+                 "Graph measurements time the captured GPU body. "
+                 "[--warmup N] [--repeat N] [--profile] [--csv-out PATH]\n",
+                 message);
     std::exit(2);
 }
 
@@ -156,12 +160,18 @@ Options parse_options(int argc, char** argv) {
                 options.format = Format::Nvfp4;
             else if (value == "fp8")
                 options.format = Format::Fp8;
+            else if (value == "mxfp8")
+                options.format = Format::Mxfp8;
+            else if (value == "mxfp8-bias")
+                options.format = Format::Mxfp8Bias;
+            else if (value == "fp8-block-bf16")
+                options.format = Format::Fp8BlockBf16;
             else if (value == "all")
                 options.format = Format::All;
             else
                 usage("--format expects q4q5, q8-qgkv, q8-qkv, q8-dflash2-qkv, q8-segmented, bf16, "
                       "nvfp4, "
-                      "fp8, or all");
+                      "fp8, mxfp8, mxfp8-bias, fp8-block-bf16, or all");
         } else if (argument == "--nvfp4-policy") {
             const std::string_view value(next("--nvfp4-policy requires a value"));
             if (value == "a16")
@@ -184,6 +194,8 @@ Options parse_options(int argc, char** argv) {
             options.k = parse_i32(next("--k"), 1, INT32_MAX, "--k");
         } else if (argument == "--rows") {
             options.rows = parse_list(next("--rows"), "--rows");
+        } else if (argument == "--sweep") {
+            options.tokens = bench::measurement::sweep(next("--sweep requires a value"));
         } else if (argument == "--tokens") {
             options.tokens = parse_list(next("--tokens requires a value"), "--tokens");
         } else if (argument == "--cache") {
@@ -345,7 +357,9 @@ void run_q4q5(const Options& options, bench::L2FlushBuffer& flush, CudaExecution
         Tensor tk(k.span(), DType::BF16, {kv_rows, tokens});
         Tensor tv(v.span(), DType::BF16, {kv_rows, tokens});
         const auto launch = [&](CudaExecutionView cuda) {
-            ops::linear_split(x, ops::PairedProjectionWeights{qk.weight, gv.weight},
+            ops::linear_split(x,
+                              ops::PairedProjectionWeights{{qk.weight, ops::LinearPolicy::A16Only},
+                                                           {gv.weight, ops::LinearPolicy::A16Only}},
                               std::array{tq, tk, tg, tv}, workspace, cuda);
         };
         const CacheState profile_cache =
@@ -535,6 +549,83 @@ void run_fp8(const Options& options, bench::L2FlushBuffer& flush, CudaExecutionV
                     flush, cuda, results);
 }
 
+void run_native(const Options& options, Format format, bench::L2FlushBuffer& flush,
+                CudaExecutionView cuda, std::vector<Result>& results) {
+    const bool biased = format == Format::Mxfp8Bias;
+    const bool paired = format == Format::Fp8BlockBf16;
+    const int n = biased ? 3072 : 20480, k = biased ? 1024 : 1536;
+    const std::vector<int> rows = biased ? std::vector{1024, 1024, 1024} : std::vector{16384, 4096};
+    const auto policy           = paired ? ops::LinearPolicy::A16Only : options.fp8_policy;
+    auto first                  = paired ? bench::make_fp8_block_weight(16384, k, 709U)
+                                         : bench::make_mxfp8_weight(n, k, 709U);
+    bench::DirectBf16Weight second;
+    ops::ProjectionWeights weights;
+    if (paired) {
+        second  = bench::make_direct_bf16_weight(4096, k, 719U);
+        weights = ops::PairedProjectionWeights{{first.weight, policy}, {second.weight, policy}};
+    } else {
+        weights = ops::SingleProjectionWeight{first.weight, policy};
+    }
+    const auto capacity = [&](int first_token, int last_token) {
+        return biased ? ops::linear_split_bias_workspace_capacity_bytes(
+                            QType::MXFP8, n, k, rows, policy, first_token, last_token)
+                      : ops::linear_split_workspace_capacity_bytes(weights, rows, first_token,
+                                                                   last_token);
+    };
+    const int max_tokens = *std::max_element(options.tokens.begin(), options.tokens.end());
+    const auto bytes =
+        capacity(*std::min_element(options.tokens.begin(), options.tokens.end()), max_tokens);
+    auto scratch = bench::make_buffer(std::max<std::size_t>(bytes, 1));
+    MemoryArena arena(scratch.span());
+    auto input = bench::make_bf16(std::size_t(k) * max_tokens, 727U);
+    DeviceBuffer bias_storage;
+    Tensor bias;
+    if (biased) {
+        bias_storage = bench::make_bf16(n, 733U);
+        bias         = Tensor(bias_storage.span(), DType::BF16, {n});
+    }
+    std::vector<DeviceBuffer> storage;
+    for (int row : rows) storage.push_back(bench::make_buffer(std::size_t(row) * max_tokens * 2));
+    const char* label = paired ? "fp8-block-bf16" : biased ? "mxfp8-bias" : "mxfp8";
+    for (int tokens : options.tokens) {
+        Tensor x(input.span(), DType::BF16, {k, tokens});
+        std::vector<Tensor> outputs;
+        for (std::size_t i = 0; i < rows.size(); ++i)
+            outputs.emplace_back(storage[i].span(), DType::BF16,
+                                 std::initializer_list<std::int32_t>{rows[i], tokens});
+        const auto exact  = capacity(tokens, tokens);
+        const auto launch = [&](CudaExecutionView c) {
+            if (biased)
+                ops::linear_split(x, first.weight, bias, outputs, policy, arena, c);
+            else
+                ops::linear_split(x, weights, outputs, arena, c);
+        };
+        // These native K1024/K1536 workspaces contain codes and scales without
+        // inter-plane padding. Include initialized code rows beyond logical T.
+        const auto quantized_io = 2 * std::uint64_t(exact);
+        const auto logical =
+            first.model_weight_bytes() + (paired ? second.model_weight_bytes() : 0) +
+            (biased ? std::uint64_t(n) * 2 : 0) + tensor_bytes(k + n, tokens) + quantized_io;
+        for (auto cache : {CacheState::Cold, CacheState::Warm}) {
+            if ((options.cache == CacheMode::Cold && cache != CacheState::Cold) ||
+                (options.cache == CacheMode::Warm && cache != CacheState::Warm))
+                continue;
+            if (options.profile) {
+                profile_public(launch, label, policy_name(policy), cache, flush, cuda,
+                               options.warmup, options.graph);
+                continue;
+            }
+            arena.reset_peak();
+            const auto timing = measure_public(launch, cache, flush, cuda, options.warmup,
+                                               options.repeat, options.graph);
+            if (arena.used() != 0 || arena.peak_used() > exact)
+                throw std::runtime_error("native LinearSplit workspace exceeded capacity");
+            append_result(results, label, policy_name(policy), tokens, cache, exact, logical,
+                          2.0 * n * k * tokens, timing, bytes, arena.peak_used());
+        }
+    }
+}
+
 void write_csv(const Options& options, const std::vector<Result>& results) {
     if (options.csv_out.empty()) return;
     const std::filesystem::path path(options.csv_out);
@@ -621,6 +712,14 @@ int main(int argc, char** argv) {
                             weight, flush, cuda, results);
         }
         if (selected(options.format, Format::Fp8)) { run_fp8(options, flush, cuda, results); }
+        for (auto format : {Format::Mxfp8, Format::Mxfp8Bias, Format::Fp8BlockBf16}) {
+            if (options.format == format
+#if NINFER_TARGET_SPARK
+                || options.format == Format::All
+#endif
+            )
+                run_native(options, format, flush, cuda, results);
+        }
         write_csv(options, results);
         CUDA_CHECK(cudaStreamDestroy(stream));
         return 0;

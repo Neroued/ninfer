@@ -96,11 +96,12 @@ void verify(ExpertCache& cache, const ExpertBankSource& source, ExpertKey key,
                 cudaMemcpy(actual.data(), pointers[p] + local, from.bytes, cudaMemcpyDeviceToHost));
             if (actual != expected) { throw std::runtime_error("real expert plane bytes differ"); }
         }
-        if (matrix.divisors) {
+        if (matrix.matrix_scales) {
             float divisor;
-            check(cudaMemcpy(&divisor, matrix.divisors + key.expert * matrix.divisor_stride, 4,
+            check(cudaMemcpy(&divisor,
+                             matrix.matrix_scales + key.expert * matrix.matrix_scale_stride, 4,
                              cudaMemcpyDeviceToHost));
-            if (divisor != bank.divisor(key.expert)) {
+            if (divisor != bank.matrix_scale(key.expert)) {
                 throw std::runtime_error("real expert divisor differs");
             }
         }

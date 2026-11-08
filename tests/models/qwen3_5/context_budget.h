@@ -55,8 +55,9 @@ inline void set_context_capacity(EngineOptions& options, std::uint32_t retained_
 // Two private requests start together, then their growth exceeds the shared arena. The
 // startup minimum must still support either complete request and its recovery by itself.
 // Choose the starting length from the actual record packing, not a separate KV token quota.
-[[nodiscard]] inline std::uint32_t configure_two_request_pressure(EngineOptions& options,
-                                                                  std::uint32_t output_tokens) {
+[[nodiscard]] inline std::uint32_t
+configure_two_request_pressure(EngineOptions& options, std::uint32_t output_tokens,
+                               bool single_request_growth = false) {
     if (options.max_concurrency != 2 || options.context_cache.enabled)
         throw std::invalid_argument("pressure fixture requires two uncached requests");
     for (options.max_context = 8192; options.max_context <= 65536; options.max_context *= 2) {
@@ -76,9 +77,15 @@ inline void set_context_capacity(EngineOptions& options, std::uint32_t retained_
             if (geometry.required_bytes(records(2, prompt + options.speculative.draft_tokens +
                                                        page_tokens + 1)) > capacity)
                 break;
-            if (geometry.required_bytes(records(
-                    2, prompt + output_tokens - options.speculative.draft_tokens - 1)) <= capacity)
-                continue;
+            auto grown = records(2, prompt + output_tokens - options.speculative.draft_tokens - 1);
+            if (single_request_growth) {
+                // Speculative acceptance can let one request finish much earlier. Require
+                // pressure even if its peer has not generated anything since prefill.
+                const auto initial = records(1, prompt);
+                for (std::size_t i = 1; i < grown.size(); ++i)
+                    grown[i].count = grown[i].count / 2 + initial[i].count;
+            }
+            if (geometry.required_bytes(grown) <= capacity) continue;
             options.context_capacity = ContextCapacityPolicy::explicit_capacity(capacity);
             if (options.context_cache.host_capacity_bytes.value_or(0))
                 options.context_cache.host_capacity_bytes =

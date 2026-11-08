@@ -7,6 +7,8 @@
 #include <cstring>
 
 namespace ninfer::test {
+void csf_selection_checks(std::optional<CudaExecutionView>);
+
 namespace {
 using namespace artifact;
 using namespace artifact_fixture;
@@ -14,15 +16,16 @@ using namespace artifact_fixture;
 void selection(QType format, QuantLayout layout, const char* name, const char* encoded_layout,
                std::optional<CudaExecutionView> execution) {
     Fixture f;
-    const bool nv     = format == QType::NVFP4;
+    const bool nv     = format == QType::NVFP4 || format == QType::NVFP4_MUL;
     const bool bank   = layout == QuantLayout::BatchedBlockScaleK16M128x4;
     const Shape shape = bank ? Shape{2, 384, 256} : Shape{384, 256};
     const auto g      = weight_geometry(format, layout, shape);
     f.payload.resize(g.bytes);
     for (std::size_t i = 0; i < f.payload.size(); ++i)
         f.payload[i] = std::byte((i * 37 + i / 73) % 251);
-    for (std::uint64_t i = 0; i < g.divisor_count; ++i)
-        put_word(f.payload, g.divisor_offset + i * 4, std::bit_cast<std::uint32_t>(2.5F + i), 4);
+    for (std::uint64_t i = 0; i < g.matrix_scale_count; ++i)
+        put_word(f.payload, g.matrix_scale_offset + i * 4, std::bit_cast<std::uint32_t>(2.5F + i),
+                 4);
     f.root["components"] = {{"text", {{"config", Json::object()}}}};
     f.root["objects"]    = Json::array({{{"id", "source"},
                                          {"kind", "tensor"},
@@ -93,8 +96,8 @@ void selection(QType format, QuantLayout layout, const char* name, const char* e
         }
     }
     if (nv) {
-        equal(d.divisor_offset, g.divisor_offset + (bank ? 4 : 0), 4);
-        require(parent.weight_divisors[0] == (bank ? 3.5F : 2.5F), "selected divisor metadata");
+        equal(d.matrix_scale_offset, g.matrix_scale_offset + (bank ? 4 : 0), 4);
+        require(parent.matrix_scales[0] == (bank ? 3.5F : 2.5F), "selected divisor metadata");
     }
     if (execution) {
         std::vector<std::byte> actual(d.bytes);
@@ -122,9 +125,9 @@ void expert_shards(bool nvfp4, std::optional<CudaExecutionView> execution) {
         f.payload.resize(g.bytes);
         for (std::size_t i = 0; i < f.payload.size(); ++i)
             f.payload[i] = std::byte((i * 37 + i / 73) % 251);
-        for (std::uint64_t e = 0; e < g.divisor_count; ++e)
-            put_word(f.payload, g.divisor_offset + e * 4, std::bit_cast<std::uint32_t>(2.5F + e),
-                     4);
+        for (std::uint64_t e = 0; e < g.matrix_scale_count; ++e)
+            put_word(f.payload, g.matrix_scale_offset + e * 4,
+                     std::bit_cast<std::uint32_t>(2.5F + e), 4);
         f.root["components"] = {{"text", {{"config", Json::object()}}}};
         f.root["objects"]    = Json::array(
             {{{"id", "source"},
@@ -197,8 +200,8 @@ void expert_shards(bool nvfp4, std::optional<CudaExecutionView> execution) {
             }
             if (nvfp4) {
                 for (std::uint64_t e = 0; e < 2; ++e) {
-                    equal(d.divisor_offset + e * 4, g.divisor_offset + e * 4, 4);
-                    require(parent.weight_divisors[e] == 2.5F + e, "local expert divisor differs");
+                    equal(d.matrix_scale_offset + e * 4, g.matrix_scale_offset + e * 4, 4);
+                    require(parent.matrix_scales[e] == 2.5F + e, "local expert divisor differs");
                 }
             }
             if (execution) {
@@ -279,6 +282,7 @@ void assembly_and_padding(std::optional<CudaExecutionView> execution) {
 } // namespace
 
 void encoded_slice_checks(std::optional<CudaExecutionView> execution) {
+    csf_selection_checks(execution);
     assembly_and_padding(execution);
     expert_shards(true, execution);
     expert_shards(false, execution);
@@ -299,5 +303,10 @@ void encoded_slice_checks(std::optional<CudaExecutionView> execution) {
               execution);
     selection(QType::NVFP4, QuantLayout::BatchedBlockScaleK16M128x4, "nvfp4",
               "batched_block_scale_k16_m128x4_v1", execution);
+    selection(QType::NVFP4_MUL, QuantLayout::BatchedBlockScaleK16M128x4, "nvfp4_mul",
+              "batched_block_scale_k16_m128x4_v1", execution);
+    selection(QType::MXFP8, QuantLayout::RowGroupScale, "mxfp8", "row_group_scale_v1", execution);
+    selection(QType::FP8_E4M3FN_BLOCK128X128_FP32, QuantLayout::BlockScaleM128K128,
+              "fp8_e4m3fn_block128x128_fp32", "block_scale_m128_k128_v1", execution);
 }
 } // namespace ninfer::test

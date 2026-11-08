@@ -121,7 +121,7 @@ struct Matrix {
                                                  : QuantLayout::BlockScaleM128K128,
                                    std::array<std::uint64_t, 3>{
                                        std::uint64_t(count), std::uint64_t(n), std::uint64_t(k)})),
-          storage(execution.device(), geometry.bytes), divisors(geometry.divisor_count),
+          storage(execution.device(), geometry.bytes), divisors(geometry.matrix_scale_count),
           parent{geometry, execution.device(), static_cast<const std::byte*>(storage.data()),
                  divisors} {
         const auto seed = gate ? 101U : 211U;
@@ -136,7 +136,8 @@ struct Matrix {
         CUDA_CHECK(cudaStreamSynchronize(execution.stream()));
         if (!divisors.empty()) {
             for (int e = 0; e < count; ++e) divisors[e] = (gate ? 6.F : 3.F) + (e % 8) * .5F;
-            storage.copy_from_host(divisors.data(), divisors.size() * 4, geometry.divisor_offset);
+            storage.copy_from_host(divisors.data(), divisors.size() * 4,
+                                   geometry.matrix_scale_offset);
         }
         bank = bind_weight_bank(
             parent, describe_weight_bank(geometry, {0, unsigned(count), unsigned(n), unsigned(n)}));
@@ -300,9 +301,14 @@ ops::RoutedSwiGLUProfile Fixture::routed_profile() const {
 }
 
 ops::CudaSwiGLUExperts Fixture::experts() const {
-    return {device_expert_bank(impl_->gate_up.bank, impl_->down.bank),
-            shape.format == QType::NVFP4 ? ops::ExpertActivationDivisors{3.5F, 5.25F}
-                                         : ops::ExpertActivationDivisors{}};
+    return {
+        device_expert_bank(impl_->gate_up.bank, impl_->down.bank),
+        shape.format == QType::NVFP4
+            ? ops::ExpertActivationCalibration{ops::ActivationCalibrationView::broadcast(
+                                                   ops::ActivationScaleOperation::Divide, 3.5F),
+                                               ops::ActivationCalibrationView::broadcast(
+                                                   ops::ActivationScaleOperation::Divide, 5.25F)}
+            : ops::ExpertActivationCalibration{}};
 }
 
 ops::SigmoidMoeProfile Fixture::sigmoid_profile() const {

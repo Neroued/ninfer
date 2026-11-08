@@ -5,6 +5,7 @@
 
 #include "core/device.h"
 #include "ninfer_bench_common.h"
+#include "common/gpu_activity.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -32,6 +33,7 @@ constexpr std::size_t kL2FlushBytes = 256ULL << 20;
 
 enum class Profile {
     Bf16D2560,
+    Bf16D4096,
     Q6D5120,
     Q8D5120,
     Q8D2048,
@@ -43,12 +45,15 @@ struct ProfileSpec {
     QType qtype;
     std::int32_t d;
     std::int32_t group;
+    std::int32_t vocab = kVocab;
 };
 
 constexpr ProfileSpec profile_spec(Profile profile) {
     switch (profile) {
     case Profile::Bf16D2560:
         return {"bf16-d2560", QType::BF16, 2560, 0};
+    case Profile::Bf16D4096:
+        return {"bf16-d4096", QType::BF16, 4096, 0, 154880};
     case Profile::Q6D5120:
         return {"q6-d5120", QType::Q6_G64_FP16, 5120, 64};
     case Profile::Q8D5120:
@@ -63,12 +68,13 @@ constexpr ProfileSpec profile_spec(Profile profile) {
 
 Profile parse_profile(const char* raw) {
     if (!std::strcmp(raw, "bf16-d2560")) return Profile::Bf16D2560;
+    if (!std::strcmp(raw, "bf16-d4096")) return Profile::Bf16D4096;
     if (!std::strcmp(raw, "q6-d5120")) return Profile::Q6D5120;
     if (!std::strcmp(raw, "q8-d5120")) return Profile::Q8D5120;
     if (!std::strcmp(raw, "q8-d2048")) return Profile::Q8D2048;
     if (!std::strcmp(raw, "fp8-d5120")) return Profile::Fp8D5120;
     throw std::invalid_argument(
-        "--format must be bf16-d2560, q6-d5120, q8-d5120, q8-d2048, or fp8-d5120");
+        "--format must be bf16-d2560, bf16-d4096, q6-d5120, q8-d5120, q8-d2048, or fp8-d5120");
 }
 
 std::uint64_t align_up(std::uint64_t value, std::uint64_t alignment) {
@@ -89,26 +95,26 @@ PackedLayout packed_layout(const ProfileSpec& spec) {
     PackedLayout layout;
     layout.padded_d = static_cast<std::int32_t>(align_up(spec.d, 128));
     if (spec.qtype == QType::BF16) {
-        layout.code_plane_bytes = std::uint64_t(kVocab) * spec.d * 2;
+        layout.code_plane_bytes = std::uint64_t(spec.vocab) * spec.d * 2;
         layout.payload_bytes    = layout.code_plane_bytes;
         return layout;
     }
     const std::uint64_t groups = static_cast<std::uint64_t>(layout.padded_d / spec.group);
     if (spec.qtype == QType::Q6_G64_FP16) {
-        layout.code_plane_bytes  = static_cast<std::uint64_t>(kVocab) * groups * 32;
+        layout.code_plane_bytes  = static_cast<std::uint64_t>(spec.vocab) * groups * 32;
         layout.high_plane_offset = align_up(layout.code_plane_bytes, 256);
-        layout.high_plane_bytes  = static_cast<std::uint64_t>(kVocab) * groups * 16;
+        layout.high_plane_bytes  = static_cast<std::uint64_t>(spec.vocab) * groups * 16;
         layout.scale_plane_offset =
             layout.high_plane_offset + align_up(layout.high_plane_bytes, 256);
     } else if (spec.qtype == QType::Q8_G32_FP16) {
-        layout.code_plane_bytes =
-            static_cast<std::uint64_t>(kVocab) * groups * static_cast<std::uint64_t>(spec.group);
+        layout.code_plane_bytes = static_cast<std::uint64_t>(spec.vocab) * groups *
+                                  static_cast<std::uint64_t>(spec.group);
         layout.scale_plane_offset = align_up(layout.code_plane_bytes, 256);
     } else {
-        layout.code_plane_bytes   = static_cast<std::uint64_t>(kVocab) * spec.d;
+        layout.code_plane_bytes   = static_cast<std::uint64_t>(spec.vocab) * spec.d;
         layout.scale_plane_offset = align_up(layout.code_plane_bytes, 256);
     }
-    layout.scale_plane_bytes = static_cast<std::uint64_t>(kVocab) * groups * 2;
+    layout.scale_plane_bytes = static_cast<std::uint64_t>(spec.vocab) * groups * 2;
     layout.payload_bytes     = layout.scale_plane_offset + layout.scale_plane_bytes;
     return layout;
 }
@@ -125,15 +131,15 @@ Weight make_weight(const ProfileSpec& spec, const PackedLayout& layout, ConstMem
         spec.qtype == QType::FP8_E4M3FN_ROW_BF16 ? QuantLayout::RowScale : QuantLayout::RowSplit;
     table.scale_dtype     = spec.qtype == QType::FP8_E4M3FN_ROW_BF16 ? DType::BF16 : DType::FP16;
     table.group_size      = spec.group;
-    table.shape[0]        = kVocab;
+    table.shape[0]        = spec.vocab;
     table.shape[1]        = spec.d;
-    table.padded_shape[0] = kVocab;
+    table.padded_shape[0] = spec.vocab;
     table.padded_shape[1] = layout.padded_d;
     table.ndim            = 2;
     table.qdata           = payload.data;
     table.qhigh  = spec.qtype == QType::Q6_G64_FP16 ? bytes + layout.high_plane_offset : nullptr;
     table.scales = bytes + layout.scale_plane_offset;
-    table.n      = kVocab;
+    table.n      = spec.vocab;
     table.k      = spec.d;
     table.group  = spec.group;
     if (spec.qtype == QType::BF16) {
@@ -141,9 +147,9 @@ Weight make_weight(const ProfileSpec& spec, const PackedLayout& layout, ConstMem
         table.scales = nullptr;
     }
     if (spec.qtype == QType::FP8_E4M3FN_ROW_BF16) {
-        table.scale_ne[0] = kVocab;
+        table.scale_ne[0] = spec.vocab;
         table.scale_nb[0] = 2;
-        table.scale_nb[1] = static_cast<std::int64_t>(kVocab) * 2;
+        table.scale_nb[1] = static_cast<std::int64_t>(spec.vocab) * 2;
         table.scale_nb[2] = table.scale_nb[1];
         table.scale_nb[3] = table.scale_nb[1];
     }
@@ -220,6 +226,7 @@ struct Options {
     std::vector<Profile> profiles;
     std::vector<int> tokens;
     int warmup = 10, repeat = 100, graph_calls = 1, block_width = 8;
+    int reserve_tokens = 0, condition_us = 0;
     std::string execution = "graph", cache = "cold", pattern = "normal", csv;
     bool profile = false;
 };
@@ -256,11 +263,11 @@ Options parse_options(int argc, char** argv) {
         if (arg == "--help") {
             std::puts(
                 "usage: ninfer_embedding_bench [--format "
-                "bf16-d2560|q6-d5120|q8-d5120|q8-d2048|fp8-d5120] "
+                "bf16-d2560|bf16-d4096|q6-d5120|q8-d5120|q8-d2048|fp8-d5120] "
                 "[--tokens T,...] [--id-pattern normal|repeated|masked] [--block-width 2..16] "
                 "[--execution "
                 "eager|graph] [--cache cold|warm] [--graph-calls 1..64] [--warmup N] [--repeat N] "
-                "[--csv-out PATH] [--profile]");
+                "[--reserve-tokens T] [--condition-us N] [--csv-out PATH] [--profile]");
             std::exit(0);
         }
         if (++i >= argc) throw std::invalid_argument("missing option value");
@@ -283,6 +290,10 @@ Options parse_options(int argc, char** argv) {
             o.warmup = parse_integer(value, 0, 10000);
         else if (arg == "--repeat")
             o.repeat = parse_integer(value, 1, 10000);
+        else if (arg == "--reserve-tokens")
+            o.reserve_tokens = parse_integer(value, 1, 262144);
+        else if (arg == "--condition-us")
+            o.condition_us = parse_integer(value, 0, 10000);
         else if (arg == "--csv-out")
             o.csv = value;
         else
@@ -311,20 +322,38 @@ double logical_bytes_per_column(const ProfileSpec& spec, const PackedLayout& lay
     return encoded + (layout.padded_d / spec.group) * 2 + spec.d * 2 + 4;
 }
 
+template <class Prepare>
+ColdTiming measure_graph_body_prepared(Prepare prepare, const TimedGraph& graph,
+                                       CudaExecutionView cuda, int warmup, int repeat) {
+    for (int i = 0; i < warmup; ++i) {
+        prepare(cuda);
+        graph.launch(cuda);
+    }
+    CUDA_CHECK(cudaStreamSynchronize(cuda.stream()));
+    std::vector<double> samples;
+    for (int i = 0; i < repeat; ++i) {
+        prepare(cuda);
+        samples.push_back(graph.launch_timed(cuda));
+    }
+    return summarize_timings(std::move(samples));
+}
+
 void run_profile(Profile profile, const Options& o, std::ofstream& csv) {
     const auto spec   = profile_spec(profile);
     const auto layout = packed_layout(spec);
     DeviceBuffer payload(ninfer::bench::device_context().device(), layout.payload_bytes);
     initialize_payload(spec, layout, payload);
     const auto weight = make_weight(spec, layout, payload.span());
-    const int max_t   = *std::max_element(o.tokens.begin(), o.tokens.end());
+    const int max_t =
+        std::max(o.reserve_tokens, *std::max_element(o.tokens.begin(), o.tokens.end()));
     std::vector<int> host_ids(max_t);
-    const int mask = spec.d == 2048 ? 248077 : 248070;
+    const int mask = spec.d == 4096 ? spec.vocab - 1 : spec.d == 2048 ? 248077 : 248070;
     for (int i = 0; i < max_t; ++i) {
-        const int normal = (static_cast<std::int64_t>(i) * 9973 + 12345) % 248077;
-        host_ids[i]      = o.pattern == "repeated"                      ? 12345
-                           : o.pattern == "masked" && i % o.block_width ? mask
-                                                                        : normal;
+        const int normal =
+            (static_cast<std::int64_t>(i) * 9973 + 12345) % std::min(spec.vocab, 248077);
+        host_ids[i] = o.pattern == "repeated"                      ? 12345
+                      : o.pattern == "masked" && i % o.block_width ? mask
+                                                                   : normal;
     }
     DeviceBuffer ids(ninfer::bench::device_context().device(), static_cast<std::size_t>(max_t) * 4);
     DeviceBuffer output(ninfer::bench::device_context().device(),
@@ -352,6 +381,7 @@ void run_profile(Profile profile, const Options& o, std::ofstream& csv) {
                 else
                     launch(device.execution_view());
             }
+            condition_gpu(device.execution_view(), o.condition_us);
             if (o.cache == "cold") flush_l2(flush, device.execution_view());
             CUDA_CHECK(cudaStreamSynchronize(device.stream()));
             CUDA_CHECK(cudaProfilerStart());
@@ -363,17 +393,20 @@ void run_profile(Profile profile, const Options& o, std::ofstream& csv) {
             CUDA_CHECK(cudaProfilerStop());
             return;
         }
+        const auto prepare = [&](CudaExecutionView cuda) { condition_gpu(cuda, o.condition_us); };
         ColdTiming result;
         if (o.execution == "graph")
-            result =
-                o.cache == "cold"
-                    ? measure_cold_graph(graph, flush, device.execution_view(), o.warmup, o.repeat)
-                    : measure_graph(graph, device.execution_view(), o.warmup, o.repeat);
+            result = o.cache == "cold"
+                         ? measure_cold_graph_prepared(prepare, graph, flush,
+                                                       device.execution_view(), o.warmup, o.repeat)
+                         : measure_graph_body_prepared(prepare, graph, device.execution_view(),
+                                                       o.warmup, o.repeat);
         else
             result = o.cache == "cold"
-                         ? measure_cold_launch(launch, flush, device.execution_view(), o.warmup,
-                                               o.repeat)
-                         : measure_launch(launch, device.execution_view(), o.warmup, o.repeat);
+                         ? measure_cold_launch_prepared(prepare, launch, flush,
+                                                        device.execution_view(), o.warmup, o.repeat)
+                         : measure_launch_prepared(prepare, launch, device.execution_view(),
+                                                   o.warmup, o.repeat);
         result.median_us /= o.graph_calls;
         result.min_us /= o.graph_calls;
         result.p95_us /= o.graph_calls;

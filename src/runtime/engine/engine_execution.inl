@@ -283,7 +283,10 @@ void EngineCore<Instance>::resolve_prefill_progress(
     if (progress.complete && request->computed_prompt_tokens != suffix_tokens) {
         throw std::logic_error("completed prefill did not reach the admitted prompt frontier");
     }
-    if (progress.processed_prompt_tokens != 0) { publish_prompt_progress(request); }
+    if (progress.processed_prompt_tokens != 0) {
+        request->last_progress = Clock::now();
+        publish_prompt_progress(request);
+    }
     if (progress.capture_ready) {
         if (progress.complete || progress.pending) {
             throw std::logic_error("prefill capture offer overlaps prompt completion");
@@ -579,6 +582,9 @@ template <class Instance>
         } else if (auto* replay =
                        std::get_if<typename ModelContract::ReplayProgress>(&event->result)) {
             const auto& request = flight.requests.front();
+            if (!request->recovery) throw std::logic_error("replay progress has no restoration");
+            request->recovery->frontier = replay->frontier;
+            if (replay->processed_tokens) request->last_progress = Clock::now();
             request->replayed_tokens += replay->processed_tokens;
             cumulative_stats_.replayed_tokens += replay->processed_tokens;
             if (replay->capture_ready) reserve_active_capture(request, EngineRequestState::Replay);

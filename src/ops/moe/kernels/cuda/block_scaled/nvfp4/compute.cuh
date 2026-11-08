@@ -66,7 +66,7 @@ __device__ __forceinline__ Matrix resolve(const ExpertMatrixDeviceView& matrix, 
                 (matrix.offsets ? offset : expert * matrix.code_stride),
             reinterpret_cast<const std::uint8_t*>(matrix.scales) +
                 (matrix.offsets ? offset : expert * matrix.scale_stride),
-            matrix.divisors[expert * matrix.divisor_stride]};
+            matrix.matrix_scales[expert * matrix.matrix_scale_stride]};
 }
 
 template <class S, bool Gate>

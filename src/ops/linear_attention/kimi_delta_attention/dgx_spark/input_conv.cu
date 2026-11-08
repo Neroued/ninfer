@@ -1,5 +1,7 @@
 #include "ops/linear_attention/kimi_delta_attention/input_conv/kernels.cuh"
-#include "ops/linear_attention/kimi_delta_attention/input_conv/tma.cuh"
+#include "ops/linear_attention/kimi_delta_attention/input_conv/tile_epilogue.cuh"
+#include "ops/linear/kernels/q8/q8_a16_tma.cuh"
+#include "ops/linear/kernels/q8/q8_a16_tma_k32.cuh"
 #include "ops/linear/kernels/q8/q8_gemv_launch.cuh"
 #include "ops/linear/kernels/q8/q8_simt_launch.cuh"
 #include "ops/linear/kernels/q8/q8_sliced_k_launch.cuh"
@@ -49,10 +51,10 @@ void tiled(const Q8LinearOperands& operands, TiledConvolution output, cudaStream
     if constexpr (K32) {
         using S = std::conditional_t<Prefetch, Q8A16TmaK32PrefetchSchedule<Raster, 4096>,
                                      Q8A16TmaK32Schedule<Raster, 4096>>;
-        launch_q8_a16_tma_k32<S>(operands, output, ConvolutionEpilogue{}, stream);
+        launch_q8_a16_tma_k32<S>(operands, output, ConvolutionEpilogue<float>{}, stream);
     } else {
         using S = Q8A16TmaMmaSchedule<64, 128, 64, 16, 2, Raster, 4096>;
-        launch_q8_a16_tma_mma<S>(operands, output, ConvolutionEpilogue{}, stream);
+        launch_q8_a16_tma_mma<S>(operands, output, ConvolutionEpilogue<float>{}, stream);
     }
 }
 } // namespace
@@ -72,8 +74,9 @@ void launch(const Tensor& x, const Weight& w, const Arguments& a, float* scratch
                                           Q8ActivationStage::PaddedZero, 4096>;
         launch_q8_a16_sliced_k_mma<S>(operands, FloatOutput{scratch}, LinearIdentityEpilogue{},
                                       stream);
-        conv_kernel<<<dim3(kProjectionFeatures / 128, (a.width + 3) / 4, a.batch), 128, 0,
-                      stream>>>(a, scratch);
+        conv_kernel<float>
+            <<<dim3(kProjectionFeatures / 128, (a.width + 3) / 4, a.batch), 128, 0, stream>>>(
+                a, scratch);
         if (a.destination)
             history_kernel<<<dim3(kProjectionFeatures / 128, a.batch), 128, 0, stream>>>(a,
                                                                                          scratch);

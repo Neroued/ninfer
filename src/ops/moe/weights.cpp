@@ -1,5 +1,6 @@
 #include "ninfer/ops/moe.h"
 
+#include <algorithm>
 #include <bit>
 #include <cmath>
 #include <limits>
@@ -27,25 +28,45 @@ void ExpertInputUsage::include(const WeightInput& input) {
         policy_ = LinearPolicy::A16Only;
     else if (input.policy == LinearPolicy::AllowA8)
         policy_ = LinearPolicy::AllowA8;
-    if (!input.activation_input_divisor) {
-        missing_divisor_ = true;
+    const auto calibration = input.calibration;
+    if (calibration.empty()) {
+        missing_calibration_ = true;
         return;
     }
-    const float value = *input.activation_input_divisor;
-    if (!std::isfinite(value) || value <= 0)
-        throw std::invalid_argument("expert activation divisor must be finite and positive");
-    if (divisor_)
-        unequal_divisors_ |=
-            std::bit_cast<std::uint32_t>(*divisor_) != std::bit_cast<std::uint32_t>(value);
-    else
-        divisor_ = value;
+    if (calibration.operation != ActivationScaleOperation::Divide &&
+        calibration.operation != ActivationScaleOperation::Multiply)
+        throw std::invalid_argument("expert activation scale operation is invalid");
+    for (const auto value : calibration.values())
+        if (!std::isfinite(value) || value <= 0)
+            throw std::invalid_argument("expert activation scale must be finite and positive");
+    if (calibration_.empty()) {
+        calibration_ = calibration;
+        return;
+    }
+    const auto a = calibration_.values(), b = calibration.values();
+    if (calibration_.operation != calibration.operation ||
+        (a.size() != b.size() && a.size() != 1 && b.size() != 1)) {
+        unequal_calibrations_ = true;
+        return;
+    }
+    for (std::size_t i = 0; i < std::max(a.size(), b.size()); ++i)
+        unequal_calibrations_ |= std::bit_cast<std::uint32_t>(a[a.size() == 1 ? 0 : i]) !=
+                                 std::bit_cast<std::uint32_t>(b[b.size() == 1 ? 0 : i]);
+    if (b.size() > a.size()) calibration_ = calibration;
 }
 
-std::optional<float> ExpertInputUsage::activation_divisor(QType format) const {
-    if (format != QType::NVFP4) return std::nullopt;
-    if (allows_a4(policy_) && (!divisor_ || missing_divisor_ || unequal_divisors_))
-        throw std::invalid_argument("NVFP4 expert A4 requires a common activation divisor");
-    return unequal_divisors_ || missing_divisor_ ? std::nullopt : divisor_;
+ActivationCalibrationView ExpertInputUsage::calibration(QType format) const {
+    if (format != QType::NVFP4 && format != QType::NVFP4_MUL) return {};
+    if (allows_a4(policy_) &&
+        (calibration_.empty() || missing_calibration_ || unequal_calibrations_))
+        throw std::invalid_argument("NVFP4 expert A4 requires matching activation calibration");
+    if (unequal_calibrations_ || missing_calibration_) return {};
+    const auto operation = format == QType::NVFP4 ? ActivationScaleOperation::Divide
+                                                  : ActivationScaleOperation::Multiply;
+    if (!calibration_.empty() && calibration_.operation != operation)
+        throw std::invalid_argument(
+            "NVFP4 activation calibration arithmetic differs from its format");
+    return calibration_;
 }
 
 SwiGLUProfile swiglu_profile(const SwiGLUWeights& weights) {

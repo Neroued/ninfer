@@ -36,7 +36,7 @@ struct QsaProfile {
 struct MoeProfile {
     ops::MoeProfile math;
     ExpertBankId bank;
-    ops::ExpertActivationDivisors activation_divisors;
+    ops::ExpertActivationCalibration activation_calibration;
     ops::ExpertSubsetKind subset = ops::ExpertSubsetKind::All;
 };
 

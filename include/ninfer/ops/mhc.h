@@ -23,9 +23,9 @@ struct MhcPreParameters {
 
 struct MhcPreWeights {
     Weight projection; // BF16 Contiguous [N,S*D], N=S*(S+2), no padding or bias.
-    Tensor base;       // BF16 [N].
-    Tensor scale;      // BF16 [3].
-    Tensor gamma;      // BF16 [D], direct gain.
+    Tensor base;       // BF16 or FP32 [N].
+    Tensor scale;      // BF16 or FP32 [3].
+    Tensor gamma;      // BF16 or FP32 [D], direct gain.
 };
 
 struct MhcCoefficients {
@@ -117,7 +117,7 @@ void mhc_post_pre(const Tensor& residual, const Tensor& block_output,
  *                        *rsqrt(sum_d mean[d,m]^2/D + final_epsilon)).
  * Mean remains FP32 through final RMSNorm. Does not assume unit row/column sums of C.
  * Only hidden (contiguous BF16 [D,M]) is written; all inputs are preserved. Gamma_final
- * is contiguous BF16 [D], a direct gain; final_epsilon is finite and positive.
+ * is contiguous BF16 or FP32 [D], a direct gain; final_epsilon is finite and positive.
  * Hidden is disjoint from all inputs and workspace. Other rules follow mhc_pre.
  */
 void mhc_post_mean_norm(const Tensor& residual, const Tensor& block_output,

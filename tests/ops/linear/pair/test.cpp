@@ -369,7 +369,9 @@ int bf16_pair(int n, int t) {
     auto& context   = cuda_environment().context;
     std::array<std::vector<std::uint16_t>, 2> activation, weights;
     std::array<std::vector<float>, 2> represented_weights;
-    std::array<DeviceBuffer, 2> dx, dw, dy;
+    std::array<DeviceBuffer, 2> dx, dw;
+    std::array<GuardedDeviceBuffer, 2> dy{GuardedDeviceBuffer(std::size_t(n) * t * 2),
+                                          GuardedDeviceBuffer(std::size_t(n) * t * 2)};
     std::array<Tensor, 2> x, y;
     std::array<Weight, 2> w;
     for (int i = 0; i < 2; ++i) {
@@ -377,7 +379,6 @@ int bf16_pair(int n, int t) {
         weights[i]     = make_activation(k, n, 173 + i * 281);
         dx[i]          = to_device(activation[i]);
         dw[i]          = to_device(weights[i]);
-        dy[i]          = DeviceBuffer(context.device(), std::size_t(n) * t * 2);
         x[i]           = Tensor(dx[i].span(), DType::BF16, {k, t});
         y[i]           = Tensor(dy[i].span(), DType::BF16, {n, t});
         auto& weight   = w[i];
@@ -399,13 +400,17 @@ int bf16_pair(int n, int t) {
     graph.instantiate(definition);
     int failures       = 0;
     const auto columns = sampled_indices(t);
-    for (int phase = 0; phase < 2; ++phase) {
-        if (phase) {
+    for (int phase = 0; phase < 3; ++phase) {
+        if (phase == 1) {
             for (auto& bits : activation[1]) bits ^= 0x8000;
             dx[1].copy_from_host(activation[1].data(), dx[1].size());
         }
+        for (auto& output : dy) output.fill(0xff);
         cuda_synchronize();
-        graph.launch(context.stream());
+        if (phase == 2)
+            ops::linear_pair(x[0], x[0], w[0], w[1], y[0], y[1], context.execution_view());
+        else
+            graph.launch(context.stream());
         context.synchronize();
         for (int i = 0; i < 2; ++i) {
             const auto actual =
@@ -414,10 +419,11 @@ int bf16_pair(int n, int t) {
             for (auto row : sampled_indices(n))
                 selected.insert(selected.end(), represented_weights[i].begin() + row * k,
                                 represented_weights[i].begin() + (row + 1) * k);
-            const auto expected =
-                linear_pair_oracle(selected, k, sampled_indices(n).size(), activation[i], columns);
+            const auto expected = linear_pair_oracle(selected, k, sampled_indices(n).size(),
+                                                     activation[phase == 2 ? 0 : i], columns);
             failures += actual.failures +
-                        compare_output("BF16 independent pair", actual.selected, expected);
+                        compare_output("BF16 independent pair", actual.selected, expected) +
+                        dy[i].verify_guards("BF16 pair output");
         }
     }
     return failures;
@@ -468,11 +474,19 @@ void add_shape(linear_suite::Suite& suite, const ShapeCase& shape) {
 
 int main(int argc, char** argv) {
     linear_suite::Suite suite;
-    for (int n : {4096, 8192})
-        for (int t : {1, 4, 8, 33, 64, 4096})
+    for (int n : {4096, 8192}) {
+        const auto tokens =
+            n == 4096
+                ? std::vector{1,    2,    3,    4,    7,    8,    9,    16,   17,  24,   31,   32,
+                              33,   48,   63,   64,   65,   96,   127,  128,  129, 159,  160,  161,
+                              191,  192,  193,  255,  256,  257,  511,  512,  513, 1023, 1024, 1025,
+                              2047, 2048, 2049, 3071, 3072, 3073, 4095, 4096, 4097}
+                : std::vector{1, 4, 8, 33, 64, 4096};
+        for (int t : tokens)
             suite.add(linear_suite::make_case("bf16", n, 128, t, ops::LinearPolicy::A16Only,
                                               linear_suite::Execution::Graph, "independent-inputs"),
                       [=] { return bf16_pair(n, t); });
+    }
     for (int k : {2048, 5120})
         suite.add(linear_suite::make_case("q8", 1024, k, 4, ops::LinearPolicy::A16Only,
                                           linear_suite::Execution::Graph, "independent-inputs"),

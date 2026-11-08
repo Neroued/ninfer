@@ -175,8 +175,8 @@ ResidentExpertBank::ResidentExpertBank(std::span<const ResidentExpertEntry> entr
             throw std::invalid_argument("resident expert entries require a common plane offset");
         offsets[e.expert] = offset;
         owned[e.expert]   = 1;
-        if (!e.gate_up->weight_divisors.empty()) gu[e.expert] = e.gate_up->weight_divisors[0];
-        if (!e.down->weight_divisors.empty()) down[e.expert] = e.down->weight_divisors[0];
+        if (!e.gate_up->matrix_scales.empty()) gu[e.expert] = e.gate_up->matrix_scales[0];
+        if (!e.down->matrix_scales.empty()) down[e.expert] = e.down->matrix_scales[0];
         end = std::max(end, e.down->data + e.down->geometry.bytes);
     }
     metadata_.copy_from_host(offsets.data(), index.bytes, index.offset);
@@ -187,12 +187,12 @@ ResidentExpertBank::ResidentExpertBank(std::span<const ResidentExpertEntry> entr
     const auto* indices = static_cast<const std::uint64_t*>(index.bind(data).data);
     ConstMemorySpan payload{first_gu->data, static_cast<std::size_t>(end - first_gu->data), device};
     view_ = {indexed_weight_matrix(*first_gu, indices,
-                                   first_gu->geometry.divisor_count
+                                   first_gu->geometry.matrix_scale_count
                                        ? static_cast<const float*>(gu_div.bind(data).data)
                                        : nullptr,
                                    payload),
              indexed_weight_matrix(*first_down, indices,
-                                   first_down->geometry.divisor_count
+                                   first_down->geometry.matrix_scale_count
                                        ? static_cast<const float*>(dn_div.bind(data).data)
                                        : nullptr,
                                    payload),
@@ -210,6 +210,39 @@ ResidentExpertBank::ResidentExpertBank(const WeightParent& gate_up, const Weight
                                          {0, static_cast<std::uint32_t>(s[0]), s[1], s[1]}));
     };
     view_ = device_expert_bank(bank(gate_up), bank(down));
+}
+
+ResidentExpertBank::ResidentExpertBank(const WeightParent& gate_up, const WeightParent& down,
+                                       std::span<const std::uint32_t> logical_ids,
+                                       std::uint32_t global_count, Device device)
+    : ResidentExpertBank(gate_up, down) {
+    if (device != gate_up.device || device != down.device || !global_count ||
+        logical_ids.size() != view_.count || logical_ids.size() > global_count)
+        throw std::invalid_argument("compact expert bank differs from its logical domain");
+    LayoutBuilder layout;
+    const auto index =
+        layout.add(global_count * sizeof(std::uint32_t), alignof(std::uint32_t), "expert indices");
+    const auto mask =
+        layout.add(global_count * sizeof(std::int32_t), alignof(std::int32_t), "expert mask");
+    std::vector<std::uint32_t> indices(global_count, UINT32_MAX);
+    std::vector<std::int32_t> owned(global_count);
+    for (std::size_t slot = 0; slot < logical_ids.size(); ++slot) {
+        const auto id = logical_ids[slot];
+        if (id >= global_count || owned[id])
+            throw std::invalid_argument("compact expert bank has an invalid logical ID");
+        indices[id] = static_cast<std::uint32_t>(slot);
+        owned[id]   = 1;
+    }
+    metadata_ = DeviceBuffer(device, layout.finish());
+    metadata_.copy_from_host(indices.data(), index.bytes, index.offset);
+    metadata_.copy_from_host(owned.data(), mask.bytes, mask.offset);
+    const auto storage           = metadata_.span();
+    const auto* map              = static_cast<const std::uint32_t*>(index.bind(storage).data);
+    view_.gate_up.expert_indices = map;
+    view_.down.expert_indices    = map;
+    view_.count                  = global_count;
+    subset_                      = ops::ExpertSubsetKind::MaskOnes;
+    mask_ = Tensor(mask.bind(storage), DType::I32, {static_cast<std::int32_t>(global_count)});
 }
 
 } // namespace ninfer::models::moe

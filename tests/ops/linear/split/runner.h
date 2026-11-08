@@ -30,6 +30,7 @@ struct Profile {
     double a4_absolute = 1.0 / 256.0;
     Binding binding    = Binding::Direct;
     std::vector<int> input_slices;
+    bool bias = false;
 };
 
 struct Invocation {
@@ -51,6 +52,7 @@ struct Invocation {
 };
 
 void add_profile(Suite& suite, const Profile& profile, std::vector<Invocation> calls);
+void add_preparation_cases(Suite& suite);
 void add_segmented_cases(Suite& suite);
 void add_two_output_cases(Suite& suite);
 void add_multi_output_cases(Suite& suite);

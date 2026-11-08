@@ -11,5 +11,6 @@ int main(int argc, char** argv) {
     add_fp8_cases(suite);
     add_nvfp4_cases(suite);
     add_bank_cases(suite);
+    add_native_cases(suite);
     return suite.main(argc, argv);
 }

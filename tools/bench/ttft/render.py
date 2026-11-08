@@ -496,13 +496,14 @@ def _stream_markdown(summary: dict[str, Any]) -> list[str]:
         "per-generation totals and do not by themselves attribute a transfer to preemption.", "",
     ])
     lines.extend(_table(
-        ("Case", "Sample", "Role", "Join", "Service/engine ID", "Preemption", "Snapshot", "Replay",
+        ("Case", "Sample", "Role", "Join", "Service/engine ID", "Preemption", "Snapshot", "Direct", "Replay",
          "Replay tokens", "Paused ms", "D2H bytes", "H2D bytes", "Usage check", "Reason"),
         (
             (row["case"], row["sample"], row["request_role"], row["diagnostic_status"],
              f"{row['service_request_id']}/{row['engine_request_id']}",
              f"{row['mechanisms']['preemption']} ({row['preemptions']})",
              f"{row['mechanisms']['snapshot_restore']} ({row['snapshot_restores']})",
+             row["direct_restores"],
              f"{row['mechanisms']['replay_restore']} ({row['replay_restores']})",
              row["replayed_tokens"], ms(row, "paused_ns"), row["device_to_host_bytes"],
              row["host_to_device_bytes"], row["usage_check"], row["diagnostic_reason"] or "—")
@@ -769,6 +770,7 @@ CSV_FIELDS = (
     "usage_check",
     "preemptions",
     "snapshot_restores",
+    "direct_restores",
     "replay_restores",
     "replayed_tokens",
     "paused_ns",

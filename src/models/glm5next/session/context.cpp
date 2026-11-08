@@ -49,6 +49,16 @@ ContextProgress detail::SessionImpl::complete_context() {
         if (auto* tx = std::get_if<detail::BindOperation>(&operation.action)) {
             if (!tx->binding) throw std::logic_error("binding operation has no prepared sequence");
             auto& s = *tx->binding;
+            if (tx->resume) {
+                result.recovery = {
+                    .route = s.phase == detail::Phase::Replay ? GenerationRecoveryRoute::Replay
+                             : tx->source                     ? GenerationRecoveryRoute::Snapshot
+                                                              : GenerationRecoveryRoute::Direct,
+                    .begin_frontier  = tx->frontier,
+                    .frontier        = tx->frontier,
+                    .target_frontier = tx->target,
+                };
+            }
             for (std::uint16_t pool = 0; pool < p.directory.pool_count(); ++pool)
                 s.histories[pool] = migration.binding(pool)->commit();
             using StateAction = detail::StateBindingAction;
@@ -88,7 +98,6 @@ ContextProgress detail::SessionImpl::complete_context() {
             result.operations.partial_tail_cow_pages = tail_copies;
             result.sequence                          = p.handle(s);
             result.residency                         = p.member(s).residency;
-            result.replaying                         = s.phase == detail::Phase::Replay;
             result.private_points                    = std::move(tx->carried);
             result.retired_checkpoints               = std::move(tx->retired);
             p.sequences[tx->lane]                    = std::move(tx->binding);

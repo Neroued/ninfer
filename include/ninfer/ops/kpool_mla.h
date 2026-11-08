@@ -6,6 +6,7 @@
 #include "core/record_view.h"
 #include "core/tensor.h"
 #include "core/weight.h"
+#include "ninfer/ops/projection_weights.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -211,11 +212,23 @@ enum class KpoolMlaPrepareProjection {
     History,         // History only; no query projection or query outputs.
 };
 
+// A role occupies a contiguous row interval in one contraction parent. Absent roles have
+// rows=0; their parent/row_begin are not accessed. The nonempty roles partition each parent.
+struct KpoolProjectionRows {
+    std::int32_t parent = 0, row_begin = 0, rows = 0;
+    friend bool operator==(const KpoolProjectionRows&, const KpoolProjectionRows&) = default;
+};
+
+struct KpoolMlaProjectionLayout {
+    KpoolProjectionRows latent, index_key, pool_gate, query, coefficients;
+    friend bool operator==(const KpoolMlaProjectionLayout&,
+                           const KpoolMlaProjectionLayout&) = default;
+};
+
 struct KpoolMlaPrepareParameters {
     KpoolMlaPrepareProjection projection = KpoolMlaPrepareProjection::Full;
-    // BF16/Contiguous, logical [N,H], K/hidden contiguous; the selected parent prefix only.
-    // Row order: latent Dc | index key Di | pool gate Di | optional Q_a Rq | optional coeff Hi.
-    Weight a_projection;
+    ProjectionWeights weights;
+    KpoolMlaProjectionLayout rows;
     Tensor query_norm;          // BF16 [Rq], absent for History.
     Tensor latent_norm;         // BF16 [Dc], direct gain.
     Tensor index_norm;          // BF16 [Di], direct LayerNorm gain.
@@ -230,15 +243,20 @@ struct KpoolMlaPrepareOutputs {
     Tensor head_coeff; // FP32 [Hi,T,B], present only for Full.
 };
 
-// Address-free actual contraction geometry; execution derives these same facts from operands.
-// query_rank=0 for History; index_heads=0 unless Full. Other extents are positive.
-// N=latent_dim+2*index_dim+query_rank+index_heads. Registered weight geometries are admitted by
-// Prepare itself. Layout planning alone does not establish execution support.
+// Address-free contraction inputs and their semantic row mapping. Planning and execution
+// admit the same formats, policies and geometries; neither depends on model identity.
 struct KpoolMlaPrepareProfile {
     KpoolMlaPrepareProjection projection = KpoolMlaPrepareProjection::Full;
-    std::int32_t hidden = 0, latent_dim = 0, index_dim = 0, query_rank = 0, index_heads = 0;
+    ProjectionProfile weights{{QType::BF16, 0, 0}, {}};
+    KpoolMlaProjectionLayout rows;
     std::int32_t pool_size = kKpoolPoolSize;
 };
+
+[[nodiscard]] inline KpoolMlaPrepareProfile
+kpool_mla_prepare_profile(const KpoolMlaPrepareParameters& parameters) {
+    return {parameters.projection, projection_profile(parameters.weights), parameters.rows,
+            parameters.pool_ape.ne[1]};
+}
 
 struct KpoolIndexerProfile {
     std::int32_t index_heads = 0, index_dim = 0;
@@ -248,11 +266,13 @@ struct KpoolIndexerProfile {
 struct KpoolSparseMlaProfile {
     std::int32_t query_heads = 0, query_dim = 0, value_dim = 0, latent_dim = 0;
     std::int32_t pool_size = kKpoolPoolSize, selected_pools = kKpoolSelectedPools;
+    QType key_format = QType::BF16, value_format = QType::BF16;
 };
 
 /**
- * Prepare projects contiguous BF16 x[H,T,B] with the selected W_A prefix, using BF16 operands
- * and FP32 accumulation. Split the result into z_c,z_k,z_g and requested z_q,z_w, and compute:
+ * Prepare projects contiguous BF16 x[H,T,B] with one or two encoded parents and their
+ * independent activation-compute policies. Contractions accumulate in FP32. The row mapping
+ * identifies z_c,z_k,z_g and requested z_q,z_w without materializing a merged weight. Compute:
  *   c     = z_c * latent_norm / sqrt(mean(z_c^2)+rms_epsilon);
  *   q_r   = BF16(z_q * query_norm / sqrt(mean(z_q^2)+rms_epsilon));
  *   k_raw = BF16((z_k-mean(z_k))*index_norm /
@@ -331,9 +351,14 @@ void kpool_indexer(const Tensor& index_query, const Tensor& head_coeff,
                    KpoolBlockSelection& out, CudaExecutionView execution);
 
 struct KpoolMlaFactors {
-    Tensor key_up;   // BF16 [Dc,Dq,Hq], logical U_K[h][Dq,Dc]; Dc contiguous.
-    Tensor value_up; // BF16 [Dc,Dv,Hq], logical U_V[h][Dv,Dc]; Dc contiguous.
+    // Logical [Hq*Dq,Dc] / [Hq*Dv,Dc], preserving the native per-head row order.
+    // BF16/Contiguous or MXFP8/RowGroupScale, G32 along Dc for both factors.
+    Weight key_up;
+    Weight value_up;
 };
+
+[[nodiscard]] KpoolSparseMlaProfile kpool_sparse_mla_profile(const KpoolMlaFactors& factors,
+                                                             std::int32_t query_heads);
 
 /**
  * Complete factorized attention. query is BF16 [Dq,Hq,T,B], out is BF16 [Dv,Hq,T,B].
@@ -354,8 +379,10 @@ struct KpoolMlaFactors {
  * BF16 storage uses BF16 QK/PV. FP8 storage uses FP8 QK with per-head G128 power-of-two
  * query quantization as internal approximation; each Q/K group's scales participate in the
  * dot product. PV decodes that same stored latent on chip to BF16 and uses BF16 P/V operands.
- * Both formats accumulate in FP32. Factors remain BF16/F32; softmax statistics, exponentials
- * and split merges are FP32.
+ * Both formats accumulate in FP32. Factor contractions permit BF16 operand arithmetic with
+ * FP32 accumulation; encoded factors do not permit quantizing their inputs. U_K scale groups
+ * remain along Dc when its contraction transposes the matrix. Softmax statistics,
+ * exponentials and split merges are FP32.
  * q_latent/u are private intermediates, may retain FP32, and impose no additional observable
  * BF16 seam or global materialization. Final O projection is outside this Op. Inputs/results
  * participating in the mathematics are finite; all inputs/cache/selection are preserved.

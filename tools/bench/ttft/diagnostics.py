@@ -11,10 +11,10 @@ from typing import Any, Sequence
 from tools.bench.serve_log import startup_resource_observation
 
 
-REQUEST_LOG_SCHEMA_VERSION = 31
+REQUEST_LOG_SCHEMA_VERSION = 32
 
 SCHEDULING_FIELDS = (
-    "preemptions", "snapshot_restores", "replay_restores", "replayed_tokens",
+    "preemptions", "snapshot_restores", "direct_restores", "replay_restores", "replayed_tokens",
     "paused_ns", "device_to_host_bytes", "host_to_device_bytes",
 )
 MECHANISM_COUNTERS = {
@@ -68,7 +68,7 @@ def request_timing_analysis(request: dict[str, Any]) -> dict[str, Any]:
         **{f"prepare_{field}_ms": None for field in
            ("frontend", "acquisition", "media_preprocess", "media_preprocess_work", "tokenize")},
         **{f"{field}_before_first": None for field in
-           ("preemptions", "snapshot_restores", "replay_restores", "replayed_tokens")},
+           ("preemptions", "snapshot_restores", "direct_restores", "replay_restores", "replayed_tokens")},
     }
 
     def seconds(value: Any) -> float | None:
@@ -161,7 +161,7 @@ def request_timing_analysis(request: dict[str, Any]) -> dict[str, Any]:
         row[f"prepare_{field}_ms"] = milliseconds(read_seconds(
             preparation, "total" if field == "frontend" else field,
         ))
-    for field in ("preemptions", "snapshot_restores", "replay_restores", "replayed_tokens"):
+    for field in ("preemptions", "snapshot_restores", "direct_restores", "replay_restores", "replayed_tokens"):
         value = scheduling.get(field) if isinstance(scheduling, dict) else None
         row[f"{field}_before_first"] = value if type(value) is int and value >= 0 else None
     return row
@@ -290,7 +290,7 @@ def _runtime_interval_observations(events: Sequence[dict[str, Any]]) -> dict[str
         "shutdown_tail": tail_status,
         "transfers": transfers, "host_work": host_work, "occupancy": occupancy,
         "scheduling": {field: total("scheduling", field) for field in
-                       ("preemptions", "snapshot_restores", "replay_restores", "replayed_tokens")},
+                       ("preemptions", "snapshot_restores", "direct_restores", "replay_restores", "replayed_tokens")},
     }
 
 

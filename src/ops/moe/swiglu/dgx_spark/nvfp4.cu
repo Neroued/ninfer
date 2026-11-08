@@ -86,7 +86,7 @@ void launch_nvfp4_down(const float* product, const Weight& w, Tensor& out, int t
         const auto launch = [&]<int Tokens>() {
             down_vector<Tokens><<<4096 / 4, 128, 0, stream>>>(
                 product, static_cast<const std::uint8_t*>(w.qdata),
-                static_cast<const std::uint8_t*>(w.scales), 1.0f / w.weight_scale_divisor,
+                static_cast<const std::uint8_t*>(w.scales), 1.0f / w.weight_scale,
                 static_cast<__nv_bfloat16*>(out.data));
         };
         switch (tokens) {
@@ -104,14 +104,11 @@ void launch_nvfp4_down(const float* product, const Weight& w, Tensor& out, int t
     const auto scratch = allocate_nvfp4_a4_workspace(ws, tokens, 6144);
     const auto route   = select_down(tokens);
     if (route.scales == Nvfp4ScaleLayout::RowMajor)
-        quantize<Nvfp4ScaleLayout::RowMajor>(product, w.input_scale_divisor, scratch, tokens,
-                                             stream);
+        quantize<Nvfp4ScaleLayout::RowMajor>(product, w.input_scale, scratch, tokens, stream);
     else if (route.scales == Nvfp4ScaleLayout::Tiled128)
-        quantize<Nvfp4ScaleLayout::Tiled128>(product, w.input_scale_divisor, scratch, tokens,
-                                             stream);
+        quantize<Nvfp4ScaleLayout::Tiled128>(product, w.input_scale, scratch, tokens, stream);
     else
-        quantize<Nvfp4ScaleLayout::Tiled256>(product, w.input_scale_divisor, scratch, tokens,
-                                             stream);
+        quantize<Nvfp4ScaleLayout::Tiled256>(product, w.input_scale, scratch, tokens, stream);
     route.launch(w, out, scratch, tokens, stream);
 }
 
@@ -121,7 +118,7 @@ void launch_nvfp4_quantized_ffn(const Tensor& x, const SwiGLUWeights& weights, T
     const auto scratch = allocate_nvfp4_a4_workspace(ws, x.ne[1], 6144);
     const auto route   = select_down(x.ne[1]);
     launch_nvfp4_gu_quantized(x, weights.gate_up.weight, scratch, route.scales,
-                              weights.down.weight.input_scale_divisor, limit, ws, stream);
+                              weights.down.weight.input_scale, limit, ws, stream);
     route.launch(weights.down.weight, out, scratch, x.ne[1], stream);
 }
 } // namespace ninfer::ops::detail::swiglu_ffn

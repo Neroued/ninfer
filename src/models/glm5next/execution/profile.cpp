@@ -3,6 +3,59 @@
 #include <algorithm>
 
 namespace ninfer::models::glm5next::execution {
+
+MlaProjectionInputs mla_projection_inputs(std::span<const BoundWeight> weights, const MlaWeights& w,
+                                          ops::KpoolMlaPrepareProjection projection) {
+    MlaProjectionInputs out;
+    const std::array ids{w.latent, w.index_key, w.pool_gate, w.query_a, w.index_weight};
+    const std::array rows{&out.rows.latent, &out.rows.index_key, &out.rows.pool_gate,
+                          &out.rows.query, &out.rows.coefficients};
+    const std::size_t count = projection == ops::KpoolMlaPrepareProjection::History           ? 3
+                              : projection == ops::KpoolMlaPrepareProjection::QueryAndHistory ? 4
+                                                                                              : 5;
+
+    struct Role {
+        WeightId id;
+        WeightRegion region;
+        ops::KpoolProjectionRows* rows;
+        std::size_t parent;
+    };
+
+    std::vector<Role> roles;
+    std::vector<const WeightParent*> parents;
+    for (std::size_t i = 0; i < count; ++i) {
+        const auto input  = weight_input(weights, ids[i]);
+        const auto region = contiguous_weight_region(input.weight);
+        auto found        = std::find(parents.begin(), parents.end(), region.parent);
+        if (found == parents.end()) {
+            parents.push_back(region.parent);
+            found = std::prev(parents.end());
+        }
+        roles.push_back({ids[i], region, rows[i], std::size_t(found - parents.begin())});
+    }
+    std::sort(roles.begin(), roles.end(), [](const Role& a, const Role& b) {
+        return a.parent != b.parent ? a.parent < b.parent : a.region.begin < b.region.begin;
+    });
+    const WeightParent* parent = nullptr;
+    std::uint64_t end = 0, row = 0;
+    int group = -1;
+    for (const auto& role : roles) {
+        if (role.region.parent != parent || role.region.begin != end) {
+            ++group;
+            row = 0;
+        }
+        const auto input   = weight_input(weights, role.id);
+        const auto n       = dimension(input.weight.shape.at(0));
+        const auto row_end = dimension(row + n);
+        *role.rows         = {group, row_end - n, n};
+        row                = row_end;
+        parent             = role.region.parent;
+        end                = role.region.end;
+        out.weights.push_back(input);
+    }
+    return out;
+}
+
 namespace {
 class Describe {
 public:
@@ -14,6 +67,12 @@ public:
         std::vector<ops::WeightInput> inputs;
         for (const auto id : ids) inputs.push_back(weight_input(weights_, id));
         return ops::describe_linear_weight(inputs);
+    }
+
+    ops::ProjectionProfile projection(std::initializer_list<WeightId> ids) const {
+        std::vector<ops::WeightInput> inputs;
+        for (const auto id : ids) inputs.push_back(weight_input(weights_, id));
+        return ops::describe_projection_weights(inputs);
     }
 
     KdaProfile kda(const KdaWeights& w) const {
@@ -30,24 +89,26 @@ public:
         const auto& m = c.mla;
         MlaProfile out;
         for (std::size_t i = 0; i < out.prepare.size(); ++i) {
-            const auto kind = static_cast<ops::KpoolMlaPrepareProjection>(i);
-            out.prepare[i]  = {
-                kind,
-                dimension(c.hidden),
-                dimension(m.latent_dim),
-                dimension(m.index_dim),
-                kind == ops::KpoolMlaPrepareProjection::History ? 0 : dimension(m.query_lowrank),
-                kind == ops::KpoolMlaPrepareProjection::Full ? dimension(m.index_heads) : 0,
-                dimension(m.pool_size)};
+            const auto kind   = static_cast<ops::KpoolMlaPrepareProjection>(i);
+            const auto inputs = mla_projection_inputs(weights_, w, kind);
+            out.prepare[i] = {kind, ops::describe_projection_weights(inputs.weights), inputs.rows,
+                              dimension(m.pool_size)};
         }
-        out.query_index = linear({w.query_b, w.index_query});
+        out.query_index = projection({w.query_b, w.index_query});
         out.query       = linear({w.query_b});
         out.output      = linear({w.output});
         out.query_rows  = {dimension(m.query_width()), dimension(m.index_query_width())};
         out.indexer     = {dimension(m.index_heads), dimension(m.index_dim), dimension(m.pool_size),
                            dimension(m.pool_budget)};
-        out.attention   = {dimension(m.heads),      dimension(m.query_dim), dimension(m.value_dim),
-                           dimension(m.latent_dim), dimension(m.pool_size), dimension(m.pool_budget)};
+        out.attention   = {
+            dimension(m.heads),
+            dimension(m.query_dim),
+            dimension(m.value_dim),
+            dimension(m.latent_dim),
+            dimension(m.pool_size),
+            dimension(m.pool_budget),
+            contiguous_weight_region(weights_[w.key_up.index].view).parent->geometry.format,
+            contiguous_weight_region(weights_[w.value_up.index].view).parent->geometry.format};
         return out;
     }
 
@@ -76,8 +137,6 @@ public:
                  routed,
                  dense(w.shared, c.swiglu_limit).math},
                 w.bank,
-                {gate_up.activation_divisor(bank.gate_up.format),
-                 down.activation_divisor(bank.down.format)},
                 bank.subset};
     }
 

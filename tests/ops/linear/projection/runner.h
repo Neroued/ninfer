@@ -57,6 +57,8 @@ struct ShapeCase {
     bool verify_each_invocation              = false;
     // Bind a native BF16 prefix view into a larger parent with a poisoned unused suffix.
     std::int32_t parent_rows = 0;
+    // Exercise borrowing scratch from a caller arena that already owns live bytes.
+    std::size_t workspace_prefix = 0;
 };
 
 void cpu_linear_gemm_fp64(const float* weight, const float* activation, double* output,
@@ -78,5 +80,6 @@ void add_q8_cases(Suite& suite);
 void add_fp8_cases(Suite& suite);
 void add_nvfp4_cases(Suite& suite);
 void add_bank_cases(Suite& suite);
+void add_native_cases(Suite& suite);
 
 } // namespace ninfer::test::linear

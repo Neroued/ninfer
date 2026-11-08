@@ -83,7 +83,8 @@ std::vector<int> columns_to_check(const Invocation& call) {
 
 int verify_output(const Profile& profile, const Invocation& call,
                   const std::vector<std::unique_ptr<DevicePackedWeight>>& parents,
-                  const Outputs& outputs, const std::vector<float>& input) {
+                  const Outputs& outputs, const std::vector<float>& input,
+                  std::span<const float> bias) {
     int failures = outputs.verify_guards(call.id);
     std::vector<std::vector<std::uint16_t>> values;
     for (const auto& output : outputs.views) {
@@ -129,6 +130,7 @@ int verify_output(const Profile& profile, const Invocation& call,
                         double sum      = 0;
                         for (int k = 0; k < profile.k; ++k)
                             sum += weight[k] * double(input[std::size_t(token) * profile.k + k]);
+                        if (!bias.empty()) sum += bias[region.first + rows[r]];
                         expected[r * columns.size() + c] = sum;
                         actual[r * columns.size() + c] =
                             bf16_to_f32(values[output_index]
@@ -147,7 +149,8 @@ ops::ProjectionWeights prepare(const Profile& profile, const Invocation& call,
                                const std::vector<std::unique_ptr<DevicePackedWeight>>& weights) {
     if (profile.binding == Binding::Direct) {
         if (weights.size() == 2)
-            return ops::PairedProjectionWeights{weights[0]->view(), weights[1]->view()};
+            return ops::PairedProjectionWeights{{weights[0]->view(), call.policy},
+                                                {weights[1]->view(), call.policy}};
         return ops::SingleProjectionWeight{weights[0]->view(), call.policy};
     }
     std::vector<WeightParent> parents;
@@ -156,7 +159,7 @@ ops::ProjectionWeights prepare(const Profile& profile, const Invocation& call,
         const auto weight = source->view();
         const std::array shape{std::uint64_t(weight.n), std::uint64_t(weight.k)};
         const auto divisors = weight.qtype == QType::NVFP4
-                                  ? std::span(&source->host.weight.weight_scale_divisor, 1)
+                                  ? std::span(&source->host.weight.weight_scale, 1)
                                   : std::span<const float>{};
         parents.push_back({weight_geometry(weight.qtype, weight.layout, shape), weight.device,
                            static_cast<const std::byte*>(weight.payload), divisors});
@@ -178,14 +181,18 @@ ops::ProjectionWeights prepare(const Profile& profile, const Invocation& call,
     for (std::size_t i = 0; i < views.size(); ++i) {
         std::optional<float> divisor;
         if (profile.binding == Binding::Nvfp4Inputs && !call.omit_divisors)
-            divisor = weights[0]->view().input_scale_divisor +
+            divisor = weights[0]->view().input_scale +
                       (call.policy == ops::LinearPolicy::AllowA4 ? 0.0F : float(i));
-        inputs.push_back({views[i], call.policy, divisor});
+        inputs.push_back({views[i], call.policy,
+                          divisor ? ops::ActivationCalibrationView::broadcast(
+                                        ops::ActivationScaleOperation::Divide, *divisor)
+                                  : ops::ActivationCalibrationView{}});
     }
     if (profile.binding == Binding::Nvfp4Inputs && call.policy == ops::LinearPolicy::AllowA8) {
         auto mixed = inputs;
         for (std::size_t i = 0; i < mixed.size(); ++i)
-            mixed[i].activation_input_divisor = weights[0]->view().input_scale_divisor + float(i);
+            mixed[i].calibration = ops::ActivationCalibrationView::broadcast(
+                ops::ActivationScaleOperation::Divide, weights[0]->view().input_scale + float(i));
         mixed[0].policy = ops::LinearPolicy::AllowA4;
         if (std::get<ops::SingleProjectionWeight>(ops::prepare_projection_weights(mixed)).policy !=
             call.policy)
@@ -193,6 +200,39 @@ ops::ProjectionWeights prepare(const Profile& profile, const Invocation& call,
     }
     if (profile.binding == Binding::LinearInputs) return ops::prepare_linear_weight(inputs);
     return ops::prepare_projection_weights(inputs);
+}
+
+int verify_preparation_policies() {
+    using Policy             = ops::LinearPolicy;
+    const auto mx_geometry   = weight_geometry(QType::MXFP8, QuantLayout::RowGroupScale,
+                                               std::array<std::uint64_t, 2>{32, 128});
+    const auto bf16_geometry = weight_geometry(QType::BF16, QuantLayout::Contiguous,
+                                               std::array<std::uint64_t, 2>{16, 128});
+    std::vector<std::byte> mx_storage(mx_geometry.bytes), bf16_storage(bf16_geometry.bytes);
+    const WeightParent mx{mx_geometry, Device::cpu(), mx_storage.data()};
+    const WeightParent bf16{bf16_geometry, Device::cpu(), bf16_storage.data()};
+    const WeightView first{{16, 128}, {{&mx, 0, 16 * 128}}};
+    const WeightView second{{16, 128}, {{&mx, 16 * 128, 32 * 128}}};
+    const WeightView third{{16, 128}, {{&bf16, 0, 16 * 128}}};
+    std::array inputs{ops::WeightInput{first, Policy::AllowA8},
+                      ops::WeightInput{second, Policy::AllowA4},
+                      ops::WeightInput{third, Policy::A16Only}};
+    int failures     = 0;
+    const auto check = [&](std::span<const ops::WeightInput> bank,
+                           const ops::ProjectionProfile& expected) {
+        if (ops::describe_projection_weights(bank) != expected ||
+            ops::projection_profile(ops::prepare_projection_weights(bank)) != expected) {
+            std::cerr << "projection preparation lost the parent activation permission\n";
+            ++failures;
+        }
+    };
+    check(inputs,
+          {{QType::MXFP8, 32, 128, Policy::AllowA8, QuantLayout::RowGroupScale},
+           ops::LinearProfile{QType::BF16, 16, 128, Policy::A16Only, QuantLayout::Contiguous}});
+    inputs[1].policy = Policy::A16Only;
+    check(std::span(inputs).first(2),
+          {{QType::MXFP8, 32, 128, Policy::A16Only, QuantLayout::RowGroupScale}, {}});
+    return failures;
 }
 
 template <class F>
@@ -260,21 +300,38 @@ int run(const Profile& profile, std::span<const Invocation> calls) {
         weights.push_back(std::make_unique<DevicePackedWeight>(std::move(packed)));
     }
     DeviceContext context;
+    std::vector<float> bias_values;
+    std::vector<std::uint16_t> bias_bits;
+    std::optional<GuardedDeviceBuffer> bias_storage;
+    Tensor bias;
+    if (profile.bias) {
+        const int rows = weights[0]->view().n;
+        bias_values    = input_projection::make_bf16_activation(rows, 1, 419U);
+        bias_bits      = input_projection::bf16_bits(bias_values);
+        bias_storage.emplace(bias_bits.size() * sizeof(std::uint16_t));
+        bias_storage->copy_from_host(bias_bits.data(), bias_bits.size() * sizeof(std::uint16_t));
+        bias = Tensor(bias_storage->span(), DType::BF16, {rows});
+    }
     int failures = 0;
     for (const auto& call : calls) {
         if (call.validate_operands) {
             failures += validate(profile, weights[0]->view(), context.execution_view());
             continue;
         }
-        const auto prepared = prepare(profile, call, weights);
+        const auto prepared           = prepare(profile, call, weights);
+        const auto workspace_capacity = [&](int first, int last) {
+            return profile.bias ? ops::linear_split_bias_workspace_capacity_bytes(
+                                      profile.weights[0].type, profile.weights[0].rows, profile.k,
+                                      profile.outputs, call.policy, first, last)
+                                : ops::linear_split_workspace_capacity_bytes(
+                                      prepared, profile.outputs, first, last);
+        };
         if (call.workspace_intervals) {
-            for (auto [first, last] : {std::pair{1, 48}, std::pair{1, 128}, std::pair{1, 1024}}) {
-                const auto capacity = ops::linear_split_workspace_capacity_bytes(
-                    prepared, profile.outputs, first, last);
+            for (auto [first, last] : {std::pair{1, 48}, std::pair{1, 128}, std::pair{33, 129},
+                                       std::pair{513, 1025}, std::pair{1, 4097}}) {
+                const auto capacity = workspace_capacity(first, last);
                 for (int t = first; t <= last; ++t)
-                    if (ops::linear_split_workspace_capacity_bytes(prepared, profile.outputs, t,
-                                                                   t) > capacity)
-                        ++failures;
+                    if (workspace_capacity(t, t) > capacity) ++failures;
             }
             continue;
         }
@@ -284,12 +341,18 @@ int run(const Profile& profile, std::span<const Invocation> calls) {
         auto input = to_device(bits);
         Tensor x(input.span(), DType::BF16, {profile.k, call.t});
         Outputs output(profile, call.t, call.shared_output);
-        const auto capacity =
-            ops::linear_split_workspace_capacity_bytes(prepared, profile.outputs, call.t, call.t);
+        const auto capacity = workspace_capacity(call.t, call.t);
         GuardedDeviceBuffer scratch(capacity);
         MemoryArena workspace(scratch.span());
         const auto launch = [&] {
-            if (call.convenience)
+            if (profile.bias) {
+                if (call.convenience)
+                    ops::linear_split(x, weights[0]->view(), bias, output.views,
+                                      context.execution_view());
+                else
+                    ops::linear_split(x, weights[0]->view(), bias, output.views, call.policy,
+                                      workspace, context.execution_view());
+            } else if (call.convenience)
                 ops::linear_split(x, weights[0]->view(), output.views, context.execution_view());
             else
                 ops::linear_split(x, prepared, output.views, workspace, context.execution_view());
@@ -323,7 +386,7 @@ int run(const Profile& profile, std::span<const Invocation> calls) {
             else
                 launch();
             context.synchronize();
-            failures += verify_output(profile, call, weights, output, activation);
+            failures += verify_output(profile, call, weights, output, activation, bias_values);
             failures += input_projection::verify_preserved(call.id, input, bits);
             failures += scratch.verify_guards(call.id);
             if (workspace.used() != 0 || workspace.peak_used() > capacity) {
@@ -333,9 +396,22 @@ int run(const Profile& profile, std::span<const Invocation> calls) {
         }
     }
     for (const auto& weight : weights) failures += weight->verify_preserved("split weight");
+    if (bias_storage) {
+        failures += bias_storage->verify_guards("split bias");
+        failures += verify_exact("split bias preserved",
+                                 from_device<std::uint16_t>(bias_storage->data(), bias_bits.size()),
+                                 bias_bits);
+    }
     return failures;
 }
 } // namespace
+
+void add_preparation_cases(Suite& suite) {
+    suite.add(linear_suite::make_case("mxfp8_bf16", 48, 128, 0, ops::LinearPolicy::AllowA8,
+                                      linear_suite::Execution::Eager,
+                                      "independent-parent-permissions"),
+              verify_preparation_policies);
+}
 
 void add_profile(Suite& suite, const Profile& profile, std::vector<Invocation> calls) {
     std::string format, recipe;
@@ -346,6 +422,7 @@ void add_profile(Suite& suite, const Profile& profile, std::vector<Invocation> c
         recipe += "s" + std::to_string(weight.seed) + "/";
         n += weight.rows;
     }
+    if (profile.bias) recipe += "bias/";
     recipe += "segments";
     for (int rows : profile.outputs) recipe += "-" + std::to_string(rows);
     std::vector<linear_suite::Case> cases;

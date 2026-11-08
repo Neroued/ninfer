@@ -1,6 +1,7 @@
 #include "artifact/materializer.h"
 
 #include "artifact/framing.h"
+#include "artifact/csf_selection.h"
 #include "artifact/reader.h"
 #include "core/buffer.h"
 #include "core/cpu/system.h"
@@ -127,14 +128,14 @@ struct TransferCompletion {
 };
 
 struct CopyRange {
-    std::size_t file             = 0;
-    std::uint64_t begin          = 0;
-    std::uint64_t end            = 0;
-    std::byte* host              = nullptr;
-    std::byte* device            = nullptr;
-    std::uint64_t object_offset  = 0;
-    std::uint64_t divisor_offset = 0;
-    std::span<std::byte> divisors;
+    std::size_t file                  = 0;
+    std::uint64_t begin               = 0;
+    std::uint64_t end                 = 0;
+    std::byte* host                   = nullptr;
+    std::byte* device                 = nullptr;
+    std::uint64_t object_offset       = 0;
+    std::uint64_t matrix_scale_offset = 0;
+    std::span<std::byte> matrix_scales;
     std::uint64_t pattern_offset = 0, row_bytes = 0, rows = 1;
     std::uint64_t source_stride = 0, destination_stride = 0;
 };
@@ -212,12 +213,12 @@ std::vector<ReadSpan> plan_reads(std::span<const CopyRange> ranges,
     return reads;
 }
 
-void validate_divisors(std::span<float> values, const std::string& name) {
+void validate_matrix_scales(std::span<float> values, const std::string& name) {
     for (std::size_t i = 0; i < values.size(); ++i) {
         const auto* word = reinterpret_cast<const std::byte*>(values.data() + i);
         values[i]        = std::bit_cast<float>(read_u32_le(word));
         if (!std::isfinite(values[i]) || values[i] <= 0) {
-            throw ArtifactError(name + ": invalid weight divisor");
+            throw ArtifactError(name + ": invalid weight matrix scale");
         }
     }
 }
@@ -307,9 +308,12 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
     for (const auto* placements :
          {&plan.device_objects, &plan.ordinary_host_objects, &plan.registered_host_objects}) {
         for (const auto& placement : *placements) {
-            for (const auto& copy : plan.tensors.at(placement.storage.index).copies)
+            const auto& tensor = plan.tensors.at(placement.storage.index);
+            for (const auto& copy : tensor.copies)
                 total = checked_add(total, checked_mul(copy.bytes, copy.count, "copy payload"),
                                     "materialized payload bytes");
+            if (!tensor.csf_slices.empty())
+                total = checked_add(total, csf_repack_bytes(tensor.geometry), "CSF payload bytes");
         }
     }
     StartupPhaseScope phase(observer, StartupPhase::WeightsMaterialize, StartupProgressUnit::Bytes,
@@ -317,9 +321,10 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
     MaterializedArtifact out;
     out.resources_.resize(plan.object_count);
     out.tensors_.resize(plan.tensors.size());
-    out.object_storage_              = plan.objects;
-    out.stats_.file_bytes            = reader.file_bytes();
-    out.stats_.read_bytes            = plan.resources.read_bytes;
+    out.object_storage_   = plan.objects;
+    out.stats_.file_bytes = reader.file_bytes();
+    out.stats_.read_bytes = checked_add(plan.resources.read_bytes, plan.preparation_read_bytes,
+                                        "prepared payload reads");
     out.stats_.owned_value_bytes     = plan.resources.owned_value_bytes;
     out.stats_.device_capacity_bytes = plan.device_capacity_bytes;
     out.stats_.host_capacity_bytes   = plan.host_capacity_bytes;
@@ -394,8 +399,8 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
     for (std::size_t i = 0; i < out.tensors_.size(); ++i) {
         auto& object       = out.tensors_[i];
         const auto& tensor = plan.tensors[i];
-        object.weight_divisors.resize(tensor.geometry.divisor_count);
-        const auto divisors = std::as_writable_bytes(std::span(object.weight_divisors));
+        object.matrix_scales.resize(tensor.geometry.matrix_scale_count);
+        const auto matrix_scales = std::as_writable_bytes(std::span(object.matrix_scales));
         for (const auto& copy : tensor.copies) {
             const auto& source = reader.directory().tensor(copy.object);
             if (!copy.count || !copy.bytes) throw ArtifactError("empty encoded copy");
@@ -415,7 +420,7 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
                 ranges.push_back(
                     {segment.file_index, segment.file_offset, segment.file_offset + segment.bytes,
                      address(object.host), address(object.device), copy.destination,
-                     tensor.geometry.divisor_offset, divisors, segment.destination_offset,
+                     tensor.geometry.matrix_scale_offset, matrix_scales, segment.destination_offset,
                      copy.bytes, copy.count, copy.source_stride, copy.destination_stride});
             }
         }
@@ -516,17 +521,18 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
                     const auto offset = row * range.destination_stride + first - row_begin;
                     const auto* bytes = destination + begin - source + first - first_byte;
                     const auto width  = last - first;
-                    if (!range.divisors.empty()) {
+                    if (!range.matrix_scales.empty()) {
                         for (std::uint64_t n = 0; n < count; ++n) {
                             const auto object_begin =
                                 range.object_offset + offset + n * range.destination_stride;
-                            const auto a = std::max(object_begin, range.divisor_offset);
-                            const auto b = std::min(object_begin + width,
-                                                    range.divisor_offset + range.divisors.size());
+                            const auto a = std::max(object_begin, range.matrix_scale_offset);
+                            const auto b =
+                                std::min(object_begin + width,
+                                         range.matrix_scale_offset + range.matrix_scales.size());
                             if (a < b)
-                                std::memcpy(range.divisors.data() + a - range.divisor_offset,
-                                            bytes + n * range.source_stride + a - object_begin,
-                                            b - a);
+                                std::memcpy(
+                                    range.matrix_scales.data() + a - range.matrix_scale_offset,
+                                    bytes + n * range.source_stride + a - object_begin, b - a);
                         }
                     }
                     if (range.host) {
@@ -559,14 +565,54 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
             phase.progress(copied, total);
         }
     }
+    const auto metadata_read_begin = reader.payload_read_bytes();
+    for (std::size_t i = 0; i < plan.tensors.size(); ++i) {
+        const auto& tensor = plan.tensors[i];
+        if (tensor.csf_slices.empty()) continue;
+        const auto& object = out.tensors_[i];
+        if (!object.host && !object.device) continue;
+        out.stats_.peak_staging_bytes = std::max(
+            out.stats_.peak_staging_bytes,
+            checked_add(checked_mul(Slot::allocation_bytes(slot_bytes, slot_alignment, cuda),
+                                    slot_count, "weight staging"),
+                        kCsfRepackScratchBytes, "CSF staging"));
+        repack_csf_scales(
+            reader, tensor, [&](std::uint64_t offset, std::span<const std::byte> bytes) {
+                if (offset > tensor.geometry.bytes || bytes.size() > tensor.geometry.bytes - offset)
+                    throw ArtifactError("CSF repack exceeds destination backing");
+                if (object.host) {
+                    std::memcpy(const_cast<std::byte*>(object.host->data) + offset, bytes.data(),
+                                bytes.size());
+                    copied += bytes.size();
+                }
+                if (object.device) {
+                    for (std::size_t begin = 0; begin < bytes.size();) {
+                        auto& slot = *slots[next_slot++ % slot_count];
+                        slot.wait();
+                        const auto count = std::min(slot_bytes, bytes.size() - begin);
+                        std::memcpy(slot.data(), bytes.data() + begin, count);
+                        check_cuda(cudaMemcpyAsync(
+                                       const_cast<std::byte*>(object.device->data) + offset + begin,
+                                       slot.data(), count, cudaMemcpyHostToDevice, stream),
+                                   "upload compressed CSF scales");
+                        slot.record(stream);
+                        copied += count;
+                        uploaded_bytes += count;
+                        begin += count;
+                    }
+                }
+                phase.progress(copied, total);
+            });
+    }
+    out.stats_.read_bytes += reader.payload_read_bytes() - metadata_read_begin;
     if (cuda) { completion.finish(); }
     if (copied != total) { throw ArtifactError("incomplete tensor materialization"); }
     for (std::size_t i = 0; i < out.tensors_.size(); ++i) {
         auto& object = out.tensors_[i];
         if (!object.host && !object.device) { continue; }
-        validate_divisors(object.weight_divisors, "materialized tensor " + std::to_string(i));
-        if (object.host) { object.host->weight_divisors = object.weight_divisors; }
-        if (object.device) { object.device->weight_divisors = object.weight_divisors; }
+        validate_matrix_scales(object.matrix_scales, "materialized tensor " + std::to_string(i));
+        if (object.host) { object.host->matrix_scales = object.matrix_scales; }
+        if (object.device) { object.device->matrix_scales = object.matrix_scales; }
     }
     out.stats_.h2d_bytes = uploaded_bytes;
     out.stats_.upload_seconds =

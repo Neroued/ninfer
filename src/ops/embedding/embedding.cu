@@ -191,10 +191,27 @@ void launch_bf16_d2560(const Tensor& ids, const Weight& table, Tensor& out, cuda
         static_cast<const std::int32_t*>(ids.data), static_cast<const uint4*>(table.qdata),
         static_cast<uint4*>(out.data));
 }
+
+void launch_bf16_d4096(const Tensor& ids, const Weight& table, Tensor& out, cudaStream_t stream) {
+    constexpr int Blocks = 2, Threads = 128;
+    constexpr auto MaxRows = std::numeric_limits<int>::max() / Blocks;
+    for (std::int64_t row = 0; row < ids.ne[0]; row += MaxRows) {
+        const auto count = static_cast<unsigned>(std::min<std::int64_t>(MaxRows, ids.ne[0] - row));
+        kernels::embed_gather_bf16_d4096_kernel<Blocks, Threads>
+            <<<count * Blocks, Threads, 0, stream>>>(
+                static_cast<const std::int32_t*>(ids.data) + row,
+                static_cast<const uint4*>(table.qdata),
+                static_cast<uint4*>(out.data) + row * (4096 / 8));
+        CUDA_CHECK(cudaGetLastError());
+    }
+}
 #endif
 
 EmbeddingLaunch select_bf16(const Weight& table, const Tensor& out) {
 #if NINFER_TARGET_SPARK
+    if (out.ne[0] == 4096 && common::operand::aligned(table.qdata, 16) &&
+        common::operand::aligned(out.data, 16))
+        return launch_bf16_d4096;
     if (out.ne[0] == 2560 && common::operand::aligned(table.qdata, 16) &&
         common::operand::aligned(out.data, 16))
         return launch_bf16_d2560;

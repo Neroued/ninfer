@@ -1,6 +1,7 @@
 #include "artifact/binder.h"
 #include "artifact/fixture.h"
 #include "artifact/formats.h"
+#include "models/common/bindings.h"
 #include "models/qwen3_5/load.h"
 
 #include <algorithm>
@@ -28,7 +29,7 @@ struct ModelFixture {
         const auto offset   = (file.payload.size() + 255) / 256 * 256;
         file.payload.resize(offset + geometry.bytes);
         if (format == QType::NVFP4) {
-            put_word(file.payload, offset + geometry.divisor_offset, 0x3f800000, 4);
+            put_word(file.payload, offset + geometry.matrix_scale_offset, 0x3f800000, 4);
         }
         file.root["objects"].push_back({{"id", id},
                                         {"kind", "tensor"},
@@ -196,8 +197,8 @@ void logical_data_and_instances() {
     require(query.binding.parts[0].object == gate.binding.parts[0].object &&
                 query.binding.parts[0].begin == 0 && gate.binding.parts[0].begin == 24 * 128,
             "Q/gate logical row correspondence changed");
-    require(plan->uses(attention.query)[0].activation_input_divisor == 2.0F &&
-                plan->uses(attention.gate)[0].activation_input_divisor == 3.0F,
+    require(plan->uses(attention.query)[0].calibration_view().scalar_divisor() == 2.0F &&
+                plan->uses(attention.gate)[0].calibration_view().scalar_divisor() == 3.0F,
             "shared-parent Uses contaminated one another");
     require(plan->parameter(plan->weights().text.token_embedding).binding.parts[0].object ==
                 plan->parameter(plan->weights().text.output_head).binding.parts[0].object,
@@ -247,6 +248,10 @@ void logical_data_and_instances() {
             "cross-layer sharing duplicated parent storage");
 }
 
+ops::ActivationCalibrationView calibration_divisor(float value) {
+    return ops::ActivationCalibrationView::broadcast(ops::ActivationScaleOperation::Divide, value);
+}
+
 void native_uses() {
     const std::array<std::uint64_t, 2> shape{128, 64};
     const auto geometry = weight_geometry(QType::NVFP4, QuantLayout::BlockScaleK16M128x4, shape);
@@ -255,11 +260,12 @@ void native_uses() {
     const WeightParent parent{geometry, Device::cpu(), bytes.data(), divisors};
     const WeightView gate{{64, 64}, {{&parent, 0, 4096}}};
     const WeightView up{{64, 64}, {{&parent, 4096, 8192}}};
-    const auto joined = ops::prepare_linear_swiglu_weight({gate, ops::LinearPolicy::AllowA4, 2.0F},
-                                                          {up, ops::LinearPolicy::AllowA8, 2.0F});
+    const auto joined = ops::prepare_linear_swiglu_weight(
+        {gate, ops::LinearPolicy::AllowA4, calibration_divisor(2.0F)},
+        {up, ops::LinearPolicy::AllowA8, calibration_divisor(2.0F)});
     require(joined.policy == ops::LinearPolicy::AllowA8 && joined.weight.payload == bytes.data() &&
-                joined.weight.n == 128 && joined.weight.weight_scale_divisor == 8.0F &&
-                joined.weight.input_scale_divisor == 2.0F,
+                joined.weight.n == 128 && joined.weight.weight_scale == 8.0F &&
+                joined.weight.input_scale == 2.0F,
             "shared quantization did not intersect Uses or preserve the complete parent");
     const WeightView full{{128, 64}, {{&parent, 0, 8192}}};
     for (const auto policy : {ops::LinearPolicy::A16Only, ops::LinearPolicy::AllowA8}) {
@@ -267,45 +273,94 @@ void native_uses() {
         require(no_aux.policy == policy && no_aux.weight.payload == bytes.data(),
                 "non-A4 NVFP4 use required an unused activation divisor");
         const auto mixed = ops::prepare_linear_swiglu_weight(
-            {gate, ops::LinearPolicy::AllowA4, 2.0F}, {up, policy});
+            {gate, ops::LinearPolicy::AllowA4, calibration_divisor(2.0F)}, {up, policy});
         require(mixed.policy == policy, "combined use required an unused child auxiliary");
         rejects<std::invalid_argument>(
-            [&] { (void)ops::prepare_linear_weight({full, policy, 0.0F}); },
+            [&] { (void)ops::prepare_linear_weight({full, policy, calibration_divisor(0.0F)}); },
             "present activation divisor was accepted without value validation");
     }
     rejects<std::invalid_argument>(
         [&] { (void)ops::prepare_linear_weight({full, ops::LinearPolicy::AllowA4}); },
         "A4 NVFP4 use accepted a missing activation divisor");
-    const auto a16 = ops::prepare_linear_swiglu_weight({gate, ops::LinearPolicy::A16Only, 2.0F},
-                                                       {up, ops::LinearPolicy::AllowA4, 3.0F});
-    require(a16.policy == ops::LinearPolicy::A16Only && a16.weight.input_scale_divisor == 2.0F,
+    const auto a16 = ops::prepare_linear_swiglu_weight(
+        {gate, ops::LinearPolicy::A16Only, calibration_divisor(2.0F)},
+        {up, ops::LinearPolicy::AllowA4, calibration_divisor(3.0F)});
+    require(a16.policy == ops::LinearPolicy::A16Only && a16.weight.input_scale == 2.0F,
             "A16-only use intersection rejected independent unused activation divisors");
-    const auto second = ops::prepare_linear_weight({full, ops::LinearPolicy::A16Only, 3.0F});
-    const auto first  = ops::prepare_linear_weight({full, ops::LinearPolicy::AllowA4, 2.0F});
-    require(first.weight.input_scale_divisor == 2.0F && second.weight.input_scale_divisor == 3.0F &&
+    const auto second =
+        ops::prepare_linear_weight({full, ops::LinearPolicy::A16Only, calibration_divisor(3.0F)});
+    const auto first =
+        ops::prepare_linear_weight({full, ops::LinearPolicy::AllowA4, calibration_divisor(2.0F)});
+    require(first.weight.input_scale == 2.0F && second.weight.input_scale == 3.0F &&
                 first.policy == ops::LinearPolicy::AllowA4 &&
-                second.policy == ops::LinearPolicy::A16Only && parent.weight_divisors[0] == 8.0F,
+                second.policy == ops::LinearPolicy::A16Only && parent.matrix_scales[0] == 8.0F,
             "preparing one use modified another use or its shared parent");
     rejects<std::invalid_argument>(
         [&] {
-            (void)ops::prepare_linear_swiglu_weight({gate, ops::LinearPolicy::AllowA4, 2.0F},
-                                                    {up, ops::LinearPolicy::AllowA4, 3.0F});
+            (void)ops::prepare_linear_swiglu_weight(
+                {gate, ops::LinearPolicy::AllowA4, calibration_divisor(2.0F)},
+                {up, ops::LinearPolicy::AllowA4, calibration_divisor(3.0F)});
         },
         "one native activation silently used differing divisors");
     rejects<std::invalid_argument>(
         [&] {
-            (void)ops::prepare_linear_swiglu_weight({up, ops::LinearPolicy::A16Only, 2.0F},
-                                                    {gate, ops::LinearPolicy::A16Only, 2.0F});
+            (void)ops::prepare_linear_swiglu_weight(
+                {up, ops::LinearPolicy::A16Only, calibration_divisor(2.0F)},
+                {gate, ops::LinearPolicy::A16Only, calibration_divisor(2.0F)});
         },
         "reordered parent regions silently changed fused gate/up row order");
     const WeightView short_gate{{64, 64}, {{&parent, 0, 4032}}};
     const WeightView long_up{{64, 64}, {{&parent, 4032, 8192}}};
     rejects<std::invalid_argument>(
         [&] {
-            (void)ops::prepare_linear_swiglu_weight({short_gate, ops::LinearPolicy::A16Only, 2.0F},
-                                                    {long_up, ops::LinearPolicy::A16Only, 2.0F});
+            (void)ops::prepare_linear_swiglu_weight(
+                {short_gate, ops::LinearPolicy::A16Only, calibration_divisor(2.0F)},
+                {long_up, ops::LinearPolicy::A16Only, calibration_divisor(2.0F)});
         },
         "combined coverage hid an incorrect gate/up boundary");
+}
+
+void matrix_calibration() {
+    ModelFixture fixture;
+    fixture.tensor("bank", {2, 8, 8});
+    fixture.file.root["bindings"]["experts"] = {{"object", "bank"}};
+    const Json auxiliary{{"activation_input_multiplier", {{"object", "calibration"}}}};
+    fixture.file.root["uses"].push_back({{"parameter", "experts"},
+                                         {"input", "hidden"},
+                                         {"activation_policy", "AllowA4"},
+                                         {"auxiliaries", auxiliary}});
+    fixture.file.root["files"][0]["payload_bytes"] = fixture.file.payload.size();
+    const auto load                                = [&] {
+        fixture.file.write();
+        artifact::Reader reader(fixture.file.entry);
+        artifact::Binder binder(reader);
+        Bindings bindings(binder);
+        const auto id = bindings.parameter("experts", {2, 8, 8}, {"hidden"});
+        return bindings.at(id).uses.front();
+    };
+    auto use        = load();
+    const auto view = use.calibration_view();
+    auto retained   = use;
+    use             = {};
+    require(view.operation == ops::ActivationScaleOperation::Multiply &&
+                view.values().size() == 2 && view.values()[0] == 2 && view.values()[1] == 3 &&
+                retained.calibration_source && retained.calibration_source->elements == 2,
+            "matrix calibration words, ownership or source binding were lost");
+    fixture.file.root["uses"].back()["auxiliaries"]["activation_input_divisor"] = {
+        {"object", "calibration"}};
+    rejects(load, "calibration accepted conflicting multiplication and division");
+    fixture.file.root["uses"].back()["auxiliaries"] = auxiliary;
+    fixture.file.root["bindings"]["experts"]        = {
+        {"parts", Json::array({{{"object", "bank"}, {"range", {0, 64}}}})}};
+    fixture.file.write();
+    rejects(
+        [&] {
+            artifact::Reader reader(fixture.file.entry);
+            artifact::Binder binder(reader);
+            Bindings bindings(binder);
+            (void)bindings.parameter("experts", {8, 8}, {"hidden"});
+        },
+        "a single matrix accepted a matrix-bank calibration vector");
 }
 
 void invalid_model_data() {
@@ -339,7 +394,9 @@ void cold_matrix_profile() {
                                           std::array<std::uint64_t, 3>{2, 256, 128});
     const WeightParent parent{geometry};
     const WeightView matrix{{128, 128}, {{&parent, 256 * 128, 384 * 128}}};
-    const std::array inputs{ops::WeightInput{matrix, ops::LinearPolicy::AllowA4, 2.0F}};
+    const std::array inputs{ops::WeightInput{
+        matrix, ops::LinearPolicy::AllowA4,
+        ops::ActivationCalibrationView::broadcast(ops::ActivationScaleOperation::Divide, 2.0F)}};
     const auto profile = ops::describe_linear_weight(inputs);
     require(profile.qtype == QType::NVFP4 && profile.n == 128 && profile.k == 128 &&
                 profile.layout == QuantLayout::BlockScaleK16M128x4 &&
@@ -353,6 +410,7 @@ int main() {
     try {
         logical_data_and_instances();
         native_uses();
+        matrix_calibration();
         cold_matrix_profile();
         invalid_model_data();
         std::cout << "model config, binding, resources and Use checks passed\n";

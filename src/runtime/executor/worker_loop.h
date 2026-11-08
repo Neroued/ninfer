@@ -27,6 +27,7 @@ public:
         observation_.rank     = identity.rank;
         observation_.node     = identity.node;
         observation_.hardware = connection_.device().properties().name;
+        connection_.communication().set_active(false);
     }
 
     // False means orderly shutdown with every frame retired.
@@ -107,6 +108,10 @@ private:
         if (!commands_.empty()) apply();
         progress_measurement();
         sample_resources();
+        if (communication_active_ && !active()) {
+            connection_.communication().set_active(false);
+            communication_active_ = false;
+        }
         return true;
     }
 
@@ -220,6 +225,10 @@ private:
             in.finish();
             program_.validate_work(work, envelope.ticket.frame.kind);
             flight = {envelope, Phase::Running, 0, {envelope.command.value}};
+            if (!communication_active_) {
+                connection_.communication().set_active(true);
+                communication_active_ = true;
+            }
             observe_host_call(host_.submit_ns, [&] {
                 program_.start(
                     ExecutionRequest<Types>{envelope.ticket, envelope.command, std::move(work)});
@@ -322,6 +331,7 @@ private:
     Program& program_;
     Codec codec_;
     protocol::ControlBudget budget_;
+    bool communication_active_ = false;
     RankSnapshot observation_;
     RankHostStatistics host_;
     std::vector<Flight> compute_, context_;

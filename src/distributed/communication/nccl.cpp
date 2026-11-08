@@ -81,7 +81,20 @@ public:
 
     CommunicationBackend kind() const noexcept override { return CommunicationBackend::Nccl; }
 
-    BackendConnection prepare(const GroupRequirements& requirements) override {
+    BackendConnection prepare(const GroupRequirements&) override {
+        BackendConnection out{kind(), {}};
+        if (rank_ == 0) {
+            ncclUniqueId id;
+            check_nccl(ncclGetUniqueId(&id), "NCCL unique ID");
+            out.data.resize(sizeof(id));
+            std::memcpy(out.data.data(), &id, sizeof(id));
+        }
+        return out;
+    }
+
+    bool supports(const CollectiveCall&) const noexcept override { return true; }
+
+    void configure(const GroupRequirements& requirements) override {
         calls_                   = warmup_calls(requirements.collectives);
         peers_                   = requirements.peers;
         std::size_t source_bytes = 0, destination_bytes = 0;
@@ -111,22 +124,15 @@ public:
         if (destination_bytes)
             destination_ = layout.add(destination_bytes, 256, "NCCL warmup destination");
         warmup_bytes_ = layout.finish();
-        BackendConnection out{kind(), {}};
-        if (rank_ == 0) {
-            ncclUniqueId id;
-            check_nccl(ncclGetUniqueId(&id), "NCCL unique ID");
-            out.data.resize(sizeof(id));
-            std::memcpy(out.data.data(), &id, sizeof(id));
-        }
-        return out;
     }
 
     void connect(std::span<const CommunicationPreparation> peers,
                  std::chrono::steady_clock::time_point deadline) override {
         const bool used =
+            !calls_.empty() ||
             std::any_of(description_.members.begin(), description_.members.end(), [&](RankId rank) {
                 const auto& r = peer_group(peers, rank, description_.id).requirements;
-                return !r.collectives.empty() || !r.peers.empty();
+                return !r.peers.empty();
             });
         if (!used) return;
         const auto& root      = peer_group(peers, description_.members.front(), description_.id);

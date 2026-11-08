@@ -1,4 +1,9 @@
 #include "distributed/communication/implementation.h"
+#include "core/platform.h"
+
+#if NINFER_TARGET_SPARK
+#    include "distributed/communication/native/rdma.h"
+#endif
 
 #include <algorithm>
 #include <set>
@@ -77,6 +82,8 @@ void validate_communication_preparation(const ExecutionTopology& topology,
         if (p.rank >= ranks.size() || ranks[p.rank])
             throw std::invalid_argument("invalid or duplicate communication preparation rank");
         ranks[p.rank] = &p;
+        if (p.policy > CommunicationPolicy::Auto || p.policy != preparations.front().policy)
+            throw std::invalid_argument("communication policies differ across ranks");
         std::set<GroupId> seen;
         for (const auto& g : p.groups) {
             const auto& description = topology.group(g.requirements.group);
@@ -92,11 +99,14 @@ void validate_communication_preparation(const ExecutionTopology& topology,
             if (current.requirements.collectives != first.requirements.collectives)
                 throw std::invalid_argument("group " + std::to_string(group.id) +
                                             ": collective requirements differ across ranks");
-            if (current.connections.size() != first.connections.size())
-                throw std::invalid_argument("communication backend sets differ across ranks");
-            for (std::size_t i = 0; i < first.connections.size(); ++i)
-                if (current.connections[i].backend != first.connections[i].backend)
-                    throw std::invalid_argument("communication backends differ across ranks");
+            if (group.members.size() > 1 &&
+                preparations.front().policy == CommunicationPolicy::Native &&
+                !current.requirements.collectives.empty() &&
+                std::none_of(
+                    current.connections.begin(), current.connections.end(),
+                    [](const auto& c) { return c.backend == CommunicationBackend::Native; }))
+                throw std::invalid_argument("native communication is unavailable on rank " +
+                                            std::to_string(rank));
             for (const auto& peer : current.requirements.peers) {
                 const auto& remote =
                     prepared_group(*ranks.at(group.members.at(peer.peer)), group.id).requirements;
@@ -123,8 +133,7 @@ struct Group::Impl {
     void ready(CudaExecutionView execution) const {
         if (execution.device() != device)
             throw std::invalid_argument("communication execution device differs");
-        if (stop->load(std::memory_order_acquire))
-            throw std::runtime_error("communication context is stopped");
+        if (stop->load(std::memory_order_acquire)) owner->check();
         if (state != State::Ready) throw std::logic_error("communication group is not ready");
     }
 
@@ -138,7 +147,14 @@ struct Group::Impl {
         work->payload_bytes[kind] += bytes;
     }
 
+    Route& select(const CollectiveCall& call) {
+        for (auto& route : routes)
+            if (route.implementation->supports(call)) return route;
+        throw std::invalid_argument("no prepared communication backend supports this collective");
+    }
+
     GroupDescription description;
+    CommunicationContext* owner;
     std::uint32_t rank;
     Device device;
     std::shared_ptr<std::atomic<bool>> stop;
@@ -181,7 +197,7 @@ void Group::enqueue(const CollectiveCall& call, const void* source, void* destin
                                        cudaMemcpyDeviceToDevice, execution.stream()));
         return;
     }
-    auto& route = p.routes.front();
+    auto& route = p.select(call);
     route.implementation->enqueue(call, source, destination, execution);
     p.observe(route, static_cast<std::size_t>(call.operation), call.count * dtype_size(call.dtype));
 }
@@ -200,7 +216,11 @@ void Group::exchange(std::span<const PeerTransfer> transfers, CudaExecutionView 
             if (memory.bytes && (!memory.data || memory.device != p.device))
                 throw std::invalid_argument("peer communication buffer is not on the group device");
     }
-    auto& route = p.routes.front();
+    auto found = std::find_if(p.routes.begin(), p.routes.end(), [](const auto& r) {
+        return r.statistics.backend == CommunicationBackend::Nccl;
+    });
+    if (found == p.routes.end()) throw std::logic_error("peer transfer has no prepared backend");
+    auto& route = *found;
     route.implementation->exchange(transfers, execution);
     for (const auto& item : transfers) {
         if (item.send.bytes) p.observe(route, 4, item.send.bytes);
@@ -224,9 +244,11 @@ void Group::record_graph(CommunicationGraphWork& into, const std::function<void(
 }
 
 void Group::replayed(const CommunicationGraphWork& work) const noexcept {
-    for (auto& route : impl_->routes)
+    for (auto& route : impl_->routes) {
+        route.implementation->wake();
         for (const auto& value : work)
             if (value.backend == route.statistics.backend) route.statistics.graph.add(value.work);
+    }
 }
 
 CommunicationContext::CommunicationContext(const DeviceContext& device,
@@ -240,6 +262,7 @@ CommunicationContext::CommunicationContext(const DeviceContext& device,
             continue;
         auto impl         = std::make_unique<Group::Impl>();
         impl->description = description;
+        impl->owner       = this;
         impl->rank        = description.index(rank);
         impl->device      = device.device();
         impl->stop        = stop_;
@@ -249,16 +272,17 @@ CommunicationContext::CommunicationContext(const DeviceContext& device,
 
 CommunicationContext::~CommunicationContext() { abort(); }
 
-CommunicationPreparation CommunicationContext::prepare(std::span<const GroupRequirements> needs) {
+CommunicationPreparation CommunicationContext::prepare(std::span<const GroupRequirements> needs,
+                                                       CommunicationPolicy policy) {
     check();
+    policy_ = policy;
     std::set<GroupId> seen;
     for (const auto& requirement : needs) {
         (void)group(requirement.group);
         if (!seen.insert(requirement.group).second)
             throw std::invalid_argument("duplicate communication group requirements");
     }
-    CommunicationPreparation result{rank_, {}};
-    std::size_t warmup_bytes = 0;
+    CommunicationPreparation result{rank_, {}, policy};
     for (auto& group : groups_) {
         auto& p = *group->impl_;
         if (p.state != Group::Impl::State::Created)
@@ -269,15 +293,29 @@ CommunicationPreparation CommunicationContext::prepare(std::span<const GroupRequ
         normalize(p.requirements, p.description, p.rank);
         auto& prepared = result.groups.emplace_back(GroupPreparation{p.requirements, {}});
         if (group->size() > 1) {
-            auto backend    = detail::make_nccl_backend(p.description, p.rank, stop_);
-            const auto kind = backend->kind();
-            prepared.connections.push_back(backend->prepare(p.requirements));
-            warmup_bytes = std::max(warmup_bytes, backend->warmup_bytes());
-            p.routes.push_back({std::move(backend), {.backend = kind}});
+#if NINFER_TARGET_SPARK
+            if (policy != CommunicationPolicy::Nccl && !p.requirements.collectives.empty()) {
+                auto backend = detail::make_native_backend(device_, p.description, p.rank, stop_,
+                                                           native_progress_, policy);
+                if (backend) {
+                    auto connection = backend->prepare(p.requirements);
+                    if (!connection.data.empty()) {
+                        prepared.connections.push_back(std::move(connection));
+                        p.routes.push_back(
+                            {std::move(backend), {.backend = CommunicationBackend::Native}});
+                    }
+                }
+            }
+#endif
+            if (policy != CommunicationPolicy::Native || !p.requirements.peers.empty() ||
+                p.description.usage == GroupUsage::PeerExchange) {
+                auto backend = detail::make_nccl_backend(p.description, p.rank, stop_);
+                prepared.connections.push_back(backend->prepare(p.requirements));
+                p.routes.push_back({std::move(backend), {.backend = CommunicationBackend::Nccl}});
+            }
         }
         p.state = Group::Impl::State::Prepared;
     }
-    warmup_ = DeviceBuffer(device_.device(), warmup_bytes);
     return result;
 }
 
@@ -285,17 +323,86 @@ void CommunicationContext::connect(std::span<const CommunicationPreparation> pee
                                    std::chrono::steady_clock::time_point deadline) {
     check();
     validate_communication_preparation(topology_, peers);
+    std::size_t warmup_bytes = 0;
     for (auto& group : groups_) {
         auto& p = *group->impl_;
         if (p.state != Group::Impl::State::Prepared)
             throw std::logic_error("communication connection precedes local preparation");
-        for (auto& route : p.routes) route.implementation->connect(peers, deadline);
+        std::erase_if(p.routes, [&](const auto& route) {
+            return std::any_of(
+                p.description.members.begin(), p.description.members.end(), [&](RankId rank) {
+                    const auto peer         = std::find_if(peers.begin(), peers.end(),
+                                                           [&](const auto& r) { return r.rank == rank; });
+                    const auto& connections = prepared_group(*peer, group->id()).connections;
+                    return std::none_of(connections.begin(), connections.end(), [&](const auto& c) {
+                        return c.backend == route.statistics.backend;
+                    });
+                });
+        });
+        for (auto& route : p.routes)
+            if (route.statistics.backend == CommunicationBackend::Native)
+                route.implementation->connect(peers, deadline);
+        std::erase_if(p.routes, [&](const auto& route) {
+            if (route.statistics.backend != CommunicationBackend::Native) return false;
+            return std::none_of(p.requirements.collectives.begin(),
+                                p.requirements.collectives.end(), [&](const auto& r) {
+                                    return route.implementation->supports(
+                                        {r.operation, r.dtype, r.min_count, r.reduction, r.root});
+                                });
+        });
+        std::vector<GroupRequirements> work(p.routes.size(), {group->id(), {}, {}});
+        for (const auto& r : p.requirements.collectives) {
+            if (group->size() == 1) break;
+            std::size_t first = r.min_count;
+            for (std::size_t i = 0; i < p.routes.size() && first <= r.max_count; ++i) {
+                if (policy_ == CommunicationPolicy::Native &&
+                    p.routes[i].statistics.backend != CommunicationBackend::Native)
+                    continue;
+                auto& backend = *p.routes[i].implementation;
+                if (!backend.supports({r.operation, r.dtype, first, r.reduction, r.root})) continue;
+                auto lo = (first - r.min_count) / r.step, hi = (r.max_count - r.min_count) / r.step;
+                while (lo < hi) {
+                    const auto mid = lo + (hi - lo + 1) / 2;
+                    if (backend.supports({r.operation, r.dtype, r.min_count + mid * r.step,
+                                          r.reduction, r.root}))
+                        lo = mid;
+                    else
+                        hi = mid - 1;
+                }
+                auto range      = r;
+                range.min_count = first;
+                range.max_count = r.min_count + lo * r.step;
+                work[i].collectives.push_back(range);
+                if (range.max_count == r.max_count) {
+                    first = 0;
+                    break;
+                }
+                first = range.max_count + r.step;
+            }
+            if (first)
+                throw std::invalid_argument(
+                    "prepared backends do not cover the collective count range");
+        }
+        for (std::size_t i = 0; i < p.routes.size(); ++i) {
+            auto& route = p.routes[i];
+            if (route.statistics.backend == CommunicationBackend::Nccl)
+                work[i].peers = p.requirements.peers;
+            route.implementation->configure(work[i]);
+            if (route.statistics.backend == CommunicationBackend::Nccl)
+                route.implementation->connect(peers, deadline);
+            warmup_bytes = std::max(warmup_bytes, route.implementation->warmup_bytes());
+        }
         p.state = Group::Impl::State::Connected;
     }
+    warmup_ = DeviceBuffer(device_.device(), warmup_bytes);
 }
 
 void CommunicationContext::warmup() {
     check();
+#if NINFER_TARGET_SPARK
+    if (native_progress_) native_progress_->start();
+#endif
+    set_active(true);
     for (auto& group : groups_) {
         auto& p = *group->impl_;
         if (p.state != Group::Impl::State::Connected)
@@ -306,6 +413,13 @@ void CommunicationContext::warmup() {
     }
     warmup_ = {};
     sample_startup_memory();
+    set_active(false);
+}
+
+void CommunicationContext::set_active(bool active) noexcept {
+#if NINFER_TARGET_SPARK
+    if (native_progress_) native_progress_->set_active(active);
+#endif
 }
 
 const Group& CommunicationContext::group(GroupId id) const {
@@ -319,6 +433,9 @@ void CommunicationContext::request_stop() noexcept {
 }
 
 void CommunicationContext::check() {
+#if NINFER_TARGET_SPARK
+    if (native_progress_) native_progress_->check();
+#endif
     if (stop_->load(std::memory_order_acquire)) throw std::runtime_error("communication stopped");
     for (const auto& group : groups_)
         for (const auto& route : group->impl_->routes) route.implementation->check();
@@ -326,6 +443,9 @@ void CommunicationContext::check() {
 
 void CommunicationContext::abort() noexcept {
     request_stop();
+#if NINFER_TARGET_SPARK
+    if (native_progress_) native_progress_->stop();
+#endif
     for (auto& group : groups_) {
         for (auto& route : group->impl_->routes) route.implementation->abort();
         group->impl_->state = Group::Impl::State::Closed;
@@ -337,6 +457,9 @@ void CommunicationContext::close(std::chrono::steady_clock::time_point deadline)
         for (auto& route : group->impl_->routes) route.implementation->close(deadline);
         group->impl_->state = Group::Impl::State::Closed;
     }
+#if NINFER_TARGET_SPARK
+    if (native_progress_) native_progress_->stop();
+#endif
     request_stop();
 }
 

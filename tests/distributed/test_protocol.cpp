@@ -39,6 +39,8 @@ void communication_preparation() {
             0, {{{0, {sum}, {{1, 64, 128}}}, {{CommunicationBackend::Nccl, {std::byte{7}}}}}}},
         dist::CommunicationPreparation{
             1, {{{0, {sum}, {{0, 128, 64}}}, {{CommunicationBackend::Nccl, {}}}}}}};
+    for (auto& rank : ranks) rank.policy = dist::CommunicationPolicy::Auto;
+    ranks[0].groups[0].connections.push_back({CommunicationBackend::Native, {std::byte{3}}});
     dist::validate_communication_preparation(topology, ranks);
     wire::Encoder out;
     dist::encode_communication_preparation(out, ranks[0]);
@@ -46,7 +48,7 @@ void communication_preparation() {
     wire::Decoder in(bytes);
     const auto decoded = dist::decode_communication_preparation(in);
     in.finish();
-    require(decoded.rank == 0 &&
+    require(decoded.rank == 0 && decoded.policy == dist::CommunicationPolicy::Auto &&
                 decoded.groups.front().requirements.collectives ==
                     ranks[0].groups.front().requirements.collectives &&
                 decoded.groups.front().requirements.peers ==
@@ -58,6 +60,19 @@ void communication_preparation() {
                 !sum.contains({dist::Collective::AllReduce, DType::BF16, 4097}) &&
                 !sum.contains({dist::Collective::AllReduce, DType::BF16, 4096 * 33}),
             "communication count domain lost its step or capacity");
+    ranks[1].policy = dist::CommunicationPolicy::Nccl;
+    bool mismatched = false;
+    try {
+        dist::validate_communication_preparation(topology, ranks);
+    } catch (const std::invalid_argument&) { mismatched = true; }
+    require(mismatched, "different backend policies were accepted");
+    for (auto& rank : ranks) rank.policy = dist::CommunicationPolicy::Native;
+    bool unavailable = false;
+    try {
+        dist::validate_communication_preparation(topology, ranks);
+    } catch (const std::invalid_argument&) { unavailable = true; }
+    require(unavailable, "forced native accepted an unavailable rank");
+    for (auto& rank : ranks) rank.policy = dist::CommunicationPolicy::Auto;
     ranks[1].groups[0].requirements.collectives[0].max_count += 4096;
     bool rejected = false;
     try {

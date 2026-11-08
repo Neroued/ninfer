@@ -40,6 +40,7 @@ std::optional<wire::Message> receive(WorkerConnection& connection, wire::Kind ex
 
 void encode_communication_preparation(wire::Encoder& out, const CommunicationPreparation& value) {
     out.u32(value.rank);
+    out.u8(static_cast<std::uint8_t>(value.policy));
     out.u64(value.groups.size());
     for (const auto& group : value.groups) {
         const auto& r = group.requirements;
@@ -70,6 +71,7 @@ void encode_communication_preparation(wire::Encoder& out, const CommunicationPre
 
 CommunicationPreparation decode_communication_preparation(wire::Decoder& in) {
     CommunicationPreparation result{in.u32(), {}};
+    result.policy = static_cast<CommunicationPolicy>(in.u8());
     result.groups.resize(in.count(28));
     for (auto& group : result.groups) {
         auto& r = group.requirements;
@@ -124,13 +126,14 @@ void prepare_communication(ExecutionGroup& group, std::chrono::milliseconds time
 }
 
 bool prepare_communication(WorkerConnection& connection,
-                           std::span<const GroupRequirements> requirements) {
+                           std::span<const GroupRequirements> requirements,
+                           CommunicationPolicy policy) {
     auto& context       = connection.communication();
     const auto observer = connection.startup_observer();
     try {
         {
             StartupPhaseScope phase(observer, StartupPhase::CommunicationInitialize);
-            const auto local = context.prepare(requirements);
+            const auto local = context.prepare(requirements, policy);
             wire::Encoder out;
             encode_communication_preparation(out, local);
             connection.send(wire::Kind::CommunicationPrepared, std::move(out).take());
@@ -138,7 +141,7 @@ bool prepare_communication(WorkerConnection& connection,
             if (!command) return false;
             wire::Decoder in(command->payload);
             std::vector<CommunicationPreparation> peers;
-            const auto count = in.count(12);
+            const auto count = in.count(13);
             peers.reserve(count);
             for (std::size_t i = 0; i < count; ++i)
                 peers.push_back(decode_communication_preparation(in));

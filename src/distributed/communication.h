@@ -13,6 +13,12 @@
 
 namespace ninfer::distributed {
 
+namespace detail {
+class NativeProgress;
+}
+
+enum class CommunicationPolicy : std::uint8_t { Nccl, Native, Auto };
+
 enum class Reduction : std::uint8_t { Sum, Max };
 enum class Collective : std::uint8_t { AllReduce, Broadcast, AllGather, ReduceScatter };
 
@@ -63,6 +69,7 @@ struct GroupPreparation {
 struct CommunicationPreparation {
     RankId rank;
     std::vector<GroupPreparation> groups;
+    CommunicationPolicy policy = CommunicationPolicy::Nccl;
 };
 
 struct PeerTransfer {
@@ -111,10 +118,14 @@ public:
     CommunicationContext& operator=(const CommunicationContext&) = delete;
     // Preparation is local allocation, peer installation, then warmup. All ranks finish each
     // stage before entering the next. Resources survive Program/Graph rebuilds.
-    [[nodiscard]] CommunicationPreparation prepare(std::span<const GroupRequirements>);
+    [[nodiscard]] CommunicationPreparation prepare(std::span<const GroupRequirements>,
+                                                   CommunicationPolicy = CommunicationPolicy::Nccl);
     void connect(std::span<const CommunicationPreparation>,
                  std::chrono::steady_clock::time_point deadline);
     void warmup();
+    // An execution window includes all asynchronous consumers. Active windows keep network
+    // progress awake; idle windows may park it. Enqueue and replay notifications also wake it.
+    void set_active(bool) noexcept;
     [[nodiscard]] const Group& group(GroupId) const;
     // The execution owner calls progress/abort. I/O may only set the atomic stop intent.
     void request_stop() noexcept;
@@ -130,6 +141,8 @@ private:
     const ExecutionTopology& topology_;
     RankId rank_;
     std::shared_ptr<std::atomic<bool>> stop_;
+    std::shared_ptr<detail::NativeProgress> native_progress_;
+    CommunicationPolicy policy_ = CommunicationPolicy::Nccl;
     std::vector<std::unique_ptr<Group>> groups_;
     DeviceBuffer warmup_;
 };

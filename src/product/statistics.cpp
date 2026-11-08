@@ -58,6 +58,8 @@ const char* communication_backend_name(CommunicationBackend backend) {
     switch (backend) {
     case CommunicationBackend::Nccl:
         return "nccl";
+    case CommunicationBackend::Native:
+        return "native";
     }
     throw std::logic_error("invalid communication backend observation");
 }

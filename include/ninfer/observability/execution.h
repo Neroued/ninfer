@@ -151,7 +151,7 @@ struct CommunicationWork {
     }
 };
 
-enum class CommunicationBackend : std::uint8_t { Nccl };
+enum class CommunicationBackend : std::uint8_t { Nccl, Native };
 
 // Library-reported Device allocations; driver and unreported Host storage are excluded.
 struct LibraryCommunicationMemory {

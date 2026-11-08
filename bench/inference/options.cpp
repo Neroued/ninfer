@@ -93,7 +93,7 @@ benchmark:
   --profile-measured  CUDA profiler range on all execution ranks; requires --repetitions 1.
 
 Each run starts with the same inputs and sampling seeds; runtime caches stay warm.
-Before each decode run, the first C-1 inputs complete ordinary one-token requests.
+Before each decode run, all C inputs complete ordinary one-token requests.
 Preparation is outside timing and profiler ranges. Prefix reuse defaults on for decode,
 using the shared Context capacity; prefill-only defaults off. Explicit configuration wins.
 Decode latency is grouped by actual batch size; a batch with no samples is reported as such.

@@ -36,7 +36,7 @@ Spark 使用 `dgx-spark-dev`；分布式配置需启用分布式构建。`*-ops`
 KV、Vision、backend、draft、proposal head、Graph 与 deployment 沿用公共启动参数。
 
 `--max-tokens 1` 用于 Prefill；更大值测正常生成。输出上限不是 decode step 数，遵循 EOS。
-每轮从相同输入和 sampling seeds 开始正常请求，保留运行时缓存预热。Decode 测量前先让前 C−1 个
+每轮从相同输入和 sampling seeds 开始正常请求，保留运行时缓存预热。Decode 测量前先让全部 C 个
 输入完成普通单 token 请求，再一起提交正式请求，以利用已有前缀缓存。它不强制调度达到 C，
 也不保证所有 rows 同时存活。Prefill-only 默认不复用前缀，显式配置优先。
 
@@ -48,7 +48,7 @@ Retirement；没有目标 batch 样本就明确为空。并列给出原生 GPU/H
 ### 外部 profiling
 
 `--profile-measured` 要求 `--repetitions 1`，通过 Engine 在实际执行 rank 开启/关闭 profiler。
-准备、预热与 C−1 个请求在窗口外，结束等待最终异步退役。单机可使用：
+输入准备、完整生成预热与全部 C 个输入的缓存预热均在窗口外，结束等待最终异步退役。单机可使用：
 
 ```bash
 nsys profile --capture-range=cudaProfilerApi \

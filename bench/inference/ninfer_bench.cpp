@@ -22,7 +22,7 @@ bench::Repetition run(Engine& engine, const bench::Options& options,
                       const std::vector<PromptInput>& inputs,
                       std::span<const RequestOptions> requests, bool measured) {
     if (options.launch.generation.max_tokens > 1) {
-        for (std::size_t row = 0; row + 1 < requests.size(); ++row) {
+        for (std::size_t row = 0; row < requests.size(); ++row) {
             auto prompt  = engine.prepare(inputs[inputs.size() == 1 ? 0 : row]);
             auto prefill = requests[row];
             prefill.execution.requested_output_tokens = 1;

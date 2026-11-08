@@ -384,6 +384,7 @@ GenerationService::preparation_cancellation(std::function<bool()> external) cons
 DecisionOutcome GenerationService::decide(const decision::Request& request,
                                           std::function<bool()> is_cancelled,
                                           std::span<const std::string> images) {
+    is_cancelled = preparation_cancellation(std::move(is_cancelled));
     if (!decision_engine_) throw std::logic_error("decision engine is disabled; start with --jev");
     if (!images.empty() && !options_.launch.engine.enable_vision)
         throw_invalid_input(std::invalid_argument("Vision is disabled for this server"),

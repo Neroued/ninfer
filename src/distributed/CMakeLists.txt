@@ -12,7 +12,8 @@ if(NINFER_ENABLE_DISTRIBUTED)
   ninfer_internal_includes(ninfer_distributed_control)
   target_link_libraries(ninfer_distributed_control PUBLIC
     ninfer_distributed_wire ninfer_cpu ninfer_distributed_cuda)
-  add_library(ninfer_distributed_cuda SHARED communication.cpp communication/nccl.cpp)
+  add_library(ninfer_distributed_cuda SHARED
+    communication.cpp communication/selection.cpp communication/nccl.cpp)
   ninfer_internal_includes(ninfer_distributed_cuda)
   target_link_libraries(ninfer_distributed_cuda PUBLIC ninfer_core ninfer_deployment PRIVATE ninfer::nccl)
   if(NINFER_TARGET STREQUAL "dgx_spark")

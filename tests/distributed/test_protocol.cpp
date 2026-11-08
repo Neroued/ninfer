@@ -1,6 +1,7 @@
 #include "distributed/transport.h"
 #include "distributed/startup.h"
 #include "distributed/communication/preparation.h"
+#include "distributed/communication/selection.h"
 #include "models/common/qwen/vision/control.h"
 #include "models/qwen4_exp/wire.h"
 #include "models/qwen4_exp/parallel/wire.h"
@@ -39,7 +40,8 @@ void communication_preparation() {
             0, {{{0, {sum}, {{1, 64, 128}}}, {{CommunicationBackend::Nccl, {std::byte{7}}}}}}},
         dist::CommunicationPreparation{
             1, {{{0, {sum}, {{0, 128, 64}}}, {{CommunicationBackend::Nccl, {}}}}}}};
-    for (auto& rank : ranks) rank.policy = dist::CommunicationPolicy::Auto;
+    require(ranks[0].policy == dist::CommunicationPolicy::Auto,
+            "communication does not default to automatic selection");
     ranks[0].groups[0].connections.push_back({CommunicationBackend::Native, {std::byte{3}}});
     dist::validate_communication_preparation(topology, ranks);
     wire::Encoder out;
@@ -73,12 +75,97 @@ void communication_preparation() {
     } catch (const std::invalid_argument&) { unavailable = true; }
     require(unavailable, "forced native accepted an unavailable rank");
     for (auto& rank : ranks) rank.policy = dist::CommunicationPolicy::Auto;
+    for (auto& rank : ranks)
+        rank.groups[0].routing = {{{sum, CommunicationBackend::Nccl}}, CommunicationBackend::Nccl};
+    dist::validate_communication_preparation(topology, ranks);
+    wire::Encoder selected_out;
+    dist::encode_communication_preparation(selected_out, ranks[0]);
+    const auto selected_bytes = std::move(selected_out).take();
+    wire::Decoder selected_in(selected_bytes);
+    require(dist::decode_communication_preparation(selected_in).groups[0].routing ==
+                ranks[0].groups[0].routing,
+            "communication selection lost its frozen routes");
+    selected_in.finish();
+    ranks[1].groups[0].routing.collectives[0].backend = CommunicationBackend::Native;
+    bool different_routes                             = false;
+    try {
+        dist::validate_communication_preparation(topology, ranks);
+    } catch (const std::invalid_argument&) { different_routes = true; }
+    require(different_routes, "different communication routes were accepted");
+    ranks[1].groups[0].routing = ranks[0].groups[0].routing;
     ranks[1].groups[0].requirements.collectives[0].max_count += 4096;
     bool rejected = false;
     try {
         dist::validate_communication_preparation(topology, ranks);
     } catch (const std::invalid_argument&) { rejected = true; }
     require(rejected, "different collective requirements were accepted");
+}
+
+class SelectionBackend final : public dist::detail::Backend {
+public:
+    SelectionBackend(CommunicationBackend kind, std::size_t capacity)
+        : kind_(kind), capacity_(capacity) {}
+
+    CommunicationBackend kind() const noexcept override { return kind_; }
+
+    dist::BackendConnection prepare(const dist::GroupRequirements&) override { return {kind_, {}}; }
+
+    dist::BackendConnection configure(const dist::GroupRequirements&) override {
+        return {kind_, {}};
+    }
+
+    bool supports(const dist::CollectiveCall& call) const noexcept override {
+        return call.count <= capacity_;
+    }
+
+    bool supports_peers(std::span<const dist::PeerRequirement>) const noexcept override {
+        return true;
+    }
+
+    std::size_t warmup_bytes() const noexcept override { return 0; }
+
+    void warmup(MemorySpan, CudaExecutionView) override {}
+
+    void enqueue(const dist::CollectiveCall&, const void*, void*, CudaExecutionView) override {}
+
+    void exchange(std::span<const dist::PeerTransfer>, CudaExecutionView) override {}
+
+    void check() override {}
+
+    void abort() noexcept override {}
+
+    void close(std::chrono::steady_clock::time_point) override {}
+
+    CommunicationMemory memory() const override { return {}; }
+private:
+    CommunicationBackend kind_;
+    std::size_t capacity_;
+};
+
+void communication_selection() {
+    using Backend = CommunicationBackend;
+    SelectionBackend native(Backend::Native, 60), nccl(Backend::Nccl, SIZE_MAX);
+    std::array<dist::detail::Backend*, 2> candidates{&nccl, &native};
+    const auto range = [](std::size_t first, std::size_t last, Backend backend) {
+        return dist::CollectiveRoute{{dist::Collective::AllReduce, DType::BF16, first, last, 10},
+                                     backend};
+    };
+    const std::array preferences{range(10, 20, Backend::Native), range(30, 40, Backend::Nccl),
+                                 range(50, 80, Backend::Native)};
+    const std::vector expected{range(10, 20, Backend::Native), range(30, 40, Backend::Nccl),
+                               range(50, 60, Backend::Native), range(70, 80, Backend::Nccl)};
+    require(dist::detail::select_collectives(preferences, candidates) == expected,
+            "measured preference bands were confused with capability limits or candidate order");
+    const std::array<dist::detail::Backend*, 1> nccl_only{&nccl}, native_only{&native};
+    auto fallback = std::vector(preferences.begin(), preferences.end());
+    for (auto& route : fallback) route.backend = Backend::Nccl;
+    require(dist::detail::select_collectives(preferences, nccl_only) == fallback,
+            "unavailable preferred backend did not use a supported candidate");
+    bool rejected = false;
+    try {
+        (void)dist::detail::select_collectives(preferences, native_only);
+    } catch (const std::invalid_argument&) { rejected = true; }
+    require(rejected, "forced backend accepted an uncovered count range");
 }
 
 std::optional<dist::IncomingMessage> poll_message(dist::Transport& transport) {
@@ -816,6 +903,7 @@ int main() {
     try {
         topology_identity();
         communication_preparation();
+        communication_selection();
         model_preparation();
         cache_profiles_roundtrip();
         native_work();

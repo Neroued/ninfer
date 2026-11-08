@@ -18,7 +18,7 @@ void check_nccl(ncclResult_t result, const char* operation) {
         throw std::runtime_error(std::string(operation) + ": " + ncclGetErrorString(result));
 }
 
-ncclDataType_t data_type(DType type) {
+std::optional<ncclDataType_t> data_type(DType type) noexcept {
     switch (type) {
     case DType::BF16:
         return ncclBfloat16;
@@ -39,7 +39,7 @@ ncclDataType_t data_type(DType type) {
     case DType::U64:
         return ncclUint64;
     default:
-        throw std::invalid_argument("NCCL does not support the collective dtype");
+        return {};
     }
 }
 
@@ -57,7 +57,8 @@ const GroupPreparation& peer_group(std::span<const CommunicationPreparation> pee
 std::vector<CollectiveCall> warmup_calls(std::span<const CollectiveRequirement> requirements) {
     std::vector<CollectiveCall> calls;
     for (const auto& r : requirements) {
-        (void)data_type(r.dtype);
+        if (!data_type(r.dtype))
+            throw std::invalid_argument("NCCL does not support the collective dtype");
         auto count = r.min_count;
         for (;;) {
             calls.push_back({r.operation, r.dtype, count, r.reduction, r.root});
@@ -83,7 +84,9 @@ public:
 
     BackendConnection prepare(const GroupRequirements&) override { return {kind(), {}}; }
 
-    bool supports(const CollectiveCall&) const noexcept override { return true; }
+    bool supports(const CollectiveCall& call) const noexcept override {
+        return data_type(call.dtype).has_value();
+    }
 
     bool supports_peers(std::span<const PeerRequirement>) const noexcept override { return true; }
 
@@ -196,24 +199,25 @@ public:
 
     void enqueue(const CollectiveCall& call, const void* source, void* destination,
                  CudaExecutionView execution) override {
-        const auto dtype     = data_type(call.dtype);
+        const auto dtype = data_type(call.dtype);
+        if (!dtype) throw std::invalid_argument("NCCL does not support the collective dtype");
         const auto reduction = call.reduction == Reduction::Sum ? ncclSum : ncclMax;
         ncclResult_t result;
         switch (call.operation) {
         case Collective::AllReduce:
-            result = ncclAllReduce(source, destination, call.count, dtype, reduction, comm_,
+            result = ncclAllReduce(source, destination, call.count, *dtype, reduction, comm_,
                                    execution.stream());
             break;
         case Collective::Broadcast:
-            result = ncclBroadcast(source, destination, call.count, dtype, call.root, comm_,
+            result = ncclBroadcast(source, destination, call.count, *dtype, call.root, comm_,
                                    execution.stream());
             break;
         case Collective::AllGather:
             result =
-                ncclAllGather(source, destination, call.count, dtype, comm_, execution.stream());
+                ncclAllGather(source, destination, call.count, *dtype, comm_, execution.stream());
             break;
         case Collective::ReduceScatter:
-            result = ncclReduceScatter(source, destination, call.count, dtype, reduction, comm_,
+            result = ncclReduceScatter(source, destination, call.count, *dtype, reduction, comm_,
                                        execution.stream());
             break;
         default:

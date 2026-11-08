@@ -849,6 +849,13 @@ int worker(dist::CommunicationPolicy policy) {
             rt::WorkerLoop<Types, Program, Codec> loop(connection, program, {});
             while (loop.advance()) std::this_thread::yield();
         }
+        // A periodic resource sample may already be in flight when Shutdown reaches a rank.
+        RankSnapshot final_sample;
+        final_sample.rank = connection.bootstrap().identity.rank;
+        final_sample.node = connection.bootstrap().identity.node;
+        wire::Encoder sample;
+        rt::protocol::encode(sample, final_sample);
+        connection.send(wire::Kind::Observation, std::move(sample).take(), false);
         connection.shutdown();
         return 0;
     } catch (const std::exception& error) {

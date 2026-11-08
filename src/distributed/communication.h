@@ -9,6 +9,7 @@
 #include <chrono>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <span>
 
 namespace ninfer::distributed {
@@ -61,15 +62,32 @@ struct BackendConnection {
     std::vector<std::byte> data;
 };
 
+struct CollectiveRoute {
+    CollectiveRequirement counts;
+    CommunicationBackend backend;
+
+    bool operator==(const CollectiveRoute&) const = default;
+};
+
+// Frozen after selection and agreed by all group members before backend initialization.
+// Peer transfers share one backend, including independently submitted sends and receives.
+struct GroupRouting {
+    std::vector<CollectiveRoute> collectives;
+    std::optional<CommunicationBackend> peers;
+
+    bool operator==(const GroupRouting&) const = default;
+};
+
 struct GroupPreparation {
     GroupRequirements requirements;
     std::vector<BackendConnection> connections;
+    GroupRouting routing;
 };
 
 struct CommunicationPreparation {
     RankId rank;
     std::vector<GroupPreparation> groups;
-    CommunicationPolicy policy = CommunicationPolicy::Nccl;
+    CommunicationPolicy policy = CommunicationPolicy::Auto;
 };
 
 struct PeerTransfer {
@@ -120,7 +138,7 @@ public:
     // Candidates are prepared locally, resolved against peers, then selected backends connect
     // and warm up. Resources survive Program/Graph rebuilds.
     [[nodiscard]] CommunicationPreparation prepare(std::span<const GroupRequirements>,
-                                                   CommunicationPolicy = CommunicationPolicy::Nccl);
+                                                   CommunicationPolicy = CommunicationPolicy::Auto);
     [[nodiscard]] CommunicationPreparation select(std::span<const CommunicationPreparation>,
                                                   std::chrono::steady_clock::time_point deadline);
     void connect(std::span<const CommunicationPreparation>,
@@ -145,7 +163,7 @@ private:
     RankId rank_;
     std::shared_ptr<std::atomic<bool>> stop_;
     std::shared_ptr<detail::NativeProgress> native_progress_;
-    CommunicationPolicy policy_ = CommunicationPolicy::Nccl;
+    CommunicationPolicy policy_ = CommunicationPolicy::Auto;
     std::vector<std::unique_ptr<Group>> groups_;
     DeviceBuffer warmup_;
 };

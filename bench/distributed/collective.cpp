@@ -36,7 +36,7 @@ std::size_t number(std::string_view value) {
 }
 
 struct Options {
-    std::string config, backend = "nccl", operation = "sum", mode = "graph";
+    std::string config, backend = "auto", operation = "sum", mode = "graph";
     std::string workload = "collective";
     unsigned width = 4096, maximum_m = 64, samples = 15, chain = 32;
     unsigned work_rows = 256;
@@ -49,12 +49,13 @@ Options options(int argc, char** argv) {
         const std::string_view flag(argv[i]);
         if (flag == "--help") {
             std::cout
-                << "ninfer_collective_bench --config FILE [--backend nccl|native|auto] "
+                << "ninfer_collective_bench --config FILE [--backend auto|native|nccl] "
                    "[--op sum|fp16|fp32|words|max|gather|candidates|broadcast|scatter|peer|send] "
                    "[--mode graph|eager] "
                    "[--width 4096] [--max-m 64] [--bytes N,N,...] [--chain 32] [--samples 15]\n"
                    "[--workload collective|pipeline|skew|overlap|compute] [--work-rows 256]\n"
-                   "Graph events time the device body after priming the selected operation "
+                   "Backend defaults to auto. Graph events time the device body after priming the "
+                   "selected operation "
                    "and an untimed collective fence. "
                    "Each reported sample uses the slower rank. Pipeline measures "
                    "RMSNorm -> SUM -> RMSNorm; skew adds rank-1 RMSNorm; overlap runs "

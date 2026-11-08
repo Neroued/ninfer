@@ -36,11 +36,15 @@ RankProgramImpl::prepare_vision(const std::optional<qwen::VisionWork>& work, std
             bytes =
                 encoder.encode(batch, destination, resources.workspace_storage(), window.staging());
         }
-        if (parallel)
+        if (parallel) {
+            // PLE reduction uses the producer stream on this same group. Vision encoding can
+            // overlap it, but its broadcast must follow the reduction on every rank.
+            if (!host_ple) ple_ready.wait(cuda.stream());
             for (const auto& block : work->window.plan->outputs) {
                 auto destination = window.output(block.feature_begin, block.token_positions.size());
                 parallel->broadcast(destination, block.rank, cuda);
             }
+        }
         window.produced(bytes);
     }
     const auto& region = *resources.plan.persistent.buffers.batch.visual_indices;

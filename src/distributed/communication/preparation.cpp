@@ -7,6 +7,28 @@
 namespace ninfer::distributed {
 namespace {
 
+void encode_counts(wire::Encoder& out, const CollectiveRequirement& c) {
+    out.u8(static_cast<std::uint8_t>(c.operation));
+    out.u8(static_cast<std::uint8_t>(c.dtype));
+    out.u8(static_cast<std::uint8_t>(c.reduction));
+    out.u32(c.root);
+    out.u64(c.min_count);
+    out.u64(c.max_count);
+    out.u64(c.step);
+}
+
+CollectiveRequirement decode_counts(wire::Decoder& in) {
+    CollectiveRequirement c;
+    c.operation = static_cast<Collective>(in.u8());
+    c.dtype     = static_cast<DType>(in.u8());
+    c.reduction = static_cast<Reduction>(in.u8());
+    c.root      = in.u32();
+    c.min_count = in.u64();
+    c.max_count = in.u64();
+    c.step      = in.u64();
+    return c;
+}
+
 void broadcast(ExecutionGroup& group, wire::Kind kind, wire::Bytes bytes = {}) {
     auto message =
         std::make_shared<wire::Message>(wire::Message{kind, group.epoch(), std::move(bytes)});
@@ -46,15 +68,7 @@ void encode_communication_preparation(wire::Encoder& out, const CommunicationPre
         const auto& r = group.requirements;
         out.u32(r.group);
         out.u64(r.collectives.size());
-        for (const auto& c : r.collectives) {
-            out.u8(static_cast<std::uint8_t>(c.operation));
-            out.u8(static_cast<std::uint8_t>(c.dtype));
-            out.u8(static_cast<std::uint8_t>(c.reduction));
-            out.u32(c.root);
-            out.u64(c.min_count);
-            out.u64(c.max_count);
-            out.u64(c.step);
-        }
+        for (const auto& c : r.collectives) encode_counts(out, c);
         out.u64(r.peers.size());
         for (const auto& peer : r.peers) {
             out.u32(peer.peer);
@@ -66,26 +80,25 @@ void encode_communication_preparation(wire::Encoder& out, const CommunicationPre
             out.u8(static_cast<std::uint8_t>(c.backend));
             out.bytes(c.data);
         }
+        out.u64(group.routing.collectives.size());
+        for (const auto& route : group.routing.collectives) {
+            encode_counts(out, route.counts);
+            out.u8(static_cast<std::uint8_t>(route.backend));
+        }
+        out.boolean(group.routing.peers.has_value());
+        if (group.routing.peers) out.u8(static_cast<std::uint8_t>(*group.routing.peers));
     }
 }
 
 CommunicationPreparation decode_communication_preparation(wire::Decoder& in) {
     CommunicationPreparation result{in.u32(), {}};
     result.policy = static_cast<CommunicationPolicy>(in.u8());
-    result.groups.resize(in.count(28));
+    result.groups.resize(in.count(37));
     for (auto& group : result.groups) {
         auto& r = group.requirements;
         r.group = in.u32();
         r.collectives.resize(in.count(31));
-        for (auto& c : r.collectives) {
-            c.operation = static_cast<Collective>(in.u8());
-            c.dtype     = static_cast<DType>(in.u8());
-            c.reduction = static_cast<Reduction>(in.u8());
-            c.root      = in.u32();
-            c.min_count = in.u64();
-            c.max_count = in.u64();
-            c.step      = in.u64();
-        }
+        for (auto& c : r.collectives) c = decode_counts(in);
         r.peers.resize(in.count(20));
         for (auto& peer : r.peers) peer = {in.u32(), in.u64(), in.u64()};
         group.connections.resize(in.count(9));
@@ -94,6 +107,12 @@ CommunicationPreparation decode_communication_preparation(wire::Decoder& in) {
             const auto bytes = in.bytes();
             c.data.assign(bytes.begin(), bytes.end());
         }
+        group.routing.collectives.resize(in.count(32));
+        for (auto& route : group.routing.collectives) {
+            route.counts  = decode_counts(in);
+            route.backend = static_cast<CommunicationBackend>(in.u8());
+        }
+        if (in.boolean()) group.routing.peers = static_cast<CommunicationBackend>(in.u8());
     }
     return result;
 }

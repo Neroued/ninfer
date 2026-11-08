@@ -202,7 +202,9 @@ struct ExecutionGroup::Impl {
                 std::this_thread::yield();
                 continue;
             }
-            if (closing && event->message.kind == wire::Kind::Progress) continue;
+            if (closing && (event->message.kind == wire::Kind::Progress ||
+                            event->message.kind == wire::Kind::Observation))
+                continue;
             if (event->message.kind != kind || !pending.erase(event->peer))
                 throw std::runtime_error(
                     "rank " + std::to_string(event->peer) + " returned message " +

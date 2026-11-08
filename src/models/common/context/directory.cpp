@@ -874,6 +874,7 @@ std::optional<StateId> reserve_capture_destination(ContextDirectory& directory,
     if (reserved.reservation && reserved.reservation->ready())
         return directory.states().reserve_destination(reserved.reservation->take(device_id),
                                                       variant);
+    reserved.reservation.reset();
     ContextDemand host_demand;
     const auto host_id = host_demand.add_state(
         {.count = 1, .variant = variant, .logical_count = 1, .memory = ContextMemory::Host});

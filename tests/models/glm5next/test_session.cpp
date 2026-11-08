@@ -38,7 +38,8 @@ public:
     bool failure            = false;
     std::atomic<bool> hold_poll{false};
     std::atomic<bool> fail_poll{false};
-    std::uint64_t unit_time_ns = 0;
+    std::uint32_t hold_prefill_frontier = UINT32_MAX;
+    std::uint64_t unit_time_ns          = 0;
     unsigned defer_binding = 0, bindings = 0;
     std::optional<rt::DeviceRetired> deferred_context;
     bool compute_retired = false;
@@ -114,6 +115,9 @@ public:
                 replay_submitted();
             computed = result;
             events.emplace_back(rt::ResultReady<glm::ExecutionTypes>{ticket, std::move(result)});
+            if (forward && forward->kind == glm::ForwardKind::Prefill &&
+                rows.front().main_frontier >= hold_prefill_frontier)
+                hold_poll = true;
         }
         return ticket;
     }
@@ -255,15 +259,23 @@ struct Fixture {
     glm::Frontend frontend;
     glm::SessionPlan layout;
     Executor executor;
+    ctx::ContextDirectory* directory = nullptr;
     glm::Session session;
 
     explicit Fixture(std::shared_ptr<const glm::ModelDefinition> d, bool pressure = false)
-        : definition(d), frontend(make_frontend()), layout(plan(*d, pressure)),
+        : Fixture(d, plan(*d, pressure)) {}
+
+    Fixture(std::shared_ptr<const glm::ModelDefinition> d, glm::SessionPlan p)
+        : definition(d), frontend(make_frontend()), layout(std::move(p)),
           executor({layout.shape, d->config().text.vocabulary,
                     d->resources().text.public_token_count, 2}),
-          session(glm::prepare_session(d, layout,
-                                       std::make_unique<ctx::ContextDirectory>(layout.context)),
-                  executor) {}
+          session(glm::prepare_session(d, layout, make_directory()), executor) {}
+
+    std::unique_ptr<ctx::ContextDirectory> make_directory() {
+        auto result = std::make_unique<ctx::ContextDirectory>(layout.context);
+        directory   = result.get();
+        return result;
+    }
 
     glm::RequestBasePlan request(unsigned n) {
         rt::ResolvedExecutionOptions o;
@@ -323,6 +335,87 @@ struct Fixture {
         idle();
     }
 };
+
+void fragmented_capture(std::shared_ptr<const glm::ModelDefinition> definition) {
+    auto layout = plan(*definition);
+    // Pad the toy State images to reproduce production's large-State/small-KV geometry.
+    for (auto& variant : layout.context.state.layouts)
+        for (auto& part : variant.parts) part.image_bytes *= 4;
+    Fixture f(definition, std::move(layout));
+    const auto sequence = f.bind(f.request(4), 0, 1);
+    const glm::ExecutionUnit unit{sequence, glm::ExecutionUnitKind::Prefill, 4};
+    require(bool(f.session.reserve_units({&unit, 1})), "fragmented capture input reservation");
+
+    auto& records     = f.directory->records();
+    auto& pool        = records.pool({1, ctx::ContextMemory::Device});
+    const auto usage  = pool.usage();
+    const auto state  = f.layout.context.state.layouts[1].parts[1];
+    const auto filler = f.layout.context.pools[0].parts[1].record;
+    const auto state_class =
+        std::find_if(usage.classes.begin(), usage.classes.end(), [&](const auto& c) {
+            return c.spec == RecordSpec{state.image_bytes, state.alignment};
+        });
+    const auto filler_class = std::find_if(usage.classes.begin(), usage.classes.end(),
+                                           [&](const auto& c) { return c.spec == filler; });
+    require(state_class != usage.classes.end() && filler_class != usage.classes.end() &&
+                state_class != filler_class && filler_class->records_per_block >= 2,
+            "fragmentation fixture needs distinct State and page classes");
+
+    auto occupy = [&](std::uint32_t layout, std::uint32_t count) {
+        std::vector<ctx::RecordLease> result;
+        auto reserved =
+            records.reserve(ctx::RecordDemand{layout, ctx::ContextMemory::Device, count, {1}});
+        require(reserved && reserved->ready(), "fragmentation fixture capacity");
+        for (std::uint32_t i = 0; i < count; ++i) result.push_back(reserved->materialize(1));
+        return result;
+    };
+    auto state_fill = occupy(ctx::state_record_layout(1), state_class->free_records);
+    const auto count =
+        usage.free_block_bytes / usage.block_bytes * filler_class->records_per_block +
+        filler_class->free_records;
+    auto fillers = occupy(1, count);
+    for (auto& record : fillers)
+        if ((record.binding().offset % usage.block_bytes / filler_class->stride) % 2 == 0)
+            record.reset();
+
+    const auto prepared = f.session.prepare_capture(sequence);
+    require(prepared && !prepared->reserved && prepared->assessment.requires_maintenance(),
+            "capture returned a wait on its own discarded reservation");
+    require(!pool.has_maintenance() && !f.session.has_context_operation(),
+            "failed capture retained an unsubmitted maintenance plan");
+    require(f.session.start_maintenance(prepared->assessment) == rt::ContextStart::Started,
+            "capture did not start the required compaction");
+    const auto maintained = f.event<glm::ContextProgress>();
+    require(maintained.kind == glm::ContextOperationKind::Maintenance && maintained.published,
+            "compaction did not publish");
+    f.idle();
+    const auto ready = f.session.prepare_capture(sequence);
+    require(ready && ready->reserved, "capture did not become ready after compaction");
+    require(f.session.start_prefill(sequence).has_value(), "compacted prefill did not execute");
+    require(f.event<glm::PrefillProgress>().capture_ready,
+            "compacted prefill lost its checkpoint boundary");
+    f.idle();
+    require(f.session.start_capture(sequence), "compacted checkpoint did not start");
+    const auto captured = f.event<glm::ContextProgress>();
+    require(captured.published && !captured.captured_checkpoints.empty(),
+            "compacted checkpoint did not publish");
+    f.idle();
+    require(f.session.abort(sequence).status == rt::ConsumeStatus::Consumed,
+            "compacted request did not cancel");
+    f.idle();
+    for (const auto checkpoint : captured.captured_checkpoints)
+        require(f.session.release_checkpoint(checkpoint), "compacted checkpoint retained readers");
+    fillers.clear();
+    state_fill.clear();
+    const auto final = f.session.physical_usage();
+    require(!final.state_objects && !final.history_objects &&
+                std::all_of(final.pools.begin(), final.pools.end(),
+                            [](const auto& p) {
+                                return !p.live_bytes && !p.reserved_bytes &&
+                                       !p.pending_retirement_bytes && !p.future_reserved_bytes;
+                            }),
+            "compacted capture retained State, history or reservations");
+}
 
 void transactions(std::shared_ptr<const glm::ModelDefinition> definition) {
     for (unsigned frontier : {3U, 4U, 63U, 64U, 65U}) {
@@ -642,6 +735,137 @@ void engine_stop(std::shared_ptr<const glm::ModelDefinition> definition) {
             "stop retained pending work or Context ownership");
 }
 
+// Hold one capture's external retirement dependency while independent requests may run.
+class WaitingCaptureSession : public glm::Session {
+public:
+    using glm::Session::Session;
+    std::atomic<bool> waiting{true};
+    std::atomic<bool> observed{false};
+    std::optional<glm::SequenceHandle> blocked;
+
+    std::optional<glm::CapturePreparation>
+    prepare_capture(glm::SequenceHandle sequence,
+                    std::span<const glm::CheckpointHandle> victims = {}) {
+        if (!blocked) blocked = sequence;
+        if (sequence == blocked && waiting) {
+            observed = true;
+            return glm::CapturePreparation{
+                .frontier = 64, .assessment = {.status = ctx::ContextAvailability::Waiting}};
+        }
+        return glm::Session::prepare_capture(sequence, victims);
+    }
+};
+
+struct WaitingCaptureRuntime : glm::RuntimeTypes {
+    using Session = WaitingCaptureSession;
+};
+
+void independent_prefill(std::shared_ptr<const glm::ModelDefinition> definition) {
+    auto layout   = plan(*definition);
+    auto frontend = make_frontend();
+    Executor executor({layout.shape, definition->config().text.vocabulary,
+                       definition->resources().text.public_token_count, 2});
+    WaitingCaptureSession session(
+        glm::prepare_session(definition, layout,
+                             std::make_unique<ctx::ContextDirectory>(layout.context)),
+        executor);
+
+    struct Instance {
+        using ModelContract = WaitingCaptureRuntime;
+        glm::Frontend& frontend;
+        Executor* executor;
+        WaitingCaptureSession* session;
+    } instance{frontend, &executor, &session};
+
+    EngineOptions options;
+    options.max_context     = 256;
+    options.max_concurrency = 3;
+    rt::EngineCore<Instance> engine(instance, options, {});
+    rt::ResolvedRequestOptions request;
+    request.execution.requested_output_tokens = 1;
+    request.output.raw                        = true;
+    request.stop.include_model_defaults       = false;
+    auto submit                               = [&](TokenId token) {
+        auto prompt        = frontend.prepare_tokens(std::vector<TokenId>(64, token), true);
+        const auto summary = prompt.summary();
+        return engine.submit(std::move(prompt), summary, 0, request, OutputConsumerMode::Aggregate,
+                                                           {});
+    };
+    auto first          = submit(0);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!session.observed && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::yield();
+    require(session.observed, "first prefill did not wait for capture capacity");
+    const auto second = submit(1).wait(
+        nullptr, CancellationView([&] { return std::chrono::steady_clock::now() >= deadline; }));
+    session.waiting = false;
+    require(second.finish_reason == FinishReason::OutputLimit,
+            "waiting capture blocked an independently runnable prefill");
+    require(first.wait(nullptr, {}).finish_reason == FinishReason::OutputLimit,
+            "prefill did not resume after capture capacity retired");
+    (void)engine.measure({rt::MeasurementAction::Reset});
+    require(!engine.snapshot().runtime.running_requests && !executor.has_pending_work(),
+            "prefill fallback retained a request or execution");
+}
+
+void cancelled_prefix_statistics(std::shared_ptr<const glm::ModelDefinition> definition) {
+    Fixture f(definition);
+
+    struct Instance {
+        using ModelContract = glm::RuntimeTypes;
+        glm::Frontend& frontend;
+        Executor* executor;
+        glm::Session* session;
+    } instance{f.frontend, &f.executor, &f.session};
+
+    EngineOptions options;
+    options.max_context              = 256;
+    options.max_concurrency          = 3;
+    options.context_cache.enabled    = true;
+    f.executor.hold_prefill_frontier = 128;
+    rt::EngineCore<Instance> engine(instance, options, {});
+    rt::ResolvedRequestOptions request;
+    request.execution.requested_output_tokens = 1;
+    request.output.raw                        = true;
+    request.stop.include_model_defaults       = false;
+    auto submit                               = [&](unsigned length) {
+        auto prompt        = f.frontend.prepare_tokens(std::vector<TokenId>(length, 0), true);
+        const auto summary = prompt.summary();
+        return engine.submit(std::move(prompt), summary, 0, request, OutputConsumerMode::Aggregate,
+                                                           {});
+    };
+    const auto warmup = submit(64).wait(nullptr, {});
+    require(warmup.finish_reason == FinishReason::OutputLimit &&
+                warmup.stats.timings.first_token_seconds.has_value(),
+            "prefix statistics warmup did not produce a token");
+    (void)engine.measure({rt::MeasurementAction::Reset});
+    auto pending        = submit(224);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!f.executor.hold_poll && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::yield();
+    require(f.executor.hold_poll, "cancellation fixture did not reach partial prefill");
+    unsigned checks      = 0;
+    const auto cancelled = pending.wait(nullptr, CancellationView([&] {
+                                            // The first check publishes cancellation; the next
+                                            // allows its device reader to retire.
+                                            if (++checks == 2) f.executor.hold_poll = false;
+                                            return true;
+                                        }));
+    require(cancelled.finish_reason == FinishReason::Cancelled &&
+                cancelled.generated_token_ids.empty() &&
+                !cancelled.stats.timings.first_token_seconds &&
+                !cancelled.stats.first_output_timing,
+            "cancelled prefill fabricated output or its timing");
+    require(cancelled.stats.reused_prompt_tokens == 64 &&
+                cancelled.stats.prefix_reuse_path == PrefixReusePath::Checkpoint &&
+                cancelled.stats.computed_prefill_tokens > 0 &&
+                cancelled.stats.computed_prefill_tokens < 224 - 64,
+            "cancelled prefill lost its admitted prefix or completed work");
+    (void)engine.measure({rt::MeasurementAction::Reset});
+    require(!engine.snapshot().runtime.running_requests && !f.executor.has_pending_work(),
+            "cancelled prefill retained execution resources");
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -649,9 +873,12 @@ int main(int argc, char** argv) {
         require(argc >= 2, "missing artifact directory");
         artifact::Reader reader(std::filesystem::path(argv[1]) / "model.ninfer");
         transactions(glm::read_definition(reader, {}));
+        fragmented_capture(glm::read_definition(reader, {}));
         engine_pressure(glm::read_definition(reader, {}), false);
         engine_pressure(glm::read_definition(reader, {}), true);
         engine_stop(glm::read_definition(reader, {}));
+        independent_prefill(glm::read_definition(reader, {}));
+        cancelled_prefix_statistics(glm::read_definition(reader, {}));
         engine_pressure(glm::read_definition(reader, {}), false, true);
         auto mtp = glm::read_definition(reader, {.speculative = SpeculativeBackend::Mtp});
         mtp_transactions(std::move(mtp));

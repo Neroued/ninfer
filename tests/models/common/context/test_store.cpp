@@ -153,6 +153,40 @@ void test_state_variants_and_metadata() {
     expect(budget.allocated() == 0, "State metadata budget leaked after destruction");
 }
 
+void test_capture_host_fallback_after_device_compaction() {
+    store::ContextDirectory directory({
+        .ranks                 = {{0, 192, 64}},
+        .state                 = {8, {{0, {{0, 64, 16}}}}},
+        .pools                 = {{.pool_id       = 0,
+                                   .logical_pages = 16,
+                                   .histories     = 4,
+                                   .page_capacity = 4,
+                                   .table_rows    = 2,
+                                   .parts         = {{0, {16, 16}}}}},
+        .metadata_budget_bytes = 16 * 1024 * 1024,
+    });
+    auto reserved =
+        directory.records().reserve(store::RecordDemand{1, store::ContextMemory::Device, 12, {}});
+    std::vector<store::RecordLease> pages;
+    for (unsigned i = 0; i < 12; ++i) {
+        auto page = reserved->materialize(0);
+        if ((page.binding().offset / 16) % 2 != 0) pages.push_back(std::move(page));
+    }
+    store::ContextDemand demand;
+    demand.add_state({.count = 1});
+    expect(directory.assess(demand).requires_maintenance(),
+           "capture fallback fixture must require device compaction");
+    std::optional<store::RecordReservation> backing;
+    const auto destination = store::reserve_capture_destination(directory, backing);
+    expect(destination && backing && backing->ready(),
+           "discarded device placement blocked a ready Host destination");
+    expect(!directory.records().pool({0, store::ContextMemory::Device}).has_maintenance(),
+           "Host fallback retained the unused device maintenance plan");
+    if (destination) expect(directory.states().release(*destination), "Host capture release");
+    backing.reset();
+    pages.clear();
+}
+
 void test_metadata_admission() {
     store::ContextDirectorySpec spec{.ranks                 = {{0, 8192, 4096}},
                                      .state                 = {700, {{0, {{0, 256, 256}}}}},
@@ -751,6 +785,7 @@ int main() {
         test_release_set_equality();
         test_rank_local_placement();
         test_state_variants_and_metadata();
+        test_capture_host_fallback_after_device_compaction();
         test_metadata_admission();
         test_mixed_context_demand();
         test_physical_resource_accounting();

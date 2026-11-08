@@ -226,11 +226,12 @@ enum class SpeculativeBackend : std::uint8_t {
 // Vision is an overlapping stream interval, with coverage in max_rank_gpu. GenerationEngineTiming
 // below is the direct, mutually-exclusive Host observation contract.
 struct GenerationTimings {
-    double prepare_seconds     = 0.0;
-    double first_token_seconds = 0.0;
-    double vision_seconds      = 0.0;
-    double prefill_seconds     = 0.0;
-    double decode_seconds      = 0.0;
+    double prepare_seconds = 0.0;
+    // Absent until the first committed token, independently of visible output.
+    std::optional<double> first_token_seconds;
+    double vision_seconds  = 0.0;
+    double prefill_seconds = 0.0;
+    double decode_seconds  = 0.0;
     double replay_seconds = 0.0, control_seconds = 0.0;
     // Prompt wall time begins at the successful initial binding attempt and ends at the first
     // accepted output token. Generation spans the first through last accepted output token and

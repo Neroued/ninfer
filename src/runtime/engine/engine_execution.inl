@@ -301,7 +301,6 @@ void EngineCore<Instance>::resolve_prefill_progress(
     if (!request->admitted_begin || progress.summary != *request->admitted_begin) {
         throw std::logic_error("runtime Begin summary differs from committed admission");
     }
-    request->begin = progress.summary;
     phase.finish();
     commit_pending(std::move(*progress.pending), std::move(flight));
     progress.pending.reset();

@@ -643,7 +643,10 @@ std::string format_request_done_json(const std::string& server_instance_id, std:
          {"tool_call_parse", tool_call_parse_json(outcome.tool_call_parse)}};
     record["timings_seconds"] =
         Json{{"prepare", outcome.service_prepare_seconds + outcome.stats.timings.prepare_seconds},
-             {"ttft", outcome.stats.timings.first_token_seconds + outcome.service_prepare_seconds},
+             {"ttft", outcome.stats.timings.first_token_seconds
+                          ? Json(*outcome.stats.timings.first_token_seconds +
+                                 outcome.service_prepare_seconds)
+                          : Json(nullptr)},
              {"vision_stream", outcome.stats.timings.vision_seconds},
              {"prefill", outcome.stats.timings.prefill_seconds},
              {"decode", outcome.stats.timings.decode_seconds},

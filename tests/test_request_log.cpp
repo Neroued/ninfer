@@ -524,16 +524,21 @@ int main() {
     cancelled.completion_tokens             = 0;
     cancelled.stats.computed_prefill_tokens = 128;
     cancelled.stats.timings.prefill_seconds = 0.25;
+    cancelled.stats.timings.first_token_seconds.reset();
     const Json cancelled_done =
         Json::parse(format_request_done_json("server-test", 123456789, context, cancelled));
     failures += check(cancelled_done.at("result").at("computed_prefill_tokens") == 128,
                       "cancelled prefill reported the uncomputed remainder as executed work");
     failures += check(cancelled_done.at("first_output_timing").is_null() &&
+                          cancelled_done.at("timings_seconds").at("ttft").is_null() &&
                           cancelled_done.at("result").at("generated_token_ids").empty(),
                       "cancelled before output fabricated an output boundary or generated tokens");
     failures += check(render_request_done(context, cancelled).message.find("prefill 512.0 tok/s") !=
                           std::string::npos,
                       "cancelled prefill rate must use completed work, not the remaining prompt");
+    failures +=
+        check(render_request_done(context, cancelled).message.find("TTFT —") != std::string::npos,
+              "cancelled before first token fabricated a TTFT");
     failures += check(done.at("result").at("prefix_reuse_path") == "checkpoint",
                       "prefix reuse path missing");
     failures += check(done.at("result").at("thinking_budget") == 256 &&
@@ -551,8 +556,10 @@ int main() {
                           outcome.stats.timings.decode_seconds,
                       "decode time lost precision");
     failures += check(done.at("timings_seconds").at("ttft").get<double>() ==
-                          outcome.stats.timings.first_token_seconds,
+                          outcome.stats.timings.first_token_seconds.value(),
                       "TTFT missing or lost precision");
+    failures += check(done.at("first_output_timing").is_null(),
+                      "first committed token must not fabricate visible output timing");
     failures += check(done.at("speculative").at("backend") == "mtp", "speculative backend missing");
     failures +=
         check(done.at("speculative").at("draft_window") == 3, "speculative draft window missing");

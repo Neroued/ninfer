@@ -240,10 +240,13 @@ OperationalRecord render_request_done(const RequestLogContext& context,
     if (metrics.prefix_reuse_path != ninfer::PrefixReusePath::Root) {
         out << ", " << prefix_reuse_path_name(metrics.prefix_reuse_path);
     }
-    out << ") | TTFT "
-        << product::format_pretty_duration(metrics.timings.first_token_seconds +
-                                           outcome.service_prepare_seconds)
-        << " | total "
+    out << ") | TTFT ";
+    if (metrics.timings.first_token_seconds)
+        out << product::format_pretty_duration(*metrics.timings.first_token_seconds +
+                                               outcome.service_prepare_seconds);
+    else
+        out << "—";
+    out << " | total "
         << product::format_pretty_duration(metrics.timings.total_seconds +
                                            outcome.service_prepare_seconds);
     if (metrics.engine_timing.queue_wait_seconds >= 0.01) {

@@ -336,6 +336,14 @@ def test_result_record_parses_production_timings(
     assert record["metrics"]["decode_scheduler_yield_us_per_round"] == pytest.approx(
         100000.0
     )
+    event["timings_seconds"]["ttft"] = None
+    event["result"]["finish_reason"] = "cancelled"
+    event["result"]["completion_tokens"] = 0
+    response["usage"]["completion_tokens"] = 0
+    cancelled = build_result_record(
+        spec, "cancelled-prefill-bindings", payload, response, event
+    )
+    assert cancelled["metrics"]["server_ttft_ms"] is None
 
 
 @pytest.mark.parametrize("resource_case", ["single", "pair", "missing", "partial"])

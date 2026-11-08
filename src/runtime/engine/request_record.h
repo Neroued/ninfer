@@ -194,7 +194,6 @@ struct RequestRecord {
     bool queue_wait_recorded = false;
     std::optional<GenerationBudget> budget;
     std::optional<BeginSummary> admitted_begin;
-    std::optional<BeginSummary> begin;
     std::vector<TokenId> generated;
     std::string content;
     std::string reasoning;

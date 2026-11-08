@@ -607,9 +607,11 @@ private:
     void update_recovery(const std::shared_ptr<Request>& request, bool released = false);
 
     enum class ReservationScope { Round, Prefill };
+    enum class ResidentReservation { Ready, Unavailable, Pending };
 
     [[nodiscard]] ExecutionUnit execution_unit(const Request& request) const;
 
+    [[nodiscard]] ResidentReservation reserve_resident_unit(std::uint32_t lane);
     void reserve_resident_units(ReservationScope scope = ReservationScope::Round);
     [[nodiscard]] std::optional<std::uint32_t>
     next_prefill(const std::array<std::shared_ptr<Request>, kMaximumConcurrency>&) const;

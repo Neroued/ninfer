@@ -96,30 +96,29 @@ Session::prepare_capture(SequenceHandle h, std::span<const CheckpointHandle> hos
     auto ticket         = std::make_unique<detail::CaptureReservation>();
     ticket->states      = &p.directory.states();
     ticket->checkpoints = &p.checkpoints;
+    ContextDemand demand;
+    const auto variant = s.continuation.metadata.placement.value;
+    const auto target  = demand.add_state({.count = 1, .variant = variant});
+    auto reserved      = p.directory.reserve(demand);
+    if (!reserved || !reserved.reservation->ready()) {
+        // The unused reservation may own an unsubmitted maintenance plan. Return
+        // its original assessment after releasing that plan, not its temporary wait.
+        reserved.reservation.reset();
+        return CapturePreparation{.frontier   = point.frontier,
+                                  .assessment = std::move(reserved.assessment),
+                                  .origin     = point.origin,
+                                  .evidence   = point.evidence};
+    }
+    ticket->destination = p.directory.states()
+                              .reserve_destination(reserved.reservation->take(target), variant)
+                              .value();
     ticket->records.reserve(point.roles.size());
     for (const auto role : point.roles) {
         const auto record = p.checkpoints.reserve();
         if (!record) return {};
         ticket->records.emplace_back(*record, role);
     }
-    ContextDemand demand;
-    const auto variant = s.continuation.metadata.placement.value;
-    const auto target  = demand.add_state({.count = 1, .variant = variant});
-    auto reserved      = p.directory.reserve(demand);
-    const auto destination =
-        reserved && reserved.reservation->ready()
-            ? p.directory.states().reserve_destination(reserved.reservation->take(target), variant)
-            : std::nullopt;
-    if (!destination) {
-        ContextDemand demand;
-        demand.add_state({.count = 1, .variant = s.continuation.metadata.placement.value});
-        return CapturePreparation{.frontier   = point.frontier,
-                                  .assessment = p.directory.assess(demand),
-                                  .origin     = point.origin,
-                                  .evidence   = point.evidence};
-    }
-    ticket->destination = *destination;
-    s.capture           = std::move(ticket);
+    s.capture = std::move(ticket);
     return CapturePreparation{.frontier       = point.frontier,
                               .reserved       = true,
                               .origin         = point.origin,

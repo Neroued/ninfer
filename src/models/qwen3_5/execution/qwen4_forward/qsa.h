@@ -131,7 +131,9 @@ void Qwen4Forward<Arena>::qsa(std::size_t layer, const RankTensors& x, RankTenso
         reserve(ops::qsa_select_workspace_bytes(b.geometry, std::max(c(0).max_visible, 1U), W, B));
         reserve(ops::qsa_attention_workspace_bytes(b.geometry, last_));
         if (kv_in_host() && c(0).prefill) {
-            reserve(ops::qsa_count_selected_blocks_workspace_bytes(std::max(c(0).max_visible, 1U)));
+            const std::uint32_t visible = std::max(c(0).max_visible, 1U);
+            reserve(std::max(ops::qsa_count_selected_blocks_workspace_bytes(visible),
+                             ops::qsa_stage_selected_union_workspace_bytes(visible)));
         }
     } else {
         each([&](int r) { qsa_rank(layer, r, b, kv_layer, y != nullptr); });
@@ -171,7 +173,9 @@ auto Qwen4Forward<Arena>::qsa_buffers(std::size_t layer, bool attend) -> QsaBuff
     b.selected = alloc(DType::I32, {g.max_selected(), kExecute ? W : T, kExecute ? B : 1});
     b.counts   = alloc(DType::I32, {kExecute ? W : T, kExecute ? B : 1});
     b.attended = alloc(DType::BF16, {head_dim, heads, T});
-    if (kv_in_host() && !c(0).prefill && attend) {
+    // Active KV in RAM: decode windows, and prompt chunks beyond the region (union staging), read
+    // the selection rewritten onto the region.
+    if (kv_in_host() && attend) {
         b.rewritten = alloc(DType::I32, {g.max_selected(), kExecute ? W : T, kExecute ? B : 1});
     }
     return b;
@@ -259,31 +263,64 @@ void Qwen4Forward<Arena>::qsa_attend(int r, QsaBuffers& b, const PagedKVBatchLay
         if (const ops::QsaStagingRegion* region = state(r).kv->qsa_staging()) {
             // Active KV in RAM: the selected keys come from the Host planes into the
             // region (bit-identical bytes); the attention reads the region.
-            if (B != 1 || geometry.ratio != 4) {
-                throw std::logic_error(
-                    "active KV in RAM serves one lane of 4-token QSA blocks at a time");
+            if (geometry.ratio != 4 || (col.prefill && B != 1)) {
+                throw std::logic_error("active KV in RAM serves 4-token QSA blocks and prefills "
+                                       "one lane at a time");
             }
+            // Lane b reads its rewritten selection through identity row entry b.
+            const Tensor identity = region->table_row.slice(0, 0, B);
             if (col.prefill) {
-                if (staging_stats() && kv_layer == 0) {
+                if (staging_stats() && state(r).kv->staging_layer(kv_layer) == 0) {
                     state(r).kv->report_staging_stats("before prefill");
                 }
-                ops::qsa_stage_visible_pages(kv, positions, valid, *col.table_rows, col.max_visible,
-                                             *region, staging_stats(), stream);
                 if (staging_stats()) {
                     ops::qsa_count_selected_blocks(
                         b.selected[i], b.counts[i], positions, col.max_visible, *region,
-                        static_cast<std::int32_t>(kv_layer), work(r), stream);
+                        state(r).kv->staging_layer(kv_layer), work(r), stream);
                 }
-                ops::qsa_attention(b.qn[i].view({head_dim, heads, W, B}), b.selected[i],
-                                   b.counts[i], region->table_row, region->pages, scale, work(r),
-                                   a4, stream);
+                // Whole visible pages while the region holds them and the chunk may select as
+                // many blocks as there are (long chunks select 73-95 % of them); otherwise the
+                // union of the selections (a resumed conversation's short suffix touches a few
+                // per cent of a long context).
+                const std::int32_t groups = (geometry.max_selected() + 3) / 4;
+                const std::int64_t visible_pages =
+                    (static_cast<std::int64_t>(col.max_visible) + kPagedKVPageSize - 1) /
+                    kPagedKVPageSize;
+                const std::int64_t visible_blocks =
+                    (static_cast<std::int64_t>(col.max_visible) + 3) / 4;
+                if (visible_pages <= region->total_pages() &&
+                    static_cast<std::int64_t>(W) * groups >= visible_blocks) {
+                    ops::qsa_stage_visible_pages(kv, positions, valid, *col.table_rows,
+                                                 col.max_visible, *region, staging_stats(), stream);
+                    ops::qsa_attention(b.qn[i].view({head_dim, heads, W, B}), b.selected[i],
+                                       b.counts[i], identity, region->pages, scale, work(r), a4,
+                                       stream);
+                } else {
+                    // The union of the selections of as many columns as the region surely
+                    // holds, then their attention, column range by column range.
+                    const auto step = static_cast<std::int32_t>(std::max<std::int64_t>(
+                        1, ops::qsa_staging_region_blocks(*region) / groups));
+                    const Tensor q4 = b.qn[i].view({head_dim, heads, W, B});
+                    for (std::int32_t w0 = 0; w0 < W; w0 += step) {
+                        const std::int32_t n = std::min(step, W - w0);
+                        Tensor rewritten     = b.rewritten[i].slice(1, w0, n);
+                        Tensor out           = a4.slice(2, w0, n);
+                        const Tensor counts  = b.counts[i].slice(0, w0, n);
+                        ops::qsa_stage_selected_union(b.selected[i].slice(1, w0, n), counts,
+                                                      *col.table_rows, kv, col.max_visible, *region,
+                                                      staging_stats(), work(r), rewritten, stream);
+                        // Split the keys as the whole chunk would: bit-identical columns.
+                        ops::qsa_attention(q4.slice(2, w0, n), rewritten, counts, identity,
+                                           region->pages, scale, work(r), out, stream, W * B);
+                    }
+                }
             } else {
                 ops::qsa_stage_selected_blocks(
                     b.selected[i], b.counts[i], positions, *col.table_rows, kv, *region,
-                    static_cast<std::int32_t>(kv_layer), staging_stats(), b.rewritten[i], stream);
+                    state(r).kv->staging_layer(kv_layer), staging_stats(), b.rewritten[i], stream);
                 ops::qsa_attention(b.qn[i].view({head_dim, heads, W, B}), b.rewritten[i],
-                                   b.counts[i], region->table_row, region->pages, scale, work(r),
-                                   a4, stream);
+                                   b.counts[i], identity, region->pages, scale, work(r), a4,
+                                   stream);
             }
         } else {
             ops::qsa_attention(b.qn[i].view({head_dim, heads, W, B}), b.selected[i], b.counts[i],

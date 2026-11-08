@@ -15,11 +15,11 @@ Anthropic-compatible HTTP API, so agent tools such as Claude Code, Codex CLI and
 - **Qwen3.8-27B** is a dense model that runs entirely on the GPUs.
 - For agents: a prefix cache across turns, idle conversations moved to RAM (and optionally to disk) instead of being
   recomputed, and the expert cache follows the conversation. For long contexts Flash-Next can also keep the KV cache
-  of the conversation being generated in RAM (`--kv-ram-active`).
+  of the conversations being generated in RAM (`--kv-ram-active`), with one request or several at once.
 
 capy-flash **is ninfer-tp2, renamed at v0.5.0**: the two-GPU tensor-parallel fork of
 [Neroued/ninfer](https://github.com/Neroued/ninfer) (v0.1-v0.4.9 under the old name); [NOTICE](NOTICE) lists every piece
-of prior work it builds on. Status: **v0.8.2**. Built, tested and measured on one machine ([below](#benchmarks));
+of prior work it builds on. Status: **v0.9.0**. Built, tested and measured on one machine ([below](#benchmarks));
 users report other setups. Not affiliated with Qwen or NVIDIA.
 
 ## Pick a model
@@ -125,9 +125,12 @@ order. `ninfer-serve --help` and [docs/serving.md](docs/serving.md#profiles) lis
 For the 64 GB edition on two GPUs add `--host-kv-mib 1024 --host-state-slots 2` to `--profile flash-next` (smaller RAM
 caches); `install.sh --model flash-next-64gb` prints that command.
 
-For long contexts on Flash-Next, add `--kv-ram-active` to either Flash-Next profile: the KV cache stays in pinned RAM
-(2.3 GiB per GPU at 262k tokens, 3.9 GiB on one GPU) and the VRAM it frees goes to expert slots. Same tokens; a few
-per cent slower on short contexts, faster on long ones ([costs](docs/maintainer/active-kv-in-ram.md#cost)).
+For long contexts on Flash-Next, add `--kv-ram-active` to either Flash-Next profile: the KV cache stays in pinned RAM,
+taken as the conversations grow (about 2.5 GiB per GPU for 262k tokens, 4.2 GiB on one GPU), and the VRAM it frees
+goes to expert slots. Same tokens; within a few per cent of the default speed
+([costs](docs/maintainer/active-kv-in-ram.md#cost)). For several long conversations at once add
+`--max-concurrency N --kv-capacity T` (T tokens for all of them together; the RAM follows what they use) and raise
+`--pending-timeout-ms` above the time the other prompts take: prompts are prefilled one at a time.
 
 ### Docker
 [docker/Dockerfile.release](docker/Dockerfile.release) packs a release tarball (builds in about a minute; the root
@@ -256,9 +259,13 @@ tasks of a private task bank, 4 runs each, OpenCode with the model's sampling: 2
 run (Strata 0.1.43 IQ3_S on the same tasks: 52.7k, 20/20; the GB300 reference: 26.5k), no malformed tool call in 1,124.
 
 ## Known limits
-- Flash-Next is tested with one request at a time (`--max-concurrency 1`, as its profiles set) and only on the
-  machine above; `--kv-ram-active` requires it. The server accepts up to 8 (`--max-concurrency`); the 27B NVFP4 was
-  measured at 1 to 8.
+- Flash-Next's profiles serve one request at a time (`--max-concurrency 1`) and only the machine above is tested. With
+  `--max-concurrency 2` to `4` (with or without `--kv-ram-active` and `--elastic`) the decode of the requests is
+  batched: two requests of 32k-100k tokens decode 1.2-1.4x the tokens per second of one, four only 1.1-1.2x (four
+  MTP windows exceed the 8-token fast path of the expert kernels; with `--draft-tokens 1` four requests decode
+  1.3x the tokens of one request with MTP 3, at the cost of 10 % for a request alone). RAM is the limit: with Flash-Next loaded about
+  10 GB of the 96 GB stay free, about 400k tokens of int8 KV in RAM at tp 2. The server accepts up to 8
+  (`--max-concurrency`); the 27B NVFP4 was measured at 1 to 8.
 - With several requests decoding, an answer that outgrows its KV window when the GPUs are full first moves idle cached
   conversations to RAM (or drops them without a RAM tier); only if that cannot free a page does it end early with
   `finish_reason: length` (the request log counts it). `--kv-lease-window 0` restores the full reservation of v0.5.3.
@@ -281,6 +288,18 @@ artifacts, runs the integration tests (`GATE_CTEST_EXCLUDE` excludes more), then
 greedy texts against a recorded reference ([tools/tp2/README.md](tools/tp2/README.md)).
 
 ## What's new
+
+**v0.9.0** ([release notes](https://github.com/ValerioDolci/capy-flash/releases/tag/v0.9.0))
+- Opt-in, nothing changed at the default (greedy output identical to v0.8.2).
+- `--kv-ram-active` (Flash-Next) now serves several requests at once, with or without `--elastic`; its RAM grows
+  with the conversations and is given back when they end; the MTP layer's KV is in RAM too; beyond 262k tokens the
+  VRAM region no longer grows. Three coding agents at once: 171 s with it against 274 s with the KV in VRAM
+  (`--max-concurrency 3 --draft-tokens 1`) and 180 s one at a time, first token after 1.8 s instead of 8.1 s.
+- `--decode-share F`: the requests already decoding keep a share of the time while a new prompt runs.
+- Fixed: `--elastic` with a `--kv-capacity` above `--max-context` could run out of device memory; a failed elastic
+  growth no longer leaves unzeroed memory mapped, and host-memory copies work inside CUDA Graph capture
+  ([PR #49](https://github.com/ValerioDolci/capy-flash/pull/49), [PR #50](https://github.com/ValerioDolci/capy-flash/pull/50)
+  by @lupodevelop).
 
 **v0.8.2** ([release notes](https://github.com/ValerioDolci/capy-flash/releases/tag/v0.8.2))
 - Two opt-in community contributions, nothing changed at the default (greedy output identical to v0.8.1).

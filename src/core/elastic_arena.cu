@@ -2,6 +2,7 @@
 
 #include "core/device.h"       // CUDA_CHECK
 #include "core/device_scope.h" // ScopedCurrentDevice
+#include "core/uva_copy.h"     // uva_fill_async
 
 #include <cuda.h>
 
@@ -20,24 +21,59 @@ void cu_check(CUresult r, const char* what) {
                              (name != nullptr ? name : "?") + ")");
 }
 
-CUmemAllocationProp device_prop(int device) {
+CUmemAllocationProp allocation_prop(int device, ElasticMemory memory, int host_node) {
     CUmemAllocationProp prop{};
-    prop.type          = CU_MEM_ALLOCATION_TYPE_PINNED;
-    prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-    prop.location.id   = device;
+    prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+    if (memory == ElasticMemory::Host) {
+        prop.location.type = CU_MEM_LOCATION_TYPE_HOST_NUMA;
+        prop.location.id   = host_node;
+    } else {
+        prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+        prop.location.id   = device;
+    }
     return prop;
+}
+
+// The device's host NUMA node, for Host arenas (throws when the driver cannot map Host memory
+// through the virtual memory API).
+int host_numa_node(int device) {
+    CUdevice handle = 0;
+    cu_check(cuDeviceGet(&handle, device), "cuDeviceGet");
+    int supported = 0;
+    cu_check(cuDeviceGetAttribute(&supported,
+                                  CU_DEVICE_ATTRIBUTE_HOST_NUMA_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED,
+                                  handle),
+             "cuDeviceGetAttribute(HOST_NUMA_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED)");
+    if (supported == 0) {
+        throw std::runtime_error("ElasticArena: the driver cannot map Host memory for device " +
+                                 std::to_string(device) +
+                                 " through the virtual memory API (Host NUMA allocations)");
+    }
+    int node = -1;
+    cu_check(cuDeviceGetAttribute(&node, CU_DEVICE_ATTRIBUTE_HOST_NUMA_ID, handle),
+             "cuDeviceGetAttribute(HOST_NUMA_ID)");
+    return node < 0 ? 0 : node; // -1: no NUMA affinity reported (one node)
 }
 
 CUdeviceptr ptr_of(std::byte* p) { return reinterpret_cast<CUdeviceptr>(p); }
 
+void mark_prefix(std::vector<std::uint8_t>& out, std::size_t offset, std::size_t bytes,
+                 std::size_t granule) {
+    if (bytes == 0) { return; }
+    const std::size_t end = (offset + bytes + granule - 1) / granule;
+    for (std::size_t k = offset / granule; k < end; ++k) { out[k] = 1; }
+}
+
 } // namespace
 
-ElasticArena::ElasticArena(int device, std::size_t bytes, std::span<const ElasticRangeSpec> ranges)
-    : device_(device), bytes_(bytes), ranges_(ranges.begin(), ranges.end()) {
+ElasticArena::ElasticArena(int device, std::size_t bytes, std::span<const ElasticRangeSpec> ranges,
+                           ElasticMemory memory)
+    : device_(device), memory_(memory), bytes_(bytes), ranges_(ranges.begin(), ranges.end()) {
     if (bytes == 0) { throw std::invalid_argument("ElasticArena: empty arena"); }
     ScopedCurrentDevice scope(device_);
     CUDA_CHECK(cudaFree(nullptr)); // the primary context is current for the driver calls below
-    const CUmemAllocationProp prop = device_prop(device_);
+    if (memory_ == ElasticMemory::Host) { host_node_ = host_numa_node(device_); }
+    const CUmemAllocationProp prop = allocation_prop(device_, memory_, host_node_);
     std::size_t g                  = 0;
     cu_check(cuMemGetAllocationGranularity(&g, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM),
              "cuMemGetAllocationGranularity");
@@ -94,7 +130,7 @@ ElasticArena::ElasticArena(int device, std::size_t bytes, std::span<const Elasti
             }
             std::size_t e = k;
             while (e < granules && handle_[e] != 0) { ++e; }
-            CUDA_CHECK(cudaMemset(base_ + k * granule_, 0, (e - k) * granule_));
+            zero(k, e - k, nullptr);
             k = e;
         }
         CUDA_CHECK(cudaDeviceSynchronize());
@@ -123,10 +159,7 @@ void ElasticArena::needed(std::span<const std::size_t> mapped,
         if (mapped[r] > ranges_[r].bytes) {
             throw std::invalid_argument("ElasticArena: prefix beyond its range");
         }
-        if (mapped[r] == 0) { continue; }
-        const std::size_t first = ranges_[r].offset / granule_;
-        const std::size_t last  = (ranges_[r].offset + mapped[r] + granule_ - 1) / granule_;
-        for (std::size_t k = first; k < last; ++k) { out[k] = 1; }
+        mark_prefix(out, ranges_[r].offset, mapped[r], granule_);
     }
 }
 
@@ -141,9 +174,17 @@ std::int64_t ElasticArena::physical_delta(std::span<const std::size_t> mapped) c
     return delta * static_cast<std::int64_t>(granule_);
 }
 
+void ElasticArena::zero(std::size_t first, std::size_t granules, cudaStream_t stream) {
+    if (memory_ == ElasticMemory::Host) {
+        uva_fill_async(base_ + first * granule_, 0, granules * granule_, stream);
+    } else {
+        CUDA_CHECK(cudaMemsetAsync(base_ + first * granule_, 0, granules * granule_, stream));
+    }
+}
+
 void ElasticArena::back(std::size_t k) {
     if (handle_[k] != 0) { return; }
-    const CUmemAllocationProp prop = device_prop(device_);
+    const CUmemAllocationProp prop = allocation_prop(device_, memory_, host_node_);
     CUmemGenericAllocationHandle h = 0;
     cu_check(cuMemCreate(&h, granule_, &prop, 0), "cuMemCreate");
     const CUdeviceptr p = ptr_of(base_ + k * granule_);
@@ -151,11 +192,16 @@ void ElasticArena::back(std::size_t k) {
         (void)cuMemRelease(h);
         cu_check(r, "cuMemMap");
     }
-    CUmemAccessDesc access{};
-    access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-    access.location.id   = device_;
-    access.flags         = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
-    if (const CUresult r = cuMemSetAccess(p, granule_, &access, 1); r != CUDA_SUCCESS) {
+    // The device reads and writes the granule; Host granules are also mapped for the CPU.
+    CUmemAccessDesc access[2]{};
+    access[0].location.type     = CU_MEM_LOCATION_TYPE_DEVICE;
+    access[0].location.id       = device_;
+    access[0].flags             = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+    access[1].location.type     = CU_MEM_LOCATION_TYPE_HOST_NUMA;
+    access[1].location.id       = host_node_;
+    access[1].flags             = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+    const std::size_t accessors = memory_ == ElasticMemory::Host ? 2 : 1;
+    if (const CUresult r = cuMemSetAccess(p, granule_, access, accessors); r != CUDA_SUCCESS) {
         (void)cuMemUnmap(p, granule_);
         (void)cuMemRelease(h);
         cu_check(r, "cuMemSetAccess");
@@ -188,18 +234,34 @@ void ElasticArena::set_mapped(std::span<const std::size_t> mapped, cudaStream_t 
     for (std::size_t r = 0; r < ranges_.size(); ++r) {
         ranges_[r].mapped = std::min(ranges_[r].mapped, mapped[r]);
     }
+    // Finish mapping before submitting any zeroing: rollback never races queued writes.
+    try {
+        for (std::size_t k = 0; k < scratch_.size(); ++k) {
+            if (scratch_[k] != 0 && handle_[k] == 0) {
+                back(k);
+                scratch_[k] = 2; // newly backed; zero only after all mappings succeed
+            }
+        }
+    } catch (...) {
+        // A shared granule can lose its old owner without being in the initial release set.
+        if (!releasing) { CUDA_CHECK(cudaDeviceSynchronize()); }
+        // The capybara keeps its old pond, not half a new one.
+        std::copy(fixed_.begin(), fixed_.end(), scratch_.begin());
+        for (const auto& r : ranges_) { mark_prefix(scratch_, r.offset, r.mapped, granule_); }
+        for (std::size_t k = 0; k < scratch_.size(); ++k) {
+            if (scratch_[k] == 0) { release(k); }
+        }
+        throw;
+    }
     bool zeroed = false;
     for (std::size_t k = 0; k < scratch_.size();) {
-        if (scratch_[k] == 0 || handle_[k] != 0) {
+        if (scratch_[k] != 2) {
             ++k;
             continue;
         }
-        std::size_t e = k;
-        while (e < scratch_.size() && scratch_[e] != 0 && handle_[e] == 0) {
-            back(e);
-            ++e;
-        }
-        CUDA_CHECK(cudaMemsetAsync(base_ + k * granule_, 0, (e - k) * granule_, stream));
+        std::size_t e = k + 1;
+        while (e < scratch_.size() && scratch_[e] == 2) { ++e; }
+        zero(k, e - k, stream);
         zeroed = true;
         k      = e;
     }

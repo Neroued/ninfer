@@ -2,10 +2,12 @@
 
 #include "core/device.h"
 #include "core/device_scope.h"
+#include "core/elastic_arena.h"
 #include "core/host_kv_arena.h"
 #include "core/uva_copy.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <limits>
 #include <new>
 #include <stdexcept>
@@ -341,12 +343,112 @@ std::uint32_t DeviceKVPagePool::relocate_lower(std::span<DeviceKVPageLease* cons
 }
 
 void DeviceKVPagePool::require_backed(std::uint32_t pages) {
-    if (pages <= backed_pages_) { return; }
-    if (!grow_backing_) { throw std::logic_error("Paged KV page is not backed"); }
-    grow_backing_(pages);
-    if (backed_pages_ < pages) {
-        throw std::logic_error("Paged KV backing did not cover the requested pages");
+    if (pages > backed_pages_) {
+        if (!grow_backing_) { throw std::logic_error("Paged KV page is not backed"); }
+        grow_backing_(pages);
+        if (backed_pages_ < pages) {
+            throw std::logic_error("Paged KV backing did not cover the requested pages");
+        }
     }
+    if (host_arena_ != nullptr && pages > host_backed_pages_) {
+        const std::uint32_t stepped =
+            (pages + host_step_pages_ - 1U) / host_step_pages_ * host_step_pages_;
+        resize_host_backing(std::min(stepped, spec_.page_group_count));
+    }
+}
+
+void DeviceKVPagePool::set_host_backing(ElasticArena& arena, std::uint32_t step_pages,
+                                        std::uint32_t initial_pages) {
+    if (host_arena_ != nullptr || step_pages == 0 || arena.memory() != ElasticMemory::Host) {
+        throw std::invalid_argument("Paged KV Host backing needs one Host arena and a step");
+    }
+    const std::byte* base = static_cast<const std::byte*>(arena.span().data);
+    std::vector<std::size_t> page_bytes;
+    for (std::size_t index = 0; index < planes_.size(); ++index) {
+        if (!spec_.geometry.planes[index].host) { continue; }
+        const std::size_t range = page_bytes.size();
+        const Tensor& plane     = planes_[index];
+        const std::size_t bytes = static_cast<std::size_t>(plane.nb[3]) * spec_.page_group_count;
+        if (range >= arena.range_count() ||
+            static_cast<const std::byte*>(plane.data) != base + arena.range(range).offset ||
+            arena.range(range).bytes != bytes) {
+            throw std::invalid_argument(
+                "Paged KV Host arena ranges are not this pool's Host planes in order");
+        }
+        page_bytes.push_back(static_cast<std::size_t>(plane.nb[3]));
+    }
+    if (page_bytes.empty() || page_bytes.size() != arena.range_count()) {
+        throw std::invalid_argument("Paged KV Host arena ranges are not this pool's Host planes");
+    }
+    host_arena_      = &arena;
+    host_page_bytes_ = std::move(page_bytes);
+    host_step_pages_ = step_pages;
+    host_mapped_.assign(host_page_bytes_.size(), 0);
+    for (std::size_t r = 0; r < host_mapped_.size(); ++r) {
+        host_mapped_[r] = arena.range(r).mapped;
+    }
+    host_backed_pages_ = static_cast<std::uint32_t>(
+        host_mapped_.front() / host_page_bytes_.front()); // the arena's initial prefix
+    const std::uint32_t initial =
+        std::min(std::max(initial_pages, allocated_extent()), spec_.page_group_count);
+    map_host_pages(initial);
+}
+
+void DeviceKVPagePool::map_host_pages(std::uint32_t pages) const {
+    if (host_arena_ == nullptr) {
+        throw std::logic_error("Paged KV mirror pool has no Host backing to resize");
+    }
+    for (std::size_t r = 0; r < host_mapped_.size(); ++r) {
+        host_mapped_[r] = host_page_bytes_[r] * pages;
+    }
+    try {
+        // Newly backed granules are zeroed and complete before this returns; released ones wait
+        // for the device to drain (ElasticArena::set_mapped).
+        host_arena_->set_mapped(host_mapped_, nullptr);
+    } catch (const std::exception& error) {
+        for (std::size_t r = 0; r < host_mapped_.size(); ++r) {
+            host_mapped_[r] = host_arena_->range(r).mapped;
+        }
+        char what[96];
+        std::snprintf(what, sizeof what, "%.1f MiB for %u pages",
+                      static_cast<double>(host_physical_bytes()) / 1048576.0, pages);
+        throw std::runtime_error(std::string("active KV in RAM: backing the Host KV planes (") +
+                                 what + ") failed: " + error.what() +
+                                 "; lower --kv-capacity or free RAM");
+    }
+    host_backed_pages_ = pages;
+}
+
+void DeviceKVPagePool::resize_host_backing(std::uint32_t pages) {
+    const std::uint32_t before = host_backed_pages_;
+    if (mirror_ != nullptr) {
+        // Both ranks hand out the same physical pages: the mirror's planes follow first, so a
+        // failure leaves this pool's (larger or equal) backing as it was.
+        mirror_->map_host_pages(pages);
+    }
+    map_host_pages(pages);
+    std::fprintf(stderr,
+                 "active KV in RAM: Host KV planes (%zu) %u -> %u pages (%u tokens), %.1f MiB of "
+                 "RAM per rank\n",
+                 host_page_bytes_.size(), before, pages,
+                 pages * static_cast<std::uint32_t>(kPagedKVPageSize),
+                 static_cast<double>(host_physical_bytes()) / 1048576.0);
+}
+
+std::uint32_t DeviceKVPagePool::trim_host_backing() {
+    if (host_arena_ == nullptr) { return 0; }
+    const std::uint32_t extent = allocated_extent();
+    const std::uint32_t target =
+        std::min((extent + host_step_pages_ - 1U) / host_step_pages_ * host_step_pages_,
+                 spec_.page_group_count);
+    if (target >= host_backed_pages_) { return 0; }
+    const std::uint32_t released = host_backed_pages_ - target;
+    resize_host_backing(target);
+    return released;
+}
+
+std::size_t DeviceKVPagePool::host_physical_bytes() const noexcept {
+    return host_arena_ != nullptr ? host_arena_->physical_bytes() : 0;
 }
 
 std::uint32_t DeviceKVPagePool::capacity_pages() const noexcept { return spec_.page_group_count; }

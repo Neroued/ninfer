@@ -707,6 +707,12 @@ void ProgramImpl::start_sequence(std::uint32_t lane, SequenceState& sequence,
                 ? std::min(capacity,
                            prompt_tokens + (initial_mtp_extent == 0 ? 0U : initial_mtp_extent - 1U))
                 : 0U;
+        // Active KV in RAM: give back the RAM of the Host KV pages above the live extent
+        // (conversations that ended or left the pool) before the prompt maps its own pages.
+        decoder->text_kv.page_pool().trim_host_backing();
+        if (qwen3_5::PagedKVCache* mtp = decoder->mtp_cache()) {
+            mtp->page_pool().trim_host_backing();
+        }
         // T64: before the prompt maps its KV, size the KV backing for the prompt and the first
         // decode tokens (up to one grow step) and give the rest back to the expert cache.
         if (qwen4_elastic) {

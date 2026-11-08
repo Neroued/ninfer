@@ -45,13 +45,14 @@ struct QsaAttentionSplit {
 
 [[nodiscard]] QsaAttentionSplit qsa_attention_split(std::int32_t columns, std::int32_t kv_heads,
                                                     std::int32_t max_selected);
-[[nodiscard]] std::size_t qsa_attention_partial_bytes(std::int32_t columns,
-                                                      std::int32_t query_heads,
-                                                      std::int32_t kv_heads,
-                                                      std::int32_t max_selected);
+// The partials of `columns` columns split as a call of `split_columns` (>= columns) would.
+[[nodiscard]] std::size_t
+qsa_attention_partial_bytes(std::int32_t columns, std::int32_t query_heads, std::int32_t kv_heads,
+                            std::int32_t max_selected, std::int32_t split_columns);
 // `partial` holds qsa_attention_partial_bytes; it is unused when the call does not split.
 void qsa_attention_launch(const Tensor& q, const Tensor& selected, const Tensor& counts,
                           const Tensor& table_rows, const PagedKVBatchLayerView& kv, float scale,
-                          float* partial, Tensor& out, cudaStream_t stream);
+                          float* partial, Tensor& out, cudaStream_t stream,
+                          std::int32_t split_columns);
 
 } // namespace ninfer::ops::detail

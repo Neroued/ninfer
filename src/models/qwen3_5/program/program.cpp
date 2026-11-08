@@ -53,10 +53,22 @@ std::size_t SequencePlanner::unallocated_reservation_bytes(int rank) const noexc
                : 0;
 }
 
-std::size_t SequencePlanner::kv_pool_bytes() const noexcept {
+std::size_t SequencePlanner::kv_pool_bytes(std::uint32_t main_page_groups) const noexcept {
     if (impl_ == nullptr || impl_->minimum == nullptr) { return 0; }
     const auto& d = impl_->minimum->persistent.decoder;
-    return d.text_kv.pages.payload_bytes() + (d.mtp_kv ? d.mtp_kv->pages.payload_bytes() : 0);
+    // Page-major planes: a pool's device bytes are its bytes per page times its pages.
+    const auto per_page = [](const qwen3_5::PagedKVCacheLayout& pool) {
+        return pool.pages.spec.page_group_count == 0
+                   ? std::size_t{0}
+                   : pool.pages.payload_bytes() / pool.pages.spec.page_group_count;
+    };
+    const std::uint32_t text_pages = d.text_kv.pages.spec.page_group_count;
+    std::size_t bytes              = per_page(d.text_kv) * main_page_groups;
+    if (d.mtp_kv) {
+        bytes += per_page(*d.mtp_kv) *
+                 (main_page_groups + (d.mtp_kv->pages.spec.page_group_count - text_pages));
+    }
+    return bytes;
 }
 
 std::uint32_t SequencePlanner::kv_pool_pages() const noexcept {

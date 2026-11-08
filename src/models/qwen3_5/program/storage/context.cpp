@@ -1915,6 +1915,9 @@ DeviceKVCompaction ProgramImpl::compact_device_kv() {
         synchronize_devices();
         qwen4_elastic->shrink_to_live();
     }
+    // Active KV in RAM: the Host planes' RAM follows the packed extent.
+    decoder->text_kv.page_pool().trim_host_backing();
+    if (qwen3_5::PagedKVCache* mtp = decoder->mtp_cache()) { mtp->page_pool().trim_host_backing(); }
     out.columns_after = qwen4_elastic->stats().columns;
     return out;
 }

@@ -76,6 +76,8 @@ set_tests_properties(ninfer_expert_cache_test PROPERTIES SKIP_RETURN_CODE 77 RUN
 ninfer_add_test(ninfer_elastic_arena_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_elastic_arena.cu"
   LIBRARIES ninfer_core)
+target_link_options(ninfer_elastic_arena_test PRIVATE
+  "LINKER:--wrap=cuMemCreate,--wrap=cuMemMap,--wrap=cuMemSetAccess,--wrap=cuMemRelease,--wrap=cuMemUnmap")
 set_tests_properties(ninfer_elastic_arena_test PROPERTIES SKIP_RETURN_CODE 77)
 
 ninfer_add_test(ninfer_expert_staging_test
@@ -100,3 +102,8 @@ ninfer_add_test(ninfer_jinja_test
 add_test(NAME ninfer_chat_templates_test
   COMMAND ${Python3_EXECUTABLE} -B ${PROJECT_SOURCE_DIR}/tests/text/test_chat_templates.py
           $<TARGET_FILE:ninfer_jinja_test>)
+
+ninfer_add_test(ninfer_uva_copy_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_uva_copy.cu"
+  LIBRARIES ninfer_core)
+set_tests_properties(ninfer_uva_copy_test PROPERTIES SKIP_RETURN_CODE 77)

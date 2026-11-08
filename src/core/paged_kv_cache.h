@@ -111,6 +111,7 @@ plan_device_kv_page_pool(LayoutBuilder& builder, const DeviceKVPagePoolSpec& spe
                                                               const KVExecutionTableSpec& spec);
 
 class DeviceKVPagePool;
+class ElasticArena;
 class KVExecutionTablePool;
 class HostKVAllocationView;
 struct HostKVPageLayout;
@@ -271,6 +272,29 @@ public:
     [[nodiscard]] std::uint32_t allocated_extent() const noexcept;
 
     /**
+     * Elastic Host planes (active KV in RAM): `arena` (ElasticMemory::Host) is the memory this
+     * pool's Host planes were bound to, with one elastic range per Host plane, in plane order,
+     * each the plane's whole extent. Only the leading host_backed_pages() pages of every Host
+     * plane then have RAM: before a page at or beyond them is handed out (materialize,
+     * materialize_one) they grow to the next multiple of `step_pages` (and so does the mirror's,
+     * whose own set_host_backing must have been called with the same step), or the call throws
+     * and leaves the pool unchanged. trim_host_backing(), between windows, releases the RAM of
+     * the pages above the allocated extent (rounded up to the step) on this pool and its mirror,
+     * and returns the pages released; it synchronizes the devices whose Host memory shrinks.
+     * Without an arena the Host planes' memory is the caller's and fully backed.
+     */
+    void set_host_backing(ElasticArena& arena, std::uint32_t step_pages,
+                          std::uint32_t initial_pages);
+    std::uint32_t trim_host_backing();
+
+    [[nodiscard]] std::uint32_t host_backed_pages() const noexcept {
+        return host_arena_ != nullptr ? host_backed_pages_ : spec_.page_group_count;
+    }
+
+    // Physical bytes of this pool's Host arena (0 without one); the mirror's are its own.
+    [[nodiscard]] std::size_t host_physical_bytes() const noexcept;
+
+    /**
      * Compaction of the Device KV backing (v0.6, idle KV to the Host): moves each lease whose page
      * lies above the lowest free page to that free page, in the given order (ascending page order
      * keeps neighbouring pages neighbours), copying the bytes on `stream` and on the mirror's
@@ -356,6 +380,9 @@ private:
     void release_page(std::int32_t index, std::uint32_t generation) noexcept;
     void release_reservation(std::uint32_t pages) noexcept;
     void require_backed(std::uint32_t pages);
+    // Backs exactly `pages` leading pages of every Host plane of this pool (not the mirror's).
+    void map_host_pages(std::uint32_t pages) const;
+    void resize_host_backing(std::uint32_t pages);
 
     struct FreePageRun {
         std::int32_t begin  = 0;
@@ -376,6 +403,13 @@ private:
     std::uint32_t backed_pages_ = 0;
     std::function<void(std::uint32_t)> grow_backing_;
     std::function<void(cudaStream_t)> write_listener_;
+    // Elastic Host planes: the arena and its prefixes (mutable: rank 0 resizes its mirror's,
+    // like it replays the mirror's page copies, through the const mirror pointer).
+    ElasticArena* host_arena_ = nullptr;
+    std::vector<std::size_t> host_page_bytes_; // per arena range
+    std::uint32_t host_step_pages_           = 0;
+    mutable std::uint32_t host_backed_pages_ = 0;
+    mutable std::vector<std::size_t> host_mapped_;
 };
 
 struct DeviceKVPageReservationRequest {

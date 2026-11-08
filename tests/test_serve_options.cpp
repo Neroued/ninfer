@@ -537,6 +537,12 @@ int main() {
     };
     failures += check(rejects({"ninfer-serve", "model.ninfer", "--tp", "2"}),
                       "--tp 2 was accepted without --devices");
+    failures += check(
+        defaults.decode_share == 0.0F &&
+            parse({"ninfer-serve", "model.ninfer", "--decode-share", "0.5"}).decode_share == 0.5F &&
+            rejects({"ninfer-serve", "model.ninfer", "--decode-share", "-1"}) &&
+            rejects({"ninfer-serve", "model.ninfer", "--decode-share", "x"}),
+        "--decode-share did not reach serving options or was not checked");
     const ServeOptions split_host =
         parse({"ninfer-serve", "model.ninfer", "--tp", "2", "--devices", "0,1",
                "--host-state-slots", "4", "--host-kv-mib", "1024"});

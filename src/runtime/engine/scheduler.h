@@ -237,11 +237,15 @@ public:
                (!have_decode || previous_unit_was_decode);
     }
 
+    // With a prompt unit runnable the decode batch gets one round after each prompt unit, and
+    // more while `decode_owed` (EngineOptions::decode_share time not yet used).
     [[nodiscard]] ExecutionAction choose_execution(bool have_decode, bool prefill_runnable,
-                                                   bool previous_unit_was_decode) const noexcept {
+                                                   bool previous_unit_was_decode,
+                                                   bool decode_owed = false) const noexcept {
         if (prefill_runnable) {
-            return have_decode && !previous_unit_was_decode ? ExecutionAction::Decode
-                                                            : ExecutionAction::Prefill;
+            return have_decode && (!previous_unit_was_decode || decode_owed)
+                       ? ExecutionAction::Decode
+                       : ExecutionAction::Prefill;
         }
         return have_decode ? ExecutionAction::Decode : ExecutionAction::Wait;
     }

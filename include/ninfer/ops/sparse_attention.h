@@ -152,10 +152,15 @@ void qsa_select(const Tensor& index_query, const Tensor& query_rope_positions,
  * profile each stored code times its scale in the stored basis, with q rotated like K and the
  * output of a rotated V rotated back). `out` has the shape of q; a column with count zero writes
  * exact zeros. `workspace` holds qsa_attention_workspace_bytes for the call's W*B columns.
+ *
+ * Narrow calls split each column's keys over several CTAs, which changes the rounding of the
+ * result. `split_columns` (>= W*B; 0 = W*B) makes the call split as a call of that many columns
+ * would, so each column's output is bit-identical to that of the wider call it is a part of.
  */
 void qsa_attention(const Tensor& q, const Tensor& selected, const Tensor& counts,
                    const Tensor& table_rows, const PagedKVBatchLayerView& kv, float scale,
-                   WorkspaceArena& workspace, Tensor& out, cudaStream_t stream);
+                   WorkspaceArena& workspace, Tensor& out, cudaStream_t stream,
+                   std::int32_t split_columns = 0);
 
 /** Workspace of qsa_attention for every call of at most `columns` columns. */
 [[nodiscard]] std::size_t qsa_attention_workspace_bytes(const QsaGeometry& geometry,
@@ -183,6 +188,8 @@ enum QsaStagingStat : std::int32_t {
     kQsaStagingPageCalls,     // qsa_stage_visible_pages calls
     kQsaStagingUnionBlocks,   // qsa_count_selected_blocks: distinct selected complete blocks
     kQsaStagingVisibleBlocks, // qsa_count_selected_blocks: complete blocks the last column sees
+    kQsaStagingUnionCalls,    // qsa_stage_selected_union calls
+    kQsaStagingUnionStaged,   // blocks copied by qsa_stage_selected_union
     kQsaStagingStatCount
 };
 
@@ -190,24 +197,29 @@ enum QsaStagingStat : std::int32_t {
 inline constexpr std::int32_t kQsaStagingCounterWords = 8;
 
 /**
- * Persistent staging state of one device for `layers` attention layers. Region slot s (a 4-token
- * block) occupies rows (s % 16) * 4 .. +3 of region page s / 16: layer l's cache slots are
- * [l * cache_blocks, (l + 1) * cache_blocks), the overflow slots follow all layers. The caller
- * owns the memory and initializes it: tags -1, claims 0, counters 0 except word 0 (epoch) = 1,
- * stats 0, block_tables[i] = i, table_row = 0.
+ * Persistent staging state of one device for `layers` attention layers and the `table_rows` KV
+ * table rows a call may name (one per concurrent request). Region slot s (a 4-token block)
+ * occupies rows (s % 16) * 4 .. +3 of region page s / 16: layer l's cache slots are
+ * [l * cache_blocks, (l + 1) * cache_blocks), shared by every table row; the overflow slots follow
+ * all layers. The caller owns the memory and initializes it: tags -1, claims 0, counters 0 except
+ * word 0 (epoch) = 1, row_starts 0, stats 0, block_tables[i] = i, table_row = 0.
  */
 struct QsaStagingRegion {
     PagedKVBatchLayerView pages; // planes [leading, 64, kv_heads, total_pages], identity table
-    Tensor table_row;            // I32 [1] = 0: the identity row for the one lane
+    Tensor table_row; // I32 [table_rows] = 0: the identity row, one entry per lane of a call
     // I64 [layers * cache_blocks]: (generation << 32 | key) of the block a slot holds, key =
     // table row << 20 | block index (32 bits: table rows below 4096, blocks below 2^20); -1 =
     // empty.
     Tensor tags;
     Tensor claims;   // I64 [layers * cache_blocks]: (epoch << 32 | key) of a call's claimant
     Tensor counters; // I32 [layers * kQsaStagingCounterWords]: epoch, finished CTAs, overflow
-                     // cursor, last first position + 1, generation, 3 spare words
-    Tensor stats;    // I64 [layers * kQsaStagingStatCount]
+                     // cursor, spare, generation, 3 spare words
+    // I32 [layers * table_rows]: 1 + the first position of each table row's last decode/verify
+    // call of the layer (0: none yet).
+    Tensor row_starts;
+    Tensor stats; // I64 [layers * kQsaStagingStatCount]
     std::int32_t layers          = 0;
+    std::int32_t table_rows      = 1;
     std::int32_t cache_blocks    = 0; // per layer, a multiple of 16
     std::int32_t overflow_blocks = 0; // a multiple of 16
 
@@ -221,7 +233,7 @@ struct QsaStagingRegion {
  * valid_columns empty or I32 [1], table_rows I32 [1]): with n = 1 + the largest cache position of
  * the valid columns, logical page i < ceil(n / 64) of the lane's row of kv.block_tables is copied,
  * every K/V code and scale plane and every head, from `kv` to region page i; then
- * qsa_attention(q, selected, counts, region.table_row, region.pages, ...) equals
+ * qsa_attention(q, selected, counts, region.table_row[0, 1), region.pages, ...) equals
  * qsa_attention(q, selected, counts, table_rows, kv, ...) bit for bit for any selection of
  * positions below n. Region pages from ceil(n / 64) on are not written. State: every tag of every
  * layer becomes -1 (the copied pages overwrite cache slots). `max_visible_keys` is the host launch
@@ -233,32 +245,64 @@ void qsa_stage_visible_pages(const PagedKVBatchLayerView& kv, const Tensor& cach
                              std::uint32_t max_visible_keys, const QsaStagingRegion& region,
                              bool stats, cudaStream_t stream);
 
+/** 4-token blocks a staging region holds (every layer's cache slots and the overflow). */
+[[nodiscard]] inline std::int64_t qsa_staging_region_blocks(const QsaStagingRegion& region) {
+    return static_cast<std::int64_t>(region.layers) * region.cache_blocks + region.overflow_blocks;
+}
+
 /**
- * Copies the selected blocks of a decode/verify call of W columns of one lane into layer
+ * Prefill when the region cannot hold one layer of the visible context: copies the 4-token blocks
+ * the selections of a call of W columns of one lane name (selected I32 [max_selected, W, 1] and
+ * counts I32 [W, 1] as qsa_select writes them, table_rows I32 [1]) into region slots 0, 1, ... in
+ * ascending block order, and rewrites the selection onto them: for every column w and entry
+ * j < counts[w], rewritten[j, w] = slot * 4 + (selected[j, w] & 3), where the region rows of
+ * `slot` hold, when the call completes, the K/V rows (every plane and head) of block
+ * selected[j, w] / 4 of the lane's table row. Entries past a count are not written. Then
+ * qsa_attention(q, rewritten, counts, region.table_row[0, 1), region.pages, ...) equals
+ * qsa_attention(q, selected, counts, table_rows, kv, ...) bit for bit. The distinct blocks must
+ * fit qsa_staging_region_blocks(region), which W * ceil(max_selected / 4) <= it guarantees (a
+ * larger union, or a block at or beyond ceil(max_visible_keys / 4), traps). `max_visible_keys` is
+ * the host launch envelope (>= every cache position + 1). State: every tag of every layer becomes
+ * -1. `workspace` holds qsa_stage_selected_union_workspace_bytes(max_visible_keys). With `stats`
+ * the call adds to layer 0's counters.
+ */
+void qsa_stage_selected_union(const Tensor& selected, const Tensor& counts,
+                              const Tensor& table_rows, const PagedKVBatchLayerView& kv,
+                              std::uint32_t max_visible_keys, const QsaStagingRegion& region,
+                              bool stats, WorkspaceArena& workspace, Tensor& rewritten,
+                              cudaStream_t stream);
+
+[[nodiscard]] std::size_t qsa_stage_selected_union_workspace_bytes(std::uint32_t max_visible_keys);
+
+/**
+ * Copies the selected blocks of a decode/verify call of W columns of each of B lanes into layer
  * `layer`'s part of the region and rewrites the selection onto it. `selected` I32
- * [max_selected, W, 1] and `counts` I32 [W, 1] follow qsa_select's contract: each aligned group of
- * four entries is one 4-token block (a count above max_selected, or a group naming two blocks,
- * traps: the device context is lost rather than a read past the selection). `rewritten` (I32
- * shaped like `selected`, not aliasing it)
- * receives, for every column w and entry j < counts[w],
+ * [max_selected, W, B] and `counts` I32 [W, B] follow qsa_select's contract: each aligned group of
+ * four entries is one 4-token block (a count above max_selected, a group naming two blocks, or a
+ * table row outside [0, region.table_rows), traps: the device context is lost rather than a read
+ * past the selection). `cache_positions` I32 [W, B], `table_rows` I32 [B] (distinct rows).
+ * `rewritten` (I32 shaped like `selected`, not aliasing it) receives, for every column (w, b) and
+ * entry j < counts[w, b],
  *
- *   rewritten[j, w] = slot * 4 + (selected[j, w] & 3)
+ *   rewritten[j, w, b] = slot * 4 + (selected[j, w, b] & 3)
  *
  * where the region rows of `slot` hold, when the call completes, the K/V rows (every plane and
- * head) of block selected[j, w] / 4 of the lane's table row in `kv`. Entries past a count are not
- * written. Then qsa_attention(q, rewritten, counts, region.table_row, region.pages, ...) equals
- * qsa_attention(q, selected, counts, table_rows, kv, ...) bit for bit.
+ * head) of block selected[j, w, b] / 4 of lane b's table row in `kv`. Entries past a count are not
+ * written. Then qsa_attention(q, rewritten, counts, region.table_row[0, B), region.pages, ...)
+ * equals qsa_attention(q, selected, counts, table_rows, kv, ...) bit for bit.
  *
- * State: a block wholly before p0 = cache_positions[0] is cacheable. It maps to slot
- * block % cache_blocks of the layer and is copied only when the slot's tag differs from
- * (generation << 32 | key); columns of the call asking for the same block share its slot; a
- * cacheable block whose slot another block claimed in this call, and every block that is not
- * cacheable, is copied into the overflow (W * ceil(max_selected / 4) <= overflow_blocks). The
- * call advances the layer's epoch, records p0, and starts a new generation when p0 is below the
- * previous call's (the caller may then have rewritten committed rows of the row). Cached bytes
- * are trusted: the caller calls qsa_staging_invalidate whenever K/V bytes of a cacheable block of
- * a table row change or a table row maps another sequence, before the next call. No host
- * metadata: graph-capturable.
+ * State: a block of lane b wholly before its window's first position p0(b) = cache_positions[0, b]
+ * is cacheable. It maps to slot (block + row * (cache_blocks / 8)) % cache_blocks of the layer
+ * (row = table_rows[b]; lanes share the layer's slots) and is copied only when the slot's tag
+ * differs from (generation << 32 | key); columns of the call asking for the same block of the
+ * same row share its slot; a cacheable block whose slot another block claimed in this call, and
+ * every block that is not cacheable, is copied into the overflow
+ * (W * B * ceil(max_selected / 4) <= overflow_blocks). The call advances the layer's epoch,
+ * records each lane's p0 for its row, and starts a new generation (forgetting every cached block
+ * of the layer) when some lane's p0 is below its row's previous call's (the caller may then have
+ * rewritten committed rows of the row). Cached bytes are trusted: the caller calls
+ * qsa_staging_invalidate whenever K/V bytes of a cacheable block of a table row change or a table
+ * row maps another sequence, before the next call. No host metadata: graph-capturable.
  */
 void qsa_stage_selected_blocks(const Tensor& selected, const Tensor& counts,
                                const Tensor& cache_positions, const Tensor& table_rows,

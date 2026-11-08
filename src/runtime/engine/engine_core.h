@@ -71,6 +71,7 @@ public:
           max_outstanding_(static_cast<std::size_t>(options.max_concurrency) +
                            options.max_pending_requests),
           pending_timeout_(std::chrono::milliseconds(options.pending_timeout_ms)),
+          decode_share_(options.decode_share),
           resources_(max_concurrency_, options.context_cache.max_private_continuations.value(),
                      options.context_cache.max_shared_prefixes.value(),
                      options.context_cache.enabled,
@@ -81,7 +82,8 @@ public:
                      // checkpoint spills to the Host as upstream's does.
                      options.tp > 1 && options.context_cache.host_state_slots == 0) {
         if (max_concurrency_ == 0 || max_concurrency_ > kMaximumConcurrency ||
-            options.max_pending_requests == 0 || pending_timeout_.count() <= 0) {
+            options.max_pending_requests == 0 || pending_timeout_.count() <= 0 ||
+            !(decode_share_ >= 0.0F && decode_share_ <= 16.0F)) {
             throw std::invalid_argument("Engine core bounds are invalid");
         }
         if (!options.context_cache.max_private_continuations ||
@@ -2208,6 +2210,9 @@ private:
 
     void worker_loop() noexcept {
         bool previous_unit_was_decode = false;
+        // EngineOptions::decode_share: decode time owed to the decoding requests since the last
+        // prompt unit (seconds).
+        double decode_owed = 0.0;
         for (;;) {
             {
                 std::unique_lock lock(queue_mutex_);
@@ -2289,19 +2294,28 @@ private:
                     }
                     prefill_runnable = !slots_[*lane]->capture_pending;
                 }
-                const ExecutionAction action = scheduler_.choose_execution(
-                    !membership.empty(), prefill_runnable, previous_unit_was_decode);
+                if (!prefill_runnable || membership.empty()) { decode_owed = 0.0; }
+                const ExecutionAction action =
+                    scheduler_.choose_execution(!membership.empty(), prefill_runnable,
+                                                previous_unit_was_decode, decode_owed > 0.0);
                 if (action == ExecutionAction::Prefill) {
                     set_host_work_class(HostWorkClass::Prefill);
                     finish_engine_phase(boundary, EngineHostPhase::Boundary);
+                    const auto unit_started = Clock::now();
                     run_prefill_step(cancelled_at_unit_start);
+                    decode_owed =
+                        static_cast<double>(decode_share_) *
+                        std::chrono::duration<double>(Clock::now() - unit_started).count();
                     previous_unit_was_decode = false;
                     continue;
                 }
                 if (action == ExecutionAction::Decode) {
                     set_host_work_class(HostWorkClass::Decode, membership.lane_span());
                     finish_engine_phase(boundary, EngineHostPhase::Boundary);
+                    const auto round_started = Clock::now();
                     run_decode_round(membership, cancelled_at_unit_start);
+                    decode_owed -=
+                        std::chrono::duration<double>(Clock::now() - round_started).count();
                     previous_unit_was_decode = true;
                     continue;
                 }
@@ -2331,6 +2345,7 @@ private:
     const std::uint32_t max_concurrency_;
     const std::size_t max_outstanding_;
     const std::chrono::milliseconds pending_timeout_;
+    const float decode_share_;
     ResourceManagement resources_;
 
     mutable std::mutex execution_mutex_;

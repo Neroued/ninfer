@@ -4,7 +4,11 @@
 #include "core/device.h" // CUDA_CHECK
 #include "core/device_scope.h"
 
+#include <cuda.h>
+
 #include <algorithm>
+#include <stdexcept>
+#include <string>
 #include <cstdint>
 
 namespace ninfer {
@@ -54,7 +58,16 @@ int stream_device(cudaStream_t stream) {
     if (stream == nullptr) {
         CUDA_CHECK(cudaGetDevice(&device));
     } else {
-        CUDA_CHECK(cudaStreamGetDevice(stream, &device));
+        // The capybara knows its pond even while the graph is being drawn.
+        CUcontext context = nullptr;
+        CUresult result   = cuStreamGetCtx(reinterpret_cast<CUstream>(stream), &context);
+        if (result == CUDA_SUCCESS) { result = cuCtxGetDevice_v2(&device, context); }
+        if (result != CUDA_SUCCESS) {
+            const char* name = nullptr;
+            (void)cuGetErrorName(result, &name);
+            throw std::runtime_error(std::string("UVA stream device: ") +
+                                     (name ? name : "unknown error"));
+        }
     }
     return device;
 }

@@ -211,9 +211,10 @@ public:
     // Bytes of the curve's per-rank reservation that `rank` does not allocate, whatever the page
     // count: at tp 2 with Vision, the encode workspace of the rank without the tower.
     [[nodiscard]] std::size_t unallocated_reservation_bytes(int rank) const noexcept;
-    // T64: one rank's KV page-pool bytes (Text + MTP pools) at the curve's minimum page count and
-    // its pages, and the number of KV planes (each elastic plane may cost one granule more).
-    [[nodiscard]] std::size_t kv_pool_bytes() const noexcept;
+    // T64: one rank's KV page-pool device bytes (Text + MTP pools) at `main_page_groups` Text
+    // pages (the MTP pool has its lanes' draft pages more), the curve's minimum page count, and
+    // the number of KV planes (each elastic plane may cost one granule more).
+    [[nodiscard]] std::size_t kv_pool_bytes(std::uint32_t main_page_groups) const noexcept;
     [[nodiscard]] std::uint32_t kv_pool_pages() const noexcept;
     [[nodiscard]] std::size_t kv_plane_count() const noexcept;
     [[nodiscard]] SequencePlan finalize(std::uint32_t main_page_groups) &&;

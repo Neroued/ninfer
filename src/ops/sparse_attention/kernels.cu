@@ -1407,8 +1407,9 @@ QsaAttentionSplit qsa_attention_split(std::int32_t columns, std::int32_t kv_head
 }
 
 std::size_t qsa_attention_partial_bytes(std::int32_t columns, std::int32_t query_heads,
-                                        std::int32_t kv_heads, std::int32_t max_selected) {
-    const QsaAttentionSplit split = qsa_attention_split(columns, kv_heads, max_selected);
+                                        std::int32_t kv_heads, std::int32_t max_selected,
+                                        std::int32_t split_columns) {
+    const QsaAttentionSplit split = qsa_attention_split(split_columns, kv_heads, max_selected);
     if (split.splits == 1) { return 0; }
     return static_cast<std::size_t>(columns) * kv_heads * split.splits * (query_heads / kv_heads) *
            kPartialWords * sizeof(float);
@@ -1416,7 +1417,8 @@ std::size_t qsa_attention_partial_bytes(std::int32_t columns, std::int32_t query
 
 void qsa_attention_launch(const Tensor& q, const Tensor& selected, const Tensor& counts,
                           const Tensor& table_rows, const PagedKVBatchLayerView& kv, float scale,
-                          float* partial, Tensor& out, cudaStream_t stream) {
+                          float* partial, Tensor& out, cudaStream_t stream,
+                          std::int32_t split_columns) {
     AttentionArgs args{};
     args.q                   = static_cast<const __nv_bfloat16*>(q.data);
     args.selected            = static_cast<const std::int32_t*>(selected.data);
@@ -1437,7 +1439,7 @@ void qsa_attention_launch(const Tensor& q, const Tensor& selected, const Tensor&
     const std::int32_t lanes = q.ne[3];
     const int blocks         = args.width * lanes * args.kv_heads;
     const QsaAttentionSplit split =
-        qsa_attention_split(args.width * lanes, args.kv_heads, args.max_selected);
+        qsa_attention_split(split_columns, args.kv_heads, args.max_selected);
     args.split_keys = split.split_keys;
     args.partial    = split.splits == 1 ? nullptr : partial;
     dispatch_storage(kv.storage, [&]<KvCacheStorage Storage>() {

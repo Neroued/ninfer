@@ -28,7 +28,10 @@ std::int32_t checked_region_pages(std::uint64_t pages) {
 }
 
 constexpr std::uint32_t kStagingDefaultCacheBlocks = 4096; // 16k tokens per attention layer
-constexpr std::int32_t kStagingBlocksPerPage       = kPagedKVPageSize / 4;
+// The region holds one layer of the visible context up to this many tokens (prefill stages the
+// visible pages); longer contexts stage the union of each chunk's selections.
+constexpr std::uint32_t kStagingDefaultRegionTokens = 262144;
+constexpr std::int32_t kStagingBlocksPerPage        = kPagedKVPageSize / 4;
 
 std::int32_t round_up_blocks(std::uint64_t blocks) {
     const std::uint64_t rounded = (blocks + kStagingBlocksPerPage - 1) / kStagingBlocksPerPage *
@@ -48,13 +51,22 @@ QsaStagingLayout plan_qsa_staging(LayoutBuilder& builder, std::uint32_t layers,
     if (spec.staging_window <= 0 || spec.staging_selection_groups <= 0) {
         throw std::invalid_argument("QSA staging region needs the decode window and selection");
     }
+    if (spec.kv_table_rows <= 0) {
+        throw std::invalid_argument("QSA staging region needs the KV table rows");
+    }
     QsaStagingLayout out;
-    out.layers = static_cast<std::int32_t>(layers);
+    out.layers     = static_cast<std::int32_t>(layers);
+    out.table_rows = spec.kv_table_rows;
+    // Every lane of a decode/verify call may overflow its whole window.
     out.overflow_blocks =
         round_up_blocks(static_cast<std::uint64_t>(spec.staging_window) *
+                        static_cast<std::uint64_t>(spec.kv_table_rows) *
                         static_cast<std::uint64_t>(spec.staging_selection_groups));
-    // Prefill stages one layer of the whole visible context into the region.
-    const std::uint64_t capacity_blocks = (static_cast<std::uint64_t>(capacity) + 3U) / 4U;
+    // Prefill stages one layer of the whole visible context into the region, up to the region cap.
+    const std::uint32_t region_tokens =
+        std::min(capacity, spec.staging_region_tokens != 0 ? spec.staging_region_tokens
+                                                           : kStagingDefaultRegionTokens);
+    const std::uint64_t capacity_blocks = (static_cast<std::uint64_t>(region_tokens) + 3U) / 4U;
     const std::uint64_t needed =
         capacity_blocks > static_cast<std::uint64_t>(out.overflow_blocks)
             ? (capacity_blocks - static_cast<std::uint64_t>(out.overflow_blocks) + layers - 1U) /
@@ -84,13 +96,16 @@ QsaStagingLayout plan_qsa_staging(LayoutBuilder& builder, std::uint32_t layers,
     }
     const std::int32_t slots = out.layers * out.cache_blocks;
     out.block_table = builder.add_tensor(DType::I32, {pages, 1}, 256, "QSA staging identity table");
-    out.table_row   = builder.add_tensor(DType::I32, {1}, 256, "QSA staging identity row");
-    out.tags        = builder.add_tensor(DType::I64, {slots}, 256, "QSA staging tags");
-    out.claims      = builder.add_tensor(DType::I64, {slots}, 256, "QSA staging claims");
+    out.table_row =
+        builder.add_tensor(DType::I32, {out.table_rows}, 256, "QSA staging identity rows");
+    out.tags     = builder.add_tensor(DType::I64, {slots}, 256, "QSA staging tags");
+    out.claims   = builder.add_tensor(DType::I64, {slots}, 256, "QSA staging claims");
     out.counters = builder.add_tensor(DType::I32, {out.layers * ops::kQsaStagingCounterWords}, 256,
                                       "QSA staging counters");
-    out.stats    = builder.add_tensor(DType::I64, {out.layers * ops::kQsaStagingStatCount}, 256,
-                                      "QSA staging statistics");
+    out.row_starts = builder.add_tensor(DType::I32, {out.layers * out.table_rows}, 256,
+                                        "QSA staging row starts");
+    out.stats      = builder.add_tensor(DType::I64, {out.layers * ops::kQsaStagingStatCount}, 256,
+                                        "QSA staging statistics");
     return out;
 }
 
@@ -98,7 +113,8 @@ PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers, std:
                               std::int32_t kv_heads, std::int32_t head_dim, KvCacheStorage storage,
                               std::int32_t table_rows, std::uint32_t physical_page_groups,
                               bool qsa_index, LayoutBuilder* pages_builder,
-                              const DecoderStateSpec* host_kv = nullptr) {
+                              const DecoderStateSpec* host_kv = nullptr,
+                              std::uint32_t region_layers     = 0) {
     if (layers == 0 ||
         layers > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max()) ||
         kv_heads <= 0 || head_dim <= 0 || table_rows <= 0) {
@@ -145,9 +161,11 @@ PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers, std:
                                  DeviceKVPagePoolSpec{.page_group_count = physical_page_groups,
                                                       .geometry         = std::move(geometry)},
                                  host ? &host_builder : nullptr);
+    // The region serves `region_layers` attention layers: this pool's, then a sharing pool's.
     std::optional<QsaStagingLayout> region;
-    if (host) {
-        region = plan_qsa_staging(builder, layers, capacity, kv_heads, layer_storage, *host_kv);
+    if (host && region_layers != 0) {
+        region =
+            plan_qsa_staging(builder, region_layers, capacity, kv_heads, layer_storage, *host_kv);
     }
     return PagedKVCacheLayout{
         .pages            = std::move(pages),
@@ -182,29 +200,32 @@ ops::QsaStagingRegion bind_qsa_staging(const QsaStagingLayout& layout, DeviceSpa
     region.tags            = layout.tags.bind(backing);
     region.claims          = layout.claims.bind(backing);
     region.counters        = layout.counters.bind(backing);
+    region.row_starts      = layout.row_starts.bind(backing);
     region.stats           = layout.stats.bind(backing);
     region.layers          = layout.layers;
+    region.table_rows      = layout.table_rows;
     region.cache_blocks    = layout.cache_blocks;
     region.overflow_blocks = layout.overflow_blocks;
     return region;
 }
 
-std::optional<PinnedHostBuffer> make_host_planes(const PagedKVCacheLayout& layout) {
-    if (layout.host_bytes == 0) { return std::nullopt; }
+// The Host planes' arena: one elastic range per Host plane (pages outermost), nothing backed yet.
+std::unique_ptr<ElasticArena> make_host_arena(int device, const PagedKVCacheLayout& layout) {
+    if (layout.host_bytes == 0) { return nullptr; }
+    std::vector<ElasticRangeSpec> ranges;
+    for (const DeviceKVPlaneLayout& plane : layout.pages.planes) {
+        if (!plane.geometry.host) { continue; }
+        ranges.push_back(ElasticRangeSpec{.offset = plane.storage.region.offset,
+                                          .bytes  = plane.storage.region.bytes,
+                                          .mapped = 0});
+    }
     try {
-        // 2 MiB pages: the GPU walks Host addresses through its own TLB (arena.h).
-        return std::optional<PinnedHostBuffer>(std::in_place, layout.host_bytes, HostMapping::Yes,
-                                               PinnedHostPages::Huge);
+        return std::make_unique<ElasticArena>(device, layout.host_bytes, ranges,
+                                              ElasticMemory::Host);
     } catch (const std::exception& error) {
-        char size[32];
-        std::snprintf(size, sizeof size, "%.2f GiB",
-                      static_cast<double>(layout.host_bytes) / static_cast<double>(1ULL << 30));
-        throw std::runtime_error(
-            std::string("active KV in RAM: page-locking its ") + size +
-            " of Host KV planes failed (" + error.what() +
-            "); set the page-locked limit (--host-pinned-max-gib or NINFER_HOST_PINNED_MAX_GIB) "
-            "to what the system grants, so that the weights leave room for them, lower "
-            "--max-context, or drop --kv-ram-active");
+        throw std::runtime_error(std::string("active KV in RAM: reserving the Host KV planes "
+                                             "failed (") +
+                                 error.what() + ")");
     }
 }
 
@@ -213,15 +234,18 @@ std::optional<PinnedHostBuffer> make_host_planes(const PagedKVCacheLayout& layou
 DecoderStateLayout plan_decoder_state(LayoutBuilder& builder, const DecoderStateSpec& spec,
                                       LayoutBuilder* pages_builder) {
     DecoderStateLayout layout;
-    // Active KV in RAM moves the text pool only; the MTP layer's pool stays in device memory.
-    layout.text_kv = plan_cache(builder, spec.full_attention_layers, spec.capacity, spec.kv_heads,
-                                spec.attention_head_dim, spec.kv_storage, spec.kv_table_rows,
-                                spec.text_physical_page_groups, spec.qsa_index, pages_builder,
-                                spec.kv_ram_active ? &spec : nullptr);
+    // Active KV in RAM moves both pools; the MTP layer stages through the text pool's region,
+    // which gets one more cache layer per MTP layer.
+    const DecoderStateSpec* host = spec.kv_ram_active ? &spec : nullptr;
+    layout.text_kv               = plan_cache(
+        builder, spec.full_attention_layers, spec.capacity, spec.kv_heads, spec.attention_head_dim,
+        spec.kv_storage, spec.kv_table_rows, spec.text_physical_page_groups, spec.qsa_index,
+        pages_builder, host, spec.full_attention_layers + (spec.enable_mtp ? spec.mtp_layers : 0U));
     if (spec.enable_mtp) {
-        layout.mtp_kv = plan_cache(builder, spec.mtp_layers, spec.capacity, spec.kv_heads,
-                                   spec.attention_head_dim, spec.kv_storage, spec.kv_table_rows,
-                                   spec.mtp_physical_page_groups, spec.qsa_index, pages_builder);
+        layout.mtp_kv =
+            plan_cache(builder, spec.mtp_layers, spec.capacity, spec.kv_heads,
+                       spec.attention_head_dim, spec.kv_storage, spec.kv_table_rows,
+                       spec.mtp_physical_page_groups, spec.qsa_index, pages_builder, host);
     }
     return layout;
 }
@@ -231,14 +255,15 @@ std::size_t active_kv_host_plane_bytes(const DecoderStateSpec& spec) {
         throw std::invalid_argument("active KV Host planes need a kv_ram_active spec");
     }
     LayoutBuilder scratch;
-    return plan_decoder_state(scratch, spec).text_kv.host_bytes;
+    const DecoderStateLayout layout = plan_decoder_state(scratch, spec);
+    return layout.text_kv.host_bytes + (layout.mtp_kv ? layout.mtp_kv->host_bytes : 0);
 }
 
 PagedKVCache::PagedKVCache(int device, DeviceSpan backing, const PagedKVCacheLayout& layout,
                            DeviceSpan elastic)
-    : host_(make_host_planes(layout)),
+    : host_(make_host_arena(device, layout)),
       pages_(layout.elastic_pages ? elastic : backing, layout.pages,
-             host_ ? DeviceSpan{host_->device_data(), layout.host_bytes} : DeviceSpan{}),
+             host_ ? host_->span() : DeviceSpan{}),
       execution_tables_(backing, layout.execution_tables, pages_), layers_(layout.layers),
       max_context_(layout.max_context), kv_heads_(layout.kv_heads),
       layer_storage_(layout.layer_storage), qsa_index_(layout.qsa_index) {
@@ -246,8 +271,10 @@ PagedKVCache::PagedKVCache(int device, DeviceSpan backing, const PagedKVCacheLay
                                     (layer_storage_.planes_per_layer() + (qsa_index_ ? 2U : 0U))) {
         throw std::invalid_argument("Paged KV layer plane inventory is inconsistent");
     }
+    if (host_) { pages_.set_host_backing(*host_, kActiveKvHostStepPages, kActiveKvHostStepPages); }
     if (!layout.staging) { return; }
-    staging_ = bind_qsa_staging(*layout.staging, backing, kv_heads_, layer_storage_);
+    staging_      = bind_qsa_staging(*layout.staging, backing, kv_heads_, layer_storage_);
+    staging_view_ = &*staging_;
     // The region's device (rank 1 builds its cache with rank 0's device current).
     staging_device_ = device;
     const ScopedCurrentDevice scope(staging_device_);
@@ -259,6 +286,7 @@ PagedKVCache::PagedKVCache(int device, DeviceSpan backing, const PagedKVCacheLay
     CUDA_CHECK(cudaMemset(staging_->table_row.data, 0, staging_->table_row.bytes()));
     CUDA_CHECK(cudaMemset(staging_->tags.data, 0xFF, staging_->tags.bytes()));
     CUDA_CHECK(cudaMemset(staging_->claims.data, 0, staging_->claims.bytes()));
+    CUDA_CHECK(cudaMemset(staging_->row_starts.data, 0, staging_->row_starts.bytes()));
     CUDA_CHECK(cudaMemset(staging_->stats.data, 0, staging_->stats.bytes()));
     std::vector<std::int32_t> counters(
         static_cast<std::size_t>(staging_->layers) * ops::kQsaStagingCounterWords, 0);
@@ -272,6 +300,24 @@ PagedKVCache::PagedKVCache(int device, DeviceSpan backing, const PagedKVCacheLay
     pages_.set_write_listener([this](cudaStream_t stream) {
         const ScopedCurrentDevice region_device(staging_device_);
         ops::qsa_staging_invalidate(*staging_, stream);
+    });
+}
+
+void PagedKVCache::share_staging(const PagedKVCache& owner, std::int32_t layer_base) {
+    const ops::QsaStagingRegion* region = owner.qsa_staging();
+    if (region == nullptr || staging_view_ != nullptr || layer_base < 0 ||
+        layer_base + static_cast<std::int32_t>(layers_) > region->layers ||
+        region->pages.storage != layer_storage_.storage ||
+        region->pages.num_kv_heads != kv_heads_) {
+        throw std::invalid_argument("active KV in RAM: the shared staging region does not fit");
+    }
+    staging_view_       = region;
+    staging_layer_base_ = layer_base;
+    staging_device_     = owner.staging_device_;
+    // This pool's page writes and rebinds drop the cached blocks of every layer of the region.
+    pages_.set_write_listener([this](cudaStream_t stream) {
+        const ScopedCurrentDevice region_device(staging_device_);
+        ops::qsa_staging_invalidate(*staging_view_, stream);
     });
 }
 
@@ -300,13 +346,14 @@ void PagedKVCache::report_staging_stats(const char* why) const {
         "active KV stats (%s, device %d): fetch calls %lld, blocks %lld: hits %lld, "
         "shared %lld, misses %lld, uncacheable %lld, collisions %lld; fetched %.1f%%; "
         "stage calls %lld, staged pages %lld; prefill selections touch %lld of %lld "
-        "visible blocks\n",
+        "visible blocks; union stage calls %lld, staged blocks %lld\n",
         why, staging_device_, sum[ops::kQsaStagingBlockCalls], blocks, sum[ops::kQsaStagingHits],
         sum[ops::kQsaStagingShared], sum[ops::kQsaStagingMisses], sum[ops::kQsaStagingUncacheable],
         sum[ops::kQsaStagingCollisions],
         blocks > 0 ? 100.0 * static_cast<double>(fetched) / static_cast<double>(blocks) : 0.0,
         sum[ops::kQsaStagingPageCalls], sum[ops::kQsaStagingPages],
-        sum[ops::kQsaStagingUnionBlocks], sum[ops::kQsaStagingVisibleBlocks]);
+        sum[ops::kQsaStagingUnionBlocks], sum[ops::kQsaStagingVisibleBlocks],
+        sum[ops::kQsaStagingUnionCalls], sum[ops::kQsaStagingUnionStaged]);
 }
 
 PagedKVCacheView::PagedKVCacheView(const PagedKVCache& cache, Tensor block_table) noexcept
@@ -382,7 +429,12 @@ DecoderState::DecoderState(int device, DeviceSpan backing, const DecoderStateLay
     if (layout.text_kv.elastic_pages && elastic.data == nullptr) {
         throw std::invalid_argument("elastic KV pages need their backing");
     }
-    if (layout.mtp_kv) { mtp_kv.emplace(device, backing, *layout.mtp_kv, elastic); }
+    if (layout.mtp_kv) {
+        mtp_kv.emplace(device, backing, *layout.mtp_kv, elastic);
+        if (text_kv.qsa_staging() != nullptr && layout.mtp_kv->host_bytes != 0) {
+            mtp_kv->share_staging(text_kv, static_cast<std::int32_t>(text_kv.layers()));
+        }
+    }
 }
 
 PagedKVCache* DecoderState::mtp_cache() noexcept { return mtp_kv ? &*mtp_kv : nullptr; }

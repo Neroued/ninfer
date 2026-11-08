@@ -267,7 +267,7 @@ std::string serve_usage_text(const char* argv0) {
            " <model.ninfer> [--profile flash-next|flash-next-1gpu|27b|27b-16gb] [--host H] "
            "[--port N] [--api-key KEY|--api-key-file FILE] "
            "[--model-id ID] [--max-context N] [--kv-capacity N|auto] [--max-concurrency N] "
-           "[--max-pending-requests N] [--pending-timeout-ms N] "
+           "[--max-pending-requests N] [--pending-timeout-ms N] [--decode-share F] "
            "[--prefill-chunk N] [--kv-lease-window N] [--log-stats-interval-ms N] [--device N] "
            "[--tp 1|2 --devices A,B] "
            "[--context-cost-presets FILE] "
@@ -351,10 +351,11 @@ std::string serve_usage_text(const char* argv0) {
            " MiB of sizing headroom; --vram-headroom-mib N changes that margin (requires auto)\n"
            "       --no-prefix-reuse disables compatible-prefix caching (enabled by default)\n"
            "       Qwen4Exp: --elastic backs the KV on demand and lends unused KV to the expert "
-           "slot cache (grow step --kv-grow tokens, default 8192; --kv-budget-gib caps one "
-           "request's KV); --kv-ram-active (with --max-concurrency 1) keeps the text attention KV "
-           "in pinned host RAM and copies only the indexer's selected blocks to the GPU (results "
-           "unchanged); "
+           "slot cache (grow step --kv-grow tokens, default 8192; --kv-budget-gib caps the "
+           "KV of every request together); --kv-ram-active keeps the text attention KV in pinned "
+           "host RAM, taken "
+           "8192 tokens at a time as conversations grow (at most --kv-capacity tokens), and "
+           "copies only the indexer's selected blocks to the GPU (results unchanged); "
            "--miss-split auto lets the GPU read part of each window's missing "
            "experts (best at one GPU), calibrate does the same with costs measured on this machine "
            "(GPU copy rate at startup, CPU time per expert over the first decode calls, logged), "
@@ -497,6 +498,18 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--max-pending-requests") {
             options.max_pending_requests = static_cast<std::uint32_t>(parse_nonnegative_int(
                 require_value("--max-pending-requests"), "max-pending-requests"));
+        } else if (arg == "--decode-share") {
+            const std::string value = require_value("--decode-share");
+            double share            = -1.0;
+            try {
+                share = std::stod(value);
+            } catch (const std::exception&) {
+                throw std::invalid_argument("--decode-share must be a number");
+            }
+            if (!(share >= 0.0 && share <= 16.0)) {
+                throw std::invalid_argument("--decode-share must be in [0,16]");
+            }
+            options.decode_share = static_cast<float>(share);
         } else if (arg == "--pending-timeout-ms") {
             options.pending_timeout_ms = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--pending-timeout-ms"), "pending-timeout-ms"));

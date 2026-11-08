@@ -21,6 +21,8 @@
 //       proposals whose chain probability (--mtp-window-rule chain, default) or own probability
 //       (step) is >= P; --prompts reads one prompt per line of
 //       IDS (one Engine for all); --temperature > 0 samples (rejection sampling under MTP).
+//       --concurrency N (2-8, greedy only): max_concurrency N and N x max_context of KV; each run
+//       submits every prompt at once (the Engine batches up to N of them), prints them in order.
 // Elastic KV (T64, both modes): [--elastic] [--kv-grow TOKENS] [--kv-budget-gib G]
 //   [--elastic-columns N (with --slots)]: the KV pool is backed on demand and the expert cache
 //   gives up / takes back whole columns of slots as the KV grows / shrinks
@@ -123,6 +125,7 @@ int main(int argc, char** argv) {
         std::uint32_t context = 0;
         std::uint32_t max_new = 0;
         std::uint32_t repeat  = 1;
+        std::uint32_t lanes   = 1;
         bool reuse_prefix     = false;
         std::uint32_t mtp     = 0;
         float temperature     = 0.0F;
@@ -173,6 +176,11 @@ int main(int argc, char** argv) {
                     options.speculative.window_rule = ninfer::MtpWindowRule::Step;
                 } else {
                     throw std::invalid_argument("--mtp-window-rule must be chain or step");
+                }
+            } else if (arg == "--concurrency") {
+                lanes = static_cast<std::uint32_t>(std::stoul(next()));
+                if (lanes == 0 || lanes > 8) {
+                    throw std::invalid_argument("--concurrency must be in [1,8]");
                 }
             } else if (arg == "--prompts") {
             } else if (arg == "--temperature") {
@@ -396,11 +404,16 @@ int main(int argc, char** argv) {
         }
         if (mode == "generate") {
             if (max_new == 0) { throw std::invalid_argument("--max-new is required"); }
+            if (lanes > 1 && temperature > 0.0F) {
+                throw std::invalid_argument("--concurrency is greedy only");
+            }
             std::size_t longest = 0;
             for (const auto& prompt : prompts) { longest = std::max(longest, prompt.size()); }
-            options.purpose     = ninfer::EnginePurpose::Generation;
-            options.max_context = context != 0 ? context : rounded(longest + max_new + 1 + mtp);
-            options.kv_capacity = ninfer::KvCapacityPolicy::explicit_capacity(options.max_context);
+            options.purpose         = ninfer::EnginePurpose::Generation;
+            options.max_context     = context != 0 ? context : rounded(longest + max_new + 1 + mtp);
+            options.max_concurrency = lanes;
+            options.kv_capacity =
+                ninfer::KvCapacityPolicy::explicit_capacity(options.max_context * lanes);
             options.context_cache.enabled = reuse_prefix;
             if (reuse_prefix &&
                 options.tp == 2) { // T109: as ninfer-serve at tp 2 (no Host tier on rank 1)
@@ -424,7 +437,24 @@ int main(int argc, char** argv) {
             }
             const bool model_stops = std::getenv("NINFER_DRIVER_STOPS") != nullptr;
             for (std::uint32_t run = 0; run < repeat; ++run) {
-                for (const auto& prompt_ids : prompts) {
+                // --concurrency: every prompt of the run is submitted before the first wait.
+                std::vector<ninfer::GenerationHandle> handles;
+                std::vector<std::chrono::steady_clock::time_point> starts;
+                for (std::size_t p = 0; lanes > 1 && p < prompts.size(); ++p) {
+                    ninfer::RequestOptions request;
+                    request.execution.requested_output_tokens    = max_new;
+                    request.execution.allow_prefix_reuse         = reuse_prefix;
+                    request.execution.sampling.temperature       = 0.0F;
+                    request.execution.sampling.presence_penalty  = 0.0F;
+                    request.execution.sampling.frequency_penalty = 0.0F;
+                    request.stop.include_model_defaults          = model_stops;
+                    request.output.raw                           = true;
+                    starts.push_back(std::chrono::steady_clock::now());
+                    handles.push_back(
+                        engine.submit(engine.prepare_tokens(prompts[p], false), request));
+                }
+                for (std::size_t p = 0; p < prompts.size(); ++p) {
+                    const auto& prompt_ids = prompts[p];
                     ninfer::RequestOptions request;
                     request.execution.requested_output_tokens = max_new;
                     request.execution.allow_prefix_reuse      = reuse_prefix;
@@ -442,10 +472,11 @@ int main(int argc, char** argv) {
                     if (top_p >= 0.0F) { request.execution.sampling.top_p = top_p; }
                     request.stop.include_model_defaults = model_stops;
                     request.output.raw                  = true;
-                    ninfer::PreparedPrompt prompt       = engine.prepare_tokens(prompt_ids, false);
-                    const auto start                    = std::chrono::steady_clock::now();
+                    const auto start = lanes > 1 ? starts[p] : std::chrono::steady_clock::now();
                     const ninfer::GenerationResult result =
-                        engine.generate(std::move(prompt), request);
+                        lanes > 1
+                            ? handles[p].wait()
+                            : engine.generate(engine.prepare_tokens(prompt_ids, false), request);
                     const double wall =
                         std::chrono::duration<double>(std::chrono::steady_clock::now() - start)
                             .count();

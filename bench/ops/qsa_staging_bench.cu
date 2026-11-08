@@ -61,7 +61,7 @@ struct Fixture {
     int pages;
     PagedKVStorageLayout layout = paged_kv_storage_layout(KvCacheStorage::Int8Group64, kHeadDim);
     PinnedHostBuffer host;
-    DeviceBuffer table, row, region_planes, identity, tags, claims, counters, stats;
+    DeviceBuffer table, row, region_planes, identity, tags, claims, counters, row_starts, stats;
     PagedKVBatchLayerView kv{};
     ops::QsaStagingRegion region;
 
@@ -128,11 +128,13 @@ struct Fixture {
         words[0] = 1;
         counters = DeviceBuffer(words.size() * 4);
         counters.copy_from_host(words.data(), words.size() * 4);
-        stats           = make_zeros(ops::kQsaStagingStatCount * 8);
-        region.tags     = Tensor(tags.p, DType::I64, {region.cache_blocks});
-        region.claims   = Tensor(claims.p, DType::I64, {region.cache_blocks});
-        region.counters = Tensor(counters.p, DType::I32, {ops::kQsaStagingCounterWords});
-        region.stats    = Tensor(stats.p, DType::I64, {ops::kQsaStagingStatCount});
+        row_starts        = make_zeros(4);
+        stats             = make_zeros(ops::kQsaStagingStatCount * 8);
+        region.row_starts = Tensor(row_starts.p, DType::I32, {1});
+        region.tags       = Tensor(tags.p, DType::I64, {region.cache_blocks});
+        region.claims     = Tensor(claims.p, DType::I64, {region.cache_blocks});
+        region.counters   = Tensor(counters.p, DType::I32, {ops::kQsaStagingCounterWords});
+        region.stats      = Tensor(stats.p, DType::I64, {ops::kQsaStagingStatCount});
     }
 };
 

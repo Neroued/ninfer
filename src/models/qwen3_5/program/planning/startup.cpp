@@ -124,6 +124,19 @@ std::int32_t qsa_selection_groups(const TextConfig& config) {
     return static_cast<std::int32_t>((config.sparse_attention->max_selected_tokens() + 3) / 4);
 }
 
+// NINFER_KVRAM_REGION_TOKENS: the tokens of one layer the active KV region holds for prefill
+// (0 = default 262,144); longer contexts stage the union of each chunk's selections.
+std::uint32_t staging_region_tokens_override() {
+    const char* env = std::getenv("NINFER_KVRAM_REGION_TOKENS");
+    if (env == nullptr || *env == '\0') { return 0; }
+    char* end         = nullptr;
+    const long tokens = std::strtol(env, &end, 10);
+    if (end == env || *end != '\0' || tokens <= 0 || tokens > (1L << 30)) {
+        throw std::invalid_argument("NINFER_KVRAM_REGION_TOKENS must be a positive token count");
+    }
+    return static_cast<std::uint32_t>(tokens);
+}
+
 // NINFER_KVRAM_CACHE_BLOCKS: the active KV cache's blocks per attention layer (0 = default).
 std::uint32_t staging_cache_blocks_override() {
     const char* env = std::getenv("NINFER_KVRAM_CACHE_BLOCKS");
@@ -200,6 +213,8 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan, int rank_index)
             .staging_selection_groups = qsa_selection_groups(config),
             .staging_cache_blocks =
                 plan.kv_ram_active && config.qwen4() ? staging_cache_blocks_override() : 0U,
+            .staging_region_tokens =
+                plan.kv_ram_active && config.qwen4() ? staging_region_tokens_override() : 0U,
         },
         elastic ? &elastic_builder : nullptr);
     qwen3_5::StateImageSpec state_image_spec{
@@ -1661,18 +1676,13 @@ make_sequence_planner_impl(const execution::Parameters& parameters,
                                             "slots; a dense Qwen4Exp FFN has none");
             }
             if (experts.backend != RoutedExpertBackend::Offload ||
-                (options.purpose == EnginePurpose::Generation && options.max_concurrency != 1) ||
                 options.elastic_kv.grow_tokens == 0) {
-                throw std::invalid_argument("Engine elastic_kv: needs the offload expert backend, "
-                                            "one request at a time and grow_tokens > 0");
+                throw std::invalid_argument("Engine elastic_kv: needs the offload expert backend "
+                                            "and grow_tokens > 0");
             }
             inputs.elastic_kv = options.elastic_kv;
         }
         if (options.kv_ram_active) {
-            if (options.max_concurrency != 1) {
-                throw std::invalid_argument(
-                    "Engine kv_ram_active: needs max_concurrency 1 (one request at a time)");
-            }
             if (!parameters.model.config().text.sparse_attention) {
                 throw std::invalid_argument("Engine kv_ram_active: stages the QSA selection; a "
                                             "Qwen4Exp without sparse attention has none");
@@ -1751,8 +1761,29 @@ std::uint64_t active_kv_host_pinned_bytes(const Config& config, const EngineOpti
     if (!options.kv_ram_active || !text.qwen4() || !text.sparse_attention || !text.attention) {
         return 0;
     }
-    // The text pool persistent_layout plans for one request (max_concurrency 1): one rank's KV
-    // heads, one page group per page of max_context.
+    // The text pool's physical pages: the explicit kv_capacity, or the most an automatic one can
+    // reach (max_concurrency x max_context). The planes take this much address space; their RAM
+    // follows the pages in use, but the weights leave room for all of it in the page-locked limit.
+    const std::uint32_t logical_pages = detail::page_count(options.max_context);
+    const std::uint64_t pages64 =
+        options.kv_capacity.mode == KvCapacityMode::Explicit
+            ? std::max<std::uint64_t>(detail::page_count(options.kv_capacity.explicit_tokens),
+                                      logical_pages)
+            : static_cast<std::uint64_t>(std::max(options.max_concurrency, 1U)) * logical_pages;
+    if (pages64 > std::numeric_limits<std::uint32_t>::max()) {
+        throw std::overflow_error("active KV in RAM: the text pool's page count exceeds uint32");
+    }
+    // The MTP pool (with MTP): the same pages plus each lane's draft window (persistent_layout).
+    const bool mtp            = options.speculative.backend == SpeculativeBackend::Mtp;
+    const std::uint64_t lanes = std::max(options.max_concurrency, 1U);
+    const std::uint64_t mtp_pages64 =
+        pages64 + (mtp ? lanes * ((static_cast<std::uint64_t>(options.speculative.draft_tokens) +
+                                   static_cast<std::uint64_t>(kPagedKVPageSize) - 2U) /
+                                  static_cast<std::uint64_t>(kPagedKVPageSize))
+                       : 0U);
+    if (mtp_pages64 > std::numeric_limits<std::uint32_t>::max()) {
+        throw std::overflow_error("active KV in RAM: the MTP pool's page count exceeds uint32");
+    }
     const TextConfig rank        = execution::shard_text_config(text, options.tp);
     const std::uint64_t per_rank = active_kv_host_plane_bytes(DecoderStateSpec{
         .full_attention_layers     = text.full_attention_layers,
@@ -1761,8 +1792,10 @@ std::uint64_t active_kv_host_pinned_bytes(const Config& config, const EngineOpti
         .kv_heads                  = execution::dimension(rank.attention->num_key_value_heads),
         .attention_head_dim        = execution::dimension(text.attention->head_dim),
         .kv_storage                = options.kv_cache,
-        .kv_table_rows             = 1,
-        .text_physical_page_groups = detail::page_count(options.max_context),
+        .enable_mtp                = mtp,
+        .kv_table_rows             = static_cast<std::int32_t>(lanes),
+        .text_physical_page_groups = static_cast<std::uint32_t>(pages64),
+        .mtp_physical_page_groups  = static_cast<std::uint32_t>(mtp_pages64),
         .qsa_index                 = true,
         .kv_ram_active             = true,
         .staging_selection_groups  = detail::qsa_selection_groups(text),

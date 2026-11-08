@@ -14,10 +14,17 @@
 // the bytes of a released granule are gone (reading or writing them faults), and a newly backed
 // granule reads zero.
 //
+// Host memory (ElasticMemory::Host, active KV in RAM): the physical granules are page-locked memory
+// of the device's host NUMA node (CU_MEM_LOCATION_TYPE_HOST_NUMA), mapped for `device` and the CPU
+// at the same address, so kernels read it over PCIe exactly like cudaHostAlloc'd mapped memory and
+// the RAM it takes follows the mapped prefixes. Only the device given at construction may
+// dereference it. Newly backed granules are zeroed by a kernel (uva_fill_async): the runtime's
+// memset rejects ranges that span several such allocations.
+//
 // The owner keeps every device access inside backed bytes: it shrinks a prefix only after the
 // device work that could touch the released bytes has completed, and grows it before handing the
-// bytes out. Not thread-safe; no device synchronization of its own except the zeroing of newly
-// backed granules (completed before set_mapped returns).
+// bytes out. Not thread-safe; releasing granules drains device work; zeroing newly backed
+// granules completes on the supplied stream before set_mapped returns.
 
 #include "core/arena.h"
 
@@ -30,6 +37,11 @@
 
 namespace ninfer {
 
+enum class ElasticMemory : std::uint8_t {
+    Device, // the device's own memory
+    Host,   // page-locked Host memory mapped for the device (and the CPU)
+};
+
 struct ElasticRangeSpec {
     std::size_t offset = 0; // from the arena base
     std::size_t bytes  = 0; // the range's extent; its prefix [offset, offset + mapped) is backed
@@ -40,7 +52,8 @@ class ElasticArena {
 public:
     // Reserves `bytes` on `device` and backs every granule that intersects a fixed byte (outside
     // all `ranges`) or a range's initial prefix. Ranges must not overlap.
-    ElasticArena(int device, std::size_t bytes, std::span<const ElasticRangeSpec> ranges);
+    ElasticArena(int device, std::size_t bytes, std::span<const ElasticRangeSpec> ranges,
+                 ElasticMemory memory = ElasticMemory::Device);
     ~ElasticArena();
 
     ElasticArena(const ElasticArena&)            = delete;
@@ -49,6 +62,8 @@ public:
     [[nodiscard]] DeviceSpan span() const noexcept { return {base_, bytes_}; }
 
     [[nodiscard]] int device() const noexcept { return device_; }
+
+    [[nodiscard]] ElasticMemory memory() const noexcept { return memory_; }
 
     [[nodiscard]] std::size_t granule() const noexcept { return granule_; }
 
@@ -66,16 +81,19 @@ public:
     [[nodiscard]] std::int64_t physical_delta(std::span<const std::size_t> mapped) const;
     // Applies those prefixes: releases the granules no longer needed first, then backs (and
     // zeroes, on `stream`, completed before returning) the newly needed ones. Throws on an
-    // allocation failure after undoing nothing it released (the arena is then consistent with the
-    // prefixes it reports).
+    // mapping/allocation failure: growth is rolled back, completed shrinks remain, and backing
+    // matches the reported prefixes min(previous, requested). Retained granules keep their data.
     void set_mapped(std::span<const std::size_t> mapped, cudaStream_t stream);
 
 private:
     void needed(std::span<const std::size_t> mapped, std::vector<std::uint8_t>& out) const;
     void back(std::size_t granule_index);
     void release(std::size_t granule_index) noexcept;
+    void zero(std::size_t first_granule, std::size_t granules, cudaStream_t stream);
 
     int device_           = 0;
+    ElasticMemory memory_ = ElasticMemory::Device;
+    int host_node_        = 0; // ElasticMemory::Host: the device's host NUMA node
     std::size_t bytes_    = 0;
     std::size_t granule_  = 0;
     std::byte* base_      = nullptr;

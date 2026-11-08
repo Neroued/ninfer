@@ -274,6 +274,7 @@ GenerationService::GenerationService(ServeOptions options, StartupObserver start
     engine_options.max_concurrency        = options_.max_concurrency;
     engine_options.max_pending_requests   = options_.max_pending_requests;
     engine_options.pending_timeout_ms     = options_.pending_timeout_ms;
+    engine_options.decode_share           = options_.decode_share;
     engine_options.prefill_chunk          = options_.prefill_chunk;
     engine_options.kv_lease_window_tokens = options_.kv_lease_window_tokens;
     engine_options.kv_cache               = options_.kv_cache;
@@ -315,8 +316,8 @@ GenerationService::GenerationService(ServeOptions options, StartupObserver start
         // rotary_dim 64 and rope_theta 1e7 are this family's geometry: the 27B and Flash-Next both
         // declare partial_rotary_factor 0.25 on head_dim 256, i.e. 32 frequency pairs.
         const auto freqs = ninfer::rope::yarn_inv_freq(yarn, yarn.rotary_dim);
-        ninfer::ops::detail::rope_install_text_inv_frequency(
-            freqs.data(), static_cast<int>(freqs.size()));
+        ninfer::ops::detail::rope_install_text_inv_frequency(freqs.data(),
+                                                             static_cast<int>(freqs.size()));
         ninfer::ops::detail::rope_install_text_attention_scale(
             ninfer::rope::yarn_attention_scale(yarn));
     }

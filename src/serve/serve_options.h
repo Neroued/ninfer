@@ -38,6 +38,7 @@ struct ServeOptions {
     std::uint32_t max_concurrency        = 1;
     std::uint32_t max_pending_requests   = 16;
     std::uint32_t pending_timeout_ms     = 30000;
+    float decode_share                   = 0.0F; // --decode-share (EngineOptions::decode_share)
     std::uint32_t prefill_chunk          = 1024;
     std::uint32_t kv_lease_window_tokens = 4096; // --kv-lease-window; 0 = reserve max_tokens
     std::filesystem::path context_cost_presets;
@@ -54,26 +55,28 @@ struct ServeOptions {
     KvCacheStorage kv_cache = KvCacheStorage::BFloat16;
     // YaRN RoPE extension. factor <= 1 is DISABLED and must stay bit-identical to the
     // unmodified engine: the fixed-frequency path is bypassed only when factor > 1.
-    float rope_yarn_factor                 = 1.0F;
+    float rope_yarn_factor                   = 1.0F;
     std::uint32_t rope_original_max_position = 262144;
     SpeculativeOptions speculative;
     ContextCacheOptions context_cache;
     bool enable_vision = false;
     std::optional<int> vision_device;               // CUDA device of the Vision tower
     std::optional<std::uint32_t> max_vision_tokens; // merged-token ceiling of one media item
-    bool use_cuda_graph     = true;
-    bool tp_mailbox         = true;
-    bool embedding_host     = false; // token embedding table in mapped pinned host memory
+    bool use_cuda_graph = true;
+    bool tp_mailbox     = true;
+    bool embedding_host = false; // token embedding table in mapped pinned host memory
     // Page-locked limit of the host-mapped weights (--host-pinned-max-gib); 0 = none.
     std::uint64_t host_pinned_max_bytes = 0;
-    bool allow_prefix_reuse = true;
-    // --reasoning-close-retry (on by default since v0.7, every model; --no-reasoning-close-retry): a reply that ends with the model's
-    // terminal token inside its thinking (or right after "</think>" with blank content and no tool
-    // call) is closed with "\n</think>\n\n" and continued once (serve/reasoning_retry.h).
+    bool allow_prefix_reuse             = true;
+    // --reasoning-close-retry (on by default since v0.7, every model; --no-reasoning-close-retry):
+    // a reply that ends with the model's terminal token inside its thinking (or right after
+    // "</think>" with blank content and no tool call) is closed with "\n</think>\n\n" and continued
+    // once (serve/reasoning_retry.h).
     bool reasoning_close_retry = true;
-    // --reasoning-eos-guard (on by default since v0.7, every model; --no-reasoning-eos-guard): the first token of a reply that starts in
-    // thinking is never a terminal token; a terminal draw is redrawn without the terminal ids
-    // (models/qwen3_5/execution/reasoning_eos_guard.h). Token-identical when it does not fire.
+    // --reasoning-eos-guard (on by default since v0.7, every model; --no-reasoning-eos-guard): the
+    // first token of a reply that starts in thinking is never a terminal token; a terminal draw is
+    // redrawn without the terminal ids (models/qwen3_5/execution/reasoning_eos_guard.h).
+    // Token-identical when it does not fire.
     bool reasoning_eos_guard = true;
     // Private long-anchor opportunities at the message boundaries before the final message: the
     // last N of them (0 disables). They keep a checkpoint at the point where a cancelled or edited
@@ -86,9 +89,9 @@ struct ServeOptions {
     // measurable, so they keep the anchor.
     std::optional<std::uint32_t> turn_anchors;
     // T64/T66c Qwen4Exp product options (no effect on other models): elastic KV <-> expert slots
-    // (--elastic, --kv-grow, --kv-budget-gib), the decode miss split (--miss-split auto|calibrate|off) and
-    // the prompt-chunk width from which the missing experts stream over PCIe (--stream-min-tokens,
-    // RoutedExpertOptions::stream_min_tokens; 0 = never).
+    // (--elastic, --kv-grow, --kv-budget-gib), the decode miss split (--miss-split
+    // auto|calibrate|off) and the prompt-chunk width from which the missing experts stream over
+    // PCIe (--stream-min-tokens, RoutedExpertOptions::stream_min_tokens; 0 = never).
     ElasticKvOptions elastic_kv;
     // --kv-ram-active (EngineOptions::kv_ram_active): the generating conversation's KV in RAM.
     bool kv_ram_active = false;

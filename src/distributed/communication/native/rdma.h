@@ -24,7 +24,7 @@ struct Port {
 
 class Link {
 public:
-    Link(const DeviceContext&, GroupId, unsigned rank, std::size_t capacity,
+    Link(const DeviceContext&, GroupId, unsigned rank, unsigned capacity, unsigned lanes,
          std::span<const Port> ports);
     ~Link();
     Link(const Link&)            = delete;

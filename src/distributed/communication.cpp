@@ -101,7 +101,8 @@ void validate_communication_preparation(const ExecutionTopology& topology,
                                             ": collective requirements differ across ranks");
             if (group.members.size() > 1 &&
                 preparations.front().policy == CommunicationPolicy::Native &&
-                !current.requirements.collectives.empty() &&
+                (!current.requirements.collectives.empty() ||
+                 !current.requirements.peers.empty()) &&
                 std::none_of(
                     current.connections.begin(), current.connections.end(),
                     [](const auto& c) { return c.backend == CommunicationBackend::Native; }))
@@ -123,7 +124,7 @@ void validate_communication_preparation(const ExecutionTopology& topology,
 }
 
 struct Group::Impl {
-    enum class State { Created, Prepared, Connected, Ready, Closed };
+    enum class State { Created, Prepared, Selected, Connected, Ready, Closed };
 
     struct Route {
         std::unique_ptr<detail::Backend> implementation;
@@ -209,6 +210,9 @@ void Group::exchange(std::span<const PeerTransfer> transfers, CudaExecutionView 
     for (const auto& item : transfers) {
         const auto allowed = std::find_if(p.requirements.peers.begin(), p.requirements.peers.end(),
                                           [&](const auto& r) { return r.peer == item.peer; });
+        if (std::count_if(transfers.begin(), transfers.end(),
+                          [&](const auto& other) { return other.peer == item.peer; }) != 1)
+            throw std::invalid_argument("peer exchange requires one entry per peer");
         if (allowed == p.requirements.peers.end() || item.send.bytes > allowed->send_bytes ||
             item.receive.bytes > allowed->receive_bytes)
             throw std::invalid_argument("peer transfer exceeds prepared communication capacity");
@@ -216,8 +220,20 @@ void Group::exchange(std::span<const PeerTransfer> transfers, CudaExecutionView 
             if (memory.bytes && (!memory.data || memory.device != p.device))
                 throw std::invalid_argument("peer communication buffer is not on the group device");
     }
-    auto found = std::find_if(p.routes.begin(), p.routes.end(), [](const auto& r) {
-        return r.statistics.backend == CommunicationBackend::Nccl;
+    const auto overlaps = [](ConstMemorySpan a, ConstMemorySpan b) {
+        if (!a.bytes || !b.bytes) return false;
+        const auto x = reinterpret_cast<std::uintptr_t>(a.data);
+        const auto y = reinterpret_cast<std::uintptr_t>(b.data);
+        return x <= y ? y - x < a.bytes : x - y < b.bytes;
+    };
+    for (const auto& receiver : transfers)
+        for (const auto& other : transfers)
+            if (overlaps(receiver.receive, other.send) ||
+                (&receiver != &other && overlaps(receiver.receive, other.receive)))
+                throw std::invalid_argument(
+                    "peer receive buffers must be disjoint from sends and other receives");
+    auto found = std::find_if(p.routes.begin(), p.routes.end(), [&](const auto& r) {
+        return r.implementation->supports_peers(p.requirements.peers);
     });
     if (found == p.routes.end()) throw std::logic_error("peer transfer has no prepared backend");
     auto& route = *found;
@@ -282,6 +298,11 @@ CommunicationPreparation CommunicationContext::prepare(std::span<const GroupRequ
         if (!seen.insert(requirement.group).second)
             throw std::invalid_argument("duplicate communication group requirements");
     }
+    const auto active_groups = std::count_if(needs.begin(), needs.end(), [](const auto& r) {
+        return !r.collectives.empty() || !r.peers.empty();
+    });
+    const auto lane_budget =
+        device_.multiprocessor_count() / std::max<std::size_t>(1, active_groups);
     CommunicationPreparation result{rank_, {}, policy};
     for (auto& group : groups_) {
         auto& p = *group->impl_;
@@ -294,9 +315,10 @@ CommunicationPreparation CommunicationContext::prepare(std::span<const GroupRequ
         auto& prepared = result.groups.emplace_back(GroupPreparation{p.requirements, {}});
         if (group->size() > 1) {
 #if NINFER_TARGET_SPARK
-            if (policy != CommunicationPolicy::Nccl && !p.requirements.collectives.empty()) {
-                auto backend = detail::make_native_backend(device_, p.description, p.rank, stop_,
-                                                           native_progress_, policy);
+            if (policy != CommunicationPolicy::Nccl &&
+                (!p.requirements.collectives.empty() || !p.requirements.peers.empty())) {
+                auto backend = detail::make_native_backend(device_, p.description, p.rank,
+                                                           lane_budget, stop_, native_progress_);
                 if (backend) {
                     auto connection = backend->prepare(p.requirements);
                     if (!connection.data.empty()) {
@@ -307,8 +329,7 @@ CommunicationPreparation CommunicationContext::prepare(std::span<const GroupRequ
                 }
             }
 #endif
-            if (policy != CommunicationPolicy::Native || !p.requirements.peers.empty() ||
-                p.description.usage == GroupUsage::PeerExchange) {
+            if (policy != CommunicationPolicy::Native) {
                 auto backend = detail::make_nccl_backend(p.description, p.rank, stop_);
                 prepared.connections.push_back(backend->prepare(p.requirements));
                 p.routes.push_back({std::move(backend), {.backend = CommunicationBackend::Nccl}});
@@ -319,11 +340,12 @@ CommunicationPreparation CommunicationContext::prepare(std::span<const GroupRequ
     return result;
 }
 
-void CommunicationContext::connect(std::span<const CommunicationPreparation> peers,
-                                   std::chrono::steady_clock::time_point deadline) {
+CommunicationPreparation
+CommunicationContext::select(std::span<const CommunicationPreparation> peers,
+                             std::chrono::steady_clock::time_point deadline) {
     check();
     validate_communication_preparation(topology_, peers);
-    std::size_t warmup_bytes = 0;
+    CommunicationPreparation selected{rank_, {}, policy_};
     for (auto& group : groups_) {
         auto& p = *group->impl_;
         if (p.state != Group::Impl::State::Prepared)
@@ -339,11 +361,12 @@ void CommunicationContext::connect(std::span<const CommunicationPreparation> pee
                     });
                 });
         });
-        for (auto& route : p.routes)
-            if (route.statistics.backend == CommunicationBackend::Native)
-                route.implementation->connect(peers, deadline);
+        for (auto& route : p.routes) route.implementation->resolve(peers, deadline);
         std::erase_if(p.routes, [&](const auto& route) {
             if (route.statistics.backend != CommunicationBackend::Native) return false;
+            if (!p.requirements.peers.empty() &&
+                route.implementation->supports_peers(p.requirements.peers))
+                return false;
             return std::none_of(p.requirements.collectives.begin(),
                                 p.requirements.collectives.end(), [&](const auto& r) {
                                     return route.implementation->supports(
@@ -383,13 +406,58 @@ void CommunicationContext::connect(std::span<const CommunicationPreparation> pee
                 throw std::invalid_argument(
                     "prepared backends do not cover the collective count range");
         }
+        const bool peer_work = std::any_of(
+            p.description.members.begin(), p.description.members.end(), [&](RankId rank) {
+                const auto peer = std::find_if(peers.begin(), peers.end(),
+                                               [&](const auto& v) { return v.rank == rank; });
+                return !prepared_group(*peer, group->id()).requirements.peers.empty();
+            });
+        std::size_t peer_route = p.routes.size();
+        if (peer_work) {
+            auto route = std::find_if(p.routes.begin(), p.routes.end(), [&](const auto& r) {
+                return r.implementation->supports_peers(p.requirements.peers);
+            });
+            if (route == p.routes.end())
+                throw std::invalid_argument("prepared backends do not cover peer transfers");
+            peer_route             = route - p.routes.begin();
+            work[peer_route].peers = p.requirements.peers;
+        }
+        auto& description = selected.groups.emplace_back(GroupPreparation{p.requirements, {}});
+        std::vector<Group::Impl::Route> used;
         for (std::size_t i = 0; i < p.routes.size(); ++i) {
-            auto& route = p.routes[i];
-            if (route.statistics.backend == CommunicationBackend::Nccl)
-                work[i].peers = p.requirements.peers;
-            route.implementation->configure(work[i]);
-            if (route.statistics.backend == CommunicationBackend::Nccl)
-                route.implementation->connect(peers, deadline);
+            if (work[i].collectives.empty() && i != peer_route) continue;
+            description.connections.push_back(p.routes[i].implementation->configure(work[i]));
+            used.push_back(std::move(p.routes[i]));
+        }
+        p.routes = std::move(used);
+        p.state  = Group::Impl::State::Selected;
+    }
+    return selected;
+}
+
+void CommunicationContext::connect(std::span<const CommunicationPreparation> peers,
+                                   std::chrono::steady_clock::time_point deadline) {
+    check();
+    validate_communication_preparation(topology_, peers);
+    std::size_t warmup_bytes = 0;
+    for (auto& group : groups_) {
+        auto& p = *group->impl_;
+        if (p.state != Group::Impl::State::Selected)
+            throw std::logic_error("communication connection precedes selection");
+        for (const auto rank : p.description.members) {
+            const auto peer         = std::find_if(peers.begin(), peers.end(),
+                                                   [&](const auto& v) { return v.rank == rank; });
+            const auto& connections = prepared_group(*peer, group->id()).connections;
+            if (connections.size() != p.routes.size() ||
+                std::any_of(p.routes.begin(), p.routes.end(), [&](const auto& route) {
+                    return std::none_of(connections.begin(), connections.end(), [&](const auto& c) {
+                        return c.backend == route.statistics.backend;
+                    });
+                }))
+                throw std::invalid_argument("selected communication backends differ across ranks");
+        }
+        for (auto& route : p.routes) {
+            route.implementation->connect(peers, deadline);
             warmup_bytes = std::max(warmup_bytes, route.implementation->warmup_bytes());
         }
         p.state = Group::Impl::State::Connected;

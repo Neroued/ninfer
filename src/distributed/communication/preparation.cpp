@@ -100,24 +100,28 @@ CommunicationPreparation decode_communication_preparation(wire::Decoder& in) {
 
 void prepare_communication(ExecutionGroup& group, std::chrono::milliseconds timeout) {
     try {
-        std::vector<CommunicationPreparation> descriptions;
-        for (auto& message : group.receive_all(wire::Kind::CommunicationPrepared, timeout)) {
-            wire::Decoder in(message.message.payload);
-            auto value = decode_communication_preparation(in);
-            in.finish();
-            if (value.rank != message.peer)
-                throw std::invalid_argument("communication preparation rank differs from sender");
-            descriptions.push_back(std::move(value));
-        }
-        validate_communication_preparation(group.topology(), descriptions);
-        wire::Encoder out;
-        out.u64(descriptions.size());
-        for (const auto& value : descriptions) encode_communication_preparation(out, value);
-        broadcast(group, wire::Kind::CommunicationConnect, std::move(out).take());
+        const auto exchange = [&](wire::Kind received, wire::Kind sent) {
+            std::vector<CommunicationPreparation> descriptions;
+            for (auto& message : group.receive_all(received, timeout)) {
+                wire::Decoder in(message.message.payload);
+                auto value = decode_communication_preparation(in);
+                in.finish();
+                if (value.rank != message.peer)
+                    throw std::invalid_argument(
+                        "communication preparation rank differs from sender");
+                descriptions.push_back(std::move(value));
+            }
+            validate_communication_preparation(group.topology(), descriptions);
+            wire::Encoder out;
+            out.u64(descriptions.size());
+            for (const auto& value : descriptions) encode_communication_preparation(out, value);
+            broadcast(group, sent, std::move(out).take());
+        };
+        exchange(wire::Kind::CommunicationPrepared, wire::Kind::CommunicationSelect);
+        exchange(wire::Kind::CommunicationSelected, wire::Kind::CommunicationConnect);
         (void)group.receive_all(wire::Kind::CommunicationConnected, timeout);
         broadcast(group, wire::Kind::CommunicationWarmup);
         (void)group.receive_all(wire::Kind::CommunicationReady, timeout);
-        // Workers may send their next product/test preparation result only after this release.
         broadcast(group, wire::Kind::CommunicationComplete);
     } catch (const std::exception& error) {
         group.fail(error.what());
@@ -130,25 +134,36 @@ bool prepare_communication(WorkerConnection& connection,
                            CommunicationPolicy policy) {
     auto& context       = connection.communication();
     const auto observer = connection.startup_observer();
+    const auto send     = [&](wire::Kind kind, const CommunicationPreparation& value) {
+        wire::Encoder out;
+        encode_communication_preparation(out, value);
+        connection.send(kind, std::move(out).take());
+    };
+    const auto descriptions = [](const wire::Message& command) {
+        wire::Decoder in(command.payload);
+        std::vector<CommunicationPreparation> peers;
+        const auto count = in.count(13);
+        peers.reserve(count);
+        for (std::size_t i = 0; i < count; ++i)
+            peers.push_back(decode_communication_preparation(in));
+        in.finish();
+        return peers;
+    };
+    const auto deadline = [&] {
+        return std::chrono::steady_clock::now() +
+               std::chrono::milliseconds(connection.bootstrap().connect_timeout_ms);
+    };
     try {
         {
             StartupPhaseScope phase(observer, StartupPhase::CommunicationInitialize);
-            const auto local = context.prepare(requirements, policy);
-            wire::Encoder out;
-            encode_communication_preparation(out, local);
-            connection.send(wire::Kind::CommunicationPrepared, std::move(out).take());
-            auto command = receive(connection, wire::Kind::CommunicationConnect);
+            send(wire::Kind::CommunicationPrepared, context.prepare(requirements, policy));
+            auto command = receive(connection, wire::Kind::CommunicationSelect);
             if (!command) return false;
-            wire::Decoder in(command->payload);
-            std::vector<CommunicationPreparation> peers;
-            const auto count = in.count(13);
-            peers.reserve(count);
-            for (std::size_t i = 0; i < count; ++i)
-                peers.push_back(decode_communication_preparation(in));
-            in.finish();
-            context.connect(
-                peers, std::chrono::steady_clock::now() +
-                           std::chrono::milliseconds(connection.bootstrap().connect_timeout_ms));
+            send(wire::Kind::CommunicationSelected,
+                 context.select(descriptions(*command), deadline()));
+            command = receive(connection, wire::Kind::CommunicationConnect);
+            if (!command) return false;
+            context.connect(descriptions(*command), deadline());
             phase.complete();
         }
         connection.send(wire::Kind::CommunicationConnected);

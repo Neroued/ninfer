@@ -50,14 +50,16 @@ Options options(int argc, char** argv) {
         if (flag == "--help") {
             std::cout
                 << "ninfer_collective_bench --config FILE [--backend nccl|native|auto] "
-                   "[--op sum|words|max|gather|candidates|broadcast] [--mode graph|eager] "
+                   "[--op sum|fp16|fp32|words|max|gather|candidates|broadcast|scatter|peer|send] "
+                   "[--mode graph|eager] "
                    "[--width 4096] [--max-m 64] [--bytes N,N,...] [--chain 32] [--samples 15]\n"
                    "[--workload collective|pipeline|skew|overlap|compute] [--work-rows 256]\n"
                    "Graph events time the device body after priming the selected operation "
                    "and an untimed collective fence. "
                    "Each reported sample uses the slower rank. Pipeline measures "
                    "RMSNorm -> SUM -> RMSNorm; skew adds rank-1 RMSNorm; overlap runs "
-                   "RMSNorm on another stream; compute measures that RMSNorm alone.\n";
+                   "RMSNorm on another stream; compute measures that RMSNorm alone.\n"
+                   "Peer measures bidirectional exchange; send measures rank 0 -> rank 1.\n";
             std::exit(0);
         }
         if (i + 1 == argc) throw std::invalid_argument("benchmark option is missing its value");
@@ -108,7 +110,15 @@ Options options(int argc, char** argv) {
 
 dist::CollectiveCall make_call(std::string_view name, std::size_t bytes) {
     dist::CollectiveCall c{dist::Collective::AllReduce, DType::BF16, 0};
-    if (name == "words")
+    if (name == "fp16")
+        c.dtype = DType::FP16;
+    else if (name == "fp32")
+        c.dtype = DType::FP32;
+    else if (name == "scatter")
+        c.operation = dist::Collective::ReduceScatter;
+    else if ((name == "peer" || name == "send"))
+        c.dtype = DType::U8;
+    else if (name == "words")
         c.dtype = DType::U32;
     else if (name == "max") {
         c.dtype     = DType::U64;
@@ -181,21 +191,41 @@ struct Compute {
 
 int worker(dist::CommunicationPolicy backend, std::size_t maximum, std::string_view operation) {
     dist::WorkerConnection connection(dist::read_worker_bootstrap());
+    const bool point_to_point = operation == "peer" || operation == "send";
+    const bool one_way        = operation == "send";
     try {
         const auto call = make_call(operation, maximum);
-        const std::array requirements{dist::GroupRequirements{
+        std::array requirements{dist::GroupRequirements{
             0,
             {{call.operation, call.dtype, 1, call.count, 1, call.reduction, call.root},
              {dist::Collective::AllReduce, DType::U64, 1, 1, 1, dist::Reduction::Max}},
             {}}};
+        if (point_to_point) {
+            requirements[0].collectives.erase(requirements[0].collectives.begin());
+            const auto rank = connection.bootstrap().identity.rank;
+            requirements[0].peers.push_back(
+                {1 - rank, one_way && rank == 1 ? 0 : maximum, one_way && rank == 0 ? 0 : maximum});
+        }
         if (!dist::prepare_communication(connection, requirements, backend)) {
             connection.shutdown();
             return 0;
         }
+        for (const auto& group : connection.communication().statistics())
+            for (const auto& route : group.backends) {
+                const auto& m = route.memory;
+                std::cerr << "communication group=" << group.group << " backend="
+                          << (route.backend == CommunicationBackend::Native ? "native" : "nccl")
+                          << " owned_host_bytes=" << m.owned_host_bytes
+                          << " owned_device_bytes=" << m.owned_device_bytes
+                          << " registered_host_bytes=" << m.registered_host_bytes;
+                if (m.library)
+                    std::cerr << " library_device_bytes=" << m.library->tracked_device_bytes;
+                std::cerr << '\n';
+            }
         {
             auto& device      = connection.device();
             const auto& group = connection.communication().group(0);
-            DeviceBuffer seed(device.device(), maximum), data(device.device(), 2 * maximum);
+            DeviceBuffer seed(device.device(), 2 * maximum), data(device.device(), 3 * maximum);
             DeviceBuffer fence_storage(device.device(), sizeof(std::uint64_t));
             fence_storage.fill();
             Tensor fence(fence_storage.span(), DType::U64, {1});
@@ -220,29 +250,47 @@ int worker(dist::CommunicationPolicy backend, std::size_t maximum, std::string_v
                 in.finish();
                 const auto c     = make_call(name, bytes);
                 const auto width = dtype_size(c.dtype);
-                std::vector<std::byte> values(bytes);
+                const auto input_bytes =
+                    bytes * (c.operation == dist::Collective::ReduceScatter ? 2 : 1);
+                std::vector<std::byte> values(input_bytes);
                 std::uint64_t random = 0x9e3779b97f4a7c15ULL + group.rank();
-                for (std::size_t i = 0; i < c.count; ++i) {
+                for (std::size_t i = 0; i < input_bytes / width; ++i) {
                     random ^= random << 13;
                     random ^= random >> 7;
                     random ^= random << 17;
                     const std::uint64_t value =
-                        c.dtype == DType::BF16 ? 0x3f00U | (random & 127U) : random;
+                        c.dtype == DType::BF16   ? 0x3f00U | (random & 127U)
+                        : c.dtype == DType::FP16 ? 0x3800U | (random & 1023U)
+                        : c.dtype == DType::FP32 ? 0x3f000000U | (random & 0x7fffffU)
+                                                 : random;
                     std::memcpy(values.data() + i * width, &value, width);
                 }
-                seed.copy_from_host(values.data(), bytes);
+                seed.copy_from_host(values.data(), input_bytes);
                 const auto offset =
                     c.operation == dist::Collective::AllGather ? group.rank() * bytes : 0;
-                auto source = Tensor(data.span().subspan(offset, bytes), c.dtype,
-                                     {static_cast<int>(c.count)});
-                auto destination =
-                    Tensor(data.span(), c.dtype,
-                           {static_cast<int>(
-                               c.count * (c.operation == dist::Collective::AllGather ? 2 : 1))});
+                auto source = Tensor(data.span().subspan(offset, input_bytes), c.dtype,
+                                     {static_cast<int>(input_bytes / width)});
+                const auto output_offset =
+                    point_to_point || c.operation == dist::Collective::ReduceScatter ? 2 * maximum
+                                                                                     : 0;
+                const auto output_count =
+                    c.count * (c.operation == dist::Collective::AllGather ? 2 : 1);
+                auto destination = Tensor(data.span().subspan(output_offset), c.dtype,
+                                          {static_cast<int>(output_count)});
                 std::unique_ptr<Compute> compute;
                 if (workload != "collective")
                     compute = std::make_unique<Compute>(device, columns, work_rows, bytes);
                 const auto enqueue = [&] {
+                    if (point_to_point) {
+                        const dist::PeerTransfer transfer{
+                            1 - group.rank(),
+                            {source.data, one_way && group.rank() == 1 ? 0 : bytes,
+                             device.device()},
+                            {destination.data, one_way && group.rank() == 0 ? 0 : bytes,
+                             device.device()}};
+                        group.exchange({&transfer, 1}, device.execution_view());
+                        return;
+                    }
                     switch (c.operation) {
                     case dist::Collective::AllReduce:
                         ops::all_reduce(source, destination, c.reduction, group,
@@ -250,6 +298,10 @@ int worker(dist::CommunicationPolicy backend, std::size_t maximum, std::string_v
                         break;
                     case dist::Collective::AllGather:
                         ops::all_gather(source, destination, group, device.execution_view());
+                        break;
+                    case dist::Collective::ReduceScatter:
+                        ops::reduce_scatter(source, destination, c.reduction, group,
+                                            device.execution_view());
                         break;
                     case dist::Collective::Broadcast:
                         ops::broadcast(destination, c.root, group, device.execution_view());
@@ -259,7 +311,7 @@ int worker(dist::CommunicationPolicy backend, std::size_t maximum, std::string_v
                     }
                 };
                 const auto body = [&](bool capturing = false) {
-                    CUDA_CHECK(cudaMemcpyAsync(source.data, seed.data(), bytes,
+                    CUDA_CHECK(cudaMemcpyAsync(source.data, seed.data(), input_bytes,
                                                cudaMemcpyDeviceToDevice, device.stream()));
                     enqueue();
                     ops::all_reduce(fence, fence, dist::Reduction::Max, group,
@@ -369,7 +421,11 @@ int coordinator(int argc, char** argv) {
     topology.ranks.resize(2);
     for (const auto& r : deployment.ranks)
         topology.ranks[r.rank] = {r.rank, r.node, 0, r.device, {r.rank, 2}, {r.rank, 2}, {}, {}};
-    topology.groups = {{0, {0, 1}}};
+    topology.groups = {{0,
+                        {0, 1},
+                        (o.operation == "peer" || o.operation == "send")
+                            ? dist::GroupUsage::PeerExchange
+                            : dist::GroupUsage::General}};
     topology.roles  = {{"tp", 0}, {"ep", 0}};
     const std::array<std::string, 4> args{"--worker", o.backend, std::to_string(maximum),
                                           o.operation};

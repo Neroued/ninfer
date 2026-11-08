@@ -39,6 +39,8 @@ enum class Kind : std::uint32_t {
     InputRelease,
     StartupProgress,
     CommunicationPrepared,
+    CommunicationSelect,
+    CommunicationSelected,
     CommunicationConnect,
     CommunicationConnected,
     CommunicationWarmup,

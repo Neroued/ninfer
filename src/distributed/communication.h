@@ -98,7 +98,8 @@ public:
     [[nodiscard]] CommunicationStatistics statistics() const;
     void record_graph(CommunicationGraphWork&, const std::function<void()>&) const;
     void replayed(const CommunicationGraphWork&) const noexcept;
-    // All mutually dependent sends/receives are enqueued together, in caller order.
+    // All mutually dependent sends/receives are enqueued together, with one entry per peer.
+    // Receive buffers are disjoint from all send buffers and from other receives.
     void exchange(std::span<const PeerTransfer>, CudaExecutionView) const;
     void enqueue(const CollectiveCall&, const void* source, void* destination,
                  CudaExecutionView) const;
@@ -116,10 +117,12 @@ public:
     ~CommunicationContext();
     CommunicationContext(const CommunicationContext&)            = delete;
     CommunicationContext& operator=(const CommunicationContext&) = delete;
-    // Preparation is local allocation, peer installation, then warmup. All ranks finish each
-    // stage before entering the next. Resources survive Program/Graph rebuilds.
+    // Candidates are prepared locally, resolved against peers, then selected backends connect
+    // and warm up. Resources survive Program/Graph rebuilds.
     [[nodiscard]] CommunicationPreparation prepare(std::span<const GroupRequirements>,
                                                    CommunicationPolicy = CommunicationPolicy::Nccl);
+    [[nodiscard]] CommunicationPreparation select(std::span<const CommunicationPreparation>,
+                                                  std::chrono::steady_clock::time_point deadline);
     void connect(std::span<const CommunicationPreparation>,
                  std::chrono::steady_clock::time_point deadline);
     void warmup();

@@ -33,6 +33,8 @@ bf16_a16_sliced_k_mma_body(const __nv_bfloat16* __restrict__ x,
     const int lid          = lane & 3;
     const int row0         = row_tile * Schedule::kBlockRows;
     const auto destination = linear_output_tile<Schedule::kBlockRows>(output, row0);
+    constexpr int kPhaseStride = Schedule::kKPhaseStride;
+    const int phase = kPhaseStride ? int(std::int64_t(row_tile) * kPhaseStride % kGroups) : 0;
 
     const int a_matrix     = lane >> 3;
     const int a_inner_row  = lane & 7;
@@ -46,7 +48,13 @@ bf16_a16_sliced_k_mma_body(const __nv_bfloat16* __restrict__ x,
     float accum[kFragments][4] = {};
 
     const auto stage_group = [&](int stage, int group) {
-        const int group_k0  = group * kBlockK;
+        int ordered_group = group;
+        if constexpr (kPhaseStride > 0) {
+            // Rotate both operands together to spread the row tiles' streaming K accesses.
+            ordered_group += phase;
+            if (ordered_group >= kGroups) ordered_group -= kGroups;
+        }
+        const int group_k0  = ordered_group * kBlockK;
         auto* weight_shared = staging + stage * Schedule::kStageElements;
         auto* x_shared      = weight_shared + kMmaRows * kBlockK;
 
@@ -148,11 +156,12 @@ bf16_a16_sliced_k_mma_body(const __nv_bfloat16* __restrict__ x,
         }
     }
 
+    // Each warp pair reuses one partial tile: odd publishes, even consumes and replaces it.
     if ((warp & 1) != 0) {
 #pragma unroll
         for (int fragment = 0; fragment < kFragments; ++fragment) {
             const std::int64_t base =
-                (static_cast<std::int64_t>(warp) * kFragments + fragment) * 32 * 4;
+                (static_cast<std::int64_t>(warp / 2) * kFragments + fragment) * 32 * 4;
             common::store_vec(partial + base + static_cast<std::int64_t>(lane) * 4,
                               make_float4(accum[fragment][0], accum[fragment][1],
                                           accum[fragment][2], accum[fragment][3]));
@@ -164,7 +173,7 @@ bf16_a16_sliced_k_mma_body(const __nv_bfloat16* __restrict__ x,
 #pragma unroll
         for (int fragment = 0; fragment < kFragments; ++fragment) {
             const std::int64_t partner_base =
-                (static_cast<std::int64_t>(warp + 1) * kFragments + fragment) * 32 * 4;
+                (static_cast<std::int64_t>(warp / 2) * kFragments + fragment) * 32 * 4;
             float4 partner = {};
             if constexpr (kKWarps % 2 == 0) {
                 partner = common::load_vec<float4>(partial + partner_base +
@@ -179,7 +188,7 @@ bf16_a16_sliced_k_mma_body(const __nv_bfloat16* __restrict__ x,
             accum[fragment][3] += partner.w;
             if (warp != 0) {
                 const std::int64_t base =
-                    (static_cast<std::int64_t>(warp) * kFragments + fragment) * 32 * 4;
+                    (static_cast<std::int64_t>(warp / 2) * kFragments + fragment) * 32 * 4;
                 common::store_vec(partial + base + static_cast<std::int64_t>(lane) * 4,
                                   make_float4(accum[fragment][0], accum[fragment][1],
                                               accum[fragment][2], accum[fragment][3]));
@@ -196,7 +205,7 @@ bf16_a16_sliced_k_mma_body(const __nv_bfloat16* __restrict__ x,
 #pragma unroll
             for (int split = 2; split < kKWarps; split += 2) {
                 const std::int64_t base =
-                    (static_cast<std::int64_t>(split) * kFragments + fragment) * 32 * 4;
+                    (static_cast<std::int64_t>(split / 2) * kFragments + fragment) * 32 * 4;
                 const float4 value =
                     common::load_vec<float4>(partial + base + static_cast<std::int64_t>(lane) * 4);
                 sum.x += value.x;
@@ -217,10 +226,20 @@ template <class Schedule, class Output, class Epilogue>
 __global__
 __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_a16_sliced_k_mma_kernel(
     const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ weight, Output output,
-    Epilogue epilogue, int rows, int input_rows, int tokens, int token_offset) {
+    Epilogue epilogue, int rows, int input_rows, int tokens, int token_offset, int count) {
     extern __shared__ __align__(16) unsigned char shared_raw[];
+    int row_tile = blockIdx.x, token_tile = blockIdx.y;
+    if constexpr (Schedule::kRaster != Bf16MmaRaster::RowFast) {
+        const int row_tiles = bf16_predicated_rows<Schedule>
+                                  ? (rows + Schedule::kBlockRows - 1) / Schedule::kBlockRows
+                                  : rows / Schedule::kBlockRows;
+        bf16_mma_tile_coordinates<Schedule>(blockIdx.x, row_tiles,
+                                            (count + Schedule::kBlockTokens - 1) /
+                                                Schedule::kBlockTokens,
+                                            row_tile, token_tile);
+    }
     bf16_a16_sliced_k_mma_body<Schedule>(
-        x, weight, output, epilogue, rows, input_rows, tokens, blockIdx.x,
-        token_offset + blockIdx.y * Schedule::kBlockTokens, shared_raw);
+        x, weight, output, epilogue, rows, input_rows, tokens, row_tile,
+        token_offset + token_tile * Schedule::kBlockTokens, shared_raw);
 }
 } // namespace ninfer::ops::detail

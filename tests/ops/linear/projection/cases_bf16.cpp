@@ -339,6 +339,46 @@ void run_new_bf16_geometry(Suite& suite, const Geometry& shape) {
 }
 
 #if NINFER_TARGET_SPARK
+void run_dflash_bf16_projections(Suite& suite) {
+    using namespace ninfer::test::linear;
+    for (auto [n, k] : std::array<std::array<int, 2>, 5>{
+             {{2048, 20480}, {3072, 4096}, {12288, 4096}, {4096, 2048}, {4096, 6144}}}) {
+        const auto seed = std::uint32_t(n + k + 541);
+        std::vector<Invocation> full{Invocation{1}, Invocation{8}, Invocation{17}};
+        if (k == 20480 || n == 3072) full.push_back({65});
+        add_shape(suite, QType::BF16, ActivationRecipe::Hashed, make_bf16_weight,
+                  {n, k, seed, Comparison::Full, true, full});
+
+        // Odd columns exercise predicated output tiles; the larger extents cross contraction
+        // routes and include the DFlash block/batch products. This is not the performance sweep.
+        std::vector<Invocation> calls;
+        for (int t : {2, 3, 4, 5, 7, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65, 95, 96, 97,
+                      127, 128, 129})
+            calls.push_back({t});
+        for (int t : {8, 33, 65, 129})
+            calls.push_back({t, CallForm::Policy, ops::LinearPolicy::A16Only, true});
+        for (int t : {1, 33, 128}) calls.push_back({t, CallForm::A16Convenience});
+        if (k == 20480) {
+            for (int t : {255, 256, 257, 511, 512, 513, 1024, 2048, 2049})
+                calls.push_back({t});
+            calls.push_back({2048, CallForm::Policy, ops::LinearPolicy::A16Only, true});
+            calls.push_back({2048, CallForm::A16Convenience});
+        }
+        ShapeCase sampled{n, k, seed + 1, Comparison::Sampled, true, calls};
+        sampled.workspace_prefix = 256;
+        add_shape(suite, QType::BF16, ActivationRecipe::Hashed, make_bf16_weight, sampled);
+        add_workspace_cases(suite, QType::BF16, n, k);
+
+        const std::array tails{Invocation{1}, Invocation{16}, Invocation{33}, Invocation{128}};
+        add_shape(suite, QType::BF16, ActivationRecipe::Hashed, make_bf16_weight,
+                  {n, k, seed + 2, Comparison::Sampled, true, tails, ActivationPattern::KTail});
+        const std::array cancel{Invocation{1}, Invocation{16}, Invocation{33}, Invocation{128}};
+        add_shape(suite, QType::BF16, ActivationRecipe::Hashed, cancellation_weight,
+                  {n, k, seed + 3, Comparison::Sampled, true, cancel,
+                   ActivationPattern::Cancellation});
+    }
+}
+
 void run_bf16_extensions(Suite& suite) {
     using namespace ninfer::test::linear;
     const std::array native_calls{
@@ -460,6 +500,7 @@ void run_bf16(Suite& suite) {
     { run_selector_linear(suite); }
     for (const auto& shape : kNewGeometries) { run_new_bf16_geometry(suite, shape); }
 #if NINFER_TARGET_SPARK
+    run_dflash_bf16_projections(suite);
     run_bf16_extensions(suite);
 #endif
 }

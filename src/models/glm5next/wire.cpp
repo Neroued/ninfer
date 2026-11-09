@@ -182,7 +182,7 @@ void encode_work(Encoder& out, const Work& work, std::uint32_t rank) {
                     out.u64(v.visual->window.id);
                     out.boolean(v.visual->window.produce);
                 }
-            } else if constexpr (std::is_same_v<T, MtpWork>) {
+            } else if constexpr (std::is_same_v<T, SpeculativeWork>) {
                 out.u8(2);
                 rows(out, v.rows);
                 integers(out, v.draft_extents);
@@ -226,7 +226,7 @@ Work decode_work(Decoder& in, const VisionInputBindings& inputs) {
         break;
     }
     case 2: {
-        MtpWork v;
+        SpeculativeWork v;
         v.rows          = rows(in);
         v.draft_extents = integers<std::uint32_t>(in);
         work.operation  = std::move(v);

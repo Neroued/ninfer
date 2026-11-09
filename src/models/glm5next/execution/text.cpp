@@ -76,11 +76,12 @@ MlaRun TextRun::local_mla(std::uint32_t layer) {
         attention_.output.data ? attention_.output : roots_.output, execution_.workspace, cuda_);
 }
 
-void TextRun::next_pre(const ops::MhcPreWeights& weights) {
+void TextRun::next_pre(const ops::MhcPreWeights& weights, const Tensor& feature) {
     const auto next = 1 - coefficients_;
     ops::mhc_post_pre(roots_.residual, roots_.output, roots_.coefficients[coefficients_], weights,
                       parameters_.profile->text.mhc_parameters, roots_.residual,
-                      {roots_.input, roots_.coefficients[next]}, execution_.workspace, cuda_);
+                      {roots_.input, roots_.coefficients[next]}, execution_.workspace, cuda_,
+                      feature);
     coefficients_ = next;
 }
 
@@ -118,8 +119,17 @@ void TextRun::ffn(std::uint32_t layer) {
 
 void TextRun::finish_layer(std::uint32_t layer) {
     if (execution_.parallel) execution_.parallel->sum(roots_.output, cuda_);
-    if (layer + 1 < parameters_.text.layers.size())
-        next_pre(parameters_.text.layers[layer + 1].attention_hc);
+    if (layer + 1 < parameters_.text.layers.size()) {
+        Tensor feature;
+        if (execution_.features.data) {
+            const int slot = parameters_.profile->text.feature_slots.at(layer);
+            if (slot >= 0) {
+                const int h = dimension(parameters_.profile->config.text.hidden);
+                feature     = execution_.features.slice(0, slot * h, h);
+            }
+        }
+        next_pre(parameters_.text.layers[layer + 1].attention_hc, feature);
+    }
 }
 
 void TextRun::finish(Tensor& hidden) {

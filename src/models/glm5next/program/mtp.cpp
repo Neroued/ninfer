@@ -1,7 +1,5 @@
 #include "models/glm5next/program/internal.h"
 
-#include "core/nvtx.h"
-#include "core/transfer.h"
 #include "models/glm5next/execution/mtp.h"
 #include "ninfer/ops/argmax.h"
 #include "ninfer/ops/indexing.h"
@@ -9,18 +7,7 @@
 #include "ninfer/ops/speculative_accept.h"
 #include "ninfer/ops/vocabulary.h"
 
-#include <algorithm>
-
 namespace ninfer::models::glm5next::detail {
-Tensor RankProgramImpl::row(const TensorRegion& region, int rows) {
-    return resources.tensor(region).slice(0, 0, rows);
-}
-
-MemorySpan RankProgramImpl::output(const TensorRegion& region) {
-    return resources.egress().subspan(region.region.offset - resources.plan.frame.egress.offset,
-                                      region.region.bytes);
-}
-
 void RankProgramImpl::stage_conditioning(int rows) {
     const auto& io = resources.plan.frame;
     auto out       = resources.packed(io.mtp->previous_hidden,
@@ -48,14 +35,8 @@ void RankProgramImpl::gather_decode_state(const execution::BatchView& call) {
     ops::gather_state_fields(fields, cuda);
 }
 
-Tensor RankProgramImpl::draft_proposals(int batch) {
-    return resources.tensor(resources.plan.frame.mtp->drafts)
-        .slice(0, 0, batch)
-        .permute({1, 0, 2, 3});
-}
-
-Tensor RankProgramImpl::draft_output_ids(int step, int batch) {
-    return resources.tensor(resources.plan.frame.mtp->drafts)
+Tensor RankProgramImpl::mtp_output_ids(int step, int batch) {
+    return resources.tensor(resources.plan.frame.speculative->drafts)
         .slice(1, step, 1)
         .slice(0, 0, batch)
         .view({batch});
@@ -116,58 +97,7 @@ void RankProgramImpl::align_history(const execution::BatchView& main, Tensor hid
     }
 }
 
-void RankProgramImpl::prepare_mtp() {
-    auto& f          = *compute;
-    const auto& work = std::get<MtpWork>(f.request.work.operation);
-    const auto& io   = resources.plan.frame;
-    const auto& m    = *io.mtp;
-    const auto rank  = parameters.profile->local.rank;
-    const int b = work.rows.size(), k = shape.draft_tokens, width = k + 1;
-    f.physical = f.request.work.batch;
-    f.tokens   = width;
-    f.sequence = false;
-    std::array<std::uint32_t, kMaximumConcurrency> valid{}, skip_first{};
-    for (int i = 0; i < b; ++i) {
-        valid[i]      = work.draft_extents[i] + 1;
-        skip_first[i] = work.draft_extents[i] != 0;
-    }
-    prepare_inputs(work.rows, f.physical, width, {valid.data(), work.rows.size()});
-    prepare_history_metadata(work.rows, {skip_first.data(), work.rows.size()});
-    const auto i32 = [&](const TensorRegion& r) {
-        return static_cast<std::int32_t*>(host(r).data);
-    };
-    const int steps = k;
-    f.draft_visible.assign(steps, 0);
-    for (int i = 0; i < b; ++i) {
-        const auto logical = f.physical.members[i];
-        const auto& r      = work.rows[logical];
-        i32(m.extents)[i]  = work.draft_extents[logical];
-        for (int s = 0; s < steps; ++s) {
-            const auto& d     = m.draft_steps[s];
-            const bool active = std::uint32_t(s) < work.draft_extents[logical];
-            i32(d.positions)[i] =
-                r.mtp_frontier + std::min<std::uint32_t>(s, work.draft_extents[logical]);
-            i32(d.valid_columns)[i] = active;
-            if (active && r.attention_rank == rank)
-                f.draft_visible[s] = std::max(f.draft_visible[s], r.mtp_frontier + s + 1);
-        }
-    }
-    for (int s = 0; s < steps; ++s)
-        fill_local_metadata(m.draft_steps[s], 1, f.batch.attention.rows);
-    f.hidden               = resources.packed(io.pending_hidden,
-                                              {dimension(parameters.profile->config.text.hidden), width, b});
-    const bool read_drafts = !f.decision;
-    f.graph_round          = graphs != nullptr;
-    if (graphs)
-        graphs->replay(f.batch, f.draft_visible, true, read_drafts);
-    else
-        execute_round(f.batch, f.draft_visible, true, read_drafts);
-    f.head_ready = true;
-    f.phase      = ComputePhase::Decision;
-    decide();
-}
-
-execution::MtpRun RankProgramImpl::draft_run(std::uint32_t step, const execution::BatchView& call) {
+execution::MtpRun RankProgramImpl::mtp_run(std::uint32_t step, const execution::BatchView& call) {
     const int c       = call.attention.rows;
     const auto before = step ? resources.mtp_tail(step == 1 ? 0 : 1 + (step - 2) % 2, c)
                              : resources.states.mtp_tail(call.attention.source_offsets);
@@ -178,7 +108,7 @@ execution::MtpRun RankProgramImpl::draft_run(std::uint32_t step, const execution
         cuda);
 }
 
-execution::MlaSelection RankProgramImpl::draft_selection(std::uint32_t step, int c) {
+execution::MlaSelection RankProgramImpl::mtp_selection(std::uint32_t step, int c) {
     auto selected          = resources.plan.frame.mtp->selection.bind(resources.fixed());
     selected.pool_ids      = selected.pool_ids.slice(1, 0, c);
     selected.pool_counts   = selected.pool_counts.slice(0, 0, c);
@@ -186,8 +116,8 @@ execution::MlaSelection RankProgramImpl::draft_selection(std::uint32_t step, int
     return {selected, step && parameters.profile->config.text.mla.share_mtp_selection};
 }
 
-void RankProgramImpl::draft_forward(std::uint32_t step, const execution::BatchView& call,
-                                    const execution::MlaSubmit& submit) {
+void RankProgramImpl::mtp_forward(std::uint32_t step, const execution::BatchView& call,
+                                  const execution::MlaSubmit& submit) {
     const auto& io = resources.plan.frame;
     const auto& m  = *io.mtp;
     const int b = call.rows, c = call.attention.rows, h = parameters.profile->config.text.hidden;
@@ -196,9 +126,9 @@ void RankProgramImpl::draft_forward(std::uint32_t step, const execution::BatchVi
                                : resources.packed(m.previous_hidden, {h, b});
     auto next           = recursive.slice(2, step % 2, 1).view({h, b});
     {
-        auto run = draft_run(step, call);
+        auto run = mtp_run(step, call);
         run.stem(previous);
-        run.local_attention(draft_selection(step, c), submit);
+        run.local_attention(mtp_selection(step, c), submit);
         run.finish_attention();
         run.ffn();
         run.finish(next);
@@ -207,7 +137,7 @@ void RankProgramImpl::draft_forward(std::uint32_t step, const execution::BatchVi
         resources.packed(*io.logits, {dimension(parameters.profile->local.vocabulary.size), b});
     const auto& head = parameters.mtp->head;
     ops::linear(next, head.weight, logits, head.policy, resources.workspace, cuda);
-    auto ids = draft_output_ids(step, b);
+    auto ids = mtp_output_ids(step, b);
     if (parallel) {
         auto keys = resources.packed(*io.candidates, {1, 1, b});
         const auto* configs =
@@ -232,7 +162,7 @@ void RankProgramImpl::accept_mtp(int b) {
     const int w       = shape.draft_tokens + 1;
     auto logits       = resources.packed(*io.logits, {dimension(local.vocabulary.size), w, b});
     auto drafts       = draft_proposals(b);
-    auto positions = row(io.rows.sampling_positions, b), extents = row(m.extents, b);
+    auto positions = row(io.rows.sampling_positions, b), extents = row(io.speculative->extents, b);
     auto licensed = resources.packed(*io.sampled_ids, {w, b});
     auto counts   = row(*io.output_counts, b);
     const auto* configs =
@@ -250,4 +180,52 @@ void RankProgramImpl::accept_mtp(int b) {
     vocabulary().accept(logits, configs, row(io.decode.valid_columns, b), drafts, extents,
                         positions, licensed, counts);
 }
+
+void RankProgramImpl::repair_mtp_history(const execution::BatchView& call, bool repair,
+                                         DecodeGraphSection* captured_repair) {
+    const auto& io = resources.plan.frame;
+    const auto& m  = *io.mtp;
+    const int b = call.rows, w = call.tokens, c = call.attention.rows,
+              h       = parameters.profile->config.text.hidden;
+    const auto hidden = resources.packed(io.pending_hidden, {h, w, b});
+    auto accepted     = row(io.rows.accepted_columns, b);
+    auto history      = batch(m.history, w - 1, c, c, call.attention.max_visible_tokens);
+    auto conditioning = resources.packed(m.conditioning, {h, w - 1, c});
+    ops::prepare_causal_pairs(
+        {hidden,
+         resources.packed(m.previous_hidden, {h, b}),
+         call.ids,
+         call.positions,
+         {},
+         {},
+         accepted,
+         row(m.skip_first, b),
+         call.attention.to_global},
+        {conditioning, history.ids, history.positions, history.valid_columns, {}}, cuda);
+    const auto& local         = call.attention;
+    const auto history_update = [&] {
+        const auto tail = resources.mtp_tail(0, c);
+        execution::mtp_history(parameters, {resources.workspace, *resources.mtp, tail, tail},
+                               history, conditioning.view({h, (w - 1) * c}), cuda);
+    };
+    if (captured_repair)
+        captured_repair->capture(cuda.stream(), history_update);
+    else if (repair)
+        history_update();
+    auto tail                        = resources.states.mtp_tail(local.destination_offsets);
+    const int features               = m.tail_keys.shape[0] * m.tail_keys.shape[1];
+    tail.raw_keys.field.tensor.shape = tail.raw_gates.field.tensor.shape = {features, 1, 1, 1};
+    const auto scratch = [&](const TensorRegion& input) {
+        return resources.tensor(input).slice(3, 0, 1).slice(2, 0, c).view({features, 1, c});
+    };
+    const std::array fields{
+        ops::StateColumnScatter{hidden, row(io.speculative->last_columns, b),
+                                resources.states.hidden(call.destination_offsets)},
+        ops::StateColumnScatter{scratch(m.tail_keys), row(io.attention.active_columns, c),
+                                tail.raw_keys},
+        ops::StateColumnScatter{scratch(m.tail_gates), row(io.attention.active_columns, c),
+                                tail.raw_gates}};
+    ops::scatter_state_fields(fields, cuda);
+}
+
 } // namespace ninfer::models::glm5next::detail

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/linear_attention_state.h"
+#include "core/cyclic_kv_cache.h"
 #include "models/common/context/directory/history.h"
 #include "models/common/context/directory/records.h"
 #include "models/common/context/storage.h"
@@ -16,6 +17,7 @@ struct StateLayout {
     StateImageLayout common, owner;
     LinearAttentionStateLayout kda;
     StateField hidden;
+    std::optional<CyclicKVCacheLayout> draft;
     ops::KpoolTailFields main;
     std::optional<ops::KpoolTailFields> mtp;
     LayoutRegion owner_fields;
@@ -26,6 +28,7 @@ struct StateLayout {
 struct StatePlacement {
     RecordSpec common, owner;
     LayoutRegion owner_fields;
+    std::optional<LayoutRegion> draft_context;
     bool operator==(const StatePlacement&) const = default;
 };
 
@@ -49,6 +52,7 @@ public:
     [[nodiscard]] const LinearAttentionStateView& kda() const noexcept { return kda_; }
 
     [[nodiscard]] StateFieldView hidden(const Tensor& offsets) const;
+    [[nodiscard]] CyclicKVCacheLayerView draft_layer(std::uint32_t, const Tensor& offsets) const;
     [[nodiscard]] ops::KpoolTailStateView main_tail(const Tensor& offsets) const;
     [[nodiscard]] ops::KpoolTailStateView mtp_tail(const Tensor& offsets) const;
     [[nodiscard]] const StateImageStorage& image(bool owner) const noexcept;
@@ -57,6 +61,7 @@ private:
     StateLayout layout_;
     StateImageStorage common_, owner_;
     LinearAttentionStateView kda_;
+    std::optional<CyclicKVCacheView> draft_;
 };
 
 class CacheViews {

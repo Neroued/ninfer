@@ -14,6 +14,7 @@ struct TextExecution {
     const CacheViews& cache;
     Tensor raw_keys, raw_gates;
     ParallelExecution* parallel = nullptr;
+    Tensor features;
 };
 
 class TextRun {
@@ -27,7 +28,7 @@ public:
     void finish_layer(std::uint32_t layer);
     void finish(Tensor& hidden);
 private:
-    void next_pre(const ops::MhcPreWeights&);
+    void next_pre(const ops::MhcPreWeights&, const Tensor& feature = {});
     const Parameters& parameters_;
     TextExecution execution_;
     BatchView batch_;

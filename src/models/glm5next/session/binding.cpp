@@ -68,10 +68,21 @@ Session::inspect_source(const RequestBasePlan& base, std::optional<CheckpointHan
         const auto& states      = p.directory.states();
         const auto source_owner = c.snapshot.continuation().metadata.placement.value;
         const bool local        = source_owner == target.value;
-        out.consume_source      = local && consume && p.checkpoints[h->index].pins == 0 &&
+        const bool own          = resume && resume->snapshot_handle() == h;
+        out.consume_source      = local && (consume || own) && p.checkpoints[h->index].pins == 0 &&
                              states.checkpoint_references(image) == 1 && !states.source_pins(image);
         out.transfers = local ? c.snapshot.restore_requirements(p.directory)
                               : detail::conversion_requirements(p.plan, c.snapshot, target.value);
+        if (local && !out.consume_source)
+            for (std::uint32_t rank = 0; rank < p.plan.states.size(); ++rank)
+                if (const auto& field = p.plan.states[rank].draft_context) {
+                    runtime::ContextTransferRequirement transfer;
+                    transfer.direction   = runtime::ContextTransferDirection::DeviceToDevice;
+                    transfer.rank        = rank;
+                    transfer.image_count = 1;
+                    transfer.work        = {field->bytes, 1};
+                    out.transfers.push_back(transfer);
+                }
         out.local_device =
             local && states.device_resident(image) &&
             std::none_of(out.transfers.begin(), out.transfers.end(), [](const auto& transfer) {
@@ -289,7 +300,7 @@ ResidencyBinding SessionImpl::context_binding(BindOperation& operation) {
         sequence.last_saved   = operation.frontier;
         sequence.resume_phase = Phase::Prefill;
         if (shape.draft_tokens) {
-            sequence.speculative.backend      = SpeculativeBackend::Mtp;
+            sequence.speculative.backend      = shape.speculative;
             sequence.speculative.enabled      = true;
             sequence.speculative.draft_window = shape.draft_tokens;
             sequence.speculative.attempted_per_position.resize(shape.draft_tokens);
@@ -363,7 +374,11 @@ void SessionImpl::prepare_binding_resources(context::ContextReservation& reserve
         states.reserve_destination(reserved.take(bind.state_target), bind.placement.value);
     if (!destination) throw std::logic_error("binding lost its State metadata reservation");
     migration.own_state(*destination);
-    if (bind.state_action == StateBindingAction::Root) { migration.clear_state(); }
+    if (bind.state_action == StateBindingAction::Root) migration.clear_state();
+    if (bind.state_action == StateBindingAction::Fork)
+        for (std::uint32_t rank = 0; rank < plan.states.size(); ++rank)
+            if (const auto& field = plan.states[rank].draft_context)
+                migration.add_state_group(bind.source_image, field->offset, field->bytes, rank);
 }
 
 } // namespace ninfer::models::glm5next::detail

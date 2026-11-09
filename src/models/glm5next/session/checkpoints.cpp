@@ -192,6 +192,9 @@ bool Session::start_capture(SequenceHandle h) {
         p.directory.states().freeze(s.continuation.image);
         tx.snapshot.emplace(p.directory.states(), s.continuation, std::move(prefixes),
                             s.request->identity);
+        for (std::uint32_t rank = 0; rank < p.plan.states.size(); ++rank)
+            if (const auto& field = p.plan.states[rank].draft_context)
+                migration.add_state_group(s.continuation.image, field->offset, field->bytes, rank);
         p.submit_context();
     } catch (...) {
         p.cancel_operation();

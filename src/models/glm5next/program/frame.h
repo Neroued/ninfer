@@ -32,13 +32,22 @@ struct AttentionFrameLayout {
     LayoutRegion ingress;
 };
 
+struct SpeculativeFrameLayout {
+    TensorRegion drafts, extents, verify_ids, last_columns;
+};
+
+struct DFlashFrameLayout {
+    TensorRegion features, ids, positions, valid_columns, window_count;
+    TensorRegion candidate_ids, proposal_q;
+};
+
 struct MtpFrameLayout {
     BatchLayout history;
     std::vector<BatchLayout> draft_steps;
-    TensorRegion conditioning, previous_hidden, recursive_hidden, drafts, extents, verify_ids;
+    TensorRegion conditioning, previous_hidden, recursive_hidden;
     TensorRegion proposal_sampling, proposal_columns;
     std::optional<TensorRegion> target_tokens;
-    TensorRegion skip_first, last_columns;
+    TensorRegion skip_first;
     ops::KpoolBlockSelectionLayout selection;
     TensorRegion tail_keys, tail_gates;
     std::array<TensorRegion, 3> tail_offsets;
@@ -52,7 +61,9 @@ struct FrameLayout {
     TensorRegion prefill_hidden, pending_hidden;
     std::optional<KdaReplayRecordLayout> kda_records;
     ops::KpoolRawRecordLayout main_records;
+    std::optional<SpeculativeFrameLayout> speculative;
     std::optional<MtpFrameLayout> mtp;
+    std::optional<DFlashFrameLayout> dflash;
     std::optional<TensorRegion> logits, token_counts, sampling, grammar_masks;
     std::optional<TensorRegion> candidates, gathered_candidates, sampled_ids, output_counts;
     std::optional<TensorRegion> visual_indices;

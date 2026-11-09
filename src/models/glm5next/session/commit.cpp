@@ -27,7 +27,7 @@ void SessionImpl::finish_result(ComputeResult result) {
     for (std::size_t b = 0; b < tx.members.size(); ++b) {
         const auto& row = tx.result->rows[b];
         generated |= !row.tokens.empty();
-        if (tx.kind == Kind::Mtp
+        if (tx.kind == Kind::Speculative
                 ? (row.drafts != tx.draft_extents[b] || row.processed != tx.draft_extents[b] + 1 ||
                    row.accepted_drafts > row.drafts || row.tokens.size() != row.accepted_drafts + 1)
                 : (row.processed != tx.rows[b].ids.size()))
@@ -217,9 +217,10 @@ CommitResult Session::commit(PendingBatch&& batch,
             if (!decision.accepted_tokens) continue;
             const auto count = decision.accepted_tokens;
             s.identity.prepare_generated(count, decision.prefix_execution_split_after);
-            const auto inputs =
-                tx.kind == detail::ComputeTransaction::Kind::Mtp ? count : tx.rows[b].ids.size();
-            completed[b] = p.prepare_commit(s, tx.rows[b], inputs, false, *tx.completion);
+            const auto inputs = tx.kind == detail::ComputeTransaction::Kind::Speculative
+                                    ? count
+                                    : tx.rows[b].ids.size();
+            completed[b]      = p.prepare_commit(s, tx.rows[b], inputs, false, *tx.completion);
         }
         tx.completion->prepare_actions();
         physical.actions = p.actions(*tx.completion);

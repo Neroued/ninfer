@@ -45,6 +45,25 @@ struct MtpParameters {
     MoeParameters moe;
 };
 
+struct DynamicConvParameters {
+    Tensor base;
+    LinearParameters projection;
+};
+
+struct DraftBlockParameters {
+    Tensor input_norm, post_attention_norm, query_norm, key_norm;
+    LinearParameters kvq, output, gate_up, down;
+    Weight context_key, context_value;
+    DynamicConvParameters attention_conv, mlp_conv;
+};
+
+struct DraftParameters {
+    Weight embedding;
+    LinearParameters feature_projection, head, selector;
+    Tensor context_norm, final_norm, predecessor_codebook, successor_codebook;
+    std::vector<DraftBlockParameters> layers;
+};
+
 struct VisionBlockParameters {
     Tensor input_norm, post_attention_norm, query_norm, key_norm;
     LinearParameters qkv, output, gate_up, down;
@@ -67,6 +86,7 @@ public:
     const std::shared_ptr<const ModelProfile> profile;
     TextParameters text;
     std::optional<MtpParameters> mtp;
+    std::optional<DraftParameters> draft;
     std::optional<VisionParameters> vision;
 };
 

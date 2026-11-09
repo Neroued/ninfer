@@ -131,16 +131,19 @@ void GraphInputs::set(int g, int c, int depth) {
     }
     for (int rank = 0; rank < ranks; ++rank)
         for (int j = 0; j < counts[rank]; ++j) i32(a.from_gather)[begins[rank] + j] = rank * c + j;
+    if (io.speculative)
+        for (int j = 0; j < g; ++j) {
+            i32(io.speculative->extents)[j]      = extent;
+            i32(io.speculative->last_columns)[j] = 0;
+        }
+    if (io.dflash)
+        for (int j = 0; j < g; ++j) i32(io.dflash->valid_columns)[j] = p.shape.draft_tokens + 1;
     if (io.mtp) {
         const auto& m = *io.mtp;
         for (int s = 0; s < depth; ++s)
             batch(m.draft_steps[s], 1, std::max(base - 1, 0) + std::min(s, extent), s < extent,
                   false);
-        for (int j = 0; j < g; ++j) {
-            i32(m.extents)[j]      = extent;
-            i32(m.skip_first)[j]   = depth ? extent != 0 : base == 0;
-            i32(m.last_columns)[j] = 0;
-        }
+        for (int j = 0; j < g; ++j) i32(m.skip_first)[j] = depth ? extent != 0 : base == 0;
     }
     p.fill_local_metadata(io.decode, width, c);
     if (io.mtp)

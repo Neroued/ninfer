@@ -51,7 +51,7 @@ struct ForwardWork {
     std::optional<vision::Work> visual;
 };
 
-struct MtpWork {
+struct SpeculativeWork {
     std::vector<WorkRow> rows;
     std::vector<std::uint32_t> draft_extents;
 };
@@ -74,7 +74,7 @@ struct ScoreWork {
 
 struct Work {
     ContextActions actions;
-    std::variant<ForwardWork, MtpWork, ContextWork, ScoreWork> operation;
+    std::variant<ForwardWork, SpeculativeWork, ContextWork, ScoreWork> operation;
     BatchPlan batch;
 };
 

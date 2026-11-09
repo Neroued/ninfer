@@ -67,6 +67,7 @@ void encode(Encoder& out, const RankResourceDescription& r) {
     out.u8(static_cast<std::uint8_t>(s.purpose));
     out.boolean(s.context_cache);
     out.boolean(s.gpu_timing);
+    out.u8(static_cast<std::uint8_t>(s.speculative));
     for (auto record : {r.state.common, r.state.owner}) {
         out.u64(record.bytes);
         out.u64(record.alignment);
@@ -74,6 +75,11 @@ void encode(Encoder& out, const RankResourceDescription& r) {
     for (auto n :
          {r.state.owner_fields.offset, r.state.owner_fields.bytes, r.state.owner_fields.alignment})
         out.u64(n);
+    out.boolean(r.state.draft_context.has_value());
+    if (r.state.draft_context)
+        for (auto n : {r.state.draft_context->offset, r.state.draft_context->bytes,
+                       r.state.draft_context->alignment})
+            out.u64(n);
     context::encode_directory(out, r.context);
     runtime::protocol::encode(out, r.budget);
     runtime::protocol::encode(out, r.observation);
@@ -94,19 +100,21 @@ void encode(Encoder& out, const RankResourceDescription& r) {
 
 RankResourceDescription decode_rank_resources(Decoder& in) {
     RankResourceDescription r;
-    r.rank                = in.u32();
-    r.shape               = {in.u32(),
-                             in.u32(),
-                             in.u32(),
-                             in.u32(),
-                             static_cast<KvCacheStorage>(in.u8()),
-                             static_cast<KvCacheVectorFormat>(in.u8()),
-                             static_cast<EnginePurpose>(in.u8()),
-                             in.boolean(),
-                             in.boolean()};
-    r.state.common        = {in.u64(), in.u64()};
-    r.state.owner         = {in.u64(), in.u64()};
-    r.state.owner_fields  = {in.u64(), in.u64(), in.u64()};
+    r.rank               = in.u32();
+    r.shape              = {in.u32(),
+                            in.u32(),
+                            in.u32(),
+                            in.u32(),
+                            static_cast<KvCacheStorage>(in.u8()),
+                            static_cast<KvCacheVectorFormat>(in.u8()),
+                            static_cast<EnginePurpose>(in.u8()),
+                            in.boolean(),
+                            in.boolean(),
+                            static_cast<SpeculativeBackend>(in.u8())};
+    r.state.common       = {in.u64(), in.u64()};
+    r.state.owner        = {in.u64(), in.u64()};
+    r.state.owner_fields = {in.u64(), in.u64(), in.u64()};
+    if (in.boolean()) r.state.draft_context = LayoutRegion{in.u64(), in.u64(), in.u64()};
     r.context             = context::decode_directory(in);
     r.budget              = runtime::protocol::memory_budget(in);
     r.observation         = runtime::protocol::rank_snapshot(in);

@@ -7,7 +7,7 @@
 #include "core/cyclic_kv_cache.h"
 #include "core/tensor.h"
 
-
+#include <array>
 #include <cstddef>
 #include <cstdint>
 
@@ -17,6 +17,24 @@ struct SlidingWindowAttentionExecutionEnvelope {
     std::uint32_t min_context = 0;
     std::uint32_t max_context = 0;
 };
+
+// Equality means the captured call is reusable for another envelope at fixed operands.
+// Device positions, valid columns and State offsets remain replay inputs.
+class SlidingWindowAttentionGraphProfile {
+public:
+    bool operator==(const SlidingWindowAttentionGraphProfile&) const = default;
+private:
+    std::array<std::int32_t, 11> words_{};
+    friend SlidingWindowAttentionGraphProfile
+        sliding_window_attention_graph_profile(AttentionHeadGeometry, std::uint32_t,
+                                               SlidingWindowAttentionExecutionEnvelope,
+                                               std::int32_t, std::int32_t);
+};
+
+[[nodiscard]] SlidingWindowAttentionGraphProfile
+sliding_window_attention_graph_profile(AttentionHeadGeometry, std::uint32_t window,
+                                       SlidingWindowAttentionExecutionEnvelope, std::int32_t tokens,
+                                       std::int32_t batch);
 
 /**
  * Symmetric non-causal sliding-window grouped-query attention.
@@ -50,7 +68,7 @@ struct SlidingWindowAttentionExecutionEnvelope {
  * The caller guarantees envelope.min_context <= L <= envelope.max_context, sequential nonnegative
  * live positions, and that the selected record contains the declared committed interval. The
  * envelope is a host launch/workspace resource promise; it never changes the admitted key set or
- * numerical result.
+ * numerical result. Fixed geometry and T/B preserve capture topology across envelope updates.
  */
 void sliding_window_attention(const Tensor& q, const Tensor& query_k, const Tensor& query_v,
                               const Tensor& positions, const Tensor& valid_columns,

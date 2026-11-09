@@ -114,7 +114,7 @@ Session::start_decode(std::span<const SequenceHandle> members,
     auto reservation = p.executor->try_reserve(runtime::FrameKind::Compute);
     if (!reservation) return {};
     p.compute = std::make_unique<detail::ComputeTransaction>(
-        speculative ? Kind::Mtp : Kind::Ordinary, p.directory);
+        speculative ? Kind::Speculative : Kind::Ordinary, p.directory);
     auto& tx = *p.compute;
     tx.members.assign(members.begin(), members.end());
     try {
@@ -131,7 +131,7 @@ Session::start_decode(std::span<const SequenceHandle> members,
         Work work;
         if (speculative) {
             tx.draft_extents = extents;
-            work.operation   = MtpWork{tx.rows, std::move(extents)};
+            work.operation   = SpeculativeWork{tx.rows, std::move(extents)};
         } else
             work.operation = ForwardWork{ForwardKind::Ordinary, SampleKind::NextToken, tx.rows};
         submit(p, std::move(*reservation), std::move(work));

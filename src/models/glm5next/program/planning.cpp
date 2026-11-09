@@ -20,9 +20,10 @@ ExecutionShape shape(const execution::ModelProfile& p, const EngineOptions& o,
         o.max_concurrency > kMaximumConcurrency)
         throw std::invalid_argument(
             "GLM5Next execution bounds differ from its model or batch contract");
-    if ((p.mtp && !o.speculative.draft_tokens) || (!p.mtp && o.speculative.draft_tokens))
-        throw std::invalid_argument("GLM5Next draft window differs from selected MTP component");
-    if (o.purpose == EnginePurpose::CausalScoring && (o.max_concurrency != 1 || p.mtp || p.vision))
+    if (bool(p.mtp || p.draft) != bool(o.speculative.draft_tokens))
+        throw std::invalid_argument("GLM5Next draft window differs from selected component");
+    if (o.purpose == EnginePurpose::CausalScoring &&
+        (o.max_concurrency != 1 || p.mtp || p.draft || p.vision))
         throw std::invalid_argument(
             "GLM5Next causal scoring requires single-request Text resources");
     if (o.context_cache.host_capacity_bytes.value_or(0))
@@ -35,7 +36,8 @@ ExecutionShape shape(const execution::ModelProfile& p, const EngineOptions& o,
             index_format,
             o.purpose,
             o.context_cache.enabled,
-            o.observability.gpu_timing};
+            o.observability.gpu_timing,
+            o.speculative.backend};
 }
 
 context::ContextDirectorySpec schema(const ExecutionPlan& p, std::size_t capacity, bool global) {

@@ -46,6 +46,11 @@ Resources::Resources(ExecutionPlan input, DeviceContext& device, ContextCommunic
         kda_records.emplace(fixed_.span(), *plan.frame.kda_records);
         kda_fold.emplace(*kda_records, states.kda().all_layers_view());
     }
+    if (plan.frame.dflash) {
+        const auto count = plan.profile->draft->context.capacity;
+        copy_bytes(plan.frame.dflash->window_count.region.bind(fixed_.span()),
+                   {&count, sizeof(count), Device::cpu()}, device.execution_view());
+    }
     std::memset(ingress_.data(), 0, ingress_.size());
     copy_bytes_async(plan.frame.host_ingress.bind(fixed_.span()), ingress_.span(),
                      device.execution_view());

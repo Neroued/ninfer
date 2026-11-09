@@ -1,7 +1,6 @@
 #include "models/glm5next/program/internal.h"
 
 #include "core/transfer.h"
-#include "models/glm5next/execution/mtp.h"
 #include "ninfer/ops/indexing.h"
 #include "ninfer/ops/sequence.h"
 
@@ -16,7 +15,8 @@ void RankProgramImpl::commit(runtime::ExecutionTicket ticket, runtime::CommandSe
     f.release_vision    = std::any_of(commit.rows.begin(), commit.rows.end(),
                                       [](const auto& row) { return row.terminal; });
     const auto* forward = std::get_if<ForwardWork>(&f.request.work.operation);
-    if (std::holds_alternative<MtpWork>(f.request.work.operation)) commit_mtp(commit);
+    if (std::holds_alternative<SpeculativeWork>(f.request.work.operation))
+        commit_speculative(commit);
     if (forward && forward->sample != SampleKind::None) {
         const auto& io = resources.plan.frame;
         const int b    = commit.rows.size();
@@ -47,15 +47,15 @@ void RankProgramImpl::commit(runtime::ExecutionTicket ticket, runtime::CommandSe
     f.phase      = ComputePhase::Retiring;
 }
 
-void RankProgramImpl::commit_mtp(const Commit& commit) {
+void RankProgramImpl::commit_speculative(const Commit& commit) {
     auto& f             = *compute;
     const auto& io      = resources.plan.frame;
     const int b         = f.batch.rows;
     auto* values        = static_cast<std::int32_t*>(host(io.rows.accepted_columns).data);
     auto* count_lengths = static_cast<std::int32_t*>(host(io.rows.count_columns).data);
-    auto* last          = static_cast<std::int32_t*>(host(io.mtp->last_columns).data);
+    auto* last          = static_cast<std::int32_t*>(host(io.speculative->last_columns).data);
     bool any = false, repair = false, count_tokens = false;
-    const auto& work = std::get<MtpWork>(f.request.work.operation);
+    const auto& work = std::get<SpeculativeWork>(f.request.work.operation);
     for (int i = 0; i < b; ++i) {
         const auto logical   = f.physical.members[i];
         const auto n         = commit.rows[logical].accepted;
@@ -65,7 +65,8 @@ void RankProgramImpl::commit_mtp(const Commit& commit) {
         count_tokens |= count_lengths[i] != 0;
         last[i] = static_cast<std::int32_t>(n) - 1;
         any |= n != 0;
-        repair |= work.rows[logical].attention_rank == parameters.profile->local.rank &&
+        repair |= parameters.mtp &&
+                  work.rows[logical].attention_rank == parameters.profile->local.rank &&
                   n > (work.draft_extents[logical] ? 1U : 0U);
     }
     if (!any) return;
@@ -81,31 +82,17 @@ void RankProgramImpl::commit_mtp(const Commit& commit) {
     if (f.graph_round)
         graphs->commit(b, f.batch.attention.rows, repair, count_tokens);
     else
-        execute_mtp_commit(f.batch, repair, count_tokens);
+        execute_speculative_commit(f.batch, repair, count_tokens);
 }
 
-void RankProgramImpl::execute_mtp_commit(const execution::BatchView& call, bool repair,
-                                         bool count_tokens, DecodeGraphSection* captured_repair,
-                                         DecodeGraphSection* captured_counts) {
+void RankProgramImpl::execute_speculative_commit(const execution::BatchView& call, bool repair,
+                                                 bool count_tokens,
+                                                 DecodeGraphSection* captured_repair,
+                                                 DecodeGraphSection* captured_counts) {
     const auto& io = resources.plan.frame;
-    const auto& m  = *io.mtp;
-    const int b = call.rows, w = call.tokens, c = call.attention.rows,
-              h       = parameters.profile->config.text.hidden;
-    const auto hidden = resources.packed(io.pending_hidden, {h, w, b});
-    auto accepted     = row(io.rows.accepted_columns, b);
-    auto history      = batch(m.history, w - 1, c, c, call.attention.max_visible_tokens);
-    auto conditioning = resources.packed(m.conditioning, {h, w - 1, c});
-    ops::prepare_causal_pairs(
-        {hidden,
-         resources.packed(m.previous_hidden, {h, b}),
-         call.ids,
-         call.positions,
-         {},
-         {},
-         accepted,
-         row(m.skip_first, b),
-         call.attention.to_global},
-        {conditioning, history.ids, history.positions, history.valid_columns, {}}, cuda);
+    const int b = call.rows, w = call.tokens, c = call.attention.rows;
+    const int h   = dimension(parameters.profile->config.text.hidden);
+    auto accepted = row(io.rows.accepted_columns, b);
     resources.kda_fold->execute(call.source_offsets, call.destination_offsets, accepted, cuda);
     const auto& local = call.attention;
     ops::kpool_tail_extract(resources.states.main_tail(local.source_offsets),
@@ -114,29 +101,15 @@ void RankProgramImpl::execute_mtp_commit(const execution::BatchView& call, bool 
                              row(io.attention.base_positions, c), local.valid_columns},
                             row(io.attention.accepted_columns, c),
                             resources.states.main_tail(local.destination_offsets), cuda);
-    const auto history_update = [&] {
-        const auto tail = resources.mtp_tail(0, c);
-        execution::mtp_history(parameters, {resources.workspace, *resources.mtp, tail, tail},
-                               history, conditioning.view({h, (w - 1) * c}), cuda);
-    };
-    if (captured_repair)
-        captured_repair->capture(cuda.stream(), history_update);
-    else if (repair)
-        history_update();
-    auto tail                        = resources.states.mtp_tail(local.destination_offsets);
-    const int features               = m.tail_keys.shape[0] * m.tail_keys.shape[1];
-    tail.raw_keys.field.tensor.shape = tail.raw_gates.field.tensor.shape = {features, 1, 1, 1};
-    const auto scratch = [&](const TensorRegion& input) {
-        return resources.tensor(input).slice(3, 0, 1).slice(2, 0, c).view({features, 1, c});
-    };
-    const std::array fields{
-        ops::StateColumnScatter{hidden, row(m.last_columns, b),
-                                resources.states.hidden(call.destination_offsets)},
-        ops::StateColumnScatter{scratch(m.tail_keys), row(io.attention.active_columns, c),
-                                tail.raw_keys},
-        ops::StateColumnScatter{scratch(m.tail_gates), row(io.attention.active_columns, c),
-                                tail.raw_gates}};
-    ops::scatter_state_fields(fields, cuda);
+    if (parameters.mtp) {
+        repair_mtp_history(call, repair, captured_repair);
+    } else {
+        append_dflash_context(call, accepted, {0, std::uint32_t(w)});
+        const std::array fields{ops::StateColumnScatter{
+            resources.packed(io.pending_hidden, {h, w, b}), row(io.speculative->last_columns, b),
+            resources.states.hidden(call.destination_offsets)}};
+        ops::scatter_state_fields(fields, cuda);
+    }
     const auto update_counts = [&] {
         auto counts = resources.tensor(*io.token_counts);
         ops::increment_token_counts_batch(resources.packed(*io.sampled_ids, {w, b}),

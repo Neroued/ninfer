@@ -16,7 +16,7 @@ select_sliding_window_attention_plan(AttentionHeadGeometry geometry, std::uint32
         throw std::invalid_argument(
             "sliding_window_attention plan: T must be 1..16 and B must be 1..8");
     }
-    if (envelope.min_context > envelope.max_context) {
+    if (envelope.min_context > envelope.max_context || envelope.max_context > INT32_MAX) {
         throw std::invalid_argument("sliding_window_attention plan: invalid envelope");
     }
     // Keep enough independent KV-head CTAs for small batches, but limit repeated Q loads,
@@ -71,7 +71,9 @@ select_sliding_window_attention_plan(AttentionHeadGeometry geometry, std::uint32
         .key_block      = key_block,
         .reduce_warps   = reduce_warps,
         .split_capacity = direct ? 1 : std::min(split_limit, std::max(1, context_tiles)),
-        .max_context    = static_cast<std::int32_t>(envelope.max_context),
+        .max_context    = envelope.max_context >= window
+                              ? INT32_MAX
+                              : static_cast<std::int32_t>((envelope.max_context + 31U) / 32U * 32U),
         .window         = static_cast<std::int32_t>(window),
     };
 }

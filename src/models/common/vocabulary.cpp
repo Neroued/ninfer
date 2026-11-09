@@ -29,4 +29,14 @@ void DistributedVocabulary::accept(const Tensor& logits, const ops::SamplingConf
                                       counts, cuda);
 }
 
+void DistributedVocabulary::accept_sparse(const Tensor& logits, const ops::SamplingConfig* configs,
+                                          const Tensor& valid, const Tensor& drafts,
+                                          const Tensor& candidate_ids, const Tensor& q,
+                                          const Tensor& extents, const Tensor& positions,
+                                          Tensor& licensed, Tensor& counts) const {
+    const auto combined = collect(logits, configs, valid, drafts);
+    ops::accept_vocabulary_candidates_sparse(combined, configs, drafts, candidate_ids, q, extents,
+                                             positions, licensed, counts, cuda);
+}
+
 } // namespace ninfer::models

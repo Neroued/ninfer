@@ -96,7 +96,7 @@ public:
         } else {
             glm::ComputeResult result;
             const auto* forward = std::get_if<glm::ForwardWork>(&last.operation);
-            const auto* mtp     = std::get_if<glm::MtpWork>(&last.operation);
+            const auto* mtp     = std::get_if<glm::SpeculativeWork>(&last.operation);
             const auto rows     = glm::work_rows(last);
             for (std::size_t b = 0; b < rows.size(); ++b) {
                 const auto& row = rows[b];
@@ -179,15 +179,16 @@ public:
 
 glm::SessionPlan plan(const glm::ModelDefinition& definition, bool pressure = false) {
     glm::SessionPlan p;
-    p.shape                  = {256,
-                                3,
-                                64,
-               definition.options().mtp() ? 3U : 0U,
-                                KvCacheStorage::BFloat16,
-                                KvCacheVectorFormat::BFloat16,
-                                EnginePurpose::Generation,
-                                true,
-                                false};
+    p.shape                  = {.max_context     = 256,
+                                .max_concurrency = 3,
+                                .prefill_chunk   = 64,
+                                .draft_tokens    = definition.options().mtp() ? 3U : 0U,
+                                .kv_storage      = KvCacheStorage::BFloat16,
+                                .index_format    = KvCacheVectorFormat::BFloat16,
+                                .purpose         = EnginePurpose::Generation,
+                                .context_cache   = true,
+                                .gpu_timing      = false,
+                                .speculative     = definition.options().speculative};
     const auto& c            = definition.config().text;
     auto profile             = std::make_shared<glm::execution::ModelProfile>();
     profile->config          = definition.config();
@@ -523,7 +524,7 @@ void mtp_transactions(std::shared_ptr<const glm::ModelDefinition> definition) {
         budgets[1].generated_tokens_remaining = 1;
         f.executor.accept                     = {accepted, 0};
         require(f.session.start_decode(members, budgets).has_value(), "MTP did not start");
-        const auto& work = std::get<glm::MtpWork>(f.executor.last.operation);
+        const auto& work = std::get<glm::SpeculativeWork>(f.executor.last.operation);
         require(work.draft_extents == std::vector<std::uint32_t>{3, 0} &&
                     f.executor.last.batch.members == std::vector<std::uint32_t>{1, 0},
                 "mixed MTP rows lost extents or ownership");

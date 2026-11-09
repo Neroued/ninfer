@@ -65,6 +65,28 @@ PartialWorkspace allocate_workspace(Allocator& workspace, AttentionHeadGeometry 
 
 } // namespace
 
+SlidingWindowAttentionGraphProfile
+sliding_window_attention_graph_profile(AttentionHeadGeometry geometry, std::uint32_t window,
+                                       SlidingWindowAttentionExecutionEnvelope envelope,
+                                       std::int32_t tokens, std::int32_t batch) {
+    require_profile(geometry, window, "sliding_window_attention graph");
+    const auto p =
+        detail::select_sliding_window_attention_plan(geometry, window, tokens, batch, envelope);
+    SlidingWindowAttentionGraphProfile out;
+    out.words_ = {geometry.head_dim,
+                  geometry.query_heads,
+                  geometry.kv_heads,
+                  tokens,
+                  batch,
+                  static_cast<int>(p.route),
+                  p.key_block,
+                  p.reduce_warps,
+                  p.split_capacity,
+                  p.max_context,
+                  p.window};
+    return out;
+}
+
 std::size_t sliding_window_attention_workspace_capacity_bytes(
     AttentionHeadGeometry geometry, std::uint32_t window,
     SlidingWindowAttentionExecutionEnvelope envelope, std::int32_t min_tokens,

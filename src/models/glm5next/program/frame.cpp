@@ -59,11 +59,12 @@ FrameLayout plan_frame(LayoutBuilder& b, const execution::ModelProfile& p,
                                   local.record_offsets.region.offset + local.record_offsets.region.bytes -
                                       local.to_global.region.offset,
                                   256};
+    if (p.mtp || p.draft) out.speculative.emplace().extents = rows();
+    if (p.draft) out.dflash.emplace().valid_columns = rows();
     if (p.mtp) {
         auto& m = out.mtp.emplace();
         for (std::uint32_t i = 0; i < s.draft_tokens; ++i)
             m.draft_steps.push_back(metadata(batch, false));
-        m.extents    = rows();
         m.skip_first = rows();
     }
     const auto local_batch = [&](BatchLayout& io, int n, TensorRegion tables) {
@@ -83,7 +84,7 @@ FrameLayout plan_frame(LayoutBuilder& b, const execution::ModelProfile& p,
     global.count_columns    = rows();
     local.accepted_columns  = rows();
     local.active_columns    = rows();
-    if (out.mtp) out.mtp->last_columns = rows();
+    if (out.speculative) out.speculative->last_columns = rows();
     const auto commit_end = b.finish(256);
     out.commit_ingress    = {global.accepted_columns.region.offset,
                              commit_end - global.accepted_columns.region.offset, 256};
@@ -92,9 +93,23 @@ FrameLayout plan_frame(LayoutBuilder& b, const execution::ModelProfile& p,
     if (p.vision) out.visual_indices = tensor(DType::I32, {columns}, "visual embedding indices");
     const auto host_end = b.finish(256);
     out.host_ingress    = {out.ingress.offset, host_end - out.ingress.offset, 256};
+    if (out.speculative)
+        out.speculative->verify_ids = tensor(DType::I32, {width * batch}, "verify IDs");
+    if (out.dflash) {
+        auto& d    = *out.dflash;
+        d.features = tensor(
+            DType::BF16,
+            {dimension(std::uint64_t(c.hidden) * p.config.draft->target_layer_ids.size()), columns},
+            "Main draft conditioning");
+        d.window_count       = tensor(DType::I32, {1}, "draft retained window");
+        d.ids                = tensor(DType::I32, {width, batch}, "masked block IDs");
+        d.positions          = tensor(DType::I32, {width, batch}, "masked block positions");
+        const int candidates = dimension(p.config.draft->dflash2->selector_top_k);
+        d.candidate_ids = tensor(DType::I32, {candidates, width - 1, batch}, "draft candidate IDs");
+        d.proposal_q = tensor(DType::FP32, {candidates, width - 1, batch}, "draft probabilities");
+    }
     if (out.mtp) {
         auto& m             = *out.mtp;
-        m.verify_ids        = tensor(DType::I32, {width * batch}, "verify IDs");
         m.history           = metadata(columns, true);
         m.history.attention = {m.history.positions, m.history.valid_columns, local.mtp_tables};
     }
@@ -103,11 +118,13 @@ FrameLayout plan_frame(LayoutBuilder& b, const execution::ModelProfile& p,
         tensor(DType::BF16, {hidden, dimension(s.prefill_chunk)}, "prefill hidden");
     out.pending_hidden = tensor(DType::BF16, {hidden, width, batch}, "pending Main hidden");
     out.main_records = ops::plan_kpool_raw_records(b, index, width, batch, dimension(c.mla_layers));
-    if (p.mtp) {
+    if (out.speculative) {
         const int heads = dimension(p.local.kda_heads.size), d = dimension(c.kda.head_dim);
         out.kda_records =
             plan_kda_replay_records(b, {dimension(c.kda_layers), batch, width,
                                         dimension(3ULL * heads * d), heads, heads, d, d});
+    }
+    if (out.mtp) {
         auto& m            = *out.mtp;
         m.proposal_columns = rows();
         m.proposal_sampling =
@@ -119,7 +136,7 @@ FrameLayout plan_frame(LayoutBuilder& b, const execution::ModelProfile& p,
         if (p.local.size == 1) {
             m.target_tokens = tensor(DType::I32, {width, batch}, "target tokens");
         }
-        m.selection    = ops::plan_kpool_block_selection(b, batch);
+        m.selection = ops::plan_kpool_block_selection(b, batch);
         for (auto& offsets : m.tail_offsets)
             offsets = tensor(DType::I64, {batch}, "frame tail offsets");
         const int tail = ops::kKpoolPoolSize - 1, slots = dimension(m.tail_offsets.size());
@@ -129,7 +146,7 @@ FrameLayout plan_frame(LayoutBuilder& b, const execution::ModelProfile& p,
     if (s.purpose == EnginePurpose::Generation) {
         out.logits =
             tensor(DType::BF16, {dimension(p.local.vocabulary.size), width, batch}, "logits");
-        out.token_counts = tensor(DType::I32, {dimension(p.public_tokens), batch}, "token counts");
+        out.token_counts  = tensor(DType::I32, {dimension(p.public_tokens), batch}, "token counts");
         out.grammar_masks = tensor(
             DType::I32, {dimension((std::uint64_t(p.public_tokens) + 31) / 32), width, batch},
             "grammar masks");
@@ -147,12 +164,16 @@ FrameLayout plan_frame(LayoutBuilder& b, const execution::ModelProfile& p,
         const auto first  = out.sampled_ids->region.offset;
         auto last         = out.output_counts->region;
         out.result_egress = {first, last.offset + last.bytes - first, 256};
+        if (out.speculative) {
+            out.speculative->drafts = out.mtp
+                                          ? tensor(DType::I32, {batch, width - 1}, "draft tokens")
+                                          : tensor(DType::I32, {width - 1, batch}, "draft tokens");
+            last                    = out.speculative->drafts.region;
+        }
         if (out.mtp) {
-            out.mtp->drafts = tensor(DType::I32, {batch, width - 1}, "draft tokens");
-            last            = out.mtp->drafts.region;
             for (int step = 0; step < width - 1; ++step) {
                 auto& ids = out.mtp->draft_steps[step].ids;
-                ids       = step ? out.mtp->drafts : out.rows.anchors;
+                ids       = step ? out.speculative->drafts : out.rows.anchors;
                 if (step) ids.region.offset += (step - 1) * batch * sizeof(TokenId);
                 ids.shape            = {batch, 1, 1, 1};
                 ids.region.bytes     = batch * sizeof(TokenId);

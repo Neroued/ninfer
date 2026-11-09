@@ -1,4 +1,5 @@
 #include "models/glm5next/execution/workspace.h"
+#include "models/glm5next/execution/dflash.h"
 #include "ninfer/ops/linear_pair.h"
 
 #include "models/glm5next/state/context.h"
@@ -159,10 +160,11 @@ WorkspacePlan plan_workspace(const ModelProfile& p, const ExecutionShape& s, int
     for (std::uint32_t b = 1; b <= s.max_concurrency; ++b) {
         const int batch = dimension(b);
         out.ordinary    = std::max(out.ordinary, body(p, s, 1, 1, batch, sm_count, false, false));
-        if (p.mtp) {
+        if (p.mtp || p.draft)
             out.verify =
                 std::max(out.verify, body(p, s, 2, dimension(std::uint64_t(s.draft_tokens) + 1),
                                           batch, sm_count, false, false));
+        if (p.mtp) {
             out.draft = std::max(out.draft, body(p, s, 1, 1, batch, sm_count, false, true));
             out.history =
                 std::max(out.history, history(p, s, 1, dimension(s.draft_tokens), batch, sm_count));
@@ -202,6 +204,11 @@ WorkspacePlan plan_workspace(const ModelProfile& p, const ExecutionShape& s, int
         }
         (void)a.alloc_bytes(out.finish);
         out.finish = a.peak_bytes();
+    }
+    if (p.draft) {
+        out.draft   = draft_workspace_capacity(p, dimension(s.draft_tokens + 1),
+                                               dimension(s.max_concurrency));
+        out.history = draft_context_workspace_capacity(p, s);
     }
     out.general_bytes =
         std::max({out.prefill, out.ordinary, out.verify, out.draft, out.history, out.finish});

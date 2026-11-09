@@ -91,6 +91,18 @@ std::vector<distributed::GroupRequirements> RankPreparation::communication_requi
         constexpr auto candidates = std::size_t(DistributedVocabulary::candidates);
         work.push_back(
             {Collective::AllGather, DType::I64, candidates, candidates * decode, candidates});
+        if (plan_.profile->draft) {
+            const auto& p              = *plan_.profile->draft;
+            const auto context_columns = std::max(
+                std::min(std::size_t(shape.prefill_chunk), std::size_t(p.context.capacity)),
+                decode);
+            work.push_back({Collective::AllGather, DType::BF16, std::size_t(p.feature_projection.n),
+                            p.feature_projection.n * context_columns,
+                            std::size_t(p.feature_projection.n)});
+            const auto k = std::size_t(plan_.profile->config.draft->dflash2->selector_top_k);
+            work.push_back(
+                {Collective::AllGather, DType::I64, k, k * batch * shape.draft_tokens, k});
+        }
         if (plan_.profile->mtp)
             work.push_back({Collective::AllReduce, DType::U64, 1, batch, 1, Reduction::Max});
     } else {

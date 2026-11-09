@@ -22,11 +22,23 @@ void Graphs::bind_sites(Round& round, int g, int c, int depth) {
         site.attention.capture(p.cuda.stream(), [&] { call.attention(visible, p.cuda); });
         round.sites.push_back(std::move(site));
     };
-    for (int step = 0; step < depth; ++step) {
-        auto call  = p.batch(io.mtp->draft_steps[step], 1, g, c, p.shape.max_context);
-        auto run   = p.draft_run(step, call);
-        auto local = run.local_mla(p.draft_selection(step, c));
-        add(local.readout(), step);
+    if (p.parameters.mtp)
+        for (int step = 0; step < depth; ++step) {
+            auto call  = p.batch(io.mtp->draft_steps[step], 1, g, c, p.shape.max_context);
+            auto run   = p.mtp_run(step, call);
+            auto local = run.local_mla(p.mtp_selection(step, c));
+            add(local.readout(), step);
+        }
+    if (p.parameters.draft && depth) {
+        auto run = p.dflash_run(g, p.shape.max_context);
+        for (std::uint32_t i = 0; i < p.parameters.draft->layers.size(); ++i) {
+            auto layer = run.attention(i);
+            DraftSite site{.call = layer.readout()};
+            site.profile = site.call.profile(p.shape.max_context);
+            site.attention.capture(p.cuda.stream(),
+                                   [&] { site.call.execute(p.shape.max_context, p.cuda); });
+            round.draft_sites.push_back(std::move(site));
+        }
     }
     const int t                   = depth ? p.shape.draft_tokens + 1 : 1;
     execution::StateUpdate update = execution::StepUpdate{};
@@ -54,13 +66,22 @@ void Graphs::prepare_round(int g, int c, bool verify) {
         if (call.index) site.index_node = site.index.append_to(p.cuda.stream());
         site.attention_node = site.attention.append_to(p.cuda.stream());
     };
+    std::size_t draft_cursor = 0;
+    const auto draft_emit    = [&](const execution::DraftReadout& call) {
+        auto& site = round.draft_sites.at(draft_cursor++);
+        if (site.call.query.data != call.query.data || site.call.scratch.data != call.scratch.data)
+            throw std::logic_error("DFlash Graph readout binding differs from execution layout");
+        site.node = site.attention.append_to(p.cuda.stream());
+    };
     const int t     = depth ? p.shape.draft_tokens + 1 : 1;
     const auto main = p.decode_batch(t, g, c, p.shape.max_context);
-    const std::vector<std::uint32_t> draft(depth, p.shape.max_context);
+    const std::vector<std::uint32_t> draft(depth && p.parameters.draft ? 1 : depth,
+                                           p.shape.max_context);
     round.graph.prepare(
-        p.cuda, [&] { p.execute_round(main, draft, true, true, emit, &round.sections); },
+        p.cuda,
+        [&] { p.execute_round(main, draft, true, true, emit, &round.sections, draft_emit); },
         p.parallel ? &*p.parallel : nullptr);
-    if (cursor != round.sites.size())
+    if (cursor != round.sites.size() || draft_cursor != round.draft_sites.size())
         throw std::logic_error("GLM Graph readouts were not consumed");
     round.workspace_bytes = p.resources.workspace.peak_used();
 }
@@ -68,19 +89,20 @@ void Graphs::prepare_round(int g, int c, bool verify) {
 void Graphs::prepare(GraphInputs& inputs, GraphPreparation& preparation) {
     auto& p           = owner_;
     const int ranks   = p.parameters.profile->local.size;
-    const int maximum = p.parameters.mtp ? p.shape.draft_tokens : 0;
+    const int maximum = p.shape.draft_tokens;
     for (int g = 1; g <= int(p.shape.max_concurrency); ++g) {
         for (int c = (g + ranks - 1) / ranks; c <= g; ++c) {
             for (bool verify : {false, true}) {
-                if (verify && !p.parameters.mtp) continue;
+                if (verify && !maximum) continue;
                 const int depth = verify ? maximum : 0;
                 inputs.set(g, c, depth);
                 const auto main =
                     p.decode_batch(verify ? maximum + 1 : 1, g, c, p.shape.max_context);
-                const std::vector<std::uint32_t> draft(depth, p.shape.max_context);
+                const std::vector<std::uint32_t> draft(depth && p.parameters.draft ? 1 : depth,
+                                                       p.shape.max_context);
                 const auto decide = [&] {
                     if (verify)
-                        p.accept_mtp(g);
+                        p.accept_speculative(g);
                     else
                         p.sample(g, SampleKind::NextToken);
                 };
@@ -93,27 +115,31 @@ void Graphs::prepare(GraphInputs& inputs, GraphPreparation& preparation) {
                 decide();
                 preparation.checkpoint();
             }
-            if (p.parameters.mtp) {
+            if (maximum) {
                 inputs.set(g, c, maximum);
                 const auto main = p.decode_batch(maximum + 1, g, c, p.shape.max_context);
                 if (!preparation.capturing()) {
-                    p.execute_mtp_commit(main, true, true);
+                    p.execute_speculative_commit(main, true, true);
                     preparation.checkpoint();
                     continue;
                 }
                 auto& commit = commits_[{g, c}];
                 p.resources.workspace.reset_peak();
-                commit.graph.prepare(p.cuda, [&] {
-                    p.execute_mtp_commit(main, true, true, &commit.repair, &commit.counts);
-                });
+                commit.graph.prepare(
+                    p.cuda,
+                    [&] {
+                        p.execute_speculative_commit(main, true, true, &commit.repair,
+                                                     &commit.counts);
+                    },
+                    p.parallel ? &*p.parallel : nullptr);
                 commit.workspace_bytes = p.resources.workspace.peak_used();
                 workspace_peak_        = std::max(workspace_peak_, commit.workspace_bytes);
-                commit.graph.launch(p.cuda);
+                commit.graph.launch(p.cuda, p.parallel ? &*p.parallel : nullptr);
                 preparation.checkpoint();
             }
         }
         for (bool verify : {false, true}) {
-            if (verify && !p.parameters.mtp) continue;
+            if (verify && !maximum) continue;
             if (!preparation.capturing()) continue;
             auto& decision = decisions_[{g, verify}];
             p.resources.workspace.reset_peak();
@@ -121,7 +147,7 @@ void Graphs::prepare(GraphInputs& inputs, GraphPreparation& preparation) {
                 p.cuda,
                 [&] {
                     if (verify)
-                        p.accept_mtp(g);
+                        p.accept_speculative(g);
                     else
                         p.sample(g, SampleKind::NextToken);
                     p.copy_result(g, verify);
@@ -158,6 +184,15 @@ void Graphs::replay(const execution::BatchView& main, std::span<const std::uint3
             site.attention_profile = profile;
         }
     }
+    for (auto& site : round.draft_sites) {
+        const auto bound   = draft.front();
+        const auto profile = site.call.profile(bound);
+        if (profile != site.profile) {
+            site.attention.capture(p.cuda.stream(), [&] { site.call.execute(bound, p.cuda); });
+            round.graph.executable.update_child(site.node, site.attention);
+            site.profile = profile;
+        }
+    }
     round.sections.head.set_enabled(round.graph.executable, head);
     round.sections.drafts.set_enabled(round.graph.executable, read_drafts);
     round.graph.launch(p.cuda, p.parallel ? &*p.parallel : nullptr);
@@ -172,9 +207,9 @@ void Graphs::decide(int g, bool verify) {
 
 void Graphs::commit(int g, int c, bool repair, bool count_tokens) {
     auto& commit = commits_.at({g, c});
-    commit.repair.set_enabled(commit.graph.executable, repair);
+    if (owner_.parameters.mtp) commit.repair.set_enabled(commit.graph.executable, repair);
     commit.counts.set_enabled(commit.graph.executable, count_tokens);
-    commit.graph.launch(owner_.cuda);
+    commit.graph.launch(owner_.cuda, owner_.parallel ? &*owner_.parallel : nullptr);
     workspace_peak_ = std::max(workspace_peak_, commit.workspace_bytes);
 }
 

@@ -6,6 +6,15 @@
 #include <algorithm>
 
 namespace ninfer::models::glm5next::detail {
+Tensor RankProgramImpl::row(const TensorRegion& region, int rows) {
+    return resources.tensor(region).slice(0, 0, rows);
+}
+
+MemorySpan RankProgramImpl::output(const TensorRegion& region) {
+    return resources.egress().subspan(region.region.offset - resources.plan.frame.egress.offset,
+                                      region.region.bytes);
+}
+
 MemorySpan RankProgramImpl::host_region(const LayoutRegion& region) {
     const auto& frame   = resources.plan.frame;
     const auto contains = [&](const LayoutRegion& backing) {
@@ -65,6 +74,9 @@ void RankProgramImpl::prepare_inputs(std::span<const WorkRow> rows, const BatchP
                 row.main_frontier + std::min<std::size_t>(t, valid ? valid - 1 : 0);
         }
     }
+    if (resources.plan.frame.dflash)
+        for (std::size_t j = 0; j < plan.members.size(); ++j)
+            i32(resources.plan.frame.dflash->valid_columns)[j] = shape.draft_tokens + 1;
     const int t = width, b = plan.members.size();
     const auto c = std::max_element(plan.owners.begin(), plan.owners.end(), [](auto a, auto b) {
                        return a.size < b.size;
@@ -163,7 +175,7 @@ execution::BatchView RankProgramImpl::batch(const BatchLayout& io, int t, int g,
 
 execution::BatchView RankProgramImpl::decode_batch(int t, int g, int c, std::uint32_t visible) {
     auto io = resources.plan.frame.decode;
-    if (t > 1) io.ids = resources.plan.frame.mtp->verify_ids;
+    if (t > 1) io.ids = resources.plan.frame.speculative->verify_ids;
     return batch(io, t, g, c, visible);
 }
 
@@ -185,10 +197,10 @@ void RankProgramImpl::fill_local_metadata(const BatchLayout& layout, int t, int 
 void RankProgramImpl::request_decision() {
     auto& f = *compute;
     if (f.requested || f.decision) return;
-    const auto* forward = std::get_if<ForwardWork>(&f.request.work.operation);
-    const auto* mtp     = std::get_if<MtpWork>(&f.request.work.operation);
-    if (mtp) {
-        const bool constrained = std::any_of(mtp->rows.begin(), mtp->rows.end(),
+    const auto* forward     = std::get_if<ForwardWork>(&f.request.work.operation);
+    const auto* speculative = std::get_if<SpeculativeWork>(&f.request.work.operation);
+    if (speculative) {
+        const bool constrained = std::any_of(speculative->rows.begin(), speculative->rows.end(),
                                              [](const auto& r) { return r.constrained; });
         if (constrained && (f.phase == ComputePhase::Forward || !drafts_done.ready())) return;
     } else if (!forward || forward->sample == SampleKind::None)
@@ -199,14 +211,16 @@ void RankProgramImpl::request_decision() {
     for (std::uint32_t i = 0; i < rows.size(); ++i) {
         if (!rows[i].constrained) continue;
         runtime::DecisionRequest::Row input{i, {}};
-        if (mtp) {
+        if (speculative) {
             const auto physical =
                 std::find(f.physical.members.begin(), f.physical.members.end(), i) -
                 f.physical.members.begin();
             const auto* drafts =
-                static_cast<const TokenId*>(output(resources.plan.frame.mtp->drafts).data);
-            for (std::uint32_t step = 0; step < mtp->draft_extents[i]; ++step)
-                input.drafts.push_back(drafts[step * shape.max_concurrency + physical]);
+                static_cast<const TokenId*>(output(resources.plan.frame.speculative->drafts).data);
+            const auto view = draft_proposals(rows.size());
+            for (std::uint32_t step = 0; step < speculative->draft_extents[i]; ++step)
+                input.drafts.push_back(
+                    drafts[(step * view.nb[0] + physical * view.nb[1]) / sizeof(TokenId)]);
         }
         request.rows.push_back(std::move(input));
     }

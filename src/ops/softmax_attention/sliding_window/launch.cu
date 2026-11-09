@@ -11,6 +11,8 @@
 namespace ninfer::ops::detail {
 namespace {
 
+__global__ void sliding_window_attention_idle_kernel() {}
+
 template <int Tokens, class Launch>
 void dispatch_token_case(Launch&& launch) {
     constexpr int Warps = (Tokens + 3) / 4;
@@ -90,6 +92,9 @@ void launch_sliding_window_attention(const Tensor& q, const Tensor& query_k, con
             };
             if (direct) {
                 partial.template operator()<true>();
+                // Keep the reduction slot for child-node updates when the context grows.
+                sliding_window_attention_idle_kernel<<<1, 1, 0, stream>>>();
+                CUDA_CHECK(cudaGetLastError());
                 return;
             }
             partial.template operator()<false>();

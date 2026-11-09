@@ -175,7 +175,7 @@ struct ContextOperation {
 };
 
 struct ComputeTransaction {
-    enum class Kind { Prefill, Replay, Ordinary, Mtp, Control, Score };
+    enum class Kind { Prefill, Replay, Ordinary, Speculative, Control, Score };
 
     Kind kind;
     context::ContextTransaction context;

@@ -184,7 +184,7 @@ std::vector<double> oracle(const Cache& cache, int width, int batch, const std::
 enum class Prefix { Full, Mixed, Zero };
 
 int run_case(Cache& cache, int width, int batch, int base_context, int envelope_max, Prefix prefix,
-             bool replay) {
+             bool replay, bool update = false) {
     const int Hkv = cache.kv_heads, Hq = Hkv * 4;
     const ops::AttentionHeadGeometry geometry{D, Hq, Hkv};
     const std::size_t q_count  = static_cast<std::size_t>(D) * Hq * width * batch;
@@ -220,8 +220,8 @@ int run_case(Cache& cache, int width, int batch, int base_context, int envelope_
                                               : 0;
         lanes[b]   = LaneOrder[b];
     }
-    const ops::SlidingWindowAttentionExecutionEnvelope envelope{
-        0, static_cast<std::uint32_t>(envelope_max)};
+    ops::SlidingWindowAttentionExecutionEnvelope envelope{0,
+                                                          static_cast<std::uint32_t>(envelope_max)};
     const auto capacity = ops::sliding_window_attention_workspace_capacity_bytes(
         geometry, cache.window, envelope, width, width, batch);
     GuardedDeviceBuffer scratch(std::max<std::size_t>(capacity, 1));
@@ -242,14 +242,22 @@ int run_case(Cache& cache, int width, int batch, int base_context, int envelope_
     };
     DecodeGraphDefinition definition;
     DecodeGraphExecutable graph;
+    DecodeGraphDefinition child;
+    DecodeGraphChild child_node;
+    ops::SlidingWindowAttentionGraphProfile captured;
     int failures = 0;
-    for (int phase = 0; phase < (replay ? 2 : 1); ++phase) {
+    for (int phase = 0; phase < (update ? 4 : replay ? 2 : 1); ++phase) {
         if (phase)
             for (int b = 0; b < batch; ++b) {
                 lengths[b] = (b % 2 == 0 ? 17 : lengths[b] + 17) % (envelope_max + 1);
                 lanes[b]   = LaneOrder[(b + 3) % 8];
                 if (prefix != Prefix::Zero) valid[b] = valid[b] == 0 ? width : valid[b] - 1;
             }
+        if (update) {
+            const unsigned bounds[]{96, 2048, 1048576, 96};
+            envelope.max_context = bounds[phase];
+            for (int b = 0; b < batch; ++b) lengths[b] = int(bounds[phase]) - b;
+        }
         for (int b = 0; b < batch; ++b)
             for (int t = 0; t < width; ++t)
                 positions[b * width + t] = t < valid[b] ? lengths[b] + t : -1234567;
@@ -281,7 +289,20 @@ int run_case(Cache& cache, int width, int batch, int base_context, int envelope_
         output.fill(0xff);
         scratch.fill(0xa7);
         cuda_synchronize();
-        if (replay && phase == 0) {
+        if (update) {
+            const auto profile = ops::sliding_window_attention_graph_profile(
+                geometry, cache.window, envelope, width, batch);
+            if (!phase || profile != captured) {
+                child.capture(device.stream(), launch);
+                if (!phase) {
+                    definition.capture(device.stream(),
+                                       [&] { child_node = child.append_to(device.stream()); });
+                    graph.instantiate(definition);
+                } else
+                    graph.update_child(child_node, child);
+                captured = profile;
+            }
+        } else if (replay && phase == 0) {
             definition.capture(device.stream(), launch);
             graph.instantiate(definition);
         }
@@ -310,7 +331,8 @@ int run_case(Cache& cache, int width, int batch, int base_context, int envelope_
             ++failures;
         }
         failures += output.verify_guards(label) + scratch.verify_guards(label + " scratch");
-        if (workspace.used() != 0 || workspace.peak_used() != capacity) {
+        if (workspace.used() != 0 ||
+            (update ? workspace.peak_used() > capacity : workspace.peak_used() != capacity)) {
             std::cerr << label << ": workspace query/scope mismatch\n";
             ++failures;
         }
@@ -442,13 +464,19 @@ int main(int argc, char** argv) {
             return failures + cache.verify();
         });
     }
+    for (int heads : {4, 8})
+        suite.add("swa/child-update/h" + std::to_string(heads),
+                  [=] {
+                      Cache cache(2048, false, heads);
+                      return run_case(cache, 8, 4, 96, 1048576, Prefix::Mixed, true, true);
+                  },
+                  {{"execution", "graph"}});
     suite.add("swa/capacity", [] {
         int failures = 0;
         for (int heads : {4, 8})
             for (int batch = 1; batch <= 8; ++batch) {
                 const ops::AttentionHeadGeometry geometry{D, heads * 4, heads};
-                const ops::SlidingWindowAttentionExecutionEnvelope envelope{0, batch % 2 ? 96U
-                                                                                         : 2048U};
+                ops::SlidingWindowAttentionExecutionEnvelope envelope{0, batch % 2 ? 96U : 2048U};
                 for (auto [lo, hi] : {std::pair{1, 16}, {4, 5}, {8, 9}}) {
                     std::size_t peak = 0;
                     for (int width = lo; width <= hi; ++width)

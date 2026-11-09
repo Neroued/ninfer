@@ -13,6 +13,11 @@ StateLayout plan_state(const execution::ModelProfile& p) {
                                                  dimension(c.kda.conv_width - 1ULL), heads, d, d,
                                                  DType::BF16});
     out.hidden = b.add(DType::BF16, {dimension(c.hidden)}, 1, "Main final hidden");
+    if (p.draft) {
+        const auto& d = p.draft->context;
+        out.draft     = plan_cyclic_kv_cache(b, p.config.draft->num_hidden_layers, d.capacity,
+                                             d.kv_heads, d.head_dim);
+    }
     out.common = b.finish();
     out.main =
         ops::append_kpool_tail_fields(b, dimension(c.mla.index_dim), dimension(c.mla_layers));
@@ -26,7 +31,8 @@ StateLayout plan_state(const execution::ModelProfile& p) {
 StatePlacement describe_state(const StateLayout& s) {
     return {{s.common.image_bytes, s.common.alignment},
             {s.owner.image_bytes, s.owner.alignment},
-            s.owner_fields};
+            s.owner_fields,
+            s.draft ? std::optional{s.draft->group} : std::nullopt};
 }
 
 ops::KpoolMlaStorage latent_storage(KvCacheStorage storage) {
@@ -52,7 +58,13 @@ CacheLayout plan_cache(LayoutBuilder& b, const MlaConfig& c, std::uint32_t layer
 
 StateViews::StateViews(MemorySpan backing, const StateLayout& layout)
     : layout_(layout), common_(backing, layout.common), owner_(backing, layout.owner),
-      kda_(common_, layout.kda) {}
+      kda_(common_, layout.kda) {
+    if (layout.draft) draft_.emplace(common_, *layout.draft);
+}
+
+CyclicKVCacheLayerView StateViews::draft_layer(std::uint32_t layer, const Tensor& offsets) const {
+    return draft_.value().layer_view(layer, offsets);
+}
 
 StateFieldView StateViews::hidden(const Tensor& offsets) const {
     return common_.field(layout_.hidden, offsets);

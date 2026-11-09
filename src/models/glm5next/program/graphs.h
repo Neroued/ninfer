@@ -2,6 +2,7 @@
 
 #include "models/common/graph.h"
 #include "models/glm5next/execution/mla.h"
+#include "models/glm5next/execution/dflash.h"
 
 #include <map>
 #include <tuple>
@@ -37,9 +38,17 @@ private:
         ops::KpoolGraphProfile index_profile, attention_profile;
     };
 
+    struct DraftSite {
+        execution::DraftReadout call;
+        DecodeGraphDefinition attention;
+        DecodeGraphChild node;
+        ops::SlidingWindowAttentionGraphProfile profile;
+    };
+
     struct Round {
         GraphSegment graph;
         std::vector<Site> sites;
+        std::vector<DraftSite> draft_sites;
         RoundSections sections;
         std::size_t workspace_bytes = 0;
     };

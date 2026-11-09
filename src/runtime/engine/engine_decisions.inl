@@ -28,7 +28,16 @@ BranchScoreResult EngineCore<Instance>::score_branches(
         decisions_.pending.push_back(job);
     }
     queue_cv_.notify_one();
-    // Wait through cancellation cleanup: queued GPU work borrows these token spans.
+    if (future.wait_until(job->pending_deadline) == std::future_status::timeout) {
+        std::lock_guard lock(queue_mutex_);
+        const auto queued = std::find(decisions_.pending.begin(), decisions_.pending.end(), job);
+        if (queued != decisions_.pending.end()) {
+            decisions_.pending.erase(queued);
+            throw RequestError(RequestErrorKind::QueueTimeout,
+                               "decision queue deadline exceeded");
+        }
+    }
+    // Once claimed, the worker must settle before the caller releases its borrowed token spans.
     return future.get();
 }
 

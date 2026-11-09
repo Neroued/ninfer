@@ -701,7 +701,7 @@ inline double native_value(const std::vector<std::uint8_t>& bytes, const WeightG
         return static_cast<double>(bf16_to_f32(load_u16_le(bytes, index * 2)));
     if (g.format == QType::Q4_G64_FP16) {
         const auto nibble = (bytes[index / 2] >> (column % 2 * 4)) & 15;
-        const int code = (static_cast<int>(nibble) ^ 8) - 8;
+        const int code    = (static_cast<int>(nibble) ^ 8) - 8;
         const auto offset = g.scale_offset + ((matrix * n + row) * (k / 64) + column / 64) * 2;
         return static_cast<double>(code) * f16_to_f32(load_u16_le(bytes, offset));
     }

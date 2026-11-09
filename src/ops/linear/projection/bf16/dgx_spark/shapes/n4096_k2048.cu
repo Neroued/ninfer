@@ -6,15 +6,15 @@ namespace ninfer::ops::detail {
 namespace {
 template <class S>
 using Static = Bf16ScheduleInstance<S, 2048>;
-using Gemv = Static<Bf16A16GemvSchedule<8, 4, 1, 8, 4, Bf16ActivationAccess::Direct,
-                                        Bf16WeightCache::Default, Bf16PhaseOrder::RowSwizzled,
-                                        1, 1, 4, 2>>;
-using Small = Static<Bf16A16SlicedKMmaSchedule<16, 32, 16, 32, 2, Cache::cg, Cache::cg,
-                                               1, 7, Bf16MmaRaster::TokenFast>>;
-using Medium = Static<Bf16A16SlicedKMmaSchedule<64, 32, 8, 32, 2, Cache::cg, Cache::cg,
-                                                1, 7, Bf16MmaRaster::TokenFast>>;
-using Wide = Static<Bf16A16TmaMmaSchedule<64, 64, 128, 32, 16, 3, 1,
-                                           Bf16MmaRaster::TokenFast, 1, 1, 3>>;
+using Gemv =
+    Static<Bf16A16GemvSchedule<8, 4, 1, 8, 4, Bf16ActivationAccess::Direct,
+                               Bf16WeightCache::Default, Bf16PhaseOrder::RowSwizzled, 1, 1, 4, 2>>;
+using Small  = Static<Bf16A16SlicedKMmaSchedule<16, 32, 16, 32, 2, Cache::cg, Cache::cg, 1, 7,
+                                                Bf16MmaRaster::TokenFast>>;
+using Medium = Static<Bf16A16SlicedKMmaSchedule<64, 32, 8, 32, 2, Cache::cg, Cache::cg, 1, 7,
+                                                Bf16MmaRaster::TokenFast>>;
+using Wide =
+    Static<Bf16A16TmaMmaSchedule<64, 64, 128, 32, 16, 3, 1, Bf16MmaRaster::TokenFast, 1, 1, 3>>;
 using Bulk = Static<Bf16A16TmaMmaSchedule<128, 128, 64, 64, 32, 3, 1>>;
 
 template <class S>

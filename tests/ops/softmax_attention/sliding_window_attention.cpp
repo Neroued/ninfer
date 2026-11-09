@@ -297,8 +297,8 @@ int run_case(Cache& cache, int width, int batch, int base_context, int envelope_
                                   " envelope=" + std::to_string(envelope_max) +
                                   (replay ? " graph " : " eager ") + std::to_string(phase);
         const auto out_bits = from_device<std::uint16_t>(output.data(), q_count);
-        failures += verify_reduction(label, from_device_bf16(output.data(), q_count), expected,
-                                     Criterion);
+        failures +=
+            verify_reduction(label, from_device_bf16(output.data(), q_count), expected, Criterion);
         bool zero = true;
         for (int b = 0; b < batch; ++b)
             for (int t = valid[b]; t < width; ++t)

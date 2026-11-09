@@ -636,8 +636,7 @@ double registered_tensor_peak_tflops(const BenchPoint& point, const char*& profi
     }
     if (point.qtype == QType::BF16 && point.t > 1 &&
         ((point.n == 2048 && point.k == 20480 && point.t > 8) ||
-         (point.n == 3072 && point.k == 4096) ||
-         (point.n == 12288 && point.k == 4096) ||
+         (point.n == 3072 && point.k == 4096) || (point.n == 12288 && point.k == 4096) ||
          (point.n == 4096 && (point.k == 2048 || point.k == 6144)))) {
         profile = "BF16_F32ACC";
         return bench::kRoofline.bf16_f32_tflops;
@@ -748,17 +747,17 @@ Result make_result(const BenchPoint& point, const LinearBenchWeight& weight,
         checked_add(weight.model_weight_bytes(), x_bytes, "model bytes"), out_bytes, "model bytes");
     std::uint64_t scratch_traffic = 0;
     if (point.qtype == QType::MXFP8) {
-        const auto& route = ops::detail::select_mxfp8_linear_route(
-            point.n, point.k, point.t, point.policy);
+        const auto& route =
+            ops::detail::select_mxfp8_linear_route(point.n, point.k, point.t, point.policy);
         if (route.compute == ops::detail::Mxfp8LinearCompute::A8) {
             const auto code_elements = checked_mul(static_cast<std::uint64_t>(point.k),
                                                    route.code_tokens(point.t), "code elements");
-            scratch_traffic = 2 * code_elements + 2 * x_elements / 32;
+            scratch_traffic          = 2 * code_elements + 2 * x_elements / 32;
         }
     } else if (point.qtype == QType::FP8_E4M3FN_BLOCK128X128_FP32) {
-        scratch_traffic = ops::detail::select_fp8_block_linear_route(
-                              point.n, point.k, point.t, point.policy)
-                              .scratch_traffic_bytes;
+        scratch_traffic =
+            ops::detail::select_fp8_block_linear_route(point.n, point.k, point.t, point.policy)
+                .scratch_traffic_bytes;
     }
     // Useful traffic is native weights, input and final output. Encoding/workspace
     // round trips remain a separate cost; they must not inflate effective bandwidth.
@@ -792,11 +791,10 @@ Result make_result(const BenchPoint& point, const LinearBenchWeight& weight,
     result.useful_tflops      = useful_flops / seconds / 1.0e12;
     result.tensor_peak_tflops = registered_tensor_peak_tflops(point, result.tensor_profile);
     if (std::isfinite(result.tensor_peak_tflops)) {
-        result.tensor_peak_pct = result.useful_tflops / result.tensor_peak_tflops * 100.0;
+        result.tensor_peak_pct  = result.useful_tflops / result.tensor_peak_tflops * 100.0;
         result.compute_floor_us = useful_flops / (result.tensor_peak_tflops * 1.0e6);
     }
-    if (opt.cold && opt.graph_calls == 1 &&
-        std::isfinite(bench::kRoofline.sustained_read_gbs)) {
+    if (opt.cold && opt.graph_calls == 1 && std::isfinite(bench::kRoofline.sustained_read_gbs)) {
         result.sustained_memory_floor_us =
             static_cast<double>(model_bytes) / (bench::kRoofline.sustained_read_gbs * 1.0e3);
         if (std::isfinite(result.compute_floor_us)) {

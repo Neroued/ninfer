@@ -58,8 +58,8 @@ int main(int argc, char** argv) {
                 Tensor x(input.span(), DType::BF16, {o.k, w, batch}),
                     d(delta.span(), DType::BF16, {G, 2, w, batch}),
                     y(output.span(), DType::BF16, {H, w, batch});
-                const auto bytes =
-                    weight.model_weight_bytes() + 2ULL * (o.k + H) * m + 4ULL * H + 4ULL * G * m - 2ULL * G * batch;
+                const auto bytes = weight.model_weight_bytes() + 2ULL * (o.k + H) * m + 4ULL * H +
+                                   4ULL * G * m - 2ULL * G * batch;
                 const double flops = 2. * H * o.k * m;
                 measurement::Row row;
                 row.op     = "linear_dynamic_grouped_conv";

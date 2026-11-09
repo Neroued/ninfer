@@ -247,8 +247,8 @@ void add_gathered_selector_cases(OpSuite& suite) {
         for (int d : {1, 7, 15})
             suite.add("gathered_selector/" + std::string(name) + "/d" + std::to_string(d),
                       [=] { return run(d, 8, pattern, true); }, {{"suite", "selector"}});
-    for (auto [name, pattern] : {std::pair{"empty_rank", F::Pattern::EmptyRank},
-                                 {"missing", F::Pattern::Missing}})
+    for (auto [name, pattern] :
+         {std::pair{"empty_rank", F::Pattern::EmptyRank}, {"missing", F::Pattern::Missing}})
         for (int d : {7, 15})
             suite.add("gathered_selector/" + std::string(name) + "/d" + std::to_string(d) + "/b1",
                       [=] { return run(d, 1, pattern, true); }, {{"suite", "selector"}});

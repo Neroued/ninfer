@@ -9,12 +9,12 @@ using Static = Bf16ScheduleInstance<S, 4096>;
 using Gemv =
     Static<Bf16A16GemvSchedule<16, 2, 1, 8, 4, Bf16ActivationAccess::Direct,
                                Bf16WeightCache::Default, Bf16PhaseOrder::Sequential, 1, 1, 2, 2>>;
-using S8 = Static<Bf16A16SlicedKMmaSchedule<16, 8, 16, 32, 2, Cache::cg, Cache::cg, 1, 7,
-                                            Bf16MmaRaster::TokenFast>>;
-using S16 = Static<Bf16A16SlicedKMmaSchedule<16, 16, 16, 32, 2, Cache::cg, Cache::cg, 1, 7,
-                                             Bf16MmaRaster::TokenFast>>;
-using S32 = Static<Bf16A16SlicedKMmaSchedule<64, 32, 8, 32, 2, Cache::cg, Cache::cg, 1, 7,
-                                             Bf16MmaRaster::TokenFast>>;
+using S8     = Static<Bf16A16SlicedKMmaSchedule<16, 8, 16, 32, 2, Cache::cg, Cache::cg, 1, 7,
+                                                Bf16MmaRaster::TokenFast>>;
+using S16    = Static<Bf16A16SlicedKMmaSchedule<16, 16, 16, 32, 2, Cache::cg, Cache::cg, 1, 7,
+                                                Bf16MmaRaster::TokenFast>>;
+using S32    = Static<Bf16A16SlicedKMmaSchedule<64, 32, 8, 32, 2, Cache::cg, Cache::cg, 1, 7,
+                                                Bf16MmaRaster::TokenFast>>;
 using Medium = Static<Bf16A16TmaMmaSchedule<64, 64, 64, 32, 16, 3, 2>>;
 using Mid    = Static<Bf16A16TmaMmaSchedule<128, 64, 64, 64, 16, 3, 1>>;
 using Large  = Static<Bf16A16TmaMmaSchedule<128, 128, 64, 64, 32, 3, 1>>;

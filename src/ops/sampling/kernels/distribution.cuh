@@ -256,45 +256,48 @@ __device__ inline void sampling_sort_tile_desc(float* vals, int* idxs) {
     }
 }
 
+__device__ inline void sampling_normalize_support_values(const SamplingConfig& cfg,
+                                                         const float* cand_val, float* prob,
+                                                         int* n_support, int n) {
+    while (n > 0 && !isfinite(cand_val[n - 1])) { --n; }
+    if (n == 0 || !isfinite(cand_val[0])) {
+        // The caller provides nonempty masks. Missing finite support is a model execution
+        // failure, not a distribution from which a placeholder token can be published.
+        asm volatile("trap;");
+    } else {
+        const float inv_temp = 1.0f / cfg.temperature;
+        const float m        = cand_val[0] * inv_temp;
+        float sum            = 0.0f;
+        for (int j = 0; j < n; ++j) {
+            const float e = __expf(cand_val[j] * inv_temp - m);
+            prob[j]       = e;
+            sum += e;
+        }
+        const float e0           = prob[0];
+        const float min_p_thresh = (cfg.min_p > 0.0f) ? cfg.min_p * e0 : -1.0f;
+        const bool top_p_active  = (cfg.top_p < 1.0f);
+        const float top_p_target = cfg.top_p * sum;
+        float cum                = 0.0f;
+        int support              = 0;
+        for (int j = 0; j < n; ++j) {
+            if (min_p_thresh >= 0.0f && prob[j] < min_p_thresh) { break; }
+            cum += prob[j];
+            support = j + 1;
+            if (top_p_active && cum >= top_p_target) { break; }
+        }
+        if (support < 1) { support = 1; }
+        float ssum = 0.0f;
+        for (int j = 0; j < support; ++j) { ssum += prob[j]; }
+        const float inv = 1.0f / ssum;
+        for (int j = 0; j < support; ++j) { prob[j] *= inv; }
+        *n_support = support;
+    }
+}
+
 __device__ inline void sampling_normalize_support(const SamplingConfig& cfg, float* cand_val,
                                                   int* cand_idx, float* prob, int* n_support,
                                                   int n) {
-    const int tid = threadIdx.x;
-    if (tid == 0) {
-        while (n > 0 && !isfinite(cand_val[n - 1])) { --n; }
-        if (n == 0 || !isfinite(cand_val[0])) {
-            // The caller provides nonempty masks. Missing finite support is a model execution
-            // failure, not a distribution from which a placeholder token can be published.
-            asm volatile("trap;");
-        } else {
-            const float inv_temp = 1.0f / cfg.temperature;
-            const float m        = cand_val[0] * inv_temp;
-            float sum            = 0.0f;
-            for (int j = 0; j < n; ++j) {
-                const float e = __expf(cand_val[j] * inv_temp - m);
-                prob[j]       = e;
-                sum += e;
-            }
-            const float e0           = prob[0];
-            const float min_p_thresh = (cfg.min_p > 0.0f) ? cfg.min_p * e0 : -1.0f;
-            const bool top_p_active  = (cfg.top_p < 1.0f);
-            const float top_p_target = cfg.top_p * sum;
-            float cum                = 0.0f;
-            int support              = 0;
-            for (int j = 0; j < n; ++j) {
-                if (min_p_thresh >= 0.0f && prob[j] < min_p_thresh) { break; }
-                cum += prob[j];
-                support = j + 1;
-                if (top_p_active && cum >= top_p_target) { break; }
-            }
-            if (support < 1) { support = 1; }
-            float ssum = 0.0f;
-            for (int j = 0; j < support; ++j) { ssum += prob[j]; }
-            const float inv = 1.0f / ssum;
-            for (int j = 0; j < support; ++j) { prob[j] *= inv; }
-            *n_support = support;
-        }
-    }
+    if (threadIdx.x == 0) sampling_normalize_support_values(cfg, cand_val, prob, n_support, n);
     __syncthreads();
 }
 

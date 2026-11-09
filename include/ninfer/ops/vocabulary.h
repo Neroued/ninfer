@@ -76,4 +76,30 @@ void accept_vocabulary_candidates(const Tensor& keys, const SamplingConfig* conf
                                   const Tensor& base_positions, Tensor& licensed_tokens,
                                   Tensor& licensed_counts, CudaExecutionView execution);
 
+/**
+ * Sparse-proposal acceptance from gathered target keys I64 [K,D+1,B,R], following the
+ * key/filter/storage contract above. candidate_ids I32 [16,D,B] and proposal_q FP32 [16,D,B]
+ * describe the conditional proposal distribution actually used for each draft prefix.
+ * They are contiguous; q is finite, nonnegative and sums to one (up to FP32 rounding).
+ * Positive-q IDs are distinct valid global IDs. Zero-q IDs are ignored (INT_MAX is allowed).
+ * For every consumed positive-temperature draft, q(draft)>0. Greedy rows ignore IDs/q.
+ *
+ * Target keys already include penalties and masks. Apply the existing target Top-K/min-p/top-p
+ * normalization once, accept with min(1,p(draft)/q(draft)), and on first rejection draw from
+ * normalize(max(p-q,0)), aligned by global ID. A proposal ID outside target support adds no
+ * correction mass. If FP32 rounding leaves zero residual mass, correction falls back to p.
+ * Full acceptance draws the bonus from p. Greedy rows accept matching target
+ * IDs. RNG purposes and base_position+column+1 match accept_vocabulary_candidates.
+ *
+ * D/B/R, nonempty consumed target support, strided drafts, extents, positions, output writes,
+ * disjointness and read-only state follow that entry. Only columns <=current_extents[b]
+ * participate, and IDs/q are read only for positive-temperature columns <current_extents[b].
+ * Outputs also overlap neither IDs nor q. No workspace, allocation or persistent state effects.
+ */
+void accept_vocabulary_candidates_sparse(const Tensor& keys, const SamplingConfig* configs,
+                                         const Tensor& drafts, const Tensor& candidate_ids,
+                                         const Tensor& proposal_q, const Tensor& current_extents,
+                                         const Tensor& base_positions, Tensor& licensed_tokens,
+                                         Tensor& licensed_counts, CudaExecutionView execution);
+
 } // namespace ninfer::ops

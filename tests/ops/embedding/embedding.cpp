@@ -617,6 +617,47 @@ int validate_fp8(Fp8Table& table) {
     return failures;
 }
 
+int test_dense_glm_mask() {
+    constexpr int rows = 154880, hidden = 4096;
+    const std::vector<int> ids{0, 77439, 77440, 154855, 154856, 154879, 154856, 12345};
+    GuardedDeviceBuffer table(std::size_t(rows) * hidden * 2), output(ids.size() * hidden * 2);
+    table.fill(0xff);
+    output.fill(0x7d);
+    std::vector<std::uint16_t> expected(ids.size() * hidden), row(hidden);
+    for (std::size_t t = 0; t < ids.size(); ++t) {
+        for (int d = 0; d < hidden; ++d)
+            row[d] =
+                std::uint16_t(std::uint32_t(ids[t]) * 1664525U + std::uint32_t(d) * 1013904223U);
+        table.copy_from_host(row.data(), hidden * 2, std::size_t(ids[t]) * hidden * 2);
+        std::copy(row.begin(), row.end(), expected.begin() + t * hidden);
+    }
+    auto db = to_device(ids);
+    Tensor input(db.span(), DType::I32, {int(ids.size())}),
+        out(output.span(), DType::BF16, {hidden, int(ids.size())});
+    Weight w{};
+    w.qtype         = QType::BF16;
+    w.layout        = QuantLayout::Contiguous;
+    w.device        = table.device();
+    w.payload       = table.data();
+    w.qdata         = table.data();
+    w.payload_bytes = table.bytes();
+    w.ndim          = 2;
+    w.shape[0] = w.padded_shape[0] = w.n = rows;
+    w.shape[1] = w.padded_shape[1] = w.k = hidden;
+    auto e                               = cuda_environment().context.execution_view();
+    cuda_synchronize();
+    DecodeGraphDefinition definition;
+    definition.capture(e.stream(), [&] { ops::embedding(input, w, out, e); });
+    DecodeGraphExecutable graph;
+    graph.instantiate(definition);
+    graph.launch(e.stream());
+    cuda_synchronize(e.stream());
+    return verify_exact("GLM physical embedding and mask rows",
+                        from_device<std::uint16_t>(output.data(), expected.size()), expected) +
+           table.verify_guards("GLM embedding table") +
+           output.verify_guards("GLM embedding output");
+}
+
 int test_dense(int dimension = kDenseD, int tokens = 7, int offset = 0, bool graph = false) {
     std::vector<std::uint16_t> table(static_cast<std::size_t>(kDenseRows) * dimension);
     for (std::int32_t row = 0; row < kDenseRows; ++row) {
@@ -722,6 +763,9 @@ void add_quantized_cases(OpSuite& suite, std::string format, int width, bool rep
 } // namespace
 
 void add_embedding_cases(ninfer::test::OpSuite& suite) {
+    suite.add("embedding/bf16/glm_mask_domain", test_dense_glm_mask,
+              {{"format", "bf16"}, {"execution", "graph"}});
+
     suite.add("embedding/bf16/rows", [] { return test_dense(); },
               {{"format", "bf16"}, {"execution", "eager"}});
     for (int tokens : {1, 48, 257})

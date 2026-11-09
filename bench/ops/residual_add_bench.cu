@@ -55,8 +55,8 @@ int main(int argc, char** argv) try {
             tokens = {measurement::integer(argv[++i])};
         } else if (!std::strcmp(argv[i], "--d") && i + 1 < argc) {
             d = measurement::integer(argv[++i]);
-            if (d != 1152 && d != 2048 && d != 5120) {
-                std::fprintf(stderr, "D must be 1152, 2048, or 5120\n");
+            if (d != 1152 && d != 2048 && d != 4096 && d != 5120) {
+                std::fprintf(stderr, "D must be 1152, 2048, 4096, or 5120\n");
                 return 2;
             }
         } else if (!std::strcmp(argv[i], "--tokens") && i + 1 < argc) {
@@ -66,12 +66,12 @@ int main(int argc, char** argv) try {
             }
             tokens = measurement::integers(argv[++i]);
         } else if (!std::strcmp(argv[i], "--help")) {
-            std::cout << "ResidualAdd: --d 1152|2048|5120 --tokens T[,T...] or --patches P\n";
+            std::cout << "ResidualAdd: --d 1152|2048|4096|5120 --tokens T[,T...] or --patches P\n";
             measurement::help();
             return 0;
         } else if (!measurement::parse(timing, flag, measurement::take(argc, argv, i))) {
             std::fprintf(stderr,
-                         "usage: %s [--d 1152|2048|5120] [--tokens T[,T...] | --patches P]\n",
+                         "usage: %s [--d 1152|2048|4096|5120] [--tokens T[,T...] | --patches P]\n",
                          argv[0]);
             return 2;
         }

@@ -1,5 +1,6 @@
 ninfer_add_op_bench(ninfer_silu_mul_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/silu_mul_bench.cu")
 ninfer_add_op_bench(ninfer_residual_add_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/residual_add_bench.cu")
+ninfer_add_op_bench(ninfer_sequence_indexing_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/sequence_indexing_bench.cu")
 ninfer_add_op_bench(ninfer_sigmoid_mul_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/sigmoid_mul_bench.cu")
 ninfer_add_op_bench(ninfer_rmsnorm_pack_tail_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/rmsnorm_pack_tail_bench.cu")
 ninfer_add_op_bench(ninfer_rmsnorm_gathered_features_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/rmsnorm_gathered_features_bench.cu")

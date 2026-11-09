@@ -239,6 +239,7 @@ int main(int argc, char** argv) {
             measurement::Row row;
             row.op     = options.op;
             row.format = "bf16";
+            row.policy = options.stochastic ? "stochastic" : "greedy";
             row.tokens = t;
             row.batch  = options.batch;
             row.n      = options.rows;

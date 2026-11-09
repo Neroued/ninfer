@@ -1,4 +1,5 @@
 #include "ops/linear/split/runner.h"
+#include "core/platform.h"
 
 namespace ninfer::test::linear_split {
 
@@ -6,6 +7,27 @@ void add_multi_output_cases(Suite& suite) {
     using Policy = ops::LinearPolicy;
     constexpr ReductionCriterion a16{2.9e-3, 4.0e-3, 4.5e-3};
     constexpr ReductionCriterion fp8_a16{1.0 / 256.0, 1.0 / 256.0, 2.0 / 256.0};
+#if NINFER_TARGET_SPARK
+    {
+        Profile profile{4096,
+                        {{QType::BF16, 3072, 2339U}},
+                        {512, 512, 2048},
+                        {{0, 512, 128}, {512, 512, 128}, {1024, 2048, 128}},
+                        a16};
+        std::vector<Invocation> calls{{.t = 0, .validate_operands = true}};
+        for (int t : {1, 2, 7, 8, 16, 17, 31, 32, 33, 63, 64, 65, 96, 127, 128, 129})
+            calls.push_back(
+                {.t = t, .input_seed = 2341U, .full_rows = t <= 17, .convenience = true});
+        for (int t : {7, 33, 65, 128, 129})
+            calls.push_back({.t            = t,
+                             .graph        = true,
+                             .input_seed   = 2341U,
+                             .changed_seed = 2347U,
+                             .sample_rows  = 31});
+        calls.push_back({.t = 0, .workspace_intervals = true});
+        add_profile(suite, profile, std::move(calls));
+    }
+#endif
     const std::vector<int> segments{6144, 1024, 6144, 1024};
     const std::vector<Region> regions{{0, 6144}, {6144, 1024}, {7168, 6144}, {13312, 1024}};
     const std::vector<int> bulk{129, 191, 192, 193, 256, 257, 287,  288,

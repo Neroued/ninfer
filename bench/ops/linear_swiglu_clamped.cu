@@ -14,6 +14,7 @@ struct Options {
     std::vector<int> tokens{1, 6, 16, 32, 128, 512, 2048, 4096};
     std::string format = "nvfp4";
     std::string policy;
+    bool clamped = true;
     int n = 0, k = 4096;
 };
 
@@ -23,14 +24,16 @@ Options parse(int argc, char** argv) {
         const std::string_view flag = argv[i];
         if (flag == "--help") {
             std::cout
-                << "Clamped Linear SwiGLU benchmark\n"
+                << "Linear SwiGLU benchmark\n"
+                   "  --product ordinary|clamped (default clamped)\n"
                    "  --format nvfp4|bf16|q8|mxfp8|fp8_block_fp32|nvfp4_mul\n"
                    "  --policy a16|a8|a4 --tokens T[,T...] --sweep START:END[:STEP] --n N --k "
                    "K\n"
                    "  Defaults: NVFP4 N=12288, K=4096, AllowA4; BF16: N=2048, K=4096, A16Only. Q8: "
                    "N=2048, K=4096, A16Only.\n"
                    "  MXFP8 defaults to AllowA8. NVFP4_MUL and block FP8 default to A16Only.\n"
-                   "  Clamp limit=10. Effective traffic includes activation packing.\n";
+                   "  Clamped product uses limit=10. Effective traffic includes activation "
+                   "packing.\n";
             measurement::help();
             std::exit(0);
         }
@@ -43,7 +46,11 @@ Options parse(int argc, char** argv) {
             o.format = value;
         else if (flag == "--policy")
             o.policy = value;
-        else if (flag == "--tokens")
+        else if (flag == "--product") {
+            if (value != "ordinary" && value != "clamped")
+                throw std::invalid_argument("product must be ordinary or clamped");
+            o.clamped = value == "clamped";
+        } else if (flag == "--tokens")
             o.tokens = measurement::integers(value);
         else if (flag == "--sweep")
             o.tokens = measurement::sweep(value);
@@ -88,7 +95,7 @@ void run(const Options& options, Fixture& fixture) {
         Tensor x(input.span(), DType::BF16, {weight.k, t}),
             y(output.span(), DType::BF16, {weight.n / 2, t});
         measurement::Row row;
-        row.op              = "linear_swiglu_clamped";
+        row.op              = options.clamped ? "linear_swiglu_clamped" : "linear_swiglu";
         row.format          = options.format;
         row.policy          = options.policy;
         row.n               = weight.n;
@@ -104,7 +111,12 @@ void run(const Options& options, Fixture& fixture) {
                  measurement::selections(options.timing.cache, "cold", "warm")) {
                 arena.reset_peak();
                 const auto result = measurement::measure(
-                    [&](auto cuda) { ops::linear_swiglu(x, weight, y, 10.f, policy, arena, cuda); },
+                    [&](auto cuda) {
+                        if (options.clamped)
+                            ops::linear_swiglu(x, weight, y, 10.f, policy, arena, cuda);
+                        else
+                            ops::linear_swiglu(x, weight, y, policy, arena, cuda);
+                    },
                     [](auto) {}, flush, device_context().execution_view(), options.timing,
                     execution, cache);
                 row.workspace_peak   = arena.peak_used();
@@ -124,7 +136,8 @@ void run(const Options& options, Fixture& fixture) {
                     : weight.qtype == QType::NVFP4_MUL ? weight.n == 8192 || t > 2
                     : weight.qtype == QType::NVFP4
                         ? t >= 3
-                        : t >= 2 || (weight.qtype == QType::BF16 && weight.n == 20480);
+                        : t >= 2 || (weight.qtype == QType::BF16 &&
+                                     (weight.n == 20480 || weight.n == 12288));
                 const double peak          = !tensor     ? std::numeric_limits<double>::quiet_NaN()
                                              : native_a4 ? kRoofline.nvfp4_f32_tflops
                                              : native_a8 ? kRoofline.mxfp8_f32_tflops

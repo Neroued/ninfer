@@ -21,6 +21,24 @@ quantized_weight::PackedWeight clamp_weight(int recipe) {
 
 void add_bf16_cases(Suite& suite) {
 #if NINFER_TARGET_SPARK
+    add_profile(suite, {QType::BF16, 12288, 4096, 6144, 2351U, ops::LinearPolicy::A16Only},
+                std::array{1, 2, 7, 8, 16, 17, 31, 32, 33, 63, 64, 65, 96, 97, 127, 128, 129},
+                std::array{7, 33, 65, 97, 128, 129});
+    for (int sign : {-1, 1}) {
+        add_negative_gate(suite,
+                          {QType::BF16, 12288, 4096, 6144, std::uint32_t(2359 + sign),
+                           ops::LinearPolicy::A16Only},
+                          std::array{1, 7, 33, 65, 128}, std::array{0}, [sign] {
+                              auto packed = linear_weights::make_bf16_weight(12288, 4096, 2359U);
+                              std::fill(packed.payload.begin(), packed.payload.end(), 0);
+                              for (int row = 0; row < 12288; ++row) {
+                                  const auto bits = f32_to_bf16(row < 6144 ? sign * 20.f : 20.f);
+                                  std::memcpy(packed.payload.data() + std::size_t(row) * 4096 * 2,
+                                              &bits, 2);
+                              }
+                              return packed;
+                          });
+    }
     add_profile(suite, {QType::BF16, 20480, 4096, 10240, 2201U, ops::LinearPolicy::A16Only, 10.f},
                 std::array{1,   4,   7,   8,    9,    15,   16,   17,   31,   32,
                            33,  63,  64,  65,   127,  128,  129,  255,  256,  257,

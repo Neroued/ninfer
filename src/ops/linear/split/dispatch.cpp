@@ -46,6 +46,7 @@ const SplitShape& select(ProjectionProfile weights, const auto& rows) {
     case QType::BF16: {
         const std::array shapes{
 #if NINFER_TARGET_SPARK
+            &kBf16SplitN3072K4096,
             &kBf16SplitN20480K1536,
             &kBf16SplitN288K4096,
             &kBf16SplitN1152K2560,

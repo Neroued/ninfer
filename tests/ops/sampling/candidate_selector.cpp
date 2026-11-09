@@ -479,12 +479,12 @@ struct Fixture {
             Tensor drafts(draft_device.span(), DType::I32, {steps, batch_size});
             Tensor q(q_device.span(), DType::FP32, {kCandidates, steps, batch_size});
             const auto capacity = ops::candidate_selector_path_workspace_capacity_bytes(
-                steps, steps, batch_size, batch_size);
+                ops::CandidateSelectorInput::Candidates, steps, steps, batch_size, batch_size);
             GuardedDeviceBuffer scratch(std::max<std::size_t>(capacity, 1));
             MemoryArena workspace(scratch.span());
             const auto launch = [&](CudaExecutionView cuda) {
                 ops::candidate_selector_path(
-                    ids, unary, hidden, anchor, predecessor, successor, positions,
+                    ids, unary, hidden, anchor, predecessor, successor, kTokenDomain, positions,
                     static_cast<const ops::SamplingConfig*>(config_device.data()), drafts, q,
                     workspace, cuda);
             };
@@ -598,8 +598,8 @@ struct Fixture {
             auto di = to_device(pi), du = to_device(pu), dh = to_device(ph), da = to_device(pa),
                  dp = to_device(pp), dc = to_device(pc);
             GuardedDeviceBuffer dd(3 * steps * 4), dq(3 * steps * kCandidates * 4);
-            const auto capacity =
-                ops::candidate_selector_path_workspace_capacity_bytes(steps, steps, 3, 3);
+            const auto capacity = ops::candidate_selector_path_workspace_capacity_bytes(
+                ops::CandidateSelectorInput::Candidates, steps, steps, 3, 3);
             GuardedDeviceBuffer sw(std::max<std::size_t>(capacity, 1));
             MemoryArena workspace(sw.span());
             Tensor ti(di.span(), DType::I32, {kCandidates, steps, 3}),
@@ -608,7 +608,7 @@ struct Fixture {
                 tp(dp.span(), DType::I32, {3});
             Tensor td(dd.span(), DType::I32, {steps, 3}),
                 tq(dq.span(), DType::FP32, {kCandidates, steps, 3});
-            ops::candidate_selector_path(ti, tu, th, ta, predecessor, successor, tp,
+            ops::candidate_selector_path(ti, tu, th, ta, predecessor, successor, kTokenDomain, tp,
                                          static_cast<const ops::SamplingConfig*>(dc.data()), td, tq,
                                          workspace,
                                          ninfer::test::cuda_environment().default_execution);
@@ -641,14 +641,20 @@ struct Fixture {
 
 } // namespace
 
+void add_gathered_selector_cases(ninfer::test::OpSuite& suite);
+
 void add_candidate_selector_cases(ninfer::test::OpSuite& suite) {
+    add_gathered_selector_cases(suite);
     for (int steps = 1; steps <= 15; ++steps)
         suite.add("candidate_selector/k" + std::to_string(steps),
-                  [=] { return Fixture(steps).run(); }, {{"execution", "graph"}});
+                  [=] { return Fixture(steps).run(); },
+                  {{"execution", "graph"}, {"suite", "selector"}});
     for (int steps : {1, 15})
         suite.add("candidate_selector/ties/k" + std::to_string(steps),
-                  [=] { return Fixture(steps).run(true); }, {{"execution", "graph"}});
+                  [=] { return Fixture(steps).run(true); },
+                  {{"execution", "graph"}, {"suite", "selector"}});
     for (int steps : {2, 15})
         suite.add("candidate_selector/dependent/k" + std::to_string(steps),
-                  [=] { return Fixture(steps).run(false, true); }, {{"execution", "graph"}});
+                  [=] { return Fixture(steps).run(false, true); },
+                  {{"execution", "graph"}, {"suite", "selector"}});
 }

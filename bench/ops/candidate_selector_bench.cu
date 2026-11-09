@@ -181,14 +181,15 @@ void run(std::int32_t batch_size, Mode mode, const Options& options, Fixture& fi
     const auto* configs = static_cast<const ops::SamplingConfig*>(fixture.configs.data());
 
     const auto capacity = ops::candidate_selector_path_workspace_capacity_bytes(
-        fixture.kSteps, fixture.kSteps, batch_size, batch_size);
+        ops::CandidateSelectorInput::Candidates, fixture.kSteps, fixture.kSteps, batch_size,
+        batch_size);
     ninfer::DeviceBuffer workspace_storage(ninfer::bench::device_context().device(),
                                            std::max<std::size_t>(capacity, 1));
     MemoryArena workspace(workspace_storage.span());
     TimedGraph graph;
     graph.capture(cuda, [&](CudaExecutionView cuda) {
-        ops::candidate_selector_path(ids, unary, hidden, anchor, predecessor, successor, positions,
-                                     configs, draft, q, workspace, cuda);
+        ops::candidate_selector_path(ids, unary, hidden, anchor, predecessor, successor,
+                                     kTokenDomain, positions, configs, draft, q, workspace, cuda);
     });
     const auto timing = measure_cold_graph(graph, flush, cuda, options.warmup, options.repeat);
     std::printf("%d,%d,%s,%.3f,%.3f,%.3f,%zu,%zu\n", fixture.kSteps, batch_size, mode_name(mode),
@@ -210,7 +211,7 @@ int main(int argc, char** argv) {
         cudaStream_t stream = nullptr;
         CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
         const auto cuda = ninfer::bench::device_context().execution_view(stream);
-        int device = 0;
+        int device      = 0;
         CUDA_CHECK(cudaGetDevice(&device));
         cudaDeviceProp properties{};
         CUDA_CHECK(cudaGetDeviceProperties(&properties, device));

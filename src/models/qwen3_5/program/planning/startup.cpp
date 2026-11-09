@@ -437,7 +437,8 @@ WorkspaceSpec build_workspace_plan(const SequencePlanImpl& plan) {
                     linear_scratch(layout, profile.draft->selector->hidden_projection, mask_columns,
                                    mask_columns);
                     scratch(layout, ops::candidate_selector_path_workspace_capacity_bytes(
-                                        drafts, drafts, batch, batch));
+                                        ops::CandidateSelectorInput::Candidates, drafts, drafts,
+                                        batch, batch));
                     return finish(layout);
                 }
                 {

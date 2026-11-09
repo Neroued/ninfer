@@ -314,8 +314,9 @@ void propose_dflash2_batch(DraftExecutionView& execution, const DraftInputs& inp
         ops::candidate_selector_path(
             candidates, scores.view({dimension(config.dflash2->selector_top_k), k, batch}),
             projected.view({dimension(config.dflash2->selector_rank), k, batch}), anchors,
-            weights.selector->predecessor_codebook, weights.selector->successor_codebook, frontiers,
-            inputs.sampling, drafts, proposal_q, work, cuda);
+            weights.selector->predecessor_codebook, weights.selector->successor_codebook,
+            dimension(execution.parameters.profile->public_tokens), frontiers, inputs.sampling,
+            drafts, proposal_q, work, cuda);
         work.reset();
     }
 }

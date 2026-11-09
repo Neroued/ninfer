@@ -37,6 +37,7 @@ ninfer_add_op_bench(ninfer_causal_conv1d_silu_bench SOURCES "${CMAKE_CURRENT_LIS
 ninfer_add_op_bench(ninfer_linear_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/linear_bench.cu")
 ninfer_add_op_bench(ninfer_linear_topk_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/linear_topk_bench.cu")
 ninfer_add_op_bench(ninfer_candidate_selector_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/candidate_selector_bench.cu")
+ninfer_add_op_bench(ninfer_gathered_selector_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/gathered_selector_bench.cu")
 ninfer_add_op_bench(ninfer_linear_split_multi_output_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/linear/split/multi_output.cu")
 ninfer_add_op_bench(ninfer_linear_split_two_output_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/linear/split/two_output.cu")
 ninfer_add_op_bench(ninfer_q8_linear_swiglu_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/q8_linear_swiglu_bench.cu")

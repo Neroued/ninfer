@@ -105,7 +105,7 @@ void check_native_inputs(const q35::ModelShard& model) {
     const auto linear = [&](ninfer::models::WeightId id) {
         return ops::prepare_linear_weight(model.input(id));
     };
-    const auto dense = [&](const q35::DenseWeights& weights) {
+    const auto dense = [&](const models::DenseWeights& weights) {
         (void)ops::prepare_linear_swiglu_weight(model.input(weights.gate), model.input(weights.up));
         (void)linear(weights.down);
     };
@@ -134,7 +134,7 @@ void check_native_inputs(const q35::ModelShard& model) {
                                                         model.input(gdn.b_projection));
             (void)linear(gdn.output);
         }
-        if (const auto* mlp = std::get_if<q35::DenseWeights>(&weights.ffn)) {
+        if (const auto* mlp = std::get_if<models::DenseWeights>(&weights.ffn)) {
             dense(*mlp);
         } else {
             const auto& moe  = std::get<q35::MoeWeights>(weights.ffn);

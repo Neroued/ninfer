@@ -317,6 +317,21 @@ void model_preparation() {
                 decoded.host_reservation_bytes == request.host_reservation_bytes,
             "GLM preparation lost partition, assembly, execution policy or Host reservation");
 
+    request.rank.draft          = {{2048, 2048}, {16, 16}, {4, 4}, {6144, 6144}};
+    request.options.speculative = {SpeculativeBackend::DFlash2, 7, ProposalHead::Optimized};
+    wire::Encoder draft_out;
+    glm::encode_rank_load(draft_out, request);
+    const auto draft_bytes = std::move(draft_out).take();
+    wire::Decoder draft_in(draft_bytes);
+    const auto draft = glm::decode_rank_load(draft_in);
+    draft_in.finish();
+    require(draft.rank.draft && draft.rank.draft->features == request.rank.draft->features &&
+                draft.rank.draft->query_heads == request.rank.draft->query_heads &&
+                draft.rank.draft->key_value_heads == request.rank.draft->key_value_heads &&
+                draft.rank.draft->intermediate == request.rank.draft->intermediate &&
+                draft.options.speculative.backend == SpeculativeBackend::DFlash2,
+            "GLM preparation lost the selected draft partition");
+
     q::RankLoadRequest qwen;
     qwen.options         = o;
     qwen.rank.assemblies = request.rank.assemblies;

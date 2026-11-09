@@ -98,7 +98,7 @@ public:
         return qwen::describe_vision(weights, [&](WeightId id) { return plan_.input(id); });
     }
 
-    DraftProfile draft(const DraftWeights& w) const {
+    DraftProfile draft(const dflash::Weights& w) const {
         DraftProfile out;
         out.feature_projection = linear(w.feature_projection);
         out.output_head        = linear(w.output_head_use);

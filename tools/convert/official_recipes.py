@@ -392,6 +392,20 @@ def qwen3_8_flash_next(model, recipe, sources):
         )
 
 
+def _glm_dflash2(model, recipe):
+    if "dflash2" not in model.components:
+        return
+    for role in ("token_embedding", "output_head"):
+        recipe.share("dflash2/" + role, "text/" + role)
+    recipe.place("dflash2/*", (2, 2))
+    config = model.components["dflash2"]["config"]
+    for layer in range(config["num_hidden_layers"]):
+        prefix = f"dflash2/layers/{layer}/attention/"
+        recipe.group(tuple(prefix + role for role in ("key", "value", "query")))
+        for role in ("key", "value"):
+            recipe.share(prefix + "context_" + role, prefix + role)
+
+
 def glm5next(model, recipe, sources):
     """NVIDIA Main NVFP4, Q8 projections/shared FFN and block-FP8 MTP experts."""
     if model.config["architectures"] != ["Glm5NextForCausalLM"]:
@@ -426,6 +440,7 @@ def glm5next(model, recipe, sources):
         ):
             _assign(recipe, name, Q8)
     recipe.place("text/*", (0,))
+    _glm_dflash2(model, recipe)
     for component in ("vision", "mtp"):
         if component in model.components:
             recipe.place(component + "/*", (1 if component == "vision" else 2, 0))
@@ -559,6 +574,7 @@ def glm5next_fp4_local(model, recipe, sources):
             name, format=format, method=import_encoded, activation_policy=policy
         )
     recipe.place("text/*", (0,))
+    _glm_dflash2(model, recipe)
     for component, order in (("vision", 1), ("mtp", 2)):
         if component in model.components:
             recipe.place(component + "/*", (order, 0))

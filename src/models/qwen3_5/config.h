@@ -1,12 +1,11 @@
 #pragma once
 
+#include "models/common/dflash/config.h"
 #include "models/common/qwen/vision/parameters.h"
-
 #include "models/load_options.h"
 #include "models/registry.h"
 
 #include <array>
-#include <algorithm>
 #include <cstdint>
 #include <optional>
 #include <variant>
@@ -19,7 +18,6 @@ struct Directory;
 namespace ninfer::models::qwen3_5 {
 
 enum class MixerKind { FullAttention, LinearAttention };
-enum class DraftAttentionKind { FullAttention, SlidingAttention };
 
 struct AttentionConfig {
     std::uint32_t num_attention_heads = 0;
@@ -90,47 +88,11 @@ struct TextConfig {
     std::variant<DenseConfig, MoeConfig> ffn;
 };
 
-struct DFlash2Config {
-    std::uint32_t conv_kernel_size = 0;
-    std::uint32_t conv_group_size  = 0;
-    std::uint32_t selector_rank    = 0;
-    std::uint32_t selector_top_k   = 0;
-};
-
-struct DraftConfig {
-    AttentionConfig attention;
-    std::uint32_t intermediate_size       = 0;
-    std::uint32_t num_hidden_layers       = 0;
-    std::uint32_t max_position_embeddings = 0;
-    float rms_norm_eps                    = 0;
-    float rope_theta                      = 0;
-    std::vector<DraftAttentionKind> layer_types;
-    std::optional<std::uint32_t> sliding_window;
-    std::vector<std::uint32_t> target_layer_ids;
-    std::uint32_t mask_token_id = 0;
-    std::optional<DFlash2Config> dflash2;
-
-    [[nodiscard]] std::uint32_t local_layer_count() const noexcept {
-        return static_cast<std::uint32_t>(std::count(layer_types.begin(), layer_types.end(),
-                                                     DraftAttentionKind::SlidingAttention));
-    }
-
-    [[nodiscard]] std::uint32_t full_layer_count() const noexcept {
-        return num_hidden_layers - local_layer_count();
-    }
-
-    [[nodiscard]] std::uint32_t compact_layer_index(std::uint32_t layer) const {
-        const auto kind = layer_types.at(layer);
-        return static_cast<std::uint32_t>(
-            std::count(layer_types.begin(), layer_types.begin() + layer, kind));
-    }
-};
-
 struct Config {
     TextConfig text;
     std::optional<qwen::VisionConfig> vision;
     bool mtp = false;
-    std::optional<DraftConfig> draft;
+    std::optional<dflash::Config> draft;
 };
 
 [[nodiscard]] ModelSamplingDefaults default_sampling(Architecture architecture);

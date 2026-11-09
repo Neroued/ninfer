@@ -5,6 +5,8 @@ add_library(ninfer_model_loading STATIC
   glm5next/frontend/resources.cpp
   glm5next/frontend/processor_config.cpp
   common/bindings.cpp
+  common/dflash/config.cpp
+  common/dflash/weights.cpp
   common/parallel.cpp
   common/parallel_weights.cpp
   common/vision/resources.cpp

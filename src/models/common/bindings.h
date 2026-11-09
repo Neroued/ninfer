@@ -15,6 +15,9 @@ struct PendingWeight {
     std::vector<std::string> source_objects;
 };
 
+void require_shared_binding(const artifact::ParameterReference&,
+                            const artifact::ParameterReference&);
+
 class Bindings {
 public:
     explicit Bindings(artifact::Binder& binder) : binder(binder) {}

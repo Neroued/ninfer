@@ -83,6 +83,12 @@ std::shared_ptr<const ModelDefinition> read_definition(const artifact::Reader& r
     out->weights.text = loading::bind_text(b, c);
     if (out->config.mtp)
         out->weights.mtp = loading::bind_mtp(b, c, out->weights.text, options.proposal_head);
+    if (out->config.draft) {
+        if (out->config.draft->dflash2->selector_top_k > out->resources.text.public_token_count)
+            throw artifact::ArtifactError("DFlash2 selector exceeds the public token domain");
+        out->weights.draft =
+            loading::bind_dflash2(b, out->config, out->weights.text, options.proposal_head);
+    }
     if (out->config.vision) out->weights.vision = loading::bind_vision(b, *out->config.vision);
     const auto bank = [&](MoeWeights& weights) {
         weights.bank = {static_cast<std::uint32_t>(out->banks.size())};

@@ -8,6 +8,7 @@ from math import prod
 
 import torch
 
+from .dflash import add_draft, draft_config
 from .model import Model, Parameter
 from .resources import TEXT_RESOURCES, load_resources
 from .sources.logical import LogicalSource, select_rows
@@ -266,6 +267,39 @@ class Builder:
 
     def group(self, *names):
         self.model.packing_groups.append(tuple(names))
+
+    def draft(self, store, config):
+        consumed = set()
+
+        def add(name, source, field, shape, *, inputs=()):
+            shape = tuple(shape)
+
+            def factory(selected, format=None):
+                if format not in (None, "bf16"):
+                    raise ValueError(f"{name}: DFlash2 preserves its BF16 source")
+                info = selected.describe(field)
+                if info.shape != shape or info.dtype != "BF16":
+                    raise ValueError(f"{field}: expected BF16 {shape}")
+                return tensor_source(selected, field, shape)
+
+            consumed.add(field)
+            self.model.add(
+                Parameter(
+                    name,
+                    shape,
+                    factory(source),
+                    source_factory=factory,
+                    inputs=tuple(inputs),
+                    residency="dflash2",
+                )
+            )
+
+        add_draft(self.model, add, store, config, self.cfg, "dflash2")
+        if consumed != set(store.weight_map):
+            raise ValueError(
+                f"DFlash2 source coverage differs: missing {sorted(set(store.weight_map) - consumed)}, "
+                f"extra {sorted(consumed - set(store.weight_map))}"
+            )
 
     def encoded(self, name, prefix, shape, *, inputs):
         if self.native:
@@ -634,10 +668,9 @@ def build_model(
     base, *, components=("text",), companions=None, resource_overrides=None
 ):
     selected = set(components)
-    if "text" not in selected or selected - {"text", "vision", "mtp"}:
-        raise ValueError("GLM5Next supports text, vision and mtp components")
-    if companions:
-        raise ValueError("GLM5Next components are read from its primary checkpoint")
+    if "text" not in selected or selected - {"text", "vision", "mtp", "dflash2"}:
+        raise ValueError("GLM5Next supports text, vision, mtp and dflash2 components")
+    companions = {} if companions is None else companions
     cfg = text_config(base.config)
     lowranks = set()
     for layer, kind in enumerate(cfg["layer_types"]):
@@ -654,6 +687,13 @@ def build_model(
     cfg["linear_gate_lowrank"] = lowranks.pop()
     records = {"text": {"config": cfg}}
     roles = {"text": TEXT_RESOURCES}
+    if "dflash2" in selected:
+        if "dflash2" not in companions:
+            raise ValueError("selected dflash2 requires its source")
+        records["dflash2"] = {
+            "config": draft_config(companions["dflash2"].config, cfg, "dflash2"),
+            "target": "text",
+        }
     if "vision" in selected:
         v = deepcopy(base.config["vision_config"])
         v["model_type"] = "glm5next_vision"
@@ -713,19 +753,29 @@ def build_model(
             b.dense(p, s)
         else:
             b.moe(p, s, encoded=True)
-    if "mtp" in selected:
+    for component in ("mtp", "dflash2"):
+        if component not in selected:
+            continue
         for role in ("token_embedding", "output_head"):
             value = model.parameters["text/" + role]
             model.add(
                 Parameter(
-                    "mtp/" + role,
+                    component + "/" + role,
                     value.shape,
                     value.source,
-                    inputs=("mtp/final_hidden",) if role == "output_head" else (),
+                    inputs=(
+                        (component + "/final_hidden",) if role == "output_head" else ()
+                    ),
                     direct_format=value.direct_format,
-                    residency="mtp",
+                    residency=component,
                 )
             )
+    if "dflash2" in selected:
+        draft = records["dflash2"]["config"]
+        if draft["dflash_config"]["selector_top_k"] > count:
+            raise ValueError("DFlash2 selector_top_k exceeds public token domain")
+        b.draft(companions["dflash2"], draft)
+    if "mtp" in selected:
         s = f"model.language_model.layers.{cfg['num_hidden_layers']}."
         for role, field in (
             ("pre_fc_embedding_norm", "enorm"),

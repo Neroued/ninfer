@@ -6,9 +6,14 @@
 
 namespace ninfer::models::glm5next {
 
+struct DraftPartition {
+    IndexRange features, query_heads, key_value_heads, intermediate;
+};
+
 struct RankPlan {
     std::uint32_t rank = 0, size = 1, ep_size = 1;
     IndexRange kda_heads, vocabulary, dense_intermediate, shared_intermediate;
+    std::optional<DraftPartition> draft;
     std::vector<ParameterAssembly> assemblies;
     std::vector<ExpertPartition> experts;
 };

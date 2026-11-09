@@ -123,7 +123,7 @@ void append_context_impl(DraftExecutionView& execution, const Tensor& features,
                 const auto& weight =
                     execution.parameters.draft->layers.at(static_cast<std::size_t>(layer));
                 const bool local_layer =
-                    config.layer_types[layer] == DraftAttentionKind::SlidingAttention;
+                    config.layer_types[layer] == dflash::AttentionKind::SlidingAttention;
                 const int layer_width   = local_layer ? local_width : width;
                 const int layer_columns = layer_width * batch;
                 Tensor layer_context    = local_layer && replace_local_window
@@ -408,7 +408,7 @@ void propose_batch_impl(DraftExecutionView& execution, const DraftInputs& inputs
                 Tensor attention_batch = roots.attention.view(
                     {dimension(config.attention.head_dim),
                      dimension(config.attention.num_attention_heads), width, batch_size});
-                if (config.layer_types[layer] == DraftAttentionKind::SlidingAttention) {
+                if (config.layer_types[layer] == dflash::AttentionKind::SlidingAttention) {
                     ops::sliding_window_attention(
                         query_batch, key_batch, value_batch, positions, valid_columns,
                         {dimension(config.attention.head_dim),

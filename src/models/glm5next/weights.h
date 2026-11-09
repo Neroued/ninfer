@@ -2,6 +2,7 @@
 
 #include "core/weight_bank.h"
 #include "models/common/weights.h"
+#include "models/common/dflash/weights.h"
 
 #include <optional>
 #include <variant>
@@ -22,10 +23,6 @@ struct MlaWeights {
     WeightId latent, index_key, pool_gate, query_a, index_weight;
     WeightId query_b, index_query, key_up, value_up, output;
     WeightId query_norm, latent_norm, index_norm, index_bias, pool_ape;
-};
-
-struct DenseWeights {
-    WeightId gate, up, down;
 };
 
 struct MoeWeights {
@@ -73,6 +70,7 @@ struct VisionWeights {
 struct ModelWeights {
     TextWeights text;
     std::optional<MtpWeights> mtp;
+    std::optional<dflash::Weights> draft;
     std::optional<VisionWeights> vision;
 };
 

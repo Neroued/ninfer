@@ -174,6 +174,8 @@ std::shared_ptr<const ModelProfile> describe_model(const ModelDefinition& defini
                                                    std::span<const BoundWeight> weights,
                                                    std::span<const moe::ExpertDescription> experts,
                                                    const RankPlan& rank) {
+    if (definition.config().draft)
+        throw std::invalid_argument("GLM5Next DFlash2 execution is not implemented");
     if (experts.size() != definition.expert_banks().size())
         throw std::invalid_argument("GLM5Next local expert descriptions are incomplete");
     auto out                 = std::make_shared<ModelProfile>();

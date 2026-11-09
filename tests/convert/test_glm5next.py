@@ -17,7 +17,135 @@ from tools.convert.__main__ import main as convert_main
 from tools.convert.proposal import add_official_proposal
 from tools.convert.recipe import Recipe
 
-from .glm5next_fixture import build_checkpoint
+from .glm5next_fixture import (
+    build_checkpoint,
+    build_draft_checkpoint,
+    build_native_checkpoint,
+)
+
+
+@pytest.mark.parametrize("native", [False, True])
+def test_dflash2_preserves_bf16_and_shared_head_choices(tmp_path, native):
+    torch.set_num_threads(1)
+    build = build_native_checkpoint if native else build_checkpoint
+    with build(tmp_path / "source") as base, build_draft_checkpoint(
+        tmp_path / "draft", base.config["text_config"]
+    ) as draft:
+        convert_main(
+            [
+                "--model",
+                str(base.path),
+                "--recipe",
+                "glm5next_fp4_local" if native else "glm5next",
+                "--components",
+                "text,vision,mtp,dflash2",
+                "--source",
+                "dflash2=" + str(draft.path),
+                "--proposal",
+                "--out",
+                str(tmp_path / "model.ninfer"),
+                "--device",
+                "cpu",
+            ]
+        )
+        with Artifact(tmp_path / "model.ninfer") as artifact:
+            bindings = artifact.directory.bindings
+            for role in ("token_embedding", "output_head"):
+                assert bindings["dflash2/" + role] == bindings["text/" + role]
+            config = artifact.directory.components["dflash2"]["config"]
+            assert config["dflash_config"]["block_size"] == 8
+            assert config["dflash_config"]["target_layer_ids"] == [0, 1]
+            assert config["rms_norm_eps"] == pytest.approx(1e-5)
+            assert config["rope_parameters"]["rope_theta"] == 10000
+            for name in bindings:
+                if name.startswith("dflash2/") and name not in (
+                    "dflash2/token_embedding",
+                    "dflash2/output_head",
+                ):
+                    assert all(
+                        artifact.object(p[0]).format == "bf16"
+                        for p in parts(artifact, name)
+                    )
+            for i in range(2):
+                p, s = f"dflash2/layers/{i}/", f"layers.{i}."
+                spans = [
+                    parts(artifact, p + "attention/" + role)[0]
+                    for role in ("key", "value", "query")
+                ]
+                assert len({span[0] for span in spans}) == 1
+                assert [span[1:] for span in spans] == [
+                    (0, 64 * 128),
+                    (64 * 128, 128 * 128),
+                    (128 * 128, 256 * 128),
+                ]
+                for role, source, shape in (
+                    ("attention/key", "self_attn.k_proj.weight", (64, 128)),
+                    ("attention/value", "self_attn.v_proj.weight", (64, 128)),
+                    ("attention/query", "self_attn.q_proj.weight", (128, 128)),
+                    ("attention/output", "self_attn.o_proj.weight", (128, 128)),
+                    ("mlp/gate", "mlp.gate_proj.weight", (256, 128)),
+                    ("mlp/up", "mlp.up_proj.weight", (256, 128)),
+                    ("mlp/down", "mlp.down_proj.weight", (128, 256)),
+                    (
+                        "attention_conv/base_kernel",
+                        "attention_conv.base_kernel",
+                        (2, 2, 128),
+                    ),
+                    (
+                        "mlp_conv/kernel_projection",
+                        "mlp_conv.kernel_projection.weight",
+                        (32, 128),
+                    ),
+                ):
+                    assert torch.equal(
+                        direct(artifact, p + role, shape),
+                        draft.read_flat(s + source).reshape(shape),
+                    )
+                for role in ("key", "value"):
+                    assert (
+                        bindings[p + "attention/context_" + role]
+                        == bindings[p + "attention/" + role]
+                    )
+            for name, source, shape in (
+                ("feature_projection", "fc.weight", (128, 256)),
+                (
+                    "candidate_selector/hidden_projection",
+                    "candidate_selector.hidden_projection.weight",
+                    (32, 128),
+                ),
+                (
+                    "candidate_selector/predecessor_codebook",
+                    "candidate_selector.predecessor_codebook",
+                    (16, 32),
+                ),
+                (
+                    "candidate_selector/successor_codebook",
+                    "candidate_selector.successor_codebook",
+                    (16, 32),
+                ),
+            ):
+                assert torch.equal(
+                    direct(artifact, "dflash2/" + name, shape),
+                    draft.read_flat(source).reshape(shape),
+                )
+            assert artifact.object(
+                parts(artifact, "dflash2/output_head")[0][0]
+            ).format == ("mxfp8" if native else "bf16")
+            uses = {(u["parameter"], u["input"]): u for u in artifact.directory.uses}
+            assert uses[("dflash2/output_head", "dflash2/final_hidden")][
+                "activation_policy"
+            ] == ("AllowA8" if native else "A16Only")
+            for backend in ("mtp", "dflash2"):
+                assert (
+                    uses[("proposal/head", backend + "/final_hidden")][
+                        "activation_policy"
+                    ]
+                    == "A16Only"
+                )
+            assert artifact.object(parts(artifact, "proposal/head")[0][0]).shape == (
+                16,
+                128,
+            )
 
 
 def parts(artifact, name):

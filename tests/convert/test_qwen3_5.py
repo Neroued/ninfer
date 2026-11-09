@@ -7,7 +7,8 @@ import pytest
 from safetensors.torch import save_file
 import torch
 
-from tools.convert.qwen3_5 import build_model, draft_config, text_config
+from tools.convert.dflash import draft_config
+from tools.convert.qwen3_5 import build_model, text_config
 from tools.convert.sources.safetensors import SafetensorsSource
 
 

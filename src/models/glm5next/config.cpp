@@ -167,7 +167,7 @@ std::uint64_t VisionConfig::merge_width() const {
 }
 
 Config parse_config(const artifact::Directory& directory, const LoadOptions& options) {
-    if (options.masked_draft()) throw ArtifactError("GLM5Next uses its native MTP backend");
+    if (options.dflash()) throw ArtifactError("GLM5Next has no DFlash component");
     try {
         Config out{text_config(directory.component("text").config), {}, options.mtp()};
         if (options.vision)
@@ -180,6 +180,11 @@ Config parse_config(const artifact::Directory& directory, const LoadOptions& opt
             expect(c, "layer_types", Json::array({"deepseek_sparse_attention"}));
             expect(directory.component("text").config, "num_nextn_predict_layers", 1);
         }
+        if (options.dflash2())
+            out.draft = dflash::parse_config(directory.component("dflash2"),
+                                             {out.text.hidden, out.text.vocabulary,
+                                              static_cast<std::uint32_t>(out.text.layers.size())},
+                                             true);
         return out;
     } catch (const Json::exception& error) {
         throw ArtifactError(std::string("invalid GLM5Next config: ") + error.what());

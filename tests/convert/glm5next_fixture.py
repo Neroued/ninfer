@@ -12,6 +12,80 @@ import torch
 from tools.convert.sources.safetensors import SafetensorsSource
 
 
+def build_draft_checkpoint(path: Path, target: dict) -> SafetensorsSource:
+    path.mkdir(parents=True, exist_ok=True)
+    h, vocab = target["hidden_size"], target["vocab_size"]
+    cfg = dict(
+        architectures=["DFlash2DraftModel"],
+        model_type="qwen3",
+        hidden_size=h,
+        vocab_size=vocab,
+        num_target_layers=target["num_hidden_layers"],
+        hidden_act="silu",
+        attention_bias=False,
+        is_causal=False,
+        num_hidden_layers=2,
+        intermediate_size=2 * h,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=h // 4,
+        layer_types=["sliding_attention"] * 2,
+        sliding_window=32,
+        max_position_embeddings=target["max_position_embeddings"],
+        rms_norm_eps=1e-5,
+        rope_parameters={"rope_theta": 10000.0},
+        dflash_config=dict(
+            target_layer_ids=[0, 1],
+            mask_token_id=vocab - 1,
+            block_size=8,
+            conv_kernel_size=2,
+            conv_group_size=16,
+            selector_rank=32,
+            selector_top_k=4,
+        ),
+    )
+    tensors = {}
+
+    def add(name, shape):
+        tensors[name] = (
+            (((torch.arange(prod(shape)) + len(tensors) * 11) % 113 - 56) / 64)
+            .bfloat16()
+            .reshape(shape)
+        )
+
+    add("fc.weight", (h, 2 * h))
+    add("hidden_norm.weight", (h,))
+    add("norm.weight", (h,))
+    for i in range(cfg["num_hidden_layers"]):
+        p = f"layers.{i}."
+        for norm in ("input_layernorm", "post_attention_layernorm"):
+            add(p + norm + ".weight", (h,))
+        for role, shape in (
+            ("q", (h, h)),
+            ("k", (h // 2, h)),
+            ("v", (h // 2, h)),
+            ("o", (h, h)),
+        ):
+            add(p + "self_attn." + role + "_proj.weight", shape)
+        for role in ("q", "k"):
+            add(p + "self_attn." + role + "_norm.weight", (h // 4,))
+        for role, shape in (
+            ("gate", (2 * h, h)),
+            ("up", (2 * h, h)),
+            ("down", (h, 2 * h)),
+        ):
+            add(p + "mlp." + role + "_proj.weight", shape)
+        for branch in ("attention_conv", "mlp_conv"):
+            add(p + branch + ".base_kernel", (2, 2, h))
+            add(p + branch + ".kernel_projection.weight", (h // 4, h))
+    add("candidate_selector.hidden_projection.weight", (32, h))
+    for role in ("predecessor_codebook", "successor_codebook"):
+        add("candidate_selector." + role, (vocab, 32))
+    (path / "config.json").write_text(json.dumps(cfg))
+    save_file(tensors, path / "model.safetensors")
+    return SafetensorsSource(path)
+
+
 def build_checkpoint(path: Path) -> SafetensorsSource:
     path.mkdir(parents=True, exist_ok=True)
     cfg = dict(

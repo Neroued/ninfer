@@ -21,6 +21,10 @@ struct WeightId {
     friend bool operator==(WeightId, WeightId) = default;
 };
 
+struct DenseWeights {
+    WeightId gate, up, down;
+};
+
 struct WeightUseId {
     WeightId parameter;
     std::size_t use_index = std::numeric_limits<std::size_t>::max();

@@ -21,16 +21,15 @@ AttentionWeights bind_attention(Bindings& b, const TextConfig& config, const std
     return out;
 }
 
+namespace {
+
 DenseWeights bind_dense(Bindings& b, std::uint64_t h, std::uint64_t intermediate,
-                        const std::string& p, bool draft) {
-    const auto input = p + (draft ? "mlp_input" : "ffn_input");
+                        const std::string& p) {
+    const auto input = p + "ffn_input";
     return {b.parameter(p + "mlp/gate", {intermediate, h}, {input}),
             b.parameter(p + "mlp/up", {intermediate, h}, {input}),
-            b.parameter(p + "mlp/down", {h, intermediate},
-                        {p + (draft ? "mlp_product" : "mlp/product")})};
+            b.parameter(p + "mlp/down", {h, intermediate}, {p + "mlp/product"})};
 }
-
-namespace {
 
 GdnWeights bind_gdn(Bindings& b, const TextConfig& text, const std::string& p) {
     const auto& g    = text.gdn.value();

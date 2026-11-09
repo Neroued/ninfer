@@ -18,6 +18,13 @@ void encode_rank_load(Encoder& out, const RankLoadRequest& request) {
         out.u32(r.begin);
         out.u32(r.size);
     }
+    out.boolean(p.draft.has_value());
+    if (p.draft)
+        for (auto r : {p.draft->features, p.draft->query_heads, p.draft->key_value_heads,
+                       p.draft->intermediate}) {
+            out.u32(r.begin);
+            out.u32(r.size);
+        }
     encode_assemblies(out, p.assemblies);
     encode_expert_partitions(out, p.experts);
     encode_rank_options(out, request.options);
@@ -36,6 +43,12 @@ RankLoadRequest decode_rank_load(Decoder& in) {
     p.ep_size = in.u32();
     for (auto* r : {&p.kda_heads, &p.vocabulary, &p.dense_intermediate, &p.shared_intermediate})
         *r = {in.u32(), in.u32()};
+    if (in.boolean()) {
+        p.draft.emplace();
+        for (auto* r : {&p.draft->features, &p.draft->query_heads, &p.draft->key_value_heads,
+                        &p.draft->intermediate})
+            *r = {in.u32(), in.u32()};
+    }
     p.assemblies                   = decode_assemblies(in);
     p.experts                      = decode_expert_partitions(in);
     request.options                = decode_rank_options(in);

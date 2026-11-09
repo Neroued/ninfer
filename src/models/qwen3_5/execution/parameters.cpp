@@ -173,11 +173,11 @@ public:
         return qwen::prepare_vision(model_.weight_data(), weights);
     }
 
-    DynamicConvParameters convolution(const DynamicConvWeights& w) const {
+    DynamicConvParameters convolution(const dflash::DynamicConvWeights& w) const {
         return {tensor(w.base_kernel), linear(w.kernel_projection)};
     }
 
-    DraftParameters draft(const DraftWeights& w) const {
+    DraftParameters draft(const dflash::Weights& w) const {
         DraftParameters out;
         out.feature_projection = linear(w.feature_projection);
         out.context_norm       = tensor(w.context_norm);

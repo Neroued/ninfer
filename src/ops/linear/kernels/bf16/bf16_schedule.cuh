@@ -164,7 +164,8 @@ struct Bf16A16MmaSchedule {
 
 template <int BlockRows, int BlockTokens, int KWarps, int WarpK = 64, int Stages = 2,
           Cache WeightCache = Cache::cg, Cache ActivationCache = Cache::cg, int MinBlocksPerSm = 1,
-          int KPhaseStride = 0, Bf16MmaRaster Raster = Bf16MmaRaster::RowFast>
+          int KPhaseStride = 0, Bf16MmaRaster Raster = Bf16MmaRaster::RowFast,
+          bool ReuseBFragments = false>
 struct Bf16A16SlicedKMmaSchedule {
     static_assert(BlockRows > 0 && BlockRows % 16 == 0);
     static_assert(BlockTokens > 0 && BlockTokens % 8 == 0);
@@ -181,6 +182,7 @@ struct Bf16A16SlicedKMmaSchedule {
     static constexpr int kThreads            = KWarps * 32;
     static constexpr int kMinBlocksPerSm     = MinBlocksPerSm;
     static constexpr int kKPhaseStride       = KPhaseStride;
+    static constexpr bool kReuseBFragments   = ReuseBFragments;
     static constexpr Bf16MmaRaster kRaster   = Raster;
     static constexpr int kRasterGroupRows    = 1;
     static constexpr int kMmaRows            = BlockRows / 16;

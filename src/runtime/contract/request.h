@@ -4,6 +4,7 @@
 #include <atomic>
 #include <cstdint>
 #include <optional>
+#include <stdexcept>
 
 namespace ninfer::runtime {
 
@@ -23,6 +24,16 @@ struct ResolvedRequestOptions {
     ResolvedExecutionOptions execution;
     StopPolicy stop;
     OutputOptions output;
+    // Structured output: copied from RequestOptions; the Frontend compiles the matcher at submit.
+    std::optional<OutputConstraint> constraint;
+    ToolChoice tool_choice;
+};
+
+// Structured output: the request matcher refused a token the sampler produced. A correct mask
+// makes this impossible; the Engine fails only the owning request instead of the batch.
+class ConstraintViolation final : public std::logic_error {
+public:
+    using std::logic_error::logic_error;
 };
 
 enum class ContinuationAction : std::uint8_t {

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "ninfer/output_constraint.h"
+
 #include <array>
 #include <chrono>
 #include <cstddef>
@@ -31,6 +33,12 @@ inline constexpr std::size_t kDefaultMediaCacheBytes     = 1ULL << 30;
 inline constexpr std::size_t kDefaultMediaLiveBytes      = 2ULL << 30;
 inline constexpr std::uint32_t kDefaultHostStateSlots    = 8;
 inline constexpr std::size_t kDefaultHostKvCapacityBytes = 8ULL << 30;
+// How long a request may wait for preparation and admission before HTTP 503. Ten minutes: with
+// --max-concurrency 1 a request waits until the requests ahead of it finish, and prompts are
+// prefilled one at a time, so several long prompts queue for minutes (a 120k-token Flash-Next
+// prompt takes about 31 s on two 16 GB GPUs). It also matches the default timeout of the OpenAI and
+// Anthropic SDKs.
+inline constexpr std::uint32_t kDefaultPendingTimeoutMs = 600'000;
 // Bounds of EngineOptions::max_vision_tokens. One merged Vision token covers 32x32 pixels, so the
 // minimum is the registered 65,536-pixel image floor and the maximum the per-item execution
 // ceiling.
@@ -378,7 +386,7 @@ struct EngineOptions {
     KvCapacityPolicy kv_capacity       = KvCapacityPolicy::explicit_capacity(2048);
     std::uint32_t max_concurrency      = 1;
     std::uint32_t max_pending_requests = 16;
-    std::uint32_t pending_timeout_ms   = 30000;
+    std::uint32_t pending_timeout_ms   = kDefaultPendingTimeoutMs;
     // Decoding requests' share of the time while another request's prompt runs: after a prompt
     // unit of t seconds the decode batch runs rounds for up to decode_share * t seconds (at least
     // one round) before the next prompt unit. 0 = one round per prompt unit (a long Flash-Next
@@ -447,6 +455,9 @@ struct EngineOptions {
     ContextCacheOptions context_cache;
     ContextCostOptions context_cost;
     StartupObserver startup_observer;
+    // Structured output: input limits, compilation limits, grammar cache and matcher time budgets
+    // (output_constraint.h). Unconstrained requests never read them.
+    OutputConstraintLimits constraint_limits;
 };
 
 enum class SamplingMode : std::uint8_t {
@@ -541,6 +552,11 @@ struct RequestOptions {
     ExecutionOptions execution;
     StopPolicy stop;
     OutputOptions output;
+    // Structured output (Neroued/ninfer 77c2e5e2 keeps these first; appended here so existing
+    // aggregate and designated initializers stay valid). Empty constraint + default tool_choice =
+    // unconstrained request, identical to the previous behaviour.
+    std::optional<OutputConstraint> constraint;
+    ToolChoice tool_choice;
 };
 
 enum class MediaKind : std::uint8_t {
@@ -794,17 +810,45 @@ enum class RequestErrorKind : std::uint8_t {
     QueueTimeout,
     Cancelled,
     Unavailable,
+    // Structured output (Neroued/ninfer 77c2e5e2). Appended so the existing values keep their
+    // numbering.
+    UnsupportedOutputCombination,
+    InvalidToolConstraint,
+    InvalidToolOutput,
+    InvalidGrammar,
+    InvalidChoice,
+    InvalidRegex,
+    InvalidJsonSchema,
+    UnsupportedJsonSchema,
+    UnsatisfiableJsonSchema,
+    ConstraintDeadEnd,
+    // capy-flash structured output limits (OutputConstraintLimits): an input over a size, depth or
+    // item limit, or a compilation over its time limit; and a request whose matcher work exceeded
+    // its time budget while generating.
+    ConstraintLimitExceeded,
+    ConstraintBudgetExceeded,
 };
 
+enum class RequestErrorSource : std::uint8_t { OutputConstraint, Tools };
+
+// pointer is a JSON Pointer into the constraint or tool schema (empty when not applicable).
 class RequestError final : public std::invalid_argument {
 public:
-    RequestError(RequestErrorKind kind, std::string message)
-        : std::invalid_argument(std::move(message)), kind_(kind) {}
+    RequestError(RequestErrorKind kind, std::string message, std::string pointer = {},
+                 RequestErrorSource source = RequestErrorSource::OutputConstraint)
+        : std::invalid_argument(std::move(message)), kind_(kind), pointer_(std::move(pointer)),
+          source_(source) {}
 
     [[nodiscard]] RequestErrorKind kind() const noexcept { return kind_; }
 
+    [[nodiscard]] RequestErrorSource source() const noexcept { return source_; }
+
+    [[nodiscard]] const std::string& pointer() const noexcept { return pointer_; }
+
 private:
     RequestErrorKind kind_;
+    std::string pointer_;
+    RequestErrorSource source_;
 };
 
 struct PromptSummary {

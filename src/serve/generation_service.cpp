@@ -15,6 +15,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 
 namespace ninfer::serve {
@@ -43,11 +44,103 @@ struct RequestLifetime {
     std::chrono::steady_clock::time_point deadline;
 };
 
-ApiError request_error_to_api_error(const ninfer::RequestError& exception) {
+namespace {
+// The grammar vendor prefixes its errors with a timestamp and the server's source path
+// ("[21:04:30] /home/.../regex_converter.cc:85: Regex parsing error..."): clients get the message
+// without them (capy-flash, second audit N6).
+std::string client_message(std::string_view text) {
+    std::string result;
+    result.reserve(text.size());
+    std::size_t at    = 0;
+    const auto digits = [&](std::size_t from, std::size_t count) {
+        if (from + count > text.size()) return false;
+        for (std::size_t i = 0; i < count; ++i)
+            if (text[from + i] < '0' || text[from + i] > '9') return false;
+        return true;
+    };
+    while (at < text.size()) {
+        // "[hh:mm:ss] " + a path without spaces + ":<line>: "
+        if (text[at] == '[' && digits(at + 1, 2) && text.size() > at + 10 && text[at + 3] == ':' &&
+            digits(at + 4, 2) && text[at + 6] == ':' && digits(at + 7, 2) &&
+            text.substr(at + 9, 2) == "] ") {
+            std::size_t end = text.find(' ', at + 11);
+            if (end == std::string_view::npos) end = text.size();
+            const auto location = text.substr(at + 11, end - at - 11);
+            const auto colon = location.rfind(':', location.size() >= 2 ? location.size() - 2 : 0);
+            if (colon != std::string_view::npos && location.ends_with(":") &&
+                digits(at + 11 + colon + 1, location.size() - colon - 2)) {
+                at = std::min(text.size(), end + 1);
+                continue;
+            }
+        }
+        result += text[at++];
+    }
+    return result;
+}
+} // namespace
+
+ApiError request_error_to_api_error(const ninfer::RequestError& exception,
+                                    std::string_view constraint_param) {
     ApiError error;
     error.param   = "messages";
-    error.message = exception.what();
+    error.message = client_message(exception.what());
     switch (exception.kind()) {
+    // Structured output (Neroued/ninfer 08902f73, eb6696ae, 8ffa3131, 2734a56e). The param is the
+    // wire field of the constraint; JSON Schema errors append their JSON Pointer to it.
+    case ninfer::RequestErrorKind::UnsupportedOutputCombination:
+        error.status = 400;
+        error.code   = "unsupported_output_combination";
+        error.param =
+            exception.pointer().empty() ? std::string(constraint_param) : exception.pointer();
+        break;
+    case ninfer::RequestErrorKind::InvalidToolOutput:
+        error.param.clear();
+        error.status = 500;
+        error.type   = "server_error";
+        error.code   = "invalid_tool_output";
+        break;
+    case ninfer::RequestErrorKind::InvalidToolConstraint:
+        error.status = 400;
+        error.code   = "invalid_tool_constraint";
+        error.param  = "tools" + exception.pointer();
+        break;
+    case ninfer::RequestErrorKind::InvalidGrammar:
+    case ninfer::RequestErrorKind::InvalidChoice:
+    case ninfer::RequestErrorKind::InvalidRegex:
+    case ninfer::RequestErrorKind::ConstraintDeadEnd:
+        error.status = 400;
+        error.param  = constraint_param;
+        error.code =
+            exception.kind() == ninfer::RequestErrorKind::InvalidGrammar  ? "invalid_grammar"
+            : exception.kind() == ninfer::RequestErrorKind::InvalidChoice ? "invalid_choice"
+            : exception.kind() == ninfer::RequestErrorKind::InvalidRegex  ? "invalid_regex"
+                                                                          : "constraint_dead_end";
+        break;
+    // capy-flash limits (OutputConstraintLimits): an input or compilation over a limit, or a
+    // generating request whose matcher exceeded its time budget (only that request fails).
+    case ninfer::RequestErrorKind::ConstraintLimitExceeded:
+        error.status = 400;
+        error.code   = "constraint_limit_exceeded";
+        error.param  = std::string(constraint_param) + exception.pointer();
+        break;
+    case ninfer::RequestErrorKind::ConstraintBudgetExceeded:
+        error.status = 400;
+        error.code   = "constraint_budget_exceeded";
+        error.param  = constraint_param;
+        break;
+    case ninfer::RequestErrorKind::InvalidJsonSchema:
+    case ninfer::RequestErrorKind::UnsupportedJsonSchema:
+    case ninfer::RequestErrorKind::UnsatisfiableJsonSchema:
+        error.status = 400;
+        error.param  = exception.source() == ninfer::RequestErrorSource::Tools
+                           ? "tools" + exception.pointer()
+                           : std::string(constraint_param) + exception.pointer();
+        error.code   = exception.kind() == ninfer::RequestErrorKind::InvalidJsonSchema
+                           ? "invalid_json_schema"
+                       : exception.kind() == ninfer::RequestErrorKind::UnsupportedJsonSchema
+                           ? "unsupported_json_schema"
+                           : "unsatisfiable_json_schema";
+        break;
     case ninfer::RequestErrorKind::ContextLengthExceeded:
         error.status = 400;
         error.code   = "context_length_exceeded";
@@ -191,8 +284,9 @@ ninfer::OwnedMedia acquire_media(const ContentPart& part, Clock::time_point dead
     return media;
 }
 
-[[noreturn]] void throw_request_error(const ninfer::RequestError& exception) {
-    throw ApiException(request_error_to_api_error(exception));
+[[noreturn]] void throw_request_error(const ninfer::RequestError& exception,
+                                      std::string_view constraint_param = {}) {
+    throw ApiException(request_error_to_api_error(exception, constraint_param));
 }
 
 void check_preparation_control(Clock::time_point deadline,
@@ -305,6 +399,7 @@ GenerationService::GenerationService(ServeOptions options, StartupObserver start
     engine_options.media_cache_bytes        = options_.media_cache_bytes;
     engine_options.media_live_bytes         = options_.media_live_bytes;
     engine_options.media_preprocess_threads = options_.media_preprocess_threads;
+    engine_options.constraint_limits        = options_.constraint_limits;
     engine_options.startup_observer         = std::move(startup_observer);
     engine_ = std::make_unique<ninfer::Engine>(std::move(engine_options));
     // YaRN tables go in BEFORE the first forward pass: the rope kernel reads the __constant__
@@ -393,6 +488,7 @@ PreparedRequest GenerationService::prepare_impl(
     DeadlinePolicy deadline_policy, bool speculation_detail) const {
     PreparedRequest prepared;
     prepared.speculation_detail             = speculation_detail;
+    prepared.constraint_param               = request.constraint_param;
     const ResolvedPromptSemantics semantics = resolve_prompt_semantics(request, options_);
     ninfer::RequestOptions request_options  = to_request_options(
         request, options_, semantics, cache_participation == CacheParticipation::ReadWrite);
@@ -434,7 +530,9 @@ PreparedRequest GenerationService::prepare_impl(
             .cancellation = CancellationView(is_cancelled),
         };
         std::shared_ptr<ReasoningRetryContext> retry;
-        if (options_.reasoning_close_retry && !request_has_media &&
+        // A constrained request is never retried: the continuation would run without the
+        // grammar state of the first reply.
+        if (options_.reasoning_close_retry && !request_has_media && !request.constraint &&
             cache_participation == CacheParticipation::ReadWrite) {
             retry                = std::make_shared<ReasoningRetryContext>();
             retry->input         = input;
@@ -468,7 +566,7 @@ PreparedRequest GenerationService::prepare_impl(
                                               observation, prepared.lifetime->deadline);
         prepared.sampling   = prepared.generation.resolved_sampling();
     } catch (const ApiException&) { throw; } catch (const ninfer::RequestError& exception) {
-        throw_request_error(exception);
+        throw_request_error(exception, request.constraint_param);
     } catch (const std::invalid_argument& exception) {
         throw_invalid_input(exception, "invalid_prompt");
     }
@@ -534,7 +632,9 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
         }
         try {
             throw;
-        } catch (const ninfer::RequestError& exception) { throw_request_error(exception); }
+        } catch (const ninfer::RequestError& exception) {
+            throw_request_error(exception, prepared.constraint_param);
+        }
     }
     GenerationOutcome outcome;
     outcome.text                = std::move(result.content);

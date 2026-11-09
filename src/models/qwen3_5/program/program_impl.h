@@ -548,7 +548,8 @@ public:
     void finalize_context_transaction() noexcept;
     [[nodiscard]] bool has_context_transaction() const noexcept;
     [[nodiscard]] PrefillProgress advance_prefill(SequenceHandle sequence,
-                                                  runtime::ExecutionTiming* failed_timing);
+                                                  runtime::ExecutionTiming* failed_timing,
+                                                  runtime::TokenMaskProvider* masks = nullptr);
     [[nodiscard]] CaptureAssessment
     inspect_capture(const CaptureOffer& offer, const SharedPrefixHandle* exact_shared,
                     const SharedPrefixHandle* replacement,
@@ -576,7 +577,9 @@ public:
         CapturePressureCandidate&& pressure, runtime::CancellationFlagView cancellation);
     [[nodiscard]] PendingBatch decode(std::span<const SequenceHandle> sequences,
                                       std::span<const runtime::RoundBudget> budgets,
-                                      runtime::ExecutionTiming* failed_timing);
+                                      runtime::ExecutionTiming* failed_timing,
+                                      runtime::TokenMaskProvider* masks = nullptr);
+    [[nodiscard]] bool sampling_bypass_hooks() const noexcept;
     [[nodiscard]] runtime::ExecutionTiming
     append_forced_tokens(std::span<const SequenceHandle> sequences,
                          std::span<const TokenId> row_major_tokens, std::uint32_t row_stride,
@@ -725,6 +728,43 @@ public:
     std::optional<Tensor> score_hidden;
     Tensor sampling_config;
     Tensor token_counts;
+
+    // Structured output (program/grammar_masks.cpp). Device 0 only (rank 0 samples alone):
+    // [ceil(V/32), positions, max_concurrency] mask words, one slot per lane; its pinned twin
+    // (plus one staged prefill SamplingConfig per lane); the provider of the current Program call
+    // and the dead-end position bits of its compact rows.
+    Tensor grammar_masks_device;
+    std::optional<PinnedHostBuffer> grammar_masks_host;
+    runtime::TokenMaskProvider* round_masks = nullptr;
+    std::array<std::uint32_t, kMaximumConcurrency> grammar_dead_positions{};
+
+    class RoundMaskScope {
+    public:
+        RoundMaskScope(ProgramImpl& program, runtime::TokenMaskProvider* masks) noexcept;
+        ~RoundMaskScope();
+        RoundMaskScope(const RoundMaskScope&)            = delete;
+        RoundMaskScope& operator=(const RoundMaskScope&) = delete;
+
+    private:
+        ProgramImpl& program_;
+    };
+
+    [[nodiscard]] bool row_constrained(std::size_t row) const noexcept;
+    [[nodiscard]] std::size_t grammar_mask_positions() const noexcept;
+
+    // Byte offset of the staged prefill configs in grammar_masks_host: after the mask words,
+    // rounded up to alignof(SamplingConfig) (the mask bytes are only a multiple of 4).
+    [[nodiscard]] static constexpr std::size_t
+    grammar_staged_config_offset(std::size_t mask_bytes) noexcept {
+        constexpr std::size_t alignment = alignof(ops::SamplingConfig);
+        return (mask_bytes + alignment - 1U) / alignment * alignment;
+    }
+
+    // Fills the lane's slot with the row's masks for (drafts.size() + 1) positions, uploads it on
+    // the device stream (before the launch) and returns the row's SamplingMask; {} unconstrained.
+    [[nodiscard]] ops::SamplingMask fill_grammar_mask(std::size_t row, std::uint32_t lane,
+                                                      std::span<const TokenId> drafts);
+    void bind_prefill_grammar_mask(SequenceState& sequence, RequestControl& request);
 
     std::vector<SequenceState> continuation_states;
     std::vector<ContinuationSlot> continuation_slots;

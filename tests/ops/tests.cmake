@@ -248,3 +248,8 @@ ninfer_op_oracle_options(ninfer_host_gguf_isa_test)
 ninfer_add_op_test(ninfer_yarn_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_yarn.cpp"
   LIBRARIES ninfer_ops)
+
+# Metadata qualification uses the production collective without loading expert weights.
+ninfer_add_op_test(ninfer_moe_grouped_scan_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_moe_grouped_scan.cu"
+  LIBRARIES ninfer_core)

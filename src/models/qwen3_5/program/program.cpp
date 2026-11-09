@@ -391,8 +391,9 @@ void Program::finalize_context_transaction() noexcept { impl_->finalize_context_
 bool Program::has_context_transaction() const noexcept { return impl_->has_context_transaction(); }
 
 PrefillProgress Program::advance_prefill(SequenceHandle sequence,
-                                         runtime::ExecutionTiming* failed_timing) {
-    return impl_->advance_prefill(sequence, failed_timing);
+                                         runtime::ExecutionTiming* failed_timing,
+                                         runtime::TokenMaskProvider* masks) {
+    return impl_->advance_prefill(sequence, failed_timing, masks);
 }
 
 CaptureAssessment
@@ -467,9 +468,12 @@ runtime::ContextTransactionReserveStatus Program::reserve_active_capture_with_pr
 
 PendingBatch Program::decode(std::span<const SequenceHandle> sequences,
                              std::span<const runtime::RoundBudget> budgets,
-                             runtime::ExecutionTiming* failed_timing) {
-    return impl_->decode(sequences, budgets, failed_timing);
+                             runtime::ExecutionTiming* failed_timing,
+                             runtime::TokenMaskProvider* masks) {
+    return impl_->decode(sequences, budgets, failed_timing, masks);
 }
+
+bool Program::sampling_bypass_hooks() const noexcept { return impl_->sampling_bypass_hooks(); }
 
 runtime::ExecutionTiming
 Program::append_forced_tokens(std::span<const SequenceHandle> sequences,

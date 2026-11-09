@@ -1,7 +1,9 @@
 #include "serve/generation_service.h"
 #include "serve/openai_chat.h"
 #include "serve/openai_common.h"
+#include "serve/request_validation.h"
 #include "serve/translate.h"
+#include "text/json_input.h"
 #include "tool_call_salvage_probe.h"
 
 #include <nlohmann/json.hpp>
@@ -9,8 +11,10 @@
 #include <cstdint>
 #include <iostream>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -147,7 +151,6 @@ int test_standard_field_policy() {
     rejected("logit_bias", Json{{"12", 1}}, "logit_bias_not_supported");
     rejected("logprobs", true, "logprobs_not_supported");
     rejected("top_logprobs", 2, "logprobs_not_supported");
-    rejected("response_format", Json{{"type", "json_schema"}}, "response_format_not_supported");
     rejected("modalities", Json::array({"text", "audio"}), "modality_not_supported");
     rejected("web_search_options", Json::object(), "web_search_not_supported");
     rejected("moderation", Json::object(), "moderation_not_supported");
@@ -187,35 +190,366 @@ int test_standard_field_policy() {
     return failures;
 }
 
+// Structured output (constrained decoding), ported from Neroued/ninfer 08902f73, eb6696ae,
+// 8ffa3131 and 2734a56e (test_openai_schema.cpp) and adapted to Tappa A: JSON output with active
+// tools stays rejected until the tool grammar lands.
 int test_constrained_decoding_extensions() {
-    int failures                                           = 0;
-    const std::vector<std::pair<const char*, Json>> active = {
-        {"grammar", "root ::= \"yes\" | \"no\""},
-        {"structured_outputs", Json{{"json", Json{{"type", "object"}}}}},
-        {"guided_json", Json{{"type", "object"}}},
-        {"guided_regex", "[a-z]+"},
-        {"guided_choice", Json::array({"yes", "no"})},
-        {"guided_grammar", "root ::= \"yes\" | \"no\""},
-    };
-    for (const auto& [field, value] : active) {
-        Json body            = base_request();
-        body[field]          = value;
-        const ApiError error = api_error([&] { (void)parse(body); });
+    int failures = 0;
+
+    // Unconstrained requests translate as before: no constraint, default engine tool choice,
+    // no presence-penalty override, special tokens preserved exactly when tools are in play.
+    for (Json body : {base_request(),
+                      [] {
+                          Json value                  = base_request();
+                          value["response_format"]    = Json{{"type", "text"}};
+                          value["grammar"]            = "";
+                          value["structured_outputs"] = nullptr;
+                          value["guided_json"]        = nullptr;
+                          return value;
+                      }(),
+                      [] {
+                          Json value     = base_request();
+                          value["tools"] = Json::array(
+                              {Json{{"type", "function"},
+                                    {"function", Json{{"name", "lookup"},
+                                                      {"parameters", Json{{"type", "object"}}}}}}});
+                          value["stop"] = "END";
+                          return value;
+                      }()}) {
+        const auto parsed = parse(body).generation;
+        const auto engine = options(parsed);
         failures +=
-            check(error.param == field && error.code == "constrained_decoding_not_supported" &&
-                      error.message.find(field) != std::string::npos,
-                  std::string(field) + " constrained decoding is explicitly rejected");
+            check(!parsed.constraint && parsed.constraint_param.empty() && !engine.constraint &&
+                      engine.tool_choice.mode == ninfer::ToolChoiceMode::Auto &&
+                      engine.tool_choice.constraints == ninfer::ToolConstraintMode::Automatic &&
+                      !engine.tool_choice.allowed_names && engine.tool_choice.parallel &&
+                      !engine.execution.sampling.presence_penalty &&
+                      engine.output.preserve_special_tokens == parsed.uses_tools(),
+                  "an unconstrained request changed its Engine options");
     }
 
-    Json neutral                  = base_request();
-    neutral["grammar"]            = "";
-    neutral["structured_outputs"] = nullptr;
-    neutral["guided_json"]        = nullptr;
-    neutral["guided_regex"]       = nullptr;
-    neutral["guided_choice"]      = nullptr;
-    neutral["guided_grammar"]     = nullptr;
-    failures += check(parse(neutral).generation.messages.size() == 1,
-                      "neutral constrained-decoding extension values are accepted");
+    // response_format json_object / json_schema (strict either way), streaming included.
+    Json body               = base_request();
+    body["stream"]          = true;
+    body["response_format"] = Json{{"type", "json_object"}};
+    const auto json_object  = parse(body);
+    failures += check(json_object.stream &&
+                          options(json_object.generation).constraint ==
+                              ninfer::OutputConstraint::json_object() &&
+                          json_object.generation.constraint_param == "response_format",
+                      "JSON object mode lost in Engine translation");
+    const Json schema = {
+        {"type", "object"},
+        {"properties", {{"description", {{"type", "string"}}}, {"a", {{"type", "integer"}}}}},
+        {"required", {"a"}}};
+    for (const Json strict : {Json(true), Json(false), Json(nullptr)}) {
+        body                    = base_request();
+        body["response_format"] = Json{
+            {"type", "json_schema"},
+            {"json_schema",
+             {{"name", "answer"}, {"description", "d"}, {"strict", strict}, {"schema", schema}}}};
+        const auto typed = parse(body).generation;
+        failures += check(options(typed).constraint ==
+                                  ninfer::OutputConstraint::json_schema(schema.dump()) &&
+                              typed.constraint_param == "response_format.json_schema.schema",
+                          "JSON schema source/order or diagnostic location lost");
+    }
+
+    // structured_outputs: grammar, regex, choice (literals kept byte for byte).
+    body                       = base_request();
+    body["structured_outputs"] = Json{{"grammar", "root ::= \"yes\" | \"no\""}};
+    const auto grammar         = parse(body).generation;
+    failures += check(options(grammar).constraint ==
+                              ninfer::OutputConstraint::grammar("root ::= \"yes\" | \"no\"") &&
+                          grammar.constraint_param == "structured_outputs.grammar",
+                      "GBNF must survive protocol-to-Engine translation");
+    body["structured_outputs"] = Json{{"choice", {"", "yes", "你好"}}};
+    failures += check(options(parse(body).generation).constraint ==
+                          ninfer::OutputConstraint::choice({"", "yes", "你好"}),
+                      "choice literals were changed in Engine translation");
+    body["structured_outputs"] = Json{{"regex", ""}};
+    failures +=
+        check(options(parse(body).generation).constraint == ninfer::OutputConstraint::regex(""),
+              "empty regex was dropped in Engine translation");
+
+    // Malformed formats: 400 with the field that is wrong.
+    const auto param_of = [&](Json format) {
+        Json request               = base_request();
+        request["response_format"] = std::move(format);
+        return api_error([&] { (void)parse(request); });
+    };
+    failures += check(param_of(Json{{"type", "json_schema"}}).param == "response_format",
+                      "json_schema without its object was accepted");
+    failures += check(
+        param_of(Json{{"type", "json_schema"}, {"json_schema", {{"schema", schema}}}}).param ==
+            "response_format.json_schema.name",
+        "json_schema without a name was accepted");
+    failures += check(param_of(Json{{"type", "json_schema"},
+                                    {"json_schema", {{"name", "bad name"}, {"schema", schema}}}})
+                              .param == "response_format.json_schema.name",
+                      "invalid schema name was accepted");
+    failures += check(param_of(Json{{"type", "json_schema"},
+                                    {"json_schema", {{"name", "a"}, {"schema", "object"}}}})
+                              .param == "response_format.json_schema.schema",
+                      "non-object schema was accepted");
+    failures += check(
+        param_of(Json{{"type", "json_schema"},
+                      {"json_schema", {{"name", "a"}, {"schema", schema}, {"strict", "yes"}}}})
+                .param == "response_format.json_schema.strict",
+        "non-boolean strict was accepted");
+    failures +=
+        check(param_of(Json{{"type", "json_schema"},
+                            {"json_schema", {{"name", "a"}, {"schema", schema}, {"extra", 1}}}})
+                      .param == "response_format.json_schema.extra",
+              "unknown schema option was accepted");
+    failures += check(param_of(Json{{"type", "xml"}}).param == "response_format.type",
+                      "unknown output format type was accepted");
+    failures += check(param_of(Json{{"type", "json_object"}, {"x", 1}}).status == 400,
+                      "json_object options were accepted");
+    failures += check(param_of(Json("json")).param == "response_format",
+                      "untyped response_format was accepted");
+    for (const auto& value : {Json{{"grammar", ""}}, Json{{"json", Json::object()}}, Json("bad"),
+                              Json{{"choice", Json::array()}}, Json{{"choice", {"a", 1}}},
+                              Json{{"regex", 7}}, Json{{"regex", "a"}, {"choice", {"a"}}}}) {
+        body                       = base_request();
+        body["structured_outputs"] = value;
+        failures += check(api_error([&] { (void)parse(body); }).status == 400,
+                          "malformed structured_outputs accepted: " + value.dump());
+    }
+    body["structured_outputs"] = Json{{"choice", {"a", 1}}};
+    const ApiError bad_choice  = api_error([&] { (void)parse(body); });
+    failures += check(bad_choice.param == "structured_outputs.choice/1" &&
+                          bad_choice.code == "invalid_choice",
+                      "bad choice entry lost its index");
+    for (const char* alias :
+         {"grammar", "guided_json", "guided_regex", "guided_choice", "guided_grammar"}) {
+        body                 = base_request();
+        body[alias]          = "root ::= \"yes\"";
+        const ApiError error = api_error([&] { (void)parse(body); });
+        failures +=
+            check(error.param == alias && error.code == "constrained_decoding_not_supported" &&
+                      error.message.find(alias) != std::string::npos,
+                  std::string(alias) + " constrained-decoding alias accepted");
+    }
+
+    // Combinations rejected before the Engine: two constraints, custom stops, active tools.
+    body                       = base_request();
+    body["response_format"]    = Json{{"type", "json_object"}};
+    body["structured_outputs"] = Json{{"grammar", "root ::= \"x\""}};
+    failures += check(api_error([&] { (void)parse(body); }).param == "structured_outputs.grammar",
+                      "conflicting formats accepted");
+    body.erase("structured_outputs");
+    body["stop"]             = "yes";
+    const ApiError with_stop = api_error([&] { (void)parse(body); });
+    failures += check(with_stop.param == "response_format" &&
+                          with_stop.code == "unsupported_output_combination",
+                      "constraint with custom stops accepted");
+    body.erase("stop");
+    body["tools"] = Json::array(
+        {Json{{"type", "function"},
+              {"function", {{"name", "lookup"}, {"parameters", {{"type", "object"}}}}}}});
+    failures +=
+        check(api_error([&] { (void)parse(body); }).code == "unsupported_output_combination",
+              "constraint with active tools accepted before the tool grammar exists");
+    body["tool_choice"]         = "none";
+    const auto inactive         = parse(body).generation;
+    const auto inactive_options = options(inactive);
+    failures += check(inactive.constraint && !inactive.uses_tools() &&
+                          !inactive_options.output.preserve_special_tokens,
+                      "inactive tools blocked a constraint");
+    body["tool_choice"] = "required";
+    failures += check(api_error([&] { (void)parse(body); }).code == "tool_choice_not_supported",
+                      "forced tool_choice is still rejected in Tappa A");
+
+    // D6: constrained requests sample without presence penalty unless the client sets one.
+    body                    = base_request();
+    body["response_format"] = Json{{"type", "json_object"}};
+    failures += check(options(parse(body).generation).execution.sampling.presence_penalty ==
+                          std::optional<float>(0.0F),
+                      "constrained request kept a default presence penalty");
+    body["presence_penalty"] = 0.5;
+    failures += check(options(parse(body).generation).execution.sampling.presence_penalty ==
+                          std::optional<float>(0.5F),
+                      "client presence penalty was overridden");
+
+    // Tool history without active tools: constrained output is plain text.
+    body             = base_request();
+    body["messages"] = Json::array(
+        {Json{{"role", "user"}, {"content", "q"}},
+         Json{{"role", "assistant"},
+              {"content", nullptr},
+              {"tool_calls",
+               Json::array({Json{{"id", "call_1"},
+                                 {"type", "function"},
+                                 {"function", {{"name", "lookup"}, {"arguments", "{}"}}}}})}},
+         Json{{"role", "tool"}, {"tool_call_id", "call_1"}, {"content", "42"}},
+         Json{{"role", "user"}, {"content", "answer as JSON"}}});
+    failures += check(options(parse(body).generation).output.preserve_special_tokens,
+                      "tool history no longer preserves special tokens");
+    body["response_format"] = Json{{"type", "json_object"}};
+    failures += check(!options(parse(body).generation).output.preserve_special_tokens,
+                      "constrained output preserved tool-call special tokens");
+
+    // Engine errors map to 400 with the request field and the schema JSON Pointer.
+    const auto error = request_error_to_api_error(
+        ninfer::RequestError(ninfer::RequestErrorKind::UnsupportedJsonSchema, "unsupported keyword",
+                             "/properties/x/format"),
+        "response_format.json_schema.schema");
+    failures += check(error.status == 400 &&
+                          error.param == "response_format.json_schema.schema/properties/x/format" &&
+                          error.code == "unsupported_json_schema",
+                      "schema error lost its source path");
+    const std::vector<std::tuple<ninfer::RequestErrorKind, int, const char*, const char*>> kinds = {
+        {ninfer::RequestErrorKind::InvalidGrammar, 400, "invalid_grammar",
+         "structured_outputs.grammar"},
+        {ninfer::RequestErrorKind::InvalidChoice, 400, "invalid_choice",
+         "structured_outputs.grammar"},
+        {ninfer::RequestErrorKind::InvalidRegex, 400, "invalid_regex",
+         "structured_outputs.grammar"},
+        {ninfer::RequestErrorKind::ConstraintDeadEnd, 400, "constraint_dead_end",
+         "structured_outputs.grammar"},
+        {ninfer::RequestErrorKind::InvalidJsonSchema, 400, "invalid_json_schema",
+         "structured_outputs.grammar/x"},
+        {ninfer::RequestErrorKind::UnsatisfiableJsonSchema, 400, "unsatisfiable_json_schema",
+         "structured_outputs.grammar/x"},
+        {ninfer::RequestErrorKind::ConstraintLimitExceeded, 400, "constraint_limit_exceeded",
+         "structured_outputs.grammar/x"},
+        {ninfer::RequestErrorKind::ConstraintBudgetExceeded, 400, "constraint_budget_exceeded",
+         "structured_outputs.grammar"},
+        {ninfer::RequestErrorKind::UnsupportedOutputCombination, 400,
+         "unsupported_output_combination", "/x"},
+        {ninfer::RequestErrorKind::InvalidToolConstraint, 400, "invalid_tool_constraint",
+         "tools/x"},
+        {ninfer::RequestErrorKind::InvalidToolOutput, 500, "invalid_tool_output", ""},
+    };
+    for (const auto& [kind, status, code, param] : kinds) {
+        const auto mapped = request_error_to_api_error(ninfer::RequestError(kind, "m", "/x"),
+                                                       "structured_outputs.grammar");
+        failures += check(mapped.status == status && mapped.code == code && mapped.param == param,
+                          std::string("structured-output error misclassified: ") + code);
+    }
+    const auto unlocated = request_error_to_api_error(
+        ninfer::RequestError(ninfer::RequestErrorKind::UnsupportedOutputCombination, "m"),
+        "text.format.schema");
+    failures += check(unlocated.param == "text.format.schema",
+                      "combination error without pointer lost the constraint field");
+    // Vendor errors carry a timestamp and the server's source path: not for clients (N6).
+    const auto vendor = request_error_to_api_error(
+        ninfer::RequestError(ninfer::RequestErrorKind::InvalidRegex,
+                             "[21:04:30] /home/u/xgrammar/cpp/regex_converter.cc:85: Regex parsing "
+                             "error at position 3: Lookahead is not supported yet."),
+        "structured_outputs.regex");
+    failures += check(vendor.message ==
+                          "Regex parsing error at position 3: Lookahead is not supported yet.",
+                      "a server source path reached the client: " + vendor.message);
+    return failures;
+}
+
+// capy-flash structured output limits (OutputConstraintLimits): over-limit inputs are 400s in the
+// HTTP layer that name the limit and the location, before anything recursive sees them. Deep
+// documents are built from text and only moved: copying or dumping them would recurse.
+std::string nested_items(std::size_t levels) {
+    std::string text;
+    for (std::size_t level = 0; level < levels; ++level) text += R"({"type":"array","items":)";
+    return text + R"({"type":"integer"})" + std::string(levels, '}');
+}
+
+int test_constraint_limits() {
+    int failures            = 0;
+    const auto schema_error = [&](const std::string& schema) {
+        Json body = Json::parse(
+            R"({"model":"qwen","messages":[{"role":"user","content":"hello"}],)"
+            R"("response_format":{"type":"json_schema","json_schema":{"name":"x","schema":)" +
+            schema + "}}}");
+        return api_error([&] { (void)parse(std::move(body)); });
+    };
+    const auto limited = [](const ApiError& error, const std::string& param, const char* flag) {
+        return error.status == 400 && error.code == "constraint_limit_exceeded" &&
+               error.param.starts_with(param) && error.message.find(flag) != std::string::npos;
+    };
+    // B2: the audit's 5 000-level schema killed the server (stack overflow in the converter).
+    for (const std::size_t levels : {300U, 5000U, 100000U}) {
+        failures += check(limited(schema_error(nested_items(levels)),
+                                  "response_format.json_schema.schema/items/items",
+                                  "--constraint-max-depth"),
+                          "deep schema was not rejected: " + std::to_string(levels));
+    }
+    failures += check(schema_error(nested_items(255)).status == 0,
+                      "a schema at the depth limit (256 containers) was rejected");
+    Json properties = Json::object();
+    for (int i = 0; i < 5000; ++i) properties["p" + std::to_string(i)] = {{"type", "string"}};
+    failures +=
+        check(limited(schema_error(
+                          Json{{"type", "object"}, {"properties", std::move(properties)}}.dump()),
+                      "response_format.json_schema.schema/properties", "--constraint-max-items"),
+              "an object with 5000 properties was not rejected");
+    const auto wide = schema_error(
+        Json{{"type", "string"}, {"description", std::string(300U * 1024U, 'x')}}.dump());
+    failures += check(limited(wide, "response_format.json_schema.schema", "--constraint-max-kib") &&
+                          wide.param == "response_format.json_schema.schema",
+                      "a 300 KiB schema was not rejected");
+
+    const auto outputs_error = [&](Json value) {
+        Json body                  = base_request();
+        body["structured_outputs"] = std::move(value);
+        return api_error([&] { (void)parse(body); });
+    };
+    Json choices = Json::array();
+    for (int i = 0; i < 5000; ++i) choices.push_back("v" + std::to_string(i));
+    failures += check(limited(outputs_error(Json{{"choice", std::move(choices)}}),
+                              "structured_outputs.choice", "--constraint-max-items"),
+                      "a 5000-entry choice was not rejected");
+    const std::string open(300, '('), close(300, ')');
+    failures += check(limited(outputs_error(Json{{"regex", open + "a" + close}}),
+                              "structured_outputs.regex", "--constraint-max-depth"),
+                      "a regex nested 300 groups deep was not rejected");
+    failures +=
+        check(limited(outputs_error(Json{{"grammar", "root ::= " + open + "\"a\"" + close}}),
+                      "structured_outputs.grammar", "--constraint-max-depth"),
+              "a GBNF nested 300 groups deep was not rejected");
+    failures += check(outputs_error(Json{{"grammar", "root ::= \"" + open + "\" [(]"}}).status == 0,
+                      "parentheses inside GBNF literals counted as groups");
+    failures += check(outputs_error(Json{{"regex", "[(]{3}\\((a)"}}).status == 0,
+                      "escaped or bracketed parentheses counted as regex groups");
+
+    // Tool-call arguments are JSON in a string: checked where they are read (capy-flash).
+    Json history        = base_request();
+    history["messages"] = Json::array(
+        {Json{{"role", "user"}, {"content", "hi"}},
+         Json{{"role", "assistant"},
+              {"content", nullptr},
+              {"tool_calls", Json::array({Json{{"id", "c1"},
+                                               {"type", "function"},
+                                               {"function",
+                                                {{"name", "f"},
+                                                 {"arguments", std::string(2000, '[') +
+                                                                   std::string(2000, ']')}}}}})}},
+         Json{{"role", "tool"}, {"tool_call_id", "c1"}, {"content", "ok"}}});
+    const auto deep_arguments = api_error([&] { (void)parse(history); });
+    failures +=
+        check(deep_arguments.status == 400 && deep_arguments.code == "request_json_too_deep" &&
+                  deep_arguments.param == "messages",
+              "deeply nested tool-call arguments were not refused");
+
+    // Configurable; set once at startup by the HTTP server.
+    configure_output_constraint_limits({.max_depth = 8});
+    failures += check(limited(schema_error(nested_items(10)), "response_format.json_schema.schema",
+                              "--constraint-max-depth"),
+                      "the configured depth limit was not applied");
+    configure_output_constraint_limits({});
+
+    // The exact-number check reads the raw body and searches the schema recursively: a deep schema
+    // with an inexact bound must stop at the depth limit, not overflow the stack.
+    std::string text =
+        R"({"response_format":{"type":"json_schema","json_schema":{"name":"x","schema":)";
+    for (int i = 0; i < 100000; ++i) text += R"({"type":"array","items":)";
+    text += R"({"type":"number","maximum":0.30000000000000001})";
+    text += std::string(100000, '}') + "}}}";
+    const auto inexact =
+        api_error([&] { validate_schema_number_input(ninfer::text::parse_json_numbers(text)); });
+    failures += check(limited(inexact, "response_format.json_schema.schema/items/items",
+                              "--constraint-max-depth"),
+                      "a deep schema with an inexact number was not stopped at the depth limit");
     return failures;
 }
 
@@ -851,6 +1185,7 @@ int main() {
     failures += test_request_envelope_and_sampling();
     failures += test_standard_field_policy();
     failures += test_constrained_decoding_extensions();
+    failures += test_constraint_limits();
     failures += test_tools();
     failures += test_messages_and_media();
     failures += test_reasoning_and_extensions();

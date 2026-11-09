@@ -33,6 +33,10 @@ struct SchedulerRequest {
         [[nodiscard]] std::span<const ninfer::TokenId> pending_control_tokens() const noexcept {
             return control;
         }
+
+        [[nodiscard]] bool control_completes_close() const noexcept { return completes_close; }
+
+        bool completes_close = false;
     };
 
     enum class State : std::uint8_t { Decode, Control };
@@ -211,6 +215,25 @@ int main() {
     failures += check(control.size == 1 && control.row_stride == 3 &&
                           control.tokens == slots[0]->output.control && control.sequences[0] == 23,
                       "ControlReady membership changed the exact control span");
+
+    // Ragged control spans: only a constrained row completing its own close may differ (it runs
+    // in the next control unit); any other ragged span is still an invariant violation.
+    slots[1]                 = std::make_shared<SchedulerRequest>();
+    slots[1]->id             = 22;
+    slots[1]->budget         = SchedulerRequest::Budget{.tokens = 11};
+    slots[1]->sequence       = 24;
+    slots[1]->state          = SchedulerRequest::State::Control;
+    slots[1]->output.control = {5};
+    failures += check(throws_logic([&] { (void)scheduler.build_control_membership(slots, 2); }),
+                      "a ragged control span of a free row was not reported");
+    slots[1]->output.completes_close = true;
+    const auto deferred              = scheduler.build_control_membership(slots, 2);
+    failures += check(deferred.size == 1 && deferred.lanes[0] == 0 && deferred.row_stride == 3,
+                      "a close-completion span was not deferred to its own control unit");
+    slots[0]->state  = SchedulerRequest::State::Decode;
+    const auto alone = scheduler.build_control_membership(slots, 2);
+    failures += check(alone.size == 1 && alone.lanes[0] == 1 && alone.row_stride == 1,
+                      "a close-completion span did not run alone");
 
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;

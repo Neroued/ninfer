@@ -14,10 +14,17 @@ namespace ninfer::serve {
 
 // Protocol default when the client omits max_tokens. Engine independently
 // clamps the request to its effective context capacity.
-inline constexpr int kDefaultMaxTokens                    = 8192;
-inline constexpr std::size_t kDefaultMaxRequestBytes      = 384ULL << 20;
-inline constexpr std::size_t kDefaultResponseStoreRecords = 1024;
-inline constexpr std::size_t kDefaultResponseStoreBytes   = 256ULL << 20;
+inline constexpr int kDefaultMaxTokens               = 8192;
+inline constexpr std::size_t kDefaultMaxRequestBytes = 384ULL << 20;
+// Nesting of objects and arrays in a request body (and in JSON carried as a string, such as tool
+// call arguments), checked on the bytes before parsing: the prompt path reads client JSON with
+// recursive code (rendering, copies, serialization), so a deep document must not reach it.
+inline constexpr std::uint32_t kDefaultMaxRequestJsonDepth = 1000;
+// The template renderer converts client JSON recursively: about 12 000 levels exhaust an 8 MiB
+// thread stack (measured), so the maximum keeps a margin.
+inline constexpr std::uint32_t kMaximumMaxRequestJsonDepth = 5000;
+inline constexpr std::size_t kDefaultResponseStoreRecords  = 1024;
+inline constexpr std::size_t kDefaultResponseStoreBytes    = 256ULL << 20;
 // --log-speculation-detail records the accepted draft length of at most this many decode steps
 // per request (one byte each in the JSONL record) unless --log-speculation-detail-max-steps
 // changes it.
@@ -37,20 +44,25 @@ struct ServeOptions {
     KvCapacityPolicy kv_capacity         = KvCapacityPolicy::explicit_capacity(8192);
     std::uint32_t max_concurrency        = 1;
     std::uint32_t max_pending_requests   = 16;
-    std::uint32_t pending_timeout_ms     = 30000;
+    std::uint32_t pending_timeout_ms     = kDefaultPendingTimeoutMs;
     float decode_share                   = 0.0F; // --decode-share (EngineOptions::decode_share)
     std::uint32_t prefill_chunk          = 1024;
     std::uint32_t kv_lease_window_tokens = 4096; // --kv-lease-window; 0 = reserve max_tokens
     std::filesystem::path context_cost_presets;
-    std::uint32_t log_stats_interval_ms    = 5000; // 0 disables periodic Engine throughput logs
-    std::size_t max_request_bytes          = kDefaultMaxRequestBytes;
-    std::size_t media_cache_bytes          = kDefaultMediaCacheBytes;
-    std::size_t media_live_bytes           = kDefaultMediaLiveBytes;
+    std::uint32_t log_stats_interval_ms  = 5000; // 0 disables periodic Engine throughput logs
+    std::size_t max_request_bytes        = kDefaultMaxRequestBytes;
+    std::uint32_t max_request_json_depth = kDefaultMaxRequestJsonDepth; // --max-request-json-depth
+    std::size_t media_cache_bytes        = kDefaultMediaCacheBytes;
+    std::size_t media_live_bytes         = kDefaultMediaLiveBytes;
     std::uint32_t media_preprocess_threads = 0;
     std::size_t response_store_max_records = kDefaultResponseStoreRecords;
     std::size_t response_store_max_bytes   = kDefaultResponseStoreBytes;
-    int device                             = 0;
-    int tp                                 = 1;
+    // Structured output limits (--constraint-*): input size/depth/items checked in the HTTP layer
+    // and again before compilation, compilation deadline and concurrency, grammar cache, matcher
+    // time budgets of a generating request.
+    OutputConstraintLimits constraint_limits;
+    int device = 0;
+    int tp     = 1;
     std::vector<int> devices; // One id per tensor-parallel rank; {device} at tp 1.
     KvCacheStorage kv_cache = KvCacheStorage::BFloat16;
     // YaRN RoPE extension. factor <= 1 is DISABLED and must stay bit-identical to the

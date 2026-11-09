@@ -5,10 +5,12 @@
 
 #include "models/qwen3_5/frontend/chat_template.h"
 #include "models/qwen3_5/frontend/media_cache.h"
+#include "models/qwen3_5/frontend/output_constraint.h"
 #include "models/qwen3_5/frontend/processor.h"
 #include "models/qwen3_5/frontend/test_access.h"
 #include "models/qwen3_5/frontend/tokenizer.h"
 #include "models/qwen3_5/frontend/tool_call_parser.h"
+#include "text/grammar.h"
 #include "text/unicode.h"
 
 #include <nlohmann/json.hpp>
@@ -631,6 +633,8 @@ public:
             }
         }
         thinking_control_tokens = std::make_shared<const std::vector<TokenId>>(std::move(encoded));
+        constraints             = std::make_shared<fi::ConstraintCompiler>(
+            tokenizer, defaults.token_ids, options.grammar_cache_bytes, options.constraint_limits);
     }
 
     fi::CompiledChatTemplate chat_template;
@@ -640,6 +644,8 @@ public:
     StopPolicy defaults;
     ModelSamplingDefaults sampling;
     std::shared_ptr<const std::vector<TokenId>> thinking_control_tokens;
+    // Structured output: built lazily on the first constrained request (output_constraint.h).
+    std::shared_ptr<fi::ConstraintCompiler> constraints;
     bool vision_enabled       = true;
     std::uint32_t max_context = 0;
 };
@@ -765,6 +771,8 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
     auto prepared              = std::make_unique<PreparedPromptData>();
     PreparedPromptData& result = *prepared;
     result.tool_call_output    = tool_call_output;
+    result.has_active_tools    = !options.tool_jsons.empty();
+    result.continuation = options.continuation == PromptContinuationMode::ContinueFinalAssistant;
     std::vector<std::optional<std::uint32_t>> message_boundaries;
     std::vector<std::optional<std::uint32_t>> cache_boundaries;
     if (has_media) {
@@ -942,6 +950,7 @@ PreparedPrompt Frontend::prepare_continuation(PromptInput input, std::span<const
     // The appended tokens are the reply so far plus the closing suffix: decoding resumes in
     // content, where the tool-call contract of the chat prompt still applies.
     data.starts_in_reasoning = false;
+    data.continuation        = true;
     return prompt;
 }
 
@@ -969,13 +978,21 @@ std::string Frontend::detokenize_text(std::span<const TokenId> token_ids) const 
 OutputSession Frontend::make_output_session(const PreparedPrompt& prompt,
                                             const StopPolicy& caller_stop,
                                             const OutputOptions& output,
-                                            const ThinkingControlOptions& thinking) const {
+                                            const ThinkingControlOptions& thinking,
+                                            const std::optional<OutputConstraint>& constraint,
+                                            const ToolChoice& tool_choice) const {
     if (prompt.data_ == nullptr) { throw std::invalid_argument("prepared prompt is empty"); }
+    fi::validate_tool_choice(tool_choice);
+    std::unique_ptr<text::GrammarSession> grammar;
+    if (constraint) {
+        grammar = fi::make_constraint_session(*impl_->constraints, *prompt.data_, *constraint,
+                                              caller_stop, output);
+    }
     StopPolicy policy = merge_stop_policy(*impl_->tokenizer, caller_stop);
     if (output.raw) { policy.publish_stop_token = true; }
-    return OutputSession(impl_->tokenizer, std::move(policy), output,
-                         prompt.data_->starts_in_reasoning, thinking,
-                         impl_->thinking_control_tokens, prompt.data_->tool_call_output);
+    return OutputSession(
+        impl_->tokenizer, std::move(policy), output, prompt.data_->starts_in_reasoning, thinking,
+        impl_->thinking_control_tokens, prompt.data_->tool_call_output, std::move(grammar));
 }
 
 const StopPolicy& Frontend::default_stop_policy() const noexcept { return impl_->defaults; }

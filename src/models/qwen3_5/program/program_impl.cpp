@@ -346,6 +346,13 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
     if (plan.persistent.sampling_config) {
         sampling_config = plan.persistent.sampling_config->bind(backing);
     }
+    if (plan.persistent.grammar_masks) {
+        // Structured output: the pinned twin of the lane slots, then one staged prefill config
+        // per lane (program/grammar_masks.cpp).
+        grammar_masks_device = plan.persistent.grammar_masks->bind(backing);
+        grammar_masks_host.emplace(grammar_staged_config_offset(grammar_masks_device.bytes()) +
+                                   kMaximumConcurrency * sizeof(ops::SamplingConfig));
+    }
     active_continuations.fill(continuation_capacity);
     for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) { lane_epochs[lane] = 1; }
     for (std::uint32_t index = 0; index < continuation_capacity; ++index) {

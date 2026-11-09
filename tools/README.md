@@ -21,6 +21,7 @@ Python tools are independent of CMake; there is no `NINFER_BUILD_TOOLS` option.
 | Run benchmark matrices | [`bench/`](bench/README.md) |
 | Measure external Serve TTFT | [`bench/ttft/`](bench/ttft/README.md) |
 | Exercise a resident HTTP server | [`smoke/serve_contract.py`](smoke/serve_contract.py) |
+| Check structured output (JSON object, JSON Schema, regex, choice, GBNF) end to end on a running server, validating replies with an independent JSON Schema validator | [`smoke/serve_structured_output.py`](smoke/serve_structured_output.py) |
 | Exercise thinking preservation through a managed server | [`smoke/serve_thinking_preservation.py`](smoke/serve_thinking_preservation.py) |
 | Measure the physical HBM read/copy ceiling | [`hbm_bandwidth_probe.cu`](hbm_bandwidth_probe.cu); [build command](#standalone-hbm-probe) |
 | Check whether the two-GPU mailbox transport works on a machine | [`tp2/mailbox_probe.cu`](tp2/mailbox_probe.cu); [build command](#standalone-tp2-mailbox-probe) |

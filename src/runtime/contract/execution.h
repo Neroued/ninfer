@@ -3,9 +3,25 @@
 #include "runtime/contract/request.h"
 #include "runtime/contract/timing.h"
 #include <compare>
+#include <cstddef>
+#include <cstdint>
 #include <span>
 
 namespace ninfer::runtime {
+
+// Structured output (upstream 08902f73): token masks of the constrained rows of one Program call.
+// Borrowed for that call only; the Engine maps compact rows to request-owned matchers.
+class TokenMaskProvider {
+public:
+    virtual ~TokenMaskProvider()                                           = default;
+    [[nodiscard]] virtual bool constrained(std::size_t row) const noexcept = 0;
+    // Fills (drafts.size() + 1) positions of ceil(V/32) words: position i is the mask after the
+    // committed output plus drafts[0..i). Returns dead-end position bits. Every position, dead or
+    // unreachable, receives a nonempty mask (an empty mask traps the sampler); a dead end fails
+    // the row only if execution reaches that position.
+    [[nodiscard]] virtual std::uint32_t fill(std::size_t row, std::span<const TokenId> drafts,
+                                             std::span<std::uint32_t> words) = 0;
+};
 
 struct LaneId {
     std::uint32_t value = 0;

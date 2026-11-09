@@ -850,10 +850,10 @@ int test_explicit_rejections() {
 
     value         = base;
     value["text"] = Json{{"format", Json{{"type", "json_schema"}}}};
-    failures += check(api_code([&] {
+    failures += check(api_error([&] {
                           (void)parse_openai_responses_create_request(value, limits());
-                      }) == "structured_outputs_not_supported",
-                      "structured output is rejected explicitly");
+                      }).param == "text.format.name",
+                      "malformed output schema is rejected");
 
     value               = base;
     value["background"] = true;
@@ -1291,10 +1291,123 @@ int test_codex_cli_compatibility() {
     return failures;
 }
 
+// Structured output, ported from Neroued/ninfer 08902f73, eb6696ae, 8ffa3131 and 2734a56e
+// (test_openai_responses.cpp), adapted to Tappa A (no JSON output with active tools yet).
+int test_constrained_decoding() {
+    int failures = 0;
+    OpenAIResponsesStore store(8, 1024 * 1024);
+    const auto engine_constraint = [&](const Json& body) {
+        const auto parsed = parse_openai_responses_create_request(body, limits());
+        const auto resolved =
+            resolve_openai_responses_prompt(parsed.prompt, store, std::nullopt, false);
+        return to_request_options(resolved.generation, {}, {}, true).constraint;
+    };
+    Json body{{"model", "qwen"}, {"input", "hello"}};
+    failures += check(!engine_constraint(body), "unconstrained request gained a constraint");
+    body["text"]     = Json{{"format", {{"type", "text"}}}};
+    const auto plain = parse_openai_responses_create_request(body, limits());
+    failures += check(!engine_constraint(body) && !plain.prompt.generation.constraint &&
+                          make_openai_response_object("resp_plain", 1, plain, {}, sample_outcome())
+                                  .body["text"]["format"] == nlohmann::json{{"type", "text"}},
+                      "text format changed the request or its echo");
+
+    for (const auto& value : {Json{{"choice", {"yes", "no"}}}, Json{{"regex", "[a-z]+"}},
+                              Json{{"grammar", "root ::= \"yes\""}}}) {
+        body                       = Json{{"model", "qwen"}, {"input", "hello"}};
+        body["structured_outputs"] = value;
+        const auto expected =
+            value.contains("choice")  ? ninfer::OutputConstraint::choice({"yes", "no"})
+            : value.contains("regex") ? ninfer::OutputConstraint::regex("[a-z]+")
+                                      : ninfer::OutputConstraint::grammar("root ::= \"yes\"");
+        failures += check(engine_constraint(body) == expected,
+                          "Responses structured_outputs lost through prompt resolution");
+    }
+    body["structured_outputs"] = Json{{"grammar", ""}};
+    failures += check(api_error([&] {
+                          (void)parse_openai_responses_create_request(body, limits());
+                      }).param == "structured_outputs.grammar",
+                      "empty grammar was accepted");
+
+    body = Json{
+        {"model", "qwen"}, {"input", "hello"}, {"text", {{"format", {{"type", "json_object"}}}}}};
+    failures += check(engine_constraint(body) == ninfer::OutputConstraint::json_object(),
+                      "Responses json_object lost");
+
+    const Json schema = {
+        {"type", "object"},
+        {"properties", {{"z", {{"type", "string"}}}, {"a", {{"type", "integer"}}}}}};
+    body = Json{
+        {"model", "qwen"},
+        {"input", "hello"},
+        {"stream", true},
+        {"text",
+         {{"format",
+           {{"type", "json_schema"}, {"name", "answer"}, {"strict", true}, {"schema", schema}}}}}};
+    const auto schema_request = parse_openai_responses_create_request(body, limits());
+    failures += check(schema_request.stream &&
+                          schema_request.prompt.generation.constraint ==
+                              ninfer::OutputConstraint::json_schema(schema.dump()) &&
+                          schema_request.prompt.generation.constraint_param == "text.format.schema",
+                      "Responses JSON schema source/order or path lost");
+    const auto response =
+        make_openai_response_object("resp_test", 1, schema_request, {}, sample_outcome());
+    failures += check(response.body["text"]["format"] == schema_request.text_format &&
+                          schema_request.text_format["name"] == "answer" &&
+                          schema_request.text_format["schema"]["properties"].contains("z"),
+                      "Responses format echo lost");
+    OpenAIResponsesEventStream stream("resp_stream", 1, schema_request, {});
+    const auto started = stream.start();
+    failures +=
+        check(!started.empty() && parse_event(started.front())["response"]["text"]["format"] ==
+                                      Json::parse(schema_request.text_format.dump()),
+              "Responses stream did not echo text.format in response.created");
+
+    // Malformed formats and combinations: 400 on the field.
+    const auto param_of = [&](Json changed) {
+        return api_error([&] { (void)parse_openai_responses_create_request(changed, limits()); });
+    };
+    auto bad = body;
+    bad["text"]["format"].erase("name");
+    failures += check(param_of(bad).param == "text.format.name", "schema without name accepted");
+    bad                           = body;
+    bad["text"]["format"]["type"] = "xml";
+    failures += check(param_of(bad).param == "text.format.type", "unknown format type accepted");
+    bad                   = body;
+    bad["text"]["format"] = Json{{"type", "text"}, {"x", 1}};
+    failures += check(param_of(bad).param == "text.format", "text format with options accepted");
+    bad                       = body;
+    bad["structured_outputs"] = Json{{"regex", "a"}};
+    failures += check(param_of(bad).param == "structured_outputs.regex",
+                      "conflicting output formats accepted");
+    bad                   = body;
+    bad["tools"]          = Json::array({Json{{"type", "function"}, {"name", "lookup"}}});
+    const auto with_tools = param_of(bad);
+    failures += check(with_tools.param == "text.format.schema" &&
+                          with_tools.code == "unsupported_output_combination",
+                      "JSON output with active tools accepted before the tool grammar exists");
+    bad["tool_choice"] = "none";
+    failures += check(parse_openai_responses_create_request(bad, limits())
+                          .prompt.generation.constraint.has_value(),
+                      "inactive tools blocked a constraint");
+    bad                = body;
+    bad["guided_json"] = Json::object();
+    failures += check(param_of(bad).code == "unknown_parameter", "guided_json accepted");
+
+    // Token counting accepts the format and ignores it.
+    failures += check(api_code([&] {
+                          (void)parse_openai_responses_input_tokens_request(
+                              Json{{"model", "qwen"}, {"input", "hello"}, {"text", body["text"]}},
+                              limits());
+                      }).empty(),
+                      "input_tokens rejected a text.format schema");
+    return failures;
+}
+
 } // namespace
 
 int main() {
     int failures = 0;
+    failures += test_constrained_decoding();
     failures += test_basic_request_and_resolution();
     failures += test_budgets_and_nonsemantic_hints();
     failures += test_typed_items_and_cache_markers();

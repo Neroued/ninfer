@@ -19,7 +19,7 @@ Anthropic-compatible HTTP API, so agent tools such as Claude Code, Codex CLI and
 
 capy-flash **is ninfer-tp2, renamed at v0.5.0**: the two-GPU tensor-parallel fork of
 [Neroued/ninfer](https://github.com/Neroued/ninfer) (v0.1-v0.4.9 under the old name); [NOTICE](NOTICE) lists every piece
-of prior work it builds on. Status: **v0.9.0**. Built, tested and measured on one machine ([below](#benchmarks));
+of prior work it builds on. Status: **v0.10.0**. Built, tested and measured on one machine ([below](#benchmarks));
 users report other setups. Not affiliated with Qwen or NVIDIA.
 
 ## Pick a model
@@ -97,6 +97,23 @@ set the key without putting it on the command line.
 
 Details, including authentication and what each client sends: [docs/serving.md](docs/serving.md#connect-a-client).
 
+**Structured output.** `response_format` (`json_object`, `json_schema`) on Chat Completions, `text.format` on
+Responses, `output_config.format` on Messages, and the `structured_outputs` extension (`grammar`, `regex`, `choice`)
+constrain the answer: the reply is valid JSON for the schema (or matches the grammar, regex or choice) whenever the
+model ends it. With thinking on, only the answer after `</think>` is constrained.
+
+```bash
+curl http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/json' -d '{
+  "model": "capy-flash", "messages": [{"role": "user", "content": "A cat, as JSON."}],
+  "response_format": {"type": "json_schema", "json_schema": {"name": "cat", "schema": {"type": "object",
+    "properties": {"name": {"type": "string"}, "age": {"type": "integer"}}, "required": ["name", "age"]}}}}'
+```
+
+Schemas and grammars come from the client, so they are bounded: size, nesting and item limits before compilation, a
+compilation timeout, and a time and memory budget while generating (`--constraint-*` flags). A request over a limit
+fails alone with a 400 that names the flag; the other requests keep their speed. Fields, errors, limits and cost:
+[docs/serving.md](docs/serving.md#structured-output).
+
 ## Run it other ways
 
 ### Build
@@ -129,8 +146,8 @@ For long contexts on Flash-Next, add `--kv-ram-active` to either Flash-Next prof
 taken as the conversations grow (about 2.5 GiB per GPU for 262k tokens, 4.2 GiB on one GPU), and the VRAM it frees
 goes to expert slots. Same tokens; within a few per cent of the default speed
 ([costs](docs/maintainer/active-kv-in-ram.md#cost)). For several long conversations at once add
-`--max-concurrency N --kv-capacity T` (T tokens for all of them together; the RAM follows what they use) and raise
-`--pending-timeout-ms` above the time the other prompts take: prompts are prefilled one at a time.
+`--max-concurrency N --kv-capacity T` (T tokens for all of them together; the RAM follows what they use). Prompts are
+prefilled one at a time: a request waits at most `--pending-timeout-ms` (default 10 minutes) for the others.
 
 ### Docker
 [docker/Dockerfile.release](docker/Dockerfile.release) packs a release tarball (builds in about a minute; the root
@@ -288,6 +305,18 @@ artifacts, runs the integration tests (`GATE_CTEST_EXCLUDE` excludes more), then
 greedy texts against a recorded reference ([tools/tp2/README.md](tools/tp2/README.md)).
 
 ## What's new
+
+**v0.10.0** ([release notes](https://github.com/ValerioDolci/capy-flash/releases/tag/v0.10.0))
+- Structured output ([#17](https://github.com/ValerioDolci/capy-flash/issues/17)): JSON mode, JSON Schema, GBNF
+  grammars, regex and choice lists on Chat Completions (`response_format`, `structured_outputs`), Responses
+  (`text.format`) and Anthropic Messages (`output_config.format`), streaming included, with MTP and next to other
+  requests. Objects are strict by default as in vLLM (`--constraint-json-strict off` for literal JSON Schema); every
+  client input is bounded (`--constraint-*`). Cost on the 27B: +0.3 % per round. See
+  [docs/serving.md](docs/serving.md#structured-output). Unconstrained requests are served as in v0.9.0.
+- `--pending-timeout-ms` defaults to 10 minutes (was 30 s): queued requests behind long prompts are no longer refused.
+- Fixed: a request body nested very deeply (for example a tool schema) crashed the server; beyond
+  `--max-request-json-depth` (default 1000) it now gets a 400.
+- Grouped MoE metadata in one scan ([PR #52](https://github.com/ValerioDolci/capy-flash/pull/52) by @lupodevelop).
 
 **v0.9.0** ([release notes](https://github.com/ValerioDolci/capy-flash/releases/tag/v0.9.0))
 - Opt-in, nothing changed at the default (greedy output identical to v0.8.2).

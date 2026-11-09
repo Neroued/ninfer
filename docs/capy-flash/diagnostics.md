@@ -142,6 +142,7 @@ note above). Variables marked *eager* need `--no-cuda-graph`.
 |---|---|---|---|
 | `NINFER_QWEN4_EXPERT_TRACE` | file | One JSON line per expert window: hits, CPU experts and time, fills, device timestamps. | capy |
 | `NINFER_QWEN4_ROUTING_DUMP` | file | The routing of every observed layer (binary). | capy |
+| `NINFER_CONSTRAINT_MASK_STATS` | `1` / unset | Structured output: every 256 host mask fills, the fills, positions per fill and microseconds per fill and per position on stderr (`[constraint] ...`). | capy |
 | `NINFER_QWEN4_ROUND_LOG` | file | One line per decode round: extent, accepted drafts, round time, host gap, misses, CPU and GPU-share experts, fill wait (T59). | capy |
 | `NINFER_QWEN4_MTP_CALIB` | file | One line per verified MTP round: extent, accepted, and the proposals' own log-probabilities. | capy |
 | `NINFER_QWEN4_TOP2` | file | The target's top-2 logits for every decoded or committed verification column. | capy |
@@ -173,6 +174,7 @@ These variables change execution on purpose so that runs can be compared exactly
 
 | variable | values | effect | results | scope |
 |---|---|---|---|---|
+| `NINFER_CONSTRAINT_DEAD_END_AFTER` | N (unset = off) | Read only by the test program `ninfer_engine_constraint_real_test deadend` (the engine and `ninfer-serve` never read it): from the N-th output token on, every constrained request of the test reports a dead end (no legal token), exactly as the matcher would; the request fails with `ConstraintDeadEnd` and the other requests continue. | test only | capy |
 | `NINFER_QWEN4_EXPERT_FREEZE` | `1`, `all` (gated) | `1`: residency is decided by the prompt windows alone, each prompt window waits for its fills, and decode windows insert nothing, so an MTP run and its no-draft control run each expert on the same side. `all`: nothing is ever inserted or evicted (fast bench, T59). | numerics (deterministic residency) | capy |
 | `NINFER_QWEN4_FREEZE_FLUSH` | any value | With `EXPERT_FREEZE=1`, the post-prompt refill lands before the first decode window (T98). | residency | capy |
 | `NINFER_QWEN4_EXPERT_SYNC` | `1` | Every window waits for its fills, so residency depends on routing only, not on copy timing (T59). | residency, slower | capy |
@@ -236,6 +238,7 @@ These are not read by the server. The list is not exhaustive; see `tests/README.
 | `NINFER_TEST_ARTIFACT`, `NINFER_TEST_QWEN4_ARTIFACT`, `NINFER_TEST_QWEN4_VISION_ARTIFACT` | real-artifact tests (skipped when unset) |
 | `NINFER_TEST_FP4_LOCAL_CHECKPOINT` | the FP4-Local checkpoint directory whose real tensors the conversion and PLE gather tests compare (skipped when unset) |
 | `NINFER_TEST_QWEN4_REUSE_ONLY`, `NINFER_PREFIX_REAL_SCENARIO`, `NINFER_TEST_PORT`, `NINFER_TEST_SCRATCH_DIR` | integration test selection and setup |
+| `NINFER_TEST_TOKENIZER_DIR`, `NINFER_TEST_SCHEMA_REPORT`, `NINFER_TEST_TOKENS_OUT` | structured output tests: Qwen3.8 tokenizer files, JSONL of constrained results for `validate_constraint_report.py`, greedy token ids of the `equiv` phase |
 | `NINFER_OP_REPORT_STATS` | op tests print statistics |
 | `NINFER_DRIVER_TEMPS` | validation driver: one sampling temperature per prompt line (T121) |
 | `NINFER_DRIVER_STOPS` | validation driver: stop at the model's default stop tokens (T121) |

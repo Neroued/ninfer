@@ -151,6 +151,11 @@ struct PreparedPromptData {
     PreparedContextCache context_cache;
     std::shared_ptr<const frontend::ToolCallOutputContract> tool_call_output;
     bool starts_in_reasoning = false;
+    // Structured output admission (frontend/output_constraint.cpp): tools are declared for this
+    // turn; the prompt continues an assistant message (ContinueFinalAssistant or a reasoning-close
+    // continuation).
+    bool has_active_tools = false;
+    bool continuation     = false;
     PrepareStats prepare;
 
     [[nodiscard]] std::span<const std::int32_t> position_axis(int axis) const;

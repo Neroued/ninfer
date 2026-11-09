@@ -313,3 +313,19 @@ Arguments are K, Graph enabled, optimized head enabled, maximum B, target KV (`b
 Vision enabled, and extra Device StateImage slots. Defaults are `15 1 1 8 bf16 0 3`. The individual
 Op suites remain the numerical/state-transition oracle;
 the fixed Engine fixture does not define bit parity across arbitrary floating-point routes.
+
+### Grouped MoE metadata
+
+`./build/tests/ninfer_moe_grouped_scan_test` compares exact offsets and job lists
+with a CPU prefix/enumeration oracle, including empty, skewed and tile-boundary counts.
+`--bench` emits 21 CUDA-event samples of 32 captured production launches per case
+(after warmup); these measure metadata only. Run the same fixture on baseline and candidate.
+The existing `ninfer_moe_grouped_test` remains the full mathematical qualification.
+
+`ninfer_moe_grouped_test --bench` measures the complete public grouped Op on the same
+synthetic pool used for qualification: 64 resident experts in randomized slots, dispersed
+and skewed routes, token counts 1–16,384 including production widths 256, 4,096 and 16,384
+and chunk boundaries. Counts below 256 are diagnostic: production uses the slots route there.
+It emits 21 event samples of a single captured call after warmup, excluding fixture upload
+and CPU work.
+Run the normal oracle test separately; benchmark mode checks guards but is not an oracle.

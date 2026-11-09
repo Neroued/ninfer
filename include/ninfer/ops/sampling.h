@@ -21,10 +21,26 @@ enum SamplePurpose : std::int32_t {
     kSamplePurposeReasoningGuard        = 6,
 };
 
-// Device-resident sampling parameters. token_counts is an optional device I32
+// Borrowed per-row token mask (constrained decoding). words == nullptr is the unconstrained row:
+// every kernel then takes exactly the route it took before masks existed. Otherwise position p of
+// the row is the packed bit vector words[p*stride .. p*stride+stride), bit v%32 of word v/32 set
+// = token v legal, stride >= ceil(token_domain/32); bits at or above token_domain are never read.
+// sample() reads position 0; speculative acceptance reads position i for verification column i
+// (i = 0..extent: the drafts' columns and the bonus column). Every position a kernel consumes
+// must have at least one legal token: the caller tracks dead ends itself and fills positions it
+// does not need (after a rejected draft, beyond the reachable prefix) with a safe non-empty mask.
+// A consumed position without a legal token stops the kernel with a device trap (an execution
+// error, not a placeholder token). The words live in caller-owned device memory at a stable
+// address (graph-capturable); only their contents and this pointer change between rounds.
+struct SamplingMask {
+    const std::uint32_t* words = nullptr;
+    std::int32_t stride        = 0;
+};
+
+// Device-resident sampling parameters and operands. token_counts is an optional device I32
 // [token_domain] committed generated-token occurrence-count array used by both penalties.
 struct SamplingConfig {
-    float temperature          = 0.0f; // <= 0 => greedy argmax (bit-identical to argmax())
+    float temperature          = 0.0f; // <= 0 => greedy argmax over the legal tokens
     std::int32_t top_k         = 20;   // runtime contract is [1,20]; Op defensively caps otherwise
     float top_p                = 1.0f; // >= 1 => disabled
     float min_p                = 0.0f; // <= 0 => disabled
@@ -32,6 +48,7 @@ struct SamplingConfig {
     float frequency_penalty    = 0.0f;
     unsigned long long seed    = 0;
     std::int32_t* token_counts = nullptr; // device [token_domain] i32, or null
+    SamplingMask mask;                    // null words => unconstrained row
 };
 
 // Caller-owned transient capacity for every parallel sampling-lane count in the inclusive
@@ -46,7 +63,10 @@ struct SamplingConfig {
  * Produces one token id per independent request row. `logits` is contiguous BF16
  * [physical_rows,B], `out` and `logical_positions` are contiguous I32 [B], and only vocabulary
  * rows v in [0,token_domain) participate. `configs` is a device-resident contiguous
- * SamplingConfig[B] array. Greedy and stochastic rows may coexist in one invocation.
+ * SamplingConfig[B] array. Greedy and stochastic rows may coexist in one invocation, and so may
+ * masked and unmasked rows. A non-null configs[b].mask.words excludes the illegal vocabulary rows
+ * (mask position 0) before argmax/top-k and normalization: adjusted_v = -inf for them, and the
+ * candidates that are not finite are dropped before normalization.
  *
  * For row b with configs[b].temperature<=0:
  *
@@ -85,7 +105,9 @@ void sample(const Tensor& logits, Tensor& out, std::int32_t token_domain,
 // when a banned id was drawn samples exactly the distribution without the banned ids, and leaves
 // out untouched otherwise: a row that did not draw a banned id is token-identical. The penalty
 // counts follow the replacement. Each replacement adds one to *replacements when it is non-null
-// (device-visible memory, e.g. mapped pinned host memory).
+// (device-visible memory, e.g. mapped pinned host memory). The redraw keeps the row's token mask:
+// when the banned ids are the only legal tokens it traps like sample() on an empty mask, so a
+// caller must not combine the guard with a mask that can leave only banned ids legal.
 void replace_banned_token(Tensor& logits, Tensor& out, std::int32_t token_domain,
                           const SamplingConfig* configs, const Tensor& logical_positions,
                           std::int32_t banned0, std::int32_t banned1,

@@ -1,6 +1,7 @@
 #include "serve/http_transport.h"
 
 #include "serve/request_validation.h"
+#include "text/json_input.h"
 
 #if defined(__linux__)
 #    include <netinet/tcp.h>
@@ -29,9 +30,19 @@ void set_socket_option(socket_t socket, int level, int option, const T& value) n
 } // namespace
 
 RequestJson parse_json_body(const httplib::Request& request) {
+    // Before the parser: the prompt path reads client JSON recursively (capy-flash).
+    check_request_json_nesting(request.body, {});
+    RequestJson body;
     try {
-        return RequestJson::parse(request.body);
+        body = RequestJson::parse(request.body);
     } catch (const std::exception&) { bad_request("request body is not valid JSON"); }
+    // A body with an output-format schema is read a second time keeping the numeric spellings
+    // (Neroued/ninfer 81c8ce09): a bound such as 1e400 would otherwise reach the grammar compiler
+    // as a different number. Every other body is parsed once, exactly as before.
+    if (has_output_format_schema(body)) {
+        validate_schema_number_input(text::parse_json_numbers(request.body));
+    }
+    return body;
 }
 
 std::optional<std::string> parse_client_label(const httplib::Request& request) {

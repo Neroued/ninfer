@@ -263,7 +263,9 @@ ModelInstance::ModelInstance(std::unique_ptr<models::qwen3_5::Model> source,
            .media_cache_bytes        = options.media_cache_bytes,
            .media_live_bytes         = options.media_live_bytes,
            .media_preprocess_threads = options.media_preprocess_threads,
-           .max_item_vision_tokens = options.max_vision_tokens.value_or(kMaximumMaxVisionTokens)})),
+           .max_item_vision_tokens   = options.max_vision_tokens.value_or(kMaximumMaxVisionTokens),
+           .grammar_cache_bytes      = options.constraint_limits.cache_bytes,
+           .constraint_limits        = options.constraint_limits})),
       capacity(options.max_context) {}
 
 ModelInstance::~ModelInstance() = default;

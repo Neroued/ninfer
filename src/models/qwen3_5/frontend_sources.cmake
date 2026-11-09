@@ -7,4 +7,7 @@ target_sources(ninfer_model_runtime PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/frontend/processor.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/frontend/media_cache.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/frontend/tool_call_parser.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/frontend/output_constraint.cpp"
 )
+# Structured output: request matchers (text/grammar.h, XGrammar).
+target_link_libraries(ninfer_model_runtime PRIVATE ninfer_grammar)

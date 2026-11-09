@@ -62,6 +62,78 @@ int main() {
                           defaults.media_live_bytes == ninfer::kDefaultMediaLiveBytes &&
                           defaults.media_preprocess_threads == 0,
                       "media preparation resource defaults mismatch");
+    failures += check(defaults.max_request_json_depth == 1000 &&
+                          parse({"ninfer-serve", "model.ninfer", "--max-request-json-depth", "64"})
+                                  .max_request_json_depth == 64,
+                      "request JSON depth default or flag mismatch");
+    for (const char* value : {"0", "5001"}) {
+        bool rejected = false;
+        try {
+            (void)parse({"ninfer-serve", "model.ninfer", "--max-request-json-depth", value});
+        } catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, "invalid request JSON depth was accepted");
+    }
+    // Structured output limits (capy-flash): prudent defaults, every flag reaches the options.
+    failures += check(defaults.constraint_limits == ninfer::OutputConstraintLimits{} &&
+                          defaults.constraint_limits.max_bytes == 256U * 1024U &&
+                          defaults.constraint_limits.max_depth == 256 &&
+                          defaults.constraint_limits.compile_timeout_ms == 5000 &&
+                          defaults.constraint_limits.round_budget_ms == 20,
+                      "structured output limit defaults mismatch");
+    const ServeOptions limited = parse({"ninfer-serve",
+                                        "model.ninfer",
+                                        "--constraint-max-kib",
+                                        "64",
+                                        "--constraint-max-depth",
+                                        "32",
+                                        "--constraint-max-items",
+                                        "100",
+                                        "--constraint-compile-timeout-ms",
+                                        "0",
+                                        "--constraint-compile-concurrency",
+                                        "1",
+                                        "--constraint-cache-mib",
+                                        "16",
+                                        "--constraint-round-budget-ms",
+                                        "5",
+                                        "--constraint-request-budget-ms",
+                                        "300",
+                                        "--constraint-round-allowance-ms",
+                                        "1",
+                                        "--constraint-matcher-mib",
+                                        "32",
+                                        "--constraint-compile-wait-ms",
+                                        "700",
+                                        "--constraint-json-strict",
+                                        "off"});
+    failures += check(limited.constraint_limits ==
+                          ninfer::OutputConstraintLimits{.max_bytes           = 64U * 1024U,
+                                                         .max_depth           = 32,
+                                                         .max_items           = 100,
+                                                         .compile_timeout_ms  = 0,
+                                                         .compile_concurrency = 1,
+                                                         .compile_wait_ms     = 700,
+                                                         .cache_bytes         = 16U * 1024U * 1024U,
+                                                         .round_budget_ms     = 5,
+                                                         .request_budget_ms   = 300,
+                                                         .round_allowance_ms  = 1,
+                                                         .matcher_bytes       = 32U * 1024U * 1024U,
+                                                         .json_strict         = false},
+                      "structured output limit flags were not parsed");
+    for (const std::vector<std::string>& bad :
+         {std::vector<std::string>{"--constraint-max-depth", "0"},
+          std::vector<std::string>{"--constraint-max-depth", "1001"},
+          std::vector<std::string>{"--constraint-max-items", "0"},
+          std::vector<std::string>{"--constraint-max-kib", "0"},
+          std::vector<std::string>{"--constraint-cache-mib", "0"}}) {
+        bool rejected = false;
+        try {
+            std::vector<std::string> arguments{"ninfer-serve", "model.ninfer"};
+            arguments.insert(arguments.end(), bad.begin(), bad.end());
+            (void)parse(std::move(arguments));
+        } catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, "invalid structured output limit was accepted");
+    }
     failures += check(defaults.kv_capacity.mode == ninfer::KvCapacityMode::Explicit &&
                           defaults.kv_capacity.explicit_tokens == defaults.max_context,
                       "default KV capacity does not follow max context");
@@ -565,6 +637,13 @@ int main() {
     failures +=
         check(profile_flash.embedding_host,
               "--profile flash-next does not keep the token embedding in host memory (T200)");
+    // A queued request waits up to 10 minutes by default (long prompts are prefilled one at a
+    // time); every profile keeps that default, and the Engine default is the same.
+    const std::uint32_t engine_timeout = ninfer::EngineOptions{}.pending_timeout_ms;
+    failures += check(defaults.pending_timeout_ms == 600000 && engine_timeout == 600000 &&
+                          profile_flash.pending_timeout_ms == 600000 &&
+                          profile_27b.pending_timeout_ms == 600000,
+                      "--pending-timeout-ms is not 600000 by default or a profile changes it");
     // v0.7: both reasoning guards are on by default for every model and every profile.
     failures += check(defaults.reasoning_close_retry && profile_flash.reasoning_close_retry &&
                           profile_27b.reasoning_close_retry &&

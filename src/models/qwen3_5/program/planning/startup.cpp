@@ -319,6 +319,18 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan, int rank_index)
         out.sampling_config = add_tensor(
             builder, DType::I32, {config_words, static_cast<std::int32_t>(plan.max_concurrency)},
             "sampling config");
+        if (rank_index == 0) {
+            // Structured output: one token-mask slot per lane, on the sampling rank only. MTP
+            // verifies K+1 columns; ordinary and DFlash2 rounds (constrained rows draft nothing,
+            // D3) read one.
+            const auto positions = static_cast<std::int32_t>(
+                plan.speculative_backend == SpeculativeBackend::Mtp ? plan.draft_window + 1U : 1U);
+            out.grammar_masks = add_tensor(
+                builder, DType::I32,
+                {dimension((parameters.model.resources().public_token_count + 31U) / 32U),
+                 positions, static_cast<std::int32_t>(plan.max_concurrency)},
+                "structured output token masks");
+        }
     }
     {
         // The Text forward's (Qwen4Forward) persistent inputs; a dense FFN and no PLE leave them

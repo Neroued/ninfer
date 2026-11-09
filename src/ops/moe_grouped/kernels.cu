@@ -18,6 +18,7 @@
 //     slot and only its columns, applies SwiGLU and writes h as NVFP4 with the down divisor;
 //   * down writes one FP32 row per assignment; the merge sums the routes of a token in k order.
 #include "ops/moe_grouped/launch.h"
+#include "ops/moe_grouped/grouped_scan.cuh"
 
 #include "core/device.h" // CUDA_CHECK
 #include "ops/common/math.cuh"
@@ -666,43 +667,6 @@ __global__ void count_kernel(const std::int32_t* __restrict__ ids,
     rank[a] = present ? atomicAdd(&counts[e], 1) : -1;
 }
 
-// One CTA of E threads: expert offsets and the (expert, column tile) work list with its slot.
-__global__ void __launch_bounds__(E)
-    scan_kernel(const std::int32_t* __restrict__ counts, const std::int32_t* __restrict__ table,
-                std::int32_t* __restrict__ offsets, std::int32_t* __restrict__ job_experts,
-                std::int32_t* __restrict__ job_columns, std::int32_t* __restrict__ job_slots,
-                std::int32_t* __restrict__ job_count) {
-    __shared__ std::int32_t scan[E];
-    const int expert = static_cast<int>(threadIdx.x);
-    const int count  = counts[expert];
-    const int jobs   = (count + kMoeGroupedJobColumns - 1) / kMoeGroupedJobColumns;
-    for (int pass = 0; pass < 2; ++pass) {
-        const int own = pass == 0 ? count : jobs;
-        scan[expert]  = own;
-        __syncthreads();
-        for (int offset = 1; offset < E; offset <<= 1) {
-            const int add = expert >= offset ? scan[expert - offset] : 0;
-            __syncthreads();
-            scan[expert] += add;
-            __syncthreads();
-        }
-        const int exclusive = scan[expert] - own;
-        if (pass == 0) {
-            offsets[expert] = exclusive;
-            if (expert == E - 1) { offsets[E] = scan[expert]; }
-        } else {
-            const int slot = jobs > 0 ? table[expert] : -1;
-            for (int job = 0; job < jobs; ++job) {
-                job_experts[exclusive + job] = expert;
-                job_columns[exclusive + job] = job * kMoeGroupedJobColumns;
-                job_slots[exclusive + job]   = slot;
-            }
-            if (expert == E - 1) { *job_count = scan[expert]; }
-        }
-        __syncthreads();
-    }
-}
-
 __global__ void place_kernel(const std::int32_t* __restrict__ ids,
                              const std::int32_t* __restrict__ rank, std::int32_t assignments,
                              const std::int32_t* __restrict__ offsets,
@@ -791,7 +755,7 @@ void group_launch(const std::int32_t* ids, std::int32_t columns, const std::int3
     CUDA_CHECK(cudaMemsetAsync(counts, 0, sizeof(std::int32_t) * E, stream));
     count_kernel<<<blocks, 256, 0, stream>>>(ids, table, slots, assignments, counts, rank);
     CUDA_CHECK(cudaGetLastError());
-    scan_kernel<<<1, E, 0, stream>>>(
+    grouped_scan_kernel<E><<<1, E, 0, stream>>>(
         counts, table, offsets, const_cast<std::int32_t*>(jobs.experts),
         const_cast<std::int32_t*>(jobs.columns), const_cast<std::int32_t*>(jobs.slots),
         const_cast<std::int32_t*>(jobs.count));

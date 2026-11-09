@@ -66,6 +66,9 @@ struct PrefillContext {
     Tensor* peer_rewrite_checkpoint_hidden = nullptr;
     // Text-only suffixes retain the multimodal prefix's position offset across fresh cards.
     std::int32_t rope_delta = 0;
+    // The reasoning EOS guard may redraw the first token; off for a constrained request, whose
+    // mask already forbids EOS while thinking (structured output).
+    bool reasoning_guard = true;
 };
 
 struct OrdinaryBatchContext {

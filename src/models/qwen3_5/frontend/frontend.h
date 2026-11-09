@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string_view>
 #include <vector>
@@ -25,6 +26,11 @@ struct FrontendOptions {
     std::uint32_t media_preprocess_threads = 0;
     // Merged-token ceiling of one image or video item (processor.h limit_item_vision_tokens).
     std::uint32_t max_item_vision_tokens = kMaximumMaxVisionTokens;
+    // Structured output: byte budget of the compiled-grammar cache (frontend/output_constraint.h;
+    // upstream 256 MiB, smaller here for the 64 GB Flash-Next profile whose RAM is mostly pinned).
+    std::size_t grammar_cache_bytes = 64ULL * 1024 * 1024;
+    // capy-flash: compilation deadline/concurrency, matcher budgets and input limits.
+    OutputConstraintLimits constraint_limits;
 };
 
 struct FrontendResources;
@@ -82,8 +88,10 @@ public:
     [[nodiscard]] MediaCacheSummary media_cache_summary() const;
     [[nodiscard]] OutputSession
     make_output_session(const PreparedPrompt& prompt, const StopPolicy& caller_stop,
-                        const OutputOptions& output            = {},
-                        const ThinkingControlOptions& thinking = {}) const;
+                        const OutputOptions& output                       = {},
+                        const ThinkingControlOptions& thinking            = {},
+                        const std::optional<OutputConstraint>& constraint = {},
+                        const ToolChoice& tool_choice                     = {}) const;
     [[nodiscard]] const StopPolicy& default_stop_policy() const noexcept;
     [[nodiscard]] const ModelSamplingDefaults& sampling_defaults() const noexcept;
 

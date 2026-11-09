@@ -94,6 +94,7 @@ PrefillChunkResult prefill_text_chunk(PrefillContext& state, std::span<const Tok
                      state.execution.tp, state.rope_delta);
     configure_text_card(card, state.execution, state.sampling, state.state_source_slot,
                         state.state_destination_slot, state.mtp_proposal_extent);
+    card.set_reasoning_guard(state.reasoning_guard);
     card.set_rewrite_checkpoint_hidden_output(state.rewrite_checkpoint_hidden,
                                               state.peer_rewrite_checkpoint_hidden);
     card.set_prefill_split_frontier(split_frontier ? static_cast<std::int64_t>(*split_frontier)
@@ -126,6 +127,7 @@ PrefillChunkResult prefill_multimodal_chunk(PrefillContext& state, const Prepare
                      state.execution.tp, state.rope_delta);
     configure_text_card(card, state.execution, state.sampling, state.state_source_slot,
                         state.state_destination_slot, state.mtp_proposal_extent);
+    card.set_reasoning_guard(state.reasoning_guard);
     card.set_rewrite_checkpoint_hidden_output(state.rewrite_checkpoint_hidden,
                                               state.peer_rewrite_checkpoint_hidden);
     card.set_prefill_split_frontier(split_frontier ? static_cast<std::int64_t>(*split_frontier)
@@ -1247,6 +1249,17 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
             staged.mtp_bridge = MtpBridgeMode::None;
         }
 
+        // Structured output: the call that samples the first token binds the lane's mask into the
+        // lane's sampling config (the matcher does not move during the prompt) and keeps the
+        // reasoning EOS guard off, so nothing redraws outside the mask.
+        if (row_constrained(0)) {
+            schedule_state.reasoning_guard = false;
+            if (staged.cursor + std::min(prefill_chunk, staged.prompt_tokens - staged.cursor) >=
+                staged.prompt_tokens) {
+                bind_prefill_grammar_mask(sequence, request);
+            }
+        }
+
         if (staged.cursor < staged.prompt_tokens) {
             const std::uint32_t nominal =
                 std::min(prefill_chunk, staged.prompt_tokens - staged.cursor);
@@ -1376,7 +1389,8 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                 schedule_state, sequence.tail_hidden,
                 checked_i32(staged.prompt_tokens, "sample position"), ops::kSamplePurposePrefill,
                 peer_retains_hidden() ? &peer_sample_hidden : nullptr,
-                execution::reasoning_eos_guard_applies(staged.prompt.token_ids));
+                schedule_state.reasoning_guard &&
+                    execution::reasoning_eos_guard_applies(staged.prompt.token_ids));
             set_device_i32(io.rope_pos, checked_i32(staged.prompt_tokens, "rope position") +
                                             sequence.rope_delta);
             if (staged.prepare_mtp) {

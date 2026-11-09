@@ -392,6 +392,8 @@ ProgramImpl::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
             ordinary_host_ingress->state_source_slots[row]      = selectors.source;
             ordinary_host_ingress->state_destination_slots[row] = selectors.destination;
             ordinary_host_ingress->sampling[row]                = request.sampling_host;
+            // Structured output: the row's mask, uploaded before the launch (D2).
+            ordinary_host_ingress->sampling[row].mask = fill_grammar_mask(row, lanes[row], {});
             ensure_sequence_kv_mapped(sequence, frontier + 1, 0);
             if (qwen4_ple_gather) {
                 // Qwen4Exp n-gram embedding of the row's token at `frontier` (its context is the
@@ -693,6 +695,13 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
                         ids[std::min(at, ids.size() - 1)];
                 }
             }
+            // Structured output: masks of the K+1 verified columns from the host drafts of this
+            // round (lookahead, matcher unchanged); columns past an illegal draft carry a safe
+            // nonempty mask. Uploaded before the launch (D2).
+            mtp_host_ingress->sampling[row].mask = fill_grammar_mask(
+                row, lanes[row],
+                std::span<const TokenId>(&mtp_host_ingress->current_drafts[row * draft_window],
+                                         extent));
             if (qwen4_ple_gather) {
                 // Qwen4Exp n-gram rows of the verified window: the anchor, then the drafts (the
                 // padding columns past the extent repeat the anchor and are never committed).
@@ -941,9 +950,13 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
         const std::uint32_t max_by_budget = budgets[row].generated_tokens_remaining > 1
                                                 ? budgets[row].generated_tokens_remaining - 1U
                                                 : 0U;
-        const std::uint32_t extent =
-            std::min({draft_window, max_by_budget, capacity - sequence.execution_frontier - 1U});
-        maximum_frontier = std::max(maximum_frontier, sequence.execution_frontier);
+        // D3: a constrained row drafts nothing (its drafts are born on the device, after the
+        // host masks): an ordinary round for that row, counted as a fallback step.
+        const std::uint32_t extent = row_constrained(row)
+                                         ? 0U
+                                         : std::min({draft_window, max_by_budget,
+                                                     capacity - sequence.execution_frontier - 1U});
+        maximum_frontier           = std::max(maximum_frontier, sequence.execution_frontier);
         maximum_target_tokens =
             std::max(maximum_target_tokens, sequence.execution_frontier + extent + 1U);
     }
@@ -977,7 +990,9 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                                                     ? budgets[row].generated_tokens_remaining - 1U
                                                     : 0U;
             const std::uint32_t extent =
-                std::min({draft_window, max_by_budget, capacity - frontier - 1U});
+                row_constrained(row)
+                    ? 0U
+                    : std::min({draft_window, max_by_budget, capacity - frontier - 1U});
             dflash_host_ingress->anchors[row] = sequence.ledger.back();
             dflash_host_ingress->execution_frontiers[row] =
                 checked_i32(frontier, "DFlash batch frontier");
@@ -998,6 +1013,7 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
             dflash_host_ingress->state_source_slots[row] = selectors.source;
             dflash_host_ingress->state_destination_slots[row] = selectors.destination;
             dflash_host_ingress->sampling[row]                = request.sampling_host;
+            dflash_host_ingress->sampling[row].mask = fill_grammar_mask(row, lanes[row], {});
             ensure_sequence_kv_mapped(sequence, frontier + extent + 1U, 0U);
         }
 

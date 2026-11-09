@@ -229,3 +229,14 @@ official recipe qwen3_8_27b_gsq3 and src/ops/linear/q3/) follows the work of:
     apply the multiplier in FP32 (see the comments in q3_linear.cu).
   * The weights are ISTA-DASLab's Qwen3.8-27B-3Bit-GSQ
     (https://huggingface.co/ISTA-DASLab/Qwen3.8-27B-3Bit-GSQ), imported verbatim.
+
+Constrained decoding: XGrammar
+------------------------------
+third_party/xgrammar/ is the CPU core of XGrammar as adapted and vendored by
+Neroued/ninfer (commit 77c2e5e2); its README.ninfer.md lists the adaptations:
+  * XGrammar Contributors -- https://github.com/mlc-ai/xgrammar
+    (commit 3641b5c2) Copyright (c) 2024 by XGrammar Contributors. Licensed under
+    the Apache License, Version 2.0 (third_party/xgrammar/LICENSE and NOTICE).
+The grammar, JSON Schema, regex and choice front end (src/text/grammar,
+json_schema, schema_composition, schema_types, json_input) and its tests come
+from Neroued/ninfer at the same commit.

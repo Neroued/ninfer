@@ -559,6 +559,8 @@ int main() {
         check(done.at("timings_seconds").at("ttft").get<double>() == outcome.metrics.ttft_seconds,
               "TTFT missing or lost precision");
     failures += check(done.at("speculative").at("backend") == "mtp", "speculative backend missing");
+    failures += check(!done.at("timings_seconds").contains("speculative"),
+                      "speculative must stay a top-level request_done object");
     failures +=
         check(done.at("speculative").at("draft_window") == 3, "speculative draft window missing");
     failures += check(done.at("speculative").at("fallback_steps") == 2,

@@ -8,13 +8,19 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <limits>
+#include <map>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
+
+#include <sys/wait.h>
+#include <unistd.h>
 
 using namespace ninfer;
 using namespace ninfer::test;
@@ -122,6 +128,9 @@ struct SparseAcceptSuite {
     const int kSparseColumns;
     const int kSparseBatch;
     std::size_t observed_workspace = 0;
+    // Optional token masks, [K+1] positions of mask_words per row (upstream 08902f73).
+    std::vector<std::uint32_t> masks;
+    static constexpr int mask_words = (kSparseTokenDomain + 31) / 32;
 
     SparseAcceptSuite(int drafts, int batch)
         : kSparseDrafts(drafts), kSparseColumns(drafts + 1), kSparseBatch(batch) {}
@@ -172,6 +181,11 @@ struct SparseAcceptSuite {
                                                   const std::vector<std::int32_t>& token_counts,
                                                   const std::vector<std::int32_t>& drafts) {
         const auto adjusted = [&](int token) {
+            if (!masks.empty() &&
+                !(masks[(static_cast<std::size_t>(row) * kSparseColumns + column) * mask_words +
+                        token / 32] &
+                  (1u << (token % 32))))
+                return -std::numeric_limits<double>::infinity();
             double value = bf16_to_f32(logits[sparse_logit_index(row, column, token)]);
             int count    = token_counts[static_cast<std::size_t>(row) * kSparseTokenDomain + token];
             for (int previous = 0; previous < column; ++previous) {
@@ -410,6 +424,16 @@ struct SparseAcceptSuite {
             device_configs[static_cast<std::size_t>(row)].token_counts =
                 static_cast<std::int32_t*>(d_token_counts.p) +
                 static_cast<std::size_t>(row) * kSparseTokenDomain;
+        }
+        std::optional<DeviceBuffer> d_masks;
+        if (!masks.empty()) {
+            d_masks.emplace(to_device(masks));
+            for (int row = 0; row < kSparseBatch; ++row) {
+                device_configs[static_cast<std::size_t>(row)].mask = {
+                    static_cast<const std::uint32_t*>(d_masks->p) +
+                        static_cast<std::size_t>(row) * kSparseColumns * mask_words,
+                    mask_words};
+            }
         }
         DeviceBuffer d_configs = to_device(device_configs);
 
@@ -690,6 +714,47 @@ struct SparseAcceptSuite {
         }
         return execute_sparse_accept_case("sparse general K=" + std::to_string(kSparseDrafts) +
                                               " B=" + std::to_string(kSparseBatch),
+                                          targets, logits, drafts, ids, q, extents, lengths,
+                                          anchors, configs, history, {false});
+    }
+
+    // Port of upstream 08902f73 grammar_mask_case: only a=V-2 and b=V-1 are legal at every
+    // column, both far below the illegal 12.0 plateau (x=42 is the raw target of every column).
+    // p(a)=p(b)=.5, q(a)=q(x)=.5: a accepts; the illegal x is rejected (p=0) and corrects to b.
+    int grammar_mask_case() {
+        std::vector<int> targets(kSparseColumns * kSparseBatch, 42),
+            drafts(kSparseDrafts * kSparseBatch),
+            ids(kSparseCandidates * kSparseDrafts * kSparseBatch),
+            extents(kSparseBatch, kSparseDrafts), lengths(kSparseBatch, 70),
+            anchors(kSparseBatch, 0);
+        std::vector<std::uint16_t> logits(static_cast<std::size_t>(kSparsePhysicalRows) *
+                                              kSparseColumns * kSparseBatch,
+                                          f32_to_bf16(12.0f));
+        std::vector<float> q(ids.size(), 0.0f);
+        std::vector<ops::SamplingConfig> configs(kSparseBatch);
+        std::vector<int> history(static_cast<std::size_t>(kSparseTokenDomain) * kSparseBatch, 0);
+        masks.assign(static_cast<std::size_t>(kSparseColumns) * kSparseBatch * mask_words, 0);
+        const int a = kSparseTokenDomain - 2, b = kSparseTokenDomain - 1, x = 42;
+        for (int row = 0; row < kSparseBatch; ++row) {
+            configs[row].temperature = row < kSparseBatch / 2 ? 0.0f : 1.0f;
+            configs[row].seed        = 8123 + row;
+            for (int col = 0; col < kSparseColumns; ++col) {
+                for (int token : {a, b}) {
+                    masks[(static_cast<std::size_t>(row) * kSparseColumns + col) * mask_words +
+                          token / 32] |= 1u << (token % 32);
+                    logits[sparse_logit_index(row, col, token)] = f32_to_bf16(0.0f);
+                }
+                if (col < kSparseDrafts) {
+                    const int base = sparse_candidate_index(row, col, 0);
+                    for (int c = 0; c < 16; ++c) ids[base + c] = c + 100;
+                    ids[base]     = a;
+                    ids[base + 1] = x;
+                    q[base] = q[base + 1]             = 0.5f;
+                    drafts[row * kSparseDrafts + col] = (row + col) % 2 ? x : a;
+                }
+            }
+        }
+        return execute_sparse_accept_case("sparse grammar mask K=" + std::to_string(kSparseDrafts),
                                           targets, logits, drafts, ids, q, extents, lengths,
                                           anchors, configs, history, {false});
     }
@@ -1222,6 +1287,656 @@ int transforms_conformance() {
     return failures;
 }
 
+// ---------------------------------------------------------------------------------------------
+// Token masks in speculative_accept_greedy_drafts (MTP: one-hot greedy drafts). Column i of a
+// masked row reads mask position i. Routes: the single-block kernel with the small builder
+// (domain <= 256), the multi-block partial/group route (domain > 256, K+1 <= 16) and the
+// single-block fast fallback (domain > 256, K+1 > 16).
+
+struct MaskedAcceptBatch {
+    int domain   = 0;
+    int physical = 0;
+    int k        = 0;
+    int batch    = 0;
+    std::vector<float> logits;                     // [physical, K+1, B], BF16-representable
+    std::vector<std::int32_t> targets;             // [K+1, B] raw argmax input of the fast path
+    std::vector<std::int32_t> drafts;              // [K, B]
+    std::vector<std::int32_t> extents;             // [B]
+    std::vector<std::int32_t> lengths;             // [B]
+    std::vector<ops::SamplingConfig> configs;      // [B]; mask and token_counts are bound here
+    std::vector<std::vector<std::uint32_t>> masks; // per row: empty = unmasked, else (K+1)*words
+    std::vector<std::int32_t> counts;              // [domain, B] committed counts, or empty = null
+
+    MaskedAcceptBatch(int token_domain, int physical_rows, int drafts_per_row, int rows)
+        : domain(token_domain), physical(physical_rows), k(drafts_per_row), batch(rows),
+          logits(static_cast<std::size_t>(physical_rows) * (drafts_per_row + 1) * rows, -20.0f),
+          targets(static_cast<std::size_t>(drafts_per_row + 1) * rows, 0),
+          drafts(static_cast<std::size_t>(drafts_per_row) * rows, 0), extents(rows, drafts_per_row),
+          lengths(rows, 500), configs(rows), masks(rows) {}
+
+    int words() const { return (domain + 31) / 32; }
+
+    float& logit(int row, int col, int token) {
+        return logits[(static_cast<std::size_t>(row) * (k + 1) + col) * physical + token];
+    }
+
+    float logit_at(int row, int col, int token) const {
+        return logits[(static_cast<std::size_t>(row) * (k + 1) + col) * physical + token];
+    }
+
+    void set_legal(int row, int col, const std::vector<int>& legal) {
+        auto& mask = masks[static_cast<std::size_t>(row)];
+        if (mask.empty()) { mask.assign(static_cast<std::size_t>(k + 1) * words(), 0u); }
+        auto* position = mask.data() + static_cast<std::size_t>(col) * words();
+        std::fill_n(position, words(), 0u);
+        for (int token : legal) { position[token / 32] |= 1u << (token % 32); }
+    }
+
+    bool legal(int row, int col, int token) const {
+        const auto& mask = masks[static_cast<std::size_t>(row)];
+        if (mask.empty()) { return true; }
+        return (mask[static_cast<std::size_t>(col) * words() + token / 32] >> (token % 32)) & 1u;
+    }
+};
+
+struct MaskedAcceptResult {
+    std::vector<std::int32_t> licensed, counts, accepted, lengths, anchors;
+};
+
+class MaskedAcceptRunner {
+public:
+    explicit MaskedAcceptRunner(const MaskedAcceptBatch& b)
+        : b_(b), logits_bits_(b.logits.size()), configs_(b.configs) {
+        for (std::size_t i = 0; i < b.logits.size(); ++i) {
+            logits_bits_[i] = f32_to_bf16(b.logits[i]);
+        }
+        d_logits_  = to_device(logits_bits_);
+        d_targets_ = to_device(b.targets);
+        d_drafts_  = to_device(b.drafts);
+        d_extents_ = to_device(b.extents);
+        std::vector<std::uint32_t> all;
+        std::vector<std::ptrdiff_t> offsets(static_cast<std::size_t>(b.batch), -1);
+        for (int row = 0; row < b.batch; ++row) {
+            const auto& mask = b.masks[static_cast<std::size_t>(row)];
+            if (mask.empty()) { continue; }
+            offsets[static_cast<std::size_t>(row)] = static_cast<std::ptrdiff_t>(all.size());
+            all.insert(all.end(), mask.begin(), mask.end());
+        }
+        all_masks_ = all;
+        if (!all.empty()) { d_masks_ = to_device(all); }
+        if (!b.counts.empty()) {
+            d_counts_pristine_ = to_device(b.counts);
+            d_counts_          = to_device(b.counts);
+        }
+        for (int row = 0; row < b.batch; ++row) {
+            auto& config = configs_[static_cast<std::size_t>(row)];
+            config.mask  = {};
+            if (offsets[static_cast<std::size_t>(row)] >= 0) {
+                config.mask = {static_cast<const std::uint32_t*>(d_masks_.p) +
+                                   offsets[static_cast<std::size_t>(row)],
+                               b.words()};
+            }
+            config.token_counts = b.counts.empty() ? nullptr
+                                                   : static_cast<std::int32_t*>(d_counts_.p) +
+                                                         static_cast<std::size_t>(row) * b.domain;
+        }
+        d_configs_ = to_device(configs_);
+        d_lengths_ = to_device(b.lengths);
+        d_anchors_ = to_device(std::vector<std::int32_t>(static_cast<std::size_t>(b.batch), -1));
+        d_licensed_ =
+            to_device(std::vector<std::int32_t>(static_cast<std::size_t>(b.k + 1) * b.batch, -9));
+        d_count_out_ = to_device(std::vector<std::int32_t>(static_cast<std::size_t>(b.batch), -9));
+        d_accepted_  = to_device(std::vector<std::int32_t>(static_cast<std::size_t>(b.batch), -9));
+        workspace_bytes_ = ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(
+            b.domain, b.k, b.k, b.batch, b.batch);
+        workspace_.emplace(std::max<std::size_t>(256, workspace_bytes_));
+    }
+
+    // One launch; `seeds` (optional, one per row) replaces the configured seeds.
+    MaskedAcceptResult run(const std::vector<unsigned long long>& seeds = {}) {
+        if (!seeds.empty()) {
+            for (int row = 0; row < b_.batch; ++row) {
+                configs_[static_cast<std::size_t>(row)].seed = seeds[static_cast<std::size_t>(row)];
+            }
+            CUDA_CHECK(cudaMemcpy(d_configs_.p, configs_.data(),
+                                  configs_.size() * sizeof(ops::SamplingConfig),
+                                  cudaMemcpyHostToDevice));
+        }
+        CUDA_CHECK(cudaMemcpy(d_lengths_.p, b_.lengths.data(),
+                              b_.lengths.size() * sizeof(std::int32_t), cudaMemcpyHostToDevice));
+        if (!b_.counts.empty()) {
+            CUDA_CHECK(cudaMemcpy(d_counts_.p, d_counts_pristine_.p, d_counts_.bytes,
+                                  cudaMemcpyDeviceToDevice));
+        }
+        const int cols = b_.k + 1;
+        Tensor targets(d_targets_.p, DType::I32, {cols, b_.batch});
+        Tensor logits(d_logits_.p, DType::BF16, {b_.physical, cols, b_.batch});
+        Tensor drafts(d_drafts_.p, DType::I32, {b_.k, b_.batch});
+        Tensor extents(d_extents_.p, DType::I32, {b_.batch});
+        Tensor lengths(d_lengths_.p, DType::I32, {b_.batch});
+        Tensor anchors(d_anchors_.p, DType::I32, {b_.batch});
+        Tensor licensed(d_licensed_.p, DType::I32, {cols, b_.batch});
+        Tensor counts(d_count_out_.p, DType::I32, {b_.batch});
+        Tensor accepted(d_accepted_.p, DType::I32, {b_.batch});
+        ops::speculative_accept_greedy_drafts(
+            targets, logits, drafts, extents, lengths, anchors, licensed, counts, accepted,
+            b_.domain, static_cast<const ops::SamplingConfig*>(d_configs_.p), *workspace_, nullptr);
+        cuda_synchronize();
+        MaskedAcceptResult out;
+        out.licensed =
+            from_device<std::int32_t>(d_licensed_, static_cast<std::size_t>(cols) * b_.batch);
+        out.counts   = from_device<std::int32_t>(d_count_out_, b_.batch);
+        out.accepted = from_device<std::int32_t>(d_accepted_, b_.batch);
+        out.lengths  = from_device<std::int32_t>(d_lengths_, b_.batch);
+        out.anchors  = from_device<std::int32_t>(d_anchors_, b_.batch);
+        return out;
+    }
+
+    // Read-only operands must be untouched and the workspace query must match the launch.
+    int integrity(const std::string& label) const {
+        int failures =
+            verify_exact((label + " logits read-only").c_str(),
+                         from_device<std::uint16_t>(d_logits_, logits_bits_.size()), logits_bits_);
+        failures +=
+            verify_exact((label + " targets read-only").c_str(),
+                         from_device<std::int32_t>(d_targets_, b_.targets.size()), b_.targets);
+        failures += verify_exact((label + " drafts read-only").c_str(),
+                                 from_device<std::int32_t>(d_drafts_, b_.drafts.size()), b_.drafts);
+        if (!all_masks_.empty()) {
+            failures +=
+                verify_exact((label + " masks read-only").c_str(),
+                             from_device<std::uint32_t>(d_masks_, all_masks_.size()), all_masks_);
+        }
+        if (workspace_->used() != 0 || workspace_->peak_used() != workspace_bytes_) {
+            std::cerr << label << ": workspace query/execution high-water mismatch\n";
+            ++failures;
+        }
+        return failures;
+    }
+
+private:
+    const MaskedAcceptBatch& b_;
+    std::vector<std::uint16_t> logits_bits_;
+    std::vector<ops::SamplingConfig> configs_;
+    std::vector<std::uint32_t> all_masks_;
+    DeviceBuffer d_logits_, d_targets_, d_drafts_, d_extents_, d_masks_, d_counts_pristine_,
+        d_counts_, d_configs_, d_lengths_, d_anchors_, d_licensed_, d_count_out_, d_accepted_;
+    std::size_t workspace_bytes_ = 0;
+    std::optional<WorkspaceArena> workspace_;
+};
+
+// FP64 target distribution of verification column `col` of `row`: legal tokens only, committed
+// counts plus the round overlay drafts[0..col-1], penalties, top-k (cap 20), min-p, top-p and
+// renormalization; a greedy row is the point mass on the penalty-adjusted legal argmax.
+std::vector<std::pair<int, double>> masked_column_distribution(const MaskedAcceptBatch& b, int row,
+                                                               int col) {
+    const auto& config = b.configs[static_cast<std::size_t>(row)];
+    std::vector<std::pair<double, int>> ranked;
+    for (int token = 0; token < b.domain; ++token) {
+        if (!b.legal(row, col, token)) { continue; }
+        int count =
+            b.counts.empty() ? 0 : b.counts[static_cast<std::size_t>(row) * b.domain + token];
+        for (int previous = 0; previous < col; ++previous) {
+            if (b.drafts[static_cast<std::size_t>(row) * b.k + previous] == token) { ++count; }
+        }
+        double value = static_cast<double>(b.logit_at(row, col, token));
+        if (count > 0) { value -= static_cast<double>(config.presence_penalty); }
+        value -= static_cast<double>(config.frequency_penalty) * static_cast<double>(count);
+        ranked.emplace_back(value, token);
+    }
+    if (ranked.empty()) { throw std::runtime_error("masked oracle: empty mask at a used column"); }
+    const auto better = [](const auto& lhs, const auto& rhs) {
+        return lhs.first > rhs.first || (lhs.first == rhs.first && lhs.second < rhs.second);
+    };
+    std::sort(ranked.begin(), ranked.end(), better);
+    if (!(config.temperature > 0.0f)) { return {{ranked.front().second, 1.0}}; }
+    int cap = kTargetCandidateCap;
+    if (config.top_k > 0 && config.top_k < cap) { cap = config.top_k; }
+    cap = std::min(cap, static_cast<int>(ranked.size()));
+    std::vector<double> weights(static_cast<std::size_t>(cap));
+    double total = 0.0;
+    for (int j = 0; j < cap; ++j) {
+        weights[static_cast<std::size_t>(j)] =
+            std::exp((ranked[static_cast<std::size_t>(j)].first - ranked.front().first) /
+                     static_cast<double>(config.temperature));
+        total += weights[static_cast<std::size_t>(j)];
+    }
+    const double min_weight = config.min_p > 0.0f ? config.min_p * weights.front() : -1.0;
+    double cumulative       = 0.0;
+    int support             = 0;
+    for (int j = 0; j < cap; ++j) {
+        if (min_weight >= 0.0 && weights[static_cast<std::size_t>(j)] < min_weight) { break; }
+        cumulative += weights[static_cast<std::size_t>(j)];
+        support = j + 1;
+        if (config.top_p < 1.0f && cumulative >= config.top_p * total) { break; }
+    }
+    support     = std::max(support, 1);
+    double kept = 0.0;
+    for (int j = 0; j < support; ++j) { kept += weights[static_cast<std::size_t>(j)]; }
+    std::vector<std::pair<int, double>> out;
+    for (int j = 0; j < support; ++j) {
+        out.emplace_back(ranked[static_cast<std::size_t>(j)].second,
+                         weights[static_cast<std::size_t>(j)] / kept);
+    }
+    return out;
+}
+
+// Exact law of (accepted count A, terminal token) for one row. With one-hot drafts the rejection
+// test accepts draft d_i with p_i(d_i) and corrects from p_i without d_i, so
+// P(A=j, t) = prod_{i<j} p_i(d_i) * p_j(t) [t != d_j] for j < extent, and the bonus column
+// gives P(A=extent, t) = prod_{i<extent} p_i(d_i) * p_extent(t). An illegal draft has p=0.
+std::map<std::pair<int, int>, double> masked_accept_law(const MaskedAcceptBatch& b, int row) {
+    const int extent = std::clamp(b.extents[static_cast<std::size_t>(row)], 0, b.k);
+    std::map<std::pair<int, int>, double> law;
+    double prefix = 1.0;
+    for (int j = 0; j <= extent && prefix > 0.0; ++j) {
+        const auto distribution = masked_column_distribution(b, row, j);
+        const int draft = j < extent ? b.drafts[static_cast<std::size_t>(row) * b.k + j] : -1;
+        double p_draft  = 0.0;
+        for (const auto& [token, p] : distribution) {
+            if (token == draft) {
+                p_draft = p;
+                continue;
+            }
+            if (p > 0.0) { law[{j, token}] += prefix * p; }
+        }
+        prefix *= p_draft;
+    }
+    return law;
+}
+
+// Checks the full effect of one row against a point-mass law (deterministic fixtures).
+int verify_masked_row(const std::string& label, const MaskedAcceptBatch& b,
+                      const MaskedAcceptResult& got, int row) {
+    const auto law = masked_accept_law(b, row);
+    if (law.size() != 1 || std::abs(law.begin()->second - 1.0) > 1e-12) {
+        std::cerr << label << ": fixture row " << row << " is not deterministic\n";
+        return 1;
+    }
+    const auto [accepted_count, terminal] = law.begin()->first;
+    const int cols                        = b.k + 1;
+    std::vector<std::int32_t> licensed(static_cast<std::size_t>(cols), 0);
+    for (int i = 0; i < accepted_count; ++i) {
+        licensed[static_cast<std::size_t>(i)] = b.drafts[static_cast<std::size_t>(row) * b.k + i];
+    }
+    licensed[static_cast<std::size_t>(accepted_count)] = terminal;
+    const std::string row_label                        = label + " row " + std::to_string(row);
+    int failures =
+        verify_exact((row_label + " licensed").c_str(),
+                     std::vector<std::int32_t>(
+                         got.licensed.begin() + static_cast<std::ptrdiff_t>(row) * cols,
+                         got.licensed.begin() + static_cast<std::ptrdiff_t>(row + 1) * cols),
+                     licensed);
+    failures += verify_exact<std::int32_t>((row_label + " count").c_str(),
+                                           {got.counts[static_cast<std::size_t>(row)]},
+                                           {accepted_count + 1});
+    failures +=
+        verify_exact<std::int32_t>((row_label + " accepted").c_str(),
+                                   {got.accepted[static_cast<std::size_t>(row)]}, {accepted_count});
+    failures += verify_exact<std::int32_t>(
+        (row_label + " length").c_str(), {got.lengths[static_cast<std::size_t>(row)]},
+        {b.lengths[static_cast<std::size_t>(row)] + accepted_count + 1});
+    failures += verify_exact<std::int32_t>(
+        (row_label + " anchor").c_str(), {got.anchors[static_cast<std::size_t>(row)]}, {terminal});
+    return failures;
+}
+
+struct AcceptRoute {
+    int domain;
+    int physical;
+    int k;
+};
+
+// Small builder, multi-block (the MTP production shape: 248077 public ids, K=3), fast fallback.
+constexpr AcceptRoute kAcceptRoutes[] = {{64, 64, 3},         {64, 66, 5},         {257, 257, 3},
+                                         {248077, 248320, 3}, {248077, 248320, 5}, {257, 259, 16}};
+
+std::string accept_label(const char* what, const AcceptRoute& route, float temperature) {
+    return std::string(what) + " domain=" + std::to_string(route.domain) +
+           " K=" + std::to_string(route.k) + " T=" + std::to_string(temperature);
+}
+
+// Upstream 08902f73 grammar_onehot_case: one legal token per column, the legal drafts of
+// columns 0 and 1 accepted, the draft of column 2 illegal, so column 2's only legal token is the
+// correction, whatever its logit (-2 against a 12.0 illegal plateau).
+int masked_onehot_case(const AcceptRoute& route, float temperature) {
+    MaskedAcceptBatch b(route.domain, route.physical, route.k, 1);
+    std::fill(b.logits.begin(), b.logits.end(), 12.0f);
+    for (int col = 0; col <= route.k; ++col) {
+        const int allowed = col < 2 ? 11 + col : 51;
+        if (col < route.k) { b.drafts[static_cast<std::size_t>(col)] = 11 + col; }
+        b.set_legal(0, col, {allowed});
+        b.logit(0, col, allowed) = -2.0f;
+    }
+    b.configs[0].temperature = temperature;
+    b.configs[0].seed        = 73;
+    b.lengths[0]             = 73;
+    MaskedAcceptRunner runner(b);
+    const std::string label = accept_label("masked one-hot", route, temperature);
+    const auto result       = runner.run();
+    return verify_masked_row(label, b, result, 0) + runner.integrity(label);
+}
+
+// An illegal draft is rejected at every position j (the oracle law is a point mass because each
+// column has one legal token), and with every draft legal the bonus comes from column K's mask.
+// Columns after the rejection carry the safe filler {0}; masks of columns past the extent are
+// left empty and must not be read. Greedy rows also get raw targets that are illegal and would
+// be accepted by the unconstrained fast path.
+int masked_reject_every_position_case(const AcceptRoute& route, float temperature) {
+    int failures = 0;
+    for (int reject = 0; reject <= route.k; ++reject) {
+        for (const bool short_extent : {false, true}) {
+            if (short_extent && reject + 1 >= route.k) { continue; }
+            MaskedAcceptBatch b(route.domain, route.physical, route.k, 1);
+            const int extent         = short_extent ? reject + 1 : route.k;
+            b.extents[0]             = extent;
+            b.lengths[0]             = 1000 + reject;
+            b.configs[0].temperature = temperature;
+            b.configs[0].top_k       = 20;
+            b.configs[0].seed        = 4242 + reject;
+            for (int col = 0; col <= route.k; ++col) {
+                const int draft = 20 + 3 * col; // distinct ids below 64
+                if (col < route.k) { b.drafts[static_cast<std::size_t>(col)] = draft; }
+                b.targets[static_cast<std::size_t>(col)] = draft; // raw argmax = the draft
+                b.logit(0, col, draft)                   = 15.0f;
+                b.logit(0, col, draft + 1)               = -5.0f;
+                if (col > extent) { continue; } // never consumed: mask stays all-zero
+                if (col < reject) {
+                    b.set_legal(0, col, {draft});
+                } else if (col == reject) {
+                    b.set_legal(0, col, {draft + 1}); // the draft (if any) is illegal here
+                } else {
+                    b.set_legal(0, col, {0}); // safe filler after the rejection
+                }
+            }
+            MaskedAcceptRunner runner(b);
+            const std::string label = accept_label("masked reject", route, temperature) +
+                                      " at=" + std::to_string(reject) +
+                                      " extent=" + std::to_string(extent);
+            const auto result = runner.run();
+            failures += verify_masked_row(label, b, result, 0) + runner.integrity(label);
+        }
+    }
+    return failures;
+}
+
+// Rows 0 and 2 masked, rows 1 and 3 not, greedy and stochastic, with penalties: unmasked rows
+// equal an all-unmasked launch exactly, masked rows equal their solo launch.
+int masked_mixed_batch_case(const AcceptRoute& route) {
+    constexpr int batch = 4;
+    MaskedAcceptBatch b(route.domain, route.physical, route.k, batch);
+    b.counts.assign(static_cast<std::size_t>(route.domain) * batch, 0);
+    for (int row = 0; row < batch; ++row) {
+        auto& config                             = b.configs[static_cast<std::size_t>(row)];
+        config.temperature                       = row < 2 ? 0.9f : 0.0f;
+        config.top_k                             = 8;
+        config.presence_penalty                  = row == 1 || row == 2 ? 0.5f : 0.0f;
+        config.seed                              = 900 + row;
+        b.lengths[static_cast<std::size_t>(row)] = 3000 + 17 * row;
+        for (int col = 0; col <= route.k; ++col) {
+            for (int token = 0; token < 40; ++token) {
+                b.logit(row, col, token) =
+                    static_cast<float>((token * 7 + col * 5 + row * 3) % 16) * 0.25f;
+            }
+            if (col < route.k) {
+                const int draft                                         = (col * 11 + row) % 40;
+                b.drafts[static_cast<std::size_t>(row) * route.k + col] = draft;
+                b.targets[static_cast<std::size_t>(row) * (route.k + 1) + col] = draft;
+            }
+        }
+        b.counts[static_cast<std::size_t>(row) * route.domain + 7] = 2;
+    }
+    for (int row : {0, 2}) {
+        for (int col = 0; col <= route.k; ++col) {
+            std::vector<int> legal;
+            for (int token = col % 2; token < 40; token += 2) { legal.push_back(token); }
+            b.set_legal(row, col, legal);
+        }
+    }
+    MaskedAcceptBatch plain = b;
+    for (auto& mask : plain.masks) { mask.clear(); }
+    MaskedAcceptRunner mixed_runner(b), plain_runner(plain);
+    const auto mixed        = mixed_runner.run();
+    const auto unmask       = plain_runner.run();
+    const std::string label = "masked mixed batch domain=" + std::to_string(route.domain) +
+                              " K=" + std::to_string(route.k);
+    int failures         = mixed_runner.integrity(label) + plain_runner.integrity(label + " plain");
+    const int cols       = route.k + 1;
+    const auto row_slice = [&](const std::vector<std::int32_t>& v, int row) {
+        return std::vector<std::int32_t>(v.begin() + static_cast<std::ptrdiff_t>(row) * cols,
+                                         v.begin() + static_cast<std::ptrdiff_t>(row + 1) * cols);
+    };
+    for (int row : {1, 3}) {
+        const std::string row_label = label + " unmasked row " + std::to_string(row);
+        failures += verify_exact((row_label + " licensed").c_str(), row_slice(mixed.licensed, row),
+                                 row_slice(unmask.licensed, row));
+        failures += verify_exact<std::int32_t>((row_label + " accepted").c_str(),
+                                               {mixed.accepted[static_cast<std::size_t>(row)]},
+                                               {unmask.accepted[static_cast<std::size_t>(row)]});
+    }
+    for (int row : {0, 2}) {
+        MaskedAcceptBatch solo(route.domain, route.physical, route.k, 1);
+        const auto r = static_cast<std::size_t>(row);
+        std::copy_n(b.logits.begin() + static_cast<std::ptrdiff_t>(row) * cols * route.physical,
+                    static_cast<std::size_t>(cols) * route.physical, solo.logits.begin());
+        std::copy_n(b.targets.begin() + static_cast<std::ptrdiff_t>(row) * cols, cols,
+                    solo.targets.begin());
+        std::copy_n(b.drafts.begin() + static_cast<std::ptrdiff_t>(row) * route.k, route.k,
+                    solo.drafts.begin());
+        solo.extents[0] = b.extents[r];
+        solo.lengths[0] = b.lengths[r];
+        solo.configs[0] = b.configs[r];
+        solo.masks[0]   = b.masks[r];
+        solo.counts.assign(b.counts.begin() + static_cast<std::ptrdiff_t>(row) * route.domain,
+                           b.counts.begin() + static_cast<std::ptrdiff_t>(row + 1) * route.domain);
+        MaskedAcceptRunner solo_runner(solo);
+        const auto alone            = solo_runner.run();
+        const std::string row_label = label + " masked row " + std::to_string(row);
+        failures += verify_exact((row_label + " licensed").c_str(), row_slice(mixed.licensed, row),
+                                 alone.licensed);
+        const int accepted = mixed.accepted[r];
+        for (int i = 0; i <= accepted; ++i) {
+            const int token = mixed.licensed[r * cols + static_cast<std::size_t>(i)];
+            if (!b.legal(row, i, token)) {
+                std::cerr << row_label << ": illegal token " << token << " at column " << i << '\n';
+                ++failures;
+            }
+        }
+        if (b.configs[r].temperature == 0.0f) {
+            failures += verify_masked_row(label, b, mixed, row);
+        }
+    }
+    return failures;
+}
+
+// Mask + penalties (committed counts and the round overlay) + top-k/top-p/min-p against the FP64
+// law of (A, terminal) over many seeds. Two draft patterns: A has every draft legal (bonus
+// reachable), B has an illegal draft at column 2.
+int masked_accept_distribution_case(const AcceptRoute& route, bool illegal_draft) {
+    constexpr int batch  = 8;
+    constexpr int ranked = 12;
+    MaskedAcceptBatch b(route.domain, route.physical, route.k, batch);
+    b.counts.assign(static_cast<std::size_t>(route.domain) * batch, 0);
+    const int spacing   = std::max(1, (route.domain - 4) / ranked);
+    const auto token_of = [&](int j) { return 2 + j * spacing; };
+    for (int row = 0; row < batch; ++row) {
+        auto& config                             = b.configs[static_cast<std::size_t>(row)];
+        config.temperature                       = 0.8f;
+        config.top_k                             = 6;
+        config.top_p                             = 0.97f;
+        config.min_p                             = 0.01f;
+        config.presence_penalty                  = 0.5f;
+        config.frequency_penalty                 = 0.25f;
+        b.lengths[static_cast<std::size_t>(row)] = 777;
+        b.counts[static_cast<std::size_t>(row) * route.domain + token_of(2)] = 1;
+        for (int col = 0; col <= route.k; ++col) {
+            std::vector<int> legal;
+            for (int j = 0; j < ranked; ++j) {
+                const int rank                 = (j + col) % ranked;
+                b.logit(row, col, token_of(j)) = 3.0f - 0.25f * static_cast<float>(rank);
+                if (rank % 3 != 0) { legal.push_back(token_of(j)); }
+            }
+            for (int token = 1; token < route.domain; token += 5) {
+                if ((token - 2) % spacing != 0 || token > token_of(ranked - 1)) {
+                    legal.push_back(token);
+                }
+            }
+            b.set_legal(row, col, legal);
+            if (col < route.k) {
+                // Pattern A: the best legal token of the column (rank 1). Pattern B: the
+                // second-best legal at column 1 and an illegal rank-0 token at column 2.
+                int rank = 1;
+                if (illegal_draft && col == 1) { rank = 2; }
+                if (illegal_draft && col == 2) { rank = 0; }
+                const int j = ((rank - col) % ranked + ranked) % ranked;
+                b.drafts[static_cast<std::size_t>(row) * route.k + col] = token_of(j);
+            }
+        }
+    }
+    std::map<std::pair<int, int>, double> law = masked_accept_law(b, 0);
+    MaskedAcceptRunner runner(b);
+    std::map<std::pair<int, int>, int> observed;
+    const int launches      = 4096 / batch;
+    int failures            = 0;
+    const std::string label = std::string("masked accept law ") + (illegal_draft ? "B" : "A") +
+                              " domain=" + std::to_string(route.domain) +
+                              " K=" + std::to_string(route.k);
+    for (int launch = 0; launch < launches; ++launch) {
+        std::vector<unsigned long long> seeds(batch);
+        for (int row = 0; row < batch; ++row) {
+            seeds[static_cast<std::size_t>(row)] = 0x51ed0000ull + launch * batch + row;
+        }
+        const auto result = runner.run(seeds);
+        for (int row = 0; row < batch; ++row) {
+            const auto r = static_cast<std::size_t>(row);
+            const int a  = result.accepted[r];
+            const int t  = result.licensed[r * (route.k + 1) + static_cast<std::size_t>(a)];
+            if (result.anchors[r] != t || result.counts[r] != a + 1 ||
+                result.lengths[r] != b.lengths[r] + a + 1) {
+                std::cerr << label << ": inconsistent row state\n";
+                ++failures;
+            }
+            ++observed[{a, t}];
+        }
+    }
+    failures += runner.integrity(label);
+    const double n = static_cast<double>(launches * batch);
+    double max_z   = 0.0;
+    for (const auto& [outcome, count] : observed) {
+        if (law.find(outcome) == law.end()) {
+            std::cerr << label << ": outcome A=" << outcome.first << " t=" << outcome.second
+                      << " has zero probability\n";
+            ++failures;
+        }
+    }
+    for (const auto& [outcome, probability] : law) {
+        const auto it          = observed.find(outcome);
+        const double frequency = it == observed.end() ? 0.0 : it->second / n;
+        const double sigma     = std::sqrt(probability * (1.0 - probability) / n);
+        const double gap       = std::abs(frequency - probability);
+        if (gap > 7.0 * sigma + 2.0 / n) {
+            std::cerr << label << ": A=" << outcome.first << " t=" << outcome.second
+                      << " frequency=" << frequency << " law=" << probability << '\n';
+            ++failures;
+        }
+        if (sigma > 0.0) { max_z = std::max(max_z, gap / sigma); }
+    }
+    if (!illegal_draft) {
+        bool bonus = false;
+        for (const auto& [outcome, probability] : law) bonus |= outcome.first == route.k;
+        if (!bonus) {
+            std::cerr << label << ": pattern A cannot reach the bonus column\n";
+            ++failures;
+        }
+    } else {
+        for (const auto& [outcome, probability] : law) {
+            if (outcome.first > 2) {
+                std::cerr << label << ": accepted past the illegal draft\n";
+                ++failures;
+            }
+        }
+    }
+    std::cout << "    " << label << " FP64 law match over " << law.size()
+              << " outcomes (max z=" << max_z << ")\n";
+    return failures;
+}
+
+// Empty mask at column 0 (always consumed) must trap, in a child process (the trap poisons
+// the CUDA context).
+int run_accept_trap_case(std::string_view name) {
+    AcceptRoute route{64, 64, 3};
+    float temperature = 0.0f;
+    if (name == "accept-greedy-small") {
+    } else if (name == "accept-stochastic-small") {
+        temperature = 1.0f;
+    } else if (name == "accept-greedy-multiblock") {
+        route = {248077, 248320, 3};
+    } else if (name == "accept-stochastic-multiblock") {
+        route       = {248077, 248320, 3};
+        temperature = 1.0f;
+    } else if (name == "accept-greedy-fast") {
+        route = {257, 257, 16};
+    } else if (name == "accept-stochastic-fast") {
+        route       = {257, 257, 16};
+        temperature = 1.0f;
+    } else {
+        std::cerr << "unknown trap case " << name << '\n';
+        return 2;
+    }
+    MaskedAcceptBatch b(route.domain, route.physical, route.k, 2);
+    for (int row = 0; row < 2; ++row) {
+        b.configs[static_cast<std::size_t>(row)].temperature = temperature;
+    }
+    for (int col = 0; col <= route.k; ++col) b.set_legal(1, col, {});
+    MaskedAcceptRunner runner(b);
+    try {
+        (void)runner.run();
+    } catch (const std::exception& error) {
+        std::cout << "trap case " << name << ": " << error.what() << std::endl;
+        // Skip the destructors: freeing on a trapped context only prints cleanup errors.
+        std::_Exit(0);
+    }
+    std::cout << "trap case " << name << ": no error\n";
+    return 3;
+}
+
+// Absolute path of this test binary (for re-running it as a child: inside std::system the
+// /proc/self/exe link names the shell).
+std::string self_executable() {
+    char path[4096];
+    const ssize_t n = readlink("/proc/self/exe", path, sizeof(path) - 1);
+    if (n <= 0) { throw std::runtime_error("cannot resolve /proc/self/exe"); }
+    path[n] = '\0';
+    return path;
+}
+
+int masked_accept_suite() {
+    int failures = 0;
+    for (const AcceptRoute& route : kAcceptRoutes) {
+        for (const float temperature : {0.0f, 1.0f}) {
+            failures += masked_onehot_case(route, temperature);
+            failures += masked_reject_every_position_case(route, temperature);
+        }
+        failures += masked_mixed_batch_case(route);
+    }
+    for (const AcceptRoute& route : {AcceptRoute{64, 64, 3}, AcceptRoute{257, 257, 3},
+                                     AcceptRoute{248077, 248320, 3}, AcceptRoute{257, 257, 16}}) {
+        failures += masked_accept_distribution_case(route, false);
+        failures += masked_accept_distribution_case(route, true);
+    }
+    for (const char* name :
+         {"accept-greedy-small", "accept-stochastic-small", "accept-greedy-multiblock",
+          "accept-stochastic-multiblock", "accept-greedy-fast", "accept-stochastic-fast"}) {
+        const std::string command = "\"" + self_executable() + "\" --trap-case " + name;
+        const int status          = std::system(command.c_str());
+        if (status == -1 || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+            std::cerr << "empty mask " << name << " did not trap (status " << status << ")\n";
+            ++failures;
+        }
+    }
+    return failures;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -1230,8 +1945,12 @@ int main(int argc, char** argv) {
         return 77;
     }
 
+    if (argc == 3 && std::string_view(argv[1]) == "--trap-case") {
+        return run_accept_trap_case(argv[2]);
+    }
     if (argc > 2 || (argc == 2 && std::string_view(argv[1]) != "--transforms-only")) {
-        std::cerr << "usage: ninfer_speculative_round_test [--transforms-only]\n";
+        std::cerr
+            << "usage: ninfer_speculative_round_test [--transforms-only | --trap-case NAME]\n";
         return 2;
     }
     int failures = transforms_conformance();
@@ -1292,10 +2011,12 @@ int main(int argc, char** argv) {
     for (int k : {1, 7, 15}) {
         SparseAcceptSuite suite(k, 8);
         failures += suite.sparse_general_mixed_case();
+        failures += SparseAcceptSuite(k, 8).grammar_mask_case();
         failures += suite.sparse_greedy_direct_case(0, true);
         failures += SparseAcceptSuite(k, 1).repeated_history_case(false);
         failures += SparseAcceptSuite(k, 1).repeated_history_case(true);
     }
+    failures += masked_accept_suite();
 
     if (failures != 0) {
         std::cerr << "speculative_round failures=" << failures << '\n';

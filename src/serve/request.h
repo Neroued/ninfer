@@ -194,6 +194,12 @@ struct GenerationRequest {
     ninfer::PromptContinuationMode continuation = ninfer::PromptContinuationMode::NewAssistantTurn;
     bool allow_engine_automatic_shared_prefixes = true;
     SamplingParams sampling;
+    // Structured output (constrained decoding): at most one per request. constraint_param is the
+    // wire field it came from ("response_format.json_schema.schema", "text.format.schema",
+    // "output_config.format.schema", "structured_outputs.<kind>"); schema compiler errors append
+    // their JSON Pointer to it. Unset = unconstrained request, translated exactly as before.
+    std::optional<ninfer::OutputConstraint> constraint;
+    std::string constraint_param;
 
     [[nodiscard]] bool uses_tools() const noexcept {
         return !tools.empty() && tool_choice.mode != ToolChoiceMode::None;

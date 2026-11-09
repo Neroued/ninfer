@@ -131,19 +131,6 @@ void validate_standard_output_controls(const Json& body) {
         }
     }
 
-    if (body.contains("response_format") && !body.at("response_format").is_null()) {
-        const Json& format = body.at("response_format");
-        if (!format.is_object() || !format.contains("type") || !format.at("type").is_string()) {
-            bad_request("response_format must contain a string type", "response_format");
-        }
-        if (format.at("type").get<std::string>() != "text") {
-            bad_request(
-                "this response_format requires constrained output, which NInfer cannot guarantee; "
-                "only {\"type\":\"text\"} is available",
-                "response_format", "response_format_not_supported");
-        }
-    }
-
     if (body.contains("modalities") && !body.at("modalities").is_null()) {
         const Json& modalities = body.at("modalities");
         if (!modalities.is_array() || modalities.empty()) {
@@ -198,26 +185,6 @@ void validate_standard_output_controls(const Json& body) {
                 "provide",
                 "store", "store_not_supported");
         }
-    }
-}
-
-void validate_constrained_decoding_extensions(const Json& body) {
-    // llama.cpp exposes grammar; vLLM uses structured_outputs and previously exposed the
-    // guided_* spellings. Each promises constrained generation rather than an advisory hint.
-    static constexpr const char* fields[] = {
-        "grammar",      "structured_outputs", "guided_json",
-        "guided_regex", "guided_choice",      "guided_grammar",
-    };
-    for (const char* field : fields) {
-        if (!body.contains(field) || body.at(field).is_null()) { continue; }
-        const Json& value = body.at(field);
-        if (std::string_view(field) == "grammar" && value.is_string() &&
-            value.get_ref<const std::string&>().empty()) {
-            continue;
-        }
-        bad_request(std::string(field) +
-                        " requests constrained decoding, which NInfer does not provide",
-                    field, "constrained_decoding_not_supported");
     }
 }
 
@@ -385,6 +352,8 @@ std::vector<ToolCall> parse_assistant_tool_calls(const Json& message, std::size_
         if (!function.contains("arguments") || !function.at("arguments").is_string()) {
             bad_request("function tool_calls must contain string arguments", "messages");
         }
+        check_request_json_nesting(function.at("arguments").get_ref<const std::string&>(),
+                                   "messages");
         calls.push_back(ToolCall{.id             = value.at("id").get<std::string>(),
                                  .name           = require_function_name(function, "messages"),
                                  .arguments_json = function.at("arguments").get<std::string>()});
@@ -406,6 +375,7 @@ std::optional<ToolCall> parse_legacy_assistant_function_call(const Json& message
     if (!call.contains("arguments") || !call.at("arguments").is_string()) {
         bad_request("assistant function_call must contain string arguments", "messages");
     }
+    check_request_json_nesting(call.at("arguments").get_ref<const std::string&>(), "messages");
     return ToolCall{.id             = {},
                     .name           = require_function_name(call, "messages"),
                     .arguments_json = call.at("arguments").get<std::string>()};
@@ -884,7 +854,6 @@ void parse_output_limit(const Json& body, const RequestLimits& limits, OpenAICha
 OpenAIChatRequest parse_chat_completion_request(const Json& body, const RequestLimits& limits) {
     require_object(body, "request body must be a JSON object");
     validate_standard_output_controls(body);
-    validate_constrained_decoding_extensions(body);
     validate_compatibility_hints(body);
 
     OpenAIChatRequest output;
@@ -910,6 +879,14 @@ OpenAIChatRequest parse_chat_completion_request(const Json& body, const RequestL
     output.generation.enable_thinking           = template_options.enable_thinking;
     output.generation.preserve_thinking         = template_options.preserve_thinking;
     output.generation.chat_template_kwargs_json = template_options.kwargs_json;
+    // Structured output (Neroued/ninfer eb6696ae, 8ffa3131): response_format text/json_object/
+    // json_schema and the structured_outputs extension, after tools and stops so that the
+    // combination rules see the whole request.
+    if (body.contains("response_format") && !body.at("response_format").is_null()) {
+        parse_json_output_format(body.at("response_format"), output.generation, "response_format",
+                                 JsonFormatProtocol::Chat);
+    }
+    parse_structured_outputs(body, output.generation);
     apply_openai_prompt_cache_policy(output.generation, cache_policy);
     return output;
 }

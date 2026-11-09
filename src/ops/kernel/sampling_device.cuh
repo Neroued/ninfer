@@ -244,9 +244,18 @@ __device__ __forceinline__ int sampling_dist_offset(int col, int j) {
 // the penalty at each column sees the same prefix a per-token sampler would.
 // Non-speculative callers pass no overlay. The scan is bounded by k and
 // only runs when penalties are active, so it is free on the no-penalty path.
+// overlay_len is also the verification column, hence the token-mask position: an illegal token
+// of a masked row is -inf before any penalty (sample() passes no overlay and reads position 0).
+__device__ __forceinline__ bool sampling_token_legal(const SamplingMask& m, int position, int v) {
+    return (m.words[static_cast<std::int64_t>(position) * m.stride + (v >> 5)] >> (v & 31)) & 1u;
+}
+
 __device__ __forceinline__ float sampling_adjusted_logit(float raw, int v, const SamplingConfig& c,
                                                          const std::int32_t* overlay = nullptr,
                                                          int overlay_len             = 0) {
+    if (c.mask.words != nullptr && !sampling_token_legal(c.mask, overlay_len, v)) {
+        return -CUDART_INF_F;
+    }
     float x = raw;
     if (c.presence_penalty == 0.0f && c.frequency_penalty == 0.0f) { return x; }
     int cnt = c.token_counts != nullptr ? c.token_counts[v] : 0;
@@ -302,6 +311,14 @@ __device__ inline void sampling_normalize_support(const SamplingConfig& cfg, flo
                                                   int n) {
     const int tid = threadIdx.x;
     if (tid == 0) {
+        if (cfg.mask.words != nullptr) {
+            // Illegal tokens rank last as -inf (or as the empty-slot sentinel when fewer than n
+            // legal tokens exist); they leave the candidate list before any weight is formed. No
+            // finite candidate means an empty mask: a model execution failure, not a distribution
+            // from which a placeholder token could be published. Unmasked rows skip this block.
+            while (n > 0 && !isfinite(cand_val[n - 1])) { --n; }
+            if (n == 0) { asm volatile("trap;"); }
+        }
         const float inv_temp = 1.0f / cfg.temperature;
         const float m        = cand_val[0] * inv_temp;
         float sum            = 0.0f;

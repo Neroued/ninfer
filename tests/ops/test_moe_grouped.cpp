@@ -16,6 +16,7 @@
 
 #include "core/arena.h"
 #include "ops/op_tester.h"
+#include "ops/metadata_timing.cuh"
 
 #include <algorithm>
 #include <cmath>
@@ -484,7 +485,7 @@ public:
 
     // grouped = true: moe_grouped_nvfp4 over the whole call; false: moe_slots_nvfp4 in slices.
     std::vector<float> run(const Call& c, const ops::MoeSlotPool& pool, bool grouped, int& failures,
-                           const std::string& label) {
+                           const std::string& label, bool benchmark = false) {
         const int T = c.tokens;
         table_.copy_from_host(c.table.data(), c.table.size() * sizeof(int));
         std::vector<std::uint16_t> xb(c.x.size());
@@ -498,7 +499,14 @@ public:
         if (grouped) {
             Tensor tx(dx.p, DType::BF16, {kH, T}), ti(di.p, DType::I32, {kK, T}),
                 tw(dw.p, DType::FP32, {kK, T}), to(out.data(), DType::FP32, {kH, T});
-            ops::moe_grouped_nvfp4(tx, ti, tw, l, pool, to, workspace_, stream_);
+            auto launch = [&] {
+                ops::moe_grouped_nvfp4(tx, ti, tw, l, pool, to, workspace_, stream_);
+            };
+            launch();
+            if (benchmark) {
+                cuda_synchronize(stream_);
+                time_captured(launch, stream_, true, label.c_str(), T, 1, 1);
+            }
         } else {
             for (int b = 0; b < T; b += ops::kMoeSlotsMaxTokens) {
                 const int n = std::min(ops::kMoeSlotsMaxTokens, T - b);
@@ -748,8 +756,10 @@ int validation_cases(const Model& m, Runner& runner, const DevicePool& pool,
 
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
     try {
+        const bool benchmark = argc == 2 && std::strcmp(argv[1], "--bench") == 0;
+        if (argc > 1 && !benchmark) { throw std::invalid_argument("usage: test [--bench]"); }
         if (cuda_unavailable()) {
             std::cout << "SKIP: no CUDA device\n";
             return 77;
@@ -758,8 +768,25 @@ int main() {
         const int slots       = 3 * static_cast<int>(m.ids.size()) + 7;
         const auto place      = random_placement(m, slots, 22U);
         const DevicePool pool = make_pool(m, place, slots, Layout::Planar, 23U);
-        Runner runner(m, 2 * ops::kMoeGroupedChunkColumns + 77);
+        Runner runner(m, benchmark ? 16384 : 2 * ops::kMoeGroupedChunkColumns + 77);
         int failures = 0;
+        if (benchmark) {
+            std::puts("case,size,columns,sample,us");
+            for (int tokens : {1, 9, 64, 200, 256, 777, 2048, 2049, 4096, 4173, 16384}) {
+                for (bool skewed : {false, true}) {
+                    auto c  = make_call(m, tokens, 100U + tokens);
+                    c.table = table_from(m, place);
+                    c.a1    = 2688.0F / 4.5F * kDivisorJitter;
+                    c.a2    = 2688.0F / 60.0F;
+                    if (skewed) {
+                        for (std::size_t i = 0; i < c.ids.size(); ++i) { c.ids[i] = m.ids[i % kK]; }
+                    }
+                    runner.run(c, pool.pool, true, failures,
+                               skewed ? "moe-grouped-skewed" : "moe-grouped", true);
+                }
+            }
+            return failures ? 1 : 0;
+        }
         failures += oracle_cases(m, runner, pool, place);
         failures += permutation_case(m, runner, pool, place);
         failures += missing_case(m, runner, pool, place);

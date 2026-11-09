@@ -792,7 +792,7 @@ void TextContext::qwen4_prompt_token(Qwen4Forward<WorkspaceArena>& forward, cons
     if (sampling_config_ != nullptr) {
         ops::sample(logits, io_.token, vocabulary, sampling_config_, io_.pos,
                     ops::kSamplePurposePrefill, work_, s);
-        if (reasoning_eos_guard_applies(prompt)) {
+        if (reasoning_guard_ && reasoning_eos_guard_applies(prompt)) {
             guard_first_token(logits, io_.token, vocabulary, sampling_config_, io_.pos, work_, s);
         }
     } else {

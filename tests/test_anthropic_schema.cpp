@@ -136,8 +136,8 @@ int test_envelope_and_field_policy() {
                       "Engine top_k range was not enforced");
     body                  = base_request();
     body["output_config"] = Json{{"format", Json{{"type", "json_schema"}}}};
-    failures += check(api_code([&] { (void)parse(body); }) == "output_config_format_not_supported",
-                      "structured output was silently downgraded");
+    failures += check(api_param([&] { (void)parse(body); }) == "output_config.format.schema",
+                      "malformed output schema was accepted");
     body              = base_request();
     body["container"] = "container_1";
     failures += check(api_code([&] { (void)parse(body); }) == "container_not_supported",
@@ -1023,10 +1023,119 @@ int test_hidden_reasoning_round_trip() {
     return failures;
 }
 
+// Structured output, ported from Neroued/ninfer 08902f73, eb6696ae, 8ffa3131 and 2734a56e
+// (test_anthropic_schema.cpp), adapted to Tappa A (no JSON output with active tools yet).
+int test_constrained_decoding() {
+    int failures = 0;
+    auto options = [](const GenerationRequest& request) {
+        return to_request_options(request, {}, semantics(request), true);
+    };
+    auto body = base_request();
+    failures += check(!options(parse(body).generation).constraint &&
+                          !options(parse(body).generation).execution.sampling.presence_penalty,
+                      "unconstrained Anthropic request changed its Engine options");
+    for (const auto& value : {Json{{"choice", {"yes", "no"}}}, Json{{"regex", "[a-z]+"}}}) {
+        body["structured_outputs"] = value;
+        const auto request         = parse(body).generation;
+        failures +=
+            check(options(request).constraint ==
+                      (value.contains("choice") ? ninfer::OutputConstraint::choice({"yes", "no"})
+                                                : ninfer::OutputConstraint::regex("[a-z]+")),
+                  "Anthropic choice/regex lost in Engine translation");
+    }
+    body["structured_outputs"] = Json{{"grammar", "root ::= \"yes\""}};
+    const auto request         = parse(body);
+    failures += check(options(request.generation).constraint ==
+                          ninfer::OutputConstraint::grammar("root ::= \"yes\""),
+                      "Anthropic GBNF extension was lost in Engine translation");
+    body["tools"] = Json::array({ordinary_tool()});
+    failures += check(api_param([&] { (void)parse(body); }) == "structured_outputs.grammar",
+                      "grammar admitted active tools");
+    body["tool_choice"] = Json{{"type", "none"}};
+    failures += check(parse(body).generation.constraint->source == "root ::= \"yes\"",
+                      "inactive tools blocked grammar");
+    body["stop_sequences"] = Json::array({"yes"});
+    failures += check(api_param([&] { (void)parse(body); }) == "structured_outputs.grammar",
+                      "grammar admitted custom stop sequences");
+
+    // output_config.format json_schema (streaming included), alongside effort.
+    const Json schema = {
+        {"type", "object"},
+        {"properties", {{"z", {{"type", "string"}}}, {"a", {{"type", "integer"}}}}},
+        {"required", {"z", "a"}},
+        {"additionalProperties", false}};
+    body           = base_request();
+    body["stream"] = true;
+    body["output_config"] =
+        Json{{"effort", "low"}, {"format", {{"type", "json_schema"}, {"schema", schema}}}};
+    const auto schema_request = parse(body);
+    failures +=
+        check(schema_request.stream &&
+                  options(schema_request.generation).constraint ==
+                      ninfer::OutputConstraint::json_schema(schema.dump()) &&
+                  schema_request.generation.constraint_param == "output_config.format.schema" &&
+                  schema_request.generation.reasoning_effort == RequestedReasoningEffort::Low &&
+                  options(schema_request.generation).execution.sampling.presence_penalty ==
+                      std::optional<float>(0.0F),
+              "Anthropic JSON schema source, effort or D6 default lost");
+    auto bad                               = body;
+    bad["output_config"]["format"]["type"] = "json_object";
+    failures += check(api_param([&] { (void)parse(bad); }) == "output_config.format.type",
+                      "Anthropic accepted the OpenAI-only json_object format");
+    bad                                    = body;
+    bad["output_config"]["format"]["name"] = "answer";
+    failures += check(api_param([&] { (void)parse(bad); }) == "output_config.format.name",
+                      "Anthropic accepted an OpenAI-only schema option");
+    bad                       = body;
+    bad["structured_outputs"] = Json{{"grammar", "root ::= \"x\""}};
+    failures += check(api_param([&] { (void)parse(bad); }) == "structured_outputs.grammar",
+                      "Anthropic conflicting output formats accepted");
+    bad          = body;
+    bad["tools"] = Json::array({ordinary_tool()});
+    failures += check(api_code([&] { (void)parse(bad); }) == "unsupported_output_combination",
+                      "JSON output with active tools accepted before the tool grammar exists");
+    bad                = body;
+    bad["tool_choice"] = Json{{"type", "any"}};
+    bad["tools"]       = Json::array({ordinary_tool()});
+    failures += check(api_code([&] { (void)parse(bad); }) == "tool_choice_not_supported",
+                      "forced tool_choice is still rejected in Tappa A");
+
+    // D7: assistant prefill with a constraint is rejected before the Engine.
+    bad             = body;
+    bad["thinking"] = Json{{"type", "disabled"}};
+    bad["messages"].push_back(Json{{"role", "assistant"}, {"content", "{\"z\":"}});
+    failures += check(api_code([&] { (void)parse(bad); }) == "assistant_prefill_not_supported",
+                      "assistant prefill admitted an output constraint");
+
+    // Count Tokens ignores the format.
+    failures += check(!parse_anthropic_count_tokens_request(body).generation.constraint,
+                      "Count Tokens parsed an output format");
+
+    // The error object has no param: structured-output errors keep their location in the message.
+    ApiError schema_error;
+    schema_error.status  = 400;
+    schema_error.code    = "unsupported_json_schema";
+    schema_error.param   = "output_config.format.schema/properties/date/format";
+    schema_error.message = "unsupported schema keyword: format";
+    const Json located   = Json::parse(make_anthropic_error_body(schema_error, "req_error"));
+    failures +=
+        check(located["error"]["message"] == schema_error.param + ": " + schema_error.message,
+              "Anthropic schema error lost its request field location");
+    ApiError other;
+    other.status  = 400;
+    other.param   = "messages";
+    other.message = "bad";
+    failures +=
+        check(Json::parse(make_anthropic_error_body(other, "r"))["error"]["message"] == "bad",
+              "Anthropic non-constraint error message changed");
+    return failures;
+}
+
 } // namespace
 
 int main() {
     int failures = 0;
+    failures += test_constrained_decoding();
     failures += test_envelope_and_field_policy();
     failures += test_message_normalization();
     failures += test_attribution_system_block();

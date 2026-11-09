@@ -10,6 +10,10 @@
 #include <string>
 #include <vector>
 
+namespace ninfer::text {
+class GrammarSession;
+}
+
 namespace ninfer::models::qwen3_5 {
 namespace frontend {
 class Tokenizer;
@@ -68,6 +72,9 @@ public:
     [[nodiscard]] std::uint32_t
     model_token_budget_remaining(std::uint32_t total_budget_remaining) const noexcept;
     [[nodiscard]] std::span<const TokenId> pending_control_tokens() const noexcept;
+    // Constrained output: the pending control span completes the model's own canonical close
+    // instead of being the thinking-control suffix (its length differs from the suffix's).
+    [[nodiscard]] bool control_completes_close() const noexcept;
     // Tokens of the thinking-control suffix that may still be forced through the output budget;
     // zero once this session can no longer apply one.
     [[nodiscard]] std::uint32_t control_suffix_tokens() const noexcept;
@@ -76,6 +83,17 @@ public:
     void validate_generation_capacity(std::uint32_t effective_output_tokens) const;
     [[nodiscard]] runtime::OutputDecision preview_terminal(FinishReason reason);
     [[nodiscard]] PublishedOutput commit_preview();
+    // Structured output (upstream 08902f73). A constrained session advances its matcher
+    // tentatively in preview_model/preview_control, confirms in commit_preview and rolls back in
+    // discard_preview; grammar_masks fills the lookahead masks of a round without changing the
+    // committed matcher state (text::GrammarSession::masks).
+    void discard_preview() noexcept;
+    [[nodiscard]] bool constrained() const noexcept;
+    [[nodiscard]] std::uint32_t grammar_masks(std::span<const TokenId> drafts,
+                                              std::span<std::uint32_t> words);
+    // The error that closes a failed constrained row: ConstraintBudgetExceeded when the matcher
+    // ran out of its time budget (capy-flash), otherwise ConstraintDeadEnd with `dead_end`.
+    [[nodiscard]] RequestError constraint_error(std::string dead_end) const;
     [[nodiscard]] std::vector<GeneratedToolCall> take_tool_calls() noexcept;
     [[nodiscard]] ToolCallParseDiagnostics tool_call_parse_diagnostics() const noexcept;
     [[nodiscard]] std::uint32_t reasoning_tokens() const noexcept;
@@ -87,7 +105,8 @@ private:
     OutputSession(std::shared_ptr<const frontend::Tokenizer> tokenizer, StopPolicy policy,
                   OutputOptions output, bool starts_in_reasoning, ThinkingControlOptions thinking,
                   std::shared_ptr<const std::vector<TokenId>> thinking_control_tokens,
-                  std::shared_ptr<const frontend::ToolCallOutputContract> tool_call_output);
+                  std::shared_ptr<const frontend::ToolCallOutputContract> tool_call_output,
+                  std::unique_ptr<text::GrammarSession> grammar = {});
     std::unique_ptr<Impl> impl_;
 
     friend class Frontend;

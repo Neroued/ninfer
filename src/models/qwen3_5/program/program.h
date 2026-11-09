@@ -711,7 +711,8 @@ public:
         : owner_(std::exchange(other.owner_, nullptr)),
           transaction_(std::exchange(other.transaction_, 0)), rows_(other.rows_),
           row_count_(std::exchange(other.row_count_, 0)), tokens_(other.tokens_),
-          row_counts_(other.row_counts_), row_stride_(other.row_stride_), timing_(other.timing_) {
+          row_counts_(other.row_counts_), row_stride_(other.row_stride_), timing_(other.timing_),
+          constraint_failed_(other.constraint_failed_) {
         other.tokens_     = {};
         other.row_counts_ = {};
         other.row_stride_ = 0;
@@ -732,6 +733,12 @@ public:
 
     [[nodiscard]] runtime::ExecutionTiming execution_timing() const noexcept { return timing_; }
 
+    // Structured output: execution reached a position of this row whose language had no legal
+    // token (its produced span ends in a placeholder). The Engine fails only that request.
+    [[nodiscard]] bool constraint_failed(std::size_t row) const noexcept {
+        return row < row_count_ && constraint_failed_[row];
+    }
+
 private:
     const void* owner_         = nullptr;
     std::uint64_t transaction_ = 0;
@@ -741,6 +748,7 @@ private:
     std::span<const std::int32_t> row_counts_;
     std::uint32_t row_stride_ = 0;
     runtime::ExecutionTiming timing_;
+    std::array<bool, kMaximumConcurrency> constraint_failed_{};
 
     friend struct detail::RuntimeContractAccess;
 };
@@ -953,8 +961,10 @@ public:
     progress_context_transaction(runtime::CancellationFlagView cancellation);
     void finalize_context_transaction() noexcept;
     [[nodiscard]] bool has_context_transaction() const noexcept;
-    [[nodiscard]] PrefillProgress
-    advance_prefill(SequenceHandle sequence, runtime::ExecutionTiming* failed_timing = nullptr);
+    // `masks` (structured output): the request's first-token mask; null for an unconstrained one.
+    [[nodiscard]] PrefillProgress advance_prefill(SequenceHandle sequence,
+                                                  runtime::ExecutionTiming* failed_timing = nullptr,
+                                                  runtime::TokenMaskProvider* masks = nullptr);
     [[nodiscard]] CaptureAssessment
     inspect_capture(const CaptureOffer& offer, const SharedPrefixHandle* exact_shared,
                     const SharedPrefixHandle* replacement,
@@ -986,9 +996,15 @@ public:
         const SharedPrefixHandle* replacement,
         std::optional<runtime::CheckpointRef> private_replacement, bool permit_shared_publication,
         CapturePressurePlan&& pressure, runtime::CancellationFlagView cancellation);
+    // `masks` (structured output): token masks of the constrained rows, filled on the host before
+    // the round's launch; null when no row is constrained (the round is then unchanged).
     [[nodiscard]] PendingBatch decode(std::span<const SequenceHandle> sequences,
                                       std::span<const runtime::RoundBudget> budgets,
-                                      runtime::ExecutionTiming* failed_timing = nullptr);
+                                      runtime::ExecutionTiming* failed_timing = nullptr,
+                                      runtime::TokenMaskProvider* masks       = nullptr);
+    // Development hooks that replace sampled tokens (NINFER_QWEN4_FORCE_TOKENS, replay, MTP
+    // oracle, teacher-forced dump) are active; constrained requests are refused then.
+    [[nodiscard]] bool sampling_bypass_hooks() const noexcept;
     // Advance each live sequence with its exact target-owned token row. This does not sample or
     // advance sampler RNG/occurrence state; callers own output publication and budget accounting.
     // Each optional execution split is relative to its row's forced-token span.
@@ -1246,6 +1262,10 @@ struct RuntimeContractAccess {
         out.row_stride_ = row_stride;
         out.timing_     = timing;
         return out;
+    }
+
+    static void set_constraint_failed(PendingBatch& pending, std::size_t row, bool failed) {
+        pending.constraint_failed_.at(row) = failed;
     }
 
     [[nodiscard]] static const void* owner(const PendingBatch& pending) noexcept {

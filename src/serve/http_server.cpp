@@ -4,6 +4,7 @@
 #include "serve/http_transport.h"
 #include "serve/openai_common.h"
 #include "serve/request_log.h"
+#include "serve/request_validation.h"
 
 #include <nlohmann/json.hpp>
 
@@ -304,6 +305,8 @@ HttpServer::HttpServer(ServeOptions options, std::shared_ptr<spdlog::logger> log
                                                             options_.response_store_max_bytes),
       operational_log_(logger),
       request_jsonl_(options_.request_log_jsonl, options_.artifact_path, std::move(logger)) {
+    configure_output_constraint_limits(options_.constraint_limits);
+    configure_max_request_json_depth(options_.max_request_json_depth);
     const std::size_t queued_requests =
         static_cast<std::size_t>(options_.max_concurrency) + options_.max_pending_requests;
     const std::size_t worker_count = queued_requests + 1;

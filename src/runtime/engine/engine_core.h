@@ -7,6 +7,7 @@
 #include "ninfer/types.h"
 #include "runtime/contract/execution.h"
 #include "runtime/contract/resources.h"
+#include "runtime/engine/constraint_masks.h"
 #include "runtime/engine/request_record.h"
 #include "runtime/engine/context_cache/resource_manager.h"
 #include "runtime/engine/scheduler.h"
@@ -208,7 +209,21 @@ public:
         std::shared_ptr<Request> request;
         try {
             auto output = instance_.frontend.make_output_session(
-                prompt, options.stop, options.output, options.execution.thinking);
+                prompt, options.stop, options.output, options.execution.thinking,
+                options.constraint, options.tool_choice);
+            if (output.constrained()) {
+                if (instance_.program->sampling_bypass_hooks()) {
+                    // Development hooks that replace sampled tokens would bypass the mask.
+                    throw RequestError(RequestErrorKind::UnsupportedOutputCombination,
+                                       "output constraints are disabled while a token-forcing "
+                                       "development hook is active");
+                }
+                // The matcher was compiled in this thread; a cold compilation can be long.
+                if (Clock::now() >= pending_deadline) {
+                    throw RequestError(RequestErrorKind::QueueTimeout,
+                                       "inference request expired during grammar preparation");
+                }
+            }
             const std::uint32_t capacity_output =
                 max_context_ - prompt_summary.prompt_tokens + static_cast<std::uint32_t>(1);
             try {
@@ -962,6 +977,22 @@ private:
                 throw std::logic_error("terminal-pending request has invalid ownership");
             }
             const FinishReason reason = *request->terminal_reason;
+            if (request->constraint_failure) {
+                // Structured output: the request's language had no legal token at a position
+                // execution reached. Its last round holds a placeholder token, so the sequence is
+                // discarded rather than catalogued, and only this request fails.
+                auto aborted =
+                    resources_.abort(*instance_.program, *request->lane, *request->sequence);
+                request->generation_timings = aborted.timings;
+                request->speculative_stats  = std::move(aborted.speculative);
+                request->terminal_reason.reset();
+                finish_engine_phase(boundary, EngineHostPhase::Boundary);
+                complete_error(request, request->constraint_failure);
+                remove_completed_slot(lane);
+                boundary = begin_host_phase();
+                changed  = true;
+                continue;
+            }
             auto finished =
                 resources_.finish(*instance_.program, *request->lane, *request->sequence);
             request->generation_timings = finished.timings;
@@ -1076,6 +1107,9 @@ private:
         std::array<ContinuationAction, kMaximumConcurrency> continuations{};
         std::array<std::size_t, kMaximumConcurrency> generated_sizes{};
         std::array<bool, kMaximumConcurrency> cancelled{};
+        // Structured output: rows whose constraint failed (dead end reached, or a token the
+        // matcher refused). They commit as terminal without publishing and fail at settlement.
+        std::array<bool, kMaximumConcurrency> failed{};
         bool generated_staged = false;
         std::array<std::shared_ptr<Request>, kMaximumConcurrency> terminal_requests{};
         std::array<std::uint32_t, kMaximumConcurrency> terminal_lanes{};
@@ -1085,6 +1119,12 @@ private:
             lanes[row] = LaneId{lane_indices[row]};
         }
         const auto rollback_generated = [&]() noexcept {
+            for (std::size_t row = 0; row < row_count; ++row) {
+                // A previewed constrained row holds a tentative matcher advance.
+                if (const auto& request = slots_[lane_indices[row]]; request != nullptr) {
+                    request->output.discard_preview();
+                }
+            }
             if (!generated_staged) { return; }
             for (std::size_t row = 0; row < row_count; ++row) {
                 const auto& request = slots_[lane_indices[row]];
@@ -1123,8 +1163,34 @@ private:
                     finish_reasons[row] = FinishReason::Cancelled;
                     continue;
                 }
-                const OutputDecision decision = request->output.preview_model(
-                    row_tokens, request->budget->remaining(), request->budget->limit_reason());
+                OutputDecision decision;
+                if (pending.constraint_failed(row)) {
+                    failed[row] = true;
+                    request->constraint_failure =
+                        std::make_exception_ptr(request->output.constraint_error(
+                            "output constraint has no valid next token"));
+                } else {
+                    try {
+                        decision =
+                            request->output.preview_model(row_tokens, request->budget->remaining(),
+                                                          request->budget->limit_reason());
+                    } catch (const ConstraintViolation& error) {
+                        if (!request->output.constrained()) { throw; }
+                        request->output.discard_preview();
+                        failed[row] = true;
+                        request->constraint_failure =
+                            std::make_exception_ptr(request->output.constraint_error(
+                                std::string("generated token violates the output constraint: ") +
+                                error.what()));
+                    }
+                }
+                if (failed[row]) {
+                    // Terminal over the whole produced span: nothing is published, and the
+                    // settlement discards the sequence (see settle_terminal_requests).
+                    decisions[row] = CommitDecision{.accepted_tokens = count, .terminal = true};
+                    finish_reasons[row] = FinishReason::StopToken;
+                    continue;
+                }
                 if (decision.accepted_tokens == 0 || decision.accepted_tokens > count ||
                     (!decision.finished() && decision.accepted_tokens != count) ||
                     (decision.finished() && decision.continuation != ContinuationAction::Decode) ||
@@ -1145,7 +1211,7 @@ private:
             generated_staged = true;
             for (std::size_t row = 0; row < row_count; ++row) {
                 const std::uint32_t accepted = decisions[row].accepted_tokens;
-                if (accepted == 0) { continue; }
+                if (accepted == 0 || failed[row]) { continue; }
                 const auto& request = slots_[lane_indices[row]];
                 if (request->generated.size() > request->generated.capacity() ||
                     accepted > request->generated.capacity() - request->generated.size()) {
@@ -1221,7 +1287,7 @@ private:
             ++cumulative_stats_.decode_rounds;
             cumulative_stats_.decode_row_rounds += row_count;
             for (std::size_t row = 0; row < row_count; ++row) {
-                if (!cancelled[row]) {
+                if (!cancelled[row] && !failed[row]) {
                     cumulative_stats_.committed_decode_tokens += decisions[row].accepted_tokens;
                 }
             }
@@ -1232,6 +1298,11 @@ private:
                 const std::uint32_t lane     = lane_indices[row];
                 const auto& request          = slots_[lane];
                 const std::uint32_t accepted = decisions[row].accepted_tokens;
+                if (failed[row]) {
+                    request->model_state     = EngineRequestState::ModelFinished;
+                    request->terminal_reason = finish_reasons[row];
+                    continue;
+                }
                 if (!cancelled[row]) {
                     request->budget->commit(accepted);
                     if (decode_round) { Scheduling::consume_service_work(*request, accepted); }
@@ -1405,9 +1476,11 @@ private:
             throw std::logic_error("prefill request has no sequence handle");
         }
         setup.finish();
+        RoundMasks<OutputSession> masks;
+        masks.bind(0, &request->output, 0);
         ProgramCallScope program_call(*this);
-        auto progress =
-            instance_.program->advance_prefill(*request->sequence, &program_call.failed_timing());
+        auto progress = instance_.program->advance_prefill(
+            *request->sequence, &program_call.failed_timing(), masks.any() ? &masks : nullptr);
         program_call.finish(progress.timing);
         resolve_prefill_progress(request, std::move(progress), cancelled_at_unit_start);
         publish_runtime_stats();
@@ -1866,9 +1939,15 @@ private:
                           const std::array<bool, kMaximumConcurrency>& cancelled_at_unit_start) {
         nvtx::ScopedRange decode_range(nvtx::Name::Decode, nvtx::Category::Decode,
                                        static_cast<std::uint64_t>(membership.size));
+        RoundMasks<OutputSession> masks;
+        for (std::size_t row = 0; row < membership.size; ++row) {
+            const auto& request = slots_[membership.lane_span()[row]];
+            masks.bind(row, &request->output, request->generated.size());
+        }
         ProgramCallScope program_call(*this);
         auto pending = instance_.program->decode(
-            membership.sequence_span(), membership.budget_span(), &program_call.failed_timing());
+            membership.sequence_span(), membership.budget_span(), &program_call.failed_timing(),
+            masks.any() ? &masks : nullptr);
         program_call.finish(pending.execution_timing());
         commit_pending(std::move(pending), membership.lane_span(), true, cancelled_at_unit_start);
         publish_runtime_stats();
@@ -1946,20 +2025,32 @@ private:
         }
     }
 
-    void run_control_batch(const ControlMembership& membership) {
+    void run_control_batch(const ControlMembership& scheduled) {
         nvtx::ScopedRange control_range(nvtx::Name::ControlBatch, nvtx::Category::Control,
-                                        static_cast<std::uint64_t>(membership.size));
+                                        static_cast<std::uint64_t>(scheduled.size));
         EnginePhaseScope phase(*this, EngineHostPhase::CommitOutput);
-        if (membership.empty() || membership.row_stride == 0 ||
-            membership.tokens.size() !=
-                static_cast<std::size_t>(membership.row_stride) * membership.size) {
+        if (scheduled.empty() || scheduled.row_stride == 0 ||
+            scheduled.tokens.size() !=
+                static_cast<std::size_t>(scheduled.row_stride) * scheduled.size) {
             throw std::logic_error("thinking control membership is invalid");
         }
 
+        // The rows that run: the scheduled ones minus the constrained rows whose control span
+        // the matcher refused. Those fail alone, as a dead end found in a round does.
+        ControlMembership membership;
+        membership.row_stride = scheduled.row_stride;
+        membership.tokens.reserve(scheduled.tokens.size());
+        std::array<std::uint32_t, kMaximumConcurrency> failed_lanes{};
+        std::size_t failed_count = 0;
         std::array<std::size_t, kMaximumConcurrency> generated_sizes{};
         std::array<std::optional<std::uint32_t>, kMaximumConcurrency> prefix_execution_splits{};
         bool generated_staged         = false;
         const auto rollback_generated = [&]() noexcept {
+            for (std::size_t row = 0; row < scheduled.size; ++row) {
+                if (const auto& request = slots_[scheduled.lanes[row]]; request != nullptr) {
+                    request->output.discard_preview();
+                }
+            }
             if (!generated_staged) { return; }
             for (std::size_t row = 0; row < membership.size; ++row) {
                 const auto& request = slots_[membership.lanes[row]];
@@ -1970,17 +2061,15 @@ private:
             generated_staged = false;
         };
 
-        for (std::size_t row = 0; row < membership.size; ++row) {
-            const auto& request = slots_[membership.lanes[row]];
-            if (request == nullptr) {
+        for (std::size_t row = 0; row < scheduled.size; ++row) {
+            if (slots_[scheduled.lanes[row]] == nullptr) {
                 throw std::logic_error("thinking control membership lost its request");
             }
-            generated_sizes[row] = request->generated.size();
         }
         generated_staged = true;
         try {
-            for (std::size_t row = 0; row < membership.size; ++row) {
-                const std::uint32_t lane = membership.lanes[row];
+            for (std::size_t row = 0; row < scheduled.size; ++row) {
+                const std::uint32_t lane = scheduled.lanes[row];
                 const auto& request      = slots_[lane];
                 if (request == nullptr || !request->is_control_ready() ||
                     request->capture_pending || !request->budget || !request->sequence ||
@@ -1988,39 +2077,83 @@ private:
                     throw std::logic_error("thinking control row lost its active request");
                 }
                 const std::span<const TokenId> tokens =
-                    std::span<const TokenId>(membership.tokens)
-                        .subspan(row * membership.row_stride, membership.row_stride);
-                const OutputDecision decision =
-                    request->output.preview_control(tokens, request->budget->remaining());
-                if (decision.accepted_tokens != membership.row_stride || decision.finished() ||
+                    std::span<const TokenId>(scheduled.tokens)
+                        .subspan(row * scheduled.row_stride, scheduled.row_stride);
+                OutputDecision decision;
+                try {
+                    decision =
+                        request->output.preview_control(tokens, request->budget->remaining());
+                    if (testing::constraint_refuse_control.load(std::memory_order_relaxed) &&
+                        request->output.constrained()) {
+                        throw ConstraintViolation("injected thinking-control refusal (test)");
+                    }
+                } catch (const ConstraintViolation& error) {
+                    if (!request->output.constrained()) { throw; }
+                    request->output.discard_preview();
+                    // A matcher budget overrun is reported as such (second audit N7).
+                    request->constraint_failure =
+                        std::make_exception_ptr(request->output.constraint_error(
+                            std::string(
+                                "thinking control suffix violates the output constraint: ") +
+                            error.what()));
+                    failed_lanes[failed_count++] = lane;
+                    continue;
+                }
+                if (decision.accepted_tokens != scheduled.row_stride || decision.finished() ||
                     decision.continuation != ContinuationAction::Decode ||
                     (decision.prefix_execution_split_after &&
                      (*decision.prefix_execution_split_after == 0 ||
                       *decision.prefix_execution_split_after > decision.accepted_tokens))) {
                     throw std::logic_error("target control preview returned an invalid decision");
                 }
-                prefix_execution_splits[row] = decision.prefix_execution_split_after;
+                const std::size_t executed        = membership.size;
+                prefix_execution_splits[executed] = decision.prefix_execution_split_after;
+                generated_sizes[executed]         = request->generated.size();
                 if (request->generated.size() > request->generated.capacity() ||
                     tokens.size() > request->generated.capacity() - request->generated.size()) {
                     throw std::logic_error(
                         "admission did not reserve thinking-control token capacity");
                 }
+                membership.lanes[executed]     = lane;
+                membership.sequences[executed] = scheduled.sequences[row];
+                membership.tokens.insert(membership.tokens.end(), tokens.begin(), tokens.end());
+                ++membership.size;
                 request->generated.insert(request->generated.end(), tokens.begin(), tokens.end());
             }
-            phase.pause_range();
-            ProgramCallScope program_call(*this);
-            const runtime::ExecutionTiming timing = instance_.program->append_forced_tokens(
-                membership.sequence_span(), membership.tokens, membership.row_stride,
-                std::span<const std::optional<std::uint32_t>>(prefix_execution_splits.data(),
-                                                              membership.size),
-                &program_call.failed_timing());
-            program_call.finish(timing);
-            phase.resume_range();
+            if (!membership.empty()) {
+                phase.pause_range();
+                ProgramCallScope program_call(*this);
+                const runtime::ExecutionTiming timing = instance_.program->append_forced_tokens(
+                    membership.sequence_span(), membership.tokens, membership.row_stride,
+                    std::span<const std::optional<std::uint32_t>>(prefix_execution_splits.data(),
+                                                                  membership.size),
+                    &program_call.failed_timing());
+                program_call.finish(timing);
+                phase.resume_range();
+            }
         } catch (...) {
             rollback_generated();
             throw;
         }
         generated_staged = false;
+
+        // Refused rows: terminal now; the settlement discards their sequences (nothing of the
+        // refused span was appended) and completes them with the error, as for a dead end.
+        for (std::size_t index = 0; index < failed_count; ++index) {
+            const std::uint32_t lane = failed_lanes[index];
+            const auto& request      = slots_[lane];
+            resources_.mark_terminal_pending(LaneId{lane});
+            request->model_state     = EngineRequestState::ModelFinished;
+            request->terminal_reason = FinishReason::StopToken;
+            std::fprintf(stderr,
+                         "[constraint] request %llu: thinking control refused by the "
+                         "output constraint; only this request fails\n",
+                         static_cast<unsigned long long>(request->id));
+        }
+        if (membership.empty()) {
+            publish_runtime_stats();
+            return;
+        }
 
         ++cumulative_stats_.host_work.control_units;
         for (const std::uint32_t lane : membership.lane_span()) {

@@ -103,9 +103,9 @@ Profiles (both arms always get the same flags):
 | `prod` | the production launch line: `--tp 2 --devices 0,1 --kv-dtype int8 --max-context 196608 --kv-capacity 196608 --device-state-slots 4 --max-concurrency 1 --spec mtp --draft-tokens 3 --vision --vision-device 0 --max-vision-tokens 4096`, plus `--lm-head-draft` |
 | `agentic` | `prod` with `--max-concurrency 4 --device-state-slots 8`, so subagents and sessions decode together when their KV reservations fit |
 
-Every profile also gets `--pending-timeout-ms 3600000`: with the default 30 s a request that
-waits for admission behind a long decode is rejected, and the workload keeps up to eight requests
-in flight.
+Every profile also gets `--pending-timeout-ms 3600000`, above the 10-minute default: a request
+that waits for admission behind long decodes must not be rejected, and the workload keeps up to
+eight requests in flight.
 
 Output layout: `<out>/runner.log`, `<out>/report.md` (combined), and per seed
 `<out>/seed-<n>/{plan.json,config.json,report.md,summary.json}` with `a/` and `b/` each holding

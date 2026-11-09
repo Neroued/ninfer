@@ -10,8 +10,9 @@
 namespace ninfer::ops {
 
 struct SpeculativeAcceptExecutionEnvelope {
-    // Execution promise: every row has temperature<=0 and both penalties disabled. When false,
-    // the general route remains valid for any supported mixture of greedy and stochastic rows.
+    // Execution promise: every row has temperature<=0, both penalties disabled and no token mask.
+    // When false, the general route remains valid for any supported mixture of greedy and
+    // stochastic rows, masked or not.
     bool all_rows_greedy_without_penalties = false;
 };
 
@@ -62,7 +63,14 @@ void speculative_prepare_verify_ids(const Tensor& anchors, const Tensor& drafts,
  * Algorithm:
  *   Independently for each row b, greedy mode accepts the longest available draft prefix matching
  *   the per-column penalty-adjusted argmax and commits that argmax at the first mismatch (or the
- *   bonus column). With both penalties disabled, target_tokens is the exact raw-logit fast path.
+ *   bonus column). With both penalties disabled and no token mask, target_tokens is the exact
+ *   raw-logit fast path; a masked row ignores target_tokens.
+ *   Token mask (sampling.h SamplingMask): column i of row b reads mask position i, for every
+ *   column 0..Pcur[b] that the route evaluates. A draft outside its column's mask has p=0 and is
+ *   rejected by the ordinary test (never dropped beforehand), so the correction is drawn from the
+ *   masked target distribution; the bonus column likewise draws from its own mask position. The
+ *   multi-block route evaluates every column 0..Pcur[b] even after the first rejection, so each
+ *   of them needs a non-empty mask (a safe filler where the grammar state is not reached).
  *   Sampling mode applies configs[b] to each valid verification column, accepts draft i with
  *   target probability p_i(draft_i), samples from the residual distribution on first rejection,
  *   and samples a bonus from column Pcur[b] when every available draft is accepted. The draft

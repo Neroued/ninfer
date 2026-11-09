@@ -271,7 +271,14 @@ std::string serve_usage_text(const char* argv0) {
            "[--prefill-chunk N] [--kv-lease-window N] [--log-stats-interval-ms N] [--device N] "
            "[--tp 1|2 --devices A,B] "
            "[--context-cost-presets FILE] "
-           "[--max-request-mib N] [--media-cache-mib N] [--media-live-mib N] "
+           "[--max-request-mib N] [--max-request-json-depth N] [--media-cache-mib N] "
+           "[--media-live-mib N] "
+           "[--constraint-max-kib N] [--constraint-max-depth N] [--constraint-max-items N] "
+           "[--constraint-compile-timeout-ms N] [--constraint-compile-concurrency N] "
+           "[--constraint-compile-wait-ms N] "
+           "[--constraint-cache-mib N] [--constraint-round-budget-ms N] "
+           "[--constraint-request-budget-ms N] [--constraint-round-allowance-ms N] "
+           "[--constraint-matcher-mib N] [--constraint-json-strict on|off] "
            "[--media-preprocess-threads N] "
            "[--device-state-slots N] [--host-state-slots N] [--host-kv-mib N] "
            "[--disk-cache-dir DIR --disk-cache-gib N] [--disk-cache-min-free-gib N] "
@@ -317,7 +324,25 @@ std::string serve_usage_text(const char* argv0) {
            std::to_string(kDefaultMaxTokens) +
            " when omitted\n"
            "       --max-request-mib defaults to 384 and is enforced before JSON parsing\n"
+           "       --max-request-json-depth defaults to " +
+           std::to_string(kDefaultMaxRequestJsonDepth) + " (at most " +
+           std::to_string(kMaximumMaxRequestJsonDepth) +
+           ") nested objects/arrays in a body or in tool-call arguments, checked before "
+           "parsing\n"
            "       --media-cache-mib defaults to 1024; 0 disables retained media reuse\n"
+           "       structured output limits (docs/serving.md): --constraint-max-kib (256), "
+           "--constraint-max-depth (256, at most 1000) and --constraint-max-items (4096) bound a "
+           "schema, grammar, regex or choice list before compilation; a compilation runs at most "
+           "--constraint-compile-timeout-ms (5000) once it holds one of "
+           "--constraint-compile-concurrency (2) slots, waited for at most "
+           "--constraint-compile-wait-ms (30000, then 429), into a --constraint-cache-mib (64) "
+           "cache; a generating constrained request may "
+           "spend --constraint-round-budget-ms (20) of matcher time per decode round and "
+           "--constraint-request-budget-ms (1000) plus --constraint-round-allowance-ms (5) per "
+           "round in total and keep --constraint-matcher-mib (512) of matcher history, or it "
+           "alone fails (0 disables a time or memory limit); --constraint-json-strict on (default, "
+           "as XGrammar/vLLM) closes JSON Schema objects without additionalProperties and arrays "
+           "without items, off keeps literal JSON Schema\n"
            "       --media-live-mib defaults to 2048 and bounds all live BF16 patch payloads\n"
            "       --media-preprocess-threads defaults to 0 (auto, at most 16 workers)\n"
            "       --request-log-jsonl appends full-precision server/request records\n"
@@ -510,6 +535,66 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                 throw std::invalid_argument("--decode-share must be in [0,16]");
             }
             options.decode_share = static_cast<float>(share);
+        } else if (arg == "--max-request-json-depth") {
+            options.max_request_json_depth = static_cast<std::uint32_t>(parse_nonnegative_int(
+                require_value("--max-request-json-depth"), "max-request-json-depth"));
+        } else if (arg == "--constraint-max-kib") {
+            const std::uint64_t kib =
+                parse_u64(require_value("--constraint-max-kib"), "constraint-max-kib");
+            if (kib == 0 || kib > (1ULL << 20)) {
+                throw std::invalid_argument("--constraint-max-kib must be in [1,1048576]");
+            }
+            options.constraint_limits.max_bytes = static_cast<std::size_t>(kib << 10);
+        } else if (arg == "--constraint-max-depth") {
+            options.constraint_limits.max_depth = static_cast<std::uint32_t>(parse_nonnegative_int(
+                require_value("--constraint-max-depth"), "constraint-max-depth"));
+        } else if (arg == "--constraint-max-items") {
+            options.constraint_limits.max_items = static_cast<std::uint32_t>(parse_nonnegative_int(
+                require_value("--constraint-max-items"), "constraint-max-items"));
+        } else if (arg == "--constraint-compile-timeout-ms") {
+            options.constraint_limits.compile_timeout_ms = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--constraint-compile-timeout-ms"),
+                                      "constraint-compile-timeout-ms"));
+        } else if (arg == "--constraint-compile-concurrency") {
+            options.constraint_limits.compile_concurrency = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--constraint-compile-concurrency"),
+                                      "constraint-compile-concurrency"));
+        } else if (arg == "--constraint-compile-wait-ms") {
+            options.constraint_limits.compile_wait_ms =
+                static_cast<std::uint32_t>(parse_nonnegative_int(
+                    require_value("--constraint-compile-wait-ms"), "constraint-compile-wait-ms"));
+        } else if (arg == "--constraint-cache-mib") {
+            const std::uint64_t mib =
+                parse_u64(require_value("--constraint-cache-mib"), "constraint-cache-mib");
+            if (mib == 0 || mib > (1ULL << 20)) {
+                throw std::invalid_argument("--constraint-cache-mib must be in [1,1048576]");
+            }
+            options.constraint_limits.cache_bytes = static_cast<std::size_t>(mib << 20);
+        } else if (arg == "--constraint-json-strict") {
+            const std::string value = require_value("--constraint-json-strict");
+            if (value != "on" && value != "off") {
+                throw std::invalid_argument("--constraint-json-strict must be on or off");
+            }
+            options.constraint_limits.json_strict = value == "on";
+        } else if (arg == "--constraint-matcher-mib") {
+            const std::uint64_t mib =
+                parse_u64(require_value("--constraint-matcher-mib"), "constraint-matcher-mib");
+            if (mib > (1ULL << 20)) {
+                throw std::invalid_argument("--constraint-matcher-mib must be at most 1048576");
+            }
+            options.constraint_limits.matcher_bytes = static_cast<std::size_t>(mib << 20);
+        } else if (arg == "--constraint-round-budget-ms") {
+            options.constraint_limits.round_budget_ms =
+                static_cast<std::uint32_t>(parse_nonnegative_int(
+                    require_value("--constraint-round-budget-ms"), "constraint-round-budget-ms"));
+        } else if (arg == "--constraint-request-budget-ms") {
+            options.constraint_limits.request_budget_ms = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--constraint-request-budget-ms"),
+                                      "constraint-request-budget-ms"));
+        } else if (arg == "--constraint-round-allowance-ms") {
+            options.constraint_limits.round_allowance_ms = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--constraint-round-allowance-ms"),
+                                      "constraint-round-allowance-ms"));
         } else if (arg == "--pending-timeout-ms") {
             options.pending_timeout_ms = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--pending-timeout-ms"), "pending-timeout-ms"));
@@ -906,6 +991,19 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     }
     if (options.max_request_bytes == 0) {
         throw std::invalid_argument("--max-request-mib must be positive");
+    }
+    if (options.max_request_json_depth == 0 ||
+        options.max_request_json_depth > kMaximumMaxRequestJsonDepth) {
+        throw std::invalid_argument("--max-request-json-depth must be in [1," +
+                                    std::to_string(kMaximumMaxRequestJsonDepth) + "]");
+    }
+    if (options.constraint_limits.max_depth == 0 ||
+        options.constraint_limits.max_depth > kMaximumConstraintDepth) {
+        throw std::invalid_argument("--constraint-max-depth must be in [1," +
+                                    std::to_string(kMaximumConstraintDepth) + "]");
+    }
+    if (options.constraint_limits.max_items == 0) {
+        throw std::invalid_argument("--constraint-max-items must be positive");
     }
     if (options.prefill_chunk == 0 || options.prefill_chunk % 128 != 0) {
         throw std::invalid_argument("--prefill-chunk must be a positive multiple of 128");

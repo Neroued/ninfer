@@ -890,7 +890,9 @@ ProgramImpl::shared_prefix_summary(const SharedPrefixState& shared) const {
 }
 
 PrefillProgress ProgramImpl::advance_prefill(SequenceHandle sequence,
-                                             runtime::ExecutionTiming* failed_timing) {
+                                             runtime::ExecutionTiming* failed_timing,
+                                             runtime::TokenMaskProvider* masks) {
+    const RoundMaskScope mask_scope(*this, masks);
     if (pending_transaction_ || !valid_sequence(sequence)) {
         throw std::logic_error("prefill sequence capability is invalid");
     }

@@ -7,16 +7,24 @@
 // production path as a golden.
 #include "ninfer/ops/sampling.h"
 #include "ops/op_tester.h"
+#include "core/decode_graph.h"
+#include "core/device.h"
 
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <iostream>
 #include <memory>
 #include <stdexcept>
+#include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
+
+#include <sys/wait.h>
+#include <unistd.h>
 
 using namespace ninfer;
 using namespace ninfer::test;
@@ -43,7 +51,8 @@ bool same_config(const ops::SamplingConfig& a, const ops::SamplingConfig& b) {
     return a.temperature == b.temperature && a.top_k == b.top_k && a.top_p == b.top_p &&
            a.min_p == b.min_p && a.presence_penalty == b.presence_penalty &&
            a.frequency_penalty == b.frequency_penalty && a.seed == b.seed &&
-           a.token_counts == b.token_counts;
+           a.token_counts == b.token_counts && a.mask.words == b.mask.words &&
+           a.mask.stride == b.mask.stride;
 }
 
 std::vector<std::uint16_t> bf16_bits(const std::vector<float>& values) {
@@ -81,16 +90,26 @@ std::vector<int> greedy_oracle(const std::vector<float>& logits, int physical_ro
     return expected;
 }
 
+bool mask_allows(const std::vector<std::uint32_t>* mask, int token) {
+    return mask == nullptr ||
+           (((*mask)[static_cast<std::size_t>(token / 32)] >> (token % 32)) & 1u) != 0;
+}
+
+// The FP64 oracle drops illegal tokens before ranking: the mask restricts the candidate set
+// itself, so a legal token beyond the unmasked top-20 can be drawn.
 Distribution distribution_oracle(const std::vector<float>& column, int token_domain,
                                  const ops::SamplingConfig& config,
-                                 const std::vector<int>* counts = nullptr) {
-    std::vector<Candidate> candidates(static_cast<std::size_t>(token_domain));
+                                 const std::vector<int>* counts         = nullptr,
+                                 const std::vector<std::uint32_t>* mask = nullptr) {
+    std::vector<Candidate> candidates;
+    candidates.reserve(static_cast<std::size_t>(token_domain));
     for (int token = 0; token < token_domain; ++token) {
+        if (!mask_allows(mask, token)) { continue; }
         const int count = counts == nullptr ? 0 : (*counts)[static_cast<std::size_t>(token)];
         double adjusted = static_cast<double>(column[static_cast<std::size_t>(token)]);
         if (count > 0) { adjusted -= static_cast<double>(config.presence_penalty); }
         adjusted -= static_cast<double>(config.frequency_penalty) * static_cast<double>(count);
-        candidates[static_cast<std::size_t>(token)] = {adjusted, token};
+        candidates.push_back({adjusted, token});
     }
     std::sort(candidates.begin(), candidates.end(), [](const Candidate& a, const Candidate& b) {
         if (a.adjusted != b.adjusted) { return a.adjusted > b.adjusted; }
@@ -99,7 +118,7 @@ Distribution distribution_oracle(const std::vector<float>& column, int token_dom
 
     int cap = 20;
     if (config.top_k > 0 && config.top_k < 20) { cap = config.top_k; }
-    cap = std::min(cap, token_domain);
+    cap = std::min(cap, static_cast<int>(candidates.size()));
     candidates.resize(static_cast<std::size_t>(cap));
 
     std::vector<double> weights(static_cast<std::size_t>(cap));
@@ -612,12 +631,534 @@ int increment_counts_contract() {
     return failures;
 }
 
+// ---------------------------------------------------------------------------------------------
+// Token masks (constrained decoding). Each route of sample() is exercised: the single-block
+// small-domain kernel (domain <= 256), the multi-block partial/group route (domain > 256 and
+// B <= 16) and the single-block fast fallback (domain > 256 and B > 16).
+
+struct MaskRoute {
+    int token_domain;
+    int batch;
+};
+
+constexpr MaskRoute kMaskRoutes[] = {{64, 8}, {257, 8}, {257, 17}, {248077, 8}, {248077, 17}};
+
+std::string route_label(const char* what, const MaskRoute& route) {
+    return std::string(what) + " domain=" + std::to_string(route.token_domain) +
+           " B=" + std::to_string(route.batch);
+}
+
+std::vector<std::uint32_t> mask_of(int token_domain, const std::vector<int>& legal) {
+    std::vector<std::uint32_t> mask(static_cast<std::size_t>((token_domain + 31) / 32), 0u);
+    for (int token : legal) { mask[static_cast<std::size_t>(token / 32)] |= 1u << (token % 32); }
+    return mask;
+}
+
+int masked_argmax(const std::vector<float>& column, int token_domain,
+                  const ops::SamplingConfig& config, const std::vector<int>* counts,
+                  const std::vector<std::uint32_t>* mask) {
+    int best             = -1;
+    double best_adjusted = 0.0;
+    for (int token = 0; token < token_domain; ++token) {
+        if (!mask_allows(mask, token)) { continue; }
+        const int count = counts == nullptr ? 0 : (*counts)[static_cast<std::size_t>(token)];
+        double adjusted = static_cast<double>(column[static_cast<std::size_t>(token)]);
+        if (count > 0) { adjusted -= static_cast<double>(config.presence_penalty); }
+        adjusted -= static_cast<double>(config.frequency_penalty) * static_cast<double>(count);
+        if (best < 0 || adjusted > best_adjusted) {
+            best          = token;
+            best_adjusted = adjusted;
+        }
+    }
+    return best;
+}
+
+// Draws `total` tokens from one column, `batch` rows per launch, every row with the same config
+// and mask but its own logical position. Every launch starts from the same committed token
+// counts (sample() increments them), so the penalties see a fixed history and the draws are
+// i.i.d. samples of one distribution.
+std::vector<int> draw_masked(const std::vector<float>& column, int token_domain,
+                             ops::SamplingConfig config, const std::vector<int>& counts,
+                             const std::vector<std::uint32_t>& mask, int total, int batch,
+                             int first_position, int& integrity_failures) {
+    if (batch <= 0 || total <= 0 || total % batch != 0) {
+        throw std::invalid_argument("masked draw count must be a positive batch multiple");
+    }
+    const int physical_rows                     = static_cast<int>(column.size());
+    const std::vector<std::uint16_t> input_bits = bf16_bits(repeat_column(column, batch));
+    DeviceBuffer device_logits                  = to_device(input_bits);
+    DeviceBuffer device_mask                    = to_device(mask);
+    GuardedDeviceBuffer device_counts(static_cast<std::size_t>(batch) * token_domain *
+                                      sizeof(std::int32_t));
+    std::vector<int> row_counts;
+    row_counts.reserve(static_cast<std::size_t>(batch) * token_domain);
+    for (int row = 0; row < batch; ++row) {
+        row_counts.insert(row_counts.end(), counts.begin(), counts.end());
+    }
+    config.mask = {static_cast<const std::uint32_t*>(device_mask.p),
+                   static_cast<std::int32_t>(mask.size())};
+    std::vector<ops::SamplingConfig> configs(static_cast<std::size_t>(batch), config);
+    for (int row = 0; row < batch; ++row) {
+        configs[static_cast<std::size_t>(row)].token_counts =
+            static_cast<std::int32_t*>(device_counts.data()) +
+            static_cast<std::size_t>(row) * token_domain;
+    }
+    DeviceBuffer device_configs = to_device(configs);
+    std::vector<int> positions(static_cast<std::size_t>(total));
+    for (int i = 0; i < total; ++i) { positions[static_cast<std::size_t>(i)] = first_position + i; }
+    DeviceBuffer device_positions = to_device(positions);
+    GuardedDeviceBuffer collected(static_cast<std::size_t>(total) * sizeof(std::int32_t));
+
+    Tensor logits_tensor(device_logits.p, DType::BF16, {physical_rows, batch});
+    const std::size_t workspace_bytes =
+        ops::sampling_workspace_capacity_bytes(token_domain, batch, batch);
+    WorkspaceArena workspace(std::max<std::size_t>(256, workspace_bytes));
+    for (int produced = 0; produced < total; produced += batch) {
+        device_counts.copy_from_host(row_counts.data(), row_counts.size() * sizeof(std::int32_t));
+        Tensor out_tensor(static_cast<std::int32_t*>(collected.data()) + produced, DType::I32,
+                          {batch});
+        Tensor positions_tensor(static_cast<std::int32_t*>(device_positions.p) + produced,
+                                DType::I32, {batch});
+        ops::sample(logits_tensor, out_tensor, token_domain,
+                    static_cast<const ops::SamplingConfig*>(device_configs.p), positions_tensor,
+                    ops::kSamplePurposeDecode, workspace, nullptr);
+    }
+    cuda_synchronize();
+
+    integrity_failures += collected.verify_guards("masked draw output");
+    integrity_failures += device_counts.verify_guards("masked draw token counts");
+    integrity_failures += verify_exact("masked draw read-only mask",
+                                       from_device<std::uint32_t>(device_mask, mask.size()), mask);
+    integrity_failures +=
+        verify_exact("masked draw read-only logits",
+                     from_device<std::uint16_t>(device_logits, input_bits.size()), input_bits);
+    const auto actual_configs = from_device<ops::SamplingConfig>(device_configs, configs.size());
+    for (std::size_t row = 0; row < configs.size(); ++row) {
+        if (!same_config(actual_configs[row], configs[row])) {
+            std::cerr << "masked draw modified SamplingConfig row " << row << '\n';
+            ++integrity_failures;
+        }
+    }
+    return from_device<int>(collected.data(), static_cast<std::size_t>(total));
+}
+
+int verify_all_equal(const std::string& label, const std::vector<int>& tokens, int expected) {
+    for (int token : tokens) {
+        if (token != expected) {
+            std::cerr << label << ": token " << token << " (expected " << expected << ")\n";
+            return 1;
+        }
+    }
+    return 0;
+}
+
+int draws_for(int batch) { return batch * ((4096 + batch - 1) / batch); }
+
+// Port of upstream 08902f73 grammar_mask_contract: the only two legal tokens rank below the
+// unmasked top-20 (a filter applied after a top-20 would find nothing legal).
+int mask_below_unmasked_top20_contract() {
+    int failures = 0;
+    for (const MaskRoute& route : kMaskRoutes) {
+        const int domain = route.token_domain;
+        std::vector<float> column(static_cast<std::size_t>(domain) + 3, 10.0f);
+        column[static_cast<std::size_t>(domain - 1)] = 1.0f;
+        column[static_cast<std::size_t>(domain - 2)] = 0.0f;
+        const auto mask                              = mask_of(domain, {domain - 1, domain - 2});
+        const std::vector<int> counts(static_cast<std::size_t>(domain), 0);
+
+        ops::SamplingConfig config;
+        auto tokens = draw_masked(column, domain, config, counts, mask, route.batch, route.batch, 0,
+                                  failures);
+        failures +=
+            verify_all_equal(route_label("masked greedy below top-20", route), tokens, domain - 1);
+
+        config.temperature = 0.75f;
+        config.seed        = 713179;
+        const auto oracle  = distribution_oracle(column, domain, config, nullptr, &mask);
+        tokens = draw_masked(column, domain, config, counts, mask, draws_for(route.batch),
+                             route.batch, 100, failures);
+        failures += verify_distribution(
+            route_label("masked distribution below top-20", route).c_str(), tokens, oracle);
+    }
+    return failures;
+}
+
+// Mask + presence/frequency penalties + top-k + top-p + min-p against the FP64 oracle. The
+// best raw logits are illegal, and the penalties reorder the legal ones.
+int mask_penalty_topk_contract() {
+    int failures = 0;
+    for (const MaskRoute& route : kMaskRoutes) {
+        const int domain  = route.token_domain;
+        const int spacing = domain / 16;
+        std::vector<float> column(static_cast<std::size_t>(domain) + 5, 0.0f);
+        for (int token = 0; token < domain; ++token) {
+            column[static_cast<std::size_t>(token)] = -6.0f + 0.1f * static_cast<float>(token % 7);
+        }
+        // Sixteen ranked tokens j*spacing+1 (logit 4-0.25j): even j illegal (the best raw
+        // logits), odd j legal; every other token a multiple of 3 is a legal low background.
+        std::vector<int> legal;
+        std::vector<bool> ranked(static_cast<std::size_t>(domain), false);
+        std::vector<int> counts(static_cast<std::size_t>(domain), 0);
+        for (int j = 0; j < 16; ++j) {
+            const int token                         = j * spacing + 1;
+            ranked[static_cast<std::size_t>(token)] = true;
+            column[static_cast<std::size_t>(token)] = 4.0f - 0.25f * static_cast<float>(j);
+            if (j % 2 == 1) { legal.push_back(token); }
+        }
+        for (int token = 0; token < domain; token += 3) {
+            if (!ranked[static_cast<std::size_t>(token)]) { legal.push_back(token); }
+        }
+        counts[static_cast<std::size_t>(1 * spacing + 1)] = 2;
+        counts[static_cast<std::size_t>(3 * spacing + 1)] = 1;
+        counts[static_cast<std::size_t>(3)]               = 4; // a legal background token
+        // Tokens past the domain are huge and their mask bits are set: never eligible.
+        column[static_cast<std::size_t>(domain)]     = 100.0f;
+        column[static_cast<std::size_t>(domain) + 4] = 200.0f;
+        round_to_bf16(column);
+        auto mask = mask_of(domain, legal);
+        if (domain % 32 != 0) { mask.back() |= ~0u << (domain % 32); }
+
+        ops::SamplingConfig config;
+        config.presence_penalty  = 0.75f;
+        config.frequency_penalty = 0.25f;
+        const int expected       = masked_argmax(column, domain, config, &counts, &mask);
+        auto tokens = draw_masked(column, domain, config, counts, mask, route.batch, route.batch,
+                                  50, failures);
+        failures +=
+            verify_all_equal(route_label("masked greedy penalties", route), tokens, expected);
+
+        config.temperature = 0.9f;
+        config.top_k       = 5;
+        config.top_p       = 0.95f;
+        config.min_p       = 0.02f;
+        config.seed        = 99173;
+        const auto oracle  = distribution_oracle(column, domain, config, &counts, &mask);
+        if (oracle.tokens.size() < 3) {
+            std::cerr << "masked penalty fixture has a degenerate support\n";
+            ++failures;
+        }
+        tokens = draw_masked(column, domain, config, counts, mask, draws_for(route.batch),
+                             route.batch, 1000, failures);
+        failures += verify_distribution(
+            route_label("masked penalties top-k/top-p/min-p", route).c_str(), tokens, oracle);
+    }
+    return failures;
+}
+
+// Exactly one legal token, the lowest logit of the row, at both ends of the bit vector.
+int mask_single_legal_contract() {
+    int failures = 0;
+    for (const MaskRoute& route : kMaskRoutes) {
+        const int domain = route.token_domain;
+        for (int legal : {0, domain - 1}) {
+            std::vector<float> column(static_cast<std::size_t>(domain) + 1, 30.0f);
+            column[static_cast<std::size_t>(legal)] = -30.0f;
+            const auto mask                         = mask_of(domain, {legal});
+            const std::vector<int> counts(static_cast<std::size_t>(domain), 0);
+            ops::SamplingConfig config;
+            auto tokens = draw_masked(column, domain, config, counts, mask, route.batch,
+                                      route.batch, 7, failures);
+            failures += verify_all_equal(route_label("single legal greedy", route), tokens, legal);
+            config.temperature = 1.5f;
+            config.top_k       = 20;
+            config.top_p       = 0.5f;
+            config.min_p       = 0.5f;
+            config.seed        = 5150;
+            tokens = draw_masked(column, domain, config, counts, mask, 4 * route.batch, route.batch,
+                                 70, failures);
+            failures +=
+                verify_all_equal(route_label("single legal stochastic", route), tokens, legal);
+        }
+    }
+    return failures;
+}
+
+// Masked and unmasked rows in one launch: the unmasked rows equal an all-unmasked launch token
+// for token, and each masked row equals the same row launched alone.
+int mask_mixed_batch_contract() {
+    int failures = 0;
+    for (const int domain : {64, 257, 248077}) {
+        constexpr int batch = 4;
+        const int physical  = domain + 2;
+        std::vector<float> logits(static_cast<std::size_t>(physical) * batch, -4.0f);
+        for (int row = 0; row < batch; ++row) {
+            for (int token = 0; token < domain; ++token) {
+                logits[static_cast<std::size_t>(row) * physical + token] =
+                    static_cast<float>((token * 37 + row * 11) % 23) * 0.25f - 2.0f;
+            }
+        }
+        round_to_bf16(logits);
+        std::vector<int> legal;
+        for (int token = 5; token < domain; token += 9) { legal.push_back(token); }
+        const auto mask       = mask_of(domain, legal);
+        DeviceBuffer d_mask   = to_device(mask);
+        const auto mask_words = static_cast<std::int32_t>(mask.size());
+
+        std::vector<ops::SamplingConfig> plain(batch);
+        plain[0].temperature                   = 0.8f;
+        plain[0].seed                          = 11;
+        plain[1].temperature                   = 0.8f;
+        plain[1].seed                          = 12;
+        plain[2].temperature                   = 0.0f;
+        plain[3].temperature                   = 0.0f;
+        plain[3].presence_penalty              = 0.5f;
+        std::vector<ops::SamplingConfig> mixed = plain;
+        for (int row : {0, 2}) {
+            mixed[static_cast<std::size_t>(row)].mask = {
+                static_cast<const std::uint32_t*>(d_mask.p), mask_words};
+        }
+        const std::vector<int> positions{300, 301, 302, 303};
+        const RunResult unmasked =
+            run_batch(logits, physical, domain, plain, positions, ops::kSamplePurposeDecode);
+        const RunResult masked =
+            run_batch(logits, physical, domain, mixed, positions, ops::kSamplePurposeDecode);
+        failures += unmasked.integrity_failures + masked.integrity_failures;
+        const std::string label = "mixed batch domain=" + std::to_string(domain);
+        for (int row : {1, 3}) {
+            if (masked.tokens[static_cast<std::size_t>(row)] !=
+                unmasked.tokens[static_cast<std::size_t>(row)]) {
+                std::cerr << label << ": unmasked row " << row << " changed\n";
+                ++failures;
+            }
+        }
+        for (int row : {0, 2}) {
+            const int token = masked.tokens[static_cast<std::size_t>(row)];
+            if (!mask_allows(&mask, token)) {
+                std::cerr << label << ": masked row " << row << " drew illegal " << token << '\n';
+                ++failures;
+            }
+            const std::vector<float> column(
+                logits.begin() + static_cast<std::ptrdiff_t>(row) * physical,
+                logits.begin() + static_cast<std::ptrdiff_t>(row + 1) * physical);
+            const RunResult alone =
+                run_batch(column, physical, domain, {mixed[static_cast<std::size_t>(row)]},
+                          {positions[static_cast<std::size_t>(row)]}, ops::kSamplePurposeDecode);
+            failures += alone.integrity_failures;
+            if (alone.tokens.front() != token) {
+                std::cerr << label << ": masked row " << row << " differs from its solo launch\n";
+                ++failures;
+            }
+        }
+        const std::vector<float> column2(logits.begin() + 2 * physical,
+                                         logits.begin() + 3 * physical);
+        if (masked.tokens[2] != masked_argmax(column2, domain, mixed[2], nullptr, &mask)) {
+            std::cerr << label << ": masked greedy row is not the legal argmax\n";
+            ++failures;
+        }
+    }
+    return failures;
+}
+
+// Decision D2: sample() captured once in a CUDA graph. The configs and the mask words sit at
+// fixed addresses; between replays only their contents change (cudaMemcpyAsync on the same
+// stream), switching row 0 between unconstrained and two different masks.
+int mask_graph_contract() {
+    constexpr int domain   = 248077;
+    constexpr int physical = 248320;
+    constexpr int batch    = 2;
+    std::vector<float> logits(static_cast<std::size_t>(physical) * batch, -10.0f);
+    const auto at = [&](int row, int token) -> float& {
+        return logits[static_cast<std::size_t>(row) * physical + token];
+    };
+    at(0, 1000)   = 9.0f; // unconstrained argmax of row 0
+    at(0, 77)     = 3.0f;
+    at(0, 200000) = 2.0f;
+    at(0, 5)      = 1.0f;
+    at(1, 4242)   = 5.0f; // row 1 is never masked
+    round_to_bf16(logits);
+    DeviceBuffer d_logits = to_device(bf16_bits(logits));
+    const auto mask_a     = mask_of(domain, {77, 5});
+    const auto mask_b     = mask_of(domain, {200000, 5});
+    DeviceBuffer d_mask   = to_device(mask_a);
+    std::vector<ops::SamplingConfig> configs(batch);
+    DeviceBuffer d_configs   = to_device(configs);
+    DeviceBuffer d_positions = to_device(std::vector<int>{10, 20});
+    GuardedDeviceBuffer d_out(batch * sizeof(std::int32_t));
+    Tensor logits_tensor(d_logits.p, DType::BF16, {physical, batch});
+    Tensor out_tensor(d_out.data(), DType::I32, {batch});
+    Tensor positions_tensor(d_positions.p, DType::I32, {batch});
+    WorkspaceArena workspace(
+        std::max<std::size_t>(256, ops::sampling_workspace_capacity_bytes(domain, batch, batch)));
+
+    DeviceContext context;
+    cuda_synchronize();
+    DecodeGraphDefinition definition;
+    definition.capture(context.stream, [&] {
+        ops::sample(logits_tensor, out_tensor, domain,
+                    static_cast<const ops::SamplingConfig*>(d_configs.p), positions_tensor,
+                    ops::kSamplePurposeDecode, workspace, context.stream);
+    });
+    DecodeGraphExecutable graph;
+    graph.instantiate(definition);
+
+    int failures      = 0;
+    const auto replay = [&](const char* label, const std::vector<int>& expected) {
+        graph.launch(context.stream);
+        context.synchronize();
+        failures += verify_exact(label, from_device<int>(d_out.data(), batch), expected);
+    };
+    replay("graph unconstrained", {1000, 4242});
+    configs[0].mask = {static_cast<const std::uint32_t*>(d_mask.p),
+                       static_cast<std::int32_t>(mask_a.size())};
+    CUDA_CHECK(cudaMemcpyAsync(d_configs.p, configs.data(), configs.size() * sizeof(configs[0]),
+                               cudaMemcpyHostToDevice, context.stream));
+    replay("graph mask A", {77, 4242});
+    CUDA_CHECK(cudaMemcpyAsync(d_mask.p, mask_b.data(), mask_b.size() * sizeof(std::uint32_t),
+                               cudaMemcpyHostToDevice, context.stream));
+    replay("graph mask B", {200000, 4242});
+    configs[0].mask = {};
+    CUDA_CHECK(cudaMemcpyAsync(d_configs.p, configs.data(), configs.size() * sizeof(configs[0]),
+                               cudaMemcpyHostToDevice, context.stream));
+    replay("graph unconstrained again", {1000, 4242});
+    failures += d_out.verify_guards("graph output");
+    return failures;
+}
+
+// The reasoning EOS guard's redraw keeps the row's mask: it replaces a banned draw with the best
+// remaining legal token, never with a better illegal one.
+int mask_reasoning_guard_contract() {
+    int failures = 0;
+    for (const int domain : {64, 248077}) {
+        const int physical = domain + 1;
+        std::vector<float> column(static_cast<std::size_t>(physical), -20.0f);
+        column[3]           = 30.0f;  // illegal
+        column[9]           = 10.0f;  // legal and banned
+        column[5]           = 8.0f;   // legal
+        column[20]          = -10.0f; // legal, negligible weight after the redraw (e^-18)
+        const auto mask     = mask_of(domain, {5, 9, 20});
+        DeviceBuffer d_mask = to_device(mask);
+        for (const float temperature : {0.0f, 1.0f}) {
+            ops::SamplingConfig config;
+            config.temperature = temperature;
+            config.top_k       = 2;
+            config.seed        = 31337;
+            config.mask        = {static_cast<const std::uint32_t*>(d_mask.p),
+                                  static_cast<std::int32_t>(mask.size())};
+            for (int position = 0; position < 16; ++position) {
+                DeviceBuffer d_logits    = to_device(bf16_bits(column));
+                DeviceBuffer d_config    = to_device(std::vector<ops::SamplingConfig>{config});
+                DeviceBuffer d_positions = to_device(std::vector<int>{position});
+                DeviceBuffer d_out       = to_device(std::vector<int>{-1});
+                DeviceBuffer d_replaced  = to_device(std::vector<unsigned long long>{0});
+                Tensor logits_tensor(d_logits.p, DType::BF16, {physical, 1});
+                Tensor out_tensor(d_out.p, DType::I32, {1});
+                Tensor positions_tensor(d_positions.p, DType::I32, {1});
+                WorkspaceArena workspace(4096 +
+                                         ops::sampling_workspace_capacity_bytes(domain, 1, 1));
+                const auto* configs = static_cast<const ops::SamplingConfig*>(d_config.p);
+                ops::sample(logits_tensor, out_tensor, domain, configs, positions_tensor,
+                            ops::kSamplePurposeDecode, workspace, nullptr);
+                const int drawn = from_device<int>(d_out, 1).front();
+                ops::replace_banned_token(
+                    logits_tensor, out_tensor, domain, configs, positions_tensor, 9, -1,
+                    static_cast<unsigned long long*>(d_replaced.p), workspace, nullptr);
+                cuda_synchronize();
+                const int final_token   = from_device<int>(d_out, 1).front();
+                const auto replaced     = from_device<unsigned long long>(d_replaced, 1).front();
+                const std::string label = "guard redraw domain=" + std::to_string(domain) +
+                                          " T=" + std::to_string(temperature);
+                if (drawn != 9 && drawn != 5) {
+                    std::cerr << label << ": first draw " << drawn << " outside the top-2\n";
+                    ++failures;
+                }
+                if (final_token != 5 || replaced != (drawn == 9 ? 1ull : 0ull)) {
+                    std::cerr << label << ": final " << final_token << " replaced " << replaced
+                              << " after drawing " << drawn << '\n';
+                    ++failures;
+                }
+                if (temperature == 0.0f) { break; }
+            }
+        }
+    }
+    return failures;
+}
+
+// An empty mask at a consumed position must stop the kernel (device trap), as upstream. The
+// trap poisons the CUDA context, so each case runs in a child process of this binary.
+int run_trap_case(std::string_view name) {
+    int domain = 64, batch = 1;
+    float temperature = 0.0f;
+    if (name == "greedy-small") {
+    } else if (name == "greedy-multiblock") {
+        domain = 248077;
+        batch  = 2;
+    } else if (name == "greedy-fast") {
+        domain = 257;
+        batch  = 17;
+    } else if (name == "stochastic-small") {
+        temperature = 1.0f;
+    } else if (name == "stochastic-multiblock") {
+        domain      = 248077;
+        batch       = 2;
+        temperature = 1.0f;
+    } else if (name == "stochastic-fast") {
+        domain      = 257;
+        batch       = 17;
+        temperature = 1.0f;
+    } else {
+        std::cerr << "unknown trap case " << name << '\n';
+        return 2;
+    }
+    std::vector<float> logits(static_cast<std::size_t>(domain) * batch, 1.0f);
+    const std::vector<std::uint32_t> empty(static_cast<std::size_t>((domain + 31) / 32), 0u);
+    DeviceBuffer d_mask = to_device(empty);
+    std::vector<ops::SamplingConfig> configs(static_cast<std::size_t>(batch));
+    for (auto& config : configs) { config.temperature = temperature; }
+    configs.back().mask      = {static_cast<const std::uint32_t*>(d_mask.p),
+                                static_cast<std::int32_t>(empty.size())};
+    DeviceBuffer d_logits    = to_device(bf16_bits(logits));
+    DeviceBuffer d_configs   = to_device(configs);
+    DeviceBuffer d_positions = to_device(std::vector<int>(static_cast<std::size_t>(batch), 0));
+    DeviceBuffer d_out(static_cast<std::size_t>(batch) * sizeof(std::int32_t));
+    Tensor logits_tensor(d_logits.p, DType::BF16, {domain, batch});
+    Tensor out_tensor(d_out.p, DType::I32, {batch});
+    Tensor positions_tensor(d_positions.p, DType::I32, {batch});
+    WorkspaceArena workspace(
+        std::max<std::size_t>(256, ops::sampling_workspace_capacity_bytes(domain, batch, batch)));
+    ops::sample(logits_tensor, out_tensor, domain,
+                static_cast<const ops::SamplingConfig*>(d_configs.p), positions_tensor,
+                ops::kSamplePurposeDecode, workspace, nullptr);
+    const cudaError_t status = cudaDeviceSynchronize();
+    std::cout << "trap case " << name << ": " << cudaGetErrorName(status) << std::endl;
+    // Skip the destructors: freeing on a trapped context only prints cleanup errors.
+    std::_Exit(status == cudaSuccess ? 3 : 0);
+}
+
+// Absolute path of this test binary (for re-running it as a child: inside std::system the
+// /proc/self/exe link names the shell).
+std::string self_executable() {
+    char path[4096];
+    const ssize_t n = readlink("/proc/self/exe", path, sizeof(path) - 1);
+    if (n <= 0) { throw std::runtime_error("cannot resolve /proc/self/exe"); }
+    path[n] = '\0';
+    return path;
+}
+
+int empty_mask_trap_contract(const std::string& self) {
+    int failures = 0;
+    for (const char* name : {"greedy-small", "greedy-multiblock", "greedy-fast", "stochastic-small",
+                             "stochastic-multiblock", "stochastic-fast"}) {
+        const std::string command = "\"" + self + "\" --trap-case " + name;
+        const int status          = std::system(command.c_str());
+        if (status == -1 || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+            std::cerr << "empty mask " << name << " did not trap (status " << status << ")\n";
+            ++failures;
+        }
+    }
+    return failures;
+}
+
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
     if (cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;
+    }
+    if (argc == 3 && std::string_view(argv[1]) == "--trap-case") { return run_trap_case(argv[2]); }
+    if (argc != 1) {
+        std::cerr << "usage: ninfer_sampling_test [--trap-case NAME]\n";
+        return 2;
     }
 
     int failures            = 0;
@@ -642,6 +1183,13 @@ int main() {
     failures += rng_key_contract();
     failures += workspace_route_boundary_contract();
     failures += increment_counts_contract();
+    failures += mask_below_unmasked_top20_contract();
+    failures += mask_penalty_topk_contract();
+    failures += mask_single_legal_contract();
+    failures += mask_mixed_batch_contract();
+    failures += mask_graph_contract();
+    failures += mask_reasoning_guard_contract();
+    failures += empty_mask_trap_contract(self_executable());
 
     std::cout << (failures == 0 ? "OK" : "FAIL") << " sample public contract\n";
     return failures == 0 ? 0 : 1;

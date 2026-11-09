@@ -109,6 +109,7 @@ struct PersistentLayout {
     std::optional<TensorLayout> score_hidden;
     std::optional<TensorLayout> token_counts;
     std::optional<TensorLayout> sampling_config;
+    std::optional<TensorLayout> grammar_masks;
     std::optional<Qwen4PersistentLayout> qwen4;
     std::size_t bytes            = 0;
     std::size_t kv_payload_bytes = 0;

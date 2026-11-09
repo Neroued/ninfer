@@ -960,9 +960,10 @@ void parse_effort(const Json& body, GenerationRequest& request, ParsePurpose pur
     if (!config.is_object()) { bad_request("output_config must be an object", "output_config"); }
     if (purpose == ParsePurpose::Messages && config.contains("format") &&
         !config.at("format").is_null()) {
-        bad_request("output_config.format requires constrained decoding, which NInfer does not "
-                    "provide",
-                    "output_config.format", "output_config_format_not_supported");
+        // {"type":"json_schema","schema":{...}} (Neroued/ninfer eb6696ae). Token counting
+        // ignores the format: it does not change the prompt.
+        parse_json_output_format(config.at("format"), request, "output_config.format",
+                                 JsonFormatProtocol::Anthropic);
     }
     if (!config.contains("effort") || config.at("effort").is_null()) { return; }
     if (!config.at("effort").is_string()) {
@@ -1130,6 +1131,9 @@ AnthropicMessagesRequest parse_anthropic_messages_request(const Json& body,
                         result.generation.max_tokens);
     result.hide_thinking = thinking_display_omitted(body);
     parse_generation_fields(body, result.generation);
+    // structured_outputs extension and the combination rules (stop_sequences, active tools,
+    // assistant prefill) once the whole request is known.
+    parse_structured_outputs(body, result.generation);
     return result;
 }
 

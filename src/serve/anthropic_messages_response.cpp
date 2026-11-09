@@ -2,6 +2,7 @@
 
 #include "serve/generation_service.h"
 #include "serve/random_id.h"
+#include "serve/request_validation.h"
 
 #include <nlohmann/json.hpp>
 
@@ -173,8 +174,14 @@ ApiError normalize_anthropic_error(ApiError error) {
 
 std::string make_anthropic_error_body(const ApiError& api_error, const std::string& request_id) {
     const ApiError error = normalize_anthropic_error(api_error);
+    // The Anthropic error object has no param: structured-output errors carry their request
+    // location (schema JSON Pointer included) in the message, as upstream 2734a56e does for all
+    // errors. Other errors keep their message unchanged.
+    const std::string message = is_output_constraint_param(error.param)
+                                    ? error.param + ": " + error.message
+                                    : error.message;
     return Json{{"type", "error"},
-                {"error", Json{{"type", error.type}, {"message", error.message}}},
+                {"error", Json{{"type", error.type}, {"message", message}}},
                 {"request_id", request_id}}
         .dump();
 }

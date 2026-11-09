@@ -16,6 +16,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace ninfer::serve {
@@ -96,7 +97,10 @@ enum class GenerationConsumerMode : std::uint8_t {
 };
 
 // Translate Engine request failures into the shared protocol-neutral HTTP error contract.
-ApiError request_error_to_api_error(const ninfer::RequestError& exception);
+// constraint_param: wire field of the request's output constraint (GenerationRequest), used as
+// the param of structured-output errors; empty for unconstrained requests.
+ApiError request_error_to_api_error(const ninfer::RequestError& exception,
+                                    std::string_view constraint_param = {});
 
 // Preparation ends by synchronously submitting the owning prompt to the Engine FIFO. The returned
 // request keeps its ingress/response lifetime reservation until the HTTP response is released and
@@ -114,6 +118,8 @@ struct PreparedRequest {
     ninfer::ResolvedSamplingParameters sampling;
     double prepare_seconds     = 0.0;
     double acquisition_seconds = 0.0;
+    // GenerationRequest::constraint_param, for errors raised while the generation runs.
+    std::string constraint_param;
     PromptPreparationStats preparation;
     int prompt_tokens    = 0;
     bool enable_thinking = true;

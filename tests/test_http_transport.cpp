@@ -1,4 +1,5 @@
 #include "serve/http_transport.h"
+#include "serve/request_validation.h"
 
 #include <atomic>
 #include <chrono>
@@ -166,6 +167,76 @@ int test_prompt_json_member_order() {
         "HTTP request JSON changed prompt-bearing object member order");
 }
 
+// Structured output: a schema number whose spelling the double cannot keep is rejected at the
+// body boundary with its location (Neroued/ninfer 81c8ce09); the same number outside a schema, or
+// a schema without such numbers, parses as before.
+// capy-flash: a body nested deeper than --max-request-json-depth is a 400 before parsing (a tool
+// schema nested 100 000 levels used to overflow the stack of the template renderer).
+int test_request_json_depth() {
+    const auto error_of = [](std::string body) {
+        httplib::Request request;
+        request.body = std::move(body);
+        try {
+            (void)ninfer::serve::parse_json_body(request);
+        } catch (const ninfer::serve::ApiException& exception) { return exception.error(); }
+        return ninfer::serve::ApiError{.status = 0};
+    };
+    const auto body = [](std::size_t levels) {
+        return R"({"model":"m","messages":[],"x":)" + std::string(levels, '[') +
+               std::string(levels, ']') + "}";
+    };
+    int failures = 0;
+    failures +=
+        check(error_of(body(999)).status == 0, "a body at the default depth (1000) was refused");
+    for (const std::size_t levels : {1000U, 100000U}) {
+        const auto error = error_of(body(levels));
+        failures += check(error.status == 400 && error.code == "request_json_too_deep" &&
+                              error.message.find("--max-request-json-depth") != std::string::npos,
+                          "a body nested past the default depth was not refused");
+    }
+    failures += check(error_of(R"({"s":")" + std::string(5000, '[') + R"("})").status == 0,
+                      "brackets inside a string counted as nesting");
+    ninfer::serve::configure_max_request_json_depth(4);
+    failures += check(error_of(body(4)).status == 400 && error_of(body(3)).status == 0,
+                      "the configured depth was not applied");
+    ninfer::serve::configure_max_request_json_depth(1000);
+    return failures;
+}
+
+int test_schema_number_spelling() {
+    const auto error_of = [](std::string body) {
+        httplib::Request request;
+        request.body = std::move(body);
+        try {
+            (void)ninfer::serve::parse_json_body(request);
+        } catch (const ninfer::serve::ApiException& exception) { return exception.error(); }
+        return ninfer::serve::ApiError{.status = 0};
+    };
+    int failures            = 0;
+    const auto inexact_chat = error_of(
+        R"({"model":"m","messages":[],"response_format":{"type":"json_schema","json_schema":{"name":"n","schema":{"type":"object","properties":{"x":{"type":"number","maximum":0.30000000000000001}}}}}})");
+    failures +=
+        check(inexact_chat.status == 400 && inexact_chat.code == "unsupported_json_schema" &&
+                  inexact_chat.param == "response_format.json_schema.schema/properties/x/maximum",
+              "inexact Chat schema bound was not rejected with its location");
+    const auto inexact_anthropic = error_of(
+        R"({"model":"m","messages":[],"output_config":{"format":{"type":"json_schema","schema":{"enum":[1, 0.10000000000000001]}}}})");
+    failures += check(inexact_anthropic.param == "output_config.format.schema/enum/1",
+                      "inexact Anthropic schema enum was not located");
+    const auto inexact_responses = error_of(
+        R"({"model":"m","input":"x","text":{"format":{"type":"json_schema","name":"n","schema":{"const":0.30000000000000001}}}})");
+    failures += check(inexact_responses.param == "text.format.schema/const",
+                      "inexact Responses schema const was not located");
+    failures += check(
+        error_of(
+            R"({"model":"m","messages":[],"temperature":0.30000000000000001,"response_format":{"type":"json_schema","json_schema":{"name":"n","schema":{"type":"number","maximum":0.5}}}})")
+                .status == 0,
+        "an exact schema or a non-schema number was rejected");
+    failures += check(error_of(R"({"model":"m","temperature":0.30000000000000001})").status == 0,
+                      "an unconstrained body was checked for number spelling");
+    return failures;
+}
+
 #if defined(__linux__)
 class Socket final {
 public:
@@ -238,7 +309,8 @@ int test_inherited_socket_liveness() {
 
 int main() {
     int failures = test_sse_transport() + test_sse_response_headers() +
-                   test_prompt_json_member_order() + test_client_label();
+                   test_prompt_json_member_order() + test_client_label() +
+                   test_schema_number_spelling() + test_request_json_depth();
 #if defined(__linux__)
     failures += test_inherited_socket_liveness();
 #endif

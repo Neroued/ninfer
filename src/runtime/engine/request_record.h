@@ -183,6 +183,9 @@ struct RequestRecord {
     bool lease_shortfall_reported         = false;
     EngineRequestState post_capture_state = EngineRequestState::Prefill;
     std::optional<FinishReason> terminal_reason;
+    // Structured output: set when the request's constraint failed in a committed round; the
+    // terminal settlement then discards the sequence and completes with this error.
+    std::exception_ptr constraint_failure;
 
     std::optional<BasePlan> base_plan;
     std::uint64_t remaining_service_work = 0;

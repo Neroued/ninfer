@@ -1,7 +1,9 @@
 #include "models/qwen3_5/frontend/output_session.h"
 #include "models/qwen3_5/frontend/chat_template.h"
+#include "models/qwen3_5/frontend/output_constraint.h"
 #include "models/qwen3_5/frontend/tokenizer.h"
 #include "models/qwen3_5/frontend/tool_call_parser.h"
+#include "text/grammar.h"
 #include "text/unicode.h"
 #include <algorithm>
 #include <array>
@@ -142,8 +144,11 @@ struct DecoderState {
     std::string utf8_pending;
     std::string think_marker_pending;
     std::array<std::string, 2> stop_pending;
-    bool in_reasoning              = false;
-    bool strip_content_leading     = false;
+    bool in_reasoning          = false;
+    bool strip_content_leading = false;
+    // Constrained output: the reasoning channel closes only on the canonical serialization the
+    // grammar licenses ("\n</think>\n\n"), and content is published byte for byte.
+    bool exact_reasoning_framing   = false;
     bool terminal                  = false;
     std::uint64_t decoded_bytes    = 0;
     std::uint32_t reasoning_tokens = 0;
@@ -158,18 +163,29 @@ struct SemanticThinkingState {
     bool in_reasoning                   = false;
     bool control_pending                = false;
     bool applied                        = false;
+    bool exact_reasoning_framing        = false;
+    // Constrained output: the budget ran out while the model was writing the canonical close
+    // ("\n</think>" or "\n</think>\n" pending). The control suffix would complete the close with
+    // its first bytes and push the rest of its message into the constrained content; the model's
+    // own close is completed instead with these tokens.
+    std::vector<TokenId> control_completion;
 };
+
+std::string_view reasoning_close(bool exact) noexcept {
+    return exact ? fi::kCanonicalReasoningCloseSerialization : kThinkClose;
+}
 
 void feed_semantic_thinking(SemanticThinkingState& state, std::string_view bytes) {
     if (!state.in_reasoning || bytes.empty()) { return; }
     state.close_pending.append(bytes);
-    if (state.close_pending.find(kThinkClose) != std::string::npos) {
+    const std::string_view close = reasoning_close(state.exact_reasoning_framing);
+    if (state.close_pending.find(close) != std::string::npos) {
         state.close_pending.clear();
         state.in_reasoning    = false;
         state.control_pending = false;
         return;
     }
-    const std::size_t hold = longest_suffix_prefix(state.close_pending, kThinkClose, true);
+    const std::size_t hold = longest_suffix_prefix(state.close_pending, close, true);
     state.close_pending.erase(0, state.close_pending.size() - hold);
 }
 
@@ -265,21 +281,22 @@ void feed_decoded_text(DecoderState& state, std::string_view text, const StopPol
     }
 
     state.think_marker_pending.append(text);
-    const std::size_t marker = state.think_marker_pending.find(kThinkClose);
+    const std::string_view close = reasoning_close(state.exact_reasoning_framing);
+    const std::size_t marker     = state.think_marker_pending.find(close);
     if (marker != std::string::npos) {
         feed_channel(state, OutputChannel::Reasoning,
                      std::string_view(state.think_marker_pending).substr(0, marker), policy,
                      emitted, committed_tokens, best_match);
         close_channel(state, OutputChannel::Reasoning, emitted);
-        std::string content = state.think_marker_pending.substr(marker + kThinkClose.size());
+        std::string content = state.think_marker_pending.substr(marker + close.size());
         state.think_marker_pending.clear();
         state.in_reasoning          = false;
-        state.strip_content_leading = true;
+        state.strip_content_leading = !state.exact_reasoning_framing;
         feed_content(state, std::move(content), policy, emitted, committed_tokens, best_match);
         return;
     }
 
-    const std::size_t hold = longest_suffix_prefix(state.think_marker_pending, kThinkClose, true);
+    const std::size_t hold = longest_suffix_prefix(state.think_marker_pending, close, true);
     const std::size_t safe = state.think_marker_pending.size() - hold;
     feed_channel(state, OutputChannel::Reasoning,
                  std::string_view(state.think_marker_pending).substr(0, safe), policy, emitted,
@@ -331,13 +348,15 @@ public:
     Impl(std::shared_ptr<const fi::Tokenizer> tokenizer_, StopPolicy policy_, OutputOptions output,
          bool starts_in_reasoning, ThinkingControlOptions thinking,
          std::shared_ptr<const std::vector<TokenId>> thinking_control_tokens_,
-         std::shared_ptr<const fi::ToolCallOutputContract> tool_call_output_)
+         std::shared_ptr<const fi::ToolCallOutputContract> tool_call_output_,
+         std::unique_ptr<text::GrammarSession> grammar_)
         : tokenizer(std::move(tokenizer_)), policy(std::move(policy_)),
           thinking_control_tokens(std::move(thinking_control_tokens_)),
           preserve_special(output.raw || output.preserve_special_tokens),
           split_reasoning(starts_in_reasoning && !output.raw),
           tool_call_output(output.raw ? nullptr : std::move(tool_call_output_),
-                           output.tool_name_max_length) {
+                           output.tool_name_max_length),
+          grammar(std::move(grammar_)) {
         if (thinking.budget && *thinking.budget == 0) {
             throw std::invalid_argument("thinking budget must be positive");
         }
@@ -348,7 +367,40 @@ public:
         // in thinking, capped or not: the count is reported per request, and it must not depend
         // on the presentation decoder, which raw output disables. A budget additionally caps it.
         // Its per-token work is one bounded scan for the close marker.
-        semantic.in_reasoning = starts_in_reasoning;
+        semantic.in_reasoning            = starts_in_reasoning;
+        state.exact_reasoning_framing    = grammar != nullptr;
+        semantic.exact_reasoning_framing = grammar != nullptr;
+    }
+
+    // Constrained output only: the tokens that complete a canonical close the model left pending
+    // at the thinking budget, when the control suffix's first bytes would complete it instead.
+    [[nodiscard]] std::vector<TokenId> close_completion(std::string_view pending) const {
+        if (!grammar || !thinking_control_tokens) { return {}; }
+        std::string control;
+        for (const TokenId token : *thinking_control_tokens) {
+            control.append(tokenizer->decoded_token(token).bytes);
+        }
+        const std::string_view close = fi::kCanonicalReasoningCloseSerialization;
+        for (std::size_t held = std::min(pending.size(), close.size() - 1); held != 0; --held) {
+            if (pending.substr(pending.size() - held) != close.substr(0, held)) { continue; }
+            if (std::string_view(control).starts_with(close.substr(held))) {
+                return tokenizer->encode(close.substr(held));
+            }
+        }
+        return {};
+    }
+
+    // Tentative matcher advance of a previewed span; a refused token leaves the committed state
+    // unchanged and is reported as runtime::ConstraintViolation (the Engine fails only this
+    // request).
+    void accept_grammar(std::span<const TokenId> tokens) {
+        if (!grammar || tokens.empty()) { return; }
+        try {
+            grammar->accept(tokens);
+        } catch (const std::exception& error) {
+            grammar->discard();
+            throw runtime::ConstraintViolation(error.what());
+        }
     }
 
     std::shared_ptr<const fi::Tokenizer> tokenizer;
@@ -371,6 +423,7 @@ public:
     std::vector<GeneratedToolCall> tool_calls;
     ToolCallParseDiagnostics tool_call_parse;
     bool preview_ready = false;
+    std::unique_ptr<text::GrammarSession> grammar;
 };
 
 PublishedOutput::PublishedOutput(PublishedOutput&& other) noexcept
@@ -405,10 +458,38 @@ OutputSession::OutputSession(
     std::shared_ptr<const frontend::Tokenizer> tokenizer, StopPolicy policy, OutputOptions output,
     bool starts_in_reasoning, ThinkingControlOptions thinking,
     std::shared_ptr<const std::vector<TokenId>> thinking_control_tokens,
-    std::shared_ptr<const frontend::ToolCallOutputContract> tool_call_output)
+    std::shared_ptr<const frontend::ToolCallOutputContract> tool_call_output,
+    std::unique_ptr<text::GrammarSession> grammar)
     : impl_(std::make_unique<Impl>(
           std::move(tokenizer), std::move(policy), output, starts_in_reasoning, thinking,
-          std::move(thinking_control_tokens), std::move(tool_call_output))) {}
+          std::move(thinking_control_tokens), std::move(tool_call_output), std::move(grammar))) {}
+
+bool OutputSession::constrained() const noexcept { return impl_ && impl_->grammar != nullptr; }
+
+std::uint32_t OutputSession::grammar_masks(std::span<const TokenId> drafts,
+                                           std::span<std::uint32_t> words) {
+    if (!constrained()) { throw std::logic_error("mask requested for unconstrained output"); }
+    return impl_->grammar->masks(drafts, words);
+}
+
+RequestError OutputSession::constraint_error(std::string dead_end) const {
+    if (constrained()) {
+        if (const std::string* failure = impl_->grammar->budget_failure())
+            return RequestError(RequestErrorKind::ConstraintBudgetExceeded, *failure);
+    }
+    return RequestError(RequestErrorKind::ConstraintDeadEnd, std::move(dead_end));
+}
+
+void OutputSession::discard_preview() noexcept {
+    if (impl_ == nullptr) { return; }
+    if (impl_->grammar) {
+        try {
+            impl_->grammar->discard();
+        } catch (...) {}
+    }
+    impl_->preview_ready = false;
+    impl_->preview_output.clear();
+}
 
 runtime::OutputDecision OutputSession::preview_model(std::span<const TokenId> tokens,
                                                      std::uint32_t total_budget_remaining,
@@ -444,6 +525,7 @@ runtime::OutputDecision OutputSession::preview_model(std::span<const TokenId> to
         if (impl_->preview_execution_split_after && *impl_->preview_execution_split_after > count) {
             throw std::logic_error("prefix execution split exceeds the accepted token prefix");
         }
+        impl_->accept_grammar(tokens.first(count));
         impl_->preview_ready = true;
         return runtime::OutputDecision{
             .accepted_tokens              = count,
@@ -514,6 +596,8 @@ runtime::OutputDecision OutputSession::preview_model(std::span<const TokenId> to
     if (impl_->preview_semantic.in_reasoning && impl_->preview_semantic.budget &&
         impl_->preview_semantic.model_thinking_tokens == *impl_->preview_semantic.budget) {
         impl_->preview_semantic.control_pending = true;
+        impl_->preview_semantic.control_completion =
+            impl_->close_completion(impl_->preview_semantic.close_pending);
         return complete(count, FinishReason::None, runtime::ContinuationAction::ApplyTargetControl);
     }
     return complete(count, FinishReason::None);
@@ -537,7 +621,13 @@ std::span<const TokenId> OutputSession::pending_control_tokens() const noexcept 
     if (impl_ == nullptr || !impl_->semantic.control_pending || !impl_->thinking_control_tokens) {
         return {};
     }
+    if (!impl_->semantic.control_completion.empty()) { return impl_->semantic.control_completion; }
     return *impl_->thinking_control_tokens;
+}
+
+bool OutputSession::control_completes_close() const noexcept {
+    return impl_ != nullptr && impl_->semantic.control_pending &&
+           !impl_->semantic.control_completion.empty();
 }
 
 std::uint32_t OutputSession::control_suffix_tokens() const noexcept {
@@ -590,10 +680,12 @@ runtime::OutputDecision OutputSession::preview_control(std::span<const TokenId> 
         throw std::logic_error("canonical thinking control did not close the reasoning channel");
     }
     impl_->preview_semantic.control_pending = false;
+    impl_->preview_semantic.control_completion.clear();
     impl_->preview_semantic.applied         = true;
     impl_->preview_semantic.injected_tokens = static_cast<std::uint32_t>(tokens.size());
     impl_->preview_finish_reason            = FinishReason::None;
-    impl_->preview_ready                    = true;
+    impl_->accept_grammar(tokens);
+    impl_->preview_ready = true;
     return runtime::OutputDecision{
         .accepted_tokens              = static_cast<std::uint32_t>(tokens.size()),
         .prefix_execution_split_after = impl_->preview_execution_split_after,
@@ -646,6 +738,12 @@ PublishedOutput OutputSession::commit_preview() {
     PublishedOutput output = std::move(impl_->preview_output);
     impl_->preview_output.clear();
     impl_->preview_ready = false;
+    if (impl_->grammar) {
+        // Constrained content is the language itself: no tool-call decoding (a JSON string may
+        // legitimately contain "<tool_call>").
+        impl_->grammar->confirm();
+        return output;
+    }
 
     for (OutputDelta& delta : output) {
         if (delta.channel == OutputChannel::Content) {

@@ -43,6 +43,8 @@ struct OpenAIResponsesCreateRequest {
     nlohmann::json metadata    = nlohmann::json::object();
     nlohmann::json tools       = nlohmann::json::array();
     nlohmann::json tool_choice = "auto";
+    // Echoed as response.text.format (default {"type":"text"}).
+    nlohmann::json text_format = {{"type", "text"}};
     // Responses beta namespace tools are flattened for the Engine and restored only at the wire
     // boundary. Never infer a namespace by splitting an Engine function name.
     std::unordered_map<std::string, OpenAIResponsesFunctionIdentity> tool_identities;

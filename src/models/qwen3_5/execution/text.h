@@ -95,6 +95,10 @@ public:
 
     void set_sampling(const ops::SamplingConfig* config) noexcept { sampling_config_ = config; }
 
+    // Structured output: a constrained prompt's first token is never redrawn by the reasoning EOS
+    // guard (program/context.h PrefillContext::reasoning_guard).
+    void set_reasoning_guard(bool enabled) noexcept { reasoning_guard_ = enabled; }
+
     void set_prefill_split_frontier(std::int64_t position) noexcept {
         prefill_split_frontier_ = position;
     }
@@ -385,6 +389,7 @@ private:
     const std::int32_t* proposal_head_ids_      = nullptr;
     int proposal_head_n_                        = 0;
     const ops::SamplingConfig* sampling_config_ = nullptr;
+    bool reasoning_guard_                       = true;
     const MtpParameters* mtp_                   = nullptr;
     const Qwen4Runtime* qwen4_runtime_          = nullptr;
     const Qwen4MtpParameters* qwen4_mtp_        = nullptr;

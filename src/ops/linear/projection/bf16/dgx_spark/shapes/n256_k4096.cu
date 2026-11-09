@@ -29,6 +29,9 @@ Bf16Launch select_bf16_n256_k4096(std::int32_t tokens) {
         return launch_bf16_simt<Static<Bf16A16SimtSchedule<
             8, 4, 1, 8, 2, 4, Bf16SimtActivationAccess::WarpPacked, Bf16WeightCache::Default,
             Bf16PhaseOrder::Sequential, 1, 2, 1, 2, 4>>>;
+    if (tokens <= 16)
+        return launch_bf16_sliced_k_mma<Static<Bf16A16SlicedKMmaSchedule<
+            16, 8, 16, 32, 2, Cache::cg, Cache::cg, 1, 7, Bf16MmaRaster::TokenFast>>>;
     if (tokens <= 24)
         return launch_bf16_sliced_k_mma<Static<Bf16A16SlicedKMmaSchedule<16, 8, 8, 64, 2>>>;
     if (tokens <= 32)

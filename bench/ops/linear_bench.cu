@@ -760,12 +760,13 @@ Result make_result(const BenchPoint& point, const LinearBenchWeight& weight,
                               point.n, point.k, point.t, point.policy)
                               .scratch_traffic_bytes;
     }
-    const auto required_bytes = checked_add(model_bytes, scratch_traffic, "required traffic");
+    // Useful traffic is native weights, input and final output. Encoding/workspace
+    // round trips remain a separate cost; they must not inflate effective bandwidth.
     const double useful_flops = 2.0 * static_cast<double>(point.n) * static_cast<double>(point.k) *
                                 static_cast<double>(point.t);
     const double seconds = timing.median_us * 1.0e-6;
     const double memory_floor_us =
-        static_cast<double>(required_bytes) / (bench::kRoofline.memory_gbs * 1.0e9) * 1.0e6;
+        static_cast<double>(model_bytes) / (bench::kRoofline.memory_gbs * 1.0e9) * 1.0e6;
 
     Result result;
     result.labels                   = join_labels(point.labels);
@@ -785,7 +786,7 @@ Result make_result(const BenchPoint& point, const LinearBenchWeight& weight,
     result.median_us          = timing.median_us;
     result.min_us             = timing.min_us;
     result.p95_us             = timing.p95_us;
-    result.effective_gbs      = static_cast<double>(required_bytes) / seconds / 1.0e9;
+    result.effective_gbs      = static_cast<double>(model_bytes) / seconds / 1.0e9;
     result.dram_spec_pct      = result.effective_gbs / bench::kRoofline.memory_gbs * 100.0;
     result.sustained_read_pct = result.effective_gbs / bench::kRoofline.sustained_read_gbs * 100.0;
     result.useful_tflops      = useful_flops / seconds / 1.0e12;
@@ -797,7 +798,7 @@ Result make_result(const BenchPoint& point, const LinearBenchWeight& weight,
     if (opt.cold && opt.graph_calls == 1 &&
         std::isfinite(bench::kRoofline.sustained_read_gbs)) {
         result.sustained_memory_floor_us =
-            static_cast<double>(required_bytes) / (bench::kRoofline.sustained_read_gbs * 1.0e3);
+            static_cast<double>(model_bytes) / (bench::kRoofline.sustained_read_gbs * 1.0e3);
         if (std::isfinite(result.compute_floor_us)) {
             result.roofline_floor_us =
                 std::max(result.sustained_memory_floor_us, result.compute_floor_us);

@@ -453,8 +453,11 @@ int run_profile(const Profile& profile, DeviceBuffer& hidden, const std::vector<
 
 } // namespace
 
+void add_topk_keys_cases(ninfer::test::linear_suite::Suite&);
+
 int main(int argc, char** argv) {
     linear_suite::Suite suite;
+    add_topk_keys_cases(suite);
     const Profile profiles[]{
         {.qtype       = QType::Q8_G32_FP16,
          .label       = "q8-full",

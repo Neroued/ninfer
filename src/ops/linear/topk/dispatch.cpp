@@ -43,18 +43,7 @@ std::size_t linear_topk_capacity(LinearTopKProfile profile, int head_rows, int m
         throw std::invalid_argument("linear_topk workspace: invalid column interval");
     WorkspaceLayoutBuilder layout;
     for (int columns = 1; columns <= kLinearTopKMaxChunkColumns; ++columns) {
-        bool reachable = columns >= min_columns && columns <= max_columns;
-        if (max_columns > kLinearTopKMaxChunkColumns) {
-            if (columns == kLinearTopKMaxChunkColumns)
-                reachable = true;
-            else {
-                const auto first = static_cast<std::int64_t>(min_columns) +
-                                   (columns - min_columns % kLinearTopKMaxChunkColumns +
-                                    kLinearTopKMaxChunkColumns) %
-                                       kLinearTopKMaxChunkColumns;
-                reachable |= first <= max_columns;
-            }
-        }
+        const bool reachable = linear_topk_chunk_reachable(columns, min_columns, max_columns);
         if (!reachable) continue;
         const auto plan = select_linear_topk(profile, columns);
         auto scope      = layout.scope();

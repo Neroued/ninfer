@@ -263,7 +263,8 @@ bf16_a16_sliced_k_mma_body(const __nv_bfloat16* __restrict__ x,
     if constexpr (kCollective) {
         __syncthreads();
         // All CTA threads participate. Tile is contiguous FP32 [BlockRows,BlockTokens],
-        // and only valid rows/columns are initialized. Its lifetime ends with this body.
+        // and only valid rows/columns are initialized. An epilogue may declare additional
+        // scratch after the tile with kSharedBytes<Schedule>. All storage expires with this body.
         epilogue.template finish_sliced_tile<Schedule>(output, partial, row0, token0, rows, tokens);
     }
 }

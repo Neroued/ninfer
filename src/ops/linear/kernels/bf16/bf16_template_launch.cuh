@@ -116,11 +116,12 @@ void launch_bf16_a16_sliced_k_mma(const Bf16A16Operands& p, Output output, Epilo
         p.k % (bf16_predicated_k<Schedule> ? 8 : Schedule::kBlockK))
         throw std::invalid_argument("BF16 sliced-K requires compatible row/K tiles");
     constexpr auto kernel = bf16_a16_sliced_k_mma_kernel<Schedule, Output, Epilogue>;
-    const int bytes       = common::prepare_shared<Schedule::kSharedBytes, kernel, true>();
+    const int bytes =
+        common::prepare_shared<linear_mma_shared_bytes<Schedule, Epilogue>, kernel, true>();
     common::for_each_token_slice(p.tokens, Schedule::kBlockTokens, [&](int offset, int count) {
-        const int row_tiles = bf16_predicated_rows<Schedule>
-                                  ? common::div_up(p.rows, Schedule::kBlockRows)
-                                  : p.rows / Schedule::kBlockRows;
+        const int row_tiles   = bf16_predicated_rows<Schedule>
+                                    ? common::div_up(p.rows, Schedule::kBlockRows)
+                                    : p.rows / Schedule::kBlockRows;
         const int token_tiles = common::div_up(count, Schedule::kBlockTokens);
         dim3 grid(row_tiles, token_tiles);
         if constexpr (Schedule::kRaster != Bf16MmaRaster::RowFast) {

@@ -17,6 +17,18 @@ inline constexpr std::int32_t kLinearTopKFullValidRows   = 248077;
 inline constexpr std::int32_t kLinearTopKMappedRows      = 131072;
 inline constexpr std::int32_t kLinearTopKHidden          = 5120;
 
+inline bool linear_topk_chunk_reachable(int columns, int first, int last) {
+    bool reachable = columns >= first && columns <= last;
+    if (last > kLinearTopKMaxChunkColumns) {
+        if (columns == kLinearTopKMaxChunkColumns) return true;
+        const auto next = std::int64_t(first) + (columns - first % kLinearTopKMaxChunkColumns +
+                                                 kLinearTopKMaxChunkColumns) %
+                                                    kLinearTopKMaxChunkColumns;
+        reachable |= next <= last;
+    }
+    return reachable;
+}
+
 struct LinearTopKWorkspace {
     Tensor partial_keys;
     Tensor group_keys;

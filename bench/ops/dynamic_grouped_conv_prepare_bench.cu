@@ -81,7 +81,7 @@ int main(int argc, char** argv) {
                 row.batch                 = batch;
                 row.workspace_bytes       = capacity;
                 const std::uint64_t bytes = projection.model_weight_bytes() +
-                                            std::uint64_t(4) * o.hidden * m + 10ULL * o.hidden +
+                                            std::uint64_t(4) * o.hidden * m + 6ULL * o.hidden +
                                             4ULL * groups * m;
                 const double flops = 2.0 * rows * o.hidden * m;
                 for (const auto& execution :

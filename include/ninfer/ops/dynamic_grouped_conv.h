@@ -94,4 +94,24 @@ void linear_dynamic_grouped_conv_add(const Tensor& x, const Weight& projection_w
                                      Tensor& residual, MemoryArena& workspace,
                                      CudaExecutionView execution);
 
+/**
+ * Local projection contribution followed by grouped two-tap convolution, without a residual.
+ * For h=16*g+j, z[h,i,b]=sum_c W[h,c]*x[c,i,b]:
+ *
+ * partial[h,i,b] = (base[h,0,1]+delta[g,0,i,b])*z[h,i,b]
+ *                + I(i>0)*(base[h,1,1]+delta[g,1,i,b])*z[h,i-1,b].
+ *
+ * x [C,W,B], partial [H,W,B], base [H,2,2] and delta [H/16,2,W,B] are contiguous,
+ * 16-byte-aligned BF16. Projection uses native contiguous BF16 [H,C] and A16 computation.
+ * W is in [2,16], B in [1,8]. Position zero has no previous contribution. All input,
+ * weight and output storage is pairwise disjoint. Inputs are preserved; every partial
+ * element is written. z has no observable cast boundary. The Op needs no caller workspace,
+ * allocates or retains no device storage, and supports Graph replay.
+ *
+ * Equal coefficients across shards permit summing their partials before one residual addition.
+ */
+void linear_dynamic_grouped_conv(const Tensor& x, const Weight& projection_weight,
+                                 const Tensor& base_kernel, const Tensor& finish_delta,
+                                 Tensor& partial, CudaExecutionView execution);
+
 } // namespace ninfer::ops

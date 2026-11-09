@@ -204,13 +204,8 @@ void finish_dynamic_branch(DraftExecutionView& execution, const Tensor& input,
 void propose_dflash2_batch(DraftExecutionView& execution, const DraftInputs& inputs,
                            DraftOutputs& outputs, int batch, int k, DraftEnvelopes envelopes) {
     if (execution.parameters.profile->config.draft->dflash2) {
-        const auto& target = execution.parameters.profile->config.text;
-        const auto& config = *execution.parameters.profile->config.draft;
-        if (config.rms_norm_eps != 1e-6F || config.rope_theta != 1e7F) {
-            throw std::invalid_argument(
-                "DFlash2: fused norm/RoPE requires epsilon=1e-6 and theta=1e7");
-        }
-
+        const auto& target             = execution.parameters.profile->config.text;
+        const auto& config             = *execution.parameters.profile->config.draft;
         const int width                = k + 1;
         const int columns              = width * batch;
         const int mask_columns         = k * batch;
@@ -255,7 +250,8 @@ void propose_dflash2_batch(DraftExecutionView& execution, const DraftInputs& inp
                 std::array outputs{query_flat, key_flat, value_flat};
                 ops::linear_split(branch.prepared.view({dimension(target.hidden_size), columns}),
                                   layer.query_key_value.weight, outputs, cuda);
-                ops::rmsnorm_rope(positions, layer.query_norm, layer.key_norm, query, key, cuda);
+                ops::rmsnorm_rope(positions, layer.query_norm, layer.key_norm, config.rms_norm_eps,
+                                  config.rope_theta, query, key, cuda);
                 Tensor attention = work.alloc(
                     DType::BF16, {dimension(config.attention.head_dim),
                                   dimension(config.attention.num_attention_heads), width, batch});
@@ -289,7 +285,7 @@ void propose_dflash2_batch(DraftExecutionView& execution, const DraftInputs& inp
             }
         }
         Tensor hidden = work.alloc(DType::BF16, {dimension(target.hidden_size), mask_columns});
-        ops::rmsnorm_pack_tail(residual, weights.final_norm, hidden, cuda);
+        ops::rmsnorm_pack_tail(residual, weights.final_norm, config.rms_norm_eps, hidden, cuda);
         Tensor candidates = outputs.candidate_ids;
         Tensor ids_flat =
             candidates.view({dimension(config.dflash2->selector_top_k), mask_columns});

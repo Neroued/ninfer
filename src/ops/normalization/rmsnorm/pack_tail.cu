@@ -2,6 +2,7 @@
 #include "core/device.h"
 #include "ops/common/host/operands.h"
 #include "ops/common/cuda/reduce.cuh"
+#include <cmath>
 #include <cuda_bf16.h>
 #include <cstdint>
 #include <stdexcept>
@@ -9,13 +10,9 @@
 
 namespace ninfer::ops {
 namespace {
-inline constexpr int kRmsnormPackTailRows        = 5120;
-inline constexpr int kRmsnormPackTailPairsPerRow = kRmsnormPackTailRows / 2;
-inline constexpr float kRmsnormPackTailEps       = 1.0e-6F;
-
-template <int kBlock>
+template <int Hidden, int kBlock>
 __device__ __forceinline__ float rmsnorm_pack_tail_inverse(float local_sum, float* warp_sums,
-                                                           float* inverse) {
+                                                           float* inverse, float epsilon) {
     constexpr int kWarps = kBlock / common::kWarpSize;
     const int lane       = static_cast<int>(threadIdx.x) & (common::kWarpSize - 1);
     const int warp       = static_cast<int>(threadIdx.x) / common::kWarpSize;
@@ -26,28 +23,26 @@ __device__ __forceinline__ float rmsnorm_pack_tail_inverse(float local_sum, floa
     if (warp == 0) {
         float block_sum = lane < kWarps ? warp_sums[lane] : 0.0F;
         block_sum       = common::warp_reduce_sum(block_sum);
-        if (lane == 0) {
-            *inverse = rsqrtf(block_sum * (1.0F / kRmsnormPackTailRows) + kRmsnormPackTailEps);
-        }
+        if (lane == 0) { *inverse = rsqrtf(block_sum * (1.0F / Hidden) + epsilon); }
     }
     __syncthreads();
     return *inverse;
 }
 
 // Grid x selects a mask column, grid y its request. Anchor columns are never read.
-template <int kBlock>
+template <int Hidden, int kBlock>
 __global__ __launch_bounds__(kBlock) void rmsnorm_pack_tail_kernel(
     const __nv_bfloat162* __restrict__ input, const __nv_bfloat162* __restrict__ weight,
-    __nv_bfloat162* __restrict__ output, int width) {
-    constexpr int kPairsPerThread = kRmsnormPackTailPairsPerRow / kBlock;
-    static_assert(kRmsnormPackTailPairsPerRow % kBlock == 0);
+    __nv_bfloat162* __restrict__ output, int width, float epsilon) {
+    constexpr int kPairsPerThread = (Hidden / 2) / kBlock;
+    static_assert((Hidden / 2) % kBlock == 0);
 
     const int tail  = static_cast<int>(blockIdx.x);
     const int batch = static_cast<int>(blockIdx.y);
     const std::int64_t input_base =
-        static_cast<std::int64_t>(batch * width + tail + 1) * kRmsnormPackTailPairsPerRow;
+        static_cast<std::int64_t>(batch * width + tail + 1) * (Hidden / 2);
     const std::int64_t output_base =
-        static_cast<std::int64_t>(batch * (width - 1) + tail) * kRmsnormPackTailPairsPerRow;
+        static_cast<std::int64_t>(batch * (width - 1) + tail) * (Hidden / 2);
 
     __nv_bfloat162 values[kPairsPerThread];
     __nv_bfloat162 weights[kPairsPerThread];
@@ -63,7 +58,8 @@ __global__ __launch_bounds__(kBlock) void rmsnorm_pack_tail_kernel(
 
     __shared__ float warp_sums[kBlock / common::kWarpSize];
     __shared__ float inverse;
-    const float inv = rmsnorm_pack_tail_inverse<kBlock>(local_sum, warp_sums, &inverse);
+    const float inv =
+        rmsnorm_pack_tail_inverse<Hidden, kBlock>(local_sum, warp_sums, &inverse, epsilon);
 
 #pragma unroll
     for (int item = 0; item < kPairsPerThread; ++item) {
@@ -74,15 +70,14 @@ __global__ __launch_bounds__(kBlock) void rmsnorm_pack_tail_kernel(
     }
 }
 
-void launch_rmsnorm_pack_tail(const Tensor& input, const Tensor& weight, Tensor& output,
-                              cudaStream_t stream) {
-    constexpr int threads = 512;
+template <int Hidden, int Threads>
+void launch_rmsnorm_pack_tail(const Tensor& input, const Tensor& weight, float epsilon,
+                              Tensor& output, cudaStream_t stream) {
     const dim3 grid(input.ne[1] - 1, input.ne[2]);
-    rmsnorm_pack_tail_kernel<threads>
-        <<<grid, threads, 0, stream>>>(static_cast<const __nv_bfloat162*>(input.data),
-                                       static_cast<const __nv_bfloat162*>(weight.data),
-                                       static_cast<__nv_bfloat162*>(output.data), input.ne[1]);
-    CUDA_CHECK(cudaGetLastError());
+    rmsnorm_pack_tail_kernel<Hidden, Threads><<<grid, Threads, 0, stream>>>(
+        static_cast<const __nv_bfloat162*>(input.data),
+        static_cast<const __nv_bfloat162*>(weight.data), static_cast<__nv_bfloat162*>(output.data),
+        input.ne[1], epsilon);
 }
 
 void require_bf16_contiguous_aligned(const Tensor& tensor, const char* name) {
@@ -95,13 +90,15 @@ void require_bf16_contiguous_aligned(const Tensor& tensor, const char* name) {
 
 } // namespace
 
-void rmsnorm_pack_tail(const Tensor& input, const Tensor& weight, Tensor& output,
+void rmsnorm_pack_tail(const Tensor& input, const Tensor& weight, float epsilon, Tensor& output,
                        CudaExecutionView execution) {
     if (input.device != execution.device() || weight.device != execution.device() ||
         output.device != execution.device()) {
         throw std::invalid_argument(
             "rmsnorm_pack_tail: operands must belong to the execution device");
     }
+    if (!(epsilon > 0) || !std::isfinite(epsilon))
+        throw std::invalid_argument("rmsnorm_pack_tail: epsilon must be positive and finite");
     const auto stream = execution.stream();
     require_bf16_contiguous_aligned(input, "input");
     require_bf16_contiguous_aligned(weight, "weight");
@@ -109,17 +106,18 @@ void rmsnorm_pack_tail(const Tensor& input, const Tensor& weight, Tensor& output
 
     const std::int32_t batch = input.ne[2];
     const std::int32_t width = input.ne[1];
-    if (input.ne[0] != 5120 || (width < 2 || width > 16) || batch < 1 || batch > 8 ||
+    const int hidden         = input.ne[0];
+    if ((hidden != 4096 && hidden != 5120) || (width < 2 || width > 16) || batch < 1 || batch > 8 ||
         input.ne[3] != 1) {
         throw std::invalid_argument(
-            "rmsnorm_pack_tail: input must have shape [5120,W,B], W=2..16, B=1..8");
+            "rmsnorm_pack_tail: input must have shape [H,W,B], H=4096 or 5120, W=2..16, B=1..8");
     }
-    if (weight.ne[0] != 5120 || weight.ne[1] != 1 || weight.ne[2] != 1 || weight.ne[3] != 1) {
-        throw std::invalid_argument("rmsnorm_pack_tail: weight must have shape [5120]");
+    if (weight.ne[0] != hidden || weight.ne[1] != 1 || weight.ne[2] != 1 || weight.ne[3] != 1) {
+        throw std::invalid_argument("rmsnorm_pack_tail: weight must have shape [H]");
     }
-    if (output.ne[0] != 5120 || output.ne[1] != (width - 1) * batch || output.ne[2] != 1 ||
+    if (output.ne[0] != hidden || output.ne[1] != (width - 1) * batch || output.ne[2] != 1 ||
         output.ne[3] != 1) {
-        throw std::invalid_argument("rmsnorm_pack_tail: output must have shape [5120,(W-1)B]");
+        throw std::invalid_argument("rmsnorm_pack_tail: output must have shape [H,(W-1)B]");
     }
     const common::operand::Range ranges[]{
         common::operand::range(input.data, input.bytes(), "rmsnorm_pack_tail"),
@@ -128,7 +126,15 @@ void rmsnorm_pack_tail(const Tensor& input, const Tensor& weight, Tensor& output
     };
     common::operand::disjoint(ranges, "rmsnorm_pack_tail");
 
-    launch_rmsnorm_pack_tail(input, weight, output, stream);
+    if (hidden == 4096) {
+        if ((width - 1) * batch <= 32)
+            launch_rmsnorm_pack_tail<4096, 128>(input, weight, epsilon, output, stream);
+        else
+            launch_rmsnorm_pack_tail<4096, 256>(input, weight, epsilon, output, stream);
+    } else {
+        launch_rmsnorm_pack_tail<5120, 512>(input, weight, epsilon, output, stream);
+    }
+    CUDA_CHECK(cudaGetLastError());
 }
 
 } // namespace ninfer::ops

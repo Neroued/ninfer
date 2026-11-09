@@ -1,78 +1,90 @@
 #pragma once
-#include "ops/rope/kernels/phase.cuh"
+
 #include "ops/common/cuda/reduce.cuh"
 #include <cuda_bf16.h>
 #include <cstdint>
 
 namespace ninfer::ops::detail {
 
-struct RmsnormRopeD128Pair {
-    __nv_bfloat162 first;
-    __nv_bfloat162 second;
+// Passed by value in launch parameters, with no device backing or workspace.
+// FP64 frequencies and phase reduction preserve accuracy at long absolute positions.
+struct RmsnormRopeD128Frequencies {
+    double value[64];
 };
 
-// One warp owns one represented BF16 D128 head. Each lane carries adjacent pairs from the first
-// and second split halves and returns the corresponding full-head RoPE pairs.
-__device__ __forceinline__ RmsnormRopeD128Pair rmsnorm_rope_d128_head(
-    __nv_bfloat162 input0, __nv_bfloat162 input1, __nv_bfloat162 weight0, __nv_bfloat162 weight1,
-    const float* cos_cache, const float* sin_cache, int lane) {
-    constexpr float kEpsilon = 1.0e-6F;
-    const float2 input0_f32  = __bfloat1622float2(input0);
-    const float2 input1_f32  = __bfloat1622float2(input1);
-    float sum                = input0_f32.x * input0_f32.x + input0_f32.y * input0_f32.y +
-                input1_f32.x * input1_f32.x + input1_f32.y * input1_f32.y;
-    sum           = common::warp_reduce_sum(sum);
-    float inverse = lane == 0 ? rsqrtf(sum * (1.0F / 128.0F) + kEpsilon) : 0.0F;
-    inverse       = __shfl_sync(common::kFullWarpMask, inverse, 0);
-
-    const float2 weight0_f32  = __bfloat1622float2(weight0);
-    const float2 weight1_f32  = __bfloat1622float2(weight1);
-    const float normalized0_x = input0_f32.x * inverse * weight0_f32.x;
-    const float normalized0_y = input0_f32.y * inverse * weight0_f32.y;
-    const float normalized1_x = input1_f32.x * inverse * weight1_f32.x;
-    const float normalized1_y = input1_f32.y * inverse * weight1_f32.y;
-    const int rotary_pair     = lane * 2;
-    const float cosine0       = cos_cache[rotary_pair];
-    const float cosine1       = cos_cache[rotary_pair + 1];
-    const float sine0         = sin_cache[rotary_pair];
-    const float sine1         = sin_cache[rotary_pair + 1];
-    return {
-        __floats2bfloat162_rn(normalized0_x * cosine0 - normalized1_x * sine0,
-                              normalized0_y * cosine1 - normalized1_y * sine1),
-        __floats2bfloat162_rn(normalized1_x * cosine0 + normalized0_x * sine0,
-                              normalized1_y * cosine1 + normalized0_y * sine1),
-    };
-}
-
-// A CTA owns eight heads of one token. Pair form uses four Q CTAs and one K CTA;
-// the single-K form uses one CTA. Each warp evaluates one complete head.
-template <bool Pair>
-__global__ __launch_bounds__(256) void rmsnorm_rope_d128_kernel(
-    const std::int32_t* __restrict__ positions, const __nv_bfloat16* __restrict__ q_norm,
-    const __nv_bfloat16* __restrict__ k_norm, __nv_bfloat16* __restrict__ q,
-    __nv_bfloat16* __restrict__ k) {
-    constexpr int kPairs = 64;
-    const int token      = blockIdx.x;
-    const bool query     = Pair && blockIdx.y < 4;
-    const int head =
-        (query ? static_cast<int>(blockIdx.y) * 8 : 0) + static_cast<int>(threadIdx.x) / 32;
-    const int lane     = threadIdx.x % 32;
-    auto* data         = reinterpret_cast<__nv_bfloat162*>(query ? q : k);
-    const auto* weight = reinterpret_cast<const __nv_bfloat162*>(query ? q_norm : k_norm);
-    __shared__ float cos_cache[kPairs];
-    __shared__ float sin_cache[kPairs];
-    __shared__ __nv_bfloat162 weight_cache[kPairs];
-    if (threadIdx.x < kPairs) {
-        const int pair = threadIdx.x;
-        rope_d128_theta1e7_sincos(positions, token, pair, &sin_cache[pair], &cos_cache[pair]);
-        weight_cache[pair] = weight[pair];
+// A CTA shares phases across Q and K heads of one token. Each (half) warp owns
+// a complete head and retains the unrounded normalized values in registers.
+template <int QueryHeads, int KeyHeads, int HeadsPerBlock, int LanesPerHead, bool WideAngles>
+__global__ __launch_bounds__(HeadsPerBlock* LanesPerHead) void rmsnorm_rope_d128_kernel(
+    const std::int32_t* __restrict__ positions, const __nv_bfloat162* __restrict__ q_weight,
+    const __nv_bfloat162* __restrict__ k_weight, __nv_bfloat162* __restrict__ q,
+    __nv_bfloat162* __restrict__ k, float epsilon, RmsnormRopeD128Frequencies frequencies) {
+    constexpr int Groups        = (QueryHeads + KeyHeads + HeadsPerBlock - 1) / HeadsPerBlock;
+    constexpr int Items         = 32 / LanesPerHead;
+    constexpr bool CacheWeights = QueryHeads == 32 && HeadsPerBlock == 8 && LanesPerHead == 32;
+    static_assert(LanesPerHead == 16 || LanesPerHead == 32);
+    static_assert(HeadsPerBlock * LanesPerHead >= 64);
+    const int token      = blockIdx.x / Groups;
+    const int head       = (blockIdx.x % Groups) * HeadsPerBlock + threadIdx.x / LanesPerHead;
+    const int lane       = threadIdx.x % LanesPerHead;
+    const bool query     = head < QueryHeads;
+    const int local_head = query ? head : head - QueryHeads;
+    auto* data           = query ? q : k;
+    const auto* weight   = query ? q_weight : k_weight;
+    const int base       = (token * (query ? QueryHeads : KeyHeads) + local_head) * 64;
+    __shared__ float sine[64], cosine[64];
+    __shared__ __nv_bfloat162 weight_cache[CacheWeights ? 64 : 1];
+    if constexpr (CacheWeights)
+        if (threadIdx.x < 64) weight_cache[threadIdx.x] = weight[threadIdx.x];
+    if (threadIdx.x < 64) {
+        const int pair     = threadIdx.x;
+        const double angle = double(positions[token]) * frequencies.value[pair];
+        // theta>=1 bounds phases by the I32 position range. Keep the large-angle
+        // library's register cost out of these common profiles.
+        if constexpr (!WideAngles) {
+            const float reduced =
+                float(angle - nearbyint(angle * 0.159154943091895336) * 6.28318530717958648);
+            sincosf(reduced, sine + pair, cosine + pair);
+        } else {
+            double s, c;
+            sincos(angle, &s, &c);
+            sine[pair]   = float(s);
+            cosine[pair] = float(c);
+        }
     }
-    __syncthreads();
-    const std::int64_t base = (static_cast<std::int64_t>(token) * (query ? 32 : 8) + head) * kPairs;
-    const auto out =
-        rmsnorm_rope_d128_head(data[base + lane], data[base + lane + 32], weight_cache[lane],
-                               weight_cache[lane + 32], cos_cache, sin_cache, lane);
-    data[base + lane]      = out.first;
-    data[base + lane + 32] = out.second;
+    if constexpr (CacheWeights) __syncthreads();
+    float2 first[Items]{}, second[Items]{}, gain0[Items]{}, gain1[Items]{};
+    float square = 0;
+    if (head < QueryHeads + KeyHeads) {
+#pragma unroll
+        for (int j = 0; j < Items; ++j) {
+            const int i = lane + j * LanesPerHead;
+            first[j]    = __bfloat1622float2(data[base + i]);
+            second[j]   = __bfloat1622float2(data[base + i + 32]);
+            gain0[j]    = __bfloat1622float2(CacheWeights ? weight_cache[i] : weight[i]);
+            gain1[j]    = __bfloat1622float2(CacheWeights ? weight_cache[i + 32] : weight[i + 32]);
+            square += first[j].x * first[j].x + first[j].y * first[j].y +
+                      second[j].x * second[j].x + second[j].y * second[j].y;
+        }
+    }
+    square        = common::warp_reduce_sum<LanesPerHead>(square);
+    float inverse = lane == 0 ? rsqrtf(square * (1.F / 128.F) + epsilon) : 0.F;
+    inverse       = __shfl_sync(common::kFullWarpMask, inverse, 0, LanesPerHead);
+    if constexpr (!CacheWeights) __syncthreads();
+    if (head < QueryHeads + KeyHeads) {
+#pragma unroll
+        for (int j = 0; j < Items; ++j) {
+            const int i         = lane + j * LanesPerHead;
+            const int pair      = i * 2;
+            const float x       = first[j].x * inverse * gain0[j].x;
+            const float y       = first[j].y * inverse * gain0[j].y;
+            const float u       = second[j].x * inverse * gain1[j].x;
+            const float v       = second[j].y * inverse * gain1[j].y;
+            data[base + i]      = __floats2bfloat162_rn(x * cosine[pair] - u * sine[pair],
+                                                        y * cosine[pair + 1] - v * sine[pair + 1]);
+            data[base + i + 32] = __floats2bfloat162_rn(u * cosine[pair] + x * sine[pair],
+                                                        v * cosine[pair + 1] + y * sine[pair + 1]);
+        }
+    }
 }
 } // namespace ninfer::ops::detail

@@ -12,7 +12,9 @@
 #include <iostream>
 #include <limits>
 #include <random>
+#include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 using namespace ninfer;
@@ -21,12 +23,16 @@ using namespace ninfer::test;
 namespace {
 
 constexpr int kHeadDim         = 128;
-constexpr int kQueryHeads      = 32;
-constexpr int kKeyHeads        = 8;
-constexpr double kEpsilon      = 1.0e-6;
-constexpr double kTheta        = 1.0e7;
 constexpr double kRelativeL2   = 1.85e-3;
 constexpr double kPairRelative = 6.9e-3;
+
+struct Profile {
+    int query_heads, key_heads;
+    float epsilon, theta;
+};
+
+constexpr Profile kQwen{32, 8, 1.e-6F, 1.e7F};
+constexpr Profile kGlm{16, 4, 1.e-5F, 10000.F};
 
 struct OracleResult {
     std::vector<double> output;
@@ -63,7 +69,7 @@ std::vector<std::int32_t> make_positions(int tokens, int first_position) {
 // Independent FP64 oracle for the complete public formula. It does not call either standalone Op
 // or reproduce the production warp reduction, coefficient table, or range reduction.
 OracleResult fused_oracle(const std::vector<float>& input, const std::vector<float>& weight,
-                          const std::vector<std::int32_t>& positions, int heads) {
+                          const std::vector<std::int32_t>& positions, int heads, Profile profile) {
     const int tokens = static_cast<int>(positions.size());
     OracleResult result{
         .output     = std::vector<double>(input.size()),
@@ -78,7 +84,7 @@ OracleResult fused_oracle(const std::vector<float>& input, const std::vector<flo
                 sum_squares += value * value;
             }
             const double inverse =
-                1.0 / std::sqrt(sum_squares / static_cast<double>(kHeadDim) + kEpsilon);
+                1.0 / std::sqrt(sum_squares / static_cast<double>(kHeadDim) + profile.epsilon);
             for (int dim = 0; dim < kHeadDim; ++dim) {
                 normalized[static_cast<std::size_t>(dim)] =
                     static_cast<double>(input[dense_index(heads, token, head, dim)]) * inverse *
@@ -88,7 +94,7 @@ OracleResult fused_oracle(const std::vector<float>& input, const std::vector<flo
                 const double exponent = -2.0 * static_cast<double>(pair) / kHeadDim;
                 const double phase =
                     static_cast<double>(positions[static_cast<std::size_t>(token)]) *
-                    std::pow(kTheta, exponent);
+                    std::pow(double(profile.theta), exponent);
                 const double cosine = std::cos(phase);
                 const double sine   = std::sin(phase);
                 const double first  = normalized[static_cast<std::size_t>(pair)];
@@ -156,46 +162,48 @@ int verify_profile(const std::string& label, const std::vector<double>& got,
     return 0;
 }
 
-template <class Launch, class Reset>
-void execute(Launch launch, Reset reset, bool graph) {
+template <class Launch, class Reset, class Check>
+int execute(Launch launch, Reset reset, Check check, bool graph) {
     if (!graph) {
+        reset(cuda_environment().default_execution, 0);
         launch(cuda_environment().default_execution);
         cuda_synchronize();
-        return;
+        return check();
     }
     cudaStream_t stream = nullptr;
     cuda_check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "create stream");
     const auto stream_execution = ninfer::test::cuda_environment().context.execution_view(stream);
+    int failures                = 0;
     {
         DecodeGraphDefinition definition;
         DecodeGraphExecutable executable;
         definition.capture(stream, [&] { launch(stream_execution); });
         executable.instantiate(definition);
         for (int i = 0; i < 2; ++i) {
-            reset(stream_execution);
+            reset(stream_execution, i);
             executable.launch(stream);
             cuda_check(cudaStreamSynchronize(stream), "graph replay synchronize");
+            failures += check();
         }
     }
     cuda_check(cudaStreamDestroy(stream), "destroy stream");
+    return failures;
 }
 
-int run_pair_case(int width, int batch, int first_position, std::uint32_t seed,
-                  bool graph = false) {
-    const int tokens              = width * batch;
-    const std::size_t q_count     = static_cast<std::size_t>(kHeadDim) * kQueryHeads * tokens;
-    const std::size_t k_count     = static_cast<std::size_t>(kHeadDim) * kKeyHeads * tokens;
-    const auto q                  = make_bf16_values(q_count, seed, -4.0F, 4.0F);
-    const auto k                  = make_bf16_values(k_count, seed + 1U, -4.0F, 4.0F);
-    const auto q_weight           = make_bf16_values(kHeadDim, seed + 2U, 0.25F, 1.75F);
-    const auto k_weight           = make_bf16_values(kHeadDim, seed + 3U, 0.25F, 1.75F);
-    const auto positions          = make_positions(tokens, first_position);
-    const OracleResult q_expected = fused_oracle(q, q_weight, positions, kQueryHeads);
-    const OracleResult k_expected = fused_oracle(k, k_weight, positions, kKeyHeads);
-    const auto q_bits             = bf16_bits(q);
-    const auto k_bits             = bf16_bits(k);
-    const auto q_weight_bits      = bf16_bits(q_weight);
-    const auto k_weight_bits      = bf16_bits(k_weight);
+int run_pair_case(int width, int batch, int first_position, std::uint32_t seed, bool graph = false,
+                  Profile profile = kQwen, float magnitude = 4.F) {
+    const int tokens          = width * batch;
+    const std::size_t q_count = static_cast<std::size_t>(kHeadDim) * profile.query_heads * tokens;
+    const std::size_t k_count = static_cast<std::size_t>(kHeadDim) * profile.key_heads * tokens;
+    const auto q              = make_bf16_values(q_count, seed, -magnitude, magnitude);
+    const auto k              = make_bf16_values(k_count, seed + 1U, -magnitude, magnitude);
+    const auto q_weight       = make_bf16_values(kHeadDim, seed + 2U, 0.25F, 1.75F);
+    const auto k_weight       = make_bf16_values(kHeadDim, seed + 3U, 0.25F, 1.75F);
+    auto positions            = make_positions(tokens, first_position);
+    const auto q_bits         = bf16_bits(q);
+    const auto k_bits         = bf16_bits(k);
+    const auto q_weight_bits  = bf16_bits(q_weight);
+    const auto k_weight_bits  = bf16_bits(k_weight);
 
     GuardedDeviceBuffer q_device(q_count * sizeof(std::uint16_t));
     GuardedDeviceBuffer k_device(k_count * sizeof(std::uint16_t));
@@ -204,18 +212,28 @@ int run_pair_case(int width, int batch, int first_position, std::uint32_t seed,
     DeviceBuffer q_weight_device = to_device(q_weight_bits);
     DeviceBuffer k_weight_device = to_device(k_weight_bits);
     DeviceBuffer position_device = to_device(positions);
-    Tensor q_tensor(q_device.span(), DType::BF16, {kHeadDim, kQueryHeads, width, batch});
-    Tensor k_tensor(k_device.span(), DType::BF16, {kHeadDim, kKeyHeads, width, batch});
+    Tensor q_tensor(q_device.span(), DType::BF16, {kHeadDim, profile.query_heads, width, batch});
+    Tensor k_tensor(k_device.span(), DType::BF16, {kHeadDim, profile.key_heads, width, batch});
     Tensor q_weight_tensor(q_weight_device.span(), DType::BF16, {kHeadDim});
     Tensor k_weight_tensor(k_weight_device.span(), DType::BF16, {kHeadDim});
     Tensor position_tensor(position_device.span(), DType::I32, {width, batch});
-    execute(
+    const std::string label = "rmsnorm_rope pair Hq=" + std::to_string(profile.query_heads) +
+                              " W=" + std::to_string(width) + " B=" + std::to_string(batch) +
+                              " graph=" + std::to_string(graph);
+    int failures = execute(
         [&](CudaExecutionView cuda) {
-            ops::rmsnorm_rope(position_tensor, q_weight_tensor, k_weight_tensor, q_tensor, k_tensor,
-                              cuda);
+            ops::rmsnorm_rope(position_tensor, q_weight_tensor, k_weight_tensor, profile.epsilon,
+                              profile.theta, q_tensor, k_tensor, cuda);
         },
-        [&](CudaExecutionView cuda) {
+        [&](CudaExecutionView cuda, int replay) {
             const auto stream = cuda.stream();
+            for (int b = 0; b < batch; ++b)
+                for (int i = 0; i < width; ++i)
+                    positions[b * width + i] = (b % 2 ? 17 : first_position) + i + replay * 123;
+            cuda_check(cudaMemcpyAsync(position_device.data(), positions.data(),
+                                       positions.size() * sizeof(std::int32_t),
+                                       cudaMemcpyHostToDevice, stream),
+                       "update positions");
             cuda_check(cudaMemcpyAsync(q_device.data(), q_bits.data(), q_device.bytes(),
                                        cudaMemcpyHostToDevice, stream),
                        "reset q");
@@ -223,15 +241,15 @@ int run_pair_case(int width, int batch, int first_position, std::uint32_t seed,
                                        cudaMemcpyHostToDevice, stream),
                        "reset k");
         },
+        [&] {
+            return verify_profile(
+                       label + " q", from_device_bf16(q_device.data(), q_count),
+                       fused_oracle(q, q_weight, positions, profile.query_heads, profile)) +
+                   verify_profile(label + " k", from_device_bf16(k_device.data(), k_count),
+                                  fused_oracle(k, k_weight, positions, profile.key_heads, profile));
+        },
         graph);
 
-    const std::string label = "rmsnorm_rope pair W=" + std::to_string(width) +
-                              " graph=" + std::to_string(graph) + " B=" + std::to_string(batch) +
-                              " P=" + std::to_string(first_position);
-    int failures =
-        verify_profile(label + " q", from_device_bf16(q_device.data(), q_count), q_expected);
-    failures +=
-        verify_profile(label + " k", from_device_bf16(k_device.data(), k_count), k_expected);
     failures += q_device.verify_guards(label + " q guards");
     failures += k_device.verify_guards(label + " k guards");
     failures +=
@@ -246,38 +264,47 @@ int run_pair_case(int width, int batch, int first_position, std::uint32_t seed,
     return failures;
 }
 
-int run_single_case(int tokens, int first_position, std::uint32_t seed, bool graph = false) {
-    const std::size_t count     = static_cast<std::size_t>(kHeadDim) * kKeyHeads * tokens;
-    const auto input            = make_bf16_values(count, seed, -4.0F, 4.0F);
-    const auto weight           = make_bf16_values(kHeadDim, seed + 1U, 0.25F, 1.75F);
-    const auto positions        = make_positions(tokens, first_position);
-    const OracleResult expected = fused_oracle(input, weight, positions, kKeyHeads);
-    const auto input_bits       = bf16_bits(input);
-    const auto weight_bits      = bf16_bits(weight);
+int run_single_case(int tokens, int first_position, std::uint32_t seed, bool graph = false,
+                    Profile profile = kQwen, float magnitude = 4.F) {
+    const std::size_t count = static_cast<std::size_t>(kHeadDim) * profile.key_heads * tokens;
+    const auto input        = make_bf16_values(count, seed, -magnitude, magnitude);
+    const auto weight       = make_bf16_values(kHeadDim, seed + 1U, 0.25F, 1.75F);
+    auto positions          = make_positions(tokens, first_position);
+    const auto input_bits   = bf16_bits(input);
+    const auto weight_bits  = bf16_bits(weight);
 
     GuardedDeviceBuffer input_device(count * sizeof(std::uint16_t));
     input_device.copy_from_host(input_bits.data(), input_device.bytes());
     DeviceBuffer weight_device   = to_device(weight_bits);
     DeviceBuffer position_device = to_device(positions);
-    Tensor input_tensor(input_device.span(), DType::BF16, {kHeadDim, kKeyHeads, tokens});
+    Tensor input_tensor(input_device.span(), DType::BF16, {kHeadDim, profile.key_heads, tokens});
     Tensor weight_tensor(weight_device.span(), DType::BF16, {kHeadDim});
     Tensor position_tensor(position_device.span(), DType::I32, {tokens});
-    execute(
+    const std::string label = "rmsnorm_rope single Hkv=" + std::to_string(profile.key_heads) +
+                              " T=" + std::to_string(tokens) + " graph=" + std::to_string(graph);
+    int failures = execute(
         [&](CudaExecutionView cuda) {
-            ops::rmsnorm_rope(position_tensor, weight_tensor, input_tensor, cuda);
+            ops::rmsnorm_rope(position_tensor, weight_tensor, profile.epsilon, profile.theta,
+                              input_tensor, cuda);
         },
-        [&](CudaExecutionView cuda) {
+        [&](CudaExecutionView cuda, int replay) {
             const auto stream = cuda.stream();
+            positions         = make_positions(tokens, first_position + replay * 123);
+            cuda_check(cudaMemcpyAsync(position_device.data(), positions.data(),
+                                       positions.size() * sizeof(std::int32_t),
+                                       cudaMemcpyHostToDevice, stream),
+                       "update positions");
             cuda_check(cudaMemcpyAsync(input_device.data(), input_bits.data(), input_device.bytes(),
                                        cudaMemcpyHostToDevice, stream),
                        "reset K");
         },
+        [&] {
+            return verify_profile(
+                label, from_device_bf16(input_device.data(), count),
+                fused_oracle(input, weight, positions, profile.key_heads, profile));
+        },
         graph);
 
-    const std::string label = "rmsnorm_rope single graph=" + std::to_string(graph) +
-                              " T=" + std::to_string(tokens) +
-                              " P=" + std::to_string(first_position);
-    int failures = verify_profile(label, from_device_bf16(input_device.data(), count), expected);
     failures += input_device.verify_guards(label + " guards");
     failures +=
         verify_exact((label + " positions").c_str(),
@@ -285,6 +312,37 @@ int run_single_case(int tokens, int first_position, std::uint32_t seed, bool gra
     failures +=
         verify_exact((label + " weight").c_str(),
                      from_device<std::uint16_t>(weight_device, weight_bits.size()), weight_bits);
+    return failures;
+}
+
+int contract() {
+    const auto e = cuda_environment().default_execution;
+    DeviceBuffer storage(e.device(), 16384);
+    Tensor q(storage.span().subspan(0, 8192), DType::BF16, {128, 16, 2}),
+        k(storage.span().subspan(8192, 2048), DType::BF16, {128, 4, 2}),
+        weight(storage.span().subspan(10240, 256), DType::BF16, {128}),
+        positions(storage.span().subspan(10496, 8), DType::I32, {2});
+    int failures = 0;
+    auto reject  = [&](auto launch) {
+        try {
+            launch();
+            ++failures;
+        } catch (const std::invalid_argument&) {}
+    };
+    for (float invalid : {0.F, -1.F, std::numeric_limits<float>::infinity(),
+                          std::numeric_limits<float>::quiet_NaN()}) {
+        reject([&] { ops::rmsnorm_rope(positions, weight, weight, invalid, 10000.F, q, k, e); });
+        reject([&] { ops::rmsnorm_rope(positions, weight, weight, 1.e-5F, invalid, q, k, e); });
+        reject([&] { ops::rmsnorm_rope(positions, weight, invalid, 10000.F, k, e); });
+        reject([&] { ops::rmsnorm_rope(positions, weight, 1.e-5F, invalid, k, e); });
+    }
+    k.ne[1] = 8;
+    reject([&] { ops::rmsnorm_rope(positions, weight, weight, 1.e-5F, 10000.F, q, k, e); });
+    k.ne[1] = 3;
+    reject([&] { ops::rmsnorm_rope(positions, weight, 1.e-5F, 10000.F, k, e); });
+    k.ne[1] = 4;
+    k.data  = q.data;
+    reject([&] { ops::rmsnorm_rope(positions, weight, weight, 1.e-5F, 10000.F, q, k, e); });
     return failures;
 }
 
@@ -314,4 +372,28 @@ void add_rmsnorm_rope_cases(ninfer::test::OpSuite& suite) {
     single(64, 262'080, 0x2003U);
     single(1024, 130'048, 0x2004U);
     single(2048, 260'032, 0x2005U);
+    for (const auto [width, batch] : {std::pair{2, 1}, {4, 2}, {8, 3}, {16, 8}}) {
+        suite.add("rmsnorm_rope/glm/pair/w" + std::to_string(width) + "/b" + std::to_string(batch),
+                  [=] { return run_pair_case(width, batch, 1'048'560, 0x3000U, false, kGlm); });
+    }
+    suite.add("rmsnorm_rope/glm/pair/graph",
+              [] { return run_pair_case(8, 8, 1'048'560, 0x3001U, true, kGlm); },
+              {{"execution", "graph"}});
+    suite.add("rmsnorm_rope/glm/pair/epsilon",
+              [] { return run_pair_case(2, 1, 0, 0x3002U, false, kGlm, 1.e-4F); });
+    for (int tokens : {1, 16, 256, 512, 2048}) {
+        suite.add("rmsnorm_rope/glm/single/t" + std::to_string(tokens),
+                  [=] { return run_single_case(tokens, 1'048'560, 0x4000U, tokens == 2048, kGlm); },
+                  {{"execution", tokens == 2048 ? "graph" : "eager"}});
+    }
+    suite.add("rmsnorm_rope/parameters",
+              [] {
+                  const Profile other{16, 4, 3.e-4F, 12345.F};
+                  return run_pair_case(3, 2, 1'048'560, 0x5000U, true, other, .01F) +
+                         run_single_case(7, 1'048'560, 0x5001U, false, other, .01F) +
+                         run_single_case(2, 1'048'560, 0x5002U, false,
+                                         Profile{16, 4, 3.e-4F, 1.e-4F}, .01F);
+              },
+              {{"execution", "graph"}});
+    suite.add("rmsnorm_rope/contract", contract);
 }

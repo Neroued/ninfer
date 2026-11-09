@@ -4,6 +4,7 @@
 #include "core/device.h"
 
 #include <array>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <stdexcept>
@@ -12,21 +13,68 @@
 namespace ninfer::ops {
 namespace {
 
-template <bool Pair>
-void launch_fixed(const Tensor& positions, const Tensor* q_norm_weight, const Tensor& k_norm_weight,
-                  Tensor* q, Tensor& k, std::int32_t tokens, cudaStream_t stream) {
-    const dim3 grid(tokens, Pair ? 5 : 1);
-    detail::rmsnorm_rope_d128_kernel<Pair><<<grid, 256, 0, stream>>>(
-        static_cast<const std::int32_t*>(positions.data),
-        q_norm_weight == nullptr ? nullptr : static_cast<const __nv_bfloat16*>(q_norm_weight->data),
-        static_cast<const __nv_bfloat16*>(k_norm_weight.data),
-        q == nullptr ? nullptr : static_cast<__nv_bfloat16*>(q->data),
-        static_cast<__nv_bfloat16*>(k.data));
+detail::RmsnormRopeD128Frequencies make_frequencies(float theta) {
+    detail::RmsnormRopeD128Frequencies result;
+    for (int i = 0; i < 64; ++i) result.value[i] = std::pow(double(theta), -double(i) / 64);
+    return result;
+}
+
+template <int QueryHeads, int KeyHeads, int HeadsPerBlock, int LanesPerHead, bool WideAngles>
+void launch(const Tensor& positions, const Tensor* q_norm_weight, const Tensor& k_norm_weight,
+            Tensor* q, Tensor& k, int tokens, float epsilon,
+            detail::RmsnormRopeD128Frequencies frequencies, cudaStream_t stream) {
+    constexpr int groups  = (QueryHeads + KeyHeads + HeadsPerBlock - 1) / HeadsPerBlock;
+    constexpr int threads = HeadsPerBlock * LanesPerHead;
+    detail::rmsnorm_rope_d128_kernel<QueryHeads, KeyHeads, HeadsPerBlock, LanesPerHead, WideAngles>
+        <<<tokens * groups, threads, 0, stream>>>(
+            static_cast<const std::int32_t*>(positions.data),
+            q_norm_weight == nullptr ? nullptr
+                                     : static_cast<const __nv_bfloat162*>(q_norm_weight->data),
+            static_cast<const __nv_bfloat162*>(k_norm_weight.data),
+            q == nullptr ? nullptr : static_cast<__nv_bfloat162*>(q->data),
+            static_cast<__nv_bfloat162*>(k.data), epsilon, frequencies);
+}
+
+template <int QueryHeads, int KeyHeads>
+void dispatch(const Tensor& positions, const Tensor* q_norm_weight, const Tensor& k_norm_weight,
+              Tensor* q, Tensor& k, int tokens, float epsilon, float theta, cudaStream_t stream) {
+    // Common profiles avoid recomputing the 64 coefficients at each eager submission.
+    static const auto qwen = make_frequencies(1.e7F);
+    static const auto glm  = make_frequencies(10000.F);
+    const auto frequencies = theta == 1.e7F     ? qwen
+                             : theta == 10000.F ? glm
+                                                : make_frequencies(theta);
+    const auto route       = [&]<bool WideAngles>() {
+        if constexpr (QueryHeads > 0) {
+            if (tokens < 32) {
+                if constexpr (QueryHeads == 32)
+                    launch<32, 8, 8, 32, WideAngles>(positions, q_norm_weight, k_norm_weight, q, k,
+                                                           tokens, epsilon, frequencies, stream);
+                else
+                    launch<16, 4, 4, 16, WideAngles>(positions, q_norm_weight, k_norm_weight, q, k,
+                                                           tokens, epsilon, frequencies, stream);
+            } else
+                launch<QueryHeads, KeyHeads, 20, 16, WideAngles>(positions, q_norm_weight,
+                                                                       k_norm_weight, q, k, tokens,
+                                                                       epsilon, frequencies, stream);
+        } else {
+            launch<0, KeyHeads, KeyHeads, 16, WideAngles>(positions, nullptr, k_norm_weight,
+                                                                nullptr, k, tokens, epsilon, frequencies,
+                                                                stream);
+        }
+    };
+    if (theta >= 1.F)
+        route.template operator()<false>();
+    else
+        route.template operator()<true>();
+}
+
+void require_parameters(float epsilon, float theta) {
+    if (!(epsilon > 0) || !std::isfinite(epsilon) || !(theta > 0) || !std::isfinite(theta))
+        throw std::invalid_argument("rmsnorm_rope: epsilon and theta must be positive and finite");
 }
 
 constexpr std::int32_t kHeadDim       = 128;
-constexpr std::int32_t kQueryHeads    = 32;
-constexpr std::int32_t kKeyHeads      = 8;
 constexpr std::int32_t kMaximumBatch  = 8;
 constexpr std::int32_t kMaximumSingle = 2048;
 
@@ -69,7 +117,8 @@ void require_single_nonoverlap(const Tensor& positions, const Tensor& norm_weigh
 } // namespace
 
 void rmsnorm_rope(const Tensor& positions, const Tensor& q_norm_weight, const Tensor& k_norm_weight,
-                  Tensor& q, Tensor& k, CudaExecutionView execution) {
+                  float epsilon, float theta, Tensor& q, Tensor& k, CudaExecutionView execution) {
+    require_parameters(epsilon, theta);
     const auto stream        = execution.stream();
     const std::int32_t batch = q.ne[3];
     const std::int32_t width = q.ne[2];
@@ -77,31 +126,46 @@ void rmsnorm_rope(const Tensor& positions, const Tensor& q_norm_weight, const Te
     if (batch < 1 || batch > kMaximumBatch) {
         throw std::invalid_argument("rmsnorm_rope: pair B must be 1..8");
     }
-    require_tensor(q, DType::BF16, {kHeadDim, kQueryHeads, width, batch}, "q", execution.device());
-    require_tensor(k, DType::BF16, {kHeadDim, kKeyHeads, width, batch}, "k", execution.device());
+    const int query_heads = q.ne[1], key_heads = k.ne[1];
+    if (!((query_heads == 32 && key_heads == 8) || (query_heads == 16 && key_heads == 4)))
+        throw std::invalid_argument("rmsnorm_rope: pair (Hq,Hkv) must be (32,8) or (16,4)");
+    require_tensor(q, DType::BF16, {kHeadDim, query_heads, width, batch}, "q", execution.device());
+    require_tensor(k, DType::BF16, {kHeadDim, key_heads, width, batch}, "k", execution.device());
     require_tensor(q_norm_weight, DType::BF16, {kHeadDim, 1, 1, 1}, "q norm weight",
                    execution.device());
     require_tensor(k_norm_weight, DType::BF16, {kHeadDim, 1, 1, 1}, "k norm weight",
                    execution.device());
     require_tensor(positions, DType::I32, {width, batch, 1, 1}, "positions", execution.device());
     require_pair_nonoverlap(positions, q_norm_weight, k_norm_weight, q, k);
-    launch_fixed<true>(positions, &q_norm_weight, k_norm_weight, &q, k, width * batch, stream);
+    if (query_heads == 16)
+        dispatch<16, 4>(positions, &q_norm_weight, k_norm_weight, &q, k, width * batch, epsilon,
+                        theta, stream);
+    else
+        dispatch<32, 8>(positions, &q_norm_weight, k_norm_weight, &q, k, width * batch, epsilon,
+                        theta, stream);
     CUDA_CHECK(cudaGetLastError());
 }
 
-void rmsnorm_rope(const Tensor& positions, const Tensor& norm_weight, Tensor& x,
-                  CudaExecutionView execution) {
+void rmsnorm_rope(const Tensor& positions, const Tensor& norm_weight, float epsilon, float theta,
+                  Tensor& x, CudaExecutionView execution) {
+    require_parameters(epsilon, theta);
     const auto stream         = execution.stream();
     const std::int32_t tokens = x.ne[2];
     if (tokens < 1 || tokens > kMaximumSingle) {
         throw std::invalid_argument("rmsnorm_rope: single T must be 1..2048");
     }
-    require_tensor(x, DType::BF16, {kHeadDim, kKeyHeads, tokens, 1}, "x", execution.device());
+    const int heads = x.ne[1];
+    if (heads != 4 && heads != 8)
+        throw std::invalid_argument("rmsnorm_rope: single Hkv must be 4 or 8");
+    require_tensor(x, DType::BF16, {kHeadDim, heads, tokens, 1}, "x", execution.device());
     require_tensor(norm_weight, DType::BF16, {kHeadDim, 1, 1, 1}, "norm weight",
                    execution.device());
     require_tensor(positions, DType::I32, {tokens, 1, 1, 1}, "positions", execution.device());
     require_single_nonoverlap(positions, norm_weight, x);
-    launch_fixed<false>(positions, nullptr, norm_weight, nullptr, x, tokens, stream);
+    if (heads == 4)
+        dispatch<0, 4>(positions, nullptr, norm_weight, nullptr, x, tokens, epsilon, theta, stream);
+    else
+        dispatch<0, 8>(positions, nullptr, norm_weight, nullptr, x, tokens, epsilon, theta, stream);
     CUDA_CHECK(cudaGetLastError());
 }
 

@@ -1,87 +1,101 @@
-// Public warm-cache Graph benchmark for the fused tail-pack RMSNorm contract.
+// Complete fused normalization and packing, with one public Op per sample.
 #include "ninfer/ops/rmsnorm_pack_tail.h"
-#include "core/buffer.h"
-#include "ninfer_bench_common.h"
-#include <cstdlib>
-#include <stdexcept>
-#include <string>
+#include "op_measurement.cuh"
+#include <iomanip>
+#include <sstream>
 using namespace ninfer;
-using namespace ninfer::bench;
+namespace m = ninfer::bench::measurement;
 
 namespace {
 struct Options {
-    int width = 0, batch = 0, warmup = 8, repeat = 60;
+    m::Options timing;
+    int hidden = 5120, calls = 1;
+    float epsilon           = 1.e-6F;
+    std::vector<int> widths = m::sweep("2:16"), batches = m::sweep("1:8");
 };
 
 Options parse(int argc, char** argv) {
-    Options out;
+    Options o;
+    o.timing.cache = "warm";
     for (int i = 1; i < argc; ++i) {
-        const std::string flag = argv[i];
+        const std::string_view flag(argv[i]);
         if (flag == "--help") {
-            std::printf("usage: %s [--width W] [--batch B] [--warmup N] [--repeat N]\n", argv[0]);
+            std::cout
+                << "usage: ninfer_rmsnorm_pack_tail_bench [--hidden 4096|5120] [--epsilon E]\n"
+                   "  --widths W,... (2..16) --batches B,... (1..8)\n"
+                   "  --calls N (1..64): repeated read-only inputs, warm cache only\n";
+            m::help();
             std::exit(0);
         }
-        if (i + 1 >= argc) throw std::invalid_argument("missing argument");
-        const int value = std::atoi(argv[++i]);
-        if (flag == "--width")
-            out.width = value;
-        else if (flag == "--batch")
-            out.batch = value;
-        else if (flag == "--warmup")
-            out.warmup = value;
-        else if (flag == "--repeat")
-            out.repeat = value;
-        else
-            throw std::invalid_argument("unknown flag: " + flag);
+        const auto value = m::take(argc, argv, i);
+        if (flag == "--hidden")
+            o.hidden = m::integer(value, 4096, 5120);
+        else if (flag == "--calls")
+            o.calls = m::integer(value, 1, 64);
+        else if (flag == "--epsilon") {
+            std::size_t end;
+            o.epsilon = std::stof(std::string(value), &end);
+            if (end != value.size() || !(o.epsilon > 0) || !std::isfinite(o.epsilon))
+                throw std::invalid_argument("epsilon must be positive and finite");
+        } else if (flag == "--widths")
+            o.widths = m::integers(value, 2, 16);
+        else if (flag == "--batches")
+            o.batches = m::integers(value, 1, 8);
+        else if (!m::parse(o.timing, flag, value))
+            throw std::invalid_argument("unknown flag: " + std::string(flag));
     }
-    if ((out.width && (out.width < 2 || out.width > 16)) || out.batch < 0 || out.batch > 8 ||
-        out.warmup < 0 || out.repeat < 1)
-        throw std::invalid_argument("invalid width/batch/timing domain");
-    return out;
+    if (o.hidden != 4096 && o.hidden != 5120) throw std::invalid_argument("hidden: 4096|5120");
+    if (o.timing.profile && o.widths.size() * o.batches.size() != 1)
+        throw std::invalid_argument("profile requires one extent");
+    if (o.calls > 1 && o.timing.cache != "warm")
+        throw std::invalid_argument("multiple calls require --cache warm");
+    return o;
 }
 
-void run(int width, int batch, const Options& options, CudaExecutionView cuda) {
-    const int columns   = (width - 1) * batch;
-    DeviceBuffer input  = make_bf16(5120ULL * width * batch, 101U);
-    DeviceBuffer weight = make_bf16(5120, 103U, .8F, 1.2F);
-    DeviceBuffer output = make_zeros(5120ULL * columns * 2);
-    Tensor x(input.span(), DType::BF16, {5120, width, batch}),
-        w(weight.span(), DType::BF16, {5120}), y(output.span(), DType::BF16, {5120, columns});
-    TimedGraph graph;
-    constexpr int repeats = 32;
-    graph.capture(cuda, [&](CudaExecutionView cuda) {
-        for (int i = 0; i < repeats; ++i) { ops::rmsnorm_pack_tail(x, w, y, cuda); }
-    });
-    const auto timing = measure_graph(graph, cuda, options.warmup, options.repeat);
-    std::printf("%d,%d,%d,%d,%.3f,%.3f,%.3f,%zu\n", width, batch, columns, 512,
-                timing.median_us / repeats, timing.min_us / repeats, timing.p95_us / repeats,
-                graph.nodes());
+void run(const Options& o, int width, int batch, bench::L2FlushBuffer& flush, m::Csv& csv,
+         CudaExecutionView e) {
+    const int columns = (width - 1) * batch;
+    auto input        = bench::make_bf16(std::size_t(o.hidden) * width * batch, 101U);
+    auto weight       = bench::make_bf16(o.hidden, 103U, .8F, 1.2F);
+    auto output       = bench::make_buffer(std::size_t(o.hidden) * columns * 2);
+    Tensor x(input.span(), DType::BF16, {o.hidden, width, batch}),
+        w(weight.span(), DType::BF16, {o.hidden}),
+        y(output.span(), DType::BF16, {o.hidden, columns});
+    const auto launch = [&](CudaExecutionView cuda) {
+        for (int i = 0; i < o.calls; ++i) ops::rmsnorm_pack_tail(x, w, o.epsilon, y, cuda);
+    };
+    const std::size_t bytes = std::size_t(o.hidden) * (4 * columns + 2);
+    m::Row row{.op     = "rmsnorm_pack_tail",
+               .format = "bf16",
+               .n      = o.hidden,
+               .tokens = width,
+               .batch  = batch};
+    for (const auto& execution : m::selections(o.timing.execution, "graph", "eager"))
+        for (const auto& cache : m::selections(o.timing.cache, "cold", "warm")) {
+            const auto result =
+                m::measure(launch, [](CudaExecutionView) {}, flush, e, o.timing, execution, cache);
+            std::ostringstream metadata;
+            metadata << std::setprecision(9) << o.epsilon << ',' << bytes << ','
+                     << bench::format_metric(bytes / (bench::kRoofline.memory_gbs * 1000), 3, "")
+                     << ',' << o.calls << ','
+                     << bench::format_metric(result.gpu.median_us / o.calls, 3, "");
+            csv.write(row, result, execution, cache, metadata.str());
+        }
 }
 } // namespace
 
 int main(int argc, char** argv) {
-    int devices = 0;
-    if (cudaGetDeviceCount(&devices) != cudaSuccess || !devices) {
-        std::puts("SKIP: no usable CUDA device");
-        return 0;
-    }
     try {
-        const auto options  = parse(argc, argv);
-        cudaStream_t stream = nullptr;
-        CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
-        const auto cuda = ninfer::bench::device_context().execution_view(stream);
-        std::puts("W,B,U,threads,median_us,min_us,p95_us,graph_repetitions");
-        for (int width = 2; width <= 16; ++width)
-            for (int batch = 1; batch <= 8; ++batch) {
-                if ((options.width && width != options.width) ||
-                    (options.batch && batch != options.batch))
-                    continue;
-                run(width, batch, options, cuda);
-            }
-        CUDA_CHECK(cudaStreamDestroy(stream));
+        const auto o = parse(argc, argv);
+        bench::L2FlushBuffer flush(o.timing.flush_bytes);
+        m::Csv csv(o.timing.csv_out, "epsilon,logical_bytes_per_call,bandwidth_reference_us_per_"
+                                     "call,calls,per_call_median_us");
+        const auto e = bench::device_context().execution_view();
+        for (int w : o.widths)
+            for (int b : o.batches) run(o, w, b, flush, csv, e);
         return 0;
-    } catch (const std::exception& e) {
-        std::fprintf(stderr, "rmsnorm_pack_tail: %s\n", e.what());
+    } catch (const std::exception& ex) {
+        std::cerr << "rmsnorm_pack_tail: " << ex.what() << '\n';
         return 1;
     }
 }

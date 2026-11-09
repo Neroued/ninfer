@@ -13,16 +13,10 @@
 namespace ninfer::ops {
 namespace {
 
-detail::RmsnormRopeD128Frequencies make_frequencies(float theta) {
-    detail::RmsnormRopeD128Frequencies result;
-    for (int i = 0; i < 64; ++i) result.value[i] = std::pow(double(theta), -double(i) / 64);
-    return result;
-}
-
 template <int QueryHeads, int KeyHeads, int HeadsPerBlock, int LanesPerHead, bool WideAngles>
 void launch(const Tensor& positions, const Tensor* q_norm_weight, const Tensor& k_norm_weight,
             Tensor* q, Tensor& k, int tokens, float epsilon,
-            detail::RmsnormRopeD128Frequencies frequencies, cudaStream_t stream) {
+            detail::RopeD128Frequencies frequencies, cudaStream_t stream) {
     constexpr int groups  = (QueryHeads + KeyHeads + HeadsPerBlock - 1) / HeadsPerBlock;
     constexpr int threads = HeadsPerBlock * LanesPerHead;
     detail::rmsnorm_rope_d128_kernel<QueryHeads, KeyHeads, HeadsPerBlock, LanesPerHead, WideAngles>
@@ -38,12 +32,7 @@ void launch(const Tensor& positions, const Tensor* q_norm_weight, const Tensor& 
 template <int QueryHeads, int KeyHeads>
 void dispatch(const Tensor& positions, const Tensor* q_norm_weight, const Tensor& k_norm_weight,
               Tensor* q, Tensor& k, int tokens, float epsilon, float theta, cudaStream_t stream) {
-    // Common profiles avoid recomputing the 64 coefficients at each eager submission.
-    static const auto qwen = make_frequencies(1.e7F);
-    static const auto glm  = make_frequencies(10000.F);
-    const auto frequencies = theta == 1.e7F     ? qwen
-                             : theta == 10000.F ? glm
-                                                : make_frequencies(theta);
+    const auto frequencies = detail::rope_d128_frequencies(theta);
     const auto route       = [&]<bool WideAngles>() {
         if constexpr (QueryHeads > 0) {
             if (tokens < 32) {

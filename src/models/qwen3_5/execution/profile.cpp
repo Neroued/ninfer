@@ -102,6 +102,18 @@ public:
         DraftProfile out;
         out.feature_projection = linear(w.feature_projection);
         out.output_head        = linear(w.output_head_use);
+        const auto& config     = *plan_.config().draft;
+        if (config.dflash2) {
+            const auto key              = linear(w.layers.front().attention.context_key);
+            out.context_materialization = ops::ContextKVMaterializeProfile{
+                key.k,
+                dimension(config.attention.head_dim),
+                dimension(config.attention.num_key_value_heads),
+                static_cast<std::uint32_t>(config.sliding_window.value_or(0)),
+                key.qtype,
+                config.rms_norm_eps,
+                config.rope_theta};
+        }
         for (const auto& layer : w.layers) {
             out.layers.push_back({linear(layer.attention.output), dense(layer.mlp)});
         }

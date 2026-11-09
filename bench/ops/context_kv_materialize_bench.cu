@@ -24,6 +24,9 @@
 using namespace ninfer;
 
 namespace {
+constexpr ops::ContextKVMaterializeProfile kProfile{5120,   128,  8, 2048, QType::Q8_G32_FP16,
+                                                    1.e-6F, 1.e7F};
+
 
 constexpr int kLayers       = static_cast<int>(ops::kContextKVMaterializeLayers);
 constexpr int kParentRows   = 6144;
@@ -143,8 +146,9 @@ struct Fixture {
         : positions(ninfer::bench::device_context().device(), sizeof(std::int32_t) * 2048),
           counts(ninfer::bench::device_context().device(), sizeof(std::int32_t) * 8),
           offsets(ninfer::bench::device_context().device(), sizeof(std::int64_t) * 8),
-          direct_workspace(ninfer::bench::device_context().device(),
-                           ops::context_kv_materialize_workspace_capacity_bytes(1, 1, 2048)),
+          direct_workspace(
+              ninfer::bench::device_context().device(),
+              ops::context_kv_materialize_workspace_capacity_bytes(kProfile, 1, 1, 2048)),
           direct_arena(direct_workspace.span()) {
         StateImageBuilder builder;
         cache_layout = plan_cyclic_kv_cache(builder, kLayers, kCapacity, kHeads, kHeadDim);
@@ -194,7 +198,7 @@ struct Fixture {
         Tensor x(context.span(), DType::BF16, {kHidden, width, batch});
         Tensor pos(positions.span(), DType::I32, {width, batch});
         Tensor count(counts.span(), DType::I32, {batch});
-        ops::context_kv_materialize(x, pos, count, layers, envelope, direct_arena, cuda);
+        ops::context_kv_materialize(x, pos, count, layers, kProfile, envelope, direct_arena, cuda);
     }
 };
 
@@ -252,21 +256,22 @@ int main(int argc, char** argv) {
                     CUDA_CHECK(cudaGraphDestroy(empty));
                     if (nodes != 0 || fixture.direct_arena.peak_used() != 0)
                         throw std::runtime_error("zero-count materialization is not empty");
-                    std::printf(
-                        "%d,%d,%d,%s,0,0,nan,nan,nan,0,%zu,0\n", width, batch, width * batch,
-                        options.counts.c_str(),
-                        ops::context_kv_materialize_workspace_capacity_bytes(batch, width, width));
+                    std::printf("%d,%d,%d,%s,0,0,nan,nan,nan,0,%zu,0\n", width, batch,
+                                width * batch, options.counts.c_str(),
+                                ops::context_kv_materialize_workspace_capacity_bytes(
+                                    kProfile, batch, width, width));
                     continue;
                 }
                 const auto timing = measure(
                     options, [&](CudaExecutionView cuda) { fixture.launch(width, batch, cuda); },
                     flush, cuda, &nodes);
-                std::printf(
-                    "%d,%d,%d,%s,%u,%u,%.3f,%.3f,%.3f,%zu,%zu,%zu\n", width, batch, width * batch,
-                    options.counts.c_str(), fixture.envelope.min_count, fixture.envelope.max_count,
-                    timing.median_us, timing.min_us, timing.p95_us, nodes,
-                    ops::context_kv_materialize_workspace_capacity_bytes(batch, width, width),
-                    fixture.direct_arena.peak_used());
+                std::printf("%d,%d,%d,%s,%u,%u,%.3f,%.3f,%.3f,%zu,%zu,%zu\n", width, batch,
+                            width * batch, options.counts.c_str(), fixture.envelope.min_count,
+                            fixture.envelope.max_count, timing.median_us, timing.min_us,
+                            timing.p95_us, nodes,
+                            ops::context_kv_materialize_workspace_capacity_bytes(kProfile, batch,
+                                                                                 width, width),
+                            fixture.direct_arena.peak_used());
             }
         CUDA_CHECK(cudaStreamDestroy(stream));
         return 0;

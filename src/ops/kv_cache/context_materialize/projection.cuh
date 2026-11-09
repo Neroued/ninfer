@@ -21,10 +21,15 @@ union alignas(16) MaterializeStorage {
 };
 
 template <int Rows, int Columns, int BlockK, int ColumnWarps>
-__global__ __launch_bounds__(Rows / 16 * ColumnWarps * 32, 1) void context_kv_mma_kernel(
-    const __nv_bfloat16* hidden, const int* positions, const int* counts,
-    const std::int64_t* offsets, DeviceLayers layers, float* key_scratch, int width, int batch,
-    int min_count, int max_count) {
+__global__
+__launch_bounds__(Rows / 16 * ColumnWarps * 32,
+                  Rows == 64 && Columns == 32
+                      ? 2
+                      : 1) void context_kv_mma_kernel(const __nv_bfloat16* hidden,
+                                                      const int* positions, const int* counts,
+                                                      const __grid_constant__ DeviceLayers layers,
+                                                      float* key_scratch, int width, int batch,
+                                                      int min_count, int max_count) {
     constexpr int kBlockRows = Rows, kBlockK = BlockK;
     constexpr int kBlockColumns = Columns;
     constexpr int kColumnWarps  = ColumnWarps;
@@ -142,8 +147,8 @@ __global__ __launch_bounds__(Rows / 16 * ColumnWarps * 32, 1) void context_kv_mm
                 common::cp_commit();
             }
 
-            const auto load_fragments = [&](int k_step, unsigned(&a)[4],
-                                            unsigned(&b)[kTokenMmas][2]) {
+            const auto load_fragments = [&](int k_step, unsigned (&a)[4],
+                                            unsigned (&b)[kTokenMmas][2]) {
                 const int weight_row = warp_row * 16 + a_rowoff;
                 const int weight_col = k_step * 16 + a_coloff;
                 common::ldmatrix_x4(
@@ -226,8 +231,8 @@ __global__ __launch_bounds__(Rows / 16 * ColumnWarps * 32, 1) void context_kv_mm
         if (count < min_count || count > max_count || column % width >= count) continue;
         if constexpr (Rows == 128) {
             if (!value) {
-                store_key_head(storage.scores[local], layer, positions, offsets, column, width,
-                               row_begin / 128);
+                store_key_head(storage.scores[local], layer, positions, layer.offsets, column,
+                               width, row_begin / 128, layers.epsilon, layers.frequencies);
                 continue;
             }
         }
@@ -238,7 +243,7 @@ __global__ __launch_bounds__(Rows / 16 * ColumnWarps * 32, 1) void context_kv_mm
                 key_scratch[row + 1024LL * (packed_column + max_count * batch * layer_index)] =
                     result;
             } else {
-                store_value(row, column, offsets[request], positions, layer, result);
+                store_value(row, column, layer.offsets[request], positions, layer, result);
             }
         }
     }
@@ -251,19 +256,41 @@ using GroupedSchedule =
 
 template <int Columns, int KWarps = 8>
 __global__ __launch_bounds__(KWarps * 32, 1) void context_kv_grouped_kernel(
-    const __nv_bfloat16* x, const int* positions, const int* counts, const std::int64_t* offsets,
-    DeviceLayers layers, float* scratch, int width, int batch, int min_count, int max_count) {
+    const __nv_bfloat16* x, const int* positions, const int* counts,
+    const __grid_constant__ DeviceLayers layers, float* scratch, int width, int batch,
+    int min_count, int max_count) {
     const int l        = blockIdx.z >> 1;
     const bool value   = (blockIdx.z & 1) != 0;
     const auto layer   = layers.layer[l];
     const auto* codes  = value ? layer.value_codes : layer.key_codes;
     const auto* scales = value ? layer.value_scales : layer.key_scales;
-    const MaterializeProjectionEpilogue epilogue{layer, positions, counts,    offsets,   scratch, l,
-                                                 width, batch,     min_count, max_count, value};
+    const MaterializeProjectionEpilogue epilogue{layer,     positions, counts, layer.offsets,
+                                                 scratch,   l,         width,  batch,
+                                                 min_count, max_count, value};
     q8_a16_sliced_k_mma<GroupedSchedule<Columns, KWarps>, true>(
         Q8LinearOperands{x, codes, scales, 1024, 5120, max_count * batch, 5120},
         LinearBf16Output{nullptr, 0}, epilogue, Q8SlicedKIdentityRows{}, 0,
         ContextPrefixColumns{width, max_count});
+}
+
+__global__ __launch_bounds__(256) void context_kv_key_post_kernel(
+    const float* __restrict__ key_scratch, const std::int32_t* __restrict__ positions,
+    const std::int32_t* __restrict__ counts, const __grid_constant__ DeviceLayers layers,
+    std::int32_t batch_size, std::int32_t width, std::int32_t min_count, std::int32_t max_count) {
+    const int packed_column   = static_cast<int>(blockIdx.x);
+    const int physical_column = context_column(packed_column, width, max_count);
+    const int layer_index     = static_cast<int>(blockIdx.y);
+    const int batch           = physical_column / width;
+    const int local           = physical_column % width;
+    const int count           = counts[batch];
+    if (count < min_count || count > max_count || local >= count) return;
+    const auto layer   = layers.layer[layer_index];
+    const int head     = threadIdx.x >> 5;
+    const float* input = key_scratch +
+                         kRows * (packed_column + max_count * batch_size * layer_index) +
+                         head * kHeadDim;
+    store_key_head(input, layer, positions, layer.offsets, physical_column, width, head,
+                   layers.epsilon, layers.frequencies);
 }
 
 } // namespace ninfer::ops::detail::context_kv

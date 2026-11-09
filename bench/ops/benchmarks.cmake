@@ -125,3 +125,6 @@ foreach(target IN ITEMS ninfer_moe_clamped_ep_bench ninfer_sigmoid_moe_bench)
 endforeach()
 
 ninfer_add_op_bench(ninfer_linear_bias_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/linear_bias.cu")
+
+ninfer_add_op_bench(ninfer_context_kv_materialize_bf16_bench
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/context_kv_materialize_bf16_bench.cu")

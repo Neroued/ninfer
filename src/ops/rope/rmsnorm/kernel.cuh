@@ -1,16 +1,11 @@
 #pragma once
 
 #include "ops/common/cuda/reduce.cuh"
+#include "ops/rope/kernels/phase.cuh"
 #include <cuda_bf16.h>
 #include <cstdint>
 
 namespace ninfer::ops::detail {
-
-// Passed by value in launch parameters, with no device backing or workspace.
-// FP64 frequencies and phase reduction preserve accuracy at long absolute positions.
-struct RmsnormRopeD128Frequencies {
-    double value[64];
-};
 
 // A CTA shares phases across Q and K heads of one token. Each (half) warp owns
 // a complete head and retains the unrounded normalized values in registers.
@@ -18,7 +13,7 @@ template <int QueryHeads, int KeyHeads, int HeadsPerBlock, int LanesPerHead, boo
 __global__ __launch_bounds__(HeadsPerBlock* LanesPerHead) void rmsnorm_rope_d128_kernel(
     const std::int32_t* __restrict__ positions, const __nv_bfloat162* __restrict__ q_weight,
     const __nv_bfloat162* __restrict__ k_weight, __nv_bfloat162* __restrict__ q,
-    __nv_bfloat162* __restrict__ k, float epsilon, RmsnormRopeD128Frequencies frequencies) {
+    __nv_bfloat162* __restrict__ k, float epsilon, RopeD128Frequencies frequencies) {
     constexpr int Groups        = (QueryHeads + KeyHeads + HeadsPerBlock - 1) / HeadsPerBlock;
     constexpr int Items         = 32 / LanesPerHead;
     constexpr bool CacheWeights = QueryHeads == 32 && HeadsPerBlock == 8 && LanesPerHead == 32;

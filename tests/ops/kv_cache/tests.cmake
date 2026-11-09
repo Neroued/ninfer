@@ -6,4 +6,5 @@ ninfer_add_op_test(ninfer_kv_cache_append_test
 
 ninfer_add_op_test(ninfer_context_kv_materialize_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/context_kv_materialize.cpp"
+          "${CMAKE_CURRENT_LIST_DIR}/context_kv_materialize_bf16.cpp"
   LIBRARIES ninfer_ops)

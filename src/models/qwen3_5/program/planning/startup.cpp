@@ -364,7 +364,8 @@ WorkspaceSpec build_workspace_plan(const SequencePlanImpl& plan) {
                     linear_scratch(layout, profile.draft->feature_projection, local_width * batch,
                                    local_width * batch);
                     scratch(layout, ops::context_kv_materialize_workspace_capacity_bytes(
-                                        batch, local_width, local_width));
+                                        *profile.draft->context_materialization, batch, local_width,
+                                        local_width));
                     return finish(layout);
                 }
                 (void)workspace::dflash_context(layout, config, *draft, tokens);

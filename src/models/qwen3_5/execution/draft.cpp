@@ -101,8 +101,7 @@ void append_context_impl(DraftExecutionView& execution, const Tensor& features,
         if (config.dflash2) {
             std::array<ops::ContextKVMaterializeLayerView, ops::kContextKVMaterializeLayers> layers;
             if (config.num_hidden_layers != layers.size() ||
-                config.local_layer_count() != layers.size() || config.rms_norm_eps != 1e-6F ||
-                config.rope_theta != 1e7F) {
+                config.local_layer_count() != layers.size()) {
                 throw std::invalid_argument(
                     "masked draft context: config is outside the fused materialization contract");
             }
@@ -115,8 +114,9 @@ void append_context_impl(DraftExecutionView& execution, const Tensor& features,
                 replace_local_window ? positions.slice(0, local_offset, local_width) : positions;
             ops::context_kv_materialize(
                 context.view({dimension(target.hidden_size), local_width, batch}), local_positions,
-                local_counts, layers, {local_envelope.min_count, local_envelope.max_count},
-                execution.work, execution.cuda);
+                local_counts, layers, *execution.parameters.profile->draft->context_materialization,
+                {local_envelope.min_count, local_envelope.max_count}, execution.work,
+                execution.cuda);
         } else {
             for (int layer = 0; layer < dimension(config.num_hidden_layers); ++layer) {
                 auto layer_scope = execution.work.scope();

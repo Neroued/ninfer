@@ -5,8 +5,6 @@
 #include "core/arena.h"
 #include "core/cyclic_kv_cache.h"
 #include "core/tensor.h"
-
-
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -15,7 +13,18 @@ namespace ninfer::ops {
 
 inline constexpr std::size_t kContextKVMaterializeLayers = 5;
 
-/** One layer's non-owning projection, norm, and destination-state views. */
+/** Address-independent mathematical/representation profile, shared by planning and execution. */
+struct ContextKVMaterializeProfile {
+    std::int32_t hidden_size;
+    std::int32_t head_dim;
+    std::int32_t kv_heads;
+    std::uint32_t capacity;
+    QType weight_type;
+    float epsilon;
+    float theta;
+};
+
+/** One layer's borrowed projection, norm and destination views. */
 struct ContextKVMaterializeLayerView {
     Weight key_weight;
     Weight value_weight;
@@ -23,64 +32,59 @@ struct ContextKVMaterializeLayerView {
     CyclicKVCacheLayerView cache;
 };
 
-/**
- * Host launch-resource promise for device-selected context prefixes. The device counts determine
- * the state transition; this interval only bounds them for capture-safe execution.
- */
+/** Host resource promise; Device counts determine the exact committed prefix. */
 struct ContextKVMaterializeExecutionEnvelope {
     std::uint32_t min_count = 0;
     std::uint32_t max_count = 0;
 };
 
 /**
- * Materialize one normalized context block into five layer-local cyclic K/V caches.
+ * Project normalized context into five layer-local cyclic K/V caches.
  *
- * context is contiguous BF16 [5120,W,B], positions is contiguous device I32 [W,B], and counts
- * are contiguous device I32 [B]. Each cache field uses device I64 record byte offsets [B]. The
- * registered domains are context blocks W=1..16,B=1..8 and single-request prefill B=1,W=1..2048. W
- * is the physical context width, independent of the draft width and the device-selected committed
- * prefix. Each of the five layer views contains independent RowSplit Q8_G32_FP16 key/value weights
- * [1024,5120], a BF16 key norm weight [128], and a capacity-2048 D128/H8 cyclic cache with BF16 K
- * and FP16 V. All five caches share padded capacity, backing arena and record offset table.
+ * context is contiguous BF16 [H,C,B], positions is Device I32 [C,B], counts is Device I32 [B].
+ * C=1..16/B=1..8 or C=1..2048/B=1. Profile epsilon/theta are positive and finite.
+ * Registered (H,D,Hkv,capacity,weight_type) are (5120,128,8,2048,Q8_G32_FP16) and
+ * (4096,128,4,2048,BF16). Per-layer key/value weights are [D*Hkv,H]. Q8 uses RowSplit
+ * FP16 scales; BF16 uses Contiguous consecutive K/V row views of one [2*D*Hkv,H]
+ * parent prefix. Thus the BF16 form consumes [K512;V512] without computing parent Q rows.
+ * Each key norm is contiguous BF16 [D], a direct multiplicative gain.
  *
- * For every layer l, row b, and i in [0,counts[b]), the complete operation is
+ * For each layer, row b and i<count[b], compute complete projections k_raw=Wk*context
+ * and v_raw=Wv*context, then per-head n[d]=k_raw[d]*gamma[d]/sqrt(mean(k_raw^2)+epsilon).
+ * Full-head split-half RoPE uses angle(j)=positions[i,b]*theta^(-2*j/D):
+ *   K[j] = BF16(n[j]*cos(angle)-n[j+D/2]*sin(angle))
+ *   K[j+D/2] = BF16(n[j+D/2]*cos(angle)+n[j]*sin(angle)).
+ * There is no represented BF16 boundary between K projection and norm/RoPE.
+ * V stores FP16_RNE(BF16_RNE(v_raw)); that BF16 boundary is semantic.
  *
- *   k_raw = linear(context[:,i,b], key_weight[l])
- *   v_raw = linear(context[:,i,b], value_weight[l])     // represented BF16
- *   inv   = 1 / sqrt(sum_d k_raw[h,d]^2 / 128 + 1e-6)
- *   n[d]  = k_raw[h,d] * inv * key_norm_weight[l][d]
- *   angle(j) = positions[i,b] * (1e7)^(-2*j/128), 0<=j<64
- *   k[j]     = n[j]    * cos(angle(j)) - n[j+64] * sin(angle(j))
- *   k[j+64]  = n[j+64] * cos(angle(j)) + n[j]    * sin(angle(j))
+ * Each layer independently supplies dense [D,padded_capacity,Hkv] BF16 K / FP16 V
+ * fields with padded_capacity>=capacity and 16-byte field alignment. K/V within a layer
+ * share a State arena and Device I64 [B] record byte-offset table; layers may use separate
+ * tables/backing. Absolute position p addresses slot p mod capacity. Live columns have
+ * sequential nonnegative positions. Each old live interval ends before positions[0,b];
+ * advancing by counts[b] makes overwritten slots dead. Live destinations are disjoint.
  *
- * K is stored as BF16 and V as FP16_RNE from represented BF16 v_raw at absolute position
- * positions[i,b] modulo 2048 in the selected State record for row b. Columns i>=counts[b] have no
- * state effect. Existing cache values outside the addressed rows and all read-only inputs are
- * unchanged. The Op emits no raw K/V and owns no logical frontier, commit, rollback, request
- * identity, or persistent allocation.
+ * The caller guarantees min_count<=counts[b]<=max_count<=C. Inactive rows/columns never
+ * read positions, projected K/V or record-offset values and never modify state. Live
+ * caches, workspace and read-only operands do not overlap. Inputs and unaddressed state
+ * are preserved. Weights may borrow their original parent backing; no repacking occurs.
+ * Context/weight bases are 16-byte aligned, norms are 4-byte aligned; metadata is naturally
+ * aligned.
  *
- * The caller guarantees min_count <= counts[b] <= max_count <= W, sequential nonnegative live
- * positions, materialized State records for live rows, and disjoint live destinations. Each
- * selected State record's old live interval ends immediately before positions[0,b], and advancing
- * it by counts[b] makes every overwritten ring slot dead. Cache K/V have dense
- * [128,padded_capacity,8] inside each State record with 16-byte-aligned field offsets. Inputs,
- * weights, live workspace, and all cache planes are mutually non-overlapping. Raw K has no semantic
- * storage cast. Reduction association, projection staging precision, and intermediate arithmetic
- * are implementation details. The Op is safe for CUDA Graph capture and replay over the complete
- * envelope.
+ * The Op owns no frontier, rollback, persistent state, allocation or synchronization.
+ * It borrows scratch in an arena scope and supports capture/replay with current Device
+ * metadata. All operands and workspace belong to execution.device().
  */
 void context_kv_materialize(
     const Tensor& context, const Tensor& positions, const Tensor& counts,
     const std::array<ContextKVMaterializeLayerView, kContextKVMaterializeLayers>& layers,
-    ContextKVMaterializeExecutionEnvelope envelope, MemoryArena& workspace,
-    CudaExecutionView execution);
+    const ContextKVMaterializeProfile& profile, ContextKVMaterializeExecutionEnvelope envelope,
+    MemoryArena& workspace, CudaExecutionView execution);
 
-/**
- * Return transient capacity for every registered W in the inclusive interval at the exact batch
- * size, covering every valid count envelope and its selected route.
- */
-[[nodiscard]] std::size_t context_kv_materialize_workspace_capacity_bytes(std::int32_t batch_size,
-                                                                          std::int32_t min_width,
-                                                                          std::int32_t max_width);
+/** Capacity over every C and legal count envelope in the inclusive interval at exact B. */
+[[nodiscard]] std::size_t
+context_kv_materialize_workspace_capacity_bytes(const ContextKVMaterializeProfile& profile,
+                                                std::int32_t batch_size, std::int32_t min_width,
+                                                std::int32_t max_width);
 
 } // namespace ninfer::ops

@@ -5,6 +5,7 @@
 #include "models/qwen3_5/config.h"
 #include "models/load_options.h"
 #include "ninfer/ops/moe.h"
+#include "ninfer/ops/context_kv_materialize.h"
 
 #include <array>
 #include <memory>
@@ -73,6 +74,7 @@ struct SelectorProfile {
 
 struct DraftProfile {
     ops::LinearProfile feature_projection, output_head;
+    std::optional<ops::ContextKVMaterializeProfile> context_materialization;
     std::vector<DraftBlockProfile> layers;
     std::optional<SelectorProfile> selector;
 };

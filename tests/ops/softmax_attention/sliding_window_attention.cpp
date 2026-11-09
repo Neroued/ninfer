@@ -1,5 +1,6 @@
 #include "ops/suite.h"
 #include <map>
+#include <tuple>
 #include "ops/state_fixture.h"
 #include <optional>
 #include "ninfer/ops/sliding_window_attention.h"
@@ -25,12 +26,12 @@ using namespace ninfer;
 using namespace ninfer::test;
 
 namespace {
-constexpr int D = 128, Hq = 32, Hkv = 8, Lanes = 8;
+constexpr int D = 128, Lanes = 8;
 constexpr float Scale = 0.08838834764831844055f;
-constexpr ops::AttentionHeadGeometry Geometry{D, Hq, Hkv};
-// BF16 output alone can round by 1/256 relative. Allow that final rounding plus
-// FP16 P/V arithmetic, while bounding aggregate error more tightly than the old BF16 partial route.
-constexpr ReductionCriterion Criterion{2.3e-3, 3e-4, 4.5e-3};
+// BF16 RNE alone permits up to 2^-8 relative error. A constant vector can reach
+// that bound in L2 as well; allow 0.45% for final rounding and attention arithmetic.
+// Both geometries and every input recipe use the same unrounded FP64 oracle and criterion.
+constexpr ReductionCriterion Criterion{4.5e-3, 3e-4, 4.5e-3};
 constexpr std::array<int, 8> LaneOrder{7, 0, 4, 2, 6, 1, 5, 3};
 
 std::vector<std::uint16_t> bf16_bits(const std::vector<float>& v) {
@@ -51,7 +52,7 @@ std::vector<std::uint16_t> fp16_bits(std::vector<float>& v) {
 }
 
 struct Cache {
-    int window, padded;
+    int window, padded, kv_heads;
     bool boundary;
     std::vector<float> k, v;
     std::vector<std::uint16_t> k_bits, v_bits;
@@ -59,22 +60,22 @@ struct Cache {
     std::optional<RecordStateFixture> key_state, value_state;
 
     std::size_t index(int lane, int head, int position, int d) const {
-        return (((static_cast<std::size_t>(lane) * Hkv + head) * padded +
+        return (((static_cast<std::size_t>(lane) * kv_heads + head) * padded +
                  (position & (window - 1))) *
                 D) +
                d;
     }
 
-    Cache(int w, bool edge = false)
-        : window(w), padded(w + 8), boundary(edge),
-          k(static_cast<std::size_t>(D) * padded * Hkv * Lanes), v(k.size()),
+    Cache(int w, bool edge = false, int heads = 8)
+        : window(w), padded(w + 8), kv_heads(heads), boundary(edge),
+          k(static_cast<std::size_t>(D) * padded * kv_heads * Lanes), v(k.size()),
           device_k(k.size() * 2), device_v(v.size() * 2) {
         if (!edge) {
             fill_uniform(k, 401U + w, -0.4f, 0.4f);
             fill_uniform(v, 503U + w, -0.8f, 0.8f);
         } else {
             for (int lane = 0; lane < Lanes; ++lane)
-                for (int head = 0; head < Hkv; ++head)
+                for (int head = 0; head < kv_heads; ++head)
                     for (int d = 0; d < D; ++d) {
                         v[index(lane, head, 0, d)] = 512.0f;
                         v[index(lane, head, 1, d)] = 256.0f;
@@ -89,13 +90,13 @@ struct Cache {
     }
 
     CyclicKVCacheLayerView view(const Tensor& offsets) {
-        key_state.emplace(Tensor(device_k.span(), DType::BF16, {D, padded, Hkv, Lanes}), 3);
-        value_state.emplace(Tensor(device_v.span(), DType::FP16, {D, padded, Hkv, Lanes}), 3);
+        key_state.emplace(Tensor(device_k.span(), DType::BF16, {D, padded, kv_heads, Lanes}), 3);
+        value_state.emplace(Tensor(device_v.span(), DType::FP16, {D, padded, kv_heads, Lanes}), 3);
         return {.k               = key_state->view(offsets),
                 .v               = value_state->view(offsets),
                 .capacity        = static_cast<std::uint32_t>(window),
                 .padded_capacity = static_cast<std::uint32_t>(padded),
-                .num_kv_heads    = Hkv,
+                .num_kv_heads    = kv_heads,
                 .head_dim        = D};
     }
 
@@ -121,6 +122,8 @@ std::vector<double> oracle(const Cache& cache, int width, int batch, const std::
                            const std::vector<float>& qk, const std::vector<float>& qv,
                            const std::vector<int>& positions, const std::vector<int>& valid,
                            const std::vector<int>& lanes) {
+    const int Hkv = cache.kv_heads, Hq = Hkv * 4;
+    const ops::AttentionHeadGeometry geometry{D, Hq, Hkv};
     std::vector<double> out(static_cast<std::size_t>(D) * Hq * width * batch, 0.0);
     parallel_rows(
         batch, std::uint64_t(batch) * width * cache.window * D * Hq, [&](int first, int last) {
@@ -132,7 +135,7 @@ std::vector<double> oracle(const Cache& cache, int width, int batch, const std::
                 for (int token = 0; token < valid[b]; ++token) {
                     const int p = positions[b * width + token];
                     naive_dense_softmax_attention(
-                        Geometry, 1, context_count + valid[b], static_cast<double>(Scale),
+                        geometry, 1, context_count + valid[b], static_cast<double>(Scale),
                         [&](int d, int h, int) {
                             return static_cast<double>(
                                 q[((static_cast<std::size_t>(b) * width + token) * Hq + h) * D +
@@ -182,6 +185,8 @@ enum class Prefix { Full, Mixed, Zero };
 
 int run_case(Cache& cache, int width, int batch, int base_context, int envelope_max, Prefix prefix,
              bool replay) {
+    const int Hkv = cache.kv_heads, Hq = Hkv * 4;
+    const ops::AttentionHeadGeometry geometry{D, Hq, Hkv};
     const std::size_t q_count  = static_cast<std::size_t>(D) * Hq * width * batch;
     const std::size_t kv_count = static_cast<std::size_t>(D) * Hkv * width * batch;
     std::vector<float> q(q_count), qk(kv_count), qv(kv_count);
@@ -218,7 +223,7 @@ int run_case(Cache& cache, int width, int batch, int base_context, int envelope_
     const ops::SlidingWindowAttentionExecutionEnvelope envelope{
         0, static_cast<std::uint32_t>(envelope_max)};
     const auto capacity = ops::sliding_window_attention_workspace_capacity_bytes(
-        Geometry, cache.window, envelope, width, width, batch);
+        geometry, cache.window, envelope, width, width, batch);
     GuardedDeviceBuffer scratch(std::max<std::size_t>(capacity, 1));
     MemoryArena workspace(scratch.span().subspan(0, std::max<std::size_t>(capacity, 1)));
     GuardedDeviceBuffer dq(q_count * 2), dk(kv_count * 2), dv(kv_count * 2),
@@ -232,7 +237,7 @@ int run_case(Cache& cache, int width, int batch, int base_context, int envelope_
     auto context = cache.view(tlane);
     DeviceContext device;
     const auto launch = [&] {
-        ops::sliding_window_attention(tq, tk, tv, tp, tvalid, Geometry, cache.window, Scale,
+        ops::sliding_window_attention(tq, tk, tv, tp, tvalid, geometry, cache.window, Scale,
                                       context, envelope, workspace, to, device.execution_view());
     };
     DecodeGraphDefinition definition;
@@ -291,10 +296,10 @@ int run_case(Cache& cache, int width, int batch, int base_context, int envelope_
                                   " L=" + std::to_string(base_context) +
                                   " envelope=" + std::to_string(envelope_max) +
                                   (replay ? " graph " : " eager ") + std::to_string(phase);
-        failures +=
-            verify_reduction(label, from_device_bf16(output.data(), q_count), expected, Criterion);
         const auto out_bits = from_device<std::uint16_t>(output.data(), q_count);
-        bool zero           = true;
+        failures += verify_reduction(label, from_device_bf16(output.data(), q_count), expected,
+                                     Criterion);
+        bool zero = true;
         for (int b = 0; b < batch; ++b)
             for (int t = valid[b]; t < width; ++t)
                 for (int i = 0; i < Hq * D; ++i)
@@ -336,6 +341,7 @@ int main(int argc, char** argv) {
     struct Recipe {
         int window;
         bool boundary = false;
+        int kv_heads  = 8;
     };
 
     struct Case {
@@ -345,10 +351,10 @@ int main(int argc, char** argv) {
         bool operator==(const Case&) const = default;
     };
 
-    std::map<std::pair<int, bool>, std::vector<Case>> groups;
+    std::map<std::tuple<int, bool, int>, std::vector<Case>> groups;
     const auto add = [&](Recipe recipe, int width, int batch, int context, int envelope,
                          Prefix prefix, bool graph) {
-        auto& cases = groups[{recipe.window, recipe.boundary}];
+        auto& cases = groups[{recipe.window, recipe.boundary, recipe.kv_heads}];
         const Case c{width, batch, context, envelope, prefix, graph};
         // Several boundary tables intersect at the same complete input recipe.
         if (std::find(cases.begin(), cases.end(), c) == cases.end()) cases.push_back(c);
@@ -398,18 +404,35 @@ int main(int argc, char** argv) {
         const Recipe edge{4096, true};
         add(edge, 2, 1, 4096, 4096, Prefix::Full, true);
     }
+    const Recipe glm{2048, false, 4};
+    for (int batch = 1; batch <= 8; ++batch)
+        for (int width = 1; width <= 16; ++width)
+            add(glm, width, batch, -1, batch % 2 ? 96 : 2048, Prefix::Mixed,
+                batch == 1 || batch == 8);
+    for (int width : {1, 4, 8, 16})
+        for (int batch : {1, 2, 4, 8}) {
+            add(glm, width, batch, 1'048'570, 1'048'640, Prefix::Mixed, true);
+            add(glm, width, batch, 2048, 1'048'640, Prefix::Zero, true);
+        }
+    for (int width : {4, 8, 16})
+        for (int batch : {1, 4, 8})
+            for (int length : {96, 97, 128, 129, 2047, 2048, 2049})
+                add(glm, width, batch, length, length, Prefix::Mixed, false);
+    for (int width : {2, 8, 16})
+        add({2048, true, 4}, width, width == 8 ? 8 : 1, 1'048'576, 1'048'640, Prefix::Full, true);
     for (const auto& [recipe, cases] : groups) {
+        const auto [window, boundary, heads] = recipe;
         std::vector<OpCase> catalogue;
         for (auto c : cases)
             catalogue.push_back(
-                {"swa/window" + std::to_string(recipe.first) +
-                     (recipe.second ? "/boundary" : "/random") + "/w" + std::to_string(c.width) +
-                     "/b" + std::to_string(c.batch) + "/context" + std::to_string(c.context) +
-                     "/bound" + std::to_string(c.envelope) + "/prefix" +
-                     std::to_string(int(c.prefix)) + (c.graph ? "/graph" : "/eager"),
+                {"swa/window" + std::to_string(window) + (boundary ? "/boundary" : "/random") +
+                     (heads == 4 ? "/q16" : "") + "/w" + std::to_string(c.width) + "/b" +
+                     std::to_string(c.batch) + "/context" + std::to_string(c.context) + "/bound" +
+                     std::to_string(c.envelope) + "/prefix" + std::to_string(int(c.prefix)) +
+                     (c.graph ? "/graph" : "/eager"),
                  {{"execution", c.graph ? "graph" : "eager"}}});
         suite.add(std::move(catalogue), [=](auto selected) {
-            Cache cache(recipe.first, recipe.second);
+            Cache cache(window, boundary, heads);
             int failures = 0;
             for (auto i : selected) {
                 auto c = cases[i];
@@ -421,17 +444,26 @@ int main(int argc, char** argv) {
     }
     suite.add("swa/capacity", [] {
         int failures = 0;
-        for (int batch = 1; batch <= 8; ++batch) {
-            const ops::SlidingWindowAttentionExecutionEnvelope envelope{0, batch % 2 ? 96U : 2048U};
-            for (auto [lo, hi] : {std::pair{1, 16}, {4, 5}, {8, 9}}) {
-                std::size_t peak = 0;
-                for (int width = lo; width <= hi; ++width)
-                    peak = std::max(peak, ops::sliding_window_attention_workspace_capacity_bytes(
-                                              Geometry, 2048, envelope, width, width, batch));
-                failures += peak != ops::sliding_window_attention_workspace_capacity_bytes(
-                                        Geometry, 2048, envelope, lo, hi, batch);
+        for (int heads : {4, 8})
+            for (int batch = 1; batch <= 8; ++batch) {
+                const ops::AttentionHeadGeometry geometry{D, heads * 4, heads};
+                const ops::SlidingWindowAttentionExecutionEnvelope envelope{0, batch % 2 ? 96U
+                                                                                         : 2048U};
+                for (auto [lo, hi] : {std::pair{1, 16}, {4, 5}, {8, 9}}) {
+                    std::size_t peak = 0;
+                    for (int width = lo; width <= hi; ++width)
+                        peak =
+                            std::max(peak, ops::sliding_window_attention_workspace_capacity_bytes(
+                                               geometry, 2048, envelope, width, width, batch));
+                    failures += peak != ops::sliding_window_attention_workspace_capacity_bytes(
+                                            geometry, 2048, envelope, lo, hi, batch);
+                }
             }
-        }
+        try {
+            (void)ops::sliding_window_attention_workspace_capacity_bytes({128, 16, 4}, 4096,
+                                                                         {0, 4096}, 1, 16, 1);
+            ++failures;
+        } catch (const std::invalid_argument&) {}
         return failures;
     });
     return suite.main(argc, argv);

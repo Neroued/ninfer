@@ -21,14 +21,16 @@ struct SlidingWindowAttentionExecutionEnvelope {
 /**
  * Symmetric non-causal sliding-window grouped-query attention.
  *
- * The registered profiles are D=128, Hq=32, Hkv=8 (group 4), window/cyclic capacity 2048 or
- * 4096, scale=1/sqrt(128), T=1..16, and B=1..8. q/out are contiguous BF16 [128,32,T,B],
- * query_k/query_v are contiguous BF16 [128,8,T,B], positions is contiguous device I32 [T,B], and
- * Context K/V select dense [128,padded_capacity,8] fields with contiguous Device I64 [B]
+ * Registered profiles are D=128, (Hq,Hkv)=(32,8) with window/cyclic capacity 2048 or 4096,
+ * and (16,4) with capacity 2048; both use group 4, scale=1/sqrt(128), T=1..16, B=1..8.
+ * q/out are contiguous BF16 [128,Hq,T,B], query_k/query_v are contiguous BF16 [128,Hkv,T,B],
+ * positions is contiguous Device I32 [T,B], and Context K/V select dense
+ * [128,padded_capacity,Hkv] fields with contiguous Device I64 [B]
  * byte offsets. Every selected field is 16-byte aligned. valid_columns is Device I32 [B].
  * Row b has V=valid_columns[b] live query columns and positions[i,b]=L+i for i<V.
  * Context K/V offsets select its cyclic-cache records; inactive rows need no valid record. Columns
- * i>=V are an inert physical tail and produce exact BF16 zero.
+ * i>=V are an inert physical tail and produce exact BF16 zero. A row with V=0 does not read
+ * positions, query K/V, or record-offset values.
  *
  * The read-only cyclic BFloat16 context stores BF16 K and FP16 V for committed absolute positions
  * [max(0,L-window),L), with absolute position p stored at slot p mod window. Temporary query K/V is

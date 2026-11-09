@@ -10,6 +10,10 @@
 namespace ninfer::ops::detail::dynamic_grouped_conv::prepare {
 namespace {
 constexpr int kBlockK = 64, kStages = 2;
+template <int Hidden>
+constexpr int Groups = PrepareGeometry{Hidden}.groups();
+template <int Hidden>
+constexpr int CoefficientRows = PrepareGeometry{Hidden}.coefficient_rows();
 
 template <int Rows, int Columns>
 struct Tile {
@@ -18,14 +22,14 @@ struct Tile {
     static constexpr int mmas         = Columns / column_warps / 8;
 };
 
-template <int Rows, int Columns, int SplitK>
+template <int Hidden, int Rows, int Columns, int SplitK>
 __launch_bounds__(Tile<Rows, Columns>::threads, 1) __global__
     void partial_kernel(const __nv_bfloat16* __restrict__ input,
                         const __nv_bfloat16* __restrict__ weight, float* __restrict__ partial,
                         int tokens) {
     constexpr int threads         = Tile<Rows, Columns>::threads;
     constexpr int mmas            = Tile<Rows, Columns>::mmas;
-    constexpr int tiles_per_split = kHidden / kBlockK / SplitK;
+    constexpr int tiles_per_split = Hidden / kBlockK / SplitK;
     __shared__ __align__(16) __nv_bfloat16 ws[kStages][Rows * kBlockK];
     __shared__ __align__(16) __nv_bfloat16 xs[kStages][Columns * kBlockK];
     const int tid = threadIdx.x, warp = tid / 32, lane = tid % 32, gid = lane / 4, lid = lane % 4;
@@ -39,14 +43,14 @@ __launch_bounds__(Tile<Rows, Columns>::threads, 1) __global__
             int row = item / (kBlockK / 8), kk = item % (kBlockK / 8) * 8;
             common::cp_async<16, Cache::cg>(
                 &ws[stage][row * kBlockK + common::swizzle_xor_64(row, kk)],
-                weight + static_cast<std::int64_t>(row0 + row) * kHidden + kt * kBlockK + kk);
+                weight + static_cast<std::int64_t>(row0 + row) * Hidden + kt * kBlockK + kk);
         }
         for (int item = tid; item < Columns * (kBlockK / 8); item += threads) {
             int col = item / (kBlockK / 8), kk = item % (kBlockK / 8) * 8;
             const int safe_col = col0 + col < tokens ? col0 + col : 0;
             common::cp_async_zfill<16, Cache::cg>(
                 &xs[stage][col * kBlockK + common::swizzle_xor_64(col, kk)],
-                input + static_cast<std::int64_t>(safe_col) * kHidden + kt * kBlockK + kk,
+                input + static_cast<std::int64_t>(safe_col) * Hidden + kt * kBlockK + kk,
                 col0 + col < tokens ? 16 : 0);
         }
     };
@@ -93,8 +97,8 @@ __launch_bounds__(Tile<Rows, Columns>::threads, 1) __global__
                   col = col0 + (warp_col * mmas + m) * 8 + 2 * lid;
         auto put      = [&](int r, int c, float value) {
             if (c < tokens)
-                partial[(static_cast<std::int64_t>(split) * tokens + c) * kCoefficientRows + r] =
-                    value;
+                partial[(static_cast<std::int64_t>(split) * tokens + c) * CoefficientRows<Hidden> +
+                        r] = value;
         };
         put(row, col, acc[m][0]);
         put(row, col + 1, acc[m][1]);
@@ -103,18 +107,18 @@ __launch_bounds__(Tile<Rows, Columns>::threads, 1) __global__
     }
 }
 
-template <int R, int C, int S>
+template <int Hidden, int R, int C, int S>
 void launch_partial(const Tensor& input, const Weight& weight, float* partial,
                     cudaStream_t stream) {
     const int tokens = input.ne[1] * input.ne[2];
-    const dim3 grid(kCoefficientRows / R, (tokens + C - 1) / C, S);
-    partial_kernel<R, C, S><<<grid, Tile<R, C>::threads, 0, stream>>>(
+    const dim3 grid(CoefficientRows<Hidden> / R, (tokens + C - 1) / C, S);
+    partial_kernel<Hidden, R, C, S><<<grid, Tile<R, C>::threads, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(input.data),
         static_cast<const __nv_bfloat16*>(weight.qdata), partial, tokens);
     CUDA_CHECK(cudaGetLastError());
 }
 
-template <int Capacity>
+template <int Hidden, int Capacity>
 __launch_bounds__(Capacity * 16, 4) __global__
     void reduce_kernel(const __nv_bfloat16* base, const float* partial, __nv_bfloat16* prepared,
                        __nv_bfloat16* finish, int width, int batch_size, int splits) {
@@ -124,75 +128,85 @@ __launch_bounds__(Capacity * 16, 4) __global__
     const int tokens = width * batch_size;
     if (tid < 4 * Capacity && tid % Capacity < width) {
         const int coefficient = tid / Capacity, position = tid % Capacity,
-                  row = coefficient * kGroups + group;
+                  row = coefficient * Groups<Hidden> + group;
         float sum     = 0;
         for (int split = 0; split < splits; ++split)
             sum += partial[(static_cast<std::int64_t>(split) * tokens + batch * width + position) *
-                               kCoefficientRows +
+                               CoefficientRows<Hidden> +
                            row];
         projected[coefficient][position] = sum;
     }
     const int position = tid / 16, channel = tid % 16, hidden = group * 16 + channel;
     const std::int64_t offset =
-        static_cast<std::int64_t>(batch * width + position) * kHidden + hidden;
+        static_cast<std::int64_t>(batch * width + position) * Hidden + hidden;
     if (position < width) { normalized[position][channel] = __bfloat162float(prepared[offset]); }
     __syncthreads();
     if (tid < 2 * Capacity && tid % Capacity < width) {
         const int tap = tid / Capacity, pos = tid % Capacity;
-        finish[((batch * width + pos) * 2 + tap) * kGroups + group] =
+        finish[((batch * width + pos) * 2 + tap) * Groups<Hidden> + group] =
             __float2bfloat16_rn(projected[2 + tap][pos]);
     }
     if (position < width) {
         float value = (__bfloat162float(base[hidden]) + projected[0][position]) *
                       normalized[position][channel];
         if (position > 0)
-            value = fmaf(__bfloat162float(base[kHidden + hidden]) + projected[1][position],
+            value = fmaf(__bfloat162float(base[Hidden + hidden]) + projected[1][position],
                          normalized[position - 1][channel], value);
         prepared[offset] = __float2bfloat16_rn(value);
     }
 }
 
-template <int Capacity>
+template <int Hidden, int Capacity>
 void launch_reduce(Projection projection, const Tensor& base, const float* partial,
                    Tensor& prepared, Tensor& finish, cudaStream_t stream) {
-    const dim3 grid(kGroups, prepared.ne[2]);
-    reduce_kernel<Capacity><<<grid, Capacity * 16, 0, stream>>>(
+    const dim3 grid(Groups<Hidden>, prepared.ne[2]);
+    reduce_kernel<Hidden, Capacity><<<grid, Capacity * 16, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(base.data), partial,
         static_cast<__nv_bfloat16*>(prepared.data), static_cast<__nv_bfloat16*>(finish.data),
         prepared.ne[1], prepared.ne[2], projection.splits);
     CUDA_CHECK(cudaGetLastError());
 }
 
+template <int Hidden>
 void launch_projection(Projection projection, const Tensor& input, const Weight& weight,
                        float* partial, cudaStream_t stream) {
     if (projection.rows == 16 && projection.splits == 8) {
         switch (projection.columns) {
         case 8:
-            return launch_partial<16, 8, 8>(input, weight, partial, stream);
+            return launch_partial<Hidden, 16, 8, 8>(input, weight, partial, stream);
         case 16:
-            return launch_partial<16, 16, 8>(input, weight, partial, stream);
+            return launch_partial<Hidden, 16, 16, 8>(input, weight, partial, stream);
         case 32:
-            return launch_partial<16, 32, 8>(input, weight, partial, stream);
+            return launch_partial<Hidden, 16, 32, 8>(input, weight, partial, stream);
         case 48:
-            return launch_partial<16, 48, 8>(input, weight, partial, stream);
+            return launch_partial<Hidden, 16, 48, 8>(input, weight, partial, stream);
         }
     }
     if (projection.rows == 32 && projection.splits == 4) {
         if (projection.columns == 32)
-            return launch_partial<32, 32, 4>(input, weight, partial, stream);
+            return launch_partial<Hidden, 32, 32, 4>(input, weight, partial, stream);
         if (projection.columns == 64)
-            return launch_partial<32, 64, 4>(input, weight, partial, stream);
+            return launch_partial<Hidden, 32, 64, 4>(input, weight, partial, stream);
     }
     throw std::logic_error("dynamic grouped conv prepare: invalid production tile");
 }
 } // namespace
 
+template <int Hidden>
+void launch_profile(Plan plan, const Tensor& base, const Weight& projection, float* partials,
+                    Tensor& prepared, Tensor& finish, cudaStream_t stream) {
+    launch_projection<Hidden>(plan.projection, prepared, projection, partials, stream);
+    if (plan.reduction_capacity == 8)
+        launch_reduce<Hidden, 8>(plan.projection, base, partials, prepared, finish, stream);
+    else
+        launch_reduce<Hidden, 16>(plan.projection, base, partials, prepared, finish, stream);
+}
+
 void launch(Plan plan, const Tensor& base, const Weight& projection, float* partials,
             Tensor& prepared, Tensor& finish, cudaStream_t stream) {
-    launch_projection(plan.projection, prepared, projection, partials, stream);
-    if (plan.reduction_capacity == 8)
-        launch_reduce<8>(plan.projection, base, partials, prepared, finish, stream);
+    if (prepared.ne[0] == 4096)
+        launch_profile<4096>(plan, base, projection, partials, prepared, finish, stream);
     else
-        launch_reduce<16>(plan.projection, base, partials, prepared, finish, stream);
+        launch_profile<5120>(plan, base, projection, partials, prepared, finish, stream);
 }
 } // namespace ninfer::ops::detail::dynamic_grouped_conv::prepare

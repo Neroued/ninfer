@@ -182,8 +182,8 @@ void prepare_dynamic_branch(DraftExecutionView& execution, const Tensor& residua
     auto scope      = execution.work.scope();
     const int width = residual.ne[1], batch = residual.ne[2];
     MemoryArena scratch(execution.work.alloc_bytes(
-        ops::rmsnorm_dynamic_grouped_conv_prepare_workspace_capacity_bytes(width, width, batch,
-                                                                           batch)));
+        ops::rmsnorm_dynamic_grouped_conv_prepare_workspace_capacity_bytes(residual.ne[0], width,
+                                                                           width, batch, batch)));
     ops::rmsnorm_dynamic_grouped_conv_prepare(residual, norm, eps, weights.base_kernel,
                                               weights.kernel_projection.weight, branch.prepared,
                                               branch.finish_delta, scratch, execution.cuda);

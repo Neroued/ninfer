@@ -1,153 +1,116 @@
-#include "core/weight.h"
-#include "core/buffer.h"
 #include "ninfer/ops/dynamic_grouped_conv.h"
-
 #include "direct_bf16_weight.cuh"
-#include "ninfer_bench_common.h"
-
-#include <cuda_runtime.h>
-
-#include <algorithm>
-#include <cstddef>
-#include <cstdint>
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
-#include <stdexcept>
-#include <string>
+#include "op_measurement.cuh"
+#include "common/roofline.h"
 
 using namespace ninfer;
 using namespace ninfer::bench;
 
 namespace {
-
-constexpr std::int32_t kHidden           = 5120;
-constexpr std::int32_t kMaximumWidth     = 16;
-constexpr std::int32_t kGroups           = 320;
-constexpr std::int32_t kTaps             = 2;
-constexpr std::int32_t kSides            = 2;
-constexpr std::int32_t kCoefficientRows  = 1280;
-constexpr std::size_t kDefaultFlushBytes = 256ULL << 20;
-
 struct Options {
-    int width               = 0;
-    int batch               = 0;
-    int warmup              = 8;
-    int repeat              = 40;
-    std::size_t flush_bytes = kDefaultFlushBytes;
+    measurement::Options timing;
+    int hidden = 5120, width = 0, batch = 0;
+    float epsilon = 1.e-6F;
 };
 
-Options parse_args(int argc, char** argv) {
-    Options options;
-    for (int index = 1; index < argc; ++index) {
-        auto next = [&](const char* label) -> const char* {
-            if (index + 1 >= argc) { throw std::invalid_argument(std::string("missing ") + label); }
-            return argv[++index];
-        };
-        if (!std::strcmp(argv[index], "--width")) {
-            options.width = std::atoi(next("width"));
-        } else if (!std::strcmp(argv[index], "--batch")) {
-            options.batch = std::atoi(next("batch"));
-
-        } else if (!std::strcmp(argv[index], "--warmup")) {
-            options.warmup = std::atoi(next("warmup"));
-        } else if (!std::strcmp(argv[index], "--repeat")) {
-            options.repeat = std::atoi(next("repeat"));
-        } else if (!std::strcmp(argv[index], "--flush-mib")) {
-            const long mib = std::strtol(next("flush MiB"), nullptr, 10);
-            if (mib <= 0) { throw std::invalid_argument("flush MiB must be positive"); }
-            options.flush_bytes = static_cast<std::size_t>(mib) << 20;
-        } else if (!std::strcmp(argv[index], "--help") || !std::strcmp(argv[index], "-h")) {
-            std::printf(
-                "usage: %s [--width W] [--batch B] [--warmup N] [--repeat N] [--flush-mib N]\n",
-                argv[0]);
+Options parse(int argc, char** argv) {
+    Options o;
+    for (int i = 1; i < argc; ++i) {
+        const std::string_view flag = argv[i];
+        if (flag == "--help" || flag == "-h") {
+            std::cout << "Dynamic prepare: --hidden H --epsilon E --width W --batch B\n"
+                         "Omit width/batch to scan W2..16,B1..8. Defaults H5120, epsilon1e-6.\n";
+            measurement::help();
             std::exit(0);
-        } else {
-            throw std::invalid_argument("unknown argument: " + std::string(argv[index]));
         }
+        const auto value = measurement::take(argc, argv, i);
+        if (flag == "--hidden")
+            o.hidden = measurement::integer(value);
+        else if (flag == "--epsilon")
+            o.epsilon = std::stof(std::string(value));
+        else if (flag == "--width")
+            o.width = measurement::integer(value);
+        else if (flag == "--batch")
+            o.batch = measurement::integer(value);
+        else if (!measurement::parse(o.timing, flag, value))
+            throw std::invalid_argument("unknown dynamic prepare option");
     }
-    if ((options.width != 0 && (options.width < 2 || options.width > 16)) || options.batch < 0 ||
-        options.batch > 8 || options.warmup < 0 || options.repeat <= 0) {
-        throw std::invalid_argument("warmup must be nonnegative and repeat positive");
-    }
-    return options;
+    if (o.width < 0 || o.width == 1 || o.width > 16 || o.batch < 0 || o.batch > 8 ||
+        !std::isfinite(o.epsilon) || o.epsilon <= 0)
+        throw std::invalid_argument("invalid width, batch or epsilon");
+    return o;
 }
-
-void run_batch(int width, std::int32_t batch_size, const Options& options,
-               const Tensor& norm_weight, const Tensor& base_kernel,
-               const Weight& projection_weight, DeviceBuffer& residual_storage,
-               DeviceBuffer& prepared_storage, DeviceBuffer& finish_storage, MemoryArena& workspace,
-               bench::L2FlushBuffer& flush, CudaExecutionView cuda) {
-    const std::int32_t tokens = width * batch_size;
-    Tensor residual(residual_storage.span(), DType::BF16, {kHidden, width, batch_size});
-    Tensor prepared(prepared_storage.span(), DType::BF16, {kHidden, width, batch_size});
-    Tensor finish_delta(finish_storage.span(), DType::BF16, {kGroups, kTaps, width, batch_size});
-    const auto launch = [&](CudaExecutionView cuda) {
-        workspace.reset();
-        ops::rmsnorm_dynamic_grouped_conv_prepare(residual, norm_weight, 1.0e-6F, base_kernel,
-                                                  projection_weight, prepared, finish_delta,
-                                                  workspace, cuda);
-    };
-    workspace.reset_peak();
-    TimedGraph graph;
-    graph.capture(cuda, launch);
-    const ColdTiming timing =
-        measure_cold_launch([&](CudaExecutionView cuda) { graph.launch(cuda); }, flush, cuda,
-                            options.warmup, options.repeat);
-    const double seconds    = timing.median_us * 1.0e-6;
-    const double projection_flops = 2.0 * kCoefficientRows * kHidden * static_cast<double>(tokens);
-    const double effective_tflops = projection_flops / seconds / 1.0e12;
-    const std::size_t workspace_bytes = workspace.peak_used();
-    std::printf("%d,%d,%d,%.3f,%.3f,%.3f,%.3f,%zu,%zu\n", width, batch_size, tokens,
-                timing.median_us, timing.min_us, timing.p95_us, effective_tflops, workspace_bytes,
-                graph.nodes());
-}
-
 } // namespace
 
 int main(int argc, char** argv) {
-    int device_count = 0;
-    if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count == 0) {
-        std::printf("SKIP: no usable CUDA device\n");
-        return 0;
-    }
     try {
-        const Options options = parse_args(argc, argv);
-        DeviceBuffer residual =
-            make_bf16(static_cast<std::size_t>(kHidden) * kMaximumWidth * 8, 101U);
-        DeviceBuffer norm = make_bf16(kHidden, 103U, .8F, 1.2F);
-        DeviceBuffer base = make_bf16(static_cast<std::size_t>(kHidden) * kTaps * kSides, 105U);
-        DirectBf16Weight projection = make_direct_bf16_weight(kCoefficientRows, kHidden, 0x31U);
-        DeviceBuffer prepared = make_zeros(static_cast<std::size_t>(kHidden) * kMaximumWidth * 8 *
-                                           sizeof(std::uint16_t));
-        DeviceBuffer finish = make_zeros(static_cast<std::size_t>(kGroups) * kTaps * kMaximumWidth *
-                                         8 * sizeof(std::uint16_t));
-        bench::L2FlushBuffer flush(options.flush_bytes);
-        const std::size_t workspace_bytes =
-            ops::rmsnorm_dynamic_grouped_conv_prepare_workspace_capacity_bytes(2, 16, 1, 8);
-        ninfer::DeviceBuffer workspace_storage(ninfer::bench::device_context().device(),
-                                               workspace_bytes);
-        MemoryArena workspace(workspace_storage.span());
-        Tensor norm_weight(norm.span(), DType::BF16, {kHidden});
-        Tensor base_kernel(base.span(), DType::BF16, {kHidden, kTaps, kSides});
-
-        cudaStream_t stream = nullptr;
-        CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
-        const auto cuda = ninfer::bench::device_context().execution_view(stream);
-        std::printf("W,B,T,median_us,min_us,p95_us,effective_projection_tflops,workspace_bytes,"
-                    "graph_nodes\n");
+        const auto o        = parse(argc, argv);
+        const auto capacity = ops::rmsnorm_dynamic_grouped_conv_prepare_workspace_capacity_bytes(
+            o.hidden, 2, 16, 1, 8);
+        const int groups = o.hidden / 16, rows = groups * 4;
+        auto residual   = make_bf16(std::size_t(o.hidden) * 128, 101U);
+        auto norm       = make_bf16(o.hidden, 103U, .8F, 1.2F);
+        auto base       = make_bf16(std::size_t(o.hidden) * 4, 105U);
+        auto projection = make_direct_bf16_weight(rows, o.hidden, 0x31U);
+        auto prepared   = make_buffer(std::size_t(o.hidden) * 128 * 2);
+        auto finish     = make_buffer(std::size_t(groups) * 2 * 128 * 2);
+        auto storage    = make_buffer(capacity);
+        MemoryArena arena(storage.span());
+        Tensor norm_weight(norm.span(), DType::BF16, {o.hidden});
+        Tensor base_kernel(base.span(), DType::BF16, {o.hidden, 2, 2});
+        L2FlushBuffer flush(o.timing.flush_bytes);
+        measurement::hardware();
+        measurement::Csv csv(
+            o.timing.csv_out,
+            "width,columns,necessary_bytes,useful_flops,effective_gbs,roofline_us");
         for (int width = 2; width <= 16; ++width) {
-            if (options.width && options.width != width) continue;
-            for (std::int32_t batch_size = 1; batch_size <= 8; ++batch_size) {
-                if (options.batch && options.batch != batch_size) continue;
-                run_batch(width, batch_size, options, norm_weight, base_kernel, projection.weight,
-                          residual, prepared, finish, workspace, flush, cuda);
+            if (o.width && width != o.width) continue;
+            for (int batch = 1; batch <= 8; ++batch) {
+                if (o.batch && batch != o.batch) continue;
+                const int m = width * batch;
+                Tensor x(residual.span(), DType::BF16, {o.hidden, width, batch});
+                Tensor y(prepared.span(), DType::BF16, {o.hidden, width, batch});
+                Tensor d(finish.span(), DType::BF16, {groups, 2, width, batch});
+                measurement::Row row;
+                row.op                    = "rmsnorm_dynamic_grouped_conv_prepare";
+                row.format                = "bf16";
+                row.policy                = "a16";
+                row.n                     = rows;
+                row.k                     = o.hidden;
+                row.tokens                = width;
+                row.batch                 = batch;
+                row.workspace_bytes       = capacity;
+                const std::uint64_t bytes = projection.model_weight_bytes() +
+                                            std::uint64_t(4) * o.hidden * m + 10ULL * o.hidden +
+                                            4ULL * groups * m;
+                const double flops = 2.0 * rows * o.hidden * m;
+                for (const auto& execution :
+                     measurement::selections(o.timing.execution, "graph", "eager"))
+                    for (const auto& cache :
+                         measurement::selections(o.timing.cache, "cold", "warm")) {
+                        arena.reset_peak();
+                        const auto result = measurement::measure(
+                            [&](auto cuda) {
+                                ops::rmsnorm_dynamic_grouped_conv_prepare(
+                                    x, norm_weight, o.epsilon, base_kernel, projection.weight, y, d,
+                                    arena, cuda);
+                            },
+                            [](auto) {}, flush, device_context().execution_view(), o.timing,
+                            execution, cache);
+                        row.workspace_peak = arena.peak_used();
+                        const double floor = std::max(bytes / (1000 * kRoofline.sustained_read_gbs),
+                                                      flops / (1.e6 * kRoofline.bf16_f32_tflops));
+                        csv.write(row, result, execution, cache,
+                                  std::to_string(width) + ',' + std::to_string(m) + ',' +
+                                      std::to_string(bytes) + ',' + std::to_string(flops) + ',' +
+                                      format_metric(bytes / result.gpu.median_us / 1000, 3, "") +
+                                      ',' + format_metric(floor, 3, ""));
+                    }
             }
         }
-        CUDA_CHECK(cudaStreamDestroy(stream));
         return 0;
-    } catch (const std::exception& error) {
-        std::fprintf(stderr, "ninfer_dynamic_grouped_conv_prepare_bench: %s\n", error.what());
+    } catch (const std::exception& e) {
+        std::cerr << "dynamic prepare bench: " << e.what() << '\n';
         return 1;
     }
 }

@@ -8,6 +8,16 @@
 
 namespace ninfer::ops::detail {
 
+template <int Rows>
+struct LinearFloatTileOutput {
+    float* data;
+    int row_begin, token_begin;
+
+    __device__ void store(int row, int token, float value) const {
+        data[(token - token_begin) * Rows + row - row_begin] = value;
+    }
+};
+
 // Coordinates are logical output rows and tokens of the complete call, including
 // when a launcher splits the CUDA grid into several launches.
 struct LinearBf16Output {

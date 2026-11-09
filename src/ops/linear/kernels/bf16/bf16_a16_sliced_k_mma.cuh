@@ -20,6 +20,7 @@ bf16_a16_sliced_k_mma_body(const __nv_bfloat16* __restrict__ x,
     constexpr int kBlockTokens = Schedule::kBlockTokens;
     constexpr int kTokenMmas   = Schedule::kMmaTokens;
     constexpr int kBlockK      = Schedule::kBlockK;
+    constexpr bool kCollective = requires { Epilogue::kSlicedTile; };
     const int kGroups = kHidden / kBlockK + (bf16_predicated_k<Schedule> && kHidden % kBlockK != 0);
     static_assert((kMmaK % 16) == 0);
 
@@ -245,10 +246,25 @@ bf16_a16_sliced_k_mma_body(const __nv_bfloat16* __restrict__ x,
             }
             const int mi = fragment / kTokenMmas, ni = fragment % kTokenMmas;
             const int token = token0 + ni * 8 + 2 * lid;
-            linear_finish_mma_fragment<false, decltype(destination), Epilogue,
-                                       !bf16_predicated_rows<Schedule>>(
-                destination, epilogue, row0 + mi * 16 + gid, token, sum, rows, tokens);
+            if constexpr (kCollective) {
+                // Pair slot zero is dead after the pair reduction. Reuse it for a complete
+                // FP32 tile; the epilogue sees only this layout, not the partial reduction.
+                const LinearFloatTileOutput<kMmaRows> tile{partial, row0, token0};
+                linear_finish_mma_fragment<false, decltype(tile), LinearIdentityEpilogue,
+                                           !bf16_predicated_rows<Schedule>>(
+                    tile, LinearIdentityEpilogue{}, row0 + mi * 16 + gid, token, sum, rows, tokens);
+            } else {
+                linear_finish_mma_fragment<false, decltype(destination), Epilogue,
+                                           !bf16_predicated_rows<Schedule>>(
+                    destination, epilogue, row0 + mi * 16 + gid, token, sum, rows, tokens);
+            }
         }
+    }
+    if constexpr (kCollective) {
+        __syncthreads();
+        // All CTA threads participate. Tile is contiguous FP32 [BlockRows,BlockTokens],
+        // and only valid rows/columns are initialized. Its lifetime ends with this body.
+        epilogue.template finish_sliced_tile<Schedule>(output, partial, row0, token0, rows, tokens);
     }
 }
 

@@ -4,3 +4,7 @@ target_sources(ninfer_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/prepare/launch.cu"
   "${CMAKE_CURRENT_LIST_DIR}/add/add.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/add/launch.cu")
+
+if(NINFER_TARGET STREQUAL "dgx_spark")
+  target_sources(ninfer_ops PRIVATE "${CMAKE_CURRENT_LIST_DIR}/prepare/dgx_spark/launch.cu")
+endif()

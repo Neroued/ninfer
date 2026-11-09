@@ -13,17 +13,17 @@ namespace ninfer::ops {
 
 /**
  * Returns the transient capacity required by rmsnorm_dynamic_grouped_conv_prepare for every
- * width/batch pair in the inclusive intervals. Width endpoints lie in [2,16], batch endpoints
- * in [1,8]. Capacity covers every shape-selected route in the requested domain.
+ * width/batch pair for hidden in the inclusive intervals. Width endpoints lie in [2,16], batch
+ * endpoints in [1,8]. Capacity covers every shape-selected route in the requested domain.
  */
 [[nodiscard]] std::size_t rmsnorm_dynamic_grouped_conv_prepare_workspace_capacity_bytes(
-    std::int32_t min_width, std::int32_t max_width, std::int32_t min_batch_size,
-    std::int32_t max_batch_size);
+    std::int32_t hidden, std::int32_t min_width, std::int32_t max_width,
+    std::int32_t min_batch_size, std::int32_t max_batch_size);
 
 /**
  * Offset-free RMSNorm, dynamic coefficient projection and grouped two-tap convolution.
  *
- *   H=5120, W=2..16, group width 16, G=320, sides=2, taps=2. For h=16*g+j:
+ *   W=2..16, group width 16, G=H/16, sides=2, taps=2. For h=16*g+j:
  *
  *     inv[i,b] = rsqrt(sum_h residual[h,i,b]^2 / H + eps)
  *     n[h,i,b] = residual[h,i,b] * inv[i,b] * norm_weight[h]
@@ -38,7 +38,7 @@ namespace ninfer::ops {
  *
  * Residual/prepared are contiguous BF16 [H,W,B], norm_weight [H], base_kernel
  * [H,2,2] with axes [channel,tap,side], and finish_delta [G,2,W,B]. The projection
- * weight is contiguous BF16 [1280,H]. W is in [2,16], B in [1,8]; tensor and weight
+ * weight is contiguous BF16 [4*G,H]. W is in [2,16], B in [1,8]; tensor and weight
  * bases are 16-byte aligned. Eps is positive and finite. Position zero has no previous
  * contribution; the Op never reads another request or an earlier round.
  *

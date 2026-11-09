@@ -384,7 +384,7 @@ WorkspaceSpec build_workspace_plan(const SequencePlanImpl& plan) {
                         (void)workspace::dflash2_branch(layout, config, *draft, width, batch);
                         scratch(layout,
                                 ops::rmsnorm_dynamic_grouped_conv_prepare_workspace_capacity_bytes(
-                                    width, width, batch, batch));
+                                    dimension(config.hidden_size), width, width, batch, batch));
                     };
                     {
                         auto attention = layout.scope();

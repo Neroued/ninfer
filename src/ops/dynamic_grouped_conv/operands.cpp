@@ -19,8 +19,9 @@ void require_tensor(const Tensor& tensor, DType dtype, std::int32_t d0, std::int
     }
 }
 
-void validate_prepare_weight(const Weight& weight) {
-    constexpr std::uint64_t kPayloadBytes =
+void validate_prepare_weight(const Weight& weight, PrepareGeometry geometry) {
+    const auto kHidden = geometry.hidden, kCoefficientRows = geometry.coefficient_rows();
+    const std::uint64_t kPayloadBytes =
         static_cast<std::uint64_t>(kCoefficientRows) * kHidden * sizeof(std::uint16_t);
     if (weight.qtype != QType::BF16 || weight.layout != QuantLayout::Contiguous ||
         weight.payload_bytes < kPayloadBytes || weight.high_plane_bytes != 0 || weight.ndim != 2 ||
@@ -81,8 +82,8 @@ void require_prepare_nonoverlap(const Tensor& residual, const Tensor& norm_weigh
                                 const Tensor& base_kernel, const Weight& kernel_projection_weight,
                                 const Tensor& prepared, const Tensor& finish_delta,
                                 const MemoryArena& workspace) {
-    constexpr std::size_t kWeightBytes =
-        static_cast<std::size_t>(kCoefficientRows) * kHidden * sizeof(std::uint16_t);
+    const std::size_t kWeightBytes = static_cast<std::size_t>(kernel_projection_weight.n) *
+                                     kernel_projection_weight.k * sizeof(std::uint16_t);
     const std::array<common::operand::Range, 7> ranges{{
         common::operand::range(residual.data, residual.bytes(), "dynamic grouped conv"),
         common::operand::range(norm_weight.data, norm_weight.bytes(), "dynamic grouped conv"),
@@ -110,12 +111,20 @@ void validate_input_rows(int input_rows) {
         throw std::invalid_argument("linear dynamic grouped conv add: C must be 4096 or 17408");
 }
 
-void validate_prepare(const Tensor& residual, const Tensor& norm_weight, float eps,
-                      const Tensor& base_kernel, const Weight& kernel_projection_weight,
-                      const Tensor& prepared, const Tensor& finish_delta,
-                      const MemoryArena& workspace, CudaExecutionView execution) {
+PrepareGeometry prepare_geometry(int hidden) {
+    if (hidden != 4096 && hidden != 5120)
+        throw std::invalid_argument("dynamic grouped conv prepare: unsupported hidden size");
+    return {hidden};
+}
+
+PrepareGeometry validate_prepare(const Tensor& residual, const Tensor& norm_weight, float eps,
+                                 const Tensor& base_kernel, const Weight& kernel_projection_weight,
+                                 const Tensor& prepared, const Tensor& finish_delta,
+                                 const MemoryArena& workspace, CudaExecutionView execution) {
     const std::int32_t batch_size = residual.ne[2];
     const std::int32_t width      = residual.ne[1];
+    const auto geometry           = prepare_geometry(residual.ne[0]);
+    const int kHidden = geometry.hidden, kGroups = geometry.groups();
     if (!(eps > 0.0F) || !std::isfinite(eps)) {
         throw std::invalid_argument(
             "dynamic grouped conv prepare: eps must be positive and finite");
@@ -134,9 +143,10 @@ void validate_prepare(const Tensor& residual, const Tensor& norm_weight, float e
     common::operand::device(kernel_projection_weight.device, execution.device(), kPrepareOp,
                             "weight");
     common::operand::device(workspace.device(), execution.device(), kPrepareOp, "workspace");
-    validate_prepare_weight(kernel_projection_weight);
+    validate_prepare_weight(kernel_projection_weight, geometry);
     require_prepare_nonoverlap(residual, norm_weight, base_kernel, kernel_projection_weight,
                                prepared, finish_delta, workspace);
+    return geometry;
 }
 
 void validate_add(const Tensor& x, const Weight& projection_weight, const Tensor& base_kernel,

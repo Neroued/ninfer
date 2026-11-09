@@ -11,8 +11,11 @@ struct Plan {
     Projection projection;
     int reduction_capacity;
     std::size_t workspace_bytes;
+    bool fused = false;
 };
 
 void launch(Plan plan, const Tensor& base, const Weight& projection, float* partials,
             Tensor& prepared, Tensor& finish, cudaStream_t stream);
+void launch_fused(const Tensor& normalized, const Tensor& base, const Weight& projection,
+                  Tensor& prepared, Tensor& finish, cudaStream_t stream);
 } // namespace ninfer::ops::detail::dynamic_grouped_conv::prepare

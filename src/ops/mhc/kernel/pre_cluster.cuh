@@ -17,7 +17,7 @@ struct ClusterPreTile {
 // A cluster owns complete token columns and partitions their hidden dimension.
 // Each CTA retains its rounded residual words until collapse, so the complete
 // pre/post-pre needs neither a residual reread nor global projection/norm scratch.
-template <class Gamma, Form F, int Tokens, int Cluster, int BK, int Stages>
+template <class Gamma, Form F, int Tokens, int Cluster, int BK, int Stages, bool Tap = false>
 __global__ __launch_bounds__(Tokens == 8 ? 512 : 256, 2) void __cluster_dims__(Cluster, 1, 1)
     pre_cluster_kernel(Operands o, std::int64_t tile_offset) {
     constexpr int H       = kHidden / Cluster;
@@ -81,6 +81,7 @@ __global__ __launch_bounds__(Tokens == 8 ? 512 : 256, 2) void __cluster_dims__(C
                 if (m0 + t < o.columns) {
                     mixed_vectors(o, m0 + t, rank * H + d, data + t * 20, data + t * 20 + 4,
                                   values);
+                    if constexpr (Tap) store_mean_tap(o, m0 + t, rank * H + d, values);
 #pragma unroll
                     for (int s = 0; s < 4; ++s)
                         values[s].store(static_cast<__nv_bfloat16*>(o.updated) + (m0 + t) * kWidth +

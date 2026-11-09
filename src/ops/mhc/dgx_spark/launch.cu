@@ -30,16 +30,16 @@ void launch_dependent_finish(int columns, CudaExecutionView e, Args... args) {
     CUDA_CHECK(cudaLaunchKernelEx(&config, Kernel, args...));
 }
 
-template <Form F, int Hidden, int Tokens>
+template <Form F, int Hidden, int Tokens, bool Tap = false>
 void launch_projection(Operands o, float* scratch, CudaExecutionView e) {
     const auto tiles = ((std::int64_t(o.columns) + Tokens - 1) / Tokens) * (kHidden / Hidden);
     for (std::int64_t offset = 0; offset < tiles; offset += GridLimit) {
         const auto count = static_cast<unsigned>(std::min(GridLimit, tiles - offset));
         if constexpr (Hidden == 64)
-            projection_partition_kernel<F, Hidden, 256>
+            projection_partition_kernel<F, Hidden, 256, Tap>
                 <<<count, 256, 0, e.stream()>>>(o, scratch, offset);
         else
-            projection_mma_kernel<F, Hidden, Tokens>
+            projection_mma_kernel<F, Hidden, Tokens, Tap>
                 <<<count, ProjectionSchedule<Tokens>::kThreads, 0, e.stream()>>>(o, scratch,
                                                                                  offset);
         CUDA_CHECK(cudaGetLastError());
@@ -73,7 +73,7 @@ void launch_cluster_tiles(Operands o, CudaExecutionView e) {
     }
 }
 
-template <class Gamma, Form F>
+template <class Gamma, Form F, bool Tap = false>
 void launch_cluster(Operands o, CudaExecutionView e) {
     if constexpr (F == Form::ExpandPre) {
         launch_cluster_tiles<ExpandClusterTile<512, 128>, expand_cluster_kernel<Gamma, 512, 128>>(
@@ -81,11 +81,12 @@ void launch_cluster(Operands o, CudaExecutionView e) {
     } else {
         constexpr int BK = F == Form::Pre ? 128 : 64, Stages = F == Form::Pre ? 2 : 4;
         launch_cluster_tiles<ClusterPreTile<8, 8, BK, Stages>,
-                             pre_cluster_kernel<Gamma, F, 8, 8, BK, Stages>, F == Form::Pre>(o, e);
+                             pre_cluster_kernel<Gamma, F, 8, 8, BK, Stages, Tap>, F == Form::Pre>(
+            o, e);
     }
 }
 
-template <class Gamma, Form F>
+template <class Gamma, Form F, bool Tap = false>
 void launch_pre(Operands o, Plan p, float* scratch, CudaExecutionView e) {
     if (p.method == Method::VectorProjection) {
         if constexpr (F == Form::Pre || F == Form::ExpandPre) {
@@ -105,11 +106,11 @@ void launch_pre(Operands o, Plan p, float* scratch, CudaExecutionView e) {
         return;
     }
     if (p.hidden_tile == 64)
-        launch_projection<F, 64, 8>(o, scratch, e);
+        launch_projection<F, 64, 8, Tap>(o, scratch, e);
     else if (p.hidden_tile == 128)
-        launch_projection<F, 128, 16>(o, scratch, e);
+        launch_projection<F, 128, 16, Tap>(o, scratch, e);
     else if constexpr (F == Form::Pre || F == Form::ExpandPre)
-        launch_projection<F, 256, 32>(o, scratch, e);
+        launch_projection<F, 256, 32, Tap>(o, scratch, e);
     else
         throw std::logic_error("mhc: invalid post-pre projection plan");
     if constexpr (F == Form::ExpandPre) {
@@ -164,13 +165,19 @@ void launch_typed(Form form, Operands o, Plan p, void* scratch, CudaExecutionVie
         else
             launch_pre<Gamma, Form::ExpandPre>(o, p, partial, e);
         return;
-    case Form::PostPre:
-        if (p.method == Method::ClusterProjection) {
-            launch_cluster<Gamma, Form::PostPre>(o, e);
-        } else {
-            launch_pre<Gamma, Form::PostPre>(o, p, partial, e);
-        }
+    case Form::PostPre: {
+        const auto submit = [&]<bool Tap>() {
+            if (p.method == Method::ClusterProjection)
+                launch_cluster<Gamma, Form::PostPre, Tap>(o, e);
+            else
+                launch_pre<Gamma, Form::PostPre, Tap>(o, p, partial, e);
+        };
+        if (o.mean_tap)
+            submit.template operator()<true>();
+        else
+            submit.template operator()<false>();
         return;
+    }
     case Form::PostMeanNorm:
         if (p.method == Method::SplitMean) {
             if (p.partials == 32) {

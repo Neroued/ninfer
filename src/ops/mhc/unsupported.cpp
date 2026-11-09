@@ -2,7 +2,7 @@
 #include <stdexcept>
 
 namespace ninfer::ops::detail::mhc {
-Plan select(Form, int, int) {
+Plan select(Form, int, int, bool) {
     throw std::invalid_argument("mhc: no implementation for this target");
 }
 

@@ -14,7 +14,7 @@ Plan post(int threads, int vector, int last) {
 }
 } // namespace
 
-Plan select(Form form, int columns, int) {
+Plan select(Form form, int columns, int, bool mean_tap) {
     // Each public form owns its cache-independent schedule and reduction crossovers.
     switch (form) {
     case Form::Pre:
@@ -32,9 +32,11 @@ Plan select(Form form, int columns, int) {
         if (columns <= 512) return projection(256, 32, 128, 8, 512);
         return {Method::ClusterProjection, 512, 8, 0, 512, 8, Unlimited};
     case Form::PostPre:
+        if (mean_tap && columns >= 448)
+            return {Method::ClusterProjection, 512, 8, 0, 512, 4, Unlimited};
         if (columns <= 32) return projection(64, 8, 288, 16, 32);
         if (columns <= 128) return projection(128, 16, 512, 4, 128);
-        if (columns <= 512) return projection(128, 16, 128, 8, 512);
+        if (columns <= 512) return projection(128, 16, 128, 8, mean_tap ? 447 : 512);
         return {Method::ClusterProjection, 512, 8, 0, 512, 4, Unlimited};
     case Form::Post:
         if (columns <= 32) return post(128, 8, 32);

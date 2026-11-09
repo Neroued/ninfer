@@ -15,6 +15,8 @@ struct Options {
     std::string op = "pre";
     std::vector<int> columns{1,  2,  3,  4,  5,   6,   7,   8,    12,   16,  24,
                              32, 48, 64, 96, 128, 256, 512, 1024, 2048, 4096};
+    std::string tap     = "none";
+    int tap_columns     = 0;
     bool alias          = false;
     int sites           = 1;
     int calls           = 0;
@@ -39,6 +41,7 @@ Options parse(int argc, char** argv) {
             std::cout << "mHC complete Op benchmark, D=4096 S=4\n"
                          "  --op pre|post|expand-pre|post-pre|post-mean-norm\n"
                          "  --columns M[,M...] --alias disjoint|inplace --sites N --calls N\n"
+                         "  --tap none|slice|contiguous|both --tap-columns C (default M)\n"
                          "  --reserve-columns M  keep allocations fixed across a partial sweep\n"
                          "  --base-type bf16|fp32 --scale-type bf16|fp32 --gamma-type bf16|fp32\n"
                          "  --condition-us N "
@@ -51,7 +54,11 @@ Options parse(int argc, char** argv) {
             std::exit(0);
         }
         const auto value = measurement::take(argc, argv, i);
-        if (flag == "--op")
+        if (flag == "--tap")
+            o.tap = value;
+        else if (flag == "--tap-columns")
+            o.tap_columns = measurement::integer(value);
+        else if (flag == "--op")
             o.op = value;
         else if (flag == "--base-type")
             o.base_type = parameter_type(value);
@@ -79,6 +86,9 @@ Options parse(int argc, char** argv) {
     if (o.op != "pre" && o.op != "post" && o.op != "expand-pre" && o.op != "post-pre" &&
         o.op != "post-mean-norm")
         throw std::invalid_argument("unknown mHC Op");
+    if ((o.tap != "none" && o.tap != "slice" && o.tap != "contiguous" && o.tap != "both") ||
+        (o.tap != "none" && o.op != "post-pre"))
+        throw std::invalid_argument("tap requires post-pre");
     if (o.alias && o.op != "post" && o.op != "post-pre")
         throw std::invalid_argument("inplace requires post or post-pre");
     if (o.sites > 1 && (o.alias || o.op == "post" || o.op == "post-mean-norm"))
@@ -128,10 +138,14 @@ struct Fixture {
           gamma(parameter(o.gamma_type, D, 7111, -1.F, 1.F)), q(make_f32(S * m, 7113, 0.F, 2.F)),
           c(make_f32(S * S * m, 7117, 0.01F, 0.5F)), r(make_zeros(std::size_t(K) * m * 2)),
           u(make_zeros(std::size_t(D) * m * 2)), nq(make_zeros(S * m * 4)),
-          nc(make_zeros(S * S * m * 4)), backup(o.alias ? make_zeros(x.size()) : DeviceBuffer{}),
-          capacity(::capacity(o.op, m, 1)), scratch(device_context().device(), capacity),
-          arena(scratch.span()), tx(x.span(), DType::BF16, {D, S, m}),
-          ty(y.span(), DType::BF16, {D, m}),
+          nc(make_zeros(S * S * m * 4)),
+          tap(o.tap == "none"
+                  ? DeviceBuffer{}
+                  : make_zeros(std::size_t(D) *
+                               (o.tap == "contiguous" ? o.sites : std::max(5, o.sites)) * m * 2)),
+          backup(o.alias ? make_zeros(x.size()) : DeviceBuffer{}), capacity(::capacity(o.op, m, 1)),
+          scratch(device_context().device(), capacity), arena(scratch.span()),
+          tx(x.span(), DType::BF16, {D, S, m}), ty(y.span(), DType::BF16, {D, m}),
           tr(o.alias ? x.span() : r.span(), DType::BF16, {D, S, m}),
           weights{projections[0].weight, Tensor(base.span(), o.base_type, {N}),
                   Tensor(scale.span(), o.scale_type, {3}), Tensor(gamma.span(), o.gamma_type, {D})},
@@ -156,6 +170,16 @@ struct Fixture {
         output       = {
             Tensor(u.span(), DType::BF16, {D, m}),
             {Tensor(nq.span(), DType::FP32, {S, m}), Tensor(nc.span(), DType::FP32, {S, S, m})}};
+        if (options.tap != "none") {
+            const int c = options.tap_columns ? options.tap_columns : m;
+            if (m % c) throw std::invalid_argument("tap columns must divide M");
+            const int pitch = D * (options.tap == "contiguous" ? 1 : std::max(5, options.sites));
+            tap_view       = Tensor(tap.span().subspan(options.tap == "contiguous" ? 0 : 2 * D * 2),
+                                    DType::BF16, {D, c, m / c});
+            tap_view.nb[1] = pitch * 2;
+            tap_view.nb[2] = std::int64_t(pitch) * c * 2;
+            tap_view.nb[3] = std::int64_t(pitch) * m * 2;
+        }
         capacity = ::capacity(options.op, m);
         arena    = MemoryArena(scratch.span().subspan(0, capacity));
     }
@@ -176,9 +200,16 @@ struct Fixture {
                 ops::mhc_post(tx, ty, coefficients, tr, e);
             else if (options.op == "expand-pre")
                 ops::mhc_expand_pre(ty, weights, parameters, tr, output, arena, e);
-            else if (options.op == "post-pre")
-                ops::mhc_post_pre(tx, ty, coefficients, weights, parameters, tr, output, arena, e);
-            else if (options.op == "post-mean-norm")
+            else if (options.op == "post-pre") {
+                auto capture = tap_view;
+                if (tap_enabled && options.sites > 1) {
+                    const auto offset = std::size_t(call % options.sites) * D *
+                                        (options.tap == "contiguous" ? m : 1) * 2;
+                    capture.data = static_cast<char*>(tap.data()) + offset;
+                }
+                ops::mhc_post_pre(tx, ty, coefficients, weights, parameters, tr, output, arena, e,
+                                  tap_enabled ? capture : Tensor{});
+            } else if (options.op == "post-mean-norm")
                 ops::mhc_post_mean_norm(tx, ty, coefficients, weights.gamma, 1.e-5F,
                                         output.block_input, arena, e);
         }
@@ -187,7 +218,9 @@ struct Fixture {
     const Options& options;
     const std::vector<DirectBf16Weight>& projections;
     int m;
-    DeviceBuffer x, y, base, scale, gamma, q, c, r, u, nq, nc, backup;
+    DeviceBuffer x, y, base, scale, gamma, q, c, r, u, nq, nc, tap, backup;
+    Tensor tap_view;
+    bool tap_enabled = false;
     std::size_t capacity;
     DeviceBuffer scratch;
     MemoryArena arena;
@@ -198,6 +231,11 @@ struct Fixture {
     ops::MhcPreParameters parameters{1.e-5F, 1.e-5F, 1.e-6F, 1.e-6F, 2.F, 20};
 };
 } // namespace
+
+std::vector<bool> options_for_tap(const std::string& tap) {
+    if (tap == "both") return {false, true};
+    return {tap != "none"};
+}
 
 int main(int argc, char** argv) {
     try {
@@ -216,46 +254,55 @@ int main(int argc, char** argv) {
             projections);
         for (int m : o.columns) {
             f.reset_columns(m);
-            for (const auto& execution :
-                 measurement::selections(o.timing.execution, "graph", "eager"))
-                for (const auto& cache : measurement::selections(o.timing.cache, "cold", "warm")) {
-                    auto result = measurement::measure([&](CudaExecutionView e) { f.launch(e); },
-                                                       [&](CudaExecutionView e) { f.restore(e); },
-                                                       flush, device_context().execution_view(),
-                                                       o.timing, execution, cache);
-                    measurement::Row row;
-                    row.op              = "mhc_" + o.op;
-                    row.format          = "bf16";
-                    row.n               = N;
-                    row.k               = K;
-                    row.value_heads     = S;
-                    row.tokens          = m;
-                    row.workspace_bytes = f.capacity;
-                    row.workspace_peak  = f.arena.peak_used();
-                    row.layers          = o.sites;
-                    for (auto* timing : {&result.gpu, &result.host}) {
-                        timing->median_us /= o.calls;
-                        timing->min_us /= o.calls;
-                        timing->p95_us /= o.calls;
+            for (bool tap_enabled : options_for_tap(o.tap)) {
+                f.tap_enabled = tap_enabled;
+                for (const auto& execution :
+                     measurement::selections(o.timing.execution, "graph", "eager"))
+                    for (const auto& cache :
+                         measurement::selections(o.timing.cache, "cold", "warm")) {
+                        f.arena.reset_peak();
+                        auto result = measurement::measure(
+                            [&](CudaExecutionView e) { f.launch(e); },
+                            [&](CudaExecutionView e) { f.restore(e); }, flush,
+                            device_context().execution_view(), o.timing, execution, cache);
+                        measurement::Row row;
+                        row.op              = "mhc_" + o.op + (tap_enabled ? "_tap" : "");
+                        row.format          = "bf16";
+                        row.n               = N;
+                        row.k               = K;
+                        row.value_heads     = S;
+                        row.tokens          = o.tap_columns ? o.tap_columns : m;
+                        row.batch           = m / row.tokens;
+                        row.workspace_bytes = f.capacity;
+                        row.workspace_peak  = f.arena.peak_used();
+                        row.layers          = o.sites;
+                        for (auto* timing : {&result.gpu, &result.host}) {
+                            timing->median_us /= o.calls;
+                            timing->min_us /= o.calls;
+                            timing->p95_us /= o.calls;
+                        }
+                        result.kernels /= o.calls;
+                        const std::size_t bytes =
+                            semantic_bytes(o, m) + (tap_enabled ? std::size_t(D) * m * 2 : 0);
+                        const double flops = (o.op == "post" || o.op == "post-mean-norm")
+                                                 ? 0
+                                                 : double(2) * N * K * m;
+                        csv.write(
+                            row, result, execution,
+                            o.sites > 1   ? "rotation-" + cache
+                            : o.calls > 1 ? "repeat-" + cache
+                                          : cache,
+                            std::string(o.alias ? "inplace," : "disjoint,") +
+                                std::to_string(bytes) + "," +
+                                format_metric(bytes / (result.gpu.median_us * 1000), 3, "") + "," +
+                                format_metric(bytes / (kRoofline.memory_gbs * 1000), 3, "") + "," +
+                                format_metric(flops, 0, "") + "," +
+                                format_metric(flops / (kRoofline.bf16_f32_tflops * 1.e6), 3, "") +
+                                "," + std::to_string(o.calls) + "," + std::to_string(o.sites) +
+                                "," + type_name(o.base_type) + "," + type_name(o.scale_type) + "," +
+                                type_name(o.gamma_type));
                     }
-                    result.kernels /= o.calls;
-                    const std::size_t bytes = semantic_bytes(o, m);
-                    const double flops =
-                        (o.op == "post" || o.op == "post-mean-norm") ? 0 : double(2) * N * K * m;
-                    csv.write(
-                        row, result, execution,
-                        o.sites > 1   ? "rotation-" + cache
-                        : o.calls > 1 ? "repeat-" + cache
-                                      : cache,
-                        std::string(o.alias ? "inplace," : "disjoint,") + std::to_string(bytes) +
-                            "," + format_metric(bytes / (result.gpu.median_us * 1000), 3, "") +
-                            "," + format_metric(bytes / (kRoofline.memory_gbs * 1000), 3, "") +
-                            "," + format_metric(flops, 0, "") + "," +
-                            format_metric(flops / (kRoofline.bf16_f32_tflops * 1.e6), 3, "") + "," +
-                            std::to_string(o.calls) + "," + std::to_string(o.sites) + "," +
-                            type_name(o.base_type) + "," + type_name(o.scale_type) + "," +
-                            type_name(o.gamma_type));
-                }
+            }
         }
     } catch (const std::exception& e) {
         std::cerr << e.what() << '\n';

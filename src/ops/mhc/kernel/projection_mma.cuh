@@ -8,7 +8,7 @@
 namespace ninfer::ops::detail::mhc {
 // A CTA owns all streams and projection rows for its hidden/token tile. In-place
 // post-pre reads every old stream before publishing the BF16 words used by the MMA.
-template <Form F, int Hidden, int Tokens>
+template <Form F, int Hidden, int Tokens, bool Tap = false>
 __launch_bounds__(ProjectionSchedule<Tokens>::kThreads) __global__
     void projection_mma_kernel(Operands o, float* partial, std::int64_t tile_offset) {
     using Schedule   = ProjectionSchedule<Tokens>;
@@ -51,6 +51,7 @@ __launch_bounds__(ProjectionSchedule<Tokens>::kThreads) __global__
                 if constexpr (F == Form::PostPre) {
                     mixed_vectors(o, m0 + token, d, coefficients[token], coefficients[token] + 4,
                                   values);
+                    if constexpr (Tap) store_mean_tap(o, m0 + token, d, values);
                 } else if constexpr (F == Form::ExpandPre) {
                     const auto value = common::Bf16Vector<2>::load(
                         static_cast<const __nv_bfloat16*>(o.residual) + (m0 + token) * kHidden + d);

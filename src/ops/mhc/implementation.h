@@ -23,6 +23,9 @@ struct Operands {
     float* next_mix  = nullptr;
     int columns      = 0;
     MhcPreParameters parameters{};
+    void* mean_tap                 = nullptr;
+    std::int64_t tap_column_stride = 0, tap_batch_gap = 0; // BF16 elements.
+    int tap_columns = 0;
 };
 
 enum class Method {
@@ -45,7 +48,7 @@ struct Plan {
     int interval_end; // Inclusive end of this route; also owns interval capacity traversal.
 };
 
-Plan select(Form form, int columns, int sm_count);
+Plan select(Form form, int columns, int sm_count, bool mean_tap = false);
 std::size_t scratch_bytes(Plan plan, int columns);
 std::size_t capacity(Form form, const MhcGeometry& geometry, int sm_count, int first, int last);
 void validate_geometry(const MhcGeometry& geometry);

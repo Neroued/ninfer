@@ -139,8 +139,7 @@ void WorkContract::validate(const Work& work, runtime::FrameKind kind) const {
     require(work.batch == plan_batch(rows, ranks), "physical row plan differs from membership");
     for (std::size_t i = 0; i < rows.size(); ++i) {
         const auto& r = rows[i];
-        require(r.control_last_token.has_value() == control && (control || r.window_ends.empty()),
-                "control fields outside control work");
+        require(r.control_last_token.has_value() == control, "control fields outside control work");
         member(r.member, shape.max_concurrency);
         require(r.states.size() == ranks && r.main_table.valid() && r.main_table.pool_id == 0,
                 "incomplete context binding");
@@ -162,11 +161,6 @@ void WorkContract::validate(const Work& work, runtime::FrameKind kind) const {
         if (control && !r.ids.empty())
             tokens(std::span<const TokenId>(r.ids).subspan(1), public_tokens);
         if (r.control_last_token) tokens({&*r.control_last_token, 1}, public_tokens);
-        std::uint32_t previous = 0;
-        for (auto end : r.window_ends) {
-            require(end > previous && end < r.ids.size(), "invalid window boundary");
-            previous = end;
-        }
         for (std::size_t j = 0; j < i; ++j) {
             require(r.member.sequence != rows[j].member.sequence &&
                         r.member.residency.lane != rows[j].member.residency.lane &&

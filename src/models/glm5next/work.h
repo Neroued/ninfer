@@ -26,7 +26,6 @@ struct WorkRow {
     std::uint32_t main_frontier = 0, mtp_frontier = 0;
     std::vector<TokenId> ids;
     std::optional<TokenId> control_last_token;
-    std::vector<std::uint32_t> window_ends;
     ResolvedSamplingParameters sampling;
     std::uint32_t sampling_position = 0;
     bool constrained                = false;

@@ -2124,18 +2124,16 @@ int test_reasoning_split(const Frontend& frontend) {
         canonical_tokens, static_cast<std::uint32_t>(canonical_tokens.size() + 1U),
         ninfer::FinishReason::OutputLimit);
     int failures =
-        check(canonical.accepted_tokens == canonical_tokens.size() && !canonical.finished() &&
-                  canonical.prefix_execution_split_after == canonical_tokens.size(),
-              "canonical reasoning close did not publish its exact token execution frontier");
+        check(canonical.accepted_tokens == canonical_tokens.size() && !canonical.finished(),
+              "canonical reasoning close was not accepted");
     (void)canonical_session.commit_preview();
 
     auto session = frontend.make_output_session(prompt, {});
     const std::array<ninfer::TokenId, 2> tokens{3, 4};
     const auto decision = session.preview_model(tokens, 2, ninfer::FinishReason::OutputLimit);
     failures += check(decision.accepted_tokens == 2 &&
-                          decision.finish_reason == ninfer::FinishReason::OutputLimit &&
-                          !decision.prefix_execution_split_after,
-                      "reasoning close inside a mixed token produced an execution frontier");
+                          decision.finish_reason == ninfer::FinishReason::OutputLimit,
+                      "reasoning close inside a mixed token changed output-budget handling");
     const auto output = session.commit_preview();
     failures += check(channel_text(output, ninfer::OutputChannel::Reasoning) == "thought",
                       "reasoning channel did not remove the close marker");
@@ -2258,8 +2256,7 @@ int test_thinking_budget_control(const Frontend& frontend) {
 
     const auto control_decision = session.preview_control(control, 18);
     failures +=
-        check(control_decision.accepted_tokens == control.size() && !control_decision.finished() &&
-                  control_decision.prefix_execution_split_after == control.size(),
+        check(control_decision.accepted_tokens == control.size() && !control_decision.finished(),
               "canonical thinking control was not accepted atomically");
     const auto control_output = session.commit_preview();
     failures += check(channel_text(control_output, ninfer::OutputChannel::Reasoning) ==
@@ -2777,7 +2774,7 @@ int test_model_owned_options() {
 int test_output_control_contract() {
     auto tokenizer = std::make_shared<const ninfer::text::Tokenizer>(fixture_tokenizer());
     auto reasoning = std::make_shared<const ninfer::models::frontend::ReasoningFormat>(
-        "</think>", "\n</think>\n\n", nullptr, true);
+        "</think>", nullptr, true);
     return check(throws_invalid_argument([&] {
                      ninfer::models::frontend::OutputSession output({.tokenizer = tokenizer,
                                                                      .reasoning = reasoning,

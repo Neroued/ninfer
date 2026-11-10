@@ -58,19 +58,7 @@ PromptLayout inspect_prompt_layout(const text::TemplateOutput& output,
         if (closed && end < source.size() && source[end] == '\n') ++end;
         result.messages.push_back({parsed, pos, header_end + 1, content_end, end, closed});
         if (parsed == ChatRole::Assistant) {
-            result.execution_boundaries.push_back(header_end + 1);
-            constexpr std::string_view open = "<think>\n";
             const auto body = source.substr(header_end + 1, content_end - header_end - 1);
-            if (body.starts_with(open) &&
-                template_bytes(output, header_end + 1, header_end + 1 + open.size())) {
-                result.execution_boundaries.push_back(header_end + 1 + open.size());
-                const auto reasoning_close = find_marker(
-                    output, kCanonicalReasoningCloseSerialization, header_end + 1 + open.size());
-                if (reasoning_close != std::string::npos && reasoning_close < content_end) {
-                    result.execution_boundaries.push_back(
-                        reasoning_close + kCanonicalReasoningCloseSerialization.size());
-                }
-            }
             if (!closed && next == std::string::npos) {
                 // Only the final assistant prefix controls the initial output channel.
                 const auto open_end =

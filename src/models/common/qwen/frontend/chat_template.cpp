@@ -259,7 +259,6 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
     result.continuation_content         = std::move(continuation_content);
     result.starts_in_reasoning          = layout.starts_in_reasoning;
     result.media_placeholders           = layout.media_placeholders;
-    result.rewrite_execution_boundaries = layout.execution_boundaries;
     result.message_boundaries.resize(messages.size() + 1);
     result.cache_boundaries.resize(options.cache_markers.size());
 

@@ -167,19 +167,16 @@ SessionImpl::start_decode(std::span<const SequenceHandle> members,
 
 std::optional<runtime::ExecutionTicket>
 SessionImpl::start_control(std::span<const SequenceHandle> members, std::span<const TokenId> tokens,
-                           std::uint32_t stride,
-                           std::span<const std::optional<std::uint32_t>> splits) {
+                           std::uint32_t stride) {
     if (execution) return {};
     if (members.empty() || members.size() > max_concurrency || !stride ||
-        stride > plan.profile->control_token_limit || tokens.size() != members.size() * stride ||
-        splits.size() != members.size())
+        stride > plan.profile->control_token_limit || tokens.size() != members.size() * stride)
         throw std::invalid_argument("forced control shape is invalid");
     auto reservation = executor().try_reserve(runtime::FrameKind::Compute);
     if (!reservation) return {};
     try {
         Execution pending{.kind = OperationKind::Control};
         pending.members.assign(members.begin(), members.end());
-        pending.splits.assign(splits.begin(), splits.end());
         pending.preparation = std::make_unique<context::ContextTransaction>(directory);
         ForwardWork forward;
         forward.purpose = ForwardPurpose::Control;
@@ -195,8 +192,6 @@ SessionImpl::start_control(std::span<const SequenceHandle> members, std::span<co
             for (const auto id : forced)
                 if (id < 0 || static_cast<std::uint32_t>(id) >= plan.profile->public_tokens)
                     throw std::invalid_argument("forced token is outside the public vocabulary");
-            if (splits[b] && (!*splits[b] || *splits[b] > stride))
-                throw std::invalid_argument("forced control split is outside its span");
             pending.bases.push_back(state.continuation);
             pending.columns.push_back(stride);
             pending.inputs.emplace_back(forced.begin(), forced.end());

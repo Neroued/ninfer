@@ -153,20 +153,19 @@ Session::start_decode(std::span<const SequenceHandle> members,
 
 std::optional<runtime::ExecutionTicket>
 Session::start_control(std::span<const SequenceHandle> members, std::span<const TokenId> tokens,
-                       std::uint32_t stride, std::span<const std::optional<std::uint32_t>> splits) {
+                       std::uint32_t stride) {
     auto& p = *impl_;
     if (p.compute) return {};
     if (members.empty() || members.size() > p.shape.max_concurrency || !stride ||
         stride > p.definition->resources().text.control_tokens->size() ||
-        tokens.size() != members.size() * stride || splits.size() != members.size())
+        tokens.size() != members.size() * stride)
         throw std::logic_error("invalid forced control window");
     for (std::size_t b = 0; b < members.size(); ++b) {
         const auto& s = p.sequence(members[b]);
         if (s.phase != detail::Phase::Active || !s.permit ||
             s.permit->kind != ExecutionUnitKind::Control ||
             s.identity.tokens.size() != s.continuation.metadata.main_frontier + 1 ||
-            s.continuation.metadata.main_frontier + stride > s.permitted_frontier ||
-            (splits[b] && (!*splits[b] || *splits[b] > stride)))
+            s.continuation.metadata.main_frontier + stride > s.permitted_frontier)
             throw std::logic_error("forced control row is not executable");
     }
     for (const auto id : tokens)
@@ -177,7 +176,6 @@ Session::start_control(std::span<const SequenceHandle> members, std::span<const 
     p.compute = std::make_unique<detail::ComputeTransaction>(Kind::Control, p.directory);
     auto& tx  = *p.compute;
     tx.members.assign(members.begin(), members.end());
-    tx.splits.assign(splits.begin(), splits.end());
     try {
         for (std::size_t b = 0; b < members.size(); ++b) {
             auto& s = p.sequence(members[b]);
@@ -186,13 +184,6 @@ Session::start_control(std::span<const SequenceHandle> members, std::span<const 
             const auto forced      = tokens.subspan(b * stride, stride);
             row.control_last_token = forced.back();
             row.ids.insert(row.ids.end(), forced.begin(), forced.end() - 1);
-            for (const auto frontier : s.identity.positions.execution_frontiers())
-                if (frontier > row.main_frontier && frontier < row.main_frontier + stride)
-                    row.window_ends.push_back(frontier - row.main_frontier);
-            if (splits[b] && *splits[b] + 1 < stride) row.window_ends.push_back(*splits[b] + 1);
-            std::sort(row.window_ends.begin(), row.window_ends.end());
-            row.window_ends.erase(std::unique(row.window_ends.begin(), row.window_ends.end()),
-                                  row.window_ends.end());
             row.rope_positions.clear();
             tx.rows.push_back(std::move(row));
         }

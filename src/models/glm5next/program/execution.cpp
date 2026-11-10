@@ -93,11 +93,6 @@ void RankProgramImpl::forward() {
         const auto& original = rows[f.control_row];
         auto end =
             std::min<std::uint32_t>(original.ids.size(), f.control_offset + shape.prefill_chunk);
-        for (auto boundary : original.window_ends)
-            if (boundary > f.control_offset) {
-                end = std::min(end, boundary);
-                break;
-            }
         f.window = original;
         auto& w  = *f.window;
         w.ids.assign(original.ids.begin() + f.control_offset, original.ids.begin() + end);

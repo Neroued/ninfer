@@ -108,14 +108,6 @@ RequestBasePlan SessionImpl::plan_request(qwen::PreparedPromptData&& prompt,
     base->prefix_identity_tag = static_cast<std::uint32_t>(speculative_backend) |
                                 (static_cast<std::uint32_t>(plan.proposal_head) << 8U) |
                                 (static_cast<std::uint32_t>(plan.kv_storage) << 16U);
-    std::uint32_t previous = 0;
-    for (const auto frontier : prompt.identity.rewrite_execution_frontiers) {
-        if (frontier <= previous || frontier > base->summary.prompt_tokens) {
-            throw std::invalid_argument(
-                "rewrite execution frontiers must be ordered prompt positions");
-        }
-        previous = frontier;
-    }
     base->prompt = std::make_shared<const qwen::PreparedPromptData>(std::move(prompt));
     if (base->summary.publish_continuation) {
         const auto& prepared = *base->prompt;

@@ -98,7 +98,6 @@ void row(Encoder& out, const WorkRow& r) {
     integers(out, r.ids);
     out.boolean(r.control_last_token.has_value());
     if (r.control_last_token) out.i32(*r.control_last_token);
-    integers(out, r.window_ends);
     sampling(out, r.sampling);
     out.u32(r.sampling_position);
     out.boolean(r.constrained);
@@ -118,7 +117,6 @@ WorkRow row(Decoder& in) {
     r.attention_rank = in.u32();
     r.ids            = integers<TokenId>(in);
     if (in.boolean()) r.control_last_token = in.i32();
-    r.window_ends       = integers<std::uint32_t>(in);
     r.sampling          = sampling(in);
     r.sampling_position = in.u32();
     r.constrained       = in.boolean();

@@ -216,7 +216,6 @@ struct ComputeTransaction {
     std::vector<SequenceHandle> members;
     std::vector<WorkRow> rows;
     std::vector<std::uint32_t> extents;
-    std::vector<std::optional<std::uint32_t>> splits;
     std::optional<ComputeResult> result;
     ExecutionSample observed_result;
     std::vector<runtime::CommitDecision> decisions;

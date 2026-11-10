@@ -343,10 +343,10 @@ Session::start_decode(std::span<const SequenceHandle> h, std::span<const runtime
     return impl_->start_decode(h, b, c);
 }
 
-std::optional<runtime::ExecutionTicket>
-Session::start_control(std::span<const SequenceHandle> h, std::span<const TokenId> ids,
-                       std::uint32_t stride, std::span<const std::optional<std::uint32_t>> splits) {
-    return impl_->start_control(h, ids, stride, splits);
+std::optional<runtime::ExecutionTicket> Session::start_control(std::span<const SequenceHandle> h,
+                                                               std::span<const TokenId> ids,
+                                                               std::uint32_t stride) {
+    return impl_->start_control(h, ids, stride);
 }
 
 std::optional<runtime::ExecutionTicket> Session::start_score(qwen::PreparedPrompt&& prompt,

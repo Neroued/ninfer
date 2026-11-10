@@ -7,11 +7,6 @@ namespace ninfer::models::glm5next::detail {
 std::uint32_t SessionImpl::window_end(const Sequence& s, std::uint32_t begin,
                                       std::uint32_t end) const {
     end = std::min(end, begin + shape.prefill_chunk);
-    for (const auto frontier : s.identity.execution_frontiers)
-        if (frontier > begin) {
-            end = std::min(end, frontier);
-            break;
-        }
     if (s.capture && s.next_capture < s.captures.size())
         end = std::min(end, s.captures[s.next_capture].frontier);
     if (s.request->vision)

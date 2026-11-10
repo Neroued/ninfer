@@ -33,6 +33,26 @@ int language_semantics() {
          {{"text", "北京🌏"}},
          "3|🌏|🌏京北||"},
         {"{% for c in text %}[{{ c }}]{% endfor %}", {{"text", "北京🌏"}}, "[北][京][🌏]"},
+        {"{% for i in range(1000000000000) %}{{ i }}{% break %}{% endfor %}", Json::object(), "0"},
+        {"{% for x,y in [[1,2],[3]] %}{{ x }}{% break %}{% endfor %}", Json::object(), "1"},
+        {"{% set a,b = range(3,7,2) %}{{ a }}|{{ b }}", Json::object(), "3|5"},
+        {"{% for i in [1] %}{% if loop %}{{ loop.index }}{% endif %}{% endfor %}", Json::object(),
+         "1"},
+        {"{% set x=0 %}{% for i in [1,2] %}{{ x }}{% set x=i %}{% endfor %}|{{ x }}",
+         Json::object(), "00|0"},
+        {"{% set n=namespace(v=0) %}{% for i in [1,2,3] if i>n.v %}{{ i }}"
+         "{% set n.v=3 %}{% endfor %}",
+         Json::object(), "1"},
+        {"{% set n=namespace(v=0) %}{% for i in [1,2,3] if i>n.v %}{{ i }}/{{ loop.length }}"
+         "{% set n.v=3 %}{% endfor %}",
+         Json::object(), "1/32/33/3"},
+        {"{% for i in range(5) if i%2==0 %}{{ loop.index }}:{{ i }}:"
+         "{{ loop.previtem|default('-') }}:{{ loop.nextitem|default('-') }}:"
+         "{{ loop.first }}:{{ loop.last }}:{{ loop.revindex }};{% endfor %}",
+         Json::object(), "1:0:-:2:True:False:3;2:2:0:4:False:False:2;3:4:2:-:False:True:1;"},
+        {"{{ range(8,1,-2)|list|tojson }}|{{ range(2,9,2)[1:]|list|tojson }}|"
+         "{{ range(2,9,2)[-1] }}|{{ 6 in range(2,9,2) }}|{{ range(3)|length }}",
+         Json::object(), "[8, 6, 4, 2]|[4, 6, 8]|8|True|3"},
         {"{{ text|upper }}|{{ text|lower }}|{{ text|capitalize }}",
          {{"text", "straße ΟΣ İ"}},
          "STRASSE ΟΣ İ|straße ος i̇|Straße ος i̇"},

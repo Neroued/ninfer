@@ -36,9 +36,6 @@ struct CommitDecision {
     bool terminal                 = false;
     bool cancelled                = false;
     bool failed                   = false;
-    // Copied unchanged from the corresponding OutputDecision; still relative to this row's
-    // accepted span.
-    std::optional<std::uint32_t> prefix_execution_split_after;
 };
 
 struct ExecutionComplete {

@@ -278,35 +278,6 @@ void test_prefix_identity() {
                                                  changed_position.token_ids.size()),
            "different MRoPE positions must not reuse resident state");
 
-    ninfer::models::qwen::PreparedPromptData changed_decomposition = identity_prompt();
-    changed_decomposition.identity.rewrite_execution_frontiers     = {1};
-    expect(!ninfer::models::qwen::prefix_matches(changed_decomposition, ledger, resident,
-                                                 changed_decomposition.token_ids.size()),
-           "different GDN execution decomposition must not reuse resident state");
-    changed_decomposition.identity.rewrite_execution_frontiers = {4};
-    expect(ninfer::models::qwen::prefix_matches(changed_decomposition, ledger, resident, 3),
-           "execution decomposition wholly after the frontier changed prefix identity");
-
-    ninfer::models::qwen::PreparedPromptData resident_future = identity_prompt();
-    resident_future.identity.rewrite_execution_frontiers     = {1, 4};
-    ninfer::models::qwen::ResidentPrefixIdentity resident_with_future;
-    resident_with_future.assign(resident_future);
-    ninfer::models::qwen::PreparedPromptData incoming_future = identity_prompt();
-    incoming_future.identity.rewrite_execution_frontiers     = {1, 3};
-    expect(ninfer::models::qwen::prefix_matches(incoming_future, ledger, resident_with_future, 1),
-           "resident execution decomposition after the frontier changed prefix identity");
-    expect(!ninfer::models::qwen::prefix_matches(incoming_future, ledger, resident_with_future, 3),
-           "different execution decomposition inside the frontier reused resident state");
-
-    ninfer::models::qwen::PrefixShortlistDigests future_digest;
-    future_digest.assign(resident_future);
-    ninfer::models::qwen::PrefixShortlistDigests incoming_digest;
-    incoming_digest.assign(incoming_future);
-    expect(future_digest.at(1) == incoming_digest.at(1),
-           "future execution boundaries changed an earlier content shortlist");
-    expect(future_digest.at(3) != incoming_digest.at(3),
-           "different in-prefix execution boundaries shared a shortlist digest");
-
     resident.append_generated(1, original.rope_delta);
     ledger.push_back(12);
     const std::array<ninfer::TokenId, 1> generated{12};
@@ -328,11 +299,10 @@ void test_prefix_identity() {
     ninfer::models::qwen::PrefixShortlistDigests accepted_digests;
     accepted_resident.assign(accepted_rebuild);
     accepted_digests.assign(accepted_rebuild);
-    accepted_resident.append_generated(accepted.size(), accepted_rebuild.rope_delta, 1);
-    accepted_digests.append_generated(accepted, accepted_rebuild.rope_delta, 1);
+    accepted_resident.append_generated(accepted.size(), accepted_rebuild.rope_delta);
+    accepted_digests.append_generated(accepted, accepted_rebuild.rope_delta);
     append_text_token(accepted_rebuild, accepted[0], 4);
     append_text_token(accepted_rebuild, accepted[1], 5);
-    accepted_rebuild.identity.rewrite_execution_frontiers = {5};
     ninfer::models::qwen::PrefixShortlistDigests rebuilt_accepted_digests;
     rebuilt_accepted_digests.assign(accepted_rebuild);
     expect(ninfer::models::qwen::prefix_matches(accepted_rebuild, accepted_ledger,
@@ -391,11 +361,6 @@ void test_regular_prefix_identity() {
     changed = prompt(128, 8);
     right.assign(changed);
     check_against_input(changed, right);
-    changed                                      = original;
-    changed.identity.rewrite_execution_frontiers = {64};
-    right.assign(changed);
-    check_against_input(changed, right);
-
     left.append_generated(2, 7);
     right.assign(prompt(130, 7));
     expect(left.equals(right), "regular generated positions differ from a full rebuild");

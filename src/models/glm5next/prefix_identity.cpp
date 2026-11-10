@@ -23,13 +23,6 @@ void validate(InputPrefixView input) {
             if (!std::isfinite(timestamp))
                 throw std::invalid_argument("media identity timestamps must be finite");
     }
-    std::uint32_t previous = 0;
-    for (const auto frontier : input.execution_frontiers) {
-        if (frontier <= previous || frontier > input.tokens.size())
-            throw std::invalid_argument(
-                "input execution frontiers must be ordered and within input");
-        previous = frontier;
-    }
 }
 
 bool same_media(const MediaInputIdentity& a, const MediaInputIdentity& b) {
@@ -86,12 +79,6 @@ bool input_prefix_equal(InputPrefixView left, InputPrefixView right, std::size_t
     if (frontier > left.tokens.size() || frontier > right.tokens.size() ||
         !std::equal(left.tokens.begin(), left.tokens.begin() + frontier, right.tokens.begin()))
         return false;
-    const auto a = std::upper_bound(left.execution_frontiers.begin(),
-                                    left.execution_frontiers.end(), frontier);
-    const auto b = std::upper_bound(right.execution_frontiers.begin(),
-                                    right.execution_frontiers.end(), frontier);
-    if (!std::equal(left.execution_frontiers.begin(), a, right.execution_frontiers.begin(), b))
-        return false;
     std::size_t count = 0;
     while (count < left.media.size() &&
            left.media[count].item.token_spans.front().begin < frontier) {
@@ -119,17 +106,12 @@ PrefixDigests::PrefixDigests(InputPrefixView input) {
     digests_.reserve(input.tokens.size() + 1);
     Digest digest{1469598103934665603ULL, 7809847782465536322ULL};
     digests_.push_back(digest);
-    std::size_t media = 0, split = 0;
+    std::size_t media = 0;
     for (std::size_t token = 0; token < input.tokens.size(); ++token) {
         if (media < input.media.size() &&
             input.media[media].item.token_spans.front().begin == token)
             mix_media(digest, input.media[media++]);
         mix(digest, static_cast<std::uint32_t>(input.tokens[token]));
-        if (split < input.execution_frontiers.size() &&
-            input.execution_frontiers[split] == token + 1) {
-            mix(digest, 0x676c6d2d73706c69ULL);
-            mix(digest, input.execution_frontiers[split++]);
-        }
         digests_.push_back(digest);
     }
 }
@@ -140,19 +122,12 @@ std::array<std::uint64_t, 2> PrefixDigests::at(std::size_t frontier) const {
 
 void PrefixDigests::reserve(std::size_t tokens) { digests_.reserve(tokens + 1); }
 
-void PrefixDigests::append_generated(std::span<const TokenId> tokens,
-                                     std::optional<std::uint32_t> split) {
-    if (split && (!*split || *split > tokens.size()))
-        throw std::invalid_argument("GLM generated execution boundary is outside its input");
+void PrefixDigests::append_generated(std::span<const TokenId> tokens) {
     const auto base = digests_.size() - 1;
     reserve(base + tokens.size());
     auto digest = digests_.back();
     for (std::size_t i = 0; i < tokens.size(); ++i) {
         mix(digest, static_cast<std::uint32_t>(tokens[i]));
-        if (split && i + 1 == *split) {
-            mix(digest, 0x676c6d2d73706c69ULL);
-            mix(digest, base + i + 1);
-        }
         digests_.push_back(digest);
     }
 }

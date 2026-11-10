@@ -254,6 +254,32 @@ protected:
 
 using value_int = std::shared_ptr<value_int_t>;
 
+struct value_range_t : public value_t {
+    int64_t start, stop, step;
+    uint64_t count;
+
+    value_range_t(int64_t start, int64_t stop, int64_t step);
+    value item(uint64_t index) const;
+    bool contains(const value& item) const;
+
+    std::string type() const override { return "Range"; }
+
+    string as_string() const override;
+
+    bool as_bool() const override { return count != 0; }
+
+    const func_builtins& get_builtins() const override;
+
+    bool is_hashable() const override { return true; }
+
+    hasher unique_hash() const noexcept override;
+
+protected:
+    bool equivalent(const value_t& other) const override;
+};
+
+using value_range = std::shared_ptr<value_range_t>;
+
 struct value_float_t : public value_t {
     value val;
 

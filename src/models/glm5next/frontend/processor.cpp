@@ -425,7 +425,6 @@ std::vector<std::vector<text::ByteSpan>> expand_media(RenderedChat& chat,
     for (auto& boundary : chat.output.boundary_mappings) boundary.offset = map(boundary.offset);
     for (auto& v : boundaries.semantic) v = map(v);
     for (auto& v : boundaries.structural) v = map(v);
-    for (auto& v : boundaries.execution) v = map(v);
     for (auto& v : boundaries.markers)
         if (v) *v = map(*v);
     if (boundaries.rewrite) boundaries.rewrite->frontier = map(boundaries.rewrite->frontier);

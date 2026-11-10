@@ -76,17 +76,13 @@ void EngineCore<Instance>::commit_pending(PendingBatch&& pending, ComputeFlight 
                 row_tokens, request->budget->remaining(), request->budget->limit_reason());
             if (decision.accepted_tokens == 0 || decision.accepted_tokens > count ||
                 (!decision.finished() && decision.accepted_tokens != count) ||
-                (decision.finished() && decision.continuation != ContinuationAction::Decode) ||
-                (decision.prefix_execution_split_after &&
-                 (*decision.prefix_execution_split_after == 0 ||
-                  *decision.prefix_execution_split_after > decision.accepted_tokens))) {
+                (decision.finished() && decision.continuation != ContinuationAction::Decode)) {
                 throw std::logic_error("output policy returned an invalid licensed prefix");
             }
             decisions[row] = CommitDecision{
                 .accepted_tokens              = decision.accepted_tokens,
                 .terminal                     = decision.finished(),
                 .cancelled                    = false,
-                .prefix_execution_split_after = decision.prefix_execution_split_after,
             };
             finish_reasons[row] = decision.finish_reason;
             continuations[row]  = decision.continuation;
@@ -392,7 +388,6 @@ template <class Instance>
     for (const auto& request : flight.requests) {
         flight.generated_sizes.push_back(request->generated.size());
     }
-    std::array<std::optional<std::uint32_t>, kMaximumConcurrency> splits{};
     try {
         EnginePhaseScope phase(*this, EngineHostPhase::CommitOutput);
         for (std::size_t row = 0; row < flight.requests.size(); ++row) {
@@ -402,13 +397,9 @@ template <class Instance>
             const auto decision =
                 request->output.preview_control(tokens, request->budget->remaining());
             if (decision.accepted_tokens != flight.control_stride || decision.finished() ||
-                decision.continuation != ContinuationAction::Decode ||
-                (decision.prefix_execution_split_after &&
-                 (*decision.prefix_execution_split_after == 0 ||
-                  *decision.prefix_execution_split_after > decision.accepted_tokens))) {
+                decision.continuation != ContinuationAction::Decode) {
                 throw std::logic_error("target control preview returned an invalid decision");
             }
-            splits[row] = decision.prefix_execution_split_after;
             if (tokens.size() > request->generated.capacity() - request->generated.size()) {
                 throw std::logic_error("admission did not reserve control token capacity");
             }
@@ -417,8 +408,7 @@ template <class Instance>
         phase.finish();
         ExecutionCallScope call(*this);
         const auto ticket = instance_.session->start_control(
-            flight.sequences, flight.control_tokens, flight.control_stride,
-            {splits.data(), flight.requests.size()});
+            flight.sequences, flight.control_tokens, flight.control_stride);
         call.finish();
         if (!ticket) {
             discard_control_preview(flight);

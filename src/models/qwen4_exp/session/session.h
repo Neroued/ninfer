@@ -388,8 +388,7 @@ public:
     start_decode(std::span<const SequenceHandle>, std::span<const runtime::RoundBudget>,
                  std::span<const bool> constrained = {});
     [[nodiscard]] std::optional<runtime::ExecutionTicket>
-    start_control(std::span<const SequenceHandle>, std::span<const TokenId>, std::uint32_t stride,
-                  std::span<const std::optional<std::uint32_t>> splits);
+    start_control(std::span<const SequenceHandle>, std::span<const TokenId>, std::uint32_t stride);
     [[nodiscard]] std::optional<runtime::ExecutionTicket> start_score(qwen::PreparedPrompt&&,
                                                                       std::uint32_t first_target);
     [[nodiscard]] std::optional<SessionEvent> poll();

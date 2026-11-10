@@ -502,8 +502,7 @@ void native_work() {
     const auto forward_copy = q::decode_work(forward_in, bindings);
     contract.validate(forward_copy, runtime::FrameKind::Compute);
     const auto& f = std::get<q::ForwardWork>(forward_copy.operation);
-    require(f.prefetch->ids == std::vector<TokenId>{31, 32} && f.prefetch->frontier == 23 &&
-                f.rows[0].window_ends.empty(),
+    require(f.prefetch->ids == std::vector<TokenId>{31, 32} && f.prefetch->frontier == 23,
             "prefill window or PLE prefetch changed in transit");
 
     auto scoring_contract          = contract;
@@ -663,7 +662,6 @@ void compact_payloads() {
     control.ids                = {23, 5};
     control.control_last_token = 8;
     control.rope_positions.clear();
-    control.window_ends = {1};
     q::Work work{{}, q::ForwardWork{q::ForwardKind::Control, q::SampleKind::None, {control}}};
     contract.validate(work, runtime::FrameKind::Compute);
     q::VisionInputBindings bindings;
@@ -677,9 +675,7 @@ void compact_payloads() {
     const auto& r = q::work_rows(decoded).front();
     std::array<TokenId, 2> forced{};
     models::ControlTokens{r.ids, *r.control_last_token}.copy(forced);
-    require(forced == std::array<TokenId, 2>{5, 8} &&
-                r.window_ends == std::vector<std::uint32_t>{1},
-            "Control lost its committed token sequence or execution split");
+    require(forced == std::array<TokenId, 2>{5, 8}, "Control lost its committed token sequence");
     const auto p = contract.payload_capacity(2);
     runtime::protocol::validate_control_capacity(
         {p.compute_work, p.context_work, p.decision, p.commit, 4096, 4096}, {1, 1}, {}, 2);

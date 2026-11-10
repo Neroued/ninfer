@@ -85,13 +85,7 @@ void RankProgramImpl::initialize_forward(ComputeOperation& operation, const Forw
     const auto& window = work.inputs[index];
     const auto offset  = operation.forward_offset;
     const auto columns = static_cast<std::uint32_t>(window.tokens.size());
-    const auto next_split =
-        std::upper_bound(window.execution_splits.begin(), window.execution_splits.end(), offset);
-    auto end  = std::holds_alternative<ForwardWork>(operation.request.work.operation) &&
-                       next_split != window.execution_splits.end()
-                    ? *next_split
-                    : columns;
-    end       = std::min(end, offset + prefill_chunk);
+    const auto end     = std::min(columns, offset + prefill_chunk);
     auto& row = operation.rows[index];
     row       = work.rows[index];
     if (offset) {

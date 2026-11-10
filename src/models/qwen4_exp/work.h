@@ -40,8 +40,6 @@ struct WorkRow {
     std::array<TokenId, 2> ple_raw_tail{};
     std::vector<TokenId> ids;
     std::optional<TokenId> control_last_token;
-    // Required boundaries within ids, measured from this input window's beginning.
-    std::vector<std::uint32_t> window_ends;
     // Axis-major [3,T], where T is ids.size().
     std::vector<std::int32_t> rope_positions;
     std::array<std::int32_t, 3> previous_rope{};

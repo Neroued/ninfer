@@ -111,7 +111,7 @@ void WorkContract::validate(const Work& work, runtime::FrameKind kind) const {
         for (std::size_t b = 0; b < rows.size(); ++b) {
             const auto& row = rows[b];
             if (row.control_last_token.has_value() != control ||
-                (!control && !row.window_ends.empty()) || (control && !row.rope_positions.empty()))
+                (control && !row.rope_positions.empty()))
                 throw std::invalid_argument("Qwen4Exp control fields outside control work");
             member(row.member, shape.max_concurrency);
             if (row.states.empty() || !row.main_table.valid() || row.main_table.pool_id != 0)
@@ -126,12 +126,6 @@ void WorkContract::validate(const Work& work, runtime::FrameKind kind) const {
                 row.ids.size() > shape.max_context - row.main_frontier ||
                 (!row.rope_positions.empty() && row.rope_positions.size() != 3 * row.ids.size()))
                 throw std::invalid_argument("Qwen4Exp input window exceeds its shape");
-            std::uint32_t previous = 0;
-            for (auto boundary : row.window_ends) {
-                if (boundary <= previous || boundary >= row.ids.size())
-                    throw std::invalid_argument("Qwen4Exp input window boundaries are invalid");
-                previous = boundary;
-            }
             tokens(row.ids, vocabulary);
             if (control && !row.ids.empty())
                 tokens(std::span<const TokenId>(row.ids).subspan(1), public_tokens);

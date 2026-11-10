@@ -125,13 +125,6 @@ void RankProgramImpl::validate_work(const Work& work, runtime::FrameKind kind) c
         if (input.tokens.size() > limit || input.rope_positions.size() != input.tokens.size() * 3) {
             throw std::invalid_argument("Qwen3.5 input window has invalid positions or extent");
         }
-        std::uint32_t previous = 0;
-        for (const auto split : input.execution_splits) {
-            if (split <= previous || split >= input.tokens.size())
-                throw std::invalid_argument(
-                    "Qwen3.5 input segments are not strictly inside its window");
-            previous = split;
-        }
         for (TokenId id : input.tokens) {
             if (id < 0 || static_cast<std::uint32_t>(id) >= parameters.profile->public_tokens)
                 throw std::invalid_argument("Qwen3.5 input token is outside the public domain");

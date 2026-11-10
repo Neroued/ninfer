@@ -19,7 +19,6 @@ struct MediaInputIdentity {
 struct InputPrefixView {
     std::span<const TokenId> tokens;
     std::span<const MediaInputIdentity> media;
-    std::span<const std::uint32_t> execution_frontiers;
 };
 
 bool input_prefix_equal(InputPrefixView left, InputPrefixView right, std::size_t frontier);
@@ -30,7 +29,7 @@ class PrefixDigests {
 public:
     explicit PrefixDigests(InputPrefixView input = {});
     void reserve(std::size_t tokens);
-    void append_generated(std::span<const TokenId>, std::optional<std::uint32_t> split = {});
+    void append_generated(std::span<const TokenId>);
     void truncate(std::size_t tokens);
     [[nodiscard]] std::array<std::uint64_t, 2> at(std::size_t frontier) const;
 private:

@@ -19,17 +19,11 @@ public:
     void clear() noexcept;
     void assign(const PreparedPromptData& prompt);
     void swap(ResidentPrefixIdentity& other) noexcept;
-    void prepare_generated(std::size_t count, std::int32_t rope_delta,
-                           std::optional<std::uint32_t> execution_split_after = std::nullopt);
-    void append_generated(std::size_t count, std::int32_t rope_delta,
-                          std::optional<std::uint32_t> execution_split_after = std::nullopt);
+    void prepare_generated(std::size_t count, std::int32_t rope_delta);
+    void append_generated(std::size_t count, std::int32_t rope_delta);
     void truncate(std::size_t tokens);
 
     [[nodiscard]] std::size_t size() const noexcept { return token_types_.size(); }
-
-    [[nodiscard]] std::span<const std::uint32_t> execution_frontiers() const noexcept {
-        return rewrite_execution_frontiers_;
-    }
 
     [[nodiscard]] bool matches(const PreparedPromptData& prompt, std::size_t count) const;
     [[nodiscard]] bool equals(const ResidentPrefixIdentity& other) const;
@@ -39,7 +33,6 @@ private:
     std::vector<std::uint8_t> token_types_;
     std::array<std::vector<std::int32_t>, 3> positions_;
     std::vector<models::frontend::VisionItem> vision_items_;
-    std::vector<std::uint32_t> rewrite_execution_frontiers_;
     // Exact proof for the initial text run: type zero and position[axis][i] = origin[axis] + i.
     std::size_t regular_prefix_ = 0;
     std::array<std::int32_t, 3> position_origins_{};
@@ -54,10 +47,8 @@ public:
     void clear() noexcept;
     void assign(const PreparedPromptData& prompt);
     void swap(PrefixShortlistDigests& other) noexcept;
-    void prepare_generated(std::size_t count, std::int32_t rope_delta,
-                           std::optional<std::uint32_t> execution_split_after = std::nullopt);
-    void append_generated(std::span<const TokenId> tokens, std::int32_t rope_delta,
-                          std::optional<std::uint32_t> execution_split_after = std::nullopt);
+    void prepare_generated(std::size_t count, std::int32_t rope_delta);
+    void append_generated(std::span<const TokenId> tokens, std::int32_t rope_delta);
     void truncate(std::size_t tokens);
 
     [[nodiscard]] std::size_t size() const noexcept {

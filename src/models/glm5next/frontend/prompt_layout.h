@@ -16,7 +16,6 @@ struct PromptBoundaries {
     std::vector<std::optional<std::size_t>> markers;
     std::vector<std::size_t> semantic;
     std::vector<std::size_t> structural;
-    std::vector<std::size_t> execution;
     std::optional<RewriteByteSpec> rewrite;
 };
 

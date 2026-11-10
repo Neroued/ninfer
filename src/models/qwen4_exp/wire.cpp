@@ -95,7 +95,6 @@ void row(Encoder& out, const WorkRow& r, std::uint32_t rank) {
     integers(out, r.ids);
     out.boolean(r.control_last_token.has_value());
     if (r.control_last_token) out.i32(*r.control_last_token);
-    integers(out, r.window_ends);
     integers(out, r.rope_positions);
     for (auto value : r.previous_rope) out.i32(value);
     sampling(out, r.sampling);
@@ -115,7 +114,6 @@ WorkRow row(Decoder& in, std::uint32_t rank) {
     for (auto& value : r.ple_raw_tail) value = in.i32();
     r.ids = integers<TokenId>(in);
     if (in.boolean()) r.control_last_token = in.i32();
-    r.window_ends    = integers<std::uint32_t>(in);
     r.rope_positions = integers<std::int32_t>(in);
     for (auto& value : r.previous_rope) value = in.i32();
     r.sampling          = sampling(in);

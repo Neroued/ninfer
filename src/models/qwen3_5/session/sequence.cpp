@@ -101,16 +101,6 @@ InputWindow SessionImpl::input_window(const SequenceState& state, std::uint32_t 
                     ? prompt.position_axis(axis)[p]
                     : static_cast<std::int32_t>(p) + state.continuation.metadata.rope_delta;
     out.prompt_begin = begin;
-    if (!causal_scoring) {
-        const auto frontiers = state.prefix_identity.execution_frontiers();
-        for (auto it = std::upper_bound(frontiers.begin(), frontiers.end(), begin);
-             it != frontiers.end() && *it < end; ++it)
-            out.execution_splits.push_back(*it - begin);
-        std::sort(out.execution_splits.begin(), out.execution_splits.end());
-        out.execution_splits.erase(
-            std::unique(out.execution_splits.begin(), out.execution_splits.end()),
-            out.execution_splits.end());
-    }
     return out;
 }
 
@@ -121,11 +111,6 @@ std::uint32_t SessionImpl::window_end(const SequenceState& state, const RequestC
     if (request.capture_reservation) end = std::min(end, request.capture_reservation->frontier);
     if (begin < request.base->summary.prompt_tokens)
         end = std::min(end, request.base->summary.prompt_tokens);
-    if (request.lifecycle == Lifecycle::Replaying) {
-        const auto frontiers = state.prefix_identity.execution_frontiers();
-        const auto next      = std::upper_bound(frontiers.begin(), frontiers.end(), begin);
-        if (next != frontiers.end()) end = std::min(end, *next);
-    }
     if (request.base->vision && begin < request.base->summary.prompt_tokens && begin < end)
         end = window.limit({state.id, state.residency}, request.base->vision->units, begin, end,
                            plan.vision_max_features);

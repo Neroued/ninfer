@@ -267,9 +267,8 @@ public:
     }
 
     q35::ControlComplete control(std::span<const q35::SequenceHandle> members,
-                                 std::span<const TokenId> tokens, std::uint32_t stride,
-                                 std::span<const std::optional<std::uint32_t>> splits) {
-        const auto ticket = session_.start_control(members, tokens, stride, splits);
+                                 std::span<const TokenId> tokens, std::uint32_t stride) {
+        const auto ticket = session_.start_control(members, tokens, stride);
         if (!ticket) throw std::logic_error("native control had no execution capacity");
         return wait<q35::ControlComplete>(*ticket);
     }

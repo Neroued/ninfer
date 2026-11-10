@@ -79,7 +79,6 @@ struct Layout {
     std::vector<std::optional<Span>> messages;
     std::vector<std::optional<Span>> tools;
     std::vector<std::size_t> semantic;
-    std::vector<std::size_t> execution;
 };
 
 Layout inspect(const RenderedChat& rendered, std::span<const ChatMessage> messages,
@@ -153,12 +152,6 @@ Layout inspect(const RenderedChat& rendered, std::span<const ChatMessage> messag
         if (continuation || i + 1 < layout.blocks.size())
             layout.semantic.push_back(block.bytes.end);
         if (block.role == ChatRole::Assistant) {
-            layout.execution.push_back(block.content);
-            if (control(out, "<think>", block.content, block.bytes.end) == block.content) {
-                layout.execution.push_back(block.content + 7);
-                const auto close = control(out, "</think>", block.content + 7, block.bytes.end);
-                if (close != absent) layout.execution.push_back(close + 8);
-            }
             for (auto span : enclosed(out, block.bytes, "<tool_call>", "</tool_call>"))
                 layout.semantic.push_back(span.end);
         } else if (block.role == ChatRole::Tool) {
@@ -275,11 +268,19 @@ PromptBoundaries resolve_prompt_boundaries(const RenderedChat& rendered,
                                            const PromptProbes& probes) {
     const auto layout = inspect(rendered, messages, continuation);
     PromptBoundaries result;
-    result.semantic  = layout.semantic;
-    result.execution = layout.execution;
-    for (const auto& marker : markers)
+    result.semantic = layout.semantic;
+    for (std::size_t i = 0; i < markers.size(); ++i) {
+        const auto same_location = [&](PromptCacheMarker other) {
+            other.kind     = markers[i].kind;
+            other.evidence = markers[i].evidence;
+            return other == markers[i];
+        };
+        const auto previous = std::find_if(markers.begin(), markers.begin() + i, same_location);
         result.markers.push_back(
-            resolve_marker(rendered, layout, messages, continuation, marker, probes));
+            previous != markers.begin() + i
+                ? result.markers[previous - markers.begin()]
+                : resolve_marker(rendered, layout, messages, continuation, markers[i], probes));
+    }
     if (const auto end = tool_end(layout, layout.tools.size())) result.structural.push_back(*end);
     std::size_t leading = 0;
     while (leading < messages.size() && (messages[leading].role == ChatRole::System ||

@@ -185,7 +185,7 @@ value binary_expression::execute_impl(context& ctx) {
             for (const auto& item : right_arr) { result->push_back(item); }
             return result;
         }
-    } else if (is_val<value_array>(right_val)) {
+    } else if (is_val<value_array>(right_val) || is_val<value_range>(right_val)) {
         // case: 1 in [0, 1, 2]
         bool member = test_is_in();
         if (op.value == "in") {
@@ -249,7 +249,7 @@ value binary_expression::execute_impl(context& ctx) {
 static value try_builtin_func(context& ctx, const std::string& name, value& input,
                               bool undef_on_missing = false) {
 
-    auto builtins = input->get_builtins();
+    const auto& builtins = input->get_builtins();
     auto it       = builtins.find(name);
     if (it != builtins.end()) { return mk_val<value_func>(name, it->second, input); }
     if (undef_on_missing) { return mk_val<value_undefined>(name); }
@@ -383,155 +383,210 @@ value if_statement::execute_impl(context& ctx) {
     return str;
 }
 
-value for_statement::execute_impl(context& ctx) {
-    context scope(ctx); // new scope for loop variables
-
-    jinja::select_expression* select_expr = cast_stmt<select_expression>(iterable);
-    statement_ptr test_expr_nullptr;
-
-    statement_ptr& iter_expr = [&]() -> statement_ptr& {
-        auto tmp = cast_stmt<select_expression>(iterable);
-        return tmp ? tmp->lhs : iterable;
-    }();
-    statement_ptr& test_expr = [&]() -> statement_ptr& {
-        auto tmp = cast_stmt<select_expression>(iterable);
-        return tmp ? tmp->test : test_expr_nullptr;
-    }();
-
-
-    value iterable_val = iter_expr->execute(scope);
-
-
-
-    if (iterable_val->is_undefined()) { iterable_val = mk_val<value_array>(); }
-
-    if (!is_val<value_array>(iterable_val) && !is_val<value_object>(iterable_val) &&
-        !is_val<value_string>(iterable_val)) {
-        throw std::runtime_error("Expected iterable or object type in for loop: got " +
-                                 iterable_val->type());
+namespace {
+class IterableCursor {
+public:
+    explicit IterableCursor(value input) : input_(std::move(input)) {
+        if (is_val<value_string>(input_)) {
+            string_ = input_->as_string();
+            bytes_  = string_.str();
+        } else if (!is_val<value_array>(input_) && !is_val<value_object>(input_) &&
+                   !is_val<value_range>(input_) && !input_->is_undefined()) {
+            throw std::runtime_error("Expected iterable, got " + input_->type());
+        }
     }
 
-    std::vector<value> items;
-    if (is_val<value_object>(iterable_val)) {
-        auto& obj = iterable_val->as_ordered_object();
-        for (auto& p : obj) {
-            auto tuple = mk_val<value_tuple>(p);
-            items.push_back(std::move(tuple));
-        }
-
-    } else if (is_val<value_string>(iterable_val)) {
-        const auto str = iterable_val->as_string();
-        for (const auto& ch : unicode::characters(str.str())) {
-            if (ctx.checkpoint) ctx.checkpoint();
-            items.push_back(mk_val<value_string>(str.cut_bytes(ch.begin, ch.end)));
-        }
-    } else {
-        auto& arr = iterable_val->as_array();
-        for (const auto& item : arr) { items.push_back(item); }
+    uint64_t size() const {
+        if (is_val<value_array>(input_)) return input_->as_array().size();
+        if (is_val<value_object>(input_)) return input_->as_ordered_object().size();
+        if (is_val<value_range>(input_)) return cast_val<value_range>(input_)->count;
+        if (is_val<value_string>(input_)) return string_.length();
+        return 0;
     }
 
-    std::vector<std::function<void(context&)>> scope_update_fns;
+    value next() {
+        if (is_val<value_string>(input_)) {
+            if (offset_ == bytes_.size()) return {};
+            const auto begin = offset_++;
+            while (offset_ < bytes_.size() &&
+                   (static_cast<unsigned char>(bytes_[offset_]) & 0xc0) == 0x80)
+                ++offset_;
+            return mk_val<value_string>(string_.cut_bytes(begin, offset_));
+        }
+        if (offset_ >= size()) return {};
+        if (is_val<value_array>(input_)) return input_->as_array()[offset_++];
+        if (is_val<value_object>(input_)) return input_->as_ordered_object()[offset_++].first;
+        return cast_val<value_range>(input_)->item(offset_++);
+    }
 
-    std::vector<value> filtered_items;
-    for (size_t i = 0; i < items.size(); ++i) {
-        context loop_scope(scope);
+private:
+    value input_;
+    string string_;
+    std::string bytes_;
+    uint64_t offset_ = 0;
+};
 
-        value current = items[i];
-
-        std::function<void(context&)> scope_update_fn = [](context&) { /* no-op */ };
-        if (is_stmt<identifier>(loopvar)) {
-            auto id = cast_stmt<identifier>(loopvar)->val;
-
-            if (is_val<value_object>(iterable_val)) {
-                // case example: {% for key in dict %}
-                current         = items[i]->as_array()[0];
-                scope_update_fn = [id, &items, i](context& ctx) {
-                    ctx.set_val(id, items[i]->as_array()[0]);
-                };
-            } else {
-                // case example: {% for item in list %}
-                scope_update_fn = [id, &items, i](context& ctx) { ctx.set_val(id, items[i]); };
+class VariableBinding {
+public:
+    explicit VariableBinding(const statement_ptr& target) {
+        if (const auto* id = cast_stmt<identifier>(target)) {
+            names_.push_back(id->val);
+        } else if (const auto* tuple = cast_stmt<tuple_literal>(target)) {
+            unpack_ = true;
+            for (const auto& item : tuple->val) {
+                const auto* id = cast_stmt<identifier>(item);
+                if (!id) throw std::runtime_error("Cannot unpack non-identifier type");
+                names_.push_back(id->val);
             }
-
-        } else if (is_stmt<tuple_literal>(loopvar)) {
-            // case example: {% for key, value in dict %}
-            auto tuple = cast_stmt<tuple_literal>(loopvar);
-            if (!is_val<value_array>(current)) {
-                throw std::runtime_error("Cannot unpack non-iterable type: " + current->type());
-            }
-            auto& c_arr = current->as_array();
-            if (tuple->val.size() != c_arr.size()) {
-                throw std::runtime_error(std::string("Too ") +
-                                         (tuple->val.size() > c_arr.size() ? "few" : "many") +
-                                         " items to unpack");
-            }
-            scope_update_fn = [tuple, &items, i](context& ctx) {
-                auto& c_arr = items[i]->as_array();
-                for (size_t j = 0; j < tuple->val.size(); ++j) {
-                    if (!is_stmt<identifier>(tuple->val[j])) {
-                        throw std::runtime_error("Cannot unpack non-identifier type: " +
-                                                 tuple->val[j]->type());
-                    }
-                    auto id = cast_stmt<identifier>(tuple->val[j])->val;
-                    ctx.set_val(id, c_arr[j]);
-                }
-            };
-
         } else {
-            throw std::runtime_error("Invalid loop variable(s): " + loopvar->type());
+            throw std::runtime_error("Invalid loop variable: " + target->type());
         }
-
-        if (select_expr && test_expr) {
-            scope_update_fn(loop_scope);
-            value test_val = test_expr->execute(loop_scope);
-            if (!test_val->as_bool()) { continue; }
-        }
-        filtered_items.push_back(current);
-        scope_update_fns.push_back(scope_update_fn);
     }
 
-    auto result = mk_val<value_array>();
+    void bind(context& scope, const value& item) const {
+        if (!unpack_) {
+            scope.set_val(names_.front(), item);
+            return;
+        }
+        IterableCursor values(item);
+        for (const auto& name : names_) {
+            auto v = values.next();
+            if (!v) throw std::runtime_error("Too few items to unpack");
+            scope.set_val(name, v);
+        }
+        if (values.next()) throw std::runtime_error("Too many items to unpack");
+    }
 
-    bool noIteration = true;
-    for (size_t i = 0; i < filtered_items.size(); i++) {
-        value_object loop_obj  = mk_val<value_object>();
-        loop_obj->has_builtins = false; // loop object has no builtins
-        loop_obj->insert("index", mk_val<value_int>(i + 1));
-        loop_obj->insert("index0", mk_val<value_int>(i));
-        loop_obj->insert("revindex", mk_val<value_int>(filtered_items.size() - i));
-        loop_obj->insert("revindex0", mk_val<value_int>(filtered_items.size() - i - 1));
-        loop_obj->insert("first", mk_val<value_bool>(i == 0));
-        loop_obj->insert("last", mk_val<value_bool>(i == filtered_items.size() - 1));
-        loop_obj->insert("length", mk_val<value_int>(filtered_items.size()));
-        loop_obj->insert("previtem",
-                         i > 0 ? filtered_items[i - 1] : mk_val<value_undefined>("previtem"));
-        loop_obj->insert("nextitem", i < filtered_items.size() - 1
-                                         ? filtered_items[i + 1]
-                                         : mk_val<value_undefined>("nextitem"));
-        scope.set_val("loop", loop_obj);
-        scope_update_fns[i](scope);
-        try {
-            for (auto& stmt : body) {
-                value val = stmt->execute(scope);
-                result->push_back(val);
+private:
+    std::vector<std::string> names_;
+    bool unpack_ = false;
+};
+
+class LoopValue final : public value_object_t {
+public:
+    LoopValue(value input, context& parent, VariableBinding binding, statement* filter)
+        : source_(std::move(input)), filter_scope_(parent), binding_(std::move(binding)),
+          filter_(filter) {
+        has_builtins = false;
+    }
+
+    bool advance(context& body) {
+        auto item = take();
+        if (!item) return false;
+        previous_ = std::move(current_);
+        current_  = std::move(item);
+        ++index_;
+        binding_.bind(body, current_);
+        return true;
+    }
+
+    bool as_bool() const override { return true; }
+
+    value& at(const value& key, value& fallback) override {
+        const auto name = key->as_string().str();
+        if (name == "index")
+            cached_ = number(index_);
+        else if (name == "index0")
+            cached_ = number(index_ - 1);
+        else if (name == "first")
+            cached_ = mk_val<value_bool>(index_ == 1);
+        else if (name == "last")
+            cached_ = mk_val<value_bool>(!peek());
+        else if (name == "length")
+            cached_ = number(length());
+        else if (name == "revindex")
+            cached_ = number(length() - index_ + 1);
+        else if (name == "revindex0")
+            cached_ = number(length() - index_);
+        else if (name == "previtem")
+            cached_ = previous_ ? previous_ : mk_val<value_undefined>("previtem");
+        else if (name == "nextitem") {
+            const auto item = peek();
+            cached_         = item ? item : mk_val<value_undefined>("nextitem");
+        } else
+            return fallback;
+        return cached_;
+    }
+
+private:
+    static value number(uint64_t n) {
+        if (n > INT64_MAX) throw std::runtime_error("loop length exceeds int64");
+        return mk_val<value_int>(static_cast<int64_t>(n));
+    }
+
+    value read() {
+        while (auto item = source_.next()) {
+            if (filter_scope_.checkpoint) filter_scope_.checkpoint();
+            if (filter_) {
+                filter_scope_.clear_locals();
+                binding_.bind(filter_scope_, item);
+                if (!filter_->execute(filter_scope_)->as_bool()) continue;
             }
+            return item;
+        }
+        return {};
+    }
+
+    value take() {
+        if (pending_.empty()) return read();
+        auto item = std::move(pending_.front());
+        pending_.pop_front();
+        return item;
+    }
+
+    value peek() {
+        if (pending_.empty()) {
+            auto item = read();
+            if (item) pending_.push_back(std::move(item));
+        }
+        return pending_.empty() ? value{} : pending_.front();
+    }
+
+    uint64_t length() {
+        if (!length_) {
+            if (filter_) {
+                while (auto item = read()) pending_.push_back(std::move(item));
+                length_ = index_ + pending_.size();
+            } else
+                length_ = source_.size();
+        }
+        return *length_;
+    }
+
+    IterableCursor source_;
+    context filter_scope_;
+    VariableBinding binding_;
+    statement* filter_;
+    std::deque<value> pending_;
+    std::optional<uint64_t> length_;
+    uint64_t index_ = 0;
+    value current_, previous_, cached_;
+};
+} // namespace
+
+value for_statement::execute_impl(context& ctx) {
+    const auto* selected = cast_stmt<select_expression>(iterable);
+    auto input           = (selected ? selected->lhs : iterable)->execute(ctx);
+    auto loop         = std::make_shared<LoopValue>(std::move(input), ctx, VariableBinding(loopvar),
+                                            selected ? selected->test.get() : nullptr);
+    auto result       = mk_val<value_array>();
+    bool no_iteration = true;
+    for (;;) {
+        context body_scope(ctx);
+        if (!loop->advance(body_scope)) break;
+        body_scope.set_val("loop", loop);
+        try {
+            for (const auto& stmt : body) result->push_back(stmt->execute(body_scope));
         } catch (const continue_statement::signal&) {
             continue;
         } catch (const break_statement::signal&) { break; }
-        noIteration = false;
+        no_iteration = false;
     }
-
-    if (noIteration) {
-        for (auto& stmt : default_block) {
-            value val = stmt->execute(ctx);
-            result->push_back(val);
-        }
-    }
-
-    // convert to string parts
-    value_string str = mk_val<value_string>();
-    gather_string_parts_recursive(result, str);
-    return str;
+    if (no_iteration)
+        for (const auto& stmt : default_block) result->push_back(stmt->execute(ctx));
+    auto output = mk_val<value_string>();
+    gather_string_parts_recursive(result, output);
+    return output;
 }
 
 value set_statement::execute_impl(context& ctx) {
@@ -543,25 +598,7 @@ value set_statement::execute_impl(context& ctx) {
         ctx.set_val(var_name, rhs);
 
     } else if (is_stmt<tuple_literal>(assignee)) {
-        // case: {% set a, b = value %}
-        auto tuple = cast_stmt<tuple_literal>(assignee);
-        if (!is_val<value_array>(rhs)) {
-            throw std::runtime_error("Cannot unpack non-iterable type in set: " + rhs->type());
-        }
-        auto& arr = rhs->as_array();
-        if (arr.size() != tuple->val.size()) {
-            throw std::runtime_error(std::string("Too ") +
-                                     (tuple->val.size() > arr.size() ? "few" : "many") +
-                                     " items to unpack in set");
-        }
-        for (size_t i = 0; i < tuple->val.size(); ++i) {
-            auto& elem = tuple->val[i];
-            if (!is_stmt<identifier>(elem)) {
-                throw std::runtime_error("Cannot unpack to non-identifier in set: " + elem->type());
-            }
-            auto var_name = cast_stmt<identifier>(elem)->val;
-            ctx.set_val(var_name, arr[i]);
-        }
+        VariableBinding(assignee).bind(ctx, rhs);
 
     } else if (is_stmt<member_expression>(assignee)) {
         // case: {% set ns.my_var = value %}
@@ -740,10 +777,16 @@ value member_expression::execute_impl(context& ctx) {
         val      = object->at(property, val);
         if (is_val<value_undefined>(val)) { val = try_builtin_func(ctx, key, object, true); }
 
-    } else if (is_val<value_array>(object) || is_val<value_string>(object)) {
+    } else if (is_val<value_array>(object) || is_val<value_string>(object) ||
+               is_val<value_range>(object)) {
         if (is_val<value_int>(property)) {
             int64_t index = property->as_int();
-            if (is_val<value_array>(object)) {
+            if (is_val<value_range>(object)) {
+                const auto* range       = cast_val<value_range>(object);
+                const __int128 position = index < 0 ? __int128(range->count) + index : index;
+                if (position >= 0 && position < range->count)
+                    val = range->item(static_cast<uint64_t>(position));
+            } else if (is_val<value_array>(object)) {
                 auto& arr = object->as_array();
                 if (index < 0) { index += static_cast<int64_t>(arr.size()); }
                 if (index >= 0 && index < static_cast<int64_t>(arr.size())) { val = arr[index]; }

@@ -37,17 +37,13 @@ struct ToolOutputError {
     }
 };
 
-// Immutable model-provided framing. Prefix failure data is shared across request previews.
+// Immutable model-provided reasoning and content framing.
 struct ReasoningFormat {
-    ReasoningFormat(std::string close, std::string execution_boundary,
-                    std::shared_ptr<const std::vector<TokenId>> control_tokens,
+    ReasoningFormat(std::string close, std::shared_ptr<const std::vector<TokenId>> control_tokens,
                     bool strip_content_leading, std::string content_open = {});
     std::string close;
-    std::string execution_boundary;
-    std::vector<std::size_t> boundary_failure;
     // An optional alternative ending reasoning; its bytes belong to the content channel.
     std::string content_open;
-    std::vector<std::size_t> content_failure;
     std::shared_ptr<const std::vector<TokenId>> control_tokens;
     bool strip_content_leading;
 };

@@ -12,11 +12,10 @@ bool reached_dead_end(const RowResult& row) {
     return (row.dead_positions & reached) != 0;
 }
 
-void append_identity(Sequence& s, std::span<const TokenId> tokens,
-                     std::optional<std::uint32_t> split) noexcept {
+void append_identity(Sequence& s, std::span<const TokenId> tokens) noexcept {
     s.identity.tokens.insert(s.identity.tokens.end(), tokens.begin(), tokens.end());
-    s.identity.positions.append_generated(tokens.size(), s.continuation.metadata.rope_delta, split);
-    s.identity.digests.append_generated(tokens, s.continuation.metadata.rope_delta, split);
+    s.identity.positions.append_generated(tokens.size(), s.continuation.metadata.rope_delta);
+    s.identity.digests.append_generated(tokens, s.continuation.metadata.rope_delta);
 }
 } // namespace
 
@@ -80,10 +79,8 @@ void SessionImpl::finish_result(ComputeResult result) {
         if (tx.kind == Kind::Control) {
             const auto count = tx.rows[b].ids.size();
             s.identity.tokens.reserve(s.identity.tokens.size() + count);
-            s.identity.positions.prepare_generated(count, s.continuation.metadata.rope_delta,
-                                                   tx.splits[b]);
-            s.identity.digests.prepare_generated(count, s.continuation.metadata.rope_delta,
-                                                 tx.splits[b]);
+            s.identity.positions.prepare_generated(count, s.continuation.metadata.rope_delta);
+            s.identity.digests.prepare_generated(count, s.continuation.metadata.rope_delta);
         }
         completed[b] =
             prepare_commit(s, tx.rows[b], tx.rows[b].ids, retain_recovery, *tx.completion);
@@ -125,13 +122,8 @@ void SessionImpl::finish_result(ComputeResult result) {
         if (tx.kind == Kind::Control) {
             const auto& row   = tx.rows[b];
             const auto prefix = std::span<const TokenId>(row.ids).subspan(1);
-            append_identity(s, prefix,
-                            tx.splits[b] && *tx.splits[b] <= prefix.size() ? tx.splits[b]
-                                                                           : std::nullopt);
-            const auto split = tx.splits[b] && *tx.splits[b] == row.ids.size()
-                                   ? std::optional<std::uint32_t>{1}
-                                   : std::nullopt;
-            append_identity(s, {&*row.control_last_token, 1}, split);
+            append_identity(s, prefix);
+            append_identity(s, {&*row.control_last_token, 1});
         }
         if (tx.kind == Kind::Replay && s.continuation.metadata.main_frontier == s.replay_target)
             s.phase = s.resume_phase;
@@ -196,10 +188,7 @@ CommitResult Session::commit(PendingBatch&& batch,
                  ? (!decision.terminal || decision.accepted_tokens != 0)
                  : (!decision.accepted_tokens || decision.accepted_tokens > produced ||
                     (!decision.terminal && decision.accepted_tokens != produced) ||
-                    batch.failed_[b])) ||
-            (decision.prefix_execution_split_after &&
-             (!*decision.prefix_execution_split_after ||
-              *decision.prefix_execution_split_after > decision.accepted_tokens)))
+                    batch.failed_[b])))
             throw std::logic_error("invalid generated-prefix decision");
     }
     CommitResult result;
@@ -222,10 +211,8 @@ CommitResult Session::commit(PendingBatch&& batch,
             if (!decision.accepted_tokens) continue;
             const auto count = decision.accepted_tokens;
             s.identity.tokens.reserve(s.identity.tokens.size() + count);
-            s.identity.positions.prepare_generated(count, s.continuation.metadata.rope_delta,
-                                                   decision.prefix_execution_split_after);
-            s.identity.digests.prepare_generated(count, s.continuation.metadata.rope_delta,
-                                                 decision.prefix_execution_split_after);
+            s.identity.positions.prepare_generated(count, s.continuation.metadata.rope_delta);
+            s.identity.digests.prepare_generated(count, s.continuation.metadata.rope_delta);
             if (tx.kind == detail::ComputeTransaction::Kind::Mtp) {
                 // Accepted drafts are the licensed output prefix before the correction/bonus.
                 // Main consumed the previous anchor followed by exactly those draft tokens.
@@ -282,7 +269,7 @@ CommitResult Session::commit(PendingBatch&& batch,
                     s.capture && s.captures[s.next_capture].frontier == completed[b].main_frontier;
             const auto tokens =
                 std::span<const TokenId>(tx.result->rows[b].tokens).first(decision.accepted_tokens);
-            detail::append_identity(s, tokens, decision.prefix_execution_split_after);
+            detail::append_identity(s, tokens);
             s.phase         = decision.terminal ? detail::Phase::Finished : detail::Phase::Active;
             row.disposition = decision.terminal ? runtime::CommitDisposition::Finishable
                                                 : runtime::CommitDisposition::Active;

@@ -45,8 +45,6 @@ struct InputWindow {
     std::vector<TokenId> tokens;
     // Axis-major positions for the exact input window.
     std::vector<std::int32_t> rope_positions;
-    // Forward mathematical segments inside one scheduling unit; excludes zero and window end.
-    std::vector<std::uint32_t> execution_splits;
     std::optional<qwen::VisionWork> visual;
     std::uint32_t prompt_begin = 0;
 };

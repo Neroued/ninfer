@@ -124,46 +124,52 @@ void RankProgramImpl::initialize_forward(ComputeOperation& operation, const Forw
                     rope + axis * operation.width);
     upload_input(operation.width, 1);
     const auto prompt_begin = window.prompt_begin + offset;
-    if (window.visual) {
-        if (!parameters.vision || !resources.vision)
-            throw std::logic_error("Vision input has no prepared execution resources");
-        const auto& visual = *window.visual;
-        auto& storage      = *resources.vision;
-        if (storage.begin(visual.window)) {
-            if (!visual.input) throw std::logic_error("Vision production has no encoder batch");
-            const auto& batch = visual.input->batches.at(0);
-            auto output       = storage.output(0, batch.features);
-            qwen::VisionContext encoder(device.execution_view(), *parameters.profile->config.vision,
-                                        *parameters.vision);
-            const auto bytes = encoder.encode(batch, output, resources.workspace_storage.span(),
-                                              storage.staging());
-            storage.produced(bytes);
-            workspace_peak = std::max(workspace_peak, bytes);
+    if (window.visual) { install_visual_embeddings(operation, *window.visual, prompt_begin); }
+}
+
+void RankProgramImpl::install_visual_embeddings(ComputeOperation& operation,
+                                                const qwen::VisionWork& visual,
+                                                std::uint32_t prompt_begin) {
+    auto& frame = resources.frame;
+    if (!parameters.vision || !resources.vision)
+        throw std::logic_error("Vision input has no prepared execution resources");
+    auto& storage = *resources.vision;
+    if (storage.begin(visual.window)) {
+        if (!visual.input) throw std::logic_error("Vision production has no encoder batch");
+        const auto& batch = visual.input->batches.at(0);
+        auto output       = storage.output(0, batch.features);
+        qwen::VisionContext encoder(device.execution_view(), *parameters.profile->config.vision,
+                                    *parameters.vision);
+        const auto offset = std::holds_alternative<BranchWork>(operation.request.work.operation)
+                                ? workspace_plan.branches->ids.region.offset
+                                : 0;
+        const auto bytes  = encoder.encode(
+            batch, output, resources.workspace_storage.span().subspan(offset), storage.staging());
+        storage.produced(bytes);
+        workspace_peak = std::max(workspace_peak, offset + bytes);
+    }
+    const auto slices =
+        vision::embedding_slices(*visual.window.plan, prompt_begin, operation.width);
+    if (!slices.empty()) {
+        const auto input = frame.input_view(operation.width, 1);
+        auto embeddings  = frame.input_embeddings.slice(1, 0, operation.width);
+        ops::embedding(input.ids.view({static_cast<int>(operation.width)}),
+                       parameters.text.token_embedding, embeddings, device.execution_view());
+        std::size_t offset = 0;
+        for (const auto& slice : slices) {
+            const auto n = slice.destination_columns.size();
+            auto host    = frame.host_visual_indices.slice(0, offset, n);
+            auto indices = frame.visual_indices.slice(0, offset, n);
+            std::copy(slice.destination_columns.begin(), slice.destination_columns.end(),
+                      static_cast<std::int32_t*>(host.data));
+            copy_bytes_async({indices.data, indices.bytes(), indices.device},
+                             {host.data, host.bytes(), host.device, true}, device.execution_view());
+            auto source = storage.output(slice.source_begin, n);
+            ops::scatter(source, indices, embeddings, device.execution_view());
+            offset += n;
         }
-        const auto slices =
-            vision::embedding_slices(*visual.window.plan, prompt_begin, operation.width);
-        if (!slices.empty()) {
-            const auto input = frame.input_view(operation.width, 1);
-            auto embeddings  = frame.input_embeddings.slice(1, 0, operation.width);
-            ops::embedding(input.ids.view({static_cast<int>(operation.width)}),
-                           parameters.text.token_embedding, embeddings, device.execution_view());
-            std::size_t offset = 0;
-            for (const auto& slice : slices) {
-                const auto n = slice.destination_columns.size();
-                auto host    = frame.host_visual_indices.slice(0, offset, n);
-                auto indices = frame.visual_indices.slice(0, offset, n);
-                std::copy(slice.destination_columns.begin(), slice.destination_columns.end(),
-                          static_cast<std::int32_t*>(host.data));
-                copy_bytes_async({indices.data, indices.bytes(), indices.device},
-                                 {host.data, host.bytes(), host.device, true},
-                                 device.execution_view());
-                auto source = storage.output(slice.source_begin, n);
-                ops::scatter(source, indices, embeddings, device.execution_view());
-                offset += n;
-            }
-            operation.input_embeddings =
-                embeddings.view({embeddings.ne[0], static_cast<int>(operation.width), 1});
-        }
+        operation.input_embeddings =
+            embeddings.view({embeddings.ne[0], static_cast<int>(operation.width), 1});
     }
 }
 
@@ -229,6 +235,8 @@ void RankProgramImpl::initialize_inputs(ComputeOperation& operation) {
         initialize_decode(operation, *work);
     else if (const auto* work = std::get_if<ScoreWork>(&operation.request.work.operation))
         initialize_score(operation, *work);
+    else if (const auto* work = std::get_if<BranchWork>(&operation.request.work.operation))
+        initialize_branch(operation, *work);
     else if (const auto* work = std::get_if<NormalizeWork>(&operation.request.work.operation)) {
         operation.rows                = work->rows;
         operation.batch               = static_cast<std::uint32_t>(work->rows.size());

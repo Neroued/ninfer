@@ -37,6 +37,7 @@ struct SequencePlanningInputs {
     bool gpu_timing                   = false;
     bool use_cuda_graph               = true;
     bool causal_scoring               = false;
+    bool decision_scoring             = false;
     std::int32_t multiprocessor_count = 0;
     ContextCacheOptions context_cache;
     std::size_t vision_memory_budget_bytes = 0;
@@ -58,6 +59,7 @@ struct SequencePlanImpl {
     bool gpu_timing                   = false;
     bool use_cuda_graph               = true;
     bool causal_scoring               = false;
+    bool decision_scoring             = false;
     std::int32_t multiprocessor_count = 0;
     ContextCacheOptions context_cache;
     std::size_t vision_memory_budget_bytes = 0;

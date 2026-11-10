@@ -50,6 +50,8 @@ EngineOptions normalize_engine_options(EngineOptions options) {
     case EnginePurpose::Generation:
         break;
     case EnginePurpose::CausalScoring:
+        if (options.enable_decisions)
+            throw std::invalid_argument("decisions require a Generation Engine");
         options.max_concurrency      = 1;
         options.max_pending_requests = 1;
         options.speculative          = {};
@@ -85,7 +87,11 @@ ConstructedModel construct_model(EngineOptions& options) {
     StartupPhaseScope inspect(options.startup_observer, StartupPhase::ArtifactInspect);
     artifact::Reader reader(options.artifact_path);
     inspect.complete();
-    switch (models::resolve_architecture(reader.directory())) {
+    const auto architecture = models::resolve_architecture(reader.directory());
+    if (options.enable_decisions && architecture != models::Architecture::Qwen3_5 &&
+        architecture != models::Architecture::Qwen3_5Moe)
+        throw std::invalid_argument("--jev supports Qwen3.5 Dense/MoE architectures");
+    switch (architecture) {
     case models::Architecture::Glm5Next: {
 #if NINFER_ENABLE_DISTRIBUTED
         if (options.deployment && options.deployment->ranks.size() > 1) {

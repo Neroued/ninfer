@@ -41,6 +41,8 @@ context::ContextDirectorySpec context_spec(const detail::SequencePlanImpl& plan)
         spec.histories     = histories;
         spec.page_capacity = layout.execution_tables.spec.logical_page_capacity;
         spec.table_rows    = layout.execution_tables.spec.table_rows;
+        if (id == 0 && plan.workspace.branches)
+            spec.table_rows = plan.workspace.branches->tables.spec.table_rows;
         spec.parts.push_back({0, {layout.pages.page_bytes, layout.pages.alignment}});
         result.pools.push_back(std::move(spec));
     };
@@ -157,6 +159,10 @@ SessionPlan plan_session(const SequencePlan& sequence) {
     out.kv_storage          = source.kv_storage;
     out.proposal_head       = source.proposal_head;
     out.causal_scoring      = source.causal_scoring;
+    out.branch_batch_capacity =
+        source.workspace.branches ? source.workspace.branches->batch_capacity : 0;
+    out.branch_prefill_chunk =
+        source.workspace.branches ? source.workspace.branches->prefill_chunk : 0;
     out.vision_max_features = source.workspace.vision ? source.workspace.vision->max_features : 0;
     const auto& image       = source.persistent.state_images;
     out.state_transfer      = image.images.transfer_work();

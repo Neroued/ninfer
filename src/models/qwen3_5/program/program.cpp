@@ -120,7 +120,21 @@ void RankProgramImpl::validate_work(const Work& work, runtime::FrameKind kind) c
     if (kind != (context ? runtime::FrameKind::Context : runtime::FrameKind::Compute)) {
         throw std::invalid_argument("Qwen3.5 work is reserved in the wrong execution frame");
     }
-    (context ? context_actions : compute_actions)->validate(work.context);
+    const auto* context_work = std::get_if<ContextWork>(&work.operation);
+    const bool branch_tables = context_work && context_work->branch_tables;
+    if (branch_tables) {
+        if (!branches || !context_work->bindings.empty() || !context_work->releases.empty())
+            throw std::invalid_argument("decision mapping work has invalid ownership");
+        for (const auto& action : work.context.operations) {
+            const auto* mapping = std::get_if<context::MappingUpdate>(&action);
+            if (!mapping || mapping->pool_id != 0 ||
+                mapping->row < static_cast<int>(max_concurrency))
+                throw std::invalid_argument(
+                    "decision table work contains ordinary Context actions");
+        }
+        branches->actions.validate(work.context);
+    } else
+        (context ? context_actions : compute_actions)->validate(work.context);
     auto validate_input = [&](const InputWindow& input, std::uint32_t limit) {
         if (input.tokens.size() > limit || input.rope_positions.size() != input.tokens.size() * 3) {
             throw std::invalid_argument("Qwen3.5 input window has invalid positions or extent");
@@ -206,6 +220,45 @@ void RankProgramImpl::validate_work(const Work& work, runtime::FrameKind kind) c
                                  [](const auto& row) -> const ExecutionRow& { return row; });
                 if (!resources.dflash)
                     throw std::logic_error("normalization requires draft feature state");
+            } else if constexpr (std::is_same_v<T, BranchWork>) {
+                if (!workspace_plan.branches || op.rows.empty() ||
+                    op.rows.size() > workspace_plan.branches->batch_capacity ||
+                    (op.prefill && op.rows.size() != 1))
+                    throw std::invalid_argument("decision work exceeds its prepared overlay");
+                const bool forwarding = !op.rows.front().tokens.empty();
+                const bool projecting = !op.rows.front().candidates.empty();
+                if (op.visual && (!op.prefill || !forwarding || !resources.vision))
+                    throw std::invalid_argument("decision visual input requires a Vision prefill");
+                for (std::size_t i = 0; i < op.rows.size(); ++i) {
+                    const auto& row = op.rows[i];
+                    if (!row.state.valid() || row.offsets.source < 0 ||
+                        row.offsets.source != row.offsets.destination || !row.table.valid() ||
+                        row.table.pool_id != 0 || row.table.index < max_concurrency ||
+                        row.table.index >=
+                            static_cast<std::uint32_t>(branches->cache.tables().row_count()) ||
+                        row.frontier > capacity || row.tokens.size() > capacity - row.frontier ||
+                        row.tokens.size() >
+                            (op.prefill ? workspace_plan.branches->prefill_chunk : kBranchWidth) ||
+                        row.tokens.empty() == forwarding || row.candidates.empty() == projecting ||
+                        row.candidates.size() > 255 || (!forwarding && !projecting))
+                        throw std::invalid_argument(
+                            "decision work has invalid state, row or token bounds");
+                    if (!row.rope_positions.empty() &&
+                        (!op.prefill || row.rope_positions.size() != 3 * row.tokens.size()))
+                        throw std::invalid_argument(
+                            "decision RoPE positions have an invalid shape");
+                    (void)resources.state_images.storage().image(row.offsets.source);
+                    for (std::size_t j = 0; j < i; ++j)
+                        if (op.rows[j].table.index == row.table.index ||
+                            op.rows[j].offsets.source == row.offsets.source)
+                            throw std::invalid_argument("decision work repeats a writable binding");
+                    for (const auto* tokens : {&row.tokens, &row.candidates})
+                        for (auto id : *tokens)
+                            if (id < 0 ||
+                                static_cast<std::uint32_t>(id) >= parameters.profile->public_tokens)
+                                throw std::invalid_argument(
+                                    "decision token exceeds public vocabulary");
+                }
             } else if constexpr (std::is_same_v<T, ScoreWork>) {
                 validate_row(op.row);
                 validate_input(op.input, prefill_chunk);

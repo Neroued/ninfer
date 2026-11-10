@@ -57,6 +57,7 @@ private:
 class PagedKVCache {
 public:
     PagedKVCache(MemorySpan arena, MemorySpan backing, const PagedKVCacheLayout& layout);
+    PagedKVCache(MemorySpan backing, const KVExecutionTableLayout&, const PagedKVCache& shared);
 
     PagedKVCache(const PagedKVCache&)            = delete;
     PagedKVCache& operator=(const PagedKVCache&) = delete;

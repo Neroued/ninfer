@@ -10,10 +10,12 @@ void RankProgramImpl::progress() {
     if (context_operation && context_ready.ready()) {
         const auto ticket    = context_operation->request.ticket;
         const auto command   = context_operation->last_command;
-        const auto transfers = context_actions->observations();
+        const auto& work     = std::get<ContextWork>(context_operation->request.work.operation);
+        auto& actions        = work.branch_tables ? branches->actions : *context_actions;
+        const auto transfers = actions.observations();
         ContextResult result;
         result.transfers.assign(transfers.begin(), transfers.end());
-        context_actions->finish();
+        actions.finish();
         events.emplace_back(
             runtime::ResultReady<ExecutionTypes>{ticket, Result{std::move(result)}});
         events.emplace_back(runtime::DeviceRetired{ticket, command, retirement_observation()});
@@ -35,6 +37,10 @@ void RankProgramImpl::progress() {
     for (;;) {
         switch (operation.stage) {
         case ComputeStage::Inputs:
+            if (std::holds_alternative<BranchWork>(operation.request.work.operation)) {
+                operation.stage = ComputeStage::Forward;
+                break;
+            }
             if (std::holds_alternative<NormalizeWork>(operation.request.work.operation)) {
                 append_draft_history(operation);
                 gpu_timer.record_result();
@@ -53,6 +59,16 @@ void RankProgramImpl::progress() {
             operation.stage = ComputeStage::Forward;
             break;
         case ComputeStage::Forward:
+            if (std::holds_alternative<BranchWork>(operation.request.work.operation)) {
+                if (!advance_branch(operation)) return;
+                if (resources.vision)
+                    if (auto elapsed = resources.vision->take_timing())
+                        operation.gpu.add_vision(*elapsed);
+                gpu_timer.record_result();
+                result_ready.record(device.stream());
+                operation.stage = ComputeStage::Readback;
+                break;
+            }
             if (!advance_target(operation)) {
                 request_decision(operation);
                 return;

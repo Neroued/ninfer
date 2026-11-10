@@ -11,6 +11,7 @@ enum class Field {
     ModelPath,
     ChatTemplate,
     Vision,
+    Jev,
     VisionMemoryBudget,
     Device,
     MaxContext,

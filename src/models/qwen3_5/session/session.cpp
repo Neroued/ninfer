@@ -72,6 +72,18 @@ Session::Session(PreparedSession&& prepared, runtime::Executor<ExecutionTypes>& 
 
 Session::~Session() noexcept = default;
 
+bool Session::branch_scoring_available() const noexcept {
+    return impl_->branch_scoring_available();
+}
+
+BranchScoreResult Session::score_branches(std::span<const BranchScoreRow> rows,
+                                          const PreparationControl& control, bool reuse_prefix,
+                                          std::shared_ptr<const qwen::PreparedPromptData> prompt) {
+    return impl_->score_branches(rows, control, reuse_prefix, std::move(prompt));
+}
+
+bool Session::release_branch_cache() { return impl_->release_branch_cache(); }
+
 RequestBasePlan Session::plan_request(qwen::PreparedPrompt&& prompt,
                                       const runtime::ResolvedExecutionOptions& options) {
     return impl_->plan_request(qwen::PreparedPromptAccess::take(std::move(prompt)), options);
@@ -443,6 +455,9 @@ void SessionImpl::fail_all_cleanup() noexcept {
         } catch (...) {}
     }
     pending_maintenance_.reset();
+    try {
+        (void)release_branch_cache();
+    } catch (...) { std::terminate(); }
     if (context_operation_) context_operation_->transaction.fail_after_drain();
     abort_context();
     if (execution) {

@@ -31,6 +31,11 @@ RankProgramImpl::RankProgramImpl(const execution::Parameters& values, const Sequ
     compute_actions =
         std::make_unique<context::ContextMigration>(device, *storage, device.execution_view());
     context_actions = std::make_unique<context::ContextMigration>(device, *storage);
+    if (workspace_plan.branches)
+        branches = std::make_unique<BranchWorkspace>(
+            resources.workspace_storage.span().subspan(0, workspace_plan.general_capacity),
+            *workspace_plan.branches, resources.decoder.text_kv, resources.host_context.span(),
+            device);
     if (plan.moe) {
         std::vector<const moe::Parameters*> layers;
         for (const auto& block : parameters.text.layers)
@@ -53,6 +58,7 @@ RankProgramImpl::~RankProgramImpl() {
 }
 
 void RankProgramImpl::install_residencies(const ContextWork& work) {
+    if (work.release_vision && resources.vision) resources.vision->release(work.release_vision);
     const auto vocabulary = static_cast<std::size_t>(parameters.profile->public_tokens);
     for (auto id : work.releases) {
         auto& residency = residencies[id.lane.value];
@@ -99,8 +105,10 @@ void RankProgramImpl::start(runtime::ExecutionRequest<ExecutionTypes>&& request)
         context_operation =
             std::make_unique<ContextOperation>(ContextOperation{std::move(request), {}});
         context_operation->last_command = context_operation->request.command;
-        context_actions->submit(context_operation->request.work.context);
-        install_residencies(std::get<ContextWork>(context_operation->request.work.operation));
+        const auto& work = std::get<ContextWork>(context_operation->request.work.operation);
+        auto& actions    = work.branch_tables ? branches->actions : *context_actions;
+        actions.submit(context_operation->request.work.context);
+        install_residencies(work);
         context_ready.record(device.transfer_stream());
     } else {
         if (compute) throw std::logic_error("Qwen3.5 compute frame is occupied");
@@ -165,6 +173,7 @@ void RankProgramImpl::drain() {
     }
     attempt([&] { compute_actions->drain(); });
     attempt([&] { context_actions->drain(); });
+    if (branches) attempt([&] { branches->actions.drain(); });
     const auto wait_stream = [](cudaStream_t stream) {
         const auto status = cudaStreamSynchronize(stream);
         if (status != cudaSuccess)

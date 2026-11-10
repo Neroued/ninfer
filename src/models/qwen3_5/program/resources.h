@@ -8,6 +8,7 @@
 #include "models/common/moe/schedule.h"
 #include "models/common/vision/resources.h"
 #include "models/qwen3_5/program/frames.h"
+#include "models/qwen3_5/program/branch_scoring.h"
 #include "models/qwen3_5/state/decoder_state.h"
 #include "models/qwen3_5/state/state_image.h"
 #include "ninfer/ops/gdn_replay.h"
@@ -66,6 +67,7 @@ struct WorkspaceSpec {
     std::size_t dflash_round     = 0;
     std::size_t causal_score     = 0;
     std::size_t general_capacity = 0;
+    std::optional<BranchLayout> branches;
     std::optional<vision::Capacity> vision;
     std::size_t capacity = 0;
 };

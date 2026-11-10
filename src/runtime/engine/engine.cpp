@@ -545,3 +545,5 @@ EngineSnapshot Engine::end_measurement() {
 }
 
 } // namespace ninfer
+
+#include "runtime/engine/engine_decision_api.inl"

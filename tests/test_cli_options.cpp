@@ -378,6 +378,16 @@ device = 0
     }
 }
 
+void test_decision_file(const Files& files) {
+    const auto path = files.write("model.path = 'model.ninfer'\n[engine]\njev = true\n").string();
+    require(serve({"ninfer-serve", "--config", path}).launch.engine.enable_decisions,
+            "TOML decision opt-in was ignored");
+    require(!serve({"ninfer-serve", "--config", path, "--no-jev"}).launch.engine.enable_decisions,
+            "CLI decision opt-out did not override TOML");
+    require(!parse({"ninfer", "--config", path, "--prompt", "x"}).launch.engine.enable_decisions,
+            "serving-only decisions leaked into the CLI");
+}
+
 void test_context_display() {
     ninfer::EngineDescription description;
     description.ranks.resize(2);
@@ -405,6 +415,7 @@ int main() {
         test_file_merge(files);
         test_file_errors_and_example(files);
         test_deployment(files);
+        test_decision_file(files);
         test_context_display();
         std::cout << "ok\n";
         return 0;

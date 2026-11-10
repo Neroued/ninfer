@@ -70,7 +70,10 @@ void render_and_write(SseTransport& transport, Render&& render) {
 }
 
 RequestJson parse_json_body(const httplib::Request& request);
+[[nodiscard]] std::unique_ptr<httplib::TaskQueue>
+make_http_task_queue(const product::ServeOptions& options, std::size_t reserved_workers = 0);
 [[nodiscard]] bool client_disconnected(const httplib::Request& request);
+[[nodiscard]] bool permits_local_media(const httplib::Request& request);
 
 void prepare_sse_response(httplib::Response& response);
 void configure_http_server_socket(socket_t socket) noexcept;

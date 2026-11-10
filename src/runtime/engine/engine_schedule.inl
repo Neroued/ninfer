@@ -1153,7 +1153,9 @@ bool EngineCore<Instance>::process_measurement() {
     MeasurementCommand command;
     {
         std::lock_guard lock(queue_mutex_);
-        if (!measurement_ || !pending_.empty() || preparing_requests_) return false;
+        if (!measurement_ || !pending_.empty() || !decisions_.pending.empty() ||
+            preparing_requests_)
+            return false;
         command = measurement_->command;
     }
     EngineSnapshot result;
@@ -1192,10 +1194,12 @@ void EngineCore<Instance>::worker_loop() noexcept {
     for (;;) {
         {
             std::unique_lock lock(queue_mutex_);
-            if (!stopping_ && pending_.empty() && resident_empty() && paused_.empty() &&
-                !execution_outstanding()) {
-                queue_cv_.wait(lock,
-                               [&] { return stopping_ || !pending_.empty() || measurement_; });
+            if (!stopping_ && pending_.empty() && decisions_.pending.empty() && resident_empty() &&
+                paused_.empty() && !execution_outstanding()) {
+                queue_cv_.wait(lock, [&] {
+                    return stopping_ || !pending_.empty() || !decisions_.pending.empty() ||
+                           measurement_;
+                });
             }
             if (stopping_) {
                 lock.unlock();
@@ -1218,6 +1222,16 @@ void EngineCore<Instance>::worker_loop() noexcept {
             auto boundary = begin_host_phase();
             progressed    = poll_execution(boundary);
             finish_engine_phase(boundary, EngineHostPhase::Boundary);
+            if (decisions_.enabled && cycle_step_ == CycleStep::Boundary &&
+                !execution_outstanding()) {
+                const bool scored = progress_branch_job();
+                const bool chat   = release_branch_workspace_before_chat();
+                if (scored) {
+                    progressed = true;
+                    publish_runtime_stats();
+                    if (!chat) continue;
+                }
+            }
             const auto revision = schedule_revision_.load(std::memory_order_acquire);
             if (revision != published_revision_) publish_runtime_stats();
             const bool schedule = progressed || revision != scheduled_revision ||

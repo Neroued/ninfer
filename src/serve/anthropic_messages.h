@@ -9,6 +9,7 @@
 #include "serve/request_json.h"
 #include "serve/tool_stream_state.h"
 
+#include <cstdint>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -18,12 +19,21 @@ namespace ninfer::serve {
 
 struct GenerationOutcome;
 
+// Anthropic-only response presentation. Visible display returns reasoning text; updates display
+// has no local progress-update source and degrades to a hidden envelope without the reasoning
+// body. It never enters common request or Engine state.
+enum class ThinkingDisplay : std::uint8_t {
+    Summarized,
+    Updates,
+};
+
 struct AnthropicMessagesRequest {
     std::string model;
     GenerationRequest generation;
     std::unordered_map<std::string, bool> eager_tool_inputs;
     bool stream                 = false;
     bool output_tokens_explicit = false;
+    ThinkingDisplay thinking_display = ThinkingDisplay::Summarized;
 };
 
 struct AnthropicCountTokensRequest {
@@ -50,13 +60,15 @@ std::string make_anthropic_error_body(const ApiError& error, const std::string& 
 std::string make_anthropic_sse_error(const ApiError& error, const std::string& request_id);
 
 std::string make_anthropic_messages_response(const AnthropicResponseIdentity& identity,
-                                             const GenerationOutcome& outcome);
+                                             const GenerationOutcome& outcome,
+                                             ThinkingDisplay display = ThinkingDisplay::Summarized);
 std::string make_anthropic_count_tokens_response(int input_tokens);
 
 class AnthropicMessagesStream {
 public:
     AnthropicMessagesStream(AnthropicResponseIdentity identity, int input_tokens,
-                            std::unordered_map<std::string, bool> eager_tool_inputs = {});
+                            std::unordered_map<std::string, bool> eager_tool_inputs = {},
+                            ThinkingDisplay display = ThinkingDisplay::Summarized);
 
     // The Engine start event is exact for normal streams. The no-argument form is reserved for an
     // error raised before admission, so an Anthropic error event still has a valid stream prefix.
@@ -84,6 +96,7 @@ private:
     std::vector<int> tool_indices_;
     std::string buffered_arguments_;
     bool eager_tool_ = false;
+    ThinkingDisplay display_ = ThinkingDisplay::Summarized;
     std::string reasoning_;
     std::string content_;
     int input_tokens_   = 0;

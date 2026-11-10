@@ -338,8 +338,9 @@ const func_builtins& global_builtins() {
         {"test_is_divisibleby",
          [](const func_args& args) -> value {
              args.ensure_vals<value_int, value_int>();
-             bool res = args.get_pos(0)->as_int() % args.get_pos(1)->as_int() == 0;
-             return mk_val<value_bool>(res);
+             const auto divisor = args.get_pos(1)->as_int();
+             if (divisor == 0) throw std::runtime_error("integer modulo by zero");
+             return mk_val<value_bool>(divisor == -1 || args.get_pos(0)->as_int() % divisor == 0);
          }},
         {"test_is_string", test_type_fn<value_string>},
         {"test_is_integer", test_type_fn<value_int>},

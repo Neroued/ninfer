@@ -9,6 +9,8 @@
 #include <memory>
 #include <sstream>
 #include <string>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace jinja {
@@ -52,104 +54,122 @@ const T* cast_stmt(const statement_ptr& ptr) {
 using visitor_pair = std::pair<std::string, std::vector<statement*>>;
 using visitor_fn   = std::function<void(bool, statement*, std::vector<visitor_pair>)>;
 
+struct macro_statement;
+struct closure_environment;
+class render_scopes;
+using scope_names = std::vector<std::string>;
+
+struct binding_cell {
+    value data;
+    macro_statement* macro = nullptr;
+    std::weak_ptr<closure_environment> owner;
+    std::shared_ptr<binding_cell> inherited;
+
+    value read() const;
+    void assign(value input);
+};
+
 struct scope {
     scope* parent = nullptr;
     std::unordered_map<std::string, value> bindings;
+    const scope_names* locals = nullptr;
+    std::shared_ptr<closure_environment> imports;
+    std::shared_ptr<closure_environment> environment;
     std::size_t references = 0;
-    bool captured          = false;
 };
 
 enum class loop_flow { none, stop, next };
 
-class render_scopes {
+// Definitions use weak environment links; materialized callable values own their captures.
+struct closure_environment : std::enable_shared_from_this<closure_environment> {
+    explicit closure_environment(std::shared_ptr<render_scopes> owner) : owner(std::move(owner)) {}
+
+    ~closure_environment();
+
+    std::shared_ptr<render_scopes> owner;
+    std::unordered_map<std::string, std::shared_ptr<binding_cell>> locals;
+    std::unordered_map<std::string, std::shared_ptr<binding_cell>> bindings;
+    std::vector<std::shared_ptr<closure_environment>> dependencies;
+    closure_environment* previous = nullptr;
+    closure_environment* next     = nullptr;
+    bool registered               = false;
+};
+
+class render_scopes : public std::enable_shared_from_this<render_scopes> {
 public:
-    ~render_scopes() {
-        closing_ = true;
-        for (auto& frame : frames_) frame.bindings.clear();
-    }
-
-    scope* acquire(scope* parent) {
-        scope* frame;
-        if (!free_) {
-            frame = &frames_.emplace_back();
-        } else {
-            frame = free_;
-            free_ = frame->parent;
-        }
-        frame->parent     = parent;
-        frame->references = 1;
-        frame->captured   = false;
-        if (parent) ++parent->references;
-        return frame;
-    }
-
-    void release(scope* frame) {
-        if (closing_) return;
-        while (frame && --frame->references == 0) {
-            auto* parent = frame->parent;
-            frame->bindings.clear();
-            frame->parent = free_;
-            free_         = frame;
-            frame         = parent;
-        }
-    }
-
-    scope* capture(scope* frame) {
-        if (!frame->captured) {
-            frame->captured = true;
-            ++frame->references;
-        }
-        return frame;
-    }
+    scope* acquire(scope* parent, const scope_names* locals,
+                   std::shared_ptr<closure_environment> imports = {});
+    void release(scope* frame);
+    std::shared_ptr<closure_environment> environment(scope* frame);
+    std::shared_ptr<closure_environment> capture(scope* frame, const scope_names& names);
+    std::shared_ptr<binding_cell> local_cell(scope* frame, const std::string& name);
+    void detach(closure_environment* environment);
+    void close();
+    void ensure_active() const;
 
     loop_flow flow = loop_flow::none;
 
 private:
+    std::pair<std::shared_ptr<binding_cell>, std::shared_ptr<closure_environment>>
+    resolve_cell(scope* frame, const std::string& name);
     std::deque<scope> frames_;
-    scope* free_  = nullptr;
-    bool closing_ = false;
+    scope* free_                       = nullptr;
+    closure_environment* environments_ = nullptr;
+    bool closed_                       = false;
 };
 
 struct context {
-    std::shared_ptr<std::string>
-        src;                  // for debugging; use shared_ptr to avoid copying on scope creation
-    std::time_t current_time; // for functions that need current time
-
+    std::shared_ptr<std::string> src;
+    std::time_t current_time;
     std::function<void()> checkpoint;
-
     visitor_fn visitor;
 
-    // src is optional, used for error reporting
-    context(std::string src = "")
-        : src(std::make_shared<std::string>(std::move(src))),
-          owned_scopes(std::make_unique<render_scopes>()), scopes(owned_scopes.get()) {
-        env = scopes->acquire(nullptr);
+    explicit context(std::string source = "")
+        : src(std::make_shared<std::string>(std::move(source))), current_time(std::time(nullptr)),
+          scopes(std::make_shared<render_scopes>()), env(scopes->acquire(nullptr, nullptr)),
+          root(true) {
         set_val("true", mk_val<value_bool>(true));
         set_val("True", mk_val<value_bool>(true));
         set_val("false", mk_val<value_bool>(false));
         set_val("False", mk_val<value_bool>(false));
         set_val("none", mk_val<value_none>());
         set_val("None", mk_val<value_none>());
-        current_time = std::time(nullptr);
     }
 
-    ~context() { scopes->release(env); }
+    ~context() {
+        if (root)
+            scopes->close();
+        else
+            scopes->release(env);
+    }
 
-    // Captured lexical frames live until the render ends; ordinary frames are recycled.
-    scope* capture_scope() const { return scopes->capture(env); }
+    context(const context& parent, const scope_names* locals = nullptr)
+        : src(parent.src), current_time(parent.current_time), checkpoint(parent.checkpoint),
+          scopes(parent.scopes), env(scopes->acquire(parent.env, locals)) {}
 
-    scope* current_scope() const { return capture_scope(); }
-
-    context(const context& caller, scope* lexical_scope)
+    context(const context& caller, std::shared_ptr<closure_environment> captured,
+            const scope_names* locals)
         : src(caller.src), current_time(caller.current_time), checkpoint(caller.checkpoint),
-          scopes(caller.scopes), env(scopes->acquire(lexical_scope)) {}
+          scopes(caller.scopes), env(nullptr) {
+        if (captured && captured->owner != scopes)
+            throw std::runtime_error("Closure belongs to a different render");
+        env = scopes->acquire(nullptr, locals, std::move(captured));
+    }
 
-    context(const context& parent) : context(parent, parent.env) {}
+    context& operator=(const context&) = delete;
 
     value find_val(const std::string& name) {
         for (auto* frame = env; frame; frame = frame->parent) {
-            const auto found = frame->bindings.find(name);
-            if (found != frame->bindings.end()) return found->second;
+            if (frame->environment) {
+                const auto found = frame->environment->locals.find(name);
+                if (found != frame->environment->locals.end()) return found->second->read();
+            }
+            if (const auto found = frame->bindings.find(name); found != frame->bindings.end())
+                return found->second;
+            if (frame->imports) {
+                const auto found = frame->imports->bindings.find(name);
+                if (found != frame->imports->bindings.end()) return found->second->read();
+            }
         }
         return {};
     }
@@ -159,18 +179,36 @@ struct context {
         return result ? result : mk_val<value_undefined>(name);
     }
 
-    void set_val(const std::string& name, const value& val) { env->bindings[name] = val; }
+    void set_val(const std::string& name, const value& input) {
+        if (env->environment) {
+            const auto found = env->environment->locals.find(name);
+            if (found != env->environment->locals.end()) {
+                found->second->assign(input);
+                return;
+            }
+        }
+        env->bindings[name] = input;
+    }
 
-    void set_val(const value& name, const value& val) { set_val(name->as_string().str(), val); }
+    void set_val(const value& name, const value& input) { set_val(name->as_string().str(), input); }
 
+    void define_macro(const std::string& name, macro_statement* definition,
+                      const scope_names& captures);
+
+    std::shared_ptr<closure_environment> capture(const scope_names& names) const {
+        return scopes->capture(env, names);
+    }
+
+    void set_locals(const scope_names& names) { env->locals = &names; }
     void clear_locals() { env->bindings.clear(); }
 
+    std::shared_ptr<render_scopes> storage() const { return scopes; }
     loop_flow& flow() { return scopes->flow; }
 
 private:
-    std::unique_ptr<render_scopes> owned_scopes;
-    render_scopes* scopes;
+    std::shared_ptr<render_scopes> scopes;
     scope* env;
+    bool root = false;
 };
 
 // utils for visiting AST nodes
@@ -246,6 +284,7 @@ struct output_statement : public statement {
 // Statements
 
 struct program : public statement {
+    scope_names locals;
     statements body;
 
     program() = default;
@@ -290,6 +329,8 @@ struct tuple_literal;
  * https://jinja.palletsprojects.com/en/3.0.x/templates/#for
  */
 struct for_statement : public statement {
+    scope_names locals;
+    scope_names filter_captures;
     statement_ptr loopvar; // Identifier | TupleLiteral
     statement_ptr iterable;
     statements body;
@@ -365,6 +406,8 @@ struct set_statement : public statement {
 };
 
 struct macro_statement : public statement {
+    scope_names locals;
+    scope_names captures;
     statement_ptr name;
     statements args;
     statements body;
@@ -750,6 +793,8 @@ struct spread_expression : public expression {
 };
 
 struct call_statement : public statement {
+    scope_names locals;
+    scope_names captures;
     statement_ptr call;
     statements caller_args;
     statements body;

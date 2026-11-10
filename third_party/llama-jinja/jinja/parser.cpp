@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <memory>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -15,6 +16,169 @@ template <typename T>
 static bool is_type(const statement_ptr& ptr) {
     return dynamic_cast<const T*>(ptr.get()) != nullptr;
 }
+
+namespace {
+using names = std::set<std::string>;
+
+class scope_analysis {
+public:
+    void run(program& program) {
+        names bound, captures, locals;
+        collect_locals(program.body, locals);
+        statements_read(program.body, bound, captures);
+        program.locals.assign(locals.begin(), locals.end());
+    }
+
+private:
+    context visitor_context_;
+
+    static void target_names(statement* target, names& output) {
+        if (auto* id = dynamic_cast<identifier*>(target))
+            output.insert(id->val);
+        else if (auto* tuple = dynamic_cast<tuple_literal*>(target)) {
+            for (auto& item : tuple->val) target_names(item.get(), output);
+        }
+    }
+
+    static void collect_locals(const statements& body, names& output) {
+        for (const auto& statement : body) {
+            if (auto* set = dynamic_cast<set_statement*>(statement.get())) {
+                target_names(set->assignee.get(), output);
+                collect_locals(set->body, output);
+            } else if (auto* macro = dynamic_cast<macro_statement*>(statement.get())) {
+                target_names(macro->name.get(), output);
+            } else if (auto* condition = dynamic_cast<if_statement*>(statement.get())) {
+                collect_locals(condition->body, output);
+                collect_locals(condition->alternate, output);
+            } else if (auto* loop = dynamic_cast<for_statement*>(statement.get())) {
+                collect_locals(loop->default_block, output);
+            } else if (auto* filter = dynamic_cast<filter_statement*>(statement.get())) {
+                collect_locals(filter->body, output);
+            }
+        }
+    }
+
+    static void merge(const scope_names& input, const names& bound, names& captures) {
+        for (const auto& name : input)
+            if (!bound.contains(name)) captures.insert(name);
+    }
+
+    void builtin_read(statement* expression, const names& bound, names& captures) {
+        if (auto* call = dynamic_cast<call_expression*>(expression)) {
+            for (auto& argument : call->args) expression_read(argument.get(), bound, captures);
+        }
+    }
+
+    void expression_read(statement* node, const names& bound, names& captures) {
+        if (!node) return;
+        if (auto* id = dynamic_cast<identifier*>(node)) {
+            if (!bound.contains(id->val)) captures.insert(id->val);
+        } else if (auto* member = dynamic_cast<member_expression*>(node)) {
+            expression_read(member->object.get(), bound, captures);
+            if (member->computed) expression_read(member->property.get(), bound, captures);
+        } else if (auto* keyword = dynamic_cast<keyword_argument_expression*>(node)) {
+            expression_read(keyword->val.get(), bound, captures);
+        } else if (auto* filter = dynamic_cast<filter_expression*>(node)) {
+            expression_read(filter->operand.get(), bound, captures);
+            builtin_read(filter->filter.get(), bound, captures);
+        } else if (auto* test = dynamic_cast<test_expression*>(node)) {
+            expression_read(test->operand.get(), bound, captures);
+            builtin_read(test->test.get(), bound, captures);
+        } else if (auto* array = dynamic_cast<array_literal*>(node)) {
+            for (auto& item : array->val) expression_read(item.get(), bound, captures);
+        } else if (auto* tuple = dynamic_cast<tuple_literal*>(node)) {
+            for (auto& item : tuple->val) expression_read(item.get(), bound, captures);
+        } else if (auto* object = dynamic_cast<object_literal*>(node)) {
+            for (auto& [key, value] : object->val) {
+                expression_read(key.get(), bound, captures);
+                expression_read(value.get(), bound, captures);
+            }
+        } else if (auto* output = dynamic_cast<output_statement*>(node)) {
+            expression_read(output->operand.get(), bound, captures);
+        } else {
+            std::vector<statement*> children;
+            visitor_context_.visitor = [&](bool, statement*,
+                                           const std::vector<visitor_pair>& fields) {
+                for (const auto& [name, items] : fields)
+                    children.insert(children.end(), items.begin(), items.end());
+            };
+            node->visit(visitor_context_);
+            for (auto* child : children) expression_read(child, bound, captures);
+        }
+    }
+
+    void closure(const statements& body, const statements& parameters, scope_names& locals_out,
+                 scope_names& captures_out, bool macro) {
+        names bound, captures, locals;
+        if (macro) bound.insert("caller");
+        for (const auto& parameter : parameters) {
+            if (auto* keyword = dynamic_cast<keyword_argument_expression*>(parameter.get())) {
+                expression_read(keyword->val.get(), bound, captures);
+                target_names(keyword->key.get(), bound);
+            } else {
+                target_names(parameter.get(), bound);
+            }
+        }
+        locals = bound;
+        collect_locals(body, locals);
+        statements_read(body, bound, captures);
+        locals_out.assign(locals.begin(), locals.end());
+        captures_out.assign(captures.begin(), captures.end());
+    }
+
+    void statements_read(const statements& body, names& bound, names& captures) {
+        for (const auto& node : body) {
+            if (auto* set = dynamic_cast<set_statement*>(node.get())) {
+                expression_read(set->val.get(), bound, captures);
+                statements_read(set->body, bound, captures);
+                if (auto* member = dynamic_cast<member_expression*>(set->assignee.get()))
+                    expression_read(member->object.get(), bound, captures);
+                else
+                    target_names(set->assignee.get(), bound);
+            } else if (auto* condition = dynamic_cast<if_statement*>(node.get())) {
+                expression_read(condition->test.get(), bound, captures);
+                auto left = bound, right = bound;
+                statements_read(condition->body, left, captures);
+                statements_read(condition->alternate, right, captures);
+                for (const auto& name : left)
+                    if (right.contains(name)) bound.insert(name);
+            } else if (auto* loop = dynamic_cast<for_statement*>(node.get())) {
+                names loop_bound, loop_captures, locals;
+                target_names(loop->loopvar.get(), loop_bound);
+                const auto* selected = dynamic_cast<select_expression*>(loop->iterable.get());
+                expression_read(selected ? selected->lhs.get() : loop->iterable.get(), bound,
+                                captures);
+                names filter_captures;
+                if (selected) expression_read(selected->test.get(), loop_bound, filter_captures);
+                loop->filter_captures.assign(filter_captures.begin(), filter_captures.end());
+                merge(loop->filter_captures, bound, captures);
+                loop_bound.insert("loop");
+                locals = loop_bound;
+                collect_locals(loop->body, locals);
+                loop->locals.assign(locals.begin(), locals.end());
+                statements_read(loop->body, loop_bound, loop_captures);
+                for (const auto& name : loop_captures)
+                    if (!bound.contains(name)) captures.insert(name);
+                auto alternate = bound;
+                statements_read(loop->default_block, alternate, captures);
+            } else if (auto* macro = dynamic_cast<macro_statement*>(node.get())) {
+                closure(macro->body, macro->args, macro->locals, macro->captures, true);
+                target_names(macro->name.get(), bound);
+                merge(macro->captures, bound, captures);
+            } else if (auto* call = dynamic_cast<call_statement*>(node.get())) {
+                expression_read(call->call.get(), bound, captures);
+                closure(call->body, call->caller_args, call->locals, call->captures, false);
+                merge(call->captures, bound, captures);
+            } else if (auto* filter = dynamic_cast<filter_statement*>(node.get())) {
+                builtin_read(filter->filter.get(), bound, captures);
+                statements_read(filter->body, bound, captures);
+            } else {
+                expression_read(node.get(), bound, captures);
+            }
+        }
+    }
+};
+} // namespace
 
 class parser {
     const std::vector<token>& tokens;
@@ -28,7 +192,9 @@ public:
     program parse() {
         statements body;
         while (current < tokens.size()) { body.push_back(parse_any()); }
-        return program(std::move(body));
+        program result(std::move(body));
+        scope_analysis().run(result);
+        return result;
     }
 
     // NOTE: start_pos is the token index, used for error reporting
@@ -257,6 +423,8 @@ private:
 
     statement_ptr parse_macro_statement(size_t start_pos) {
         auto name = parse_primary_expression();
+        if (!is_type<identifier>(name))
+            throw parser_exception("Expected a macro name", source, name->pos);
         auto args = parse_args();
         expect(token::close_statement, "Expected %}");
         statements body;
@@ -281,6 +449,18 @@ private:
     statement_ptr parse_for_statement(size_t start_pos) {
         // e.g., `message` in `for message in messages`
         auto loop_var = parse_expression_sequence(true); // should be an identifier/tuple
+        const auto check_target = [&](const statement_ptr& target) {
+            const auto* id = cast_stmt<identifier>(target);
+            if (!id || id->val == "loop")
+                throw parser_exception(
+                    "Invalid for-loop target: expected an identifier other than loop", source,
+                    target->pos);
+        };
+        if (const auto* tuple = cast_stmt<tuple_literal>(loop_var)) {
+            for (const auto& target : tuple->val) check_target(target);
+        } else {
+            check_target(loop_var);
+        }
         if (!is_identifier("in")) throw std::runtime_error("Expected 'in'");
         ++current; // consume 'in'
 

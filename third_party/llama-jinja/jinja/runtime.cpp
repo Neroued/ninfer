@@ -12,6 +12,174 @@
 
 namespace jinja {
 
+static value make_macro_value(macro_statement* definition,
+                              std::shared_ptr<closure_environment> environment);
+
+value binding_cell::read() const {
+    if (!macro) return inherited ? inherited->read() : data;
+    auto captured = owner.lock();
+    if (!captured) throw std::runtime_error("Closure environment has ended");
+    captured->owner->ensure_active();
+    return make_macro_value(macro, std::move(captured));
+}
+
+closure_environment::~closure_environment() { owner->detach(this); }
+
+void render_scopes::ensure_active() const {
+    if (closed_) throw std::runtime_error("Template render has ended");
+}
+
+scope* render_scopes::acquire(scope* parent, const scope_names* locals,
+                              std::shared_ptr<closure_environment> imports) {
+    ensure_active();
+    scope* frame;
+    if (free_) {
+        frame = free_;
+        free_ = frame->parent;
+    } else {
+        frame = &frames_.emplace_back();
+    }
+    frame->parent     = parent;
+    frame->locals     = locals;
+    frame->imports    = std::move(imports);
+    frame->references = 1;
+    if (parent) ++parent->references;
+    return frame;
+}
+
+void render_scopes::release(scope* frame) {
+    if (closed_) return;
+    while (frame && --frame->references == 0) {
+        auto* parent = frame->parent;
+        frame->bindings.clear();
+        frame->environment.reset();
+        frame->imports.reset();
+        frame->parent = free_;
+        free_         = frame;
+        frame         = parent;
+    }
+}
+
+std::shared_ptr<closure_environment> render_scopes::environment(scope* frame) {
+    if (!frame->environment) {
+        auto result  = std::make_shared<closure_environment>(shared_from_this());
+        result->next = environments_;
+        if (environments_) environments_->previous = result.get();
+        environments_      = result.get();
+        result->registered = true;
+        frame->environment = std::move(result);
+    }
+    return frame->environment;
+}
+
+std::shared_ptr<binding_cell> render_scopes::local_cell(scope* frame, const std::string& name) {
+    auto captured = environment(frame);
+    if (const auto found = captured->locals.find(name); found != captured->locals.end())
+        return found->second;
+    auto cell   = std::make_shared<binding_cell>();
+    cell->owner = captured;
+    if (const auto found = frame->bindings.find(name); found != frame->bindings.end()) {
+        cell->assign(std::move(found->second));
+        frame->bindings.erase(found);
+    } else {
+        std::shared_ptr<closure_environment> owner;
+        if (frame->parent) {
+            auto inherited  = resolve_cell(frame->parent, name);
+            cell->inherited = std::move(inherited.first);
+            owner           = std::move(inherited.second);
+        } else if (frame->imports) {
+            const auto found = frame->imports->bindings.find(name);
+            if (found != frame->imports->bindings.end()) {
+                cell->inherited = found->second;
+                owner           = frame->imports;
+            }
+        }
+        if (owner && owner != captured &&
+            std::find(captured->dependencies.begin(), captured->dependencies.end(), owner) ==
+                captured->dependencies.end())
+            captured->dependencies.push_back(std::move(owner));
+    }
+    captured->locals.emplace(name, cell);
+    return cell;
+}
+
+std::pair<std::shared_ptr<binding_cell>, std::shared_ptr<closure_environment>>
+render_scopes::resolve_cell(scope* frame, const std::string& name) {
+    for (auto* current = frame; current; current = current->parent) {
+        if (current->bindings.contains(name) ||
+            (current->environment && current->environment->locals.contains(name)) ||
+            (current->locals && std::find(current->locals->begin(), current->locals->end(), name) !=
+                                    current->locals->end())) {
+            auto cell = local_cell(current, name);
+            return {std::move(cell), environment(current)};
+        }
+        if (current->imports) {
+            const auto found = current->imports->bindings.find(name);
+            if (found != current->imports->bindings.end()) return {found->second, current->imports};
+        }
+        if (!current->parent) {
+            auto cell = local_cell(current, name);
+            return {std::move(cell), environment(current)};
+        }
+    }
+    throw std::logic_error("Missing lexical scope");
+}
+
+std::shared_ptr<closure_environment> render_scopes::capture(scope* frame,
+                                                            const scope_names& names) {
+    if (names.empty()) return {};
+    auto captured = environment(frame);
+    for (const auto& name : names) {
+        if (captured->bindings.contains(name)) continue;
+        auto [cell, owner] = resolve_cell(frame, name);
+        captured->bindings.emplace(name, std::move(cell));
+        if (owner != captured &&
+            std::find(captured->dependencies.begin(), captured->dependencies.end(), owner) ==
+                captured->dependencies.end())
+            captured->dependencies.push_back(std::move(owner));
+    }
+    return captured;
+}
+
+void render_scopes::detach(closure_environment* environment) {
+    if (!environment->registered) return;
+    if (environment->previous)
+        environment->previous->next = environment->next;
+    else
+        environments_ = environment->next;
+    if (environment->next) environment->next->previous = environment->previous;
+    environment->registered = false;
+}
+
+void render_scopes::close() {
+    if (closed_) return;
+    closed_ = true;
+    for (auto& frame : frames_) {
+        frame.bindings.clear();
+        frame.imports.reset();
+        frame.environment.reset();
+    }
+    // Explicitly stored recursive values may form cycles within this render.
+    while (environments_) {
+        auto current = environments_->shared_from_this();
+        detach(current.get());
+        for (auto& [name, cell] : current->locals) cell->assign({});
+        current->bindings.clear();
+        current->locals.clear();
+        current->dependencies.clear();
+    }
+}
+
+void context::define_macro(const std::string& name, macro_statement* definition,
+                           const scope_names& captures) {
+    auto cell = scopes->local_cell(env, name);
+    scopes->capture(env, captures);
+    cell->data.reset();
+    cell->inherited.reset();
+    cell->macro = definition;
+}
+
+
 
 static void render_statements(const statements& stmts, context& ctx, string& output) {
     for (const auto& stmt : stmts) {
@@ -27,6 +195,7 @@ static value_string exec_statements(const statements& stmts, context& ctx) {
 }
 
 value_string runtime::execute(const program& prog) {
+    ctx.set_locals(prog.locals);
     auto result = exec_statements(prog.body, ctx);
     if (ctx.flow() != loop_flow::none) throw std::runtime_error("Loop control used outside a loop");
     return result;
@@ -430,15 +599,22 @@ public:
     }
 
     value next() {
+        if (exhausted_) return {};
         if (is_val<value_string>(input_)) {
-            if (offset_ == bytes_.size()) return {};
+            if (offset_ == bytes_.size()) {
+                exhausted_ = true;
+                return {};
+            }
             const auto begin = offset_++;
             while (offset_ < bytes_.size() &&
                    (static_cast<unsigned char>(bytes_[offset_]) & 0xc0) == 0x80)
                 ++offset_;
             return mk_val<value_string>(string_.cut_bytes(begin, offset_));
         }
-        if (offset_ >= size()) return {};
+        if (offset_ >= size()) {
+            exhausted_ = true;
+            return {};
+        }
         if (is_val<value_array>(input_)) return input_->as_array()[offset_++];
         if (is_val<value_object>(input_)) return input_->as_ordered_object()[offset_++].first;
         return cast_val<value_range>(input_)->item(offset_++);
@@ -449,6 +625,7 @@ private:
     string string_;
     std::string bytes_;
     uint64_t offset_ = 0;
+    bool exhausted_  = false;
 };
 
 class VariableBinding {
@@ -489,10 +666,13 @@ private:
 
 class LoopValue final : public value_object_t {
 public:
-    LoopValue(value input, context& parent, VariableBinding binding, statement* filter)
-        : source_(std::move(input)), filter_scope_(parent), binding_(std::move(binding)),
-          filter_(filter) {
+    LoopValue(value input, context& parent, VariableBinding binding, statement* filter,
+              const scope_names& captures)
+        : source_(std::move(input)), owner_(parent.storage()), checkpoint_(parent.checkpoint),
+          binding_(std::move(binding)), filter_(filter) {
         has_builtins = false;
+        if (filter)
+            filter_scope_ = std::make_unique<context>(parent, parent.capture(captures), nullptr);
     }
 
     bool advance(context& body) {
@@ -513,6 +693,7 @@ public:
     }
 
     value& at(const value& key, value& fallback) override {
+        owner_->ensure_active();
         const auto name = key->as_string().str();
         if (name == "index")
             cached_ = number(index_);
@@ -545,12 +726,13 @@ private:
     }
 
     value read() {
+        owner_->ensure_active();
         while (auto item = source_.next()) {
-            if (filter_scope_.checkpoint) filter_scope_.checkpoint();
+            if (checkpoint_) checkpoint_();
             if (filter_) {
-                filter_scope_.clear_locals();
-                binding_.bind(filter_scope_, item);
-                if (!filter_->execute(filter_scope_)->as_bool()) continue;
+                filter_scope_->clear_locals();
+                binding_.bind(*filter_scope_, item);
+                if (!filter_->execute(*filter_scope_)->as_bool()) continue;
             }
             return item;
         }
@@ -584,7 +766,9 @@ private:
     }
 
     IterableCursor source_;
-    context filter_scope_;
+    std::shared_ptr<render_scopes> owner_;
+    std::function<void()> checkpoint_;
+    std::unique_ptr<context> filter_scope_;
     VariableBinding binding_;
     statement* filter_;
     std::deque<value> pending_;
@@ -603,11 +787,12 @@ value for_statement::execute_impl(context& ctx) {
 void for_statement::render_impl(context& ctx, string& output) {
     const auto* selected = cast_stmt<select_expression>(iterable);
     auto input           = (selected ? selected->lhs : iterable)->execute(ctx);
-    auto loop         = std::make_shared<LoopValue>(std::move(input), ctx, VariableBinding(loopvar),
-                                            selected ? selected->test.get() : nullptr);
+    auto loop =
+        std::make_shared<LoopValue>(std::move(input), ctx, VariableBinding(loopvar),
+                                    selected ? selected->test.get() : nullptr, filter_captures);
     bool no_iteration = true;
     for (;;) {
-        context body_scope(ctx);
+        context body_scope(ctx, &locals);
         if (!loop->advance(body_scope)) break;
         body_scope.set_val("loop", loop);
         render_statements(body, body_scope, output);
@@ -688,26 +873,45 @@ static void bind_parameters(const std::string& name, const statements& parameter
     if (!named.empty()) throw std::runtime_error("unknown macro argument: " + named.begin()->first);
 }
 
-value macro_statement::execute_impl(context& ctx) {
-    if (!is_stmt<identifier>(this->name)) {
-        throw std::runtime_error("Macro name must be an identifier");
-    }
-    std::string name = cast_stmt<identifier>(this->name)->val;
+namespace {
+struct macro_function final : value_func_t {
+    macro_statement* definition;
+    std::shared_ptr<closure_environment> environment;
 
-    const func_handler func = [this, name,
-                               scope = ctx.capture_scope()](const func_args& args) -> value {
-        context macro_ctx(args.ctx, scope);
+    macro_function(macro_statement* definition, std::shared_ptr<closure_environment> environment)
+        : value_func_t(cast_stmt<identifier>(definition->name)->val, {}), definition(definition),
+          environment(std::move(environment)) {}
+
+    value invoke(const func_args& args) const override {
+        environment->owner->ensure_active();
+        context macro_ctx(args.ctx, environment, &definition->locals);
         const auto caller = args.ctx.get_val("caller");
         if (!caller->is_undefined()) macro_ctx.set_val("caller", caller);
+        bind_parameters(name, definition->args, args, macro_ctx);
+        return exec_statements(definition->body, macro_ctx);
+    }
+};
+} // namespace
 
-        bind_parameters(name, this->args, args, macro_ctx);
+static value make_macro_value(macro_statement* definition,
+                              std::shared_ptr<closure_environment> environment) {
+    return std::make_shared<macro_function>(definition, std::move(environment));
+}
 
-        // execute macro body
-        auto res = exec_statements(this->body, macro_ctx);
-        return res;
-    };
+void binding_cell::assign(value input) {
+    inherited.reset();
+    if (const auto* function = dynamic_cast<const macro_function*>(input.get());
+        function && function->environment == owner.lock()) {
+        macro = function->definition;
+        data.reset();
+    } else {
+        macro = nullptr;
+        data  = std::move(input);
+    }
+}
 
-    ctx.set_val(name, mk_val<value_func>(name, func));
+value macro_statement::execute_impl(context& ctx) {
+    ctx.define_macro(cast_stmt<identifier>(name)->val, this, captures);
     return {};
 }
 
@@ -721,8 +925,12 @@ value call_statement::execute_impl(context& ctx) {
     }
     auto* callee_func = cast_val<value_func>(callee_val);
 
-    const func_handler func = [this, scope = ctx.current_scope()](const func_args& args) -> value {
-        context block_ctx(args.ctx, scope);
+    const func_handler func = [this, captured = ctx.capture(captures),
+                               owner = ctx.storage()](const func_args& args) -> value {
+        owner->ensure_active();
+        if (owner != args.ctx.storage())
+            throw std::runtime_error("Closure belongs to a different render");
+        context block_ctx(args.ctx, captured, &locals);
 
         bind_parameters("caller", this->caller_args, args, block_ctx);
 

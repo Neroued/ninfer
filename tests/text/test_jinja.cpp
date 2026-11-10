@@ -35,6 +35,15 @@ int language_semantics() {
         {"{% for c in text %}[{{ c }}]{% endfor %}", {{"text", "北京🌏"}}, "[北][京][🌏]"},
         {"{% for i in range(1000000000000) %}{{ i }}{% break %}{% endfor %}", Json::object(), "0"},
         {"{% for x,y in [[1,2],[3]] %}{{ x }}{% break %}{% endfor %}", Json::object(), "1"},
+        {"{% for i in [1,2] %}A{% if true %}B{% break %}C{% endif %}D{% else %}E{% endfor %}",
+         Json::object(), "ABE"},
+        {"{% for i in [1,2] %}A{% if true %}B{% continue %}C{% endif %}D{% else %}E{% endfor %}",
+         Json::object(), "ABABE"},
+        {"{% for i in [1] %}{% set x %}A{% break %}{% endset %}B{% else %}E{% endfor %}|"
+         "{% for i in [1] %}{% filter upper %}a{% break %}{% endfilter %}B{% else %}E{% endfor %}",
+         Json::object(), "E|E"},
+        {"{% set d={1:'one',2.0:'two',true:'bool'} %}{{ d[1] }}|{{ d[2] }}|{{ d[true] }}",
+         Json::object(), "bool|two|bool"},
         {"{% set a,b = range(3,7,2) %}{{ a }}|{{ b }}", Json::object(), "3|5"},
         {"{% for i in [1] %}{% if loop %}{{ loop.index }}{% endif %}{% endfor %}", Json::object(),
          "1"},
@@ -123,6 +132,13 @@ int origins_and_requests() {
     failures += check(clipped.regions.size() == 1 && clipped.regions[0].source_offset == 1 &&
                           clipped.regions[0].end == 6,
                       "Unicode slice lost byte origin mapping");
+    const auto indexed =
+        JinjaTemplate("{{ ('a' ~ text ~ 'z')[1] }}|{{ ('a' ~ text ~ 'z')[-2] }}", "index-origin")
+            .render({{"text", "北京🌏"}}, options);
+    failures +=
+        check(indexed.text == "北|🌏" && indexed.regions.size() == 2 &&
+                  indexed.regions[0].source_offset == 0 && indexed.regions[1].source_offset == 6,
+              "Unicode indexing lost source coordinates across string parts");
     const std::vector<ninfer::text::TemplateInputRegion> nested_regions{{"/obj", 10},
                                                                         {"/obj/b", 11}};
     const auto nested =

@@ -8,17 +8,28 @@
 #include <vector>
 #include <memory>
 #include <cmath>
+#include <utility>
 
 namespace jinja {
 
 
+static void render_statements(const statements& stmts, context& ctx, string& output) {
+    for (const auto& stmt : stmts) {
+        stmt->render(ctx, output);
+        if (ctx.flow() != loop_flow::none) break;
+    }
+}
+
 static value_string exec_statements(const statements& stmts, context& ctx) {
-    auto result = mk_val<value_array>();
-    for (const auto& stmt : stmts) { result->push_back(stmt->execute(ctx)); }
-    // convert to string parts
-    value_string str = mk_val<value_string>();
-    gather_string_parts_recursive(result, str);
-    return str;
+    auto output = mk_val<value_string>();
+    render_statements(stmts, ctx, output->val_str);
+    return output;
+}
+
+value_string runtime::execute(const program& prog) {
+    auto result = exec_statements(prog.body, ctx);
+    if (ctx.flow() != loop_flow::none) throw std::runtime_error("Loop control used outside a loop");
+    return result;
 }
 
 static std::string get_line_col(const std::string& source, size_t pos) {
@@ -41,29 +52,26 @@ static void ensure_key_type_allowed(const value& val) {
     }
 }
 
-// execute with error handling
-value statement::execute(context& ctx) {
+template <class Operation>
+static decltype(auto) evaluate(statement& node, context& ctx, Operation&& operation) {
     if (ctx.checkpoint) ctx.checkpoint();
     try {
-        return execute_impl(ctx);
-    } catch (const continue_statement::signal& /* ex */) {
-        throw;
-    } catch (const break_statement::signal& /* ex */) {
-        throw;
+        return operation();
     } catch (const rethrown_exception& /* ex */) {
         throw;
     } catch (const not_implemented_exception& /* ex */) { throw; } catch (const std::exception& e) {
         const std::string& source = *ctx.src;
         if (source.empty()) {
             std::ostringstream oss;
-            oss << "\nError executing " << type() << " at position " << pos << ": " << e.what();
+            oss << "\nError executing " << node.type() << " at position " << node.pos << ": "
+                << e.what();
             throw rethrown_exception(oss.str());
         } else {
             std::ostringstream oss;
             oss << "\n------------\n";
-            oss << "While executing " << type() << " at " << get_line_col(source, pos)
+            oss << "While executing " << node.type() << " at " << get_line_col(source, node.pos)
                 << " in source:\n";
-            oss << peak_source(source, pos) << "\n";
+            oss << peak_source(source, node.pos) << "\n";
             oss << "Error: " << e.what();
             // throw as another exception to avoid repeated formatting
             throw rethrown_exception(oss.str());
@@ -71,10 +79,29 @@ value statement::execute(context& ctx) {
     }
 }
 
+value statement::execute(context& ctx) {
+    return evaluate(*this, ctx, [&] { return execute_impl(ctx); });
+}
+
+void statement::render(context& ctx, string& output) {
+    evaluate(*this, ctx, [&] { render_impl(ctx, output); });
+}
+
+void statement::render_impl(context& ctx, string& output) {
+    const auto result = execute_impl(ctx);
+    if (!result) return;
+    if (is_val<value_string>(result)) {
+        output.append(cast_val<value_string>(result)->val_str);
+    } else {
+        const auto text = runtime::gather_string_parts(result);
+        output.append(text->val_str);
+    }
+}
+
 value identifier::execute_impl(context& ctx) {
-    auto it              = ctx.get_val(val);
+    auto it              = ctx.find_val(val);
     const auto& builtins = global_builtins();
-    if (!it->is_undefined()) {
+    if (it && !it->is_undefined()) {
 
         return it;
     } else if (builtins.find(val) != builtins.end()) {
@@ -252,7 +279,7 @@ static value try_builtin_func(context& ctx, const std::string& name, value& inpu
     const auto& builtins = input->get_builtins();
     auto it       = builtins.find(name);
     if (it != builtins.end()) { return mk_val<value_func>(name, it->second, input); }
-    if (undef_on_missing) { return mk_val<value_undefined>(name); }
+    if (undef_on_missing) { return {}; }
     throw std::runtime_error("Unknown (built-in) filter '" + name + "' for type " + input->type());
 }
 
@@ -307,7 +334,9 @@ value filter_expression::execute_impl(context& ctx) {
 }
 
 value filter_statement::execute_impl(context& ctx) {
-    return apply_filter(exec_statements(body, ctx), filter, ctx);
+    auto input = exec_statements(body, ctx);
+    if (ctx.flow() != loop_flow::none) return {};
+    return apply_filter(input, filter, ctx);
 }
 
 value test_expression::execute_impl(context& ctx) {
@@ -369,18 +398,14 @@ value unary_expression::execute_impl(context& ctx) {
 }
 
 value if_statement::execute_impl(context& ctx) {
-    value test_val = test->execute(ctx);
+    auto output = mk_val<value_string>();
+    render_impl(ctx, output->val_str);
+    return output;
+}
 
-    auto out = mk_val<value_array>();
-    if (test_val->as_bool()) {
-        for (auto& stmt : body) { out->push_back(stmt->execute(ctx)); }
-    } else {
-        for (auto& stmt : alternate) { out->push_back(stmt->execute(ctx)); }
-    }
-    // convert to string parts
-    value_string str = mk_val<value_string>();
-    gather_string_parts_recursive(out, str);
-    return str;
+void if_statement::render_impl(context& ctx, string& output) {
+    value test_val = test->execute(ctx);
+    render_statements(test_val->as_bool() ? body : alternate, ctx, output);
 }
 
 namespace {
@@ -482,6 +507,11 @@ public:
 
     bool as_bool() const override { return true; }
 
+    value find(const value& key) override {
+        value missing;
+        return at(key, missing);
+    }
+
     value& at(const value& key, value& fallback) override {
         const auto name = key->as_string().str();
         if (name == "index")
@@ -565,32 +595,33 @@ private:
 } // namespace
 
 value for_statement::execute_impl(context& ctx) {
+    auto output = mk_val<value_string>();
+    render_impl(ctx, output->val_str);
+    return output;
+}
+
+void for_statement::render_impl(context& ctx, string& output) {
     const auto* selected = cast_stmt<select_expression>(iterable);
     auto input           = (selected ? selected->lhs : iterable)->execute(ctx);
     auto loop         = std::make_shared<LoopValue>(std::move(input), ctx, VariableBinding(loopvar),
                                             selected ? selected->test.get() : nullptr);
-    auto result       = mk_val<value_array>();
     bool no_iteration = true;
     for (;;) {
         context body_scope(ctx);
         if (!loop->advance(body_scope)) break;
         body_scope.set_val("loop", loop);
-        try {
-            for (const auto& stmt : body) result->push_back(stmt->execute(body_scope));
-        } catch (const continue_statement::signal&) {
-            continue;
-        } catch (const break_statement::signal&) { break; }
+        render_statements(body, body_scope, output);
+        const auto flow = std::exchange(ctx.flow(), loop_flow::none);
+        if (flow == loop_flow::next) continue;
+        if (flow == loop_flow::stop) break;
         no_iteration = false;
     }
-    if (no_iteration)
-        for (const auto& stmt : default_block) result->push_back(stmt->execute(ctx));
-    auto output = mk_val<value_string>();
-    gather_string_parts_recursive(result, output);
-    return output;
+    if (no_iteration) render_statements(default_block, ctx, output);
 }
 
 value set_statement::execute_impl(context& ctx) {
     auto rhs = val ? val->execute(ctx) : exec_statements(body, ctx);
+    if (ctx.flow() != loop_flow::none) return {};
 
     if (is_stmt<identifier>(assignee)) {
         // case: {% set my_var = value %}
@@ -607,19 +638,17 @@ value set_statement::execute_impl(context& ctx) {
         if (!is_stmt<identifier>(member->property)) {
             throw std::runtime_error("Cannot assign to member with non-identifier property");
         }
-        auto prop_name = cast_stmt<identifier>(member->property)->val;
-
         value object = member->object->execute(ctx);
         if (!is_val<value_object>(object)) {
             throw std::runtime_error("Cannot assign to member of non-object");
         }
         auto obj_ptr = cast_val<value_object>(object);
-        obj_ptr->insert(prop_name, rhs);
+        obj_ptr->insert(member->static_property, rhs);
 
     } else {
         throw std::runtime_error("Invalid LHS inside assignment expression: " + assignee->type());
     }
-    return mk_val<value_undefined>();
+    return {};
 }
 
 static void bind_parameters(const std::string& name, const statements& parameters,
@@ -679,7 +708,7 @@ value macro_statement::execute_impl(context& ctx) {
     };
 
     ctx.set_val(name, mk_val<value_func>(name, func));
-    return mk_val<value_undefined>();
+    return {};
 }
 
 value call_statement::execute_impl(context& ctx) {
@@ -714,6 +743,19 @@ value call_statement::execute_impl(context& ctx) {
     return callee_func->invoke(args);
 }
 
+member_expression::member_expression(statement_ptr&& object, statement_ptr&& property,
+                                     bool computed)
+    : object(std::move(object)), property(std::move(property)), computed(computed) {
+    chk_type<expression>(this->object);
+    chk_type<expression>(this->property);
+    if (!computed) {
+        if (const auto* id = cast_stmt<identifier>(this->property))
+            static_property = mk_val<value_string>(id->val);
+        else if (const auto* index = cast_stmt<integer_literal>(this->property))
+            static_property = index->constant;
+    }
+}
+
 value member_expression::execute_impl(context& ctx) {
     value object = this->object->execute(ctx);
 
@@ -740,7 +782,7 @@ value member_expression::execute_impl(context& ctx) {
         }
     } else if (is_stmt<integer_literal>(this->property)) {
         // syntax: obj.index
-        property = mk_val<value_int>(cast_stmt<integer_literal>(this->property)->val);
+        property = static_property;
         if (property->as_int() < 0) {
             throw std::runtime_error("Static member property cannot be negative");
         }
@@ -749,8 +791,8 @@ value member_expression::execute_impl(context& ctx) {
         if (!is_stmt<identifier>(this->property)) {
             throw std::runtime_error("Static member property must be an identifier");
         }
-        property         = mk_val<value_string>(cast_stmt<identifier>(this->property)->val);
-        std::string prop = property->as_string().str();
+        property         = static_property;
+        const auto& prop = cast_stmt<identifier>(this->property)->val;
 
         // behavior of jinja2: obj having prop as a built-in function AND 'prop', as an object key,
         // then obj.prop returns the built-in function, not the property value.
@@ -759,23 +801,23 @@ value member_expression::execute_impl(context& ctx) {
         // 123
 
         value val = try_builtin_func(ctx, prop, object, true);
-        if (!is_val<value_undefined>(val)) { return val; }
+        if (val) { return val; }
         // else, fallthrough to normal property access below
     }
 
-    value val = mk_val<value_undefined>("object_property");
+    value val;
 
-    if (property->is_undefined()) { return val; }
+    if (property->is_undefined()) { return mk_val<value_undefined>("object_property"); }
 
     ensure_key_type_allowed(property);
 
     if (is_val<value_undefined>(object)) {
-        return val;
+        return mk_val<value_undefined>("object_property");
 
     } else if (is_val<value_object>(object)) {
-        auto key = property->as_string().str();
-        val      = object->at(property, val);
-        if (is_val<value_undefined>(val)) { val = try_builtin_func(ctx, key, object, true); }
+        val = object->find(property);
+        if (!val || val->is_undefined())
+            val = try_builtin_func(ctx, property->as_string().str(), object, true);
 
     } else if (is_val<value_array>(object) || is_val<value_string>(object) ||
                is_val<value_range>(object)) {
@@ -791,12 +833,8 @@ value member_expression::execute_impl(context& ctx) {
                 if (index < 0) { index += static_cast<int64_t>(arr.size()); }
                 if (index >= 0 && index < static_cast<int64_t>(arr.size())) { val = arr[index]; }
             } else { // value_string
-                const auto str  = object->as_string();
-                const auto size = static_cast<int64_t>(str.length());
-                if (index < 0) index += size;
-                if (index >= 0 && index < size) {
-                    val = mk_val<value_string>(str.slice(index, index + 1));
-                }
+                auto item = cast_val<value_string>(object)->val_str.at(index);
+                if (item) val = mk_val<value_string>(std::move(*item));
             }
 
         } else if (is_val<value_string>(property)) {
@@ -818,7 +856,7 @@ value member_expression::execute_impl(context& ctx) {
 
 
 
-    return val;
+    return val ? val : mk_val<value_undefined>("object_property");
 }
 
 value call_expression::execute_impl(context& ctx) {

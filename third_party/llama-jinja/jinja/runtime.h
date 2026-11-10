@@ -55,6 +55,59 @@ using visitor_fn   = std::function<void(bool, statement*, std::vector<visitor_pa
 struct scope {
     scope* parent = nullptr;
     std::unordered_map<std::string, value> bindings;
+    std::size_t references = 0;
+    bool captured          = false;
+};
+
+enum class loop_flow { none, stop, next };
+
+class render_scopes {
+public:
+    ~render_scopes() {
+        closing_ = true;
+        for (auto& frame : frames_) frame.bindings.clear();
+    }
+
+    scope* acquire(scope* parent) {
+        scope* frame;
+        if (!free_) {
+            frame = &frames_.emplace_back();
+        } else {
+            frame = free_;
+            free_ = frame->parent;
+        }
+        frame->parent     = parent;
+        frame->references = 1;
+        frame->captured   = false;
+        if (parent) ++parent->references;
+        return frame;
+    }
+
+    void release(scope* frame) {
+        if (closing_) return;
+        while (frame && --frame->references == 0) {
+            auto* parent = frame->parent;
+            frame->bindings.clear();
+            frame->parent = free_;
+            free_         = frame;
+            frame         = parent;
+        }
+    }
+
+    scope* capture(scope* frame) {
+        if (!frame->captured) {
+            frame->captured = true;
+            ++frame->references;
+        }
+        return frame;
+    }
+
+    loop_flow flow = loop_flow::none;
+
+private:
+    std::deque<scope> frames_;
+    scope* free_  = nullptr;
+    bool closing_ = false;
 };
 
 struct context {
@@ -69,8 +122,8 @@ struct context {
     // src is optional, used for error reporting
     context(std::string src = "")
         : src(std::make_shared<std::string>(std::move(src))),
-          owned_scopes(std::make_unique<std::deque<scope>>()), scopes(owned_scopes.get()) {
-        env = &scopes->emplace_back();
+          owned_scopes(std::make_unique<render_scopes>()), scopes(owned_scopes.get()) {
+        env = scopes->acquire(nullptr);
         set_val("true", mk_val<value_bool>(true));
         set_val("True", mk_val<value_bool>(true));
         set_val("false", mk_val<value_bool>(false));
@@ -80,26 +133,30 @@ struct context {
         current_time = std::time(nullptr);
     }
 
-    ~context() = default;
+    ~context() { scopes->release(env); }
 
-    // The root render owns all lexical frames. Values borrow frames, including escaped
-    // macros and loop metadata, without creating environment/callable ownership cycles.
-    scope* capture_scope() const { return env; }
+    // Captured lexical frames live until the render ends; ordinary frames are recycled.
+    scope* capture_scope() const { return scopes->capture(env); }
 
-    scope* current_scope() const { return env; }
+    scope* current_scope() const { return capture_scope(); }
 
     context(const context& caller, scope* lexical_scope)
         : src(caller.src), current_time(caller.current_time), checkpoint(caller.checkpoint),
-          scopes(caller.scopes), env(&scopes->emplace_back(scope{lexical_scope, {}})) {}
+          scopes(caller.scopes), env(scopes->acquire(lexical_scope)) {}
 
     context(const context& parent) : context(parent, parent.env) {}
 
-    value get_val(const std::string& name) {
+    value find_val(const std::string& name) {
         for (auto* frame = env; frame; frame = frame->parent) {
             const auto found = frame->bindings.find(name);
             if (found != frame->bindings.end()) return found->second;
         }
-        return mk_val<value_undefined>(name);
+        return {};
+    }
+
+    value get_val(const std::string& name) {
+        auto result = find_val(name);
+        return result ? result : mk_val<value_undefined>(name);
     }
 
     void set_val(const std::string& name, const value& val) { env->bindings[name] = val; }
@@ -108,9 +165,11 @@ struct context {
 
     void clear_locals() { env->bindings.clear(); }
 
+    loop_flow& flow() { return scopes->flow; }
+
 private:
-    std::unique_ptr<std::deque<scope>> owned_scopes;
-    std::deque<scope>* scopes;
+    std::unique_ptr<render_scopes> owned_scopes;
+    render_scopes* scopes;
     scope* env;
 };
 
@@ -135,8 +194,11 @@ struct statement {
     // execute_impl must be overridden by derived classes
     virtual value execute_impl(context&) { throw_exec_error(); }
 
+    virtual void render_impl(context&, string&);
+
     // execute is the public method to execute a statement with error handling
     value execute(context&);
+    void render(context&, string&);
 
 private:
     [[noreturn]] void throw_exec_error() const {
@@ -176,6 +238,7 @@ struct output_statement : public statement {
 
     value execute_impl(context& ctx) override {
         const auto result = operand->execute(ctx);
+        if (is_val<value_string>(result)) return result;
         return mk_val<value_string>(result->as_string());
     }
 };
@@ -209,6 +272,7 @@ struct if_statement : public statement {
     std::string type() const override { return "If"; }
 
     value execute_impl(context& ctx) override;
+    void render_impl(context&, string&) override;
 
     void visit(context& ctx) override {
         ctx.visitor(false, this,
@@ -242,6 +306,7 @@ struct for_statement : public statement {
     std::string type() const override { return "For"; }
 
     value execute_impl(context& ctx) override;
+    void render_impl(context&, string&) override;
 
     void visit(context& ctx) override {
         ctx.visitor(false, this,
@@ -255,28 +320,26 @@ struct for_statement : public statement {
 struct break_statement : public statement {
     std::string type() const override { return "Break"; }
 
-    struct signal : public std::exception {
-        const char* what() const noexcept override { return "Break statement executed"; }
-    };
-
-    [[noreturn]] value execute_impl(context&) override { throw break_statement::signal(); }
+    value execute_impl(context& ctx) override {
+        ctx.flow() = loop_flow::stop;
+        return {};
+    }
 };
 
 struct continue_statement : public statement {
     std::string type() const override { return "Continue"; }
 
-    struct signal : public std::exception {
-        const char* what() const noexcept override { return "Continue statement executed"; }
-    };
-
-    [[noreturn]] value execute_impl(context&) override { throw continue_statement::signal(); }
+    value execute_impl(context& ctx) override {
+        ctx.flow() = loop_flow::next;
+        return {};
+    }
 };
 
 // do nothing
 struct noop_statement : public statement {
     std::string type() const override { return "Noop"; }
 
-    value execute_impl(context&) override { return mk_val<value_undefined>(); }
+    value execute_impl(context&) override { return {}; }
 };
 
 struct set_statement : public statement {
@@ -330,7 +393,7 @@ struct comment_statement : public statement {
 
     std::string type() const override { return "Comment"; }
 
-    value execute_impl(context&) override { return mk_val<value_undefined>(); }
+    value execute_impl(context&) override { return {}; }
 };
 
 // Expressions
@@ -346,12 +409,9 @@ struct member_expression : public expression {
     statement_ptr object;
     statement_ptr property;
     bool computed; // true if obj[expr] and false if obj.prop
+    value static_property;
 
-    member_expression(statement_ptr&& object, statement_ptr&& property, bool computed)
-        : object(std::move(object)), property(std::move(property)), computed(computed) {
-        chk_type<expression>(this->object);
-        chk_type<expression>(this->property);
-    }
+    member_expression(statement_ptr&& object, statement_ptr&& property, bool computed);
 
     std::string type() const override { return "MemberExpression"; }
 
@@ -398,32 +458,36 @@ struct identifier : public expression {
 
 struct integer_literal : public expression {
     int64_t val;
+    value constant;
 
-    explicit integer_literal(int64_t val) : val(val) {}
+    explicit integer_literal(int64_t val) : val(val), constant(mk_val<value_int>(val)) {}
 
     std::string type() const override { return "IntegerLiteral"; }
 
-    value execute_impl(context&) override { return mk_val<value_int>(val); }
+    value execute_impl(context&) override { return constant; }
 };
 
 struct float_literal : public expression {
     double val;
+    value constant;
 
-    explicit float_literal(double val) : val(val) {}
+    explicit float_literal(double val) : val(val), constant(mk_val<value_float>(val)) {}
 
     std::string type() const override { return "FloatLiteral"; }
 
-    value execute_impl(context&) override { return mk_val<value_float>(val); }
+    value execute_impl(context&) override { return constant; }
 };
 
 struct string_literal : public expression {
     std::string val;
+    value constant;
 
-    explicit string_literal(const std::string& val) : val(val) {}
+    explicit string_literal(const std::string& val)
+        : val(val), constant(mk_val<value_string>(val)) {}
 
     std::string type() const override { return "StringLiteral"; }
 
-    value execute_impl(context&) override { return mk_val<value_string>(val); }
+    value execute_impl(context&) override { return constant; }
 };
 
 struct array_literal : public expression {
@@ -768,15 +832,9 @@ static void gather_string_parts_recursive(const value& val, value_string& parts)
         std::string str_val = val->as_string().str();
         parts->val_str.append(str_val);
     } else if (is_val<value_array>(val)) {
-        auto items = cast_val<value_array>(val)->as_array();
+        const auto& items = cast_val<value_array>(val)->as_array();
         for (const auto& item : items) { gather_string_parts_recursive(item, parts); }
     }
-}
-
-static std::string render_string_parts(const value_string& parts) {
-    std::ostringstream oss;
-    for (const auto& part : parts->val_str.parts) { oss << part.val; }
-    return oss.str();
 }
 
 struct runtime {
@@ -784,16 +842,10 @@ struct runtime {
 
     explicit runtime(context& ctx) : ctx(ctx) {}
 
-    value_array execute(const program& prog) {
-        value_array results = mk_val<value_array>();
-        for (const auto& stmt : prog.body) {
-            value res = stmt->execute(ctx);
-            results->push_back(std::move(res));
-        }
-        return results;
-    }
+    value_string execute(const program& prog);
 
     static value_string gather_string_parts(const value& val) {
+        if (is_val<value_string>(val)) return std::static_pointer_cast<value_string_t>(val);
         value_string parts = mk_val<value_string>();
         gather_string_parts_recursive(val, parts);
         return parts;

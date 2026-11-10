@@ -6,6 +6,72 @@
 
 namespace jinja {
 
+bool string::empty() const noexcept {
+    for (const auto& part : parts)
+        if (!part.val.empty()) return false;
+    return true;
+}
+
+bool string::equals(std::string_view other) const noexcept {
+    for (const auto& part : parts) {
+        if (!other.starts_with(part.val)) return false;
+        other.remove_prefix(part.val.size());
+    }
+    return other.empty();
+}
+
+bool string::equals(const string& other) const noexcept {
+    std::size_t part = 0, offset = 0;
+    for (const auto& left : parts) {
+        std::string_view text(left.val);
+        while (!text.empty()) {
+            while (part < other.parts.size() && offset == other.parts[part].val.size()) {
+                ++part;
+                offset = 0;
+            }
+            if (part == other.parts.size()) return false;
+            const auto& right = other.parts[part].val;
+            const auto count  = std::min(text.size(), right.size() - offset);
+            if (text.substr(0, count) != std::string_view(right).substr(offset, count))
+                return false;
+            text.remove_prefix(count);
+            offset += count;
+        }
+    }
+    while (part < other.parts.size() && offset == other.parts[part].val.size()) {
+        ++part;
+        offset = 0;
+    }
+    return part == other.parts.size();
+}
+
+std::optional<string> string::at(std::int64_t index) const {
+    const auto joined           = parts.size() > 1 ? str() : std::string{};
+    const std::string_view text = parts.size() == 1 ? std::string_view(parts[0].val) : joined;
+    std::size_t begin = 0, end = text.size();
+    if (index >= 0) {
+        for (std::int64_t i = 0; begin < text.size(); ++i) {
+            const auto cp =
+                ninfer::text::unicode_internal::utf8_codepoint_at(text, begin, "Jinja string");
+            end = begin + cp.length;
+            if (i == index) return cut_bytes(begin, end);
+            begin = end;
+        }
+    } else {
+        auto remaining = std::uint64_t(-(index + 1)) + 1;
+        while (end && remaining--) {
+            begin = end - 1;
+            while (begin && (static_cast<unsigned char>(text[begin]) & 0xc0) == 0x80) --begin;
+            const auto cp =
+                ninfer::text::unicode_internal::utf8_codepoint_at(text, begin, "Jinja string");
+            if (begin + cp.length != end) throw std::invalid_argument("Invalid UTF-8 boundary");
+            if (!remaining) return cut_bytes(begin, end);
+            end = begin;
+        }
+    }
+    return {};
+}
+
 void string::tag(std::uint32_t origin, bool exact) {
     std::erase_if(parts, [](const auto& part) { return part.collapsed_source_end.has_value(); });
     std::size_t offset = 0;

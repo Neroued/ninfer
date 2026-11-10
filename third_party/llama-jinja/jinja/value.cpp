@@ -139,7 +139,7 @@ static value tojson(const func_args& args) {
     if (args.get_pos(0)->origin)
         result->val_str.tag(args.get_pos(0)->origin, false);
     else if (is_val<value_string>(args.get_pos(0))) {
-        const auto& parts = args.get_pos(0)->val_str.parts;
+        const auto& parts         = cast_val<value_string>(args.get_pos(0))->val_str.parts;
         const string_part* source = nullptr;
         for (const auto& part : parts) {
             if (part.collapsed_source_end) continue;
@@ -338,7 +338,7 @@ const func_builtins& global_builtins() {
         {"test_is_divisibleby",
          [](const func_args& args) -> value {
              args.ensure_vals<value_int, value_int>();
-             bool res = args.get_pos(0)->val_int % args.get_pos(1)->val_int == 0;
+             bool res = args.get_pos(0)->as_int() % args.get_pos(1)->as_int() == 0;
              return mk_val<value_bool>(res);
          }},
         {"test_is_string", test_type_fn<value_string>},
@@ -351,12 +351,14 @@ const func_builtins& global_builtins() {
         {"test_is_lower",
          [](const func_args& args) -> value {
              args.ensure_vals<value_string>();
-             return mk_val<value_bool>(args.get_pos(0)->val_str.is_lowercase());
+             return mk_val<value_bool>(
+                 cast_val<value_string>(args.get_pos(0))->val_str.is_lowercase());
          }},
         {"test_is_upper",
          [](const func_args& args) -> value {
              args.ensure_vals<value_string>();
-             return mk_val<value_bool>(args.get_pos(0)->val_str.is_uppercase());
+             return mk_val<value_bool>(
+                 cast_val<value_string>(args.get_pos(0))->val_str.is_uppercase());
          }},
         {"test_is_none", test_type_fn<value_none>},
         {"test_is_defined",
@@ -407,7 +409,7 @@ const func_builtins& global_builtins() {
          [](const func_args& args) -> value {
              args.ensure_vals<value_string>();
              auto& builtins        = global_builtins();
-             std::string test_name = args.get_pos(0)->val_str.str();
+             std::string test_name = args.get_pos(0)->as_string().str();
              auto it               = builtins.find("test_is_" + test_name);
              bool res              = it != builtins.end();
              return mk_val<value_bool>(res);
@@ -762,7 +764,7 @@ const func_builtins& value_bool_t::get_builtins() const {
 }
 
 value_range_t::value_range_t(int64_t start_, int64_t stop_, int64_t step_)
-    : start(start_), stop(stop_), step(step_), count(0) {
+    : value_t(kind_id), start(start_), stop(stop_), step(step_), count(0) {
     if (!step) throw raised_exception("range() step argument must not be zero");
     const __int128 distance = step > 0 ? __int128(stop) - start : __int128(start) - stop;
     const __int128 stride   = step > 0 ? __int128(step) : -__int128(step);
@@ -1257,7 +1259,7 @@ bool value_compare(const value& a, const value& b, value_compare_op op) {
         if (op == gt) return lhs > rhs;
         return lhs < rhs;
     };
-    if (a->is_numeric() && b->is_numeric()) return compare(a->val_flt, b->val_flt);
+    if (a->is_numeric() && b->is_numeric()) return compare(a->as_float(), b->as_float());
     if (is_val<value_string>(a) && is_val<value_string>(b))
         return compare(a->as_string().str(), b->as_string().str());
     throw raised_exception("Cannot order " + a->type() + " and " + b->type());

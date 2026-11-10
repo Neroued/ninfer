@@ -17,9 +17,10 @@ void EngineCore<Instance>::reserve_active_capture(const std::shared_ptr<Request>
         request->capture_pending = false;
         return;
     }
-    bool started = instance_.session->start_capture(*request->sequence);
-    if (!started) {
-        instance_.session->skip_capture(*request->sequence);
+    if (!prepare_semantic_capture(request)) return;
+    const auto started = instance_.session->start_capture(*request->sequence);
+    if (started == ContextStart::Deferred) return;
+    if (started == ContextStart::Stale) {
         request->capture_pending = false;
         return;
     }
@@ -30,9 +31,6 @@ template <class Instance>
 bool EngineCore<Instance>::prepare_semantic_capture(const std::shared_ptr<Request>& request) {
     auto& decision = capture_decisions_[request->lane->value];
     if (decision && decision->sequence != *request->sequence) { decision.reset(); }
-    if (instance_.session->capture_is_input(*request->sequence) && !decision) {
-        (void)resources_.recycle_input(*instance_.session, request->continuation_owner);
-    }
     while (const auto capture = instance_.session->prepare_capture(*request->sequence)) {
         if (scheduler_.progress_owner()) {
             instance_.session->skip_capture(*request->sequence);
@@ -47,6 +45,18 @@ bool EngineCore<Instance>::prepare_semantic_capture(const std::shared_ptr<Reques
             decision.reset();
             continue;
         }
+        if (const auto source = resources_.capture_source(
+                *instance_.session, *request->base_plan, capture->frontier,
+                instance_.session->placement(*request->sequence))) {
+            const auto shared = instance_.session->share_capture(*request->sequence, *source);
+            if (!shared.empty()) {
+                for (const auto checkpoint : shared)
+                    resources_.publish(*instance_.session, request->continuation_owner, checkpoint);
+                decision.reset();
+                request_admission_check();
+                continue;
+            }
+        }
         if (capture->reserved) {
             decision.reset();
             return true;
@@ -54,7 +64,8 @@ bool EngineCore<Instance>::prepare_semantic_capture(const std::shared_ptr<Reques
         if (instance_.session->has_context_operation()) { return false; }
         const auto admission = resources_.capture_admission(
             *instance_.session, request->continuation_owner, *request->base_plan, capture->frontier,
-            instance_.session->capture_is_input(*request->sequence));
+            instance_.session->capture_is_input(*request->sequence)
+                ? CheckpointRole::InputReplay : CheckpointRole::SharedPrefix);
         if (!decision || decision->frontier != capture->frontier) {
             decision.emplace(
                 CaptureDecision{*request->sequence, capture->frontier,
@@ -68,7 +79,8 @@ bool EngineCore<Instance>::prepare_semantic_capture(const std::shared_ptr<Reques
                     resources_.host_victims(*instance_.session, capture->host, std::nullopt, {}, {},
                                             admission, &decision->reclaim)) {
                 const auto loss  = resources_.release_cost(*instance_.session, *victims);
-                const auto retry = instance_.session->prepare_capture(*request->sequence, *victims);
+                const auto retry = instance_.session->prepare_capture(
+                    *request->sequence, *victims, CaptureStorage::Host);
                 if (retry && !retry->retired_points.empty()) {
                     if (retry->retired_points != *victims)
                         throw std::logic_error("capture consumed only part of its victim quote");
@@ -81,13 +93,35 @@ bool EngineCore<Instance>::prepare_semantic_capture(const std::shared_ptr<Reques
                     return true;
                 }
             }
+            const auto preserved = resources_.preserve_capture(
+                *instance_.session, capture->assessment, decision->reclaim);
+            if (preserved == ReclaimProgress::Transferring || preserved == ReclaimProgress::Deferred)
+                return false;
+            if (preserved == ReclaimProgress::Changed || preserved == ReclaimProgress::Retry)
+                continue;
         }
-        const auto progress =
-            resources_.reclaim(*instance_.session, capture->assessment, {}, decision->reclaim);
-        if (progress == ReclaimProgress::Transferring || progress == ReclaimProgress::Deferred)
-            return false;
-        if (progress == ReclaimProgress::Retry) continue;
-        if (progress == ReclaimProgress::Changed) { continue; }
+        if (capture->assessment.requires_maintenance()) {
+            const auto started = instance_.session->start_maintenance(capture->assessment);
+            if (started == ContextStart::Started || started == ContextStart::Deferred) return false;
+        }
+        if (capture->assessment.waiting()) return false;
+        if (const auto victims = resources_.capture_victims(
+                *instance_.session, capture->assessment, decision->reclaim)) {
+            const auto loss = resources_.release_cost(*instance_.session, *victims);
+            const auto retry = instance_.session->prepare_capture(
+                *request->sequence, *victims, CaptureStorage::Device);
+            if (retry && !retry->retired_points.empty()) {
+                if (retry->retired_points != *victims)
+                    throw std::logic_error("capture consumed only part of its victim quote");
+                resources_.adopt_release(*instance_.session, retry->retired_points,
+                                         decision->reclaim, loss);
+                request_admission_check();
+            }
+            if (retry && retry->reserved) {
+                decision.reset();
+                return true;
+            }
+        }
         instance_.session->skip_capture(*request->sequence);
         decision.reset();
     }

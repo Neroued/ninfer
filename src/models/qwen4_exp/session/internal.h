@@ -92,6 +92,7 @@ struct Sequence {
     std::size_t next_capture         = 0;
     std::vector<CapturePoint> captures;
     std::uint32_t last_saved = 0, last_intermediate_attempt = 0;
+    std::optional<std::uint32_t> retry_frontier;
     std::unique_ptr<CaptureReservation> capture;
     bool capture_pending = false;
     SpeculativeStats speculative;

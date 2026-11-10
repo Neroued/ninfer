@@ -53,6 +53,7 @@ class ReclaimSelection {
         std::uint64_t waiting      = 0;
         std::size_t snapshot_order = 0;
         bool allowed = true, chosen = false;
+        bool replaces_input = false;
     };
 
     struct Gain {
@@ -114,10 +115,16 @@ public:
         candidates_.reserve(releases.size());
         for (const auto& release : releases) {
             Candidate candidate;
-            candidate.allowed = policy.may_revoke(release.sources, cursor.rights) &&
-                                std::none_of(release.sources.begin(), release.sources.end(),
-                                             [&](auto h) { return Policy::contains(excluded, h); });
+            candidate.allowed =
+                policy.may_revoke(release.sources, cursor.rights) &&
+                std::none_of(release.sources.begin(), release.sources.end(), [&](auto h) {
+                    return Policy::contains(excluded, h) ||
+                           Policy::contains(cursor.protected_points, h);
+                });
             if (candidate.allowed) {
+                candidate.replaces_input =
+                    cursor.admission && cursor.admission->replacement &&
+                    Policy::contains(release.sources, *cursor.admission->replacement);
                 candidate.waiting = policy.waiting_ticket(release.sources);
                 auto ordered      = release.sources;
                 std::sort(ordered.begin(), ordered.end(), [&](auto a, auto b) {
@@ -170,8 +177,9 @@ public:
                 continue;
             // Removing more checkpoints cannot lower recovery loss. Cached component losses
             // therefore bound this trial even after their component has changed.
-            auto bound = selected_;
-            bool known = true;
+            auto bound           = selected_;
+            bound.replaces_input = bound.replaces_input || candidate.replaces_input;
+            bool known           = true;
             for (const auto& part : candidate.parts) {
                 if (!part.facts.loss) {
                     known = false;
@@ -188,9 +196,10 @@ public:
             const auto snapshot = std::max(selected_snapshot_, candidate.snapshot_order);
             if (known && best &&
                 (snapshot > best->snapshot_order ||
-                 (snapshot == best->snapshot_order && !Policy::less_rank(bound, best->rank))))
+                 (snapshot == best->snapshot_order && !less_rank(bound, best->rank))))
                 continue;
-            auto rank = selected_;
+            auto rank           = selected_;
+            rank.replaces_input = rank.replaces_input || candidate.replaces_input;
             for (auto& part : candidate.parts) {
                 const auto& group = groups_[part.group];
                 if (part.version != group.version) {
@@ -222,6 +231,8 @@ public:
             for (auto& gain : gains_) {
                 if (!Policy::admits_limits(rank.priority, rank.loss, *gain.admission, cursor_) ||
                     (!gain.admission->demand.reused() &&
+                     (gain.admission->purpose != CheckpointRole::InputReplay ||
+                      rank.priority.reused()) &&
                      gain_after(gain, candidate) <= rank.loss)) {
                     accepted = false;
                     break;
@@ -231,7 +242,7 @@ public:
             rank.units   = std::max<std::uint64_t>(1, value.useful_bytes(limits_));
             rank.waiting = include_waiting(selected_.waiting, candidate.waiting);
             if (!best || snapshot < best->snapshot_order ||
-                (snapshot == best->snapshot_order && Policy::less_rank(rank, best->rank)))
+                (snapshot == best->snapshot_order && less_rank(rank, best->rank)))
                 best = Choice{i, rank, snapshot};
         }
         return best;
@@ -273,6 +284,16 @@ private:
         for (const auto& object : inventory.objects())
             values.push_back(session.release_measure(object.released, assessment));
         return values;
+    }
+
+    bool less_rank(const Rank& left, const Rank& right) const {
+        if (cursor_.admission && cursor_.admission->purpose == CheckpointRole::InputReplay &&
+            !left.waiting && !right.waiting && !left.priority.reused() &&
+            !right.priority.reused()) {
+            if (left.replaces_input != right.replaces_input) return left.replaces_input;
+            if (left.order != right.order) return left.order < right.order;
+        }
+        return Policy::less_rank(left, right);
     }
 
     std::uint64_t gain_after(Gain& gain, const Candidate& candidate) {

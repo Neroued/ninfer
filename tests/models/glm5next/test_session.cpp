@@ -396,7 +396,8 @@ void fragmented_capture(std::shared_ptr<const glm::ModelDefinition> definition) 
     require(f.event<glm::PrefillProgress>().capture_ready,
             "compacted prefill lost its checkpoint boundary");
     f.idle();
-    require(f.session.start_capture(sequence), "compacted checkpoint did not start");
+    require(f.session.start_capture(sequence) == runtime::ContextStart::Started,
+            "compacted checkpoint did not start");
     const auto captured = f.event<glm::ContextProgress>();
     require(captured.published && !captured.captured_checkpoints.empty(),
             "compacted checkpoint did not publish");
@@ -463,7 +464,8 @@ void transactions(std::shared_ptr<const glm::ModelDefinition> definition) {
         require(progress.capture_ready && !progress.pending,
                 "input checkpoint boundary not honored");
         f.idle();
-        require(f.session.start_capture(sequence), "capture did not start");
+        require(f.session.start_capture(sequence) == runtime::ContextStart::Started,
+                "capture did not start");
         const auto captured = f.event<glm::ContextProgress>();
         require(captured.published && !captured.captured_checkpoints.empty(),
                 "capture did not publish");
@@ -506,6 +508,79 @@ void transactions(std::shared_ptr<const glm::ModelDefinition> definition) {
                 std::all_of(usage.kv_page_groups.begin(), usage.kv_page_groups.end(),
                             [](auto n) { return n == 0; }),
             "discard leaked context objects");
+}
+
+void capture_replacement_and_retry(std::shared_ptr<const glm::ModelDefinition> definition) {
+    Fixture f(definition);
+    const auto request = f.request(4);
+    const auto first   = f.bind(request, 0, 1);
+    const glm::ExecutionUnit unit{first, glm::ExecutionUnitKind::Prefill, 4};
+    require(bool(f.session.reserve_units({&unit, 1})), "retry input reservation");
+    require(f.session.prepare_capture(first)->reserved, "retry initial capture reservation");
+    f.session.skip_capture(first);
+    require(f.session.start_prefill(first).has_value(), "retry prefill start");
+    auto result = f.event<glm::PrefillProgress>();
+    require(result.complete && result.pending && !result.capture_ready,
+            "skipped capture changed the normal prefill boundary");
+    f.commit(std::move(*result.pending));
+    require(f.session.retry_capture(first), "completed prefill lost its retryable input frontier");
+    require(f.session.prepare_capture(first)->reserved,
+            "late capture could not reserve without a compute permit");
+    auto frame = f.executor.try_reserve(rt::FrameKind::Context);
+    require(frame.has_value() && f.session.start_capture(first) == rt::ContextStart::Deferred,
+            "temporarily busy context frame discarded an input capture");
+    frame.reset();
+    require(f.session.start_capture(first) == rt::ContextStart::Started,
+            "deferred capture did not start");
+    auto captured = f.event<glm::ContextProgress>();
+    f.idle();
+    require(captured.published && captured.captured_checkpoints.size() == 1,
+            "retried input capture did not publish");
+    const auto old = captured.captured_checkpoints.front();
+    require(f.session.abort(first).status == rt::ConsumeStatus::Consumed, "retried writer release");
+    f.idle();
+
+    const auto second = f.bind(request, 0, 1);
+    const glm::ExecutionUnit next{second, glm::ExecutionUnitKind::Prefill, 4};
+    require(bool(f.session.reserve_units({&next, 1})), "shared capture compute reservation");
+    const auto before = f.session.physical_usage();
+    const auto alias  = f.session.share_capture(second, old);
+    require(alias.size() == 1 && alias.front() != old,
+            "same-position input did not share the complete snapshot");
+    const auto after = f.session.physical_usage();
+    require(before.state_objects == after.state_objects &&
+                before.kv_page_groups == after.kv_page_groups,
+            "sharing an input snapshot allocated another State or KV history");
+    f.commit(f.prefill(second));
+    require(f.session.abort(second).status == rt::ConsumeStatus::Consumed, "shared writer release");
+    f.idle();
+    const auto third = f.bind(f.request(8), 0, 1);
+    const glm::ExecutionUnit growing{third, glm::ExecutionUnitKind::Prefill, 8};
+    require(bool(f.session.reserve_units({&growing, 1})), "replacement compute reservation");
+    std::vector<ctx::RecordLease> fillers;
+    for (;;) {
+        auto held = f.directory->records().reserve(
+            ctx::RecordDemand{ctx::state_record_layout(1), ctx::ContextMemory::Device, 1});
+        if (!held || !held->ready()) break;
+        for (const auto& part : f.layout.context.state.layouts[1].parts)
+            fillers.push_back(held->materialize(part.rank));
+    }
+    const auto replacement = f.session.prepare_capture(third, {&old, 1});
+    require(replacement && !replacement->reserved && f.session.valid_checkpoint(old) &&
+                f.session.valid_checkpoint(alias.front()),
+            "failed whole-placement preparation deleted a still-shared input checkpoint");
+    fillers.clear();
+    require(f.session.prepare_capture(third)->reserved,
+            "capture did not recover when capacity returned");
+    require(f.session.abort(third).status == rt::ConsumeStatus::Consumed,
+            "replacement writer release");
+    f.idle();
+    require(f.session.release_checkpoint(old) && f.session.valid_checkpoint(alias.front()),
+            "retiring a prior role invalidated its shared snapshot");
+    require(f.session.release_checkpoint(alias.front()), "shared capture release");
+    require(!f.session.physical_usage().state_objects &&
+                !f.session.physical_usage().history_objects,
+            "shared capture leaked its complete snapshot");
 }
 
 void mtp_transactions(std::shared_ptr<const glm::ModelDefinition> definition) {
@@ -746,14 +821,15 @@ public:
 
     std::optional<glm::CapturePreparation>
     prepare_capture(glm::SequenceHandle sequence,
-                    std::span<const glm::CheckpointHandle> victims = {}) {
+                    std::span<const glm::CheckpointHandle> victims = {},
+                    runtime::CaptureStorage storage = runtime::CaptureStorage::Automatic) {
         if (!blocked) blocked = sequence;
         if (sequence == blocked && waiting) {
             observed = true;
             return glm::CapturePreparation{
                 .frontier = 64, .assessment = {.status = ctx::ContextAvailability::Waiting}};
         }
-        return glm::Session::prepare_capture(sequence, victims);
+        return glm::Session::prepare_capture(sequence, victims, storage);
     }
 };
 
@@ -874,6 +950,7 @@ int main(int argc, char** argv) {
         require(argc >= 2, "missing artifact directory");
         artifact::Reader reader(std::filesystem::path(argv[1]) / "model.ninfer");
         transactions(glm::read_definition(reader, {}));
+        capture_replacement_and_retry(glm::read_definition(reader, {}));
         fragmented_capture(glm::read_definition(reader, {}));
         engine_pressure(glm::read_definition(reader, {}), false);
         engine_pressure(glm::read_definition(reader, {}), true);

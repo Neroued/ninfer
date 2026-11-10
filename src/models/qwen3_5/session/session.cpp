@@ -231,12 +231,22 @@ BindingReservation Session::start_binding(const RequestBasePlan& base, runtime::
     return impl_->start_binding(base, lane, source, resume, kind, tokens);
 }
 
-bool Session::start_capture(SequenceHandle h) { return impl_->start_capture(h); }
+runtime::ContextStart Session::start_capture(SequenceHandle h) { return impl_->start_capture(h); }
 
-std::vector<std::uint32_t> Session::capture_frontiers(SequenceHandle h) const {
+bool Session::retry_capture(SequenceHandle h) { return impl_->retry_capture(h); }
+
+std::vector<CheckpointHandle> Session::share_capture(SequenceHandle h, CheckpointHandle source) {
+    return impl_->share_capture(h, source);
+}
+
+std::vector<std::uint32_t> Session::capture_frontiers(SequenceHandle h, std::uint32_t begin,
+                                                      std::uint32_t end) const {
     std::vector<std::uint32_t> result;
-    for (const auto& point : impl_->requests[impl_->lane(h)].capture_groups)
-        result.push_back(point.frontier);
+    const auto& points = impl_->requests[impl_->lane(h)].capture_groups;
+    for (auto it = std::upper_bound(points.begin(), points.end(), begin,
+                                    [](auto f, const auto& point) { return f < point.frontier; });
+         it != points.end() && it->frontier <= end; ++it)
+        result.push_back(it->frontier);
     return result;
 }
 
@@ -250,8 +260,9 @@ bool Session::capture_is_shared(SequenceHandle h) const {
 bool Session::capture_is_input(SequenceHandle h) const { return impl_->capture_is_input(h); }
 
 std::optional<CapturePreparation>
-Session::prepare_capture(SequenceHandle h, std::span<const CheckpointHandle> host_victims) {
-    return impl_->prepare_capture(h, host_victims);
+Session::prepare_capture(SequenceHandle h, std::span<const CheckpointHandle> victims,
+                         runtime::CaptureStorage storage) {
+    return impl_->prepare_capture(h, victims, storage);
 }
 
 void Session::skip_capture(SequenceHandle h, runtime::CaptureSkip reason) {

@@ -981,8 +981,9 @@ void test_capture_origin_does_not_override_recovery_value() {
         f.program.contents[prior.index].origin = origin;
         f.publish(prior);
         const Base request{.tokens = {100, 101, 102, 103}};
-        const auto admission = f.cache.capture_admission(f.program, 0, request, 4, false);
-        auto cursor          = f.cache.begin_reclaim(f.program, admission);
+        const auto admission =
+            f.cache.capture_admission(f.program, 0, request, 4, Role::SharedPrefix);
+        auto cursor = f.cache.begin_reclaim(f.program, admission);
         require(f.cache.reclaim(f.program, f.program.pressure(1), {}, cursor) ==
                         ninfer::runtime::ReclaimProgress::Changed &&
                     !f.program.valid_checkpoint(prior),
@@ -1077,8 +1078,11 @@ void test_private_role_wins_same_position_without_erasing_shared() {
     const auto choices = f.cache.candidates(f.program, base);
     require(choices.front().owner == owner && choices.front().source.checkpoint == replay,
             "physical position matching selected a public role before a valid private source");
-    require(f.cache.recycle_input(f.program, owner) && f.program.valid_checkpoint(shared),
-            "private input replacement removed its independent shared alias");
+    require(f.cache.input_checkpoint(f.program, owner) == replay &&
+                f.program.valid_checkpoint(replay),
+            "input replacement lookup retired its source");
+    require(f.cache.erase(f.program, replay) && f.program.valid_checkpoint(shared),
+            "private input retirement removed its independent shared alias");
     require(f.cache.candidates(f.program, base).front().source.checkpoint == shared,
             "private retirement lost the remaining shared index entry");
 }
@@ -1251,7 +1255,7 @@ void test_waiting_only_source_is_not_a_public_capture_fallback() {
     f.cache.abandon(f.program, owner);
     const auto cold = f.program.add({9});
     f.publish(cold);
-    const auto admission = f.cache.capture_admission(f.program, 0, base, 3);
+    const auto admission = f.cache.capture_admission(f.program, 0, base, 3, Role::SharedPrefix);
     auto cursor          = f.cache.begin_reclaim(f.program, admission);
     require(f.cache.reclaim(f.program, f.program.pressure(1), {}, cursor) ==
                     ninfer::runtime::ReclaimProgress::Changed &&
@@ -1683,7 +1687,7 @@ void test_fallback_requires_surviving_compatible_earlier_history() {
     f.publish(input);
     f.publish(endpoint);
     const Base smaller{.tokens = tokens(50, 1000)};
-    auto admission = f.cache.capture_admission(f.program, 0, smaller, 50);
+    auto admission = f.cache.capture_admission(f.program, 0, smaller, 50, Role::SharedPrefix);
     auto decision  = f.cache.begin_reclaim(f.program, admission);
     require(!f.cache.host_victims(f.program, 32, {}, {}, {}, admission, &decision),
             "joint E/R deletion counted the two removed records as each other's fallback");
@@ -1704,7 +1708,7 @@ void test_optional_capture_does_not_inherit_required_eviction_rights() {
     const auto long_history = f.program.add(tokens(100), {f.program.host_block(64)});
     f.publish(long_history);
     const Base shorter{.tokens = tokens(3, 1000)};
-    const auto admission = f.cache.capture_admission(f.program, 0, shorter, 3);
+    const auto admission = f.cache.capture_admission(f.program, 0, shorter, 3, Role::SharedPrefix);
     auto cursor          = f.cache.begin_reclaim(f.program, admission);
     require(f.cache.reclaim(f.program, f.program.pressure(1), {}, cursor) ==
                     ninfer::runtime::ReclaimProgress::Blocked &&
@@ -1725,7 +1729,8 @@ void test_physical_host_alias_uses_all_holders_priority() {
     f.publish(hot);
     f.use_shared(hot);
     const Base incoming{.tokens = tokens(100, 1000)};
-    const auto admission = f.cache.capture_admission(f.program, 0, incoming, 100);
+    const auto admission =
+        f.cache.capture_admission(f.program, 0, incoming, 100, Role::SharedPrefix);
     require(!f.cache.host_victims(f.program, 64, {}, {}, {}, admission) &&
                 f.program.released.empty(),
             "cold Host alias granted permission to remove its hot physical co-owner");
@@ -1738,7 +1743,7 @@ void test_committed_repeated_demand_admits_a_new_short_working_set() {
     f.use_shared(old);
     const Base incoming{.tokens = tokens(3, 1000), .captures = {2}};
     const auto permission = [&] {
-        return f.cache.capture_admission(f.program, 0, incoming, 2, false);
+        return f.cache.capture_admission(f.program, 0, incoming, 2, Role::SharedPrefix);
     };
     (void)f.begin(incoming);
     f.cache.observe_committed(incoming, 7, 0, 1, incoming.captures);
@@ -1756,13 +1761,14 @@ void test_committed_repeated_demand_admits_a_new_short_working_set() {
                 !f.program.valid_checkpoint(old),
             "old long history permanently excluded the repeated short working set");
     const Base old_input{.tokens = tokens(100)};
-    require(f.cache.capture_admission(f.program, 0, old_input, 100, false).priority.reused(),
+    require(f.cache.capture_admission(f.program, 0, old_input, 100, Role::SharedPrefix)
+                .priority.reused(),
             "retiring physical history discarded the bounded record of its actual adoption");
     const auto new_point = f.program.add(tokens(2, 1000));
     f.publish(new_point);
     const Base unrelated{.tokens = {9999}};
-    auto cold =
-        f.cache.begin_reclaim(f.program, f.cache.capture_admission(f.program, 0, unrelated, 1));
+    auto cold = f.cache.begin_reclaim(
+        f.program, f.cache.capture_admission(f.program, 0, unrelated, 1, Role::SharedPrefix));
     require(f.cache.reclaim(f.program, f.program.pressure(1), {}, cold) ==
                 ninfer::runtime::ReclaimProgress::Blocked,
             "publishing the newly learned Shared point lost its actual demand evidence");
@@ -1776,7 +1782,8 @@ void test_optional_capture_budget_spans_host_and_device_actions() {
     f.publish(host);
     f.publish(device);
     const Base incoming{.tokens = tokens(100)};
-    const auto admission    = f.cache.capture_admission(f.program, 0, incoming, 100);
+    const auto admission =
+        f.cache.capture_admission(f.program, 0, incoming, 100, Role::SharedPrefix);
     auto decision           = f.cache.begin_reclaim(f.program, admission);
     const auto host_victims = f.cache.host_victims(f.program, 64, {}, {}, {}, admission, &decision);
     require(host_victims && *host_victims == std::vector<Handle>{host},
@@ -1817,8 +1824,9 @@ void test_deeper_survivor_cannot_replace_an_earlier_recovery_point() {
     f.publish(endpoint);
     f.publish(survivor);
     const Base incoming{.tokens = tokens(20, 1000)};
-    require(!f.cache.host_victims(f.program, 64, {}, {}, {},
-                                  f.cache.capture_admission(f.program, 0, incoming, 20)),
+    require(!f.cache.host_victims(
+                f.program, 64, {}, {}, {},
+                f.cache.capture_admission(f.program, 0, incoming, 20, Role::SharedPrefix)),
             "a later recurrent state was incorrectly used to recover an earlier input frontier");
 }
 
@@ -1831,12 +1839,16 @@ void test_inherited_owner_heat_cannot_spend_a_full_other_continuation() {
     const auto other =
         f.program.add(tokens(2079, 10000), {f.program.host_block(64)}, Role::Continuation);
     f.publish(other);
+    const Base other_request{.tokens = tokens(2080, 10000)};
+    const auto other_owner = f.begin(other_request, other, {&other, 1});
+    f.cache.finish(f.program, other_owner, other_request, 0);
     const Base next{.tokens = tokens(2091)};
     const auto continuing = f.begin(next, old_input);
     require(continuing == owner && f.cache.retention(owner).reused(),
             "fixture did not inherit actual private adoption evidence");
-    const auto admission = f.cache.capture_admission(f.program, owner, next, 2091);
-    auto decision        = f.cache.begin_reclaim(f.program, admission);
+    const auto admission =
+        f.cache.capture_admission(f.program, owner, next, 2091, Role::InputReplay);
+    auto decision = f.cache.begin_reclaim(f.program, admission);
     require(!f.cache.host_victims(f.program, 64, {}, {}, {}, admission, &decision) &&
                 f.program.valid_checkpoint(other),
             "a new 52-token refinement borrowed owner heat to erase another complete dialogue");
@@ -1854,12 +1866,129 @@ void test_exact_repeated_candidate_can_replace_a_long_hotspot_with_common_fallba
     f.cache.observe_committed(incoming, 100, 32, 1000, incoming.captures);
     (void)f.begin(incoming);
     f.cache.observe_committed(incoming, 101, 32, 1000, incoming.captures);
-    const auto admission = f.cache.capture_admission(f.program, 0, incoming, 1000, false);
-    auto decision        = f.cache.begin_reclaim(f.program, admission);
-    const auto replaced  = f.cache.host_victims(f.program, 64, {}, {}, {}, admission, &decision);
+    const auto admission =
+        f.cache.capture_admission(f.program, 0, incoming, 1000, Role::SharedPrefix);
+    auto decision       = f.cache.begin_reclaim(f.program, admission);
+    const auto replaced = f.cache.host_victims(f.program, 64, {}, {}, {}, admission, &decision);
     require(
         replaced && *replaced == std::vector<Handle>{old},
         "a generic system fallback permanently excluded a repeatedly demanded shorter candidate");
+}
+
+void test_input_capture_replaces_cold_history_without_preemptive_deletion() {
+    Fixture f(64);
+    const auto cold = f.program.add(tokens(16384, 10000), {f.program.host_block(64)});
+    f.publish(cold);
+    const Base incoming{.tokens = tokens(52)};
+    const auto owner = f.begin(incoming);
+    const auto shared =
+        f.cache.capture_admission(f.program, owner, incoming, 52, Role::SharedPrefix);
+    require(!f.cache.host_victims(f.program, 64, {}, {}, {}, shared),
+            "an opportunistic capture displaced a longer cold history");
+    const auto input = f.cache.capture_admission(f.program, owner, incoming, 52, Role::InputReplay);
+    const auto host  = f.cache.host_victims(f.program, 64, {}, {}, {}, input);
+    require(host && *host == std::vector<Handle>{cold},
+            "cold historical coverage permanently excluded the current input checkpoint");
+    const auto cursor = f.cache.begin_reclaim(f.program, input);
+    const auto device = f.cache.capture_victims(f.program, f.program.pressure(1), cursor);
+    require(device && *device == std::vector<Handle>{cold} && f.program.released.empty(),
+            "complete capture quote either lost the victim or deleted it before preparation");
+    f.use_shared(cold);
+    const auto protected_cursor = f.cache.begin_reclaim(f.program, input);
+    require(!f.cache.capture_victims(f.program, f.program.pressure(1), protected_cursor) &&
+                f.program.released.empty(),
+            "unproven input capture displaced actually reused history");
+}
+
+void test_input_replacement_protects_active_owners_and_physical_aliases() {
+    Fixture f(128);
+    const auto old = f.program.add(tokens(100), {f.program.host_block(64)}, Role::InputReplay);
+    f.publish(old);
+    const auto another =
+        f.program.add(tokens(50, 1000), {f.program.host_block(64)}, Role::InputReplay);
+    f.publish(another);
+    const Base ongoing{.tokens = tokens(60, 1000)};
+    (void)f.begin(ongoing, another, {&another, 1});
+    const Base incoming{.tokens = tokens(120)};
+    const auto owner = f.begin(incoming, old, {&old, 1});
+    const auto admission =
+        f.cache.capture_admission(f.program, owner, incoming, 120, Role::InputReplay);
+    const auto cursor      = f.cache.begin_reclaim(f.program, admission);
+    const auto replacement = f.cache.capture_victims(f.program, f.program.pressure(1), cursor);
+    require(replacement && *replacement == std::vector<Handle>{old},
+            "input replacement did not reuse its own previous allocation");
+    require(!f.cache.capture_victims(f.program, f.program.pressure(3), cursor) &&
+                f.program.valid_checkpoint(old) && f.program.valid_checkpoint(another),
+            "insufficient replacement deleted history or borrowed another active input");
+
+    const auto alias = f.program.add(tokens(100), f.program.contents[old.index].host_blocks);
+    f.publish(alias);
+    f.use_shared(alias);
+    const auto revised = f.cache.begin_reclaim(f.program, admission);
+    require(!f.cache.host_victims(f.program, 64, {}, {}, {}, admission, &revised) &&
+                f.program.released.empty(),
+            "private replacement ignored the reused public alias of its physical allocation");
+}
+
+void test_recomputed_prefix_evidence_follows_a_growing_input() {
+    Fixture f(0);
+    const Base first{.tokens = tokens(120), .captures = {100}};
+    auto owner = f.begin(first);
+    f.cache.observe_committed(first, 1, 0, 120, first.captures, owner);
+    f.cache.abandon(f.program, owner);
+    const Base unrelated{.tokens = tokens(150, 1000), .captures = {140}};
+    owner = f.begin(unrelated);
+    f.cache.observe_committed(unrelated, 2, 0, 150, unrelated.captures, owner);
+    require(!f.cache.capture_admission(f.program, owner, unrelated, 140, Role::InputReplay)
+                 .demand.reused(),
+            "another identity at the same depth fabricated recomputation evidence");
+    f.cache.abandon(f.program, owner);
+    const Base next{.tokens = tokens(150), .captures = {140}};
+    owner = f.begin(next);
+    f.cache.observe_committed(next, 3, 0, 80, {}, owner);
+    require(
+        !f.cache.capture_admission(f.program, owner, next, 140, Role::InputReplay).demand.reused(),
+        "planning a growing request counted as recomputing its old prefix");
+    f.cache.observe_committed(next, 3, 80, 150, next.captures, owner);
+    require(
+        f.cache.capture_admission(f.program, owner, next, 140, Role::InputReplay).demand.reused(),
+        "a growing input lost repeat evidence at a prior request's capture frontier");
+    require(
+        !f.cache.capture_admission(f.program, owner, next, 140, Role::SharedPrefix).demand.reused(),
+        "a new shared checkpoint inherited private prefix evidence");
+    f.cache.abandon(f.program, owner);
+    owner = f.begin(next);
+    require(
+        !f.cache.capture_admission(f.program, owner, next, 140, Role::InputReplay).demand.reused(),
+        "request-local recomputation evidence leaked before the next request computed");
+    f.cache.observe_committed(next, 4, 0, 150, next.captures, owner);
+    require(
+        f.cache.capture_admission(f.program, owner, next, 140, Role::SharedPrefix).demand.reused(),
+        "actual recomputation did not promote the exact new shared candidate");
+}
+
+void test_capture_preservation_requires_a_complete_free_host_plan() {
+    Fixture f(64);
+    const auto first  = f.program.add(tokens(100));
+    const auto second = f.program.add(tokens(200, 1000));
+    for (const auto h : {first, second}) {
+        f.program.contents[h.index].demotion_bytes = 32;
+        f.publish(h);
+    }
+    const Base input{.tokens = tokens(10, 10000)};
+    const auto owner = f.begin(input);
+    const auto admission =
+        f.cache.capture_admission(f.program, owner, input, 10, Role::InputReplay);
+    const auto cursor = f.cache.begin_reclaim(f.program, admission);
+    require(f.cache.preserve_capture(f.program, f.program.pressure(3), cursor) ==
+                    ninfer::runtime::ReclaimProgress::Blocked &&
+                f.program.demoted.empty(),
+            "capture moved partial history without a complete capacity plan");
+    require(f.cache.preserve_capture(f.program, f.program.pressure(2), cursor) ==
+                    ninfer::runtime::ReclaimProgress::Changed &&
+                f.program.demotion_submissions == 1 && f.program.released.empty() &&
+                f.program.valid_checkpoint(first) && f.program.valid_checkpoint(second),
+            "capture failed to preserve existing history in one free-Host transaction");
 }
 
 void test_old_candidate_demand_cannot_borrow_a_new_owner_epoch() {
@@ -1875,8 +2004,9 @@ void test_old_candidate_demand_cannot_borrow_a_new_owner_epoch() {
     const auto owner  = f.publish(source);
     const Base request{.tokens = tokens(100)};
     require(f.begin(request, source) == owner, "fixture did not establish newer owner adoption");
-    const auto admission = f.cache.capture_admission(f.program, owner, request, 100);
-    auto decision        = f.cache.begin_reclaim(f.program, admission);
+    const auto admission =
+        f.cache.capture_admission(f.program, owner, request, 100, Role::InputReplay);
+    auto decision = f.cache.begin_reclaim(f.program, admission);
     require(!f.cache.host_victims(f.program, 64, {}, {}, {}, admission, &decision),
             "an older exact candidate borrowed newer owner heat to displace a more recent demand");
 }
@@ -1963,8 +2093,9 @@ void test_optional_capture_cannot_borrow_a_demotion_sources_heat() {
     f.use_shared(newer);
 
     const Base incoming{.tokens = tokens(1000, 30000)};
-    const auto admission = f.cache.capture_admission(f.program, 0, incoming, 1000, false);
-    auto decision        = f.cache.begin_reclaim(f.program, admission);
+    const auto admission =
+        f.cache.capture_admission(f.program, 0, incoming, 1000, Role::SharedPrefix);
+    auto decision = f.cache.begin_reclaim(f.program, admission);
     require(!f.cache.host_victims(f.program, 64, {}, {}, {}, admission, &decision),
             "cold optional capture could directly evict the hot Host history");
     // Deleting source costs 2000 tokens and exceeds this capture's gain. Moving source
@@ -2187,7 +2318,7 @@ void test_queries_publication_and_resume_do_not_age_reuse() {
     const auto resume = f.source(base, {}, owner);
     for (unsigned i = 0; i < 256; ++i) {
         (void)f.cache.candidates(f.program, base);
-        (void)f.cache.capture_admission(f.program, owner, base, 2);
+        (void)f.cache.capture_admission(f.program, owner, base, 2, Role::InputReplay);
         require(f.cache.retain_shared_checkpoint(f.program, base, 1), "duplicate source missing");
         f.cache.publish(f.program, publisher, hot);
         require(f.cache.adopt(f.program, resume, base, i, true) == owner, "resume changed owner");
@@ -2439,6 +2570,10 @@ int main() {
         test_consuming_rewind_resets_proven_progress_to_the_adopted_prefix();
         test_inherited_owner_heat_cannot_spend_a_full_other_continuation();
         test_exact_repeated_candidate_can_replace_a_long_hotspot_with_common_fallback();
+        test_input_capture_replaces_cold_history_without_preemptive_deletion();
+        test_input_replacement_protects_active_owners_and_physical_aliases();
+        test_recomputed_prefix_evidence_follows_a_growing_input();
+        test_capture_preservation_requires_a_complete_free_host_plan();
         test_old_candidate_demand_cannot_borrow_a_new_owner_epoch();
         test_optional_capture_budget_spans_host_and_device_actions();
         test_snapshot_revocation_follows_ordinary_history_and_engine_order();

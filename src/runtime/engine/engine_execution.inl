@@ -214,6 +214,11 @@ void EngineCore<Instance>::commit_pending(PendingBatch&& pending, ComputeFlight 
             }
             if (fail_output(request, lane)) continue;
         }
+        if (!decode_round && !decisions[row].terminal && !committed.capture_ready[row] &&
+            instance_.session->retry_capture(*request->sequence)) {
+            capture_decisions_[lane].reset();
+            committed.capture_ready[row] = true;
+        }
         if (decisions[row].terminal) {
             request->model_state     = EngineRequestState::ModelFinished;
             request->terminal_reason = finish_reasons[row];
@@ -274,7 +279,10 @@ void EngineCore<Instance>::resolve_prefill_progress(
     if (!request->cancelled.load(std::memory_order_acquire)) {
         resources_.observe_committed(*request->base_plan, request->id, computed_begin,
                                      computed_begin + progress.processed_prompt_tokens,
-                                     instance_.session->capture_frontiers(*request->sequence));
+                                     instance_.session->capture_frontiers(
+                                         *request->sequence, computed_begin,
+                                         computed_begin + progress.processed_prompt_tokens),
+                                     request->continuation_owner);
     }
     if (progress.complete && request->computed_prompt_tokens != suffix_tokens) {
         throw std::logic_error("completed prefill did not reach the admitted prompt frontier");
@@ -287,6 +295,12 @@ void EngineCore<Instance>::resolve_prefill_progress(
         if (progress.complete || progress.pending) {
             throw std::logic_error("prefill capture offer overlaps prompt completion");
         }
+        reserve_active_capture(request, EngineRequestState::Prefill);
+        return;
+    }
+    if (!progress.complete && !request->cancelled.load(std::memory_order_acquire) &&
+        instance_.session->retry_capture(*request->sequence)) {
+        capture_decisions_[request->lane->value].reset();
         reserve_active_capture(request, EngineRequestState::Prefill);
         return;
     }

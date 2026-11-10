@@ -174,11 +174,10 @@ struct TemplateInput {
         }
         if (!message.tool_calls.empty()) {
             value["tool_calls"] = Json::array();
-            for (const auto& call : message.tool_calls) {
-                auto arguments =
-                    call.arguments_json.empty() ? Json::object() : Json::parse(call.arguments_json);
-                if (!arguments.is_object())
-                    throw std::invalid_argument("tool call arguments must be a JSON object");
+            for (std::size_t j = 0; j < message.tool_calls.size(); ++j) {
+                const auto& call = message.tool_calls[j];
+                auto arguments   = models::frontend::parse_tool_history_arguments(
+                    call.arguments_json, call.name, messages.size(), j);
                 sources.tool_calls.push_back(
                     tag(pointer + "/tool_calls/" + std::to_string(value["tool_calls"].size())));
                 value["tool_calls"].push_back(

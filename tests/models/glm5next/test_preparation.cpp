@@ -98,6 +98,41 @@ void golden(const glm::Frontend& frontend, const std::filesystem::path& path) {
     std::cout << fixture["cases"].size() << " prepared-prompt HF cases passed\n";
 }
 
+void tool_history_arguments(const glm::Frontend& f) {
+    PromptInput input;
+    input.messages = {message(ChatRole::User, "run the tool"), message(ChatRole::Assistant, ""),
+                      message(ChatRole::Tool, "done")};
+    input.messages[1].tool_calls   = {{.id = "first", .name = "noop", .arguments_json = "{}"},
+                                      {.id = "second", .name = "legacy"}};
+    input.messages[2].tool_call_id = "second";
+    auto& arguments                = input.messages[1].tool_calls[1].arguments_json;
+    for (const auto bad : {R"({"x": nope})", R"({"x":)", "[]", "null", R"({"x":1e99999})"}) {
+        arguments     = bad;
+        bool rejected = false;
+        try {
+            (void)f.prepare(input);
+        } catch (const std::invalid_argument& error) {
+            rejected = true;
+            const std::string_view message(error.what());
+            require(message.find("messages[1].tool_calls[1]") != message.npos &&
+                        message.find("legacy") != message.npos,
+                    "invalid tool history lost its message and call identity");
+        }
+        require(rejected, "invalid tool history was accepted");
+    }
+    arguments.clear();
+    const auto empty  = f.prepare(input);
+    arguments         = "{}";
+    const auto object = f.prepare(input);
+    require(glm::PreparedPromptAccess::view(empty).token_ids ==
+                glm::PreparedPromptAccess::view(object).token_ids,
+            "empty tool arguments no longer represent an empty object");
+    arguments         = R"({"z":[1,true,null,{"s":"a\nb\"c"}],"a":2})";
+    const auto nested = f.prepare(input);
+    require(f.count_tokens(input) == nested.summary().prompt_tokens,
+            "valid tool history differs between preparation and token counting");
+}
+
 void behavior(const glm::Frontend& f, const std::filesystem::path& tokenizer) {
     PromptInput input;
     input.messages = {message(ChatRole::System, "policy"), message(ChatRole::User, "question")};
@@ -280,6 +315,7 @@ int main(int argc, char** argv) {
             throw std::invalid_argument("usage: preparation_test [--tokenizer FILE --golden FILE]");
         const auto f = frontend(tokenizer);
         golden(f, expected);
+        tool_history_arguments(f);
         behavior(f, tokenizer);
         identities();
         multi_turn(f);

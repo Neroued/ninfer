@@ -104,10 +104,7 @@ Fp8WeightGeometry validate_fp8_weight(const Weight& weight, const char* operatio
         throw std::invalid_argument(std::string(operation) + ": invalid FP8 weight");
     }
 
-    const auto* payload = static_cast<const std::byte*>(weight.payload);
-    if (weight.qdata != payload || weight.scales != payload + geometry.scale_plane_offset) {
-        throw std::invalid_argument(std::string(operation) + ": invalid FP8 plane geometry");
-    }
+    weight_planes(weight, geometry.code_plane_bytes, geometry.scale_plane_bytes, 16, operation);
     return geometry;
 }
 

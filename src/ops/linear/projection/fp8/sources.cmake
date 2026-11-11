@@ -7,3 +7,9 @@ target_sources(ninfer_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/shapes/n5120_k17408.cu"
   "${CMAKE_CURRENT_LIST_DIR}/shapes/n248320_k5120.cu"
 )
+if(NINFER_TARGET STREQUAL "rtx5090")
+  target_sources(ninfer_ops PRIVATE
+    "${CMAKE_CURRENT_LIST_DIR}/rtx5090/shapes/n14976_k5120.cu"
+    "${CMAKE_CURRENT_LIST_DIR}/rtx5090/shapes/n5120_k5120.cu"
+  )
+endif()

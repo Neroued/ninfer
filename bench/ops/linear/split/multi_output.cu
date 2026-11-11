@@ -1,4 +1,5 @@
 #include "core/weight.h"
+#include "core/weight_view.h"
 #include "core/buffer.h"
 #include "ninfer/ops/linear_split.h"
 #include "op_measurement.cuh"
@@ -48,6 +49,7 @@ enum class Format : std::uint8_t {
     Mxfp8,
     Mxfp8Bias,
     Fp8BlockBf16,
+    Fp8Segmented,
     All
 };
 enum class CacheMode : std::uint8_t { Cold, Warm, Both };
@@ -56,6 +58,7 @@ enum class CacheState : std::uint8_t { Cold, Warm };
 struct Options {
     Format format = Format::All;
     int n = 0, k = 0;
+    int parent_rows = 0;
     std::vector<int> rows;
     ops::LinearPolicy nvfp4_policy = ops::LinearPolicy::AllowA4;
     ops::LinearPolicy fp8_policy   = ops::LinearPolicy::AllowA8;
@@ -93,8 +96,9 @@ struct Measurement {
                  "usage: ninfer_linear_split_multi_output_bench "
                  "[--format "
                  "q4q5|q8-qgkv|q8-qkv|q8-dflash2-qkv|q8-segmented|bf16-segmented|bf16|nvfp4|fp8|"
+                 "fp8-segmented|"
                  "mxfp8|mxfp8-bias|fp8-block-bf16|all] "
-                 "[--n N --k K --rows R1,R2,... (segmented)] "
+                 "[--n N --k K --rows R1,R2,... (segmented)] [--parent-rows N (fp8-segmented)] "
                  "[--nvfp4-policy a16|a4] [--fp8-policy a16|a8] "
                  "[--tokens T,... | --sweep START:END[:STEP]] [--cache cold|warm|both] "
                  "[--execution eager|graph] "
@@ -166,6 +170,8 @@ Options parse_options(int argc, char** argv) {
                 options.format = Format::Mxfp8Bias;
             else if (value == "fp8-block-bf16")
                 options.format = Format::Fp8BlockBf16;
+            else if (value == "fp8-segmented")
+                options.format = Format::Fp8Segmented;
             else if (value == "all")
                 options.format = Format::All;
             else
@@ -190,6 +196,8 @@ Options parse_options(int argc, char** argv) {
                 usage("--fp8-policy expects a16 or a8");
         } else if (argument == "--n") {
             options.n = parse_i32(next("--n"), 1, INT32_MAX, "--n");
+        } else if (argument == "--parent-rows") {
+            options.parent_rows = parse_i32(next("--parent-rows"), 1, INT32_MAX, "--parent-rows");
         } else if (argument == "--k") {
             options.k = parse_i32(next("--k"), 1, INT32_MAX, "--k");
         } else if (argument == "--rows") {
@@ -230,7 +238,8 @@ Options parse_options(int argc, char** argv) {
                             options.cache == CacheMode::Both)) {
         usage("--profile requires one format, one T, and one cache state");
     }
-    if ((options.format == Format::Q8Segmented || options.format == Format::Bf16Segmented) &&
+    if ((options.format == Format::Q8Segmented || options.format == Format::Bf16Segmented ||
+         options.format == Format::Fp8Segmented) &&
         (!options.n || !options.k || options.rows.empty()))
         usage("segmented requires --n, --k and --rows");
     return options;
@@ -496,12 +505,13 @@ void run_q8_qkv(const Options& options, const char* label, std::int32_t hidden,
 template <class Fixture>
 void run_segmented(const Options& options, const char* label, int hidden, int parent_rows,
                    std::span<const int> rows, Fixture& weight, bench::L2FlushBuffer& flush,
-                   CudaExecutionView cuda, std::vector<Result>& results) {
+                   CudaExecutionView cuda, std::vector<Result>& results,
+                   ops::LinearPolicy policy           = ops::LinearPolicy::A16Only,
+                   std::uint64_t logical_weight_bytes = 0) {
     const int max_tokens = *std::max_element(options.tokens.begin(), options.tokens.end());
     const int min_tokens = *std::min_element(options.tokens.begin(), options.tokens.end());
     const auto capacity  = ops::linear_split_workspace_capacity_bytes(
-        ops::SingleProjectionWeight{weight.weight, ops::LinearPolicy::A16Only}, rows, min_tokens,
-        max_tokens);
+        ops::SingleProjectionWeight{weight.weight, policy}, rows, min_tokens, max_tokens);
     auto scratch = bench::make_buffer(std::max<std::size_t>(capacity, 1));
     MemoryArena arena(scratch.span());
     auto input = bench::make_bf16(std::size_t(hidden) * max_tokens, 103U);
@@ -514,20 +524,18 @@ void run_segmented(const Options& options, const char* label, int hidden, int pa
             outputs.emplace_back(storage[i].span(), DType::BF16,
                                  std::initializer_list<std::int32_t>{rows[i], tokens});
         const auto exact = ops::linear_split_workspace_capacity_bytes(
-            ops::SingleProjectionWeight{weight.weight, ops::LinearPolicy::A16Only}, rows, tokens,
-            tokens);
+            ops::SingleProjectionWeight{weight.weight, policy}, rows, tokens, tokens);
         const auto launch = [&](CudaExecutionView c) {
-            ops::linear_split(
-                x, ops::SingleProjectionWeight{weight.weight, ops::LinearPolicy::A16Only}, outputs,
-                arena, c);
+            ops::linear_split(x, ops::SingleProjectionWeight{weight.weight, policy}, outputs, arena,
+                              c);
         };
         for (auto cache : {CacheState::Cold, CacheState::Warm}) {
             if ((options.cache == CacheMode::Cold && cache != CacheState::Cold) ||
                 (options.cache == CacheMode::Warm && cache != CacheState::Warm))
                 continue;
             if (options.profile) {
-                profile_public(launch, label, "a16", cache, flush, cuda, options.warmup,
-                               options.graph);
+                profile_public(launch, label, policy_name(policy), cache, flush, cuda,
+                               options.warmup, options.graph);
                 continue;
             }
             arena.reset_peak();
@@ -535,9 +543,11 @@ void run_segmented(const Options& options, const char* label, int hidden, int pa
                                          options.graph);
             if (arena.used() != 0 || arena.peak_used() > exact)
                 throw std::runtime_error("segmented Linear workspace exceeded capacity");
-            append_result(results, label, "a16", tokens, cache, exact,
-                          weight.model_weight_bytes() + tensor_bytes(hidden + parent_rows, tokens),
-                          2.0 * parent_rows * hidden * tokens, timing, capacity, arena.peak_used());
+            append_result(
+                results, label, policy_name(policy), tokens, cache, exact,
+                (logical_weight_bytes ? logical_weight_bytes : weight.model_weight_bytes()) +
+                    tensor_bytes(hidden + parent_rows, tokens),
+                2.0 * parent_rows * hidden * tokens, timing, capacity, arena.peak_used());
         }
     }
 }
@@ -624,6 +634,25 @@ void run_native(const Options& options, Format format, bench::L2FlushBuffer& flu
                           2.0 * n * k * tokens, timing, bytes, arena.peak_used());
         }
     }
+}
+
+void run_fp8_segmented(const Options& options, bench::L2FlushBuffer& flush, CudaExecutionView cuda,
+                       std::vector<Result>& results) {
+    const int parent_rows = options.parent_rows ? options.parent_rows : options.n;
+    if (parent_rows < options.n) throw std::invalid_argument("prefix exceeds FP8 parent");
+    auto weight = bench::make_fp8_weight(parent_rows, options.k);
+    const WeightParent parent{
+        weight_geometry(
+            QType::FP8_E4M3FN_ROW_BF16, QuantLayout::RowScale,
+            std::array<std::uint64_t, 2>{std::uint64_t(parent_rows), std::uint64_t(options.k)}),
+        weight.weight.device, static_cast<const std::byte*>(weight.weight.payload)};
+    weight.weight = native_weight(WeightView{{std::uint64_t(options.n), std::uint64_t(options.k)},
+                                             {{&parent, 0, std::uint64_t(options.n) * options.k}}});
+    std::string label =
+        "fp8-segmented_n" + std::to_string(options.n) + "_k" + std::to_string(options.k);
+    if (parent_rows != options.n) label += "_parent" + std::to_string(parent_rows);
+    run_segmented(options, label.c_str(), options.k, options.n, options.rows, weight, flush, cuda,
+                  results, options.fp8_policy, std::uint64_t(options.n) * (options.k + 2));
 }
 
 void write_csv(const Options& options, const std::vector<Result>& results) {
@@ -720,6 +749,8 @@ int main(int argc, char** argv) {
             )
                 run_native(options, format, flush, cuda, results);
         }
+        if (options.format == Format::Fp8Segmented)
+            run_fp8_segmented(options, flush, cuda, results);
         write_csv(options, results);
         CUDA_CHECK(cudaStreamDestroy(stream));
         return 0;

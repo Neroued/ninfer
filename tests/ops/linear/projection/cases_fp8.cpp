@@ -1,4 +1,5 @@
 #include "core/weight.h"
+#include "core/platform.h"
 #include "cuda_fixture.h"
 #include "core/buffer.h"
 #include "ops/linear/projection/runner.h"
@@ -150,6 +151,12 @@ void run_fp8_a16(Suite& suite) {
                   invalid               = weight;
                   invalid.payload_bytes = invalid.payload_bytes - 1;
                   expect_invalid("payload bound", invalid);
+                  invalid        = weight;
+                  invalid.scales = weight.qdata;
+                  expect_invalid("overlapping planes", invalid);
+                  invalid       = weight;
+                  invalid.qdata = static_cast<const std::byte*>(weight.qdata) + 256;
+                  expect_invalid("code range overlapping scales", invalid);
                   failures += device_output.verify_guards("FP8 metadata output");
                   failures += test::linear_common::verify_preserved(
                       device_input.data(), std::as_bytes(std::span(input_bits)),
@@ -335,4 +342,48 @@ void run_fp8_a8(Suite& suite) {
 void ninfer::test::linear::add_fp8_cases(Suite& suite) {
     run_fp8_a16(suite);
     run_fp8_a8(suite);
+#if NINFER_TARGET_RTX5090
+    const std::vector<Invocation> a16{
+        {1, CallForm::A16Convenience}, {2}, {16}, {24}, {32}, {64}, {128}, {2048}};
+    add_shape(suite, QType::FP8_E4M3FN_ROW_BF16, ActivationRecipe::TokenBlocks, make_fp8_weight,
+              {14976, 5120, 861U, Comparison::Sampled, true, a16});
+    const std::vector<Invocation> a8{{16, CallForm::Policy, ops::LinearPolicy::AllowA8},
+                                     {17, CallForm::Policy, ops::LinearPolicy::AllowA8, true},
+                                     {32, CallForm::Policy, ops::LinearPolicy::AllowA8},
+                                     {64, CallForm::Policy, ops::LinearPolicy::AllowA4},
+                                     {128, CallForm::Policy, ops::LinearPolicy::AllowA8},
+                                     {129, CallForm::Policy, ops::LinearPolicy::AllowA8, true},
+                                     {1536, CallForm::Policy, ops::LinearPolicy::AllowA8, true},
+                                     {512, CallForm::Policy, ops::LinearPolicy::AllowA8},
+                                     {1024, CallForm::Policy, ops::LinearPolicy::AllowA8},
+                                     {2048, CallForm::Policy, ops::LinearPolicy::AllowA8}};
+    add_shape(suite, QType::FP8_E4M3FN_ROW_BF16, ActivationRecipe::Hashed, make_fp8_weight,
+              {14976, 5120, 863U, Comparison::Sampled, true, a8});
+    const std::vector<Invocation> tail{{257, CallForm::Policy, ops::LinearPolicy::AllowA8, true}};
+    add_shape(suite, QType::FP8_E4M3FN_ROW_BF16, ActivationRecipe::Hashed, make_fp8_weight,
+              {14976, 5120, 865U, Comparison::Sampled, true, tail, ActivationPattern::KTail});
+    add_workspace_cases(suite, QType::FP8_E4M3FN_ROW_BF16, 14976, 5120);
+    const std::vector<Invocation> stem_a16{
+        {1, CallForm::A16Convenience}, {2}, {16}, {24}, {32}, {64}, {128}, {2048}};
+    add_shape(suite, QType::FP8_E4M3FN_ROW_BF16, ActivationRecipe::TokenBlocks, make_fp8_weight,
+              {5120, 5120, 875U, Comparison::Sampled, true, stem_a16});
+    const std::vector<Invocation> stem_a8{
+        {16, CallForm::Policy, ops::LinearPolicy::AllowA8},
+        {17, CallForm::Policy, ops::LinearPolicy::AllowA8, true},
+        {32, CallForm::Policy, ops::LinearPolicy::AllowA8},
+        {64, CallForm::Policy, ops::LinearPolicy::AllowA4},
+        {128, CallForm::Policy, ops::LinearPolicy::AllowA8},
+        {129, CallForm::Policy, ops::LinearPolicy::AllowA8, true},
+        {512, CallForm::Policy, ops::LinearPolicy::AllowA8},
+        {513, CallForm::Policy, ops::LinearPolicy::AllowA8, true},
+        {2048, CallForm::Policy, ops::LinearPolicy::AllowA8},
+        {4096, CallForm::Policy, ops::LinearPolicy::AllowA8, true}};
+    add_shape(suite, QType::FP8_E4M3FN_ROW_BF16, ActivationRecipe::Hashed, make_fp8_weight,
+              {5120, 5120, 877U, Comparison::Sampled, true, stem_a8});
+    const std::vector<Invocation> stem_tail{
+        {2052, CallForm::Policy, ops::LinearPolicy::AllowA8, true}};
+    add_shape(suite, QType::FP8_E4M3FN_ROW_BF16, ActivationRecipe::Hashed, make_fp8_weight,
+              {5120, 5120, 879U, Comparison::Sampled, true, stem_tail, ActivationPattern::KTail});
+    add_workspace_cases(suite, QType::FP8_E4M3FN_ROW_BF16, 5120, 5120);
+#endif
 }

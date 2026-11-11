@@ -7,7 +7,7 @@
 namespace ninfer::ops::detail {
 namespace {
 using Geometry = Nvfp4Geometry<5120, 14336>;
-using T32R32   = Nvfp4A4MmaSchedule<32, 32, 256, 2, 2, 4, 2>;
+using T16R64   = Nvfp4A4MmaSchedule<16, 64, 512, 1, 4, 3, 2>;
 using T32R64   = Nvfp4A4MmaSchedule<32, 64, 256, 2, 4, 3, 2>;
 using T64R64   = Nvfp4A4MmaSchedule<64, 64, 256, 2, 4, 3, 1>;
 
@@ -46,7 +46,7 @@ void launch_a16(const Tensor& x, const Weight& w, Tensor& y, cudaStream_t stream
 Nvfp4A4Route select_a4(std::int32_t tokens) {
     for (const auto& range : kSplitRanges)
         if (tokens >= range.begin && tokens <= range.end) return range.route;
-    if (tokens <= 32) return nvfp4_a4_mma_route<Geometry, T32R32>();
+    if (tokens <= 32) return nvfp4_a4_mma_route<Geometry, T16R64>();
     if (tokens <= 64) return nvfp4_a4_mma_route<Geometry, T32R64>();
     if (tokens <= 128) return nvfp4_a4_mma_route<Geometry, T64R64>();
     return nvfp4_a4_tma_route<Nvfp4GeometryId::N5120K14336>();

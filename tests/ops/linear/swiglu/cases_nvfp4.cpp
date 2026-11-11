@@ -68,12 +68,12 @@ void ninfer::test::linear_swiglu::add_nvfp4_cases(Suite& suite) {
 
 #if NINFER_TARGET_RTX5090
     add_profile(suite, {QType::NVFP4, 28672, 5120, 14336, 2011U, ops::LinearPolicy::AllowA4},
-                std::array{1, 4, 7, 8, 17, 33, 64, 65, 128, 385, 512, 1024, 2048},
+                std::array{1, 4, 7, 8, 16, 17, 33, 64, 65, 128, 385, 512, 1024, 2048},
                 std::array{129, 513});
     add_profile(suite, {QType::NVFP4, 28672, 5120, 14336, 2013U, ops::LinearPolicy::A16Only},
                 std::array{4, 16});
     add_negative_gate(suite, {QType::NVFP4, 28672, 5120, 14336, 2015U, ops::LinearPolicy::AllowA4},
-                      std::array{1, 17, 385}, std::array{0, 16},
+                      std::array{1, 8, 17, 385}, std::array{0, 16},
                       [] { return make_negative_gate_weight(28672); });
 #endif
 

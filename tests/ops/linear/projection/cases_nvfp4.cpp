@@ -180,6 +180,7 @@ void run_nvfp4_n5120_k14336(Suite& suite) {
               {5120, 14336, 751U, Comparison::Sampled, true, a16});
     const std::vector<Invocation> a4{{1, CallForm::Policy, ops::LinearPolicy::AllowA4},
                                      {5, CallForm::Policy, ops::LinearPolicy::AllowA4, true},
+                                     {17, CallForm::Policy, ops::LinearPolicy::AllowA4},
                                      {32, CallForm::Policy, ops::LinearPolicy::AllowA4},
                                      {64, CallForm::Policy, ops::LinearPolicy::AllowA4},
                                      {128, CallForm::Policy, ops::LinearPolicy::AllowA4},

@@ -77,7 +77,11 @@ common::operand::Range tensor(const Tensor& t, DType type, int n, int s, int m, 
 std::size_t capacity(LinearProfile d, LinearProfile u, const LinearProfile* j, int first,
                      int last) {
     profile(d, u, j, first, last);
-    return layout(last, plan(d.policy, u.policy, last)).bytes;
+    auto bytes = layout(last, plan(d.policy, u.policy, last)).bytes;
+    if (first <= kDownVectorColumns && last > kDownVectorColumns)
+        bytes = std::max(
+            bytes, layout(kDownVectorColumns, plan(d.policy, u.policy, kDownVectorColumns)).bytes);
+    return bytes;
 }
 
 void execute(Weights w, const Tensor& z, MemoryArena& arena, Tensor& out, Tensor* j,

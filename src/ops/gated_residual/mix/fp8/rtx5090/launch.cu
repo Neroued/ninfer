@@ -1,5 +1,6 @@
 #include "ops/gated_residual/mix/fp8/kernel/output.cuh"
 #include "ops/gated_residual/mix/fp8/kernel/input.cuh"
+#include "ops/gated_residual/mix/fp8/kernel/down.cuh"
 #include "ops/linear/kernels/fp8/fp8_template_launch.cuh"
 #include "ops/common/host/operands.h"
 
@@ -28,10 +29,12 @@ int up_token_tile(UpSchedule up) {
 }
 
 Plan plan(LinearPolicy down, LinearPolicy up, int m) {
-    return {allows_a8(down), allows_a8(up) && m >= 33,
-            m <= 64    ? 32
-            : m <= 320 ? 64
-                       : 128,
+    const auto down_schedule = m <= kDownVectorColumns ? DownSchedule::SplitVector
+                               : !allows_a8(down)      ? DownSchedule::Vector
+                               : m <= 64               ? DownSchedule::A8Thin
+                               : m <= 320              ? DownSchedule::A8Medium
+                                                       : DownSchedule::A8Wide;
+    return {down_schedule, allows_a8(up) && m >= 33,
             m <= 64     ? UpSchedule::Thin
             : m <= 128  ? UpSchedule::Medium
             : m <= 1024 ? UpSchedule::WideRows
@@ -50,18 +53,23 @@ Layout layout(int m, Plan p) {
     const auto u =
         b.add(common::operand::bytes(std::uint64_t(kRank) * m, 2, "hc_mix"), 256, "HC u");
     LayoutRegion codes, scales, partials;
-    if (p.down_a8 || p.up_a8) {
+    if (p.down_a8() || p.up_a8) {
         const int up_columns = p.up_a8 ? encoded_columns(m, up_token_tile(p.up)) : m;
         const auto code_bytes =
-            std::max(p.down_a8 ? fp8_a8_checked_bytes(m, kTotal) : std::size_t(0),
+            std::max(p.down_a8() ? fp8_a8_checked_bytes(m, kTotal) : std::size_t(0),
                      p.up_a8 ? fp8_a8_checked_bytes(up_columns, kRank) : std::size_t(0));
         codes  = b.add(code_bytes, 256, "HC A8 codes");
         scales = b.add(fp8_a8_checked_bytes(std::max(m, up_columns), 4), 256, "HC A8 scales");
     }
-    if (p.down_a8) {
-        const auto bytes = p.down_tile == 32   ? DownThin::kPartialBytes
-                           : p.down_tile == 64 ? DownMedium::kPartialBytes
-                                               : DownWide::kPartialBytes;
+    if (p.down == DownSchedule::SplitVector) {
+        partials =
+            b.add(common::operand::bytes(std::uint64_t(kDownPartitions) * m * (kRank + kStreams),
+                                         sizeof(float), "hc_mix"),
+                  256, "HC down partials");
+    } else if (p.down_a8()) {
+        const auto bytes = p.down == DownSchedule::A8Thin     ? DownThin::kPartialBytes
+                           : p.down == DownSchedule::A8Medium ? DownMedium::kPartialBytes
+                                                              : DownWide::kPartialBytes;
         partials         = b.add(bytes, 256, "HC down partials");
     }
     return {u, codes, scales, partials, b.finish(1)};
@@ -73,13 +81,34 @@ void launch(Weights w, const Tensor& z, Tensor& out, Tensor* j, Scratch s, Plan 
     const int m       = z.ne[2];
     const Tensor input(z.data, z.device, DType::BF16, {kTotal, m});
     const LinearBf16Output down{s.u, kRank};
-    if (j && !p.down_a8) {
+    if (j && p.down == DownSchedule::Vector) {
         injection<<<dim3(m, 4), 256, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(z.data),
             static_cast<const __nv_bfloat16*>(w.injection->qdata), static_cast<float*>(j->data), m);
         CUDA_CHECK(cudaGetLastError());
     }
-    if (p.down_a8) {
+    if (p.down == DownSchedule::SplitVector) {
+        const auto submit = [&]<int Tokens, int Values>() {
+            constexpr int Rows = 2;
+            down_split_vector<Tokens, Rows, Values>
+                <<<dim3((kRank + (j ? kStreams : 0) + 4 * Rows - 1) / (4 * Rows),
+                        (m + Tokens - 1) / Tokens, kDownPartitions),
+                   128, 0, stream>>>(static_cast<const __nv_bfloat16*>(z.data),
+                                     static_cast<const std::uint8_t*>(w.down.weight.qdata),
+                                     j ? static_cast<const __nv_bfloat16*>(w.injection->qdata)
+                                       : nullptr,
+                                     s.encoded.partials, m, kDownPartitions);
+        };
+        if (m == 1)
+            submit.template operator()<1, 8>();
+        else
+            submit.template operator()<4, 4>();
+        CUDA_CHECK(cudaGetLastError());
+        down_split_finish<<<dim3((kRank + (j ? kStreams : 0) + 127) / 128, m), 128, 0, stream>>>(
+            s.encoded.partials, static_cast<const __nv_bfloat16*>(w.down.weight.scales), s.u,
+            j ? static_cast<float*>(j->data) : nullptr, m, kDownPartitions);
+        CUDA_CHECK(cudaGetLastError());
+    } else if (p.down_a8()) {
         if (j) {
             encode_injection<<<m, 256, 0, stream>>>(
                 static_cast<const __nv_bfloat16*>(z.data),
@@ -92,9 +121,9 @@ void launch(Weights w, const Tensor& z, Tensor& out, Tensor* j, Scratch s, Plan 
         const auto submit = [&]<class Schedule>() {
             launch_fp8_a8_tma_mma<Schedule>(a, down, DownEpilogue{}, stream, s.encoded.partials);
         };
-        if (p.down_tile == 32)
+        if (p.down == DownSchedule::A8Thin)
             submit.template operator()<DownThin>();
-        else if (p.down_tile == 64)
+        else if (p.down == DownSchedule::A8Medium)
             submit.template operator()<DownMedium>();
         else
             submit.template operator()<DownWide>();
@@ -134,6 +163,9 @@ void launch(Weights w, const Tensor& z, Tensor& out, Tensor* j, Scratch s, Plan 
         if (m == 1) {
             up_gemv<<<kWidth / 16, 128, 0, stream>>>(a, output);
             CUDA_CHECK(cudaGetLastError());
+        } else if (m >= 17 && m <= 32) {
+            using Up = Fp8ScheduleInstance<Fp8A16MmaSchedule<64, 32, 64, 16, 16, 2, 2>, kRank>;
+            launch_fp8_a16_mma<Up>(a, output, A16UpEpilogue{}, stream, StreamRows<16>{});
         } else {
             using Up = Fp8A16MmaSchedule<64, 16, 64, 16, 8, 2, 2>;
             launch_fp8_a16_mma<Up>(a, output, A16UpEpilogue{}, stream, StreamRows<16>{});

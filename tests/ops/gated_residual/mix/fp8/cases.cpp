@@ -19,11 +19,12 @@ void add_fp8_mix_cases(OpSuite& suite) {
         std::vector<Case> cases;
         for (bool final : {false, true}) {
             if (pattern == f::Pattern::Dense) {
-                for (int m : {1, 32, 33, 34, 64, 65, 66, 128, 129, 130, 320, 321, 322, 1024, 1025,
-                              1026, 2048})
+                for (int m : {1,   4,   5,   17,  32,  33,  34,   64,   65,   66,
+                              128, 129, 130, 320, 321, 322, 1024, 1025, 1026, 2048})
                     cases.push_back({m, final, m == 1 || m == 128 || m == 129 || m == 2048,
                                      ops::LinearPolicy::AllowA8});
                 cases.push_back({1, final, false, ops::LinearPolicy::A16Only});
+                cases.push_back({4, final, true, ops::LinearPolicy::A16Only});
                 cases.push_back({512, final, true, ops::LinearPolicy::A16Only});
                 cases.push_back({48, final, true, ops::LinearPolicy::A16Only, true});
                 cases.push_back({48, final, true, ops::LinearPolicy::AllowA8, true});
@@ -145,10 +146,23 @@ void add_fp8_mix_cases(OpSuite& suite) {
                       ops::linear_profile(w.bound.down),
                       ops::linear_profile(w.bound.up),
                       {QType::BF16, 4, f::K, ops::LinearPolicy::A16Only, QuantLayout::Contiguous}};
-                  for (int m : {1, 32, 33, 64, 65, 320, 321, 1024, 1025, 2048})
+                  for (int m : {1, 4, 5, 17, 32, 33, 64, 65, 320, 321, 1024, 1025, 2048})
                       if (ops::hc_mix_workspace_capacity_bytes(p, 1, m) <
                           ops::hc_mix_workspace_capacity_bytes(w.bound, m, m))
                           ++failed;
+                  for (auto policy : {ops::LinearPolicy::A16Only, ops::LinearPolicy::AllowA8}) {
+                      auto bound        = w.bound;
+                      bound.down.policy = bound.up.policy = policy;
+                      DeviceBuffer storage(e.device(),
+                                           ops::hc_mix_workspace_capacity_bytes(bound, 1, 8));
+                      MemoryArena arena(storage.span());
+                      for (int m : {1, 4, 5, 8}) {
+                          f::Fixture small(w, m, false, policy);
+                          small.upload(z, e.stream());
+                          ops::hc_mix(small.z, bound, arena, small.x, small.j, e);
+                          cuda_synchronize(e.stream());
+                      }
+                  }
                   return failed;
               },
               {{"format", "fp8"}, {"width", "5120"}});

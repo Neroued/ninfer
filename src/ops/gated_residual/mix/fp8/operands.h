@@ -13,12 +13,19 @@ struct Weights {
     const Weight* injection;
 };
 
+inline constexpr int kDownVectorColumns = 4, kDownPartitions = 16;
+
+enum class DownSchedule { SplitVector, Vector, A8Thin, A8Medium, A8Wide };
+
 enum class UpSchedule { Thin, Medium, WideRows, WideTokens };
 int up_token_tile(UpSchedule);
 
 struct Plan {
-    bool down_a8, up_a8;
-    int down_tile;
+    DownSchedule down;
+    bool up_a8;
+
+    bool down_a8() const { return down >= DownSchedule::A8Thin; }
+
     UpSchedule up;
 };
 

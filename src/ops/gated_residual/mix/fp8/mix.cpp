@@ -14,7 +14,7 @@ Plan plan(LinearPolicy, LinearPolicy, int) { return {}; }
 
 int up_token_tile(UpSchedule) { return 0; }
 
-Layout layout(int, Plan) { return {}; }
+Layout layout(int, Plan, bool) { return {}; }
 #endif
 namespace {
 constexpr const char* kOp = "hc_mix FP8";
@@ -77,10 +77,11 @@ common::operand::Range tensor(const Tensor& t, DType type, int n, int s, int m, 
 std::size_t capacity(LinearProfile d, LinearProfile u, const LinearProfile* j, int first,
                      int last) {
     profile(d, u, j, first, last);
-    auto bytes = layout(last, plan(d.policy, u.policy, last)).bytes;
-    if (first <= kDownVectorColumns && last > kDownVectorColumns)
-        bytes = std::max(
-            bytes, layout(kDownVectorColumns, plan(d.policy, u.policy, kDownVectorColumns)).bytes);
+    auto bytes = layout(last, plan(d.policy, u.policy, last), j != nullptr).bytes;
+    for (const int boundary : {kDownVectorColumns, kSmallColumns})
+        if (first <= boundary && last > boundary)
+            bytes = std::max(
+                bytes, layout(boundary, plan(d.policy, u.policy, boundary), j != nullptr).bytes);
     return bytes;
 }
 
@@ -103,7 +104,7 @@ void execute(Weights w, const Tensor& z, MemoryArena& arena, Tensor& out, Tensor
         for (auto r : ins) common::operand::disjoint(jr, r, kOp);
     }
     const auto p    = plan(w.down.policy, w.up.policy, m);
-    const auto l    = layout(m, p);
+    const auto l    = layout(m, p, w.injection != nullptr);
     auto scope      = arena.scope();
     auto mem        = arena.alloc_bytes(l.bytes, 256);
     const auto work = common::operand::range(mem.data, mem.bytes, kOp);

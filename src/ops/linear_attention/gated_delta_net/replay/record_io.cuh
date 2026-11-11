@@ -132,14 +132,14 @@ struct RecordAccess {
     }
 };
 
-template <bool Masked>
+template <bool Masked, bool PrefetchKey = true>
 __global__ void __launch_bounds__(common::kWarpSize* kNumWarps, 2)
     recurrent_record_kernel(RecordAccess<Masked> access) {
     const RecurrentCoordinates coord = access.coordinates();
     const std::int32_t valid         = access.active_columns(coord);
     __align__(16) float state[kDvPerWarp][kQkPerLane];
     load_state_tile(state, access.state_read_base(coord), coord);
-    run_recurrent_sequence<true, RecordEffects>(state, access, coord, valid);
+    run_recurrent_sequence<true, RecordEffects, PrefetchKey>(state, access, coord, valid);
     zero_output_suffix(access, coord, valid, access.width);
 }
 

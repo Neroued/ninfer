@@ -217,10 +217,28 @@ __device__ __forceinline__ void store_state_tile(const float (&state)[kDvPerWarp
     }
 }
 
-template <bool NormalizeInputs, class Effects, class Access>
+template <bool NormalizeInputs, class Effects, bool PrefetchKey = true, class Access>
 __device__ __forceinline__ void
 run_recurrent_sequence(float (&state)[kDvPerWarp][kQkPerLane], const Access& access,
                        const RecurrentCoordinates& coord, std::int32_t valid) {
+    if constexpr (!PrefetchKey) {
+        if (valid == 0) {
+            const auto key = load_raw_qk_lane(access.key_ptr(coord, 0), coord.dqk_base);
+            Effects::observe_key(access, coord, 0, key);
+        }
+        for (std::int32_t token = 0; token < valid; ++token) {
+            RawQkLane key = load_raw_qk_lane(access.key_ptr(coord, token), coord.dqk_base);
+            Effects::observe_key(access, coord, token, key);
+            normalize_qk_lane<NormalizeInputs>(key.value, coord.lane);
+            const auto gate = access.load_gate(coord, token);
+            const auto value =
+                load_value_lane(access.value_ptr(coord, token), coord.lane, coord.dv_base);
+            Effects::observe_value_gate(access, coord, token, value, gate);
+            apply_gdn_transition(state, key.value, value.value, gate.g, gate.beta);
+            Effects::template publish_output<NormalizeInputs>(state, access, coord, token);
+        }
+        return;
+    }
     RawQkLane key = load_raw_qk_lane(access.key_ptr(coord, 0), coord.dqk_base);
     Effects::observe_key(access, coord, 0, key);
     normalize_qk_lane<NormalizeInputs>(key.value, coord.lane);

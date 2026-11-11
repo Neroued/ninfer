@@ -14,19 +14,25 @@ struct Weights {
 };
 
 inline constexpr int kDownVectorColumns = 4, kDownPartitions = 16;
+inline constexpr int kSmallColumns = 32, kUpGroup = 128;
 
-enum class DownSchedule { SplitVector, Vector, A8Thin, A8Medium, A8Wide };
+enum class DownSchedule { SplitVector, Vector, A8Segmented, A8Thin, A8Medium, A8Wide };
 
 enum class UpSchedule { Thin, Medium, WideRows, WideTokens };
+enum class UpEncoding { None, Row, Group };
 int up_token_tile(UpSchedule);
 
 struct Plan {
     DownSchedule down;
-    bool up_a8;
+    UpEncoding up_encoding;
 
-    bool down_a8() const { return down >= DownSchedule::A8Thin; }
+    bool down_a8() const { return down >= DownSchedule::A8Segmented; }
 
     UpSchedule up;
+
+    bool up_a8() const { return up_encoding != UpEncoding::None; }
+
+    bool grouped_up() const { return up_encoding == UpEncoding::Group; }
 };
 
 struct Scratch {
@@ -40,7 +46,7 @@ struct Layout {
 };
 
 Plan plan(LinearPolicy down, LinearPolicy up, int columns);
-Layout layout(int columns, Plan plan);
+Layout layout(int columns, Plan plan, bool injection);
 void launch(Weights weights, const Tensor& z, Tensor& output, Tensor* injection, Scratch scratch,
             Plan plan, CudaExecutionView execution);
 } // namespace ninfer::ops::detail::hc::mix::fp8

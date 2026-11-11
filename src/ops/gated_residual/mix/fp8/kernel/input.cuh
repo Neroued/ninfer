@@ -7,14 +7,15 @@
 namespace ninfer::ops::detail::hc::mix::fp8 {
 // Encode the down input and compute all four BF16/A16 injection dots from the
 // same original values. The encoded activation is never used by injection.
-__global__ __launch_bounds__(256) void encode_injection(const __nv_bfloat16* input,
-                                                        const __nv_bfloat16* weight,
-                                                        std::uint8_t* codes, float* scales,
-                                                        float* injection) {
-    constexpr int Pairs = kTotal / 2, Slots = Pairs / 256;
+template <int Threads>
+__global__ __launch_bounds__(Threads) void encode_injection(const __nv_bfloat16* input,
+                                                            const __nv_bfloat16* weight,
+                                                            std::uint8_t* codes, float* scales,
+                                                            float* injection) {
+    constexpr int Pairs = kTotal / 2, Slots = Pairs / Threads;
     const auto m  = std::int64_t(blockIdx.x);
     const int tid = threadIdx.x;
-    float2 values[Slots];
+    __nv_bfloat162 values[Slots];
     float dots[4]{}, maximum = 0;
     const auto accumulate = [&](int p, float2 x) {
         maximum = fmaxf(maximum, fmaxf(fabsf(x.x), fabsf(x.y)));
@@ -28,23 +29,22 @@ __global__ __launch_bounds__(256) void encode_injection(const __nv_bfloat16* inp
     };
 #pragma unroll
     for (int v = 0; v < Slots; ++v) {
-        const int p = tid + 256 * v;
-        values[v] =
-            __bfloat1622float2(reinterpret_cast<const __nv_bfloat162*>(input)[m * Pairs + p]);
-        accumulate(p, values[v]);
+        const int p = tid + Threads * v;
+        values[v]   = reinterpret_cast<const __nv_bfloat162*>(input)[m * Pairs + p];
+        accumulate(p, __bfloat1622float2(values[v]));
     }
-    __shared__ float sums[4][8];
-    const float bound = common::block_max_broadcast<256>(maximum);
+    __shared__ float sums[4][Threads / 32];
+    const float bound = common::block_max_broadcast<Threads>(maximum);
     const float scale = bound > 0 ? bound / 448.F : 0.F, inv = scale > 0 ? 1.F / scale : 0.F;
 #pragma unroll
     for (int s = 0; s < 4; ++s) {
-        const float dot = common::block_reduce_sum<256>(dots[s], sums[s]);
+        const float dot = common::block_reduce_sum<Threads>(dots[s], sums[s]);
         if (tid == 0) injection[m * 4 + s] = 2.F * common::sigmoid(dot * .25F);
     }
 #pragma unroll
     for (int v = 0; v < Slots; ++v) {
-        int p        = tid + 256 * v;
-        const auto x = values[v];
+        int p        = tid + Threads * v;
+        const auto x = __bfloat1622float2(values[v]);
         reinterpret_cast<std::uint16_t*>(codes)[m * Pairs + p] =
             __nv_cvt_float2_to_fp8x2(make_float2(x.x * inv, x.y * inv), __NV_SATFINITE, __NV_E4M3);
     }

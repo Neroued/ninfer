@@ -35,7 +35,7 @@ void launch_recurrent_record_fixed(const Tensor& q, const Tensor& k, const Tenso
         q.ne[2],
         scale,
     };
-    recurrent_record_kernel<Masked><<<grid, block, 0, stream>>>(access);
+    recurrent_record_kernel<Masked, false><<<grid, block, 0, stream>>>(access);
     CUDA_CHECK(cudaGetLastError());
 }
 

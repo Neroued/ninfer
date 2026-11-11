@@ -21,6 +21,9 @@ inline const char* name(Projection p) {
     throw std::invalid_argument("invalid QSA projection");
 }
 
+// Canonical fixture geometry; Op admission remains in the corresponding entry.
+inline int prepare_query_heads(int kv_heads) { return kv_heads == 1 ? 12 : 24; }
+
 inline std::vector<int> segments(Projection p, int kv_heads) {
     switch (p) {
     case Projection::QueryGate:
@@ -76,7 +79,7 @@ inline Options parse_options(int argc, char** argv) {
                    "  --op input-proj|tail-extract|prepare|prepare-kv|indexer|sparse-gqa (default "
                    "input-proj)\n"
                    "  --projection qg|kv-index|joint|kv-index-key|all\n"
-                   "  --kv-heads 1|2 (input projection/prepare/sparse GQA, default 2)\n"
+                   "  --kv-heads 1|2|4 (4: RTX 5090 prepare/sparse GQA, default 2)\n"
                    "  --entry split|linear|both\n"
                    "  --tokens M[,M...] or --sweep START:END[:STEP] --rounds N\n"
                    "Prepare: --tokens T[,T...] --batch B --axes 1|3 --inplace\n"
@@ -87,7 +90,8 @@ inline Options parse_options(int argc, char** argv) {
                    "  --context-capacity N (default maximum L) --score-pattern random|ties\n"
                    "  --valid dense|N[,N...]\n"
                    "Sparse GQA: --tokens T[,T...] --batch B --contexts L[,L...]\n  "
-                   "--query-heads Hq --kv-heads Hkv (24/2 or 12/1)\n  --prefix-tokens "
+                   "--query-heads Hq --kv-heads Hkv (24/2 or 12/1; RTX 5090 prepare/sparse GQA "
+                   "also accept 24/4)\n  --prefix-tokens "
                    "P[,P...] (derive each context as prefix + valid length)\n"
                    "  --selection random|shared|contiguous --selected-blocks 0..512\n"
                    "  --context-capacity N (default maximum L)\n"

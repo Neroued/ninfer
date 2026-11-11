@@ -82,12 +82,12 @@ inline Metrics indexer_metrics(int tokens, std::span<const int> contexts,
     return m;
 }
 
-inline Metrics prepare_metrics(int tokens, int axes, int kv_heads, std::span<const int> bases,
-                               std::span<const int> lengths, std::uint64_t kv_token_bytes,
-                               bool queries = true) {
+inline Metrics prepare_metrics(int tokens, int axes, int query_heads, int kv_heads,
+                               std::span<const int> bases, std::span<const int> lengths,
+                               std::uint64_t kv_token_bytes, bool queries = true) {
     Metrics m;
     m.read_bytes              = lengths.size() * sizeof(std::int32_t);
-    const auto query_elements = queries ? 3072 * kv_heads + 512 : 0;
+    const auto query_elements = queries ? 256 * query_heads + 512 : 0;
     m.write_bytes             = std::uint64_t(tokens) * lengths.size() * query_elements * 2;
     std::uint64_t complete    = 0;
     for (std::size_t b = 0; b < lengths.size(); ++b) {

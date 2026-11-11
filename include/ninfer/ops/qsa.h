@@ -176,7 +176,7 @@ struct QsaSparseGqaExecutionEnvelope {
  * Math / indexing:
  * For each live (t,b), p=positions[t,b], C=floor((p+1)/4), c=block_counts[t,b].
  * J is the union of {4*g,4*g+1,4*g+2,4*g+3} for the first c block_ids and [4*C,p+1).
- * For head h, kvh=floor(h/12), score[j]=dot(query[:,h,t,b],K[:,j,kvh])/16:
+ * For head h, kvh=floor(h/(Hq/Hkv)), score[j]=dot(query[:,h,t,b],K[:,j,kvh])/16:
  *   attention[d,h] = sum_{j in J} softmax(score)[j] * V[d,j,kvh];
  *   out[d,h,t,b] = BF16(attention[d,h] * sigmoid(FP32(output_gate[d,h,t,b]))).
  * There is no attention-output BF16 rounding before the gate. Indexer scores do not enter
@@ -186,8 +186,9 @@ struct QsaSparseGqaExecutionEnvelope {
  * K8V4 values represent R*V, so apply R^T to the fully reduced attention before the gate.
  *
  * Domain / numeric:
- * T>0, B=1..8. Query, gate and out are contiguous, 16-byte-aligned BF16 [256,Hq,T,B], (Hq,Hkv) in
- * {(24,2),(12,1)}. Cache supports BFloat16 (BF16 K / FP16 V), Fp8E4m3fnGroup128Ue8m0, Int8Group64,
+ * T>0, B=1..8. Query, gate and out are contiguous, 16-byte-aligned BF16 [256,Hq,T,B].
+ * Supported Hq/Hkv combinations belong to the implementation catalog. Cache supports
+ * BFloat16 (BF16 K / FP16 V), Fp8E4m3fnGroup128Ue8m0, Int8Group64,
  * Nvfp4Group16 and Fp8KeyNvfp4Value. Data/scale planes follow paged_kv_storage_layout(storage,256),
  * with dense, naturally aligned [leading_extent,64,Hkv] geometry per 64-token record. Q and softmax
  * probabilities are not quantized to low-bit operands. The A16 numerical policy applies to the
@@ -255,8 +256,9 @@ void qsa_sparse_gqa(const Tensor& query, const Tensor& output_gate,
  *
  * Logical shapes / supported domain:
  * The current rotary implementation accepts rotary_dim=64, interleaved sections [11,11,10].
- * Hkv=1 or 2, Hq=12*Hkv; index queries always have four heads. Cache and projections agree on
- * Hkv. T>0, B in [1,8], A=1 or 3. Projections and both outputs have the shapes above, are
+ * Supported Hq/Hkv combinations belong to the implementation catalog; index queries always
+ * have four heads. Cache and projections agree on Hkv. T>0, B in [1,8], A=1 or 3.
+ * Projections and both outputs have the shapes above, are
  * contiguous and 16-byte aligned. Norm weights are contiguous, naturally aligned BF16 vectors.
  * Positions are contiguous I32 [T,B]; rho is contiguous I32 [T,A,B]. Metadata is contiguous Device
  * I32 [B]. Tail/records follow QsaTailStateView's feature-contiguous, naturally aligned stride

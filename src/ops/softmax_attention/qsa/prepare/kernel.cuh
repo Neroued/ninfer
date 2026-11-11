@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ops/softmax_attention/qsa/prepare/norm_rope.cuh"
+#include "ops/softmax_attention/qsa/geometry.h"
 #include "ops/softmax_attention/qsa/prepare/arguments.cuh"
 #include "ops/softmax_attention/qsa/prepare/cache.cuh"
 
@@ -46,7 +47,7 @@ __device__ __forceinline__ void prepare_raw(const PrepareArguments& a, int t, in
 template <int KvHeads, bool Queries>
 struct PrepareGeometry {
     static constexpr int warps       = 4;
-    static constexpr int query_heads = Queries ? 12 * KvHeads : 0;
+    static constexpr int query_heads = Queries ? HeadGeometry<KvHeads>::query_heads : 0;
     static constexpr int key_task    = Queries ? query_heads + 4 : 0;
     static constexpr int raw_task    = key_task + KvHeads;
     static constexpr int groups      = (raw_task + 1 + warps - 1) / warps;
@@ -56,7 +57,7 @@ struct PrepareGeometry {
 // Compression reads immutable projections/tail, never records.
 // A carried block retains its first token's three axes even when current coordinates use A=1.
 template <KvCacheStorage Storage, bool BoundedPhase, bool VectorWeights, bool TokenMajor,
-          int KvHeads, bool Queries>
+          int KvHeads, bool Queries, bool VectorKv = KvHeads == 4>
 __global__ __launch_bounds__(128) void prepare_kernel(const __grid_constant__ PrepareArguments a) {
     using Geometry = PrepareGeometry<KvHeads, Queries>;
     const int t    = TokenMajor ? blockIdx.x / Geometry::groups : blockIdx.x;
@@ -66,7 +67,10 @@ __global__ __launch_bounds__(128) void prepare_kernel(const __grid_constant__ Pr
     const auto m    = t + std::int64_t(b) * a.tokens;
     const bool live = t < a.valid[b];
     __shared__ float2 coefficients[32];
-    if (live && threadIdx.x < 32)
+    // A raw-only group needs the pooled block's first coordinate, computed by
+    // prepare_raw itself; it never consumes the current token's coefficients.
+    const bool current_coefficients = group * Geometry::warps < Geometry::raw_task;
+    if (live && current_coefficients && threadIdx.x < 32)
         coefficients[lane] =
             prepare_sincos<BoundedPhase>(a.frequency[lane], coordinate(a, t, b, lane % 3));
     __syncthreads();
@@ -85,8 +89,11 @@ __global__ __launch_bounds__(128) void prepare_kernel(const __grid_constant__ Pr
         }
     }
     if (live && task < Geometry::raw_task) {
-        if constexpr (Storage == KvCacheStorage::Nvfp4Group16 ||
-                      Storage == KvCacheStorage::Fp8KeyNvfp4Value) {
+        if constexpr (VectorKv) {
+            prepare_kv_vector<Storage, KvHeads>(a, task - Geometry::key_task, t, b, lane,
+                                                coefficients);
+        } else if constexpr (Storage == KvCacheStorage::Nvfp4Group16 ||
+                             Storage == KvCacheStorage::Fp8KeyNvfp4Value) {
             __shared__ float scratch[KvHeads][256];
             prepare_kv<Storage, KvHeads>(a, task - Geometry::key_task, t, b, lane,
                                          coefficients[lane], scratch[task - Geometry::key_task]);

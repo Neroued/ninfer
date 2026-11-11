@@ -62,6 +62,13 @@ Session::inspect_source(const RequestBasePlan& base, std::optional<CheckpointHan
     if (out.reused_tokens > end) return {};
     out.remaining_work = runtime::make_prefill_work(out.reused_tokens, end - out.reused_tokens, 0,
                                                     0, p.shape.prefill_chunk);
+    if (const auto& vision = base.plan_->vision; vision && out.reused_tokens < end)
+        for (const auto& unit : vision->units)
+            if (unit.end() > out.reused_tokens && unit.token_begin < end) {
+                // Each image/video frame is encoded in full, even for a partial replay range.
+                ++out.remaining_work.vision_items;
+                out.remaining_work.vision_patches += unit.patches;
+            }
     if (h) {
         const auto& c           = p.checkpoints.at(*h);
         const auto image        = c.snapshot.continuation().image;

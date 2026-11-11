@@ -44,7 +44,8 @@ const models::frontend::PreparedContextCache& RequestBasePlan::context_cache() c
 }
 
 std::optional<PrefixShortlistKey> RequestBasePlan::prefix_shortlist_key(std::uint32_t f) const {
-    if (!plan_->reuse || !plan_->can_checkpoint(f) || f > plan_->summary.prompt_tokens) return {};
+    // Prefix-index branches can fall inside media even though checkpoints cannot.
+    if (!plan_->reuse || !f || f > plan_->summary.prompt_tokens) return {};
     return detail::key(*plan_->identity, f);
 }
 

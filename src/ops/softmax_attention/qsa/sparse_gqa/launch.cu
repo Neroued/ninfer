@@ -35,6 +35,8 @@ void launch_sparse_gqa(const Tensor& query, const Tensor& gate,
                          plan.splits,
                          plan.key_rows,
                          0};
+    a.min_split_tiles  = plan.min_split_tiles;
+    a.direct_single    = plan.direct_single;
     const auto queries = std::int64_t(a.tokens) * a.batch;
     // This slab only bounds grid.x (including the per-head merge); scratch/output indexing
     // stays global and T is not a semantic launch limit.

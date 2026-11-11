@@ -1,9 +1,11 @@
 #include "ops/suite.h"
+#include "core/platform.h"
 #include "kv_cache_storage.h"
 #include "sparse_gqa_fixture.h"
 #include "cuda_fixture.h"
 #include "core/buffer.h"
 #include "core/decode_graph.h"
+#include <utility>
 
 using namespace ninfer;
 using namespace ninfer::test;
@@ -74,8 +76,8 @@ int verify(Fixture& f, const std::string& label, bool preserved = true) {
 int run(DeviceContext& device, int t, int b, int history, bool padded = false, int cap = 512,
         float magnitude = 1, bool graph = false, KvCacheStorage storage = KvCacheStorage::BFloat16,
         int live_limit = std::numeric_limits<int>::max(), int query_heads = 24,
-        bool dense_rows = false) {
-    Fixture f(t, b, history, padded, storage, false, query_heads);
+        bool dense_rows = false, int kv_heads = 0) {
+    Fixture f(t, b, history, padded, storage, false, query_heads, kv_heads);
     f.dense_rows     = dense_rows;
     f.live_limit     = live_limit;
     const auto bytes = ops::qsa_sparse_gqa_workspace_capacity_bytes(
@@ -110,8 +112,8 @@ int run(DeviceContext& device, int t, int b, int history, bool padded = false, i
 }
 
 int gate_rounding(DeviceContext& device, KvCacheStorage storage = KvCacheStorage::BFloat16,
-                  int tokens = 1, std::uint32_t bound = 1, int query_heads = 24) {
-    Fixture f(tokens, 1, 1, false, storage, false, query_heads);
+                  int tokens = 1, std::uint32_t bound = 1, int query_heads = 24, int kv_heads = 0) {
+    Fixture f(tokens, 1, 1, false, storage, false, query_heads, kv_heads);
     f.envelope.max_visible_tokens = bound;
     f.reset();
     std::fill(f.ghost.begin(), f.ghost.end(), f32_to_bf16(1.0f));
@@ -165,16 +167,21 @@ int gate_rounding(DeviceContext& device, KvCacheStorage storage = KvCacheStorage
 }
 
 int read_footprint(DeviceContext& device, KvCacheStorage storage, bool padded, int batch = 4,
-                   int query_heads = 24) {
-    Fixture f(3, batch, 2053, padded, storage, false, query_heads);
-    f.reset(0, 1);
+                   int query_heads = 24, int kv_heads = 0, int history = 2053, int cap = 1) {
+    Fixture f(3, batch, history, padded, storage, false, query_heads, kv_heads);
+    f.reset(0, cap);
     DeviceBuffer q(ninfer::test::cuda_environment().context.device(), f.q.bytes());
     DeviceBuffer gate(ninfer::test::cuda_environment().context.device(), f.gate.bytes());
     DeviceBuffer pos(ninfer::test::cuda_environment().context.device(), f.pos.bytes());
     DeviceBuffer ids(ninfer::test::cuda_environment().context.device(), f.selections.bytes());
     DeviceBuffer counts(ninfer::test::cuda_environment().context.device(), f.sizes.bytes());
     DeviceBuffer table(ninfer::test::cuda_environment().context.device(), f.table.bytes());
-    DeviceBuffer payload(device.device(), f.packed->storage().bytes);
+    // Exercise both the aligned path and the cache format's natural record alignment
+    // in the existing read-footprint cases, including odd-byte NVFP4 records.
+    const int record_offset = padded ? (storage == KvCacheStorage::Nvfp4Group16 ? 1 : 2) : 0;
+    DeviceBuffer payload(device.device(), f.packed->storage().bytes + record_offset);
+    for (auto& offset : f.table_offsets)
+        if (offset >= 0) offset += record_offset;
     const std::uint8_t* host[4]{};
     PagedPlaneView* targets[]{&f.cache.k_pages, &f.cache.v_pages, &f.cache.k_scale_pages,
                               &f.cache.v_scale_pages};
@@ -191,6 +198,9 @@ int read_footprint(DeviceContext& device, KvCacheStorage storage, bool padded, i
         if (!plane->data()) continue;
         plane->records.storage           = payload.span();
         plane->records.page_offsets.data = table.data();
+        if (record_offset)
+            plane->plane.tensor.region.alignment =
+                std::min<std::size_t>(plane->plane.tensor.region.alignment, record_offset);
     }
     f.query.data                 = q.data();
     f.output_gate.data           = gate.data();
@@ -249,8 +259,8 @@ int read_footprint(DeviceContext& device, KvCacheStorage storage, bool padded, i
 
 int graph_update(DeviceContext& device, int tokens, int batch,
                  KvCacheStorage storage = KvCacheStorage::BFloat16, bool padded = true,
-                 int query_heads = 24) {
-    Fixture f(tokens, batch, 8192, padded, storage, false, query_heads);
+                 int query_heads = 24, int kv_heads = 0) {
+    Fixture f(tokens, batch, 8192, padded, storage, false, query_heads, kv_heads);
     const auto bytes = ops::qsa_sparse_gqa_workspace_capacity_bytes(
         storage, f.q_heads, f.kv_heads, tokens, tokens, batch, {262144},
         device.execution_view().multiprocessor_count());
@@ -275,6 +285,36 @@ int graph_update(DeviceContext& device, int tokens, int batch,
                                   " T=" + std::to_string(tokens) + " B=" + std::to_string(batch) +
                                   " L=" + std::to_string(history));
         if (failures) return failures;
+    }
+    return failures;
+}
+
+int smaller_envelope_capacity(DeviceContext& device, int tokens, unsigned history) {
+    constexpr auto storage            = KvCacheStorage::Nvfp4Group16;
+    constexpr unsigned reserved_bound = 2052;
+    Fixture f(tokens, 1, history, false, storage);
+    f.reset();
+    const auto bytes = ops::qsa_sparse_gqa_workspace_capacity_bytes(
+        storage, f.q_heads, f.kv_heads, tokens, tokens, 1, {reserved_bound},
+        device.execution_view().multiprocessor_count());
+    GuardedDeviceBuffer scratch(bytes);
+    MemoryArena workspace(scratch.span());
+    DecodeGraphExecutable graph;
+    int failures = 0;
+    for (unsigned bound : {reserved_bound, history}) {
+        f.envelope.max_visible_tokens = bound;
+        f.out.fill(0xff);
+        DecodeGraphDefinition definition;
+        definition.capture(device.stream(), [&] { f.launch(workspace, device.execution_view()); });
+        if (graph.ready())
+            graph.update(definition);
+        else
+            graph.instantiate(definition);
+        graph.launch(device.stream());
+        device.synchronize();
+        const auto label =
+            "smaller envelope T=" + std::to_string(tokens) + " bound=" + std::to_string(bound);
+        failures += verify(f, label) + scratch.verify_guards(label);
     }
     return failures;
 }
@@ -319,24 +359,25 @@ int validation(DeviceContext& device) {
     for (auto storage : {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64,
                          KvCacheStorage::Fp8E4m3fnGroup128Ue8m0, KvCacheStorage::Nvfp4Group16,
                          KvCacheStorage::Fp8KeyNvfp4Value}) {
-        for (int batch : {1, 8}) {
-            std::size_t maximum = 0;
-            for (int t = 1; t <= 512; ++t)
-                maximum = std::max(maximum, ops::qsa_sparse_gqa_workspace_capacity_bytes(
-                                                storage, 24, 2, t, t, batch, f.envelope,
-                                                execution.multiprocessor_count()));
-            failures += maximum != ops::qsa_sparse_gqa_workspace_capacity_bytes(
-                                       storage, 24, 2, 1, 512, batch, f.envelope,
-                                       execution.multiprocessor_count());
-        }
+        for (int batch : {1, 8})
+            for (std::uint32_t bound : {f.envelope.max_visible_tokens, 262144u}) {
+                std::size_t maximum = 0;
+                for (int t = 1; t <= 4096; ++t)
+                    maximum = std::max(maximum, ops::qsa_sparse_gqa_workspace_capacity_bytes(
+                                                    storage, 24, 2, t, t, batch, {bound},
+                                                    execution.multiprocessor_count()));
+                failures += maximum != ops::qsa_sparse_gqa_workspace_capacity_bytes(
+                                           storage, 24, 2, 1, 4096, batch, {bound},
+                                           execution.multiprocessor_count());
+            }
     }
     return failures;
 }
 
 int scale_layout(DeviceContext& device, KvCacheStorage storage, int tokens, int history,
-                 int query_heads = 24) {
+                 int query_heads = 24, int kv_heads = 0) {
     // Scale planes have their own strides/alignment, independently of vector-aligned data.
-    Fixture f(tokens, 1, history, false, storage, true, query_heads);
+    Fixture f(tokens, 1, history, false, storage, true, query_heads, kv_heads);
     f.live_limit = 4;
     f.reset();
     ninfer::DeviceBuffer arena_storage(
@@ -352,8 +393,9 @@ int scale_layout(DeviceContext& device, KvCacheStorage storage, int tokens, int 
                          " T=" + std::to_string(tokens));
 }
 
-int wide_scales(DeviceContext& device, KvCacheStorage storage, int tokens, int history) {
-    Fixture f(tokens, 1, history, false, storage);
+int wide_scales(DeviceContext& device, KvCacheStorage storage, int tokens, int history,
+                int kv_heads = 2) {
+    Fixture f(tokens, 1, history, false, storage, false, 24, kv_heads);
     f.dense_rows = true;
     f.reset();
     for (auto& value : f.qhost) value = f32_to_bf16(bf16_to_f32(value) / 128.0F);
@@ -404,13 +446,18 @@ int quantized_validation(DeviceContext& device, KvCacheStorage storage) {
     const auto key_scales       = invalid.cache.k_scale_pages;
     invalid.cache.k_scale_pages = {};
     int failures = rejects([&] { invalid.launch(workspace, device.execution_view()); });
-    invalid.cache.k_scale_pages = key_scales;
+    invalid.cache.k_scale_pages                    = key_scales;
     invalid.cache.k_scale_pages.plane.tensor.dtype = DType::BF16;
     failures += rejects([&] { invalid.launch(workspace, device.execution_view()); });
     invalid.cache.k_scale_pages                         = key_scales;
     invalid.cache.k_scale_pages.plane.head_stride_bytes = 0;
     failures += rejects([&] { invalid.launch(workspace, device.execution_view()); });
     invalid.cache.k_scale_pages = key_scales;
+    // Reserving a larger envelope must cover recapture at a smaller one, even
+    // when the latter changes between prefix and gathered attention inside a tile.
+    if (storage == KvCacheStorage::Nvfp4Group16)
+        for (const auto [tokens, bound] : {std::pair{34, 375u}, std::pair{182, 2003u}})
+            failures += smaller_envelope_capacity(device, tokens, bound);
     return failures;
 }
 
@@ -418,16 +465,19 @@ void add_case(OpSuite& suite, int t, int b, int history, bool padded = false, in
               float magnitude = 1, bool graph = false,
               KvCacheStorage storage = KvCacheStorage::BFloat16,
               int live_limit = std::numeric_limits<int>::max(), int query_heads = 24,
-              bool dense_rows = false) {
+              bool dense_rows = false, int kv_heads = 0) {
     const auto format = kv_cache_storage_name(storage);
-    suite.add(std::string(query_heads == 12 ? "sparse_gqa_local/" : "sparse_gqa/") + format + "/t" +
-                  std::to_string(t) + "/b" + std::to_string(b) + "/l" + std::to_string(history) +
-                  "/cap" + std::to_string(cap) + (padded ? "/padded" : "/contiguous") + "/qk" +
-                  std::to_string(magnitude) + "/live" + std::to_string(live_limit) +
-                  (graph ? "/graph" : "/eager") + (dense_rows ? "/dense_rows" : ""),
+    suite.add(std::string(kv_heads == 4       ? "sparse_gqa_h24_4/"
+                          : query_heads == 12 ? "sparse_gqa_local/"
+                                              : "sparse_gqa/") +
+                  format + "/t" + std::to_string(t) + "/b" + std::to_string(b) + "/l" +
+                  std::to_string(history) + "/cap" + std::to_string(cap) +
+                  (padded ? "/padded" : "/contiguous") + "/qk" + std::to_string(magnitude) +
+                  "/live" + std::to_string(live_limit) + (graph ? "/graph" : "/eager") +
+                  (dense_rows ? "/dense_rows" : ""),
               [=] {
                   return run(cuda_environment().context, t, b, history, padded, cap, magnitude,
-                             graph, storage, live_limit, query_heads, dense_rows);
+                             graph, storage, live_limit, query_heads, dense_rows, kv_heads);
               },
               {{"format", format}, {"execution", graph ? "graph" : "eager"}});
 }
@@ -438,10 +488,13 @@ void add_cases(OpSuite& suite, KvCacheStorage storage) {
         suite.add(prefix + "/" + id, [=] { return run(cuda_environment().context); },
                         {{"format", kv_cache_storage_name(storage)}, {"execution", execution}});
     };
-    special("contract", [=](auto& device) {
-        return storage == KvCacheStorage::BFloat16 ? validation(device)
-                                                   : quantized_validation(device, storage);
-    });
+    special(
+        "contract",
+        [=](auto& device) {
+            return storage == KvCacheStorage::BFloat16 ? validation(device)
+                                                       : quantized_validation(device, storage);
+        },
+        storage == KvCacheStorage::Nvfp4Group16 ? "graph" : "eager");
     special("gate_rounding", [=](auto& device) { return gate_rounding(device, storage); });
     for (auto [t, b] : {std::pair{8, 3}, {33, 8}})
         special(
@@ -450,6 +503,13 @@ void add_cases(OpSuite& suite, KvCacheStorage storage) {
     special(
         "update/contiguous/t4/b1",
         [=](auto& device) { return graph_update(device, 4, 1, storage, false); }, "graph");
+    if (storage != KvCacheStorage::BFloat16)
+        add_case(suite, 128, 1, 129, false, 512, 1, true, storage);
+    if (storage == KvCacheStorage::Fp8E4m3fnGroup128Ue8m0 ||
+        storage == KvCacheStorage::Fp8KeyNvfp4Value)
+        special(
+            "update/contiguous/t128/b1",
+            [=](auto& device) { return graph_update(device, 128, 1, storage, false); }, "graph");
     add_case(suite, 4, 1, 8195, false, 512, 1.8f, false, storage);
     add_case(suite, 3, 2, 32771, false, 512, 1, true, storage);
     special("read_footprint/padded",
@@ -574,6 +634,133 @@ void add_local_cases(OpSuite& suite, KvCacheStorage storage) {
     });
 }
 
+void add_four_head_cases(OpSuite& suite) {
+    constexpr auto storage = KvCacheStorage::Fp8E4m3fnGroup128Ue8m0;
+    const auto add         = [&](int t, int b, int history, bool padded = false, int cap = 512,
+                         float magnitude = 1.F, bool graph = false) {
+        add_case(suite, t, b, history, padded, cap, magnitude, graph, storage,
+                         std::numeric_limits<int>::max(), 24, false, 4);
+    };
+    // Tails, full-select/TopK transition, long sparse history, and independent head mapping.
+    for (int l : {1, 2, 3, 4, 64, 65, 2044, 2048, 2051, 2052, 262144}) add(1, 1, l);
+    for (int t : {255, 256, 257}) add(t, 1, 2051);
+    add(65, 1, 2051, false, 17, 1.F, true);
+    for (int t : {2, 4}) add(t, 1, 2051);
+    for (int t : {8, 9}) add(t, 1, 8192);
+    for (int t : {63, 64, 65}) add(t, 1, 2048);
+    add(2048, 1, 8192, false, 1);
+    add(33, 8, 1024, false, 512, 1.F, true);
+    add(6, 8, 32771, true, 512, 1.8F, true);
+    add(3, 2, 2052, true, 0, 0.1F, true);
+    const std::string prefix = "sparse_gqa_h24_4/fp8/";
+    const auto special       = [&](std::string id, auto run, const char* execution = "eager") {
+        suite.add(prefix + id, std::move(run), {{"format", "fp8"}, {"execution", execution}});
+    };
+    for (int t : {8, 64, 256})
+        special("wide_scales/t" + std::to_string(t),
+                [=] { return wide_scales(cuda_environment().context, storage, t, 8192, 4); });
+    special("capacity", [=] {
+        const int sms = cuda_environment().context.multiprocessor_count();
+        int failures  = 0;
+        for (int b : {1, 8})
+            for (unsigned bound : {0u, 64u, 2051u, 262144u}) {
+                std::size_t maximum = 0;
+                for (int t = 1; t <= 4096; ++t)
+                    maximum = std::max(maximum, ops::qsa_sparse_gqa_workspace_capacity_bytes(
+                                                    storage, 24, 4, t, t, b, {bound}, sms));
+                failures += maximum != ops::qsa_sparse_gqa_workspace_capacity_bytes(
+                                           storage, 24, 4, 1, 4096, b, {bound}, sms);
+            }
+        return failures;
+    });
+    special(
+        "metadata_update",
+        [=] {
+            return graph_update(cuda_environment().context, 129, 8, storage, true, 24, 4) +
+                   graph_update(cuda_environment().context, 8, 8, storage, true, 24, 4);
+        },
+        "graph");
+    special("gate_rounding", [=] {
+        return gate_rounding(cuda_environment().context, storage, 1, 1, 24, 4) +
+               gate_rounding(cuda_environment().context, storage, 256, 8192, 24, 4);
+    });
+    special("read_footprint",
+            [=] { return read_footprint(cuda_environment().context, storage, true, 4, 24, 4); });
+    special("scale_layout",
+            [=] { return scale_layout(cuda_environment().context, storage, 256, 65, 24, 4); });
+}
+
+// New storage profiles qualify the actual compact, prefix, fallback and scalar-cache routes.
+// The larger FP8 catalogue already establishes shared exhaustive seam neighborhoods.
+void add_four_head_storage_cases(OpSuite& suite, KvCacheStorage storage) {
+    const auto add = [&](int t, int b, int history, bool padded = false, int cap = 512,
+                         bool graph = false) {
+        add_case(suite, t, b, history, padded, cap, 1.F, graph, storage,
+                 std::numeric_limits<int>::max(), 24, false, 4);
+    };
+    if (storage == KvCacheStorage::Nvfp4Group16 || storage == KvCacheStorage::Fp8KeyNvfp4Value)
+        add(17, 1, 31);
+    else
+        add(1, 1, 3);
+    if (storage == KvCacheStorage::BFloat16) {
+        add(17, 1, 31);
+        add(13, 1, 2048, false, 512, true);
+    }
+    add(1, 1, 2051);
+    add(4, 1, 2051);
+    add(8, 1, 8192);
+    add(9, 1, 8192);
+    add(65, 1, 2051, false, 17, true);
+    if (storage != KvCacheStorage::BFloat16) add(255, 1, 255);
+    add(256, 1, 2051);
+    add(257, 1, 8192);
+    add(6, 8, 32771, true, 512, true);
+    add(3, 2, 2052, true, 0, true);
+    const std::string format = kv_cache_storage_name(storage);
+    const std::string prefix = "sparse_gqa_h24_4/" + format + "/";
+    const auto special       = [&](std::string id, auto run, const char* execution = "eager") {
+        suite.add(prefix + id, std::move(run), {{"format", format}, {"execution", execution}});
+    };
+    if (storage == KvCacheStorage::Fp8KeyNvfp4Value)
+        special("wide_scales",
+                [=] { return wide_scales(cuda_environment().context, storage, 64, 8192, 4); });
+    special("capacity", [=] {
+        const int sms = cuda_environment().context.multiprocessor_count();
+        int failures  = 0;
+        for (int b : {1, 8})
+            for (unsigned bound : {64u, 2051u, 262144u}) {
+                std::size_t maximum = 0;
+                for (int t = 1; t <= 4096; ++t)
+                    maximum = std::max(maximum, ops::qsa_sparse_gqa_workspace_capacity_bytes(
+                                                    storage, 24, 4, t, t, b, {bound}, sms));
+                failures += maximum != ops::qsa_sparse_gqa_workspace_capacity_bytes(
+                                           storage, 24, 4, 1, 4096, b, {bound}, sms);
+            }
+        return failures;
+    });
+    special(
+        "metadata_update",
+        [=] {
+            return graph_update(cuda_environment().context, 129, 8, storage, true, 24, 4) +
+                   graph_update(cuda_environment().context, 8, 8, storage, true, 24, 4);
+        },
+        "graph");
+    special("gate_rounding", [=] {
+        return gate_rounding(cuda_environment().context, storage, 1, 1, 24, 4) +
+               gate_rounding(cuda_environment().context, storage, 256, 8192, 24, 4);
+    });
+    special("read_footprint", [=] {
+        auto& device = cuda_environment().context;
+        int failures = read_footprint(device, storage, true, 4, 24, 4);
+        if (storage == KvCacheStorage::Nvfp4Group16 || storage == KvCacheStorage::Fp8KeyNvfp4Value)
+            failures += read_footprint(device, storage, true, 4, 24, 4, 4, 0);
+        return failures;
+    });
+    if (storage != KvCacheStorage::BFloat16)
+        special("scale_layout",
+                [=] { return scale_layout(cuda_environment().context, storage, 9, 8192, 24, 4); });
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -584,5 +771,12 @@ int main(int argc, char** argv) {
         add_cases(suite, storage);
         add_local_cases(suite, storage);
     }
+#if NINFER_TARGET_RTX5090
+    add_four_head_cases(suite);
+    add_four_head_storage_cases(suite, KvCacheStorage::BFloat16);
+    add_four_head_storage_cases(suite, KvCacheStorage::Int8Group64);
+    add_four_head_storage_cases(suite, KvCacheStorage::Nvfp4Group16);
+    add_four_head_storage_cases(suite, KvCacheStorage::Fp8KeyNvfp4Value);
+#endif
     return suite.main(argc, argv);
 }

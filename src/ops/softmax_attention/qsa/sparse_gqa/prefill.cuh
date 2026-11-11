@@ -109,7 +109,7 @@ sparse_gqa_all_select(SparseGqaKernelArguments<KvHeads> a,
 #pragma unroll
     for (int j = 0; j < 2; ++j) {
         const int h = gid + j * 8;
-        if (q >= total || h >= 12) continue;
+        if (q >= total || h >= a.ratio) continue;
         const float inv = live ? __frcp_rn(state[j].sum) : 0;
 #pragma unroll
         for (int n = 0; n < 32; ++n) {
@@ -119,11 +119,11 @@ sparse_gqa_all_select(SparseGqaKernelArguments<KvHeads> a,
                     *reinterpret_cast<float2*>(s.partial + (warp * 16 + h) * 256 + d) =
                         make_float2(acc[n][j * 2] * inv, acc[n][j * 2 + 1] * inv);
                 else
-                    sparse_gqa_store(a, q, head * 12 + h, d, acc[n][j * 2] * inv,
+                    sparse_gqa_store(a, q, head * a.ratio + h, d, acc[n][j * 2] * inv,
                                      acc[n][j * 2 + 1] * inv);
             } else
-                *reinterpret_cast<unsigned*>(a.out + (q * a.query_heads + head * 12 + h) * 256 +
-                                             d) = 0;
+                *reinterpret_cast<unsigned*>(
+                    a.out + (q * a.query_heads + head * a.ratio + h) * 256 + d) = 0;
         }
     }
     if constexpr (kSparseRotatedValue<Storage>) {

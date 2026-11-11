@@ -1,4 +1,5 @@
 #include "ninfer/ops/qsa.h"
+#include "ops/softmax_attention/qsa/geometry.h"
 #include "ops/softmax_attention/qsa/sparse_gqa/plan.h"
 #include "ops/softmax_attention/qsa/validation.h"
 
@@ -8,7 +9,7 @@ constexpr detail::qsa::ViewValidation v{"qsa_sparse_gqa"};
 
 void profile(KvCacheStorage storage, int query_heads, int kv_heads, int lo, int hi, int batch,
              QsaSparseGqaExecutionEnvelope envelope, std::int32_t multiprocessor_count) {
-    v.require((query_heads == 24 && kv_heads == 2) || (query_heads == 12 && kv_heads == 1),
+    v.require(query_heads == detail::qsa::registered_query_heads(kv_heads) && query_heads > 0,
               "query/KV heads");
     v.require(envelope.max_visible_tokens <= 262144, "visible-token capacity");
     v.require(
@@ -34,12 +35,16 @@ std::size_t qsa_sparse_gqa_workspace_capacity_bytes(KvCacheStorage storage,
     const int end = std::min(
         hi, (detail::qsa::sparse_gqa_direct_queries(kv_heads, multiprocessor_count) - 1) / batch);
     for (int t = lo; t <= end; ++t) {
-        WorkspaceLayoutBuilder layout;
-        detail::qsa::allocate_sparse_gqa_workspace(
-            layout, t, batch, query_heads,
-            detail::qsa::select_sparse_gqa_plan(storage, t, batch, kv_heads, envelope,
-                                                multiprocessor_count));
-        maximum = std::max(maximum, layout.peak_bytes(1));
+        const auto bounds = detail::qsa::sparse_gqa_capacity_envelopes(
+            storage, t, batch, kv_heads, envelope, multiprocessor_count);
+        for (int i = 0; i < bounds.count; ++i) {
+            WorkspaceLayoutBuilder layout;
+            detail::qsa::allocate_sparse_gqa_workspace(
+                layout, t, batch, query_heads,
+                detail::qsa::select_sparse_gqa_plan(storage, t, batch, kv_heads, {bounds.values[i]},
+                                                    multiprocessor_count));
+            maximum = std::max(maximum, layout.peak_bytes(1));
+        }
     }
     return maximum;
 }

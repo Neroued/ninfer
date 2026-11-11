@@ -8,13 +8,18 @@ struct Nvfp4LinearShape {
     Nvfp4Launch a16;
     void (*a4)(const Tensor&, const Weight&, Tensor&, Nvfp4A4Workspace, cudaStream_t);
     bool (*uses_a4)(std::int32_t min_tokens, std::int32_t max_tokens);
+    // Maximum over the interval, including routes that need less storage at larger T.
+    std::size_t (*partial_capacity_bytes)(std::int32_t min_tokens,
+                                          std::int32_t max_tokens) = nullptr;
 };
 
 extern const Nvfp4LinearShape kNvfp4N12288K4096;
 extern const Nvfp4LinearShape kNvfp4N4096K6144;
 extern const Nvfp4LinearShape kNvfp4N14336K5120;
 extern const Nvfp4LinearShape kNvfp4N16384K5120;
+extern const Nvfp4LinearShape kNvfp4N28672K5120;
 extern const Nvfp4LinearShape kNvfp4N34816K5120;
 extern const Nvfp4LinearShape kNvfp4N5120K6144;
+extern const Nvfp4LinearShape kNvfp4N5120K14336;
 extern const Nvfp4LinearShape kNvfp4N5120K17408;
 } // namespace ninfer::ops::detail

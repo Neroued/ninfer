@@ -169,6 +169,12 @@ struct Nvfp4A4TmaMmaSchedule {
     static_assert((kBlockK / 16) * 2 == kNvfp4ScaleTileGroups);
 };
 
+template <class TmaSchedule, int Partitions>
+struct Nvfp4A4TmaSplitKSchedule : TmaSchedule {
+    static_assert(Partitions > 1);
+    static constexpr int kKPartitions = Partitions;
+};
+
 enum class Nvfp4MmaFragmentPipeline : std::uint8_t {
     Serial,
     PingPong,

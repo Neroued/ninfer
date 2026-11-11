@@ -347,7 +347,8 @@ static int run_shape(std::string_view label, ActivationRecipe recipe, WeightGene
                 if (shape.workspace_prefix) {
                     std::vector<std::uint8_t> prefix(shape.workspace_prefix);
                     cuda_check(cudaMemcpy(prefix.data(), workspace_storage.data(), prefix.size(),
-                                          cudaMemcpyDeviceToHost), "read caller workspace prefix");
+                                          cudaMemcpyDeviceToHost),
+                               "read caller workspace prefix");
                     if (!std::all_of(prefix.begin(), prefix.end(),
                                      [](auto byte) { return byte == kOutputGuardByte; })) {
                         std::cerr << case_label << ": modified caller workspace prefix\n";
@@ -468,13 +469,16 @@ void add_workspace_cases(Suite& suite, QType format, int n, int k) {
 
 int verify_workspace_envelopes(QType qtype, std::int32_t n, std::int32_t k) {
     int failures = 0;
-    std::vector<std::pair<int, int>> intervals{
-        {1, 4}, {2, 4}, {1, 128}, {9, 25}, {24, 129}};
-    const bool block_tail =
-        qtype == QType::FP8_E4M3FN_BLOCK128X128_FP32 && n == 4096 && k == 16384;
+    std::vector<std::pair<int, int>> intervals{{1, 4},  {2, 4},    {1, 128},
+                                               {9, 25}, {24, 129}, {1, 2048}};
+    const bool block_tail = qtype == QType::FP8_E4M3FN_BLOCK128X128_FP32 && n == 4096 && k == 16384;
     if (block_tail) {
-        intervals.insert(intervals.end(), {{1, 4096}, {512, 641}, {641, 896}, {641, 897},
-                                           {1024, 1409}, {2049, 2433},
+        intervals.insert(intervals.end(), {{1, 4096},
+                                           {512, 641},
+                                           {641, 896},
+                                           {641, 897},
+                                           {1024, 1409},
+                                           {2049, 2433},
                                            {std::numeric_limits<int>::max() - 512,
                                             std::numeric_limits<int>::max()}});
     }
@@ -487,7 +491,7 @@ int verify_workspace_envelopes(QType qtype, std::int32_t n, std::int32_t k) {
             std::size_t interval_peak = 0;
             for (int t = first;; ++t) {
                 const auto point = ops::linear_workspace_capacity_bytes(qtype, n, k, policy, t, t);
-                interval_peak = std::max(interval_peak, point);
+                interval_peak    = std::max(interval_peak, point);
                 if (point > capacity) {
                     std::cerr << "Linear workspace interval [" << first << ',' << last
                               << "] cannot cover T=" << t << " for [" << n << ',' << k << "]\n";
@@ -498,12 +502,14 @@ int verify_workspace_envelopes(QType qtype, std::int32_t n, std::int32_t k) {
             }
             observed_peak = std::max(observed_peak, interval_peak);
             if (block_tail && capacity != interval_peak) {
-                std::cerr << "Block-FP8 workspace interval does not match its point high-water mark\n";
+                std::cerr
+                    << "Block-FP8 workspace interval does not match its point high-water mark\n";
                 ++failures;
             }
         }
-        if (block_tail && ops::linear_workspace_capacity_bytes(
-                              qtype, n, k, policy, 1, std::numeric_limits<int>::max()) != observed_peak) {
+        if (block_tail && ops::linear_workspace_capacity_bytes(qtype, n, k, policy, 1,
+                                                               std::numeric_limits<int>::max()) !=
+                              observed_peak) {
             std::cerr << "Block-FP8 full token range misses transient workspace\n";
             ++failures;
         }

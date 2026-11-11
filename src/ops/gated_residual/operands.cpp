@@ -35,29 +35,31 @@ Operands validate(Form form, const Tensor& input, const Tensor* block, const Ten
                   const Tensor* weight, float epsilon, Tensor* residual, Tensor* normalized,
                   CudaExecutionView execution, const char* op) {
     const bool expand = form == Form::ExpandNorm;
-    const auto m      = input.ne[expand ? 1 : 2];
+    const int width   = input.ne[0];
+    validate_norm_combine_width(width);
+    const auto m = input.ne[expand ? 1 : 2];
     require(m > 0, op, "columns must be positive");
     if (weight)
         require(epsilon > 0 && std::isfinite(epsilon), op, "epsilon must be positive and finite");
     std::array<common::operand::Range, 4> inputs;
     int count = 1;
-    inputs[0] = check(input, DType::BF16, kWidth, expand ? m : kStreams, expand ? 1 : m,
+    inputs[0] = check(input, DType::BF16, width, expand ? m : kStreams, expand ? 1 : m,
                       execution.device(), op);
-    if (block) inputs[count++] = check(*block, DType::BF16, kWidth, m, 1, execution.device(), op);
+    if (block) inputs[count++] = check(*block, DType::BF16, width, m, 1, execution.device(), op);
     if (injection)
         inputs[count++] = check(*injection, DType::FP32, kStreams, m, 1, execution.device(), op);
     if (weight)
-        inputs[count++] = check(*weight, DType::BF16, kWidth, kStreams, 1, execution.device(), op);
+        inputs[count++] = check(*weight, DType::BF16, width, kStreams, 1, execution.device(), op);
     const bool alias = residual && !expand && same_view(input, *residual);
     if (residual) {
         const auto output =
-            check(*residual, DType::BF16, kWidth, kStreams, m, execution.device(), op);
+            check(*residual, DType::BF16, width, kStreams, m, execution.device(), op);
         for (int i = alias ? 1 : 0; i < count; ++i)
             common::operand::disjoint(output, inputs[i], op);
     }
     if (normalized) {
         const auto output =
-            check(*normalized, DType::BF16, kWidth, kStreams, m, execution.device(), op);
+            check(*normalized, DType::BF16, width, kStreams, m, execution.device(), op);
         for (int i = 0; i < count; ++i) common::operand::disjoint(output, inputs[i], op);
         if (residual)
             common::operand::disjoint(
@@ -70,6 +72,7 @@ Operands validate(Form form, const Tensor& input, const Tensor* block, const Ten
             residual ? residual->data : nullptr,
             normalized ? normalized->data : nullptr,
             m,
+            width,
             epsilon};
 }
 } // namespace ninfer::ops::detail::hc

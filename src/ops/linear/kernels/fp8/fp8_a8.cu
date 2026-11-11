@@ -84,6 +84,9 @@ void launch_fp8_a8_quantize(const Tensor& x, const Weight& weight, Fp8A8Workspac
         throw std::invalid_argument("fp8 A8 requires caller workspace");
     }
     switch (weight.k) {
+    case Fp8Activation20480Geometry::kInputRows:
+        launch_quantize_exact<Fp8Activation20480Geometry>(x, workspace, stream);
+        return;
     case Fp8Activation5120Geometry::kInputRows:
         launch_quantize_exact<Fp8Activation5120Geometry>(x, workspace, stream);
         return;

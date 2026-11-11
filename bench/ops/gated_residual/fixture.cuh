@@ -9,11 +9,12 @@ inline constexpr float kEpsilon = 1.e-6F;
 struct Fixture {
     Fixture(const Options& options, int tokens)
         : op(options.op), in_place(options.in_place), m(columns(tokens, options.batch)),
-          input(make_bf16(std::size_t(kWidth) * m * (op == Op::ExpandNorm ? 1 : kStreams), 6101,
+          width(options.width),
+          input(make_bf16(std::size_t(width) * m * (op == Op::ExpandNorm ? 1 : kStreams), 6101,
                           -1.F, 1.F)),
-          block(combines(op) ? make_bf16(std::size_t(kWidth) * m, 6103, -0.75F, 0.75F)
+          block(combines(op) ? make_bf16(std::size_t(width) * m, 6103, -0.75F, 0.75F)
                              : DeviceBuffer{}),
-          weight(op != Op::Combine ? make_bf16(kWidth * kStreams, 6107, -0.25F, 0.25F)
+          weight(op != Op::Combine ? make_bf16(width * kStreams, 6107, -0.25F, 0.25F)
                                    : DeviceBuffer{}),
           injection(combines(op) && op != Op::AddNorm ? make_f32(std::size_t(kStreams) * m, 6109,
                                                                  op == Op::AddThenNorm ? 1.F : 0.F,
@@ -21,20 +22,20 @@ struct Fixture {
                                                       : DeviceBuffer{}),
           backup(in_place ? make_zeros(input.size()) : DeviceBuffer{}),
           residual(op != Op::GroupedNorm && !in_place
-                       ? make_zeros(std::size_t(kWidth) * kStreams * m * sizeof(__nv_bfloat16))
+                       ? make_zeros(std::size_t(width) * kStreams * m * sizeof(__nv_bfloat16))
                        : DeviceBuffer{}),
           normalized(op != Op::Combine
-                         ? make_zeros(std::size_t(kWidth) * kStreams * m * sizeof(__nv_bfloat16))
+                         ? make_zeros(std::size_t(width) * kStreams * m * sizeof(__nv_bfloat16))
                          : DeviceBuffer{}) {
-        h = op == Op::ExpandNorm ? Tensor(input.span(), DType::BF16, {kWidth, m})
-                                 : Tensor(input.span(), DType::BF16, {kWidth, kStreams, m});
-        if (block.size()) b = Tensor(block.span(), DType::BF16, {kWidth, m});
-        if (weight.size()) w = Tensor(weight.span(), DType::BF16, {kWidth, kStreams});
+        h = op == Op::ExpandNorm ? Tensor(input.span(), DType::BF16, {width, m})
+                                 : Tensor(input.span(), DType::BF16, {width, kStreams, m});
+        if (block.size()) b = Tensor(block.span(), DType::BF16, {width, m});
+        if (weight.size()) w = Tensor(weight.span(), DType::BF16, {width, kStreams});
         if (injection.size()) j = Tensor(injection.span(), DType::FP32, {kStreams, m});
         if (in_place || residual.size())
             r = Tensor(in_place ? input.span() : residual.span(), DType::BF16,
-                       {kWidth, kStreams, m});
-        if (normalized.size()) z = Tensor(normalized.span(), DType::BF16, {kWidth, kStreams, m});
+                       {width, kStreams, m});
+        if (normalized.size()) z = Tensor(normalized.span(), DType::BF16, {width, kStreams, m});
         if (in_place)
             CUDA_CHECK(
                 cudaMemcpy(backup.data(), input.data(), input.size(), cudaMemcpyDeviceToDevice));
@@ -43,7 +44,8 @@ struct Fixture {
     void restore(CudaExecutionView cuda) {
         const auto stream = cuda.stream();
         if (in_place)
-            CUDA_CHECK(cudaMemcpyAsync(input.data(), backup.data(), input.size(),
+            CUDA_CHECK(cudaMemcpyAsync(input.data(), backup.data(),
+                                       std::size_t(width) * kStreams * m * sizeof(__nv_bfloat16),
                                        cudaMemcpyDeviceToDevice, stream));
     }
 
@@ -81,7 +83,7 @@ struct Fixture {
 
     Op op;
     bool in_place;
-    int m;
+    int m, width;
     DeviceBuffer input;
     DeviceBuffer block;
     DeviceBuffer weight;

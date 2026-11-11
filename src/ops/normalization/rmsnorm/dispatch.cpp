@@ -9,12 +9,18 @@ namespace ninfer::ops::detail::rmsnorm {
 namespace {
 
 Instance select_instance(Epilogue kind, Operands operands, std::int32_t sms) {
-    const auto [d, rows, aligned, vectors] = operands;
-    if (!aligned) return Instance::Generic;
-#if NINFER_TARGET_SPARK
-    if (kind == Epilogue::Plain && d == 1024 && vectors) return Instance::D1024Vector;
+    const auto [d, rows, aligned] = operands;
+    if (aligned < 4) return Instance::Generic;
+#if NINFER_TARGET_RTX5090
+    if (!gated(kind) && d == 20480 && aligned >= 8) {
+        // One CTA per row: widen each CTA once a row wave covers the device. The small
+        // route uses wider transfers; naturally aligned operands keep their fallback.
+        return rows <= sms && aligned >= 16 ? Instance::D20480Block512 : Instance::D20480Block1024;
+    }
+#elif NINFER_TARGET_SPARK
+    if (kind == Epilogue::Plain && d == 1024 && aligned >= 16) return Instance::D1024Vector;
     if (kind == Epilogue::Plain && d == 4096)
-        return vectors && rows >= 289 ? Instance::D4096Vector : Instance::D4096;
+        return aligned >= 16 && rows >= 289 ? Instance::D4096Vector : Instance::D4096;
 #endif
     if (kind == Epilogue::Offset && d == 10240) return Instance::D10240;
     if (gated(kind) && d == 128) {
@@ -53,8 +59,7 @@ void dispatch(const Tensor& x, const Tensor& weight, const Tensor* gate, float e
             gate_chunk      = *gate;
             gate_chunk.data = static_cast<std::byte*>(gate->data) + offset;
         }
-        const Operands chunk{operands.dimension, count, operands.aligned_pairs,
-                             operands.aligned_vectors};
+        const Operands chunk{operands.dimension, count, operands.alignment_bytes};
         launch(x_chunk, weight, gate ? &gate_chunk : nullptr, eps, kind, out_chunk, chunk,
                select_instance(kind, chunk, execution.multiprocessor_count()), execution.stream());
         first += count;

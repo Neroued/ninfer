@@ -14,21 +14,29 @@ void launch(const SparseGqaArguments& arguments, SparseGqaPlan plan,
     SparseGqaKernelArguments<KvHeads> a{arguments};
     a.splits             = launch_plan.splits;
     constexpr bool Async = kSparseQuantized<Storage> && VectorCache;
-    const auto compact =
-        [&]<int N, int Warps, SparseGqaLoad Load, bool Prefix, bool Delay = false>() {
-            constexpr int resident = compact_launch_min_blocks(
-                Storage, KvHeads, N, Prefix, Load == SparseGqaLoad::Reused, Delay);
-            constexpr auto kernel = sparse_gqa_compact_kernel<Storage, N, Warps, VectorCache, Load,
-                                                              Prefix, Delay, KvHeads, resident>;
-            constexpr int bytes =
-                sizeof(SparseGqaStorage<Storage, N, Warps, Load, SparseGqaWarpSplit::Sequence, 8>);
-            const int shared     = common::prepare_shared<bytes, kernel, true>();
-            constexpr int packet = Warps / (HeadGeometry<KvHeads>::ratio / 6);
-            const int groups     = Prefix ? (queries + packet - 1) / packet : queries;
-            kernel<<<dim3(groups * a.kv_heads, a.splits), Warps * 32, shared, execution.stream()>>>(
-                a, queries);
-        };
+    const auto compact = [&]<int N, int Warps, SparseGqaLoad Load, bool Prefix, bool Delay = false,
+                             bool WarpAddresses = false>() {
+        constexpr int resident = compact_launch_min_blocks(Storage, KvHeads, N, Prefix,
+                                                           Load == SparseGqaLoad::Reused, Delay);
+        constexpr auto kernel =
+            sparse_gqa_compact_kernel<Storage, N, Warps, VectorCache, Load, Prefix, Delay, KvHeads,
+                                      resident, WarpAddresses>;
+        constexpr int bytes =
+            sizeof(SparseGqaStorage<Storage, N, Warps, Load, SparseGqaWarpSplit::Sequence, 8>);
+        const int shared     = common::prepare_shared<bytes, kernel, true>();
+        constexpr int packet = Warps / (HeadGeometry<KvHeads>::ratio / 6);
+        const int groups     = Prefix ? (queries + packet - 1) / packet : queries;
+        kernel<<<dim3(groups * a.kv_heads, a.splits), Warps * 32, shared, execution.stream()>>>(
+            a, queries);
+    };
     const auto submit = [&]<int N, int Warps, bool Prefix, bool Delay = false>() {
+        if constexpr (KvHeads == 4 && Storage == KvCacheStorage::Fp8E4m3fnGroup128Ue8m0 &&
+                      VectorCache && N == 16 && Warps == 1 && !Prefix) {
+            if (queries >= 16 && queries <= 128 && launch_plan.load == SparseGqaLoad::Aliased) {
+                compact.template operator()<N, Warps, SparseGqaLoad::Aliased, false, Delay, true>();
+                return;
+            }
+        }
         if constexpr (Storage == KvCacheStorage::BFloat16) {
             if (launch_plan.load == SparseGqaLoad::Reused)
                 compact.template operator()<N, Warps, SparseGqaLoad::Reused, Prefix, Delay>();

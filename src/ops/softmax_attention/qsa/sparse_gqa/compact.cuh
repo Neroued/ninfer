@@ -60,7 +60,7 @@ compact_probabilities(float (&score)[Tiles][4], OnlineSoftmaxRow (&state)[2], fl
 }
 
 template <KvCacheStorage Storage, int N, int Warps, bool Vector, SparseGqaLoad Load, bool Prefix,
-          bool DelaySoftmax = false, int KvHeads>
+          bool DelaySoftmax = false, bool WarpAddresses = false, int KvHeads>
 __device__ __forceinline__ void
 sparse_gqa_compact(const SparseGqaKernelArguments<KvHeads>& a,
                    SparseGqaStorage<Storage, N, Warps, Load, SparseGqaWarpSplit::Sequence, 8>& s,
@@ -132,17 +132,26 @@ sparse_gqa_compact(const SparseGqaKernelArguments<KvHeads>& a,
     OnlineSoftmaxRow state[2];
     constexpr float scale = common::kLog2E / 16;
     const auto address_q  = Prefix ? last - 1 : first;
-    sparse_gqa_addresses<Storage>(a, s, work, address_q, head, start, end);
-    auto key_scale =
-        sparse_gqa_stage<Storage, N, Warps, Vector, true, true, NaturalPrefetch>(a, s, start, end);
+    SparseGqaWarpAddresses addresses_in_warp;
+    const auto address_tile = [&](int k0) {
+        if constexpr (WarpAddresses)
+            addresses_in_warp = sparse_gqa_warp_addresses(a, work, address_q, k0, end);
+        else
+            sparse_gqa_addresses<Storage>(a, s, work, address_q, head, k0, end);
+    };
+    const auto stage = [&]<bool Key>(int k0) {
+        return sparse_gqa_stage<Storage, N, Warps, Vector, Key, true, NaturalPrefetch,
+                                WarpAddresses>(a, s, k0, end, addresses_in_warp, head);
+    };
+    address_tile(start);
+    auto key_scale       = stage.template operator()<true>(start);
     unsigned value_scale = 127;
     common::cp_commit();
     for (int k0 = start; k0 < end; k0 += N) {
         const bool half_key_scale = sparse_gqa_wait_stage<Storage, true>(s, key_scale);
         sparse_gqa_expand_stage<Storage, true>(s, half_key_scale, key_scale, min(N, end - k0));
         if constexpr (Load != SparseGqaLoad::Reused) {
-            value_scale = sparse_gqa_stage<Storage, N, Warps, Vector, false, true, NaturalPrefetch>(
-                a, s, k0, end);
+            value_scale = stage.template operator()<false>(k0);
             common::cp_commit();
         }
         float score[Tiles][4]{};
@@ -174,8 +183,7 @@ sparse_gqa_compact(const SparseGqaKernelArguments<KvHeads>& a,
                                   k0 + (Prefix ? 0 : (warp / HeadPackets) * NK), position);
         if constexpr (Load == SparseGqaLoad::Reused) {
             sparse_gqa_sync<Warps>();
-            value_scale = sparse_gqa_stage<Storage, N, Warps, Vector, false, true, NaturalPrefetch>(
-                a, s, k0, end);
+            value_scale = stage.template operator()<false>(k0);
             common::cp_commit();
         }
         if constexpr (quant_reuse && !DelaySoftmax)
@@ -184,9 +192,8 @@ sparse_gqa_compact(const SparseGqaKernelArguments<KvHeads>& a,
         const bool half_value_scale = sparse_gqa_wait_stage<Storage, false>(s, value_scale);
         sparse_gqa_expand_stage<Storage, false>(s, half_value_scale, value_scale, min(N, end - k0));
         if (Load != SparseGqaLoad::Reused && k0 + N < end) {
-            sparse_gqa_addresses<Storage>(a, s, work, address_q, head, k0 + N, end);
-            key_scale = sparse_gqa_stage<Storage, N, Warps, Vector, true, true, NaturalPrefetch>(
-                a, s, k0 + N, end);
+            address_tile(k0 + N);
+            key_scale = stage.template operator()<true>(k0 + N);
             common::cp_commit();
         }
         if constexpr ((Warps == 1 && !quant_reuse) || DelaySoftmax)
@@ -211,9 +218,8 @@ sparse_gqa_compact(const SparseGqaKernelArguments<KvHeads>& a,
         }
         sparse_gqa_sync<Warps>();
         if (Load == SparseGqaLoad::Reused && k0 + N < end) {
-            sparse_gqa_addresses<Storage>(a, s, work, address_q, head, k0 + N, end);
-            key_scale = sparse_gqa_stage<Storage, N, Warps, Vector, true, true, NaturalPrefetch>(
-                a, s, k0 + N, end);
+            address_tile(k0 + N);
+            key_scale = stage.template operator()<true>(k0 + N);
             common::cp_commit();
         }
     }
@@ -317,7 +323,8 @@ sparse_gqa_compact(const SparseGqaKernelArguments<KvHeads>& a,
 }
 
 template <KvCacheStorage Storage, int N, int Warps, bool Vector, SparseGqaLoad Load,
-          bool Prefix = false, bool DelaySoftmax = false, int KvHeads, int MinBlocks = 1>
+          bool Prefix = false, bool DelaySoftmax = false, int KvHeads, int MinBlocks = 1,
+          bool WarpAddresses = false>
 __launch_bounds__(Warps * 32, MinBlocks) __global__
     void sparse_gqa_compact_kernel(const __grid_constant__ SparseGqaKernelArguments<KvHeads> a,
                                    int slab_queries) {
@@ -338,18 +345,18 @@ __launch_bounds__(Warps * 32, MinBlocks) __global__
     const int head = a.group_head(blockIdx.x);
     if constexpr (Prefix) {
         if (sparse_gqa_all_selected<Queries>(a, first, packed))
-            sparse_gqa_compact<Storage, N, Warps, Vector, Load, true, DelaySoftmax>(
+            sparse_gqa_compact<Storage, N, Warps, Vector, Load, true, DelaySoftmax, WarpAddresses>(
                 a, s, first, head, blockIdx.y, packed);
         else {
             const auto total = std::int64_t(a.tokens) * a.batch;
             for (int i = 0; i < packed && first + i < total; ++i) {
-                sparse_gqa_compact<Storage, N, Warps, Vector, Load, false, DelaySoftmax>(
-                    a, s, first + i, head, blockIdx.y);
+                sparse_gqa_compact<Storage, N, Warps, Vector, Load, false, DelaySoftmax,
+                                   WarpAddresses>(a, s, first + i, head, blockIdx.y);
                 sparse_gqa_sync<Warps>();
             }
         }
     } else
-        sparse_gqa_compact<Storage, N, Warps, Vector, Load, false, DelaySoftmax>(a, s, first, head,
-                                                                                 blockIdx.y);
+        sparse_gqa_compact<Storage, N, Warps, Vector, Load, false, DelaySoftmax, WarpAddresses>(
+            a, s, first, head, blockIdx.y);
 }
 } // namespace ninfer::ops::detail::qsa

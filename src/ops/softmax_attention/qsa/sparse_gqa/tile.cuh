@@ -108,14 +108,48 @@ sparse_gqa_addresses(const SparseGqaArguments& a,
     sparse_gqa_sync<Warps>();
 }
 
+struct SparseGqaWarpAddresses {
+    long long page = 0;
+    int row        = 0;
+};
+
+// A single warp keeps one block's page/row in each of its first four lanes.
+// Exchange addresses before row-validity branches so every lane joins each shuffle.
+__device__ __forceinline__ SparseGqaWarpAddresses sparse_gqa_warp_addresses(
+    const SparseGqaArguments& a, SparseGqaWork work, std::int64_t q, int start, int end) {
+    const int lane = threadIdx.x;
+    SparseGqaWarpAddresses result;
+    if (lane < 4 && start + lane * 4 < end) {
+        const int ordinal   = start / 4 + lane;
+        const int g         = ordinal < work.count
+                                  ? (work.count == work.complete ? ordinal : a.ids[q * 512 + ordinal])
+                                  : work.complete;
+        const int table_row = a.table_rows[q / a.tokens];
+        result.page         = a.tables[std::int64_t(table_row) * a.table_stride + g / 16];
+        result.row          = 4 * (g % 16);
+    }
+    return result;
+}
+
+__device__ __forceinline__ std::int64_t
+sparse_gqa_warp_row_address(SparseGqaWarpAddresses addresses, SparseGqaPage plane, int head,
+                            int row) {
+    const auto page = __shfl_sync(0xffffffffu, addresses.page, row / 4);
+    const int first = __shfl_sync(0xffffffffu, addresses.row, row / 4);
+    return page + head * plane.head + (first + row % 4) * plane.row;
+}
+
 template <KvCacheStorage Storage, int N, int Warps, bool Vector, bool Key,
-          bool PrefetchFp8Scale = true, int NaturalPipeline = 0, SparseGqaLoad Load,
-          SparseGqaWarpSplit Split, int PaddedHeads>
+          bool PrefetchFp8Scale = true, int NaturalPipeline = 0, bool WarpAddresses = false,
+          SparseGqaLoad Load, SparseGqaWarpSplit Split, int PaddedHeads>
 __device__ __forceinline__ unsigned
 sparse_gqa_stage(const SparseGqaArguments& a,
                  SparseGqaStorage<Storage, N, Warps, Load, Split, PaddedHeads>& s, int start,
-                 int end) {
-    using Codec      = SparseGqaCodec<Storage, Key>;
+                 int end, SparseGqaWarpAddresses addresses_in_warp = {}, int head = 0) {
+    using Codec = SparseGqaCodec<Storage, Key>;
+    static_assert(!WarpAddresses ||
+                  (N == 16 && Warps == 1 && Vector && Load != SparseGqaLoad::Direct &&
+                   Codec::format == KvCacheVectorFormat::Fp8E4m3fnGroup128Ue8m0));
     const auto plane = Key ? a.key : a.value, scale_plane = Key ? a.key_scale : a.value_scale;
     const auto* addresses       = Key ? s.addresses.key : s.addresses.value;
     const auto* scale_addresses = Key ? s.addresses.key_scale : s.addresses.value_scale;
@@ -127,10 +161,15 @@ sparse_gqa_stage(const SparseGqaArguments& a,
         if constexpr (PrefetchFp8Scale &&
                       Codec::format == KvCacheVectorFormat::Fp8E4m3fnGroup128Ue8m0) {
             static_assert((N + Warps - 1) / Warps * 2 <= 32);
-            const int row = (threadIdx.x % 32 / 2) * Warps + threadIdx.x / 32;
-            if (row < N && start + row < end)
-                scale = scale_plane.data[scale_addresses[row / 4] + row % 4 * scale_plane.row +
-                                         threadIdx.x % 2];
+            const int row        = (threadIdx.x % 32 / 2) * Warps + threadIdx.x / 32;
+            std::int64_t address = 0;
+            if constexpr (WarpAddresses)
+                address = sparse_gqa_warp_row_address(addresses_in_warp, scale_plane, head, row);
+            if (row < N && start + row < end) {
+                if constexpr (!WarpAddresses)
+                    address = scale_addresses[row / 4] + row % 4 * scale_plane.row;
+                scale = scale_plane.data[address + threadIdx.x % 2];
+            }
         }
         constexpr bool inplace = Load == SparseGqaLoad::InPlace || Load == SparseGqaLoad::Reused;
         constexpr int Row      = inplace ? Codec::packed_row : Codec::code_bytes;
@@ -154,11 +193,15 @@ sparse_gqa_stage(const SparseGqaArguments& a,
         } else
             for (int i = threadIdx.x; i < N * (Codec::code_bytes / 16); i += Warps * 32) {
                 const int row = i / (Codec::code_bytes / 16), d = i % (Codec::code_bytes / 16) * 16;
-                auto* dst = codes + row * Row + d;
-                if (start + row < end)
-                    sparse_gqa_copy_16<Vector, Codec::code_bytes>(
-                        dst, plane.data + addresses[row / 4] + row % 4 * plane.row, d);
-                else
+                auto* dst            = codes + row * Row + d;
+                std::int64_t address = 0;
+                if constexpr (WarpAddresses)
+                    address = sparse_gqa_warp_row_address(addresses_in_warp, plane, head, row);
+                if (start + row < end) {
+                    if constexpr (!WarpAddresses)
+                        address = addresses[row / 4] + row % 4 * plane.row;
+                    sparse_gqa_copy_16<Vector, Codec::code_bytes>(dst, plane.data + address, d);
+                } else
                     common::store_vec(dst, make_int4(0, 0, 0, 0));
             }
         if constexpr (Codec::format != KvCacheVectorFormat::Fp8E4m3fnGroup128Ue8m0) {

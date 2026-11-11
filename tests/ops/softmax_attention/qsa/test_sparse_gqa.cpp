@@ -652,6 +652,8 @@ void add_four_head_cases(OpSuite& suite) {
     add(33, 8, 1024, false, 512, 1.F, true);
     add(6, 8, 32771, true, 512, 1.8F, true);
     add(3, 2, 2052, true, 0, 0.1F, true);
+    add(4, 4, 8195, false, 512, 1.F, true);
+    add(8, 8, 2052, false, 1, 1.F, true);
     const std::string prefix = "sparse_gqa_h24_4/fp8/";
     const auto special       = [&](std::string id, auto run, const char* execution = "eager") {
         suite.add(prefix + id, std::move(run), {{"format", "fp8"}, {"execution", execution}});

@@ -16,7 +16,7 @@ namespace {
 
 template <class ActivationGeometry>
 void launch_quantize_exact(const Tensor& x, const Weight& weight, Nvfp4A4Workspace workspace,
-                           Nvfp4ScaleLayout layout, cudaStream_t stream) {
+                           Nvfp4ScaleLayout layout, cudaStream_t stream, bool programmatic) {
     const std::int32_t tokens = x.ne[1];
     constexpr int kThreads    = 256;
     const auto* input         = static_cast<const __nv_bfloat16*>(x.data);
@@ -26,36 +26,35 @@ void launch_quantize_exact(const Tensor& x, const Weight& weight, Nvfp4A4Workspa
         layout != Nvfp4ScaleLayout::RowMajor ? nvfp4_a4_padded_tokens(tokens, layout) : tokens;
     const std::int32_t tasks = written_tokens * ActivationGeometry::kGroupsPerRow;
     const int blocks         = (tasks + kThreads - 1) / kThreads;
-    // The tiled plane exists only for a K whose group count divides into whole tiles. Registered
-    // Ks all do; gating the instantiation keeps a future K that does not out of a hard compile
-    // error and into a runtime message.
-    if constexpr (ActivationGeometry::kGroupsPerRow % kNvfp4ScaleTileGroups == 0) {
-        if (layout != Nvfp4ScaleLayout::RowMajor) {
-            if (layout == Nvfp4ScaleLayout::Tiled128) {
-                nvfp4_a4_quantize_kernel<ActivationGeometry, kThreads, Nvfp4ScaleLayout::Tiled128>
-                    <<<blocks, kThreads, 0, stream>>>(input, workspace.codes, workspace.scales,
-                                                      tokens, written_tokens, weight.input_scale);
-            } else {
-                nvfp4_a4_quantize_kernel<ActivationGeometry, kThreads, Nvfp4ScaleLayout::Tiled256>
-                    <<<blocks, kThreads, 0, stream>>>(input, workspace.codes, workspace.scales,
-                                                      tokens, written_tokens, weight.input_scale);
-            }
-            CUDA_CHECK(cudaGetLastError());
-            return;
-        }
-    } else if (layout != Nvfp4ScaleLayout::RowMajor) {
+    const auto launch        = [&]<Nvfp4ScaleLayout Layout>() {
+        const auto submit = [&]<bool Programmatic>() {
+            nvfp4_a4_quantize_kernel<ActivationGeometry, kThreads, Layout, __nv_bfloat16,
+                                            Programmatic>
+                <<<blocks, kThreads, 0, stream>>>(input, workspace.codes, workspace.scales, tokens,
+                                                         written_tokens, weight.input_scale);
+        };
+        if (programmatic)
+            submit.template operator()<true>();
+        else
+            submit.template operator()<false>();
+    };
+    if (layout == Nvfp4ScaleLayout::RowMajor) {
+        launch.template operator()<Nvfp4ScaleLayout::RowMajor>();
+    } else if constexpr (ActivationGeometry::kGroupsPerRow % kNvfp4ScaleTileGroups == 0) {
+        if (layout == Nvfp4ScaleLayout::Tiled128)
+            launch.template operator()<Nvfp4ScaleLayout::Tiled128>();
+        else
+            launch.template operator()<Nvfp4ScaleLayout::Tiled256>();
+    } else {
         throw std::invalid_argument("nvfp4 A4 tiled scales need K groups in whole tiles");
     }
-    nvfp4_a4_quantize_kernel<ActivationGeometry, kThreads, Nvfp4ScaleLayout::RowMajor>
-        <<<blocks, kThreads, 0, stream>>>(input, workspace.codes, workspace.scales, tokens,
-                                          written_tokens, weight.input_scale);
     CUDA_CHECK(cudaGetLastError());
 }
 
 } // namespace
 
 void launch_nvfp4_a4_quantize(const Tensor& x, const Weight& weight, Nvfp4A4Workspace workspace,
-                              Nvfp4ScaleLayout layout, cudaStream_t stream) {
+                              Nvfp4ScaleLayout layout, cudaStream_t stream, bool programmatic) {
     if (workspace.codes == nullptr || workspace.scales == nullptr) {
         throw std::invalid_argument("nvfp4 A4 requires caller workspace");
     }
@@ -74,21 +73,26 @@ void launch_nvfp4_a4_quantize(const Tensor& x, const Weight& weight, Nvfp4A4Work
     switch (weight.k) {
 #if NINFER_TARGET_SPARK
     case 4096:
-        launch_quantize_exact<Nvfp4ActivationGeometry<4096>>(x, weight, workspace, layout, stream);
+        launch_quantize_exact<Nvfp4ActivationGeometry<4096>>(x, weight, workspace, layout, stream,
+                                                             programmatic);
         return;
 #endif
     case Nvfp4Activation5120Geometry::kInputRows:
-        launch_quantize_exact<Nvfp4Activation5120Geometry>(x, weight, workspace, layout, stream);
+        launch_quantize_exact<Nvfp4Activation5120Geometry>(x, weight, workspace, layout, stream,
+                                                           programmatic);
         return;
     case Nvfp4Activation6144Geometry::kInputRows:
-        launch_quantize_exact<Nvfp4Activation6144Geometry>(x, weight, workspace, layout, stream);
+        launch_quantize_exact<Nvfp4Activation6144Geometry>(x, weight, workspace, layout, stream,
+                                                           programmatic);
         return;
     case Nvfp4Activation17408Geometry::kInputRows:
-        launch_quantize_exact<Nvfp4Activation17408Geometry>(x, weight, workspace, layout, stream);
+        launch_quantize_exact<Nvfp4Activation17408Geometry>(x, weight, workspace, layout, stream,
+                                                            programmatic);
         return;
 #if NINFER_TARGET_RTX5090
     case Nvfp4Activation14336Geometry::kInputRows:
-        launch_quantize_exact<Nvfp4Activation14336Geometry>(x, weight, workspace, layout, stream);
+        launch_quantize_exact<Nvfp4Activation14336Geometry>(x, weight, workspace, layout, stream,
+                                                            programmatic);
         return;
 #endif
     default:

@@ -1,4 +1,5 @@
 #include "core/weight.h"
+#include "core/platform.h"
 #include "ops/linear_attention/gated_delta_net/input_conv/nvfp4/launch.h"
 #include "core/device.h"
 #include "ops/linear/common/output.cuh"
@@ -17,10 +18,10 @@ using M64N128           = Nvfp4A4MmaSchedule<64, 128, 256, 4, 2, 2, 1>;
 using M128N128Pipelined = Nvfp4A4MmaSchedule<128, 128, 256, 4, 2, 2, 1>;
 using M128N128Resident  = Nvfp4A4MmaSchedule<128, 128, 256, 4, 2, 1, 2>;
 
-template <class Schedule>
+template <class Schedule, bool Programmatic = false>
 void launch_gemm(const Weight& weight, Tensor& qkv, Tensor& z, Nvfp4A4Workspace workspace,
                  std::int32_t tokens, cudaStream_t stream) {
-    launch_nvfp4_a4_mma<Nvfp4ScheduleInstance<Schedule, Geometry::kInputRows>>(
+    launch_nvfp4_a4_mma<Nvfp4ScheduleInstance<Schedule, Geometry::kInputRows>, Programmatic>(
         nvfp4_a4_operands(weight, workspace, tokens, Nvfp4ScaleLayout::RowMajor),
         LinearBf16SegmentedOutput<10240, 6144>{static_cast<__nv_bfloat16*>(qkv.data),
                                                static_cast<__nv_bfloat16*>(z.data)},
@@ -40,9 +41,12 @@ using Launcher = void (*)(const Weight&, Tensor&, Tensor&, Nvfp4A4Workspace, std
 struct Plan {
     Nvfp4ScaleLayout scales;
     Launcher launch;
+    bool programmatic = false;
 };
 
 Plan select_projection(int tokens) {
+    if (NINFER_TARGET_RTX5090 && tokens <= 16)
+        return {Nvfp4ScaleLayout::RowMajor, launch_gemm<M32N64, true>, true};
     if (tokens >= 512) return {Nvfp4ScaleLayout::Tiled256, launch_tma};
     if (tokens <= 64) return {Nvfp4ScaleLayout::RowMajor, launch_gemm<M32N64>};
     if (tokens <= 96) return {Nvfp4ScaleLayout::RowMajor, launch_gemm<M32N128>};
@@ -55,7 +59,7 @@ Plan select_projection(int tokens) {
 void launch_nvfp4_gdn_input_a4(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                                Nvfp4A4Workspace workspace, cudaStream_t stream) {
     const auto plan = select_projection(x.ne[1]);
-    launch_nvfp4_a4_quantize(x, weight, workspace, plan.scales, stream);
+    launch_nvfp4_a4_quantize(x, weight, workspace, plan.scales, stream, plan.programmatic);
     plan.launch(weight, qkv, z, workspace, x.ne[1], stream);
 }
 } // namespace ninfer::ops::detail

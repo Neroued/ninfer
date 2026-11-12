@@ -25,10 +25,10 @@ int up_token_tile(UpSchedule);
 struct Plan {
     DownSchedule down;
     UpEncoding up_encoding;
+    UpSchedule up;
+    int down_columns;
 
     bool down_a8() const { return down >= DownSchedule::A8Segmented; }
-
-    UpSchedule up;
 
     bool up_a8() const { return up_encoding != UpEncoding::None; }
 

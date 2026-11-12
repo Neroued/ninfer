@@ -19,11 +19,12 @@ void add_fp8_mix_cases(OpSuite& suite) {
         std::vector<Case> cases;
         for (bool final : {false, true}) {
             if (pattern == f::Pattern::Dense) {
-                for (int m : {1,   4,   5,   16,  17,  32,  33,   34,   64,   65,  66,
-                              128, 129, 130, 320, 321, 322, 1024, 1025, 1026, 2048})
+                for (int m : {1,  2,   4,   5,   16,  17,  32,  33,   34,   64,   65,
+                              66, 128, 129, 130, 320, 321, 322, 1024, 1025, 1026, 2048})
                     cases.push_back({m, final, m == 1 || m == 128 || m == 129 || m == 2048,
                                      ops::LinearPolicy::AllowA8});
                 cases.push_back({1, final, false, ops::LinearPolicy::A16Only});
+                cases.push_back({2, final, true, ops::LinearPolicy::A16Only});
                 cases.push_back({4, final, true, ops::LinearPolicy::A16Only});
                 cases.push_back({512, final, true, ops::LinearPolicy::A16Only});
                 cases.push_back({16, final, true, ops::LinearPolicy::A16Only, true});

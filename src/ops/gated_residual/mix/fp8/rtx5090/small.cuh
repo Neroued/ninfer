@@ -1,16 +1,83 @@
 #pragma once
 
 #include "ops/gated_residual/mix/fp8/kernel/output.cuh"
-#include "ops/linear/kernels/fp8/fp8_a8_mma_common.cuh"
+#include "ops/linear/kernels/fp8/fp8_a8_tma_mma.cuh"
 #include "ops/common/cuda/pipeline.cuh"
 
 namespace ninfer::ops::detail::hc::mix::fp8 {
 
 inline constexpr int kSegmentThreads = 64, kSegmentK = kTotal / kDownPartitions;
-using SegmentedDown =
-    Fp8A8TmaSplitKSchedule<Fp8A8TmaMmaSchedule<kSmallColumns, 32, 128, 1, 2, 3, 2>, 340,
-                           kDownPartitions, 1>;
-static_assert(kSegmentK % SegmentedDown::kBlockK == 0);
+
+template <int Columns>
+struct SmallDownSchedule : Fp8A8TmaMmaSchedule<Columns, 32, 128, Columns / 16, 2, 2, 1> {
+    static constexpr std::size_t kPartialBytes =
+        std::size_t(kRank) * kDownPartitions * Columns * sizeof(float);
+};
+
+// Every CTA owns one fixed row/K partition and publishes raw FP32 partials.
+// Partition scaling and nonlinearities belong to finish_small_down.
+template <int Columns>
+__global__ __launch_bounds__(SmallDownSchedule<Columns>::kThreads,
+                             1) void down_small(const __grid_constant__ Fp8TmaDescriptors maps,
+                                                float* partials) {
+    using S            = SmallDownSchedule<Columns>;
+    constexpr int Rows = S::kBlockRows, K = S::kBlockK, Stages = S::kStages;
+    constexpr int Steps = kSegmentK / K;
+    static_assert(kSegmentK % K == 0 && kRank % Rows == 0);
+    extern __shared__ __align__(128) unsigned char storage[];
+    auto* x           = storage;
+    auto* w           = x + Stages * Columns * K;
+    auto* full        = reinterpret_cast<std::uint64_t*>(storage + S::kStorageBytes);
+    auto* empty       = full + Stages;
+    const int row     = blockIdx.x / kDownPartitions * Rows;
+    const int first_k = blockIdx.x % kDownPartitions * Steps;
+    if (threadIdx.x == 0) {
+#pragma unroll
+        for (int stage = 0; stage < Stages; ++stage) {
+            common::cta_mbarrier_init(full + stage, 1);
+            common::cta_mbarrier_init(empty + stage, S::kConsumerWarps);
+        }
+        common::cta_mbarrier_fence_init();
+    }
+    __syncthreads();
+    if (threadIdx.x < S::kProducerThreads) {
+        if (threadIdx.x == 0) {
+#pragma unroll
+            for (int kt = 0; kt < Steps; ++kt) {
+                const int stage = kt % Stages;
+                common::cta_mbarrier_wait(empty + stage, 1U ^ ((kt / Stages) & 1U));
+                common::cta_mbarrier_arrive_expect_tx(full + stage, (Columns + Rows) * K);
+                common::tma_load_2d(x + stage * Columns * K, &maps.activation, (first_k + kt) * K,
+                                    0, full + stage);
+                common::tma_load_2d(w + stage * Rows * K, &maps.weight, (first_k + kt) * K, row,
+                                    full + stage);
+            }
+        }
+        return;
+    }
+    const int warp = (threadIdx.x - S::kProducerThreads) / 32, lane = threadIdx.x % 32;
+    float sum[S::kMmaTokens][S::kMmaRows][4]{};
+#pragma unroll
+    for (int kt = 0; kt < Steps; ++kt) {
+        const int stage = kt % Stages;
+        common::cta_mbarrier_wait(full + stage, (kt / Stages) & 1U);
+        fp8_mma_compute_stage<S>(x + stage * Columns * K, w + stage * Rows * K, sum, warp, lane);
+        __syncwarp();
+        if (lane == 0) common::cta_mbarrier_arrive(empty + stage);
+    }
+#pragma unroll
+    for (int mt = 0; mt < S::kMmaTokens; ++mt) {
+        const int token = warp / S::kWarpsRows * S::kWarpTokens + mt * 16 + lane / 4;
+#pragma unroll
+        for (int mr = 0; mr < S::kMmaRows; ++mr) {
+            const int r = warp % S::kWarpsRows * S::kWarpRows + mr * 8 + 2 * (lane % 4);
+            auto* out   = partials + blockIdx.x * Columns * Rows + token * Rows + r;
+            *reinterpret_cast<float2*>(out) = make_float2(sum[mt][mr][0], sum[mt][mr][1]);
+            *reinterpret_cast<float2*>(out + 8 * Rows) =
+                make_float2(sum[mt][mr][2], sum[mt][mr][3]);
+        }
+    }
+}
 
 inline int down_control_elements(int columns, bool injection) {
     return columns * kDownPartitions * (injection ? kStreams + 1 : 1);
@@ -85,7 +152,7 @@ __global__ __launch_bounds__(kSegmentThreads) void encode_segments(const __nv_bf
 
 // TMA partials have [row tile, partition, token, row] order. The SIMT route
 // uses [partition, token, row]. Both finish at the same public FP32 nonlinearities.
-template <bool Segmented, bool EncodeUp, bool Injection>
+template <bool Segmented, bool EncodeUp, bool Injection, int PartialColumns = kSmallColumns>
 __global__ __launch_bounds__(kUpGroup) void finish_small_down(
     const float* partial, const __nv_bfloat16* weights, const float* control, __nv_bfloat16* u,
     std::uint8_t* codes, float* scales, float* injection, int columns) {
@@ -95,10 +162,11 @@ __global__ __launch_bounds__(kUpGroup) void finish_small_down(
 #pragma unroll
     for (int part = 0; part < kDownPartitions; ++part) {
         if constexpr (Segmented) {
-            constexpr int Rows = SegmentedDown::kBlockRows, Tokens = SegmentedDown::kBlockTokens;
-            const float value = partial[((row / Rows) * kDownPartitions + part) * Tokens * Rows +
+            constexpr int Rows   = SmallDownSchedule<PartialColumns>::kBlockRows;
+            constexpr int Tokens = PartialColumns;
+            const float value    = partial[((row / Rows) * kDownPartitions + part) * Tokens * Rows +
                                         token * Rows + row % Rows];
-            sum               = fmaf(value, control[token * kDownPartitions + part], sum);
+            sum                  = fmaf(value, control[token * kDownPartitions + part], sum);
         } else {
             sum += partial[(std::int64_t(part) * columns + token) * (kRank + kStreams) + row];
         }
@@ -132,12 +200,17 @@ __global__ __launch_bounds__(kUpGroup) void finish_small_down(
 }
 
 template <int Tokens>
-using GroupedUpSchedule =
-    Fp8A8MmaSchedule<Tokens, 32, kUpGroup, Tokens / 16, 64 / Tokens, 2, 2, Cache::cg, Cache::ca,
-                     Fp8MmaFragmentPipeline::PingPong, Fp8MmaRaster::TokenFast>;
+struct GroupedUpSchedule
+    : Fp8A8MmaSchedule<Tokens, 32, kUpGroup, Tokens / 16, 64 / Tokens, 2, 2, Cache::cg, Cache::ca,
+                       Fp8MmaFragmentPipeline::PingPong, Fp8MmaRaster::TokenFast> {
+    static constexpr int kScaleOffset       = 2 * (Tokens + 32) * kUpGroup;
+    static constexpr int kWeightScaleOffset = kScaleOffset + Tokens * (kRank / kUpGroup) * 4;
+    static constexpr int kNormalizedOffset  = kWeightScaleOffset + 32 * 2;
+    static constexpr int kSharedBytes       = kNormalizedOffset + Tokens * 32 * 2;
+};
 
-// The five K groups are accumulated in FP32 with their own activation scales.
-// Four stream gates stay in one CTA and share the existing fused output epilogue.
+// Scales and normalized values enter shared memory with the first K group.
+// Their consumers then stay off the global-memory dependency path.
 template <int Tokens>
 __global__ __launch_bounds__(128, 2) void grouped_up_kernel(const std::uint8_t* input,
                                                             const float* input_scales,
@@ -149,24 +222,49 @@ __global__ __launch_bounds__(128, 2) void grouped_up_kernel(const std::uint8_t* 
     constexpr int Threads = S::kThreads;
     auto* shared          = common::shared_storage<S::kSharedBytes>();
     auto* x               = shared;
-    auto* w               = x + 2 * Tokens * Group;
+    auto* w               = x + S::kStages * Tokens * Group;
+    auto* scales          = reinterpret_cast<float*>(shared + S::kScaleOffset);
+    auto* row_scales      = reinterpret_cast<__nv_bfloat16*>(shared + S::kWeightScaleOffset);
+    auto* normalized      = reinterpret_cast<__nv_bfloat16*>(shared + S::kNormalizedOffset);
     const int tid = threadIdx.x, warp = tid / 32, lane = tid % 32;
     const int row_begin = blockIdx.x * Rows;
     const auto stage    = [&](int slot, int group) {
-        for (int task = tid; task < (Tokens + Rows) * (Group / 16); task += Threads) {
-            int row     = task / (Group / 16);
-            const int k = task % (Group / 16) * 16;
-            if (row < Tokens) {
-                const bool valid = row < output.columns;
+#pragma unroll
+        for (int i = 0; i < Rows * (Group / 16) / Threads; ++i) {
+            const int row    = tid / (Group / 16) + i * Threads / (Group / 16);
+            const int k      = tid % (Group / 16) * 16;
+            const int parent = row / (Rows / 4) * kWidth + row_begin / 4 + row % (Rows / 4);
+            common::cp_async<16, Cache::cg>(w + (slot * Rows + row) * Group +
+                                                fp8_mma_shared_byte<S>(row, k),
+                                            weights + parent * kRank + group * Group + k);
+        }
+#pragma unroll
+        for (int i = 0; i < Tokens * (Group / 16) / Threads; ++i) {
+            const int row    = tid / (Group / 16) + i * Threads / (Group / 16);
+            const int k      = tid % (Group / 16) * 16;
+            const bool valid = row < output.columns;
+            common::cp_async_zfill<16, Cache::ca>(
+                x + (slot * Tokens + row) * Group + fp8_mma_shared_byte<S>(row, k),
+                input + (valid ? row : 0) * kRank + group * Group + k, valid ? 16 : 0);
+        }
+        if (group == 0) {
+            if (tid < Tokens * Groups / 4) {
+                const int bytes = min(16, max(0, (output.columns * Groups - tid * 4) * 4));
+                common::cp_async_zfill<16, Cache::ca>(scales + tid * 4,
+                                                      input_scales + (bytes ? tid * 4 : 0), bytes);
+            }
+            if (tid < kStreams)
+                common::cp_async<16, Cache::ca>(row_scales + tid * (Rows / kStreams),
+                                                weight_scales + tid * kWidth +
+                                                    row_begin / kStreams);
+            if (tid < Tokens * kStreams) {
+                const int token = tid / kStreams, stream = tid % kStreams;
+                const bool valid = token < output.columns;
                 common::cp_async_zfill<16, Cache::ca>(
-                    x + (slot * Tokens + row) * Group + fp8_mma_shared_byte<S>(row, k),
-                    input + (valid ? row : 0) * kRank + group * Group + k, valid ? 16 : 0);
-            } else {
-                row -= Tokens;
-                const int parent = row / (Rows / 4) * kWidth + row_begin / 4 + row % (Rows / 4);
-                common::cp_async<16, Cache::cg>(w + (slot * Rows + row) * Group +
-                                                       fp8_mma_shared_byte<S>(row, k),
-                                                   weights + parent * kRank + group * Group + k);
+                    normalized + A8UpEpilogue::at<Tokens>(stream * (Rows / kStreams), token),
+                    output.z + std::int64_t(valid ? token : 0) * kTotal + stream * kWidth +
+                        row_begin / kStreams,
+                    valid ? 16 : 0);
             }
         }
         common::cp_commit();
@@ -187,9 +285,9 @@ __global__ __launch_bounds__(128, 2) void grouped_up_kernel(const std::uint8_t* 
                                  lane);
 #pragma unroll
         for (int mt = 0; mt < S::kMmaTokens; ++mt) {
-            const int t    = warp / S::kWarpsRows * S::kWarpTokens + mt * 16 + lane / 4;
-            const float s0 = t < output.columns ? input_scales[t * Groups + group] : 0;
-            const float s1 = t + 8 < output.columns ? input_scales[(t + 8) * Groups + group] : 0;
+            const int token = warp / S::kWarpsRows * S::kWarpTokens + mt * 16 + lane / 4;
+            const float s0  = scales[token * Groups + group];
+            const float s1  = scales[(token + 8) * Groups + group];
 #pragma unroll
             for (int mr = 0; mr < S::kMmaRows; ++mr) {
                 sum[mt][mr][0] = fmaf(value[mt][mr][0], s0, sum[mt][mr][0]);
@@ -201,22 +299,12 @@ __global__ __launch_bounds__(128, 2) void grouped_up_kernel(const std::uint8_t* 
         __syncthreads();
         if (group + 2 < Groups) stage(slot, group + 2);
     }
-#pragma unroll
-    for (int mt = 0; mt < S::kMmaTokens; ++mt) {
-#pragma unroll
-        for (int mr = 0; mr < S::kMmaRows; ++mr) {
-            const int row     = warp % S::kWarpsRows * S::kWarpRows + mr * 8 + 2 * (lane % 4);
-            const int parent  = row / (Rows / 4) * kWidth + row_begin / 4 + row % (Rows / 4);
-            const auto scales = __bfloat1622float2(
-                *reinterpret_cast<const __nv_bfloat162*>(weight_scales + parent));
-            sum[mt][mr][0] *= scales.x;
-            sum[mt][mr][1] *= scales.y;
-            sum[mt][mr][2] *= scales.x;
-            sum[mt][mr][3] *= scales.y;
-        }
-    }
-    __syncthreads();
-    A8UpEpilogue{}.template finish_tile<S, false>(output, shared, sum, row_begin, 0, kTotal,
-                                                  output.columns);
+    const auto load = [&](int row, int token, int) {
+        return A8UpEpilogue::GateInput{
+            __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(
+                normalized + A8UpEpilogue::at<Tokens>(row, token))),
+            __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(row_scales + row))};
+    };
+    A8UpEpilogue::finish<S, true>(output, shared, sum, row_begin, 0, load);
 }
 } // namespace ninfer::ops::detail::hc::mix::fp8

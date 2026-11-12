@@ -46,7 +46,8 @@ int verify_equal(const std::string& label, const std::vector<std::uint16_t>& lhs
 }
 
 int run_case(std::int32_t value_heads, std::int32_t width, std::int32_t batch,
-             std::vector<std::int32_t> valid_columns, std::uint32_t seed) {
+             std::vector<std::int32_t> valid_columns, std::uint32_t seed,
+             bool minimum_alignment = false) {
     const std::int32_t kQkHeads = value_heads == 24 ? 8 : 16;
     const bool dense            = valid_columns.empty();
     if (dense) { valid_columns.assign(static_cast<std::size_t>(batch), width); }
@@ -80,9 +81,18 @@ int run_case(std::int32_t value_heads, std::int32_t width, std::int32_t batch,
         initial_slots[static_cast<std::size_t>(row)] = row == 7 ? 7 : (row * 3 + 7) % slots;
     }
 
-    DeviceBuffer device_q        = to_device(q_bits);
-    DeviceBuffer device_k        = to_device(k_bits);
-    DeviceBuffer device_v        = to_device(v_bits);
+    const std::size_t qk_offset = minimum_alignment ? 8 : 0;
+    const std::size_t v_offset  = minimum_alignment ? 2 : 0;
+    const auto upload           = [&](const std::vector<std::uint16_t>& bits, std::size_t offset) {
+        DeviceBuffer buffer(ninfer::test::cuda_environment().context.device(),
+                                      offset + bits.size() * sizeof(std::uint16_t));
+        CUDA_CHECK(cudaMemcpy(static_cast<std::byte*>(buffer.data()) + offset, bits.data(),
+                                        bits.size() * sizeof(std::uint16_t), cudaMemcpyHostToDevice));
+        return buffer;
+    };
+    DeviceBuffer device_q        = upload(q_bits, qk_offset);
+    DeviceBuffer device_k        = upload(k_bits, qk_offset);
+    DeviceBuffer device_v        = upload(v_bits, v_offset);
     DeviceBuffer device_g        = to_device(g);
     DeviceBuffer device_beta     = to_device(beta);
     DeviceBuffer reference_state = to_device(state);
@@ -109,9 +119,12 @@ int run_case(std::int32_t value_heads, std::int32_t width, std::int32_t batch,
     value_record.fill(0xff);
     gate_record.fill(0xff);
 
-    Tensor q(device_q.span(), DType::BF16, {kStateDim, kQkHeads, width, batch});
-    Tensor k(device_k.span(), DType::BF16, {kStateDim, kQkHeads, width, batch});
-    Tensor v(device_v.span(), DType::BF16, {kStateDim, value_heads, width, batch});
+    Tensor q(device_q.span().subspan(qk_offset, qk_elements * 2), DType::BF16,
+             {kStateDim, kQkHeads, width, batch});
+    Tensor k(device_k.span().subspan(qk_offset, qk_elements * 2), DType::BF16,
+             {kStateDim, kQkHeads, width, batch});
+    Tensor v(device_v.span().subspan(v_offset, value_elements * 2), DType::BF16,
+             {kStateDim, value_heads, width, batch});
     Tensor g_tensor(device_g.span(), DType::FP32, {value_heads, width, batch});
     Tensor beta_tensor(device_beta.span(), DType::FP32, {value_heads, width, batch});
     Tensor reference_states(reference_state.span(), DType::FP32,
@@ -205,8 +218,8 @@ int run_case(std::int32_t value_heads, std::int32_t width, std::int32_t batch,
         CUDA_CHECK(cudaGraphLaunch(executable, stream));
         CUDA_CHECK(cudaStreamSynchronize(stream));
         for (auto& bits : q_bits) bits ^= 0x8000U;
-        CUDA_CHECK(cudaMemcpyAsync(device_q.data(), q_bits.data(), device_q.size(),
-                                   cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(
+            cudaMemcpyAsync(q.data, q_bits.data(), q.bytes(), cudaMemcpyHostToDevice, stream));
         for (auto& slot : initial_slots) slot = (slot + 3) % slots;
         initial_offsets = history.record_offsets(initial_slots);
         CUDA_CHECK(cudaMemcpyAsync(device_initial.data(), initial_offsets.data(),
@@ -303,9 +316,9 @@ int run_case(std::int32_t value_heads, std::int32_t width, std::int32_t batch,
         std::cerr << "replay record modified source state" << suffix << "\n";
         ++failures;
     }
-    if (from_device<std::uint16_t>(device_q, qk_elements) != q_bits ||
-        from_device<std::uint16_t>(device_k, qk_elements) != k_bits ||
-        from_device<std::uint16_t>(device_v, value_elements) != v_bits) {
+    if (from_device<std::uint16_t>(q.data, qk_elements) != q_bits ||
+        from_device<std::uint16_t>(k.data, qk_elements) != k_bits ||
+        from_device<std::uint16_t>(v.data, value_elements) != v_bits) {
         std::cerr << "replay record modified inputs" << suffix << "\n";
         ++failures;
     }
@@ -333,6 +346,8 @@ int main(int argc, char** argv) {
         add(48, width, 8, valid, 1760U + width);
     }
     add(48, 5, 3, {5, 3, 1}, 1791U);
+    suite.add("gdn_record/h48/minimum-alignment/graph",
+              [] { return run_case(48, 9, 2, {9, 3}, 1793U, true); }, {{"execution", "graph"}});
 
     for (int b = 1; b <= 8; ++b)
         for (int t = 2; t <= 16; ++t) {

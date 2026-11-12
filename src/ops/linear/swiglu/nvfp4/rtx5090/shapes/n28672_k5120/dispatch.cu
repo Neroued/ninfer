@@ -13,8 +13,13 @@ struct FusedSchedule : Nvfp4ScheduleInstance<Schedule, 5120> {};
 
 using Gemv =
     Nvfp4A16GemvSchedule<8, 2, 16, 4, Nvfp4ScaleAccess::Direct, Nvfp4CodeCache::Default, 2>;
+template <int Capacity>
+using Small =
+    Nvfp4ScheduleInstance<Nvfp4A16SlicedKMmaSchedule<8, 8, 2, Cache::ca, Cache::cg,
+                                                     Nvfp4ActivationStage::ActiveOnly, 2, true>,
+                          5120, Capacity>;
 using T16  = Nvfp4A4MmaSchedule<16, 64, 512, 1, 4, 3, 2>;
-using T32  = Nvfp4A4MmaSchedule<32, 128, 256, 2, 4, 2, 1>;
+using T32  = Nvfp4A4MmaSchedule<32, 64, 512, 2, 4, 2, 1>;
 using T64  = Nvfp4A4MmaSchedule<64, 64, 512, 2, 4, 2, 1>;
 using T128 = Nvfp4A4MmaSchedule<128, 64, 256, 4, 2, 2, 1>;
 
@@ -52,9 +57,12 @@ void launch_nvfp4_swiglu_n28672_k5120(const Tensor& x, const Weight& w, Tensor& 
         if (tokens == 1)
             launch_nvfp4_a16_gemv<FusedSchedule<Gemv>>(p, output, SwiGluPairEpilogue{}, stream,
                                                        SwiGluBranchRows<1>{});
+        else if (tokens <= 4)
+            launch_nvfp4_a16_sliced_k_mma<Small<4>>(p, output, SwiGluPairEpilogue{}, stream,
+                                                    SwiGluBranchRows<8>{});
         else if (tokens <= 8)
-            launch_nvfp4_a16_sliced_k_mma<FusedSchedule<Nvfp4SlicedInstance<8, 8, 2>>>(
-                p, output, SwiGluPairEpilogue{}, stream, SwiGluBranchRows<8>{});
+            launch_nvfp4_a16_sliced_k_mma<Small<8>>(p, output, SwiGluPairEpilogue{}, stream,
+                                                    SwiGluBranchRows<8>{});
         else
             launch_nvfp4_a16_sliced_k_mma<FusedSchedule<Nvfp4SlicedInstance<16, 8, 2>>>(
                 p, output, SwiGluPairEpilogue{}, stream, SwiGluBranchRows<8>{});

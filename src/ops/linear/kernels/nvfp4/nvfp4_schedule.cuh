@@ -233,8 +233,10 @@ enum class Nvfp4ActivationStage : std::uint8_t { ActiveOnly, PaddedZero };
 
 template <int KWarps, int TileTokens, int MinBlocksPerSm, Cache ActivationCache = Cache::ca,
           Cache WeightCache                    = Cache::cg,
-          Nvfp4ActivationStage ActivationStage = Nvfp4ActivationStage::ActiveOnly, int Stages = 1>
+          Nvfp4ActivationStage ActivationStage = Nvfp4ActivationStage::ActiveOnly, int Stages = 1,
+          bool VectorCodes = false>
 struct Nvfp4A16SlicedKMmaSchedule {
+    static constexpr bool kVectorCodes = VectorCodes;
     static_assert(KWarps == 2 || KWarps == 4 || KWarps == 8 || KWarps == 16);
     static_assert(TileTokens > 0 && TileTokens % 8 == 0);
     static_assert(Stages == 1 || Stages == 2);

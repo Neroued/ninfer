@@ -184,13 +184,96 @@ struct Program {
     std::size_t device_capacity      = 4096;
     bool transfer_in_progress        = false;
     std::vector<Handle> placement_holders;
-    std::uint64_t checkpoint_revision = 1;
-    ninfer::models::context::MetadataBudget metadata{16 * 1024 * 1024};
+    std::uint64_t checkpoint_revision                = 1;
+    std::uint64_t maintenance_bytes                  = 0;
+    ninfer::runtime::ContextStart maintenance_result = ninfer::runtime::ContextStart::Stale;
+    mutable ninfer::models::context::MetadataBudget metadata{16 * 1024 * 1024};
     mutable ninfer::models::context::RecoveryIndex<Handle> recovery_index{metadata};
     using ReleaseInventory = ninfer::models::context::ReleaseInventory<Usage, Handle>;
     mutable std::shared_ptr<const ReleaseInventory> last_inventory;
     mutable std::uint64_t score_queries = 0, scored_handles = 0;
     mutable std::uint64_t host_plan_builds = 0;
+    mutable std::uint64_t rebuild_quotes   = 0;
+    mutable std::uint64_t recovery_scans   = 0;
+
+    using RecoveryAccount = ninfer::models::context::MetadataAccount;
+    using RecoveryTopology =
+        ninfer::models::context::RecoveryIndex<ninfer::runtime::RecoveryHandle>;
+    using RecoveryPoint = ninfer::runtime::RecoveryPoint<Handle>;
+
+    auto& recovery_budget() const { return metadata; }
+
+    class ValueIdentity final : public ninfer::runtime::RecoveryIdentity {
+    public:
+        ValueIdentity(const Program& owner, Key tokens, std::uint32_t end)
+            : ninfer::runtime::RecoveryIdentity(&owner, end, 0), program_(owner),
+              tokens_(std::move(tokens)) {
+            hashes_.push_back({0, 0});
+            for (auto token : tokens_) hashes_.push_back({hashes_.back()[0] * 131 + token, 0});
+        }
+
+        std::array<std::uint64_t, 2> digest(std::uint32_t f) const override {
+            return hashes_.at(f);
+        }
+
+        ninfer::runtime::PrefillWork rebuild(std::uint32_t begin) const override {
+            ++program_.rebuild_quotes;
+            return ninfer::runtime::make_prefill_work(begin, frontier - begin, 0, 0, 1024);
+        }
+    private:
+        bool exact_prefix(const ninfer::runtime::RecoveryIdentity& other) const override {
+            const auto* value = dynamic_cast<const ValueIdentity*>(&other);
+            return value &&
+                   std::equal(tokens_.begin(), tokens_.begin() + frontier, value->tokens_.begin());
+        }
+
+        const Program& program_;
+        Key tokens_;
+        std::vector<std::array<std::uint64_t, 2>> hashes_;
+    };
+
+    std::vector<RecoveryPoint> recovery_points(const Usage& removed             = {},
+                                               std::span<const Handle> selected = {}) const {
+        ++recovery_scans;
+        std::vector<RecoveryPoint> result;
+        for (std::uint32_t i = 0; i < contents.size(); ++i) {
+            const Handle h{i};
+            if (!valid_checkpoint(h)) continue;
+            if (!selected.empty() &&
+                std::find(selected.begin(), selected.end(), h) == selected.end())
+                continue;
+            auto value       = std::make_shared<ninfer::runtime::RecoveryDescription>();
+            value->identity  = std::make_shared<ValueIdentity>(*this, contents[i].tokens,
+                                                               contents[i].tokens.size());
+            value->placement = contents[i].placement;
+            for (auto target : available_placements) {
+                const auto source =
+                    inspect_source(Base{contents[i].tokens}, h, false, {}, {}, target);
+                if (!source) continue;
+                auto transfers = source->transfers;
+                if (std::find(removed.records.begin(), removed.records.end(), i) !=
+                        removed.records.end() &&
+                    contents[i].demotion_bytes && *contents[i].demotion_bytes)
+                    transfers.push_back(
+                        {.direction   = ninfer::runtime::ContextTransferDirection::HostToDevice,
+                         .image_count = 1,
+                         .work        = {*contents[i].demotion_bytes, 1}});
+                value->restores.push_back({target, std::move(transfers)});
+            }
+            result.push_back({h, std::move(value)});
+        }
+        return result;
+    }
+
+    std::shared_ptr<const ninfer::runtime::RecoveryDescription> recovery_target(
+        const Base& base, std::uint32_t frontier, PlacementId placement,
+        ninfer::runtime::CaptureStorage = ninfer::runtime::CaptureStorage::Device) const {
+        auto value       = std::make_shared<ninfer::runtime::RecoveryDescription>();
+        value->identity  = std::make_shared<ValueIdentity>(*this, base.tokens, frontier);
+        value->placement = placement;
+        value->restores.push_back({placement, {}});
+        return value;
+    }
 
     struct Recovery : ninfer::models::context::RecoveryEvaluation<Handle> {
         using Core = ninfer::models::context::RecoveryEvaluation<Handle>;
@@ -310,8 +393,15 @@ struct Program {
                  assessment.demand.host_bytes ? released.host_bytes : 0}};
     }
 
+    std::vector<ninfer::runtime::ContextTransferRequirement>
+    maintenance_work(const Assessment&) const {
+        if (!maintenance_bytes) return {};
+        return {{.direction = ninfer::runtime::ContextTransferDirection::DeviceToDevice,
+                 .work      = {maintenance_bytes, 1}}};
+    }
+
     ninfer::runtime::ContextStart start_maintenance(const Assessment&) {
-        throw std::logic_error("the policy fixture does not require relocation");
+        return maintenance_result;
     }
 
     std::size_t checkpoint_extent() const { return contents.size(); }
@@ -495,7 +585,7 @@ struct Program {
             result.push_back({handle,
                               *content.demotion_bytes * bytes,
                               {handle},
-                              {.device_bytes = bytes},
+                              {.device_bytes = bytes, .records = {handle.index}},
                               pages ? std::vector<std::pair<Handle, std::uint32_t>>{{handle, pages}}
                                     : std::vector<std::pair<Handle, std::uint32_t>>{}});
         }
@@ -645,6 +735,14 @@ struct Program {
                 return false;
         }
         return bytes <= usage.capacity.host_bytes - usage.occupied.host_bytes + released.host_bytes;
+    }
+
+    std::vector<ninfer::runtime::ContextTransferRequirement>
+    demotion_work(const Demotion& plan, std::span<const Handle> = {}) const {
+        if (!plan.host_bytes) return {};
+        return {{.direction   = ninfer::runtime::ContextTransferDirection::DeviceToHost,
+                 .image_count = 1,
+                 .work        = {plan.host_bytes, 1}}};
     }
 
     ninfer::runtime::ContextStart start_demote(const Demotion& plan,
@@ -1788,10 +1886,10 @@ void test_optional_capture_budget_spans_host_and_device_actions() {
     const auto host_victims = f.cache.host_victims(f.program, 64, {}, {}, {}, admission, &decision);
     require(host_victims && *host_victims == std::vector<Handle>{host},
             "first Host action did not fit optional capture's recovery budget");
-    const auto loss = f.cache.release_cost(f.program, *host_victims);
+    auto quote = f.cache.quote_release(f.program, *host_victims, decision);
     for (const auto victim : *host_victims)
         require(f.program.release_checkpoint(victim), "prepared capture victim was not released");
-    f.cache.adopt_release(f.program, *host_victims, decision, loss);
+    f.cache.adopt_release(f.program, *host_victims, decision, std::move(quote));
     require(f.cache.reclaim(f.program, f.program.pressure(1), {}, decision) ==
                     ninfer::runtime::ReclaimProgress::Blocked &&
                 f.program.valid_checkpoint(device),
@@ -1828,6 +1926,26 @@ void test_deeper_survivor_cannot_replace_an_earlier_recovery_point() {
                 f.program, 64, {}, {}, {},
                 f.cache.capture_admission(f.program, 0, incoming, 20, Role::SharedPrefix)),
             "a later recurrent state was incorrectly used to recover an earlier input frontier");
+}
+
+void test_later_snapshot_joins_required_recovery_decision() {
+    Fixture f(64);
+    const auto original = f.program.add(tokens(10));
+    f.publish(original);
+    auto cursor = f.cache.begin_reclaim(f.program);
+    (void)f.cache.quote_release(f.program, {}, cursor);
+    const auto snapshot = f.program.add(tokens(100, 1000), {f.program.host_block(64)});
+    const auto victims  = f.cache.host_victims(f.program, 64, {}, {&snapshot, 1}, {}, {}, &cursor);
+    require(victims && *victims == std::vector<Handle>{snapshot} &&
+                cursor.ledger->contains(snapshot),
+            "required Host recovery did not include the newly paused snapshot");
+    const auto receipt = f.cache.quote_release(f.program, *victims, cursor);
+    require(receipt.loss_after == 100 && f.program.valid_checkpoint(snapshot),
+            "newly paused recovery obligation was omitted or retired during quotation");
+    require(f.program.release_checkpoint(snapshot), "snapshot revocation failed");
+    f.cache.adopt_release(f.program, *victims, cursor, receipt);
+    require(cursor.ledger->loss_after == 100 && cursor.ledger->paid_actions == 0,
+            "snapshot revocation was not journaled by its required decision");
 }
 
 void test_inherited_owner_heat_cannot_spend_a_full_other_continuation() {
@@ -2225,10 +2343,17 @@ void test_consuming_rewind_resets_proven_progress_to_the_adopted_prefix() {
 
 std::uint64_t recovery_oracle(const Program& program, std::span<const Handle> removed,
                               std::span<const Handle> advertised) {
+    const auto degraded = [&](Handle h) {
+        return std::none_of(advertised.begin(), advertised.end(), [&](auto kept) {
+            return std::find(removed.begin(), removed.end(), kept) == removed.end() &&
+                   program.contents[kept.index].tokens == program.contents[h.index].tokens;
+        });
+    };
     std::uint64_t total = 0;
     for (const auto branch : removed) {
+        if (!degraded(branch)) continue;
         if (std::any_of(removed.begin(), removed.end(), [&](auto other) {
-                return other != branch && program.prefix(branch, other) &&
+                return other != branch && degraded(other) && program.prefix(branch, other) &&
                        (program.contents[branch.index].tokens.size() <
                             program.contents[other.index].tokens.size() ||
                         other.index < branch.index);
@@ -2486,11 +2611,15 @@ void test_independent_host_candidates_reuse_scores() {
             f.publish(f.program.add({i + 1}, {f.program.host_block(1)}));
         (void)f.program.evaluate_recovery({});
         const auto comparisons = f.program.recovery_index.work().exact_comparisons;
+        std::optional<std::uint64_t> first_work;
         for (const auto count : {1U, n / 2}) {
             f.program.score_queries = f.program.scored_handles = 0;
+            f.program.rebuild_quotes                           = 0;
             const auto victims = f.cache.host_victims(f.program, count, {});
-            require(victims && victims->size() == count && f.program.score_queries == n &&
-                        f.program.scored_handles == n &&
+            if (!first_work) first_work = f.program.rebuild_quotes;
+            require(victims && victims->size() == count && f.program.rebuild_quotes >= n &&
+                        f.program.rebuild_quotes <= 8 * n &&
+                        f.program.rebuild_quotes == *first_work &&
                         f.program.recovery_index.work().exact_comparisons == comparisons,
                     "Host trials rescored unrelated selected checkpoints or repeated exact "
                     "identity checks");
@@ -2540,8 +2669,710 @@ void test_preservation_batches_only_until_complete_admission() {
 }
 } // namespace
 
+void test_semantic_loss_and_joint_decision_budget() {
+    {
+        Fixture f(0);
+        const auto parent = f.program.add(tokens(50));
+        auto a = tokens(100), b = tokens(100);
+        b[50]         = 9999;
+        const auto a1 = f.program.add(a, {}, Role::InputReplay);
+        const auto a2 = f.program.add(a, {}, Role::InputReplay);
+        const auto b1 = f.program.add(b, {}, Role::InputReplay);
+        const auto b2 = f.program.add(b, {}, Role::InputReplay);
+        for (auto h : {parent, a1, a2, b1, b2}) f.publish(h);
+        auto cursor = f.cache.begin_reclaim(f.program);
+        require(
+            f.cache.quote_release(f.program, std::array{parent}, cursor).loss_after == 50 &&
+                f.cache.quote_release(f.program, std::array{a1, b1}, cursor).loss_after == 0 &&
+                f.cache.quote_release(f.program, std::array{parent, a1, b1}, cursor).loss_after ==
+                    50,
+            "redundant aliases multiplied their ancestor's retention value");
+    }
+    Fixture f(64);
+    const auto parent = f.program.add(tokens(50), {f.program.host_block(64)});
+    f.program.contents[parent.index].device_state = false;
+    f.program.contents[parent.index].main_pages   = 0;
+    const auto child                              = f.program.add(tokens(100));
+    f.publish(parent);
+    f.publish(child);
+    const Base input{.tokens = tokens(120, 1000)};
+    const auto admission = f.cache.capture_admission(f.program, 0, input, 120, Role::SharedPrefix);
+    auto cursor          = f.cache.begin_reclaim(f.program, admission);
+    const auto joint     = f.cache.capture_victims(f.program, f.program.pressure(1, 64), cursor);
+    require(joint && joint->size() == 2 &&
+                f.cache.quote_release(f.program, *joint, cursor).loss_after == 100,
+            "joint loss differs from the complete branch's reconstruction cost");
+    const auto host = f.cache.host_victims(f.program, 64, {}, {}, {}, admission, &cursor);
+    require(host && *host == std::vector<Handle>{parent}, "wrong first-stage victim");
+    auto quote = f.cache.quote_release(f.program, *host, cursor);
+    auto stale = quote;
+    require(f.program.release_checkpoint(parent), "first-stage release failed");
+    f.cache.adopt_release(f.program, *host, cursor, std::move(quote));
+    bool rejected = false;
+    try {
+        f.cache.adopt_release(f.program, *host, cursor, std::move(stale));
+    } catch (const std::logic_error&) { rejected = true; }
+    require(rejected && cursor.ledger->loss_after == 50,
+            "a repeated receipt changed its decision budget");
+    const auto device = f.cache.capture_victims(f.program, f.program.pressure(1), cursor);
+    require(device && *device == std::vector<Handle>{child},
+            "split execution spent the ancestor loss twice");
+    quote = f.cache.quote_release(f.program, *device, cursor);
+    require(quote.loss_after == 100, "split execution differs from the joint quote");
+    require(f.program.release_checkpoint(child), "second-stage release failed");
+    f.cache.adopt_release(f.program, *device, cursor, std::move(quote));
+    require(cursor.ledger->loss_after == 100, "joint budget was not preserved across domains");
+}
+
+void test_demotion_prices_copy_and_future_restore() {
+    for (auto copy : {1ULL, 4ULL}) {
+        Fixture f(64);
+        ninfer::runtime::ContextMachineCostModel costs;
+        costs.prefill.token_ns_q32                 = ninfer::runtime::kContextCostQ32One;
+        costs.transfer[0].batch_ns                 = copy;
+        costs.transfer[1].batch_ns                 = 7;
+        f.cache                                    = Fixture::Cache(true, costs);
+        const auto h                               = f.program.add(tokens(10));
+        f.program.contents[h.index].demotion_bytes = 8;
+        f.publish(h);
+        require(f.cache.reclaim(f.program, f.program.pressure(1)) ==
+                    ninfer::runtime::ReclaimProgress::Changed,
+                "priced reclamation did not progress");
+        require((copy == 1 && f.program.demoted == std::vector<Handle>{h} &&
+                 f.program.released.empty()) ||
+                    (copy == 4 && f.program.released == std::vector<Handle>{h} &&
+                     f.program.demoted.empty()),
+                "demotion ignored its immediate copy or future Host restore cost");
+    }
+}
+
+void test_unpriced_cost_does_not_create_admission_credit() {
+    Fixture f(0);
+    ninfer::runtime::ContextMachineCostModel costs;
+    costs.prefill.chunk_ns = UINT64_MAX;
+    f.cache                = Fixture::Cache(true, costs);
+    const auto a = f.program.add(tokens(4)), b = f.program.add(tokens(4, 100));
+    f.publish(a);
+    f.publish(b);
+    const Base input{.tokens = tokens(8, 1000)};
+    const auto admission = f.cache.capture_admission(f.program, 0, input, 8, Role::SharedPrefix);
+    const auto cursor    = f.cache.begin_reclaim(f.program, admission);
+    require(!f.cache.capture_victims(f.program, f.program.pressure(1), cursor),
+            "saturated estimates fabricated an optional capture's benefit");
+    require(f.cache.reclaim(f.program, f.program.pressure(3)) ==
+                ninfer::runtime::ReclaimProgress::Changed,
+            "unpriced costs blocked necessary execution or underflowed combined loss");
+}
+
+void test_unpriced_unchanged_component_is_not_a_loss() {
+    namespace rt = ninfer::runtime;
+    Fixture f(64);
+    rt::ContextMachineCostModel costs;
+    costs.prefill.token_ns_q32 = rt::kContextCostQ32One;
+    costs.transfer[1].batch_ns = UINT64_MAX;
+    const auto known           = f.program.add(tokens(10));
+    const auto expensive       = f.program.add(tokens(100000, 100), {f.program.host_block(8)});
+    // Force both absolute rebuild and restore prices to saturate on the long branch.
+    costs.prefill.attention_pair_ns_q32 = UINT64_MAX;
+    const Base small{tokens(1)};
+    const auto short_source = f.program.add(small.tokens);
+    const std::array all{known, expensive, short_source};
+    rt::RecoveryCostEvaluation<Program, Handle> values(f.program, all, nullptr, costs);
+    require(values.total_loss() == 0, "unchanged source sets fabricated an unpriced loss");
+    const auto short_loss = values.loss(std::span(&short_source, 1));
+    require(short_loss != UINT64_MAX && short_loss > 0,
+            "unrelated unpriced history contaminated a finite removal");
+}
+
+void test_capture_and_maintenance_action_accounting() {
+    namespace rt = ninfer::runtime;
+    for (auto copy : {1ULL, 4ULL}) {
+        Fixture f(64);
+        rt::ContextMachineCostModel costs;
+        costs.prefill.token_ns_q32 = rt::kContextCostQ32One;
+        costs.transfer[0].batch_ns = copy;
+        costs.transfer[1].batch_ns = 7;
+        f.cache                    = Fixture::Cache(true, costs);
+        const Base input{tokens(10)};
+        auto target =
+            std::make_shared<rt::RecoveryDescription>(*f.program.recovery_target(input, 10, {}));
+        target->restores[0].transfers = {
+            {.direction = rt::ContextTransferDirection::HostToDevice, .work = {8, 1}}};
+        const rt::CaptureCostQuote capture{
+            target, {{.direction = rt::ContextTransferDirection::DeviceToHost, .work = {8, 1}}}};
+        const auto admission =
+            f.cache.capture_admission(f.program, 0, input, 10, Role::SharedPrefix, {}, &capture);
+        auto cursor = f.cache.begin_reclaim(f.program, admission);
+        require(bool(f.cache.quote_capture(f.program, capture, cursor)) == (copy == 1),
+                "free Host capacity bypassed a capture's copy and restore cost");
+    }
+    Fixture f(0);
+    rt::ContextMachineCostModel costs;
+    costs.prefill.token_ns_q32 = rt::kContextCostQ32One;
+    costs.transfer[2].batch_ns = 3;
+    f.cache                    = Fixture::Cache(true, costs);
+    const Base input{tokens(10)};
+    const rt::CaptureCostQuote capture{
+        f.program.recovery_target(input, 10, {}),
+        {{.direction = rt::ContextTransferDirection::DeviceToDevice, .work = {8, 1}}}};
+    const auto admission =
+        f.cache.capture_admission(f.program, 0, input, 10, Role::SharedPrefix, {}, &capture);
+    auto cursor                  = f.cache.begin_reclaim(f.program, admission);
+    f.program.maintenance_bytes  = 8;
+    f.program.maintenance_result = rt::ContextStart::Deferred;
+    require(f.cache.maintain(f.program, {}, cursor) == rt::ReclaimProgress::Deferred &&
+                cursor.ledger->paid_actions == 0,
+            "deferred maintenance was charged");
+    f.program.maintenance_result = rt::ContextStart::Stale;
+    require(f.cache.maintain(f.program, {}, cursor) == rt::ReclaimProgress::Retry &&
+                cursor.ledger->paid_actions == 0,
+            "stale maintenance was charged");
+    f.program.maintenance_result = rt::ContextStart::Started;
+    require(f.cache.maintain(f.program, {}, cursor) == rt::ReclaimProgress::Changed &&
+                cursor.ledger->paid_actions == 3,
+            "accepted maintenance was not charged once");
+    const auto quote = f.cache.quote_capture(f.program, capture, cursor);
+    require(quote.has_value(), "maintenance exhausted an affordable capture");
+    f.cache.accept_action(cursor, *quote);
+    require(cursor.ledger->paid_actions == 6, "capture lost its earlier maintenance costs");
+    bool rejected = false;
+    try {
+        f.cache.accept_action(cursor, *quote);
+    } catch (const std::logic_error&) { rejected = true; }
+    require(rejected, "repeated capture receipt was accepted");
+    require(f.cache.maintain(f.program, {}, cursor) == rt::ReclaimProgress::Blocked &&
+                cursor.ledger->paid_actions == 6,
+            "optional maintenance overspent the remaining capture budget");
+}
+
+void test_pause_prices_save_restore_and_victim_loss() {
+    namespace rt = ninfer::runtime;
+    Fixture f(64);
+    rt::ContextMachineCostModel costs;
+    costs.prefill.token_ns_q32 = rt::kContextCostQ32One;
+    costs.transfer[0].batch_ns = 1;
+    costs.transfer[1].batch_ns = 7;
+    f.cache                    = Fixture::Cache(true, costs);
+    const auto victim          = f.program.add(tokens(5, 100));
+    f.publish(victim);
+
+    struct Option {
+        std::optional<std::size_t> host_write;
+        Usage released;
+    } host{8, {}}, replay;
+
+    const rt::PauseCostQuote save{
+        {{.direction = rt::ContextTransferDirection::DeviceToHost, .work = {8, 1}}},
+        {{{}, {{.direction = rt::ContextTransferDirection::HostToDevice, .work = {8, 1}}}}}};
+    const rt::PauseCostQuote rebuild{{}, {{{.tokens = 10}, {}}}};
+    require(f.cache.pause_cost(f.program, save, host, {}) == 8 &&
+                f.cache.pause_cost(f.program, rebuild, replay, {}) == 10 &&
+                f.cache.pause_cost(f.program, save, host, std::array{victim}) == 13,
+            "pause ranking lost immediate save, future restore, or Host victim loss");
+    auto unknown          = save;
+    unknown.unpriced_work = true;
+    require(f.cache.pause_cost(f.program, unknown, host, {}) == UINT64_MAX,
+            "unpriced normalization was ranked as a free pause");
+}
+
+void test_same_position_promotion_is_not_deduplicated_early() {
+    namespace rt = ninfer::runtime;
+    Fixture f(64);
+    rt::ContextMachineCostModel costs;
+    costs.prefill.token_ns_q32 = rt::kContextCostQ32One;
+    costs.transfer[1].batch_ns = 10;
+    costs.transfer[2].batch_ns = 1;
+    f.cache                    = Fixture::Cache(true, costs);
+    const auto old             = f.program.add(tokens(50), {f.program.host_block(8)});
+    f.program.contents[old.index].device_state = false;
+    f.publish(old);
+    const Base input{tokens(50)};
+    const rt::CaptureCostQuote capture{
+        f.program.recovery_target(input, 50, {}),
+        {{.direction = rt::ContextTransferDirection::DeviceToDevice, .work = {8, 1}}}};
+    require(!f.cache.retain_shared_checkpoint(f.program, input, 50, {}, {}, &capture) &&
+                !f.cache.capture_source(f.program, input, 50, {}, &capture),
+            "early dedup suppressed cheaper Device recovery");
+    f.program.contents[old.index].leased = true;
+    require(f.cache.retain_shared_checkpoint(f.program, input, 50, {}, {}, &capture),
+            "promotion tried to replace a leased source");
+    f.program.contents[old.index].leased = false;
+    const auto next                      = f.program.add(tokens(50));
+    f.publish(next);
+    require(f.program.valid_checkpoint(next) && !f.program.valid_checkpoint(old),
+            "publication disagreed with promotion's restore-cost ordering");
+}
+
+void test_weighted_recovery_and_new_fallback() {
+    Fixture f(64);
+    ninfer::runtime::ContextMachineCostModel costs;
+    costs.prefill.token_ns_q32 = ninfer::runtime::kContextCostQ32One;
+    costs.transfer[1].batch_ns = 100;
+    f.cache                    = Fixture::Cache(true, costs);
+    const auto shallow         = f.program.add(tokens(2));
+    const auto deep            = f.program.add(tokens(8), {f.program.host_block(8)});
+    const auto target          = f.program.add(tokens(10));
+    for (auto h : {shallow, deep, target}) f.publish(h);
+    auto cursor = f.cache.begin_reclaim(f.program);
+    require(f.cache.quote_release(f.program, std::array{target}, cursor).loss_after == 8,
+            "recovery chose a deeper expensive Host source over a cheaper Device ancestor");
+    auto quote = f.cache.quote_release(f.program, std::array{shallow}, cursor);
+    require(f.program.release_checkpoint(shallow), "failed to retire shallow source");
+    f.cache.adopt_release(f.program, std::array{shallow}, cursor, quote);
+    const auto fallback = f.program.add(tokens(1));
+    f.publish(fallback);
+    require(f.cache.quote_release(f.program, std::array{target}, cursor).loss_after == 9,
+            "new fallback failed to enter both sides of the decision counterfactual");
+}
+
+void test_weighted_loss_against_independent_oracle() {
+    namespace rt = ninfer::runtime;
+    Fixture f(64);
+    rt::ContextMachineCostModel costs;
+    costs.prefill              = {.chunk_ns              = 3,
+                                  .token_ns_q32          = rt::kContextCostQ32One,
+                                  .attention_pair_ns_q32 = 2 * rt::kContextCostQ32One};
+    costs.transfer[1].batch_ns = 17;
+    f.cache                    = Fixture::Cache(true, costs);
+    auto fork                  = tokens(5);
+    fork[2]                    = 99;
+    std::vector<Key> keys{tokens(2), tokens(5), tokens(5), fork, tokens(8), tokens(3, 200)};
+    std::vector<Handle> all;
+    for (std::size_t i = 0; i < keys.size(); ++i) {
+        all.push_back(f.program.add(keys[i],
+                                    i == 1 || i == 3
+                                        ? std::vector<std::size_t>{f.program.host_block(8)}
+                                        : std::vector<std::size_t>{},
+                                    Role::InputReplay));
+        f.publish(all.back());
+    }
+    const auto prefix = [&](std::size_t a, std::size_t b) {
+        return keys[a].size() <= keys[b].size() &&
+               std::equal(keys[a].begin(), keys[a].end(), keys[b].begin());
+    };
+    const auto rebuild = [](std::uint64_t a, std::uint64_t b) {
+        // Independent integer definition: one launch plus one token unit and two units
+        // for each causal attention pair in this short, single-chunk range.
+        return a == b ? 0ULL : 3ULL + b - a + b * (b + 1) - a * (a + 1);
+    };
+    const auto cost = [&](std::size_t target, unsigned removed) {
+        std::uint64_t best = rebuild(0, keys[target].size());
+        for (std::size_t source = 0; source < keys.size(); ++source)
+            if (!(removed & (1U << source)) && prefix(source, target))
+                best = std::min(best,
+                                std::uint64_t((source == 1 || source == 3 ? 17 : 0) +
+                                              rebuild(keys[source].size(), keys[target].size())));
+        return best;
+    };
+    const auto oracle = [&](unsigned removed) {
+        std::vector<std::pair<std::size_t, std::uint64_t>> positive;
+        for (std::size_t t = 0; t < keys.size(); ++t) {
+            const auto delta = cost(t, removed) - cost(t, 0);
+            if (!delta) continue;
+            const auto alias =
+                std::find_if(positive.begin(), positive.end(),
+                             [&](const auto& entry) { return keys[entry.first] == keys[t]; });
+            if (alias == positive.end())
+                positive.push_back({t, delta});
+            else
+                alias->second = std::max(alias->second, delta);
+        }
+        std::uint64_t total = 0;
+        for (const auto& [t, delta] : positive) {
+            if (std::any_of(positive.begin(), positive.end(), [&](const auto& other) {
+                    return keys[other.first].size() > keys[t].size() && prefix(t, other.first);
+                }))
+                continue;
+            auto maximum = delta;
+            for (const auto& [ancestor, loss] : positive)
+                if (prefix(ancestor, t)) maximum = std::max(maximum, loss);
+            total += maximum;
+        }
+        return total;
+    };
+    rt::RecoveryCostEvaluation<Program, Handle> values(f.program, all, nullptr, costs);
+    for (unsigned mask = 0; mask < (1U << all.size()); ++mask) {
+        std::vector<Handle> removed;
+        for (std::size_t i = 0; i < all.size(); ++i)
+            if (mask & (1U << i)) removed.push_back(all[i]);
+        require(values.loss(removed) == oracle(mask),
+                "weighted semantic loss differs from the independent forest definition");
+        for (std::size_t a = 0; a < all.size(); ++a) {
+            const auto dependencies = values.dependencies(removed, {&all[a], 1});
+            const auto marginal     = oracle(mask | (1U << a)) - oracle(mask);
+            for (std::size_t b = 0; b < all.size(); ++b)
+                if (!dependencies.intersects({&all[b], 1}))
+                    require(oracle(mask | (1U << a) | (1U << b)) - oracle(mask | (1U << b)) ==
+                                marginal,
+                            "weighted recovery pruning omitted a dependent removal");
+        }
+    }
+}
+
+void test_recycled_slot_keeps_distinct_decision_identity() {
+    namespace rt = ninfer::runtime;
+
+    struct GenerationHandle {
+        std::uint32_t index;
+        std::uint64_t generation;
+        bool operator==(const GenerationHandle&) const = default;
+    };
+
+    struct Session {
+        using RecoveryAccount  = Program::RecoveryAccount;
+        using RecoveryTopology = Program::RecoveryTopology;
+        ninfer::models::context::MetadataBudget budget{4 * 1024 * 1024};
+        std::vector<rt::RecoveryPoint<GenerationHandle>> current;
+
+        auto& recovery_budget() { return budget; }
+
+        auto recovery_points() { return current; }
+    } session;
+
+    Program native{.host_capacity = 0};
+    const Base original{tokens(50)}, replacement{tokens(25)};
+    const GenerationHandle old{0, 1}, fresh{0, 2};
+    session.current.push_back({old, native.recovery_target(original, 50, {})});
+    rt::ContextMachineCostModel costs;
+    costs.prefill.token_ns_q32 = rt::kContextCostQ32One;
+    const std::array advertised{old};
+    rt::RecoveryLedger<Session, GenerationHandle> ledger(session, advertised, costs);
+    ledger.accept(advertised, advertised, 50, 0);
+    session.current = {{fresh, native.recovery_target(replacement, 25, {})}};
+    const std::array live{fresh};
+    {
+        rt::RecoveryCostEvaluation<Session, GenerationHandle> values(session, live, &ledger, costs);
+        require(values.frontier(old) == 50 && values.frontier(fresh) == 25 &&
+                    values.total_loss() == 25 && values.total_loss(live) == 50,
+                "recycled native slot aliased a retired decision target or created a new target");
+    }
+    ledger.include_required(session, session.current, live, costs);
+    require(ledger.contains(fresh), "required snapshot did not join its owner's recovery decision");
+    ledger.accept(live, live, 50, 0);
+    session.current.clear();
+    rt::RecoveryCostEvaluation<Session, GenerationHandle> retired(session, {}, &ledger, costs);
+    require(retired.frontier(old) == 50 && retired.frontier(fresh) == 25 &&
+                retired.total_loss() == 50,
+            "two retired snapshot generations in one slot lost their exact reference identities");
+}
+
+void test_capture_preservation_rolls_back_rejected_candidates() {
+    namespace rt = ninfer::runtime;
+    for (bool expensive_first : {true, false}) {
+        Fixture f(4096);
+        rt::ContextMachineCostModel costs;
+        costs.prefill.token_ns_q32                         = rt::kContextCostQ32One;
+        costs.transfer[0].ns_per_byte_q32                  = rt::kContextCostQ32One;
+        costs.transfer[1].batch_ns                         = 7;
+        f.cache                                            = Fixture::Cache(true, costs);
+        const auto expensive                               = f.program.add(tokens(100));
+        const auto cheap                                   = f.program.add(tokens(5, 200));
+        f.program.contents[expensive.index].demotion_bytes = 1000;
+        f.program.contents[cheap.index].demotion_bytes     = 1;
+        if (expensive_first) {
+            f.publish(expensive);
+            f.publish(cheap);
+        } else {
+            f.publish(cheap);
+            f.publish(expensive);
+        }
+        const Base input{tokens(20, 500)};
+        auto cursor = f.cache.begin_reclaim(
+            f.program, f.cache.capture_admission(f.program, 0, input, 20, Role::SharedPrefix));
+        require(f.cache.preserve_capture(f.program, f.program.pressure(1), cursor) ==
+                        rt::ReclaimProgress::Changed &&
+                    f.program.demoted == std::vector<Handle>{cheap} &&
+                    cursor.ledger->paid_actions == 1 && cursor.ledger->loss_after == 5,
+                "a rejected expensive demotion contaminated a complete cheap candidate");
+    }
+}
+
+void test_pause_destination_is_quoted_before_retirement() {
+    namespace rt = ninfer::runtime;
+    Fixture f(0);
+    rt::ContextMachineCostModel costs;
+    costs.prefill.token_ns_q32 = rt::kContextCostQ32One;
+    costs.transfer[2].batch_ns = 1;
+    f.cache                    = Fixture::Cache(true, costs);
+    const auto victim          = f.program.add(tokens(1000));
+    f.publish(victim);
+
+    struct Option {
+        std::optional<std::size_t> host_write;
+        Usage released;
+    } relocate, replay;
+
+    const rt::PauseCostQuote move{
+        {{.direction = rt::ContextTransferDirection::DeviceToDevice, .work = {8, 1}}}, {{{}, {}}}};
+    const rt::PauseCostQuote recompute{{}, {{{.tokens = 10}, {}}}};
+    auto cursor        = f.cache.begin_reclaim(f.program);
+    const auto victims = f.cache.pause_victims(f.program, f.program.pressure(1).demand, cursor);
+    require(victims && *victims == std::vector<Handle>{victim} &&
+                f.program.valid_checkpoint(victim) && f.program.released.empty() &&
+                cursor.ledger->revision == 0,
+            "destination quotation mutated a checkpoint or charged an unaccepted action");
+    require(f.cache.pause_cost(f.program, move, relocate, *victims) == 1001 &&
+                f.cache.pause_cost(f.program, recompute, replay, {}) == 10,
+            "pause choice ignored the complete destination retirement cost");
+    require(!f.cache.pause_victims(f.program, f.program.pressure(1).demand, cursor, {&victim, 1}),
+            "pause preflight evicted an excluded source");
+}
+
+void test_unused_reclaim_cursor_does_not_snapshot_catalog() {
+    Fixture f(64);
+    const auto h = f.program.add(tokens(4));
+    f.publish(h);
+    const auto scans = f.program.recovery_scans;
+    auto cursor      = f.cache.begin_reclaim(f.program);
+    require(!cursor.ledger && f.program.recovery_scans == scans,
+            "healthy admission created a recovery snapshot before any pressure");
+    require(f.cache.reclaim(f.program, f.program.assess({}), {}, cursor) ==
+                    ninfer::runtime::ReclaimProgress::Retry &&
+                !cursor.ledger && f.program.recovery_scans == scans,
+            "ready resources materialized an unused decision ledger");
+    (void)f.cache.quote_release(f.program, {&h, 1}, cursor);
+    require(cursor.ledger && f.program.recovery_scans > scans,
+            "actual retirement did not establish its reference view");
+}
+
+void test_lazy_cursor_survives_external_retirement() {
+    Fixture f(0);
+    const auto low  = f.program.add({1});
+    const auto high = f.program.add({2});
+    f.publish(low);
+    f.publish(high);
+    auto cursor = f.cache.begin_reclaim(f.program);
+    require(!cursor.ledger && f.cache.erase(f.program, high), "lazy retirement setup failed");
+    const auto victims = f.cache.capture_victims(f.program, f.program.pressure(1), cursor);
+    require(victims && *victims == std::vector<Handle>{low},
+            "an externally retired high slot invalidated the remaining reclaim candidate");
+}
+
+void test_external_retirement_after_own_demotion() {
+    namespace rt = ninfer::runtime;
+    Fixture f(64);
+    rt::ContextMachineCostModel costs;
+    costs.prefill.token_ns_q32                 = rt::kContextCostQ32One;
+    costs.transfer[0].batch_ns                 = 1;
+    costs.transfer[1].batch_ns                 = 7;
+    f.cache                                    = Fixture::Cache(true, costs);
+    const auto h                               = f.program.add(tokens(100), {}, Role::InputReplay);
+    f.program.contents[h.index].demotion_bytes = 8;
+    const auto owner                           = f.publish(h);
+    const Base incoming{tokens(20, 1000)};
+    const rt::CaptureCostQuote capture{f.program.recovery_target(incoming, 20, {}), {}};
+    auto cursor = f.cache.begin_reclaim(
+        f.program,
+        f.cache.capture_admission(f.program, 0, incoming, 20, Role::SharedPrefix, {}, &capture));
+    require(f.cache.preserve_capture(f.program, f.program.pressure(1), cursor) ==
+                    rt::ReclaimProgress::Changed &&
+                cursor.ledger->loss_after == 7 && cursor.ledger->paid_actions == 1,
+            "demotion did not preserve its own cost");
+    f.cache.abandon(f.program, owner);
+    const auto quote = f.cache.quote_capture(f.program, capture, cursor);
+    require(quote && quote->loss_after == 0 && cursor.ledger->paid_actions == 1,
+            "external retirement was misattributed to an earlier demotion");
+}
+
+void test_pause_uses_parent_recovery_obligations() {
+    namespace rt = ninfer::runtime;
+    Fixture f(1024);
+    rt::ContextMachineCostModel costs;
+    costs.prefill.token_ns_q32     = 75ULL * rt::kContextCostQ32One / 64;
+    costs.transfer[0].operation_ns = 10;
+    costs.transfer[1].operation_ns = 10;
+    f.cache                        = Fixture::Cache(true, costs);
+    const auto q                   = f.program.add(tokens(64));
+    auto branch_a = tokens(128), branch_b = tokens(128);
+    branch_b[64] = 10001;
+    const auto a = f.program.add(branch_a), b = f.program.add(branch_b);
+    f.publish(q);
+    f.program.contents[q.index].demotion_bytes = 8;
+    auto cursor                                = f.cache.begin_reclaim(f.program);
+    for (auto h : {a, b}) {
+        const auto receipt = f.cache.quote_release(f.program, {&h, 1}, cursor);
+        require(f.program.release_checkpoint(h), "snapshot revocation failed");
+        f.cache.adopt_release(f.program, {&h, 1}, cursor, receipt);
+    }
+
+    struct Option {
+        std::optional<std::size_t> host_write;
+        Usage released;
+    };
+
+    const Option host{24, {.records = {q.index}}}, replay;
+    const rt::PauseCostQuote save{
+        {{.direction = rt::ContextTransferDirection::DeviceToHost, .work = {24, 3}}},
+        {{{}, {{.direction = rt::ContextTransferDirection::HostToDevice, .work = {24, 3}}}}}};
+    const rt::PauseCostQuote recompute{{}, {{{.tokens = 64}, {}}}};
+    require(cursor.ledger->loss_after == 150 &&
+                f.cache.pause_cost(f.program, save, host, {}, &cursor) == 80 &&
+                f.cache.pause_cost(f.program, recompute, replay, {}, &cursor) == 75,
+            "pause forgot the two previously revoked recovery branches");
+    const auto accepted = f.cache.quote_pause_action(f.program, save, host, {}, cursor);
+    require(accepted.loss_after == 170 && accepted.action_cost == 30,
+            "pause charged future recovery as already paid or lost its joint degradation");
+    f.cache.accept_pause(f.program, cursor, accepted);
+    require(cursor.ledger->paid_actions == 30 && cursor.ledger->loss_after == 170,
+            "accepted pause did not belong to the parent decision");
+}
+
+struct CountHandle {
+    std::uint32_t index;
+    inline static std::uint64_t comparisons = 0;
+
+    bool operator==(const CountHandle& b) const {
+        ++comparisons;
+        return index == b.index;
+    }
+};
+
+struct CountSession {
+    using RecoveryAccount  = Program::RecoveryAccount;
+    using RecoveryTopology = Program::RecoveryTopology;
+    ninfer::models::context::MetadataBudget budget{64ULL << 20};
+
+    struct Identity : ninfer::runtime::RecoveryIdentity {
+        std::uint32_t tag;
+
+        Identity(const void* scope, std::uint32_t t) : RecoveryIdentity(scope, 1, 0), tag(t) {}
+
+        std::array<std::uint64_t, 2> digest(std::uint32_t f) const override {
+            return {f ? tag + 1 : 0, f};
+        }
+
+        ninfer::runtime::PrefillWork rebuild(std::uint32_t f) const override {
+            return {.tokens = 1 - f};
+        }
+
+        bool exact_prefix(const RecoveryIdentity& b) const override {
+            return tag == static_cast<const Identity&>(b).tag;
+        }
+    };
+
+    std::vector<ninfer::runtime::RecoveryPoint<CountHandle>> points;
+
+    auto& recovery_budget() { return budget; }
+
+    auto recovery_points() { return points; }
+};
+
+void test_live_evaluation_membership_work_is_linear() {
+    namespace rt             = ninfer::runtime;
+    std::uint64_t first_work = 0;
+    for (unsigned n : {128U, 1024U, 4096U}) {
+        CountSession session;
+        std::vector<CountHandle> advertised;
+        for (unsigned i = 0; i < n; ++i) {
+            auto description      = std::make_shared<rt::RecoveryDescription>();
+            description->identity = std::make_shared<CountSession::Identity>(&session, i);
+            description->restores.push_back({{}, {}});
+            session.points.push_back({{i}, std::move(description)});
+            advertised.push_back({i});
+        }
+        CountHandle::comparisons = 0;
+        rt::ContextMachineCostModel costs;
+        costs.prefill.token_ns_q32 = rt::kContextCostQ32One;
+        rt::RecoveryCostEvaluation<CountSession, CountHandle> evaluation(session, advertised,
+                                                                         nullptr, costs);
+        require(evaluation.total_loss() == 0 && CountHandle::comparisons <= 4ULL * n,
+                "actual evaluation construction rescanned independent advertised handles");
+        CountHandle::comparisons = 0;
+        for (auto h : advertised)
+            require(evaluation.loss({&h, 1}) == 1, "independent victim loss changed");
+        if (!first_work) first_work = CountHandle::comparisons;
+        require(CountHandle::comparisons <= 2 * first_work * n / 128,
+                "single-candidate evaluation rescanned unrelated components");
+    }
+}
+
+void test_replay_preparation_is_priced_only_for_later_targets() {
+    namespace rt = ninfer::runtime;
+    CountSession session;
+    Program native{.host_capacity = 0};
+    const Base same{tokens(2)}, later{tokens(4)};
+    auto source = std::make_shared<rt::RecoveryDescription>(*native.recovery_target(same, 2, {}));
+    source->restores.front().transfers.push_back(
+        {.direction = rt::ContextTransferDirection::DeviceToDevice, .work = {9, 1}});
+    source->restores.front().replay_transfers.push_back(
+        {.direction = rt::ContextTransferDirection::DeviceToDevice, .work = {3, 1}});
+    session.points.push_back({{0}, source});
+    rt::ContextMachineCostModel costs;
+    costs.prefill.token_ns_q32        = 100 * rt::kContextCostQ32One;
+    costs.transfer[2].batch_ns        = 7;
+    costs.transfer[2].ns_per_byte_q32 = rt::kContextCostQ32One;
+    const std::array<CountHandle, 1> visible{{{0}}};
+    rt::RecoveryCostEvaluation<CountSession, CountHandle> values(session, visible, nullptr, costs);
+    require(values.gain(*native.recovery_target(same, 2, {})) == 9 &&
+                values.gain(*native.recovery_target(later, 4, {})) == 212,
+            "replay setup was omitted, charged at the same frontier, or billed as a second batch");
+}
+
+void test_host_chain_uses_lazy_bounded_source_search() {
+    namespace rt = ninfer::runtime;
+
+    struct Identity : rt::RecoveryIdentity {
+        std::uint64_t& calls;
+
+        Identity(const void* owner, unsigned frontier, std::uint64_t& count)
+            : RecoveryIdentity(owner, frontier, 0), calls(count) {}
+
+        std::array<std::uint64_t, 2> digest(std::uint32_t f) const override { return {f, 0}; }
+
+        rt::PrefillWork rebuild(std::uint32_t begin) const override {
+            ++calls;
+            return {.tokens = frontier - begin};
+        }
+
+        bool exact_prefix(const rt::RecoveryIdentity&) const override { return true; }
+    };
+
+    for (unsigned count : {128U, 512U, 2048U}) {
+        CountSession session;
+        std::uint64_t calls = 0;
+        std::vector<CountHandle> visible;
+        for (unsigned i = 0; i < count; ++i) {
+            auto value      = std::make_shared<rt::RecoveryDescription>();
+            value->identity = std::make_shared<Identity>(&session, i + 1, calls);
+            value->restores.push_back(
+                {{}, {{.direction = rt::ContextTransferDirection::HostToDevice, .work = {1, 1}}}});
+            session.points.push_back({{i}, value});
+            visible.push_back({i});
+        }
+        rt::ContextMachineCostModel costs;
+        costs.prefill.token_ns_q32        = rt::kContextCostQ32One;
+        costs.transfer[1].ns_per_byte_q32 = rt::kContextCostQ32One;
+        rt::RecoveryCostEvaluation<CountSession, CountHandle> values(session, visible, nullptr,
+                                                                     costs);
+        require(calls == 0 && values.total_loss() == 0,
+                "unchanged Host chain eagerly scanned all source/target pairs");
+        const CountHandle deepest{count - 1};
+        require(values.loss({&deepest, 1}) == 1 && calls <= 8ULL * count,
+                "Host chain source search ignored its text-work lower bound");
+    }
+}
+
 int main() {
     try {
+        test_replay_preparation_is_priced_only_for_later_targets();
+        test_host_chain_uses_lazy_bounded_source_search();
+        test_lazy_cursor_survives_external_retirement();
+        test_external_retirement_after_own_demotion();
+        test_pause_uses_parent_recovery_obligations();
+        test_capture_preservation_rolls_back_rejected_candidates();
+        test_pause_destination_is_quoted_before_retirement();
+        test_unused_reclaim_cursor_does_not_snapshot_catalog();
+        test_live_evaluation_membership_work_is_linear();
+        test_capture_and_maintenance_action_accounting();
+        test_pause_prices_save_restore_and_victim_loss();
+        test_same_position_promotion_is_not_deduplicated_early();
+        test_weighted_recovery_and_new_fallback();
+        test_recycled_slot_keeps_distinct_decision_identity();
+        test_weighted_loss_against_independent_oracle();
+        test_semantic_loss_and_joint_decision_budget();
+        test_demotion_prices_copy_and_future_restore();
+        test_unpriced_cost_does_not_create_admission_credit();
+        test_unpriced_unchanged_component_is_not_a_loss();
         test_shared_publication_deduplicates_complete_snapshots();
         test_shared_publication_preserves_distinct_placements();
         test_candidates_expand_sources_and_target_placements();
@@ -2577,6 +3408,7 @@ int main() {
         test_old_candidate_demand_cannot_borrow_a_new_owner_epoch();
         test_optional_capture_budget_spans_host_and_device_actions();
         test_snapshot_revocation_follows_ordinary_history_and_engine_order();
+        test_later_snapshot_joins_required_recovery_decision();
         test_deeper_survivor_cannot_replace_an_earlier_recovery_point();
         test_necessary_execution_preserves_long_recovery_across_one_off_requests();
         test_fallback_requires_surviving_compatible_earlier_history();

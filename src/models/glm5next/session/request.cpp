@@ -16,11 +16,14 @@ PrefixShortlistKey key(const Identity& identity, std::uint32_t frontier) {
     return {identity.digests.at(frontier), frontier, identity.tag};
 }
 
-std::shared_ptr<const Identity> capture_identity(const Sequence& s) {
+std::shared_ptr<const Identity> capture_identity(const Sequence& s,
+                                                 context::MetadataBudget& budget) {
+    if (!context::IdentityMetadata::can_copy(budget, s.identity)) return {};
     auto out       = std::make_shared<Identity>(s.identity);
     const auto end = s.continuation.metadata.main_frontier;
     out->truncate(end);
-    return out;
+    const std::shared_ptr<const Identity> immutable = std::move(out);
+    return immutable->retention.retain(budget, immutable);
 }
 
 } // namespace ninfer::models::glm5next::detail

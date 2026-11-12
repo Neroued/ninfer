@@ -80,9 +80,9 @@ void EngineCore<Instance>::commit_pending(PendingBatch&& pending, ComputeFlight 
                 throw std::logic_error("output policy returned an invalid licensed prefix");
             }
             decisions[row] = CommitDecision{
-                .accepted_tokens              = decision.accepted_tokens,
-                .terminal                     = decision.finished(),
-                .cancelled                    = false,
+                .accepted_tokens = decision.accepted_tokens,
+                .terminal        = decision.finished(),
+                .cancelled       = false,
             };
             finish_reasons[row] = decision.finish_reason;
             continuations[row]  = decision.continuation;
@@ -216,7 +216,6 @@ void EngineCore<Instance>::commit_pending(PendingBatch&& pending, ComputeFlight 
         }
         if (!decode_round && !decisions[row].terminal && !committed.capture_ready[row] &&
             instance_.session->retry_capture(*request->sequence)) {
-            capture_decisions_[lane].reset();
             committed.capture_ready[row] = true;
         }
         if (decisions[row].terminal) {
@@ -277,12 +276,12 @@ void EngineCore<Instance>::resolve_prefill_progress(
     flight.progressed.front() = progress.processed_prompt_tokens != 0;
     record_service(flight);
     if (!request->cancelled.load(std::memory_order_acquire)) {
-        resources_.observe_committed(*request->base_plan, request->id, computed_begin,
-                                     computed_begin + progress.processed_prompt_tokens,
-                                     instance_.session->capture_frontiers(
-                                         *request->sequence, computed_begin,
-                                         computed_begin + progress.processed_prompt_tokens),
-                                     request->continuation_owner);
+        resources_.observe_committed(
+            *request->base_plan, request->id, computed_begin,
+            computed_begin + progress.processed_prompt_tokens,
+            instance_.session->capture_frontiers(*request->sequence, computed_begin,
+                                                 computed_begin + progress.processed_prompt_tokens),
+            request->continuation_owner);
     }
     if (progress.complete && request->computed_prompt_tokens != suffix_tokens) {
         throw std::logic_error("completed prefill did not reach the admitted prompt frontier");
@@ -300,7 +299,6 @@ void EngineCore<Instance>::resolve_prefill_progress(
     }
     if (!progress.complete && !request->cancelled.load(std::memory_order_acquire) &&
         instance_.session->retry_capture(*request->sequence)) {
-        capture_decisions_[request->lane->value].reset();
         reserve_active_capture(request, EngineRequestState::Prefill);
         return;
     }
@@ -694,6 +692,7 @@ void EngineCore<Instance>::fail_all(std::exception_ptr error) noexcept {
     materializing_.reset();
     admission_decision_.reset();
     for (auto& decision : capture_decisions_) { decision.reset(); }
+    for (auto& decision : execution_decisions_) { decision.reset(); }
     for (auto& unit : reserved_units_) { unit.reset(); }
     context_owner_.reset();
     std::vector<std::shared_ptr<Request>> paused;

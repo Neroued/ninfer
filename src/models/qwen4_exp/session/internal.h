@@ -4,6 +4,7 @@
 #include "models/qwen4_exp/state/continuation.h"
 #include "models/qwen4_exp/definition.h"
 #include "models/common/context/snapshot.h"
+#include "models/common/context/identity.h"
 #include "models/common/qwen/prefix_identity.h"
 #include "models/common/qwen/vision/control.h"
 
@@ -25,6 +26,19 @@ struct Identity {
     qwen::ResidentPrefixIdentity positions;
     qwen::PrefixShortlistDigests digests;
     std::uint32_t tag = 0;
+    context::IdentityMetadata retention;
+
+    [[nodiscard]] std::size_t metadata_bytes() const noexcept {
+        return sizeof(*this) + tokens.capacity() * sizeof(TokenId) + positions.metadata_bytes() +
+               digests.metadata_bytes();
+    }
+
+    [[nodiscard]] static std::size_t cache_bytes(std::size_t tokens, std::size_t concurrency) {
+        return context::IdentityMetadata::cache_bytes<Identity>(
+            tokens, concurrency,
+            sizeof(TokenId) + 3 * sizeof(std::int32_t) + sizeof(std::uint8_t) +
+                sizeof(std::array<std::uint64_t, 2>));
+    }
 };
 
 struct RequestPlan {
@@ -46,6 +60,8 @@ struct Checkpoint {
     runtime::CheckpointRole role;
     runtime::CheckpointOrigin origin = runtime::CheckpointOrigin::Semantic;
     SharedCandidateEvidence evidence = SharedCandidateEvidence::None;
+
+    mutable std::weak_ptr<const runtime::RecoveryIdentity> recovery_identity_cache;
 
     [[nodiscard]] std::uint32_t frontier() const {
         return snapshot.continuation().metadata.main_frontier;
@@ -72,6 +88,7 @@ struct CaptureReservation {
     Checkpoints* checkpoints;
     Image destination;
     std::optional<context::RecordReservation> host;
+    std::shared_ptr<const Identity> identity;
     std::vector<std::pair<CheckpointHandle, runtime::CheckpointRole>> records;
     ~CaptureReservation();
 };
@@ -332,7 +349,9 @@ public:
     const ExecutionShape& shape;
     runtime::Executor<ExecutionTypes>* executor = nullptr;
     context::ContextDirectory directory;
-    mutable context::RecoveryIndex<> recovery_index{directory.metadata_budget()};
+    context::RecoveryMetadata recovery_metadata;
+    mutable context::RecoveryIndex<> recovery_index{directory.metadata_budget(),
+                                                    &recovery_metadata};
     Checkpoints checkpoints;
     context::MetadataAccount count_storage{directory.metadata_budget()};
     TokenCountBuilder count_builder;
@@ -351,7 +370,8 @@ public:
     std::uint64_t identity_generation = 0;
 };
 
-[[nodiscard]] std::shared_ptr<const Identity> capture_identity(const Sequence&);
+[[nodiscard]] std::shared_ptr<const Identity> capture_identity(const Sequence&,
+                                                               context::MetadataBudget&);
 [[nodiscard]] PrefixShortlistKey key(const Identity&, std::uint32_t);
 
 } // namespace ninfer::models::qwen4_exp::detail

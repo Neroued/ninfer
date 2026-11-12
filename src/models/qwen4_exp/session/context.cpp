@@ -1,3 +1,4 @@
+#include "models/common/qwen/recovery_value.h"
 #include "models/qwen4_exp/session/internal.h"
 #include "models/common/context/work.h"
 
@@ -111,30 +112,16 @@ Session::inspect_source(const RequestBasePlan& base, std::optional<CheckpointHan
     out.reused_tokens = h ? p.checkpoints.at(*h).frontier() : 0;
     const auto end    = resume ? resume->frontier() : base.summary().prompt_tokens;
     if (out.reused_tokens > end) return {};
-    out.remaining_work = runtime::make_prefill_work(out.reused_tokens, end - out.reused_tokens, 0,
-                                                    0, p.shape.prefill_chunk);
-    for (const auto& item : base.plan_->prompt.vision_items)
-        if (item.token_spans.back().begin + item.token_spans.back().count > out.reused_tokens &&
-            item.token_spans.front().begin < end) {
-            ++out.remaining_work.vision_items;
-            out.remaining_work.vision_patches += item.patch_count;
-        }
-    if (const auto& vision = base.plan_->vision) {
-        out.remaining_work.chunks = 0;
-        const vision::Window available;
-        for (auto cursor = out.reused_tokens; cursor < end;) {
-            cursor = available.limit({}, vision->units, cursor,
-                                     std::min(end, cursor + p.shape.prefill_chunk),
-                                     p.plan.vision_max_features);
-            ++out.remaining_work.chunks;
-        }
-    }
+    out.remaining_work =
+        qwen::recovery_work(base.plan_->prompt.vision_items, out.reused_tokens, end,
+                            p.shape.prefill_chunk, p.plan.vision_max_features);
     if (h) {
         const auto& c      = p.checkpoints.at(*h);
         const auto image   = c.snapshot.continuation().image;
         const auto& states = p.directory.states();
-        out.consume_source = consume && p.checkpoints[h->index].pins == 0 &&
-                             states.checkpoint_references(image) == 1 && !states.source_pins(image);
+        const bool own     = resume && resume->snapshot_handle() == h;
+        out.consume_source = (consume || own) && p.checkpoints[h->index].pins == 0 &&
+                             states.can_recover_exclusively(image);
         out.transfers = c.snapshot.restore_requirements(p.directory);
         out.local_device =
             states.device_resident(image) &&
@@ -147,7 +134,19 @@ Session::inspect_source(const RequestBasePlan& base, std::optional<CheckpointHan
             p.checkpoints.at(point).frontier() <= out.reused_tokens)
             out.private_points.push_back(point);
     for (const auto point : retired)
-        if ((!h || point != *h) && valid_checkpoint(point)) out.retired_points.push_back(point);
+        if ((!h || point != *h) && valid_checkpoint(point) &&
+            std::find(out.retired_points.begin(), out.retired_points.end(), point) ==
+                out.retired_points.end())
+            out.retired_points.push_back(point);
+    if (h) {
+        const auto& snapshot = p.checkpoints.at(*h).snapshot;
+        std::vector<const detail::Snapshot*> retired_snapshots;
+        for (auto point : out.retired_points)
+            retired_snapshots.push_back(&p.checkpoints.at(point).snapshot);
+        if (out.consume_source) retired_snapshots.push_back(&snapshot);
+        auto copies = snapshot.replay_requirements(p.directory, retired_snapshots);
+        out.transfers.insert(out.transfers.end(), copies.begin(), copies.end());
+    }
     return out;
 }
 
@@ -176,7 +175,7 @@ detail::SessionImpl::plan_binding(const RequestBasePlan& base, runtime::LaneId l
     const bool resident    = checkpoint && states.device_resident(image);
     const bool consume     = checkpoint && (own || candidate.consume_source) &&
                          checkpoints[source->index].pins == 0 &&
-                         states.checkpoint_references(image) == 1 && !states.source_pins(image);
+                         states.can_recover_exclusively(image);
     const bool split = checkpoint && !consume && resident && states.host_resident(image) &&
                        !states.source_pins(image);
     const auto target = resume ? resume->frontier() : frontier;

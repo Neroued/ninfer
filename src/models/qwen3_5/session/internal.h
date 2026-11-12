@@ -3,6 +3,7 @@
 #include "models/qwen3_5/session/session.h"
 #include "models/qwen3_5/state/continuation.h"
 #include "models/common/context/snapshot.h"
+#include "models/common/context/identity.h"
 #include "models/common/context/work.h"
 #include "models/common/qwen/prefix_identity.h"
 #include "models/common/qwen/recovery_store.h"
@@ -24,6 +25,19 @@ struct PreparedCaptureBacking {
     qwen::PrefixShortlistDigests digests;
     std::vector<TokenId> ledger;
     qwen::ResidentPrefixIdentity prefix_identity;
+    context::IdentityMetadata retention;
+
+    [[nodiscard]] std::size_t metadata_bytes() const noexcept {
+        return sizeof(*this) + ledger.capacity() * sizeof(TokenId) +
+               prefix_identity.metadata_bytes() + digests.metadata_bytes();
+    }
+
+    [[nodiscard]] static std::size_t cache_bytes(std::size_t tokens, std::size_t concurrency) {
+        return context::IdentityMetadata::cache_bytes<PreparedCaptureBacking>(
+            tokens, concurrency,
+            sizeof(TokenId) + 3 * sizeof(std::int32_t) + sizeof(std::uint8_t) +
+                sizeof(std::array<std::uint64_t, 2>));
+    }
 };
 
 struct CaptureGroup {
@@ -113,6 +127,7 @@ struct CaptureReservation {
     std::vector<std::pair<CheckpointHandle, runtime::CheckpointRole>> points;
     context::StateId state;
     std::optional<context::RecordReservation> host;
+    std::shared_ptr<const PreparedCaptureBacking> identity;
     std::uint32_t frontier = 0;
     ~CaptureReservation();
 };
@@ -154,6 +169,8 @@ struct CheckpointState {
     PrefixShortlistKey key;
     runtime::CheckpointOrigin origin = runtime::CheckpointOrigin::Semantic;
     SharedCandidateEvidence evidence = SharedCandidateEvidence::None;
+
+    mutable std::weak_ptr<const runtime::RecoveryIdentity> recovery_identity_cache;
 
     [[nodiscard]] const Continuation& continuation() const noexcept {
         return snapshot.continuation();
@@ -238,6 +255,7 @@ struct CaptureOperation {
     std::uint32_t frontier         = 0;
     std::uint32_t backend_frontier = 0;
     std::vector<std::pair<CheckpointHandle, runtime::CheckpointRole>> points;
+    std::shared_ptr<const PreparedCaptureBacking> identity;
 };
 
 struct MaintenanceOperation {
@@ -427,12 +445,13 @@ public:
     std::array<RequestControl, kMaximumConcurrency> requests;
     std::array<std::uint64_t, kMaximumConcurrency> lane_epochs{};
     std::uint64_t next_sequence = 1;
-    mutable context::RecoveryIndex<> recovery_index{directory.metadata_budget()};
+    context::RecoveryMetadata recovery_metadata;
+    mutable context::RecoveryIndex<> recovery_index{directory.metadata_budget(),
+                                                    &recovery_metadata};
     Checkpoints checkpoints;
     context::MetadataAccount count_storage{directory.metadata_budget()};
     TokenCountBuilder count_builder;
     std::unique_ptr<PendingContext> context_operation_;
-    std::optional<ContextAssessment> pending_maintenance_;
     std::optional<SequenceHandle> normalizing_pause_;
 
     struct PauseReservation {
@@ -544,10 +563,9 @@ public:
     void initialize_prefill(RequestControl&, std::uint32_t base);
     void initialize_captures(RequestControl&, std::uint32_t from, std::uint32_t through);
     enum class CaptureReservationStatus { Ready, NeedsContext, Unavailable };
-    [[nodiscard]] CaptureReservationStatus
-    reserve_capture_destination(std::uint32_t, std::uint32_t,
-                                std::span<const CheckpointHandle> victims = {},
-                                runtime::CaptureStorage storage = runtime::CaptureStorage::Automatic);
+    [[nodiscard]] CaptureReservationStatus reserve_capture_destination(
+        std::uint32_t, std::uint32_t, std::span<const CheckpointHandle> victims = {},
+        runtime::CaptureStorage storage = runtime::CaptureStorage::Automatic);
     void prepare_capture_boundary(std::uint32_t);
     void abort_context() noexcept;
     void cancel_context() noexcept;

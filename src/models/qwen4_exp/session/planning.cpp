@@ -67,10 +67,14 @@ runtime::ContextMetadataPlan session_metadata_plan(const ExecutionPlan& executio
             {i, state_part.image_bytes, state_part.alignment});
     }
     auto metadata = context::ContextDirectory::metadata_plan(schema, rank);
+    const auto concurrency =
+        execution.shape.purpose == EnginePurpose::Generation ? execution.shape.max_concurrency : 0U;
     const auto checkpoint_cost =
         detail::Checkpoints::metadata_bytes(1) - detail::Checkpoints::metadata_bytes(0);
-    const auto recovery_cost =
-        context::RecoveryIndex<>::metadata_bytes(1) - context::RecoveryIndex<>::metadata_bytes(0);
+    const auto recovery_cost = context::RecoveryIndex<>::metadata_bytes(1) -
+                               context::RecoveryIndex<>::metadata_bytes(0) +
+                               context::recovery_value_metadata_bytes(1, concurrency, ranks) -
+                               context::recovery_value_metadata_bytes(0, concurrency, ranks);
     std::size_t history_cost = 0;
     for (const auto& pool : schema.pools)
         history_cost += context::HistoryDirectory::metadata_bytes(1, 0, pool.page_capacity, ranks) -
@@ -81,7 +85,10 @@ runtime::ContextMetadataPlan session_metadata_plan(const ExecutionPlan& executio
                                                   ? execution.profile->public_tokens
                                                   : 0) +
             detail::Checkpoints::metadata_bytes(std::size_t(schema.state.logical_capacity)) +
-            context::RecoveryIndex<>::metadata_bytes(std::size_t(schema.state.logical_capacity));
+            context::RecoveryIndex<>::metadata_bytes(std::size_t(schema.state.logical_capacity)) +
+            context::recovery_value_metadata_bytes(schema.state.logical_capacity, concurrency,
+                                                   ranks) +
+            detail::Identity::cache_bytes(execution.shape.max_context, concurrency);
     metadata.bytes_per_record.at(geometry.spec_classes[0].index) +=
         (checkpoint_cost + recovery_cost + history_cost + ranks - 1) / ranks;
     return metadata;

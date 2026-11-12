@@ -5,7 +5,7 @@
 
 namespace ninfer::models::qwen3_5 {
 
-RequestBasePlan::RequestBasePlan(std::shared_ptr<detail::RequestBasePlanImpl> impl) noexcept
+RequestBasePlan::RequestBasePlan(std::shared_ptr<const detail::RequestBasePlanImpl> impl) noexcept
     : impl_(std::move(impl)) {}
 
 RequestBasePlan::RequestBasePlan(RequestBasePlan&&) noexcept = default;
@@ -418,7 +418,11 @@ SessionImpl::SessionImpl(std::shared_ptr<const ModelDefinition> definition_in, S
       max_concurrency(plan.max_concurrency), prefill_chunk(plan.prefill_chunk),
       draft_window(plan.draft_window), speculative_backend(plan.speculative_backend),
       context_cache(plan.context_cache), vision_enabled(plan.profile->options.vision),
-      causal_scoring(plan.causal_scoring) {
+      causal_scoring(plan.causal_scoring),
+      recovery_metadata(directory.metadata_budget(), plan.causal_scoring ? 0 : plan.max_concurrency,
+                        1, 1,
+                        PreparedCaptureBacking::cache_bytes(
+                            plan.capacity, plan.causal_scoring ? 0 : plan.max_concurrency)) {
     if (!definition || !plan.profile || plan.context.pools.empty())
         throw std::invalid_argument("Session preparation is incomplete");
     checkpoints.configure(Checkpoints::capacity_for_metadata(directory.metadata_budget().limit()),
@@ -442,7 +446,6 @@ void SessionImpl::fail_all_cleanup() noexcept {
             executor().drain();
         } catch (...) {}
     }
-    pending_maintenance_.reset();
     if (context_operation_) context_operation_->transaction.fail_after_drain();
     abort_context();
     if (execution) {

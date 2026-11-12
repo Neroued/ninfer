@@ -4,6 +4,34 @@
 
 namespace ninfer::models::glm5next {
 
+namespace {
+struct PauseResources {
+    ContextDemand demand;
+    detail::RelocationTargets relocation;
+};
+
+PauseResources pause_resources(const detail::SessionImpl& p, const detail::Sequence& s,
+                               runtime::PauseAction action) {
+    PauseResources out;
+    if (action.kind == runtime::PauseKind::ReleaseAndReplay) return out;
+    for (std::uint32_t pool = 0; pool < p.pool_count(); ++pool)
+        out.demand.add_growth(p.directory.pool(pool).histories(), s.histories[pool].handle(), 0);
+    if (action.kind == runtime::PauseKind::Relocate) {
+        out.relocation.state =
+            out.demand.add_state({.count = 1, .variant = action.placement.value});
+        const std::array placement{action.placement.value};
+        for (std::uint32_t pool = 0; pool < p.pool_count(); ++pool) {
+            const auto f                   = pool ? s.continuation.metadata.mtp_frontier.value()
+                                                  : s.continuation.metadata.main_frontier;
+            out.relocation.histories[pool] = out.demand.add_history(
+                pool,
+                p.directory.pool(pool).histories().binding_demand(nullptr, 0, f, {}, placement));
+        }
+    }
+    return out;
+}
+} // namespace
+
 std::vector<PauseOption> Session::pause_options(SequenceHandle h) const {
     const auto& p = *impl_;
     const auto& s = p.sequence(h);
@@ -23,13 +51,10 @@ std::vector<PauseOption> Session::pause_options(SequenceHandle h) const {
 
     std::vector<PauseOption> result;
     if (s.request->can_checkpoint(s.continuation.metadata.main_frontier)) {
-        ContextDemand checkpoint_demand;
-        for (std::uint32_t pool = 0; pool < p.pool_count(); ++pool)
-            checkpoint_demand.add_growth(p.directory.pool(pool).histories(),
-                                         s.histories[pool].handle(), 0);
-        result.push_back({.action   = {runtime::PauseKind::KeepDevice, {}},
-                          .demand   = checkpoint_demand,
-                          .released = preparation_release});
+        result.push_back(
+            {.action   = {runtime::PauseKind::KeepDevice, {}},
+             .demand   = pause_resources(p, s, {runtime::PauseKind::KeepDevice, {}}).demand,
+             .released = preparation_release});
     }
 
     ContextReleaseSet released = std::move(preparation_release);
@@ -48,17 +73,9 @@ std::vector<PauseOption> Session::pause_options(SequenceHandle h) const {
     if (s.request->can_checkpoint(s.continuation.metadata.main_frontier)) {
         for (const auto target : p.placements) {
             if (target == s.continuation.metadata.placement) continue;
-            ContextDemand demand;
-            demand.add_state({.count = 1, .variant = target.value});
-            const std::array placement{target.value};
-            for (std::uint32_t pool = 0; pool < p.pool_count(); ++pool) {
-                const auto f = pool ? s.continuation.metadata.mtp_frontier.value()
-                                    : s.continuation.metadata.main_frontier;
-                demand.add_history(pool, p.directory.pool(pool).histories().binding_demand(
-                                             nullptr, 0, f, {}, placement));
-            }
+            auto resources = pause_resources(p, s, {runtime::PauseKind::Relocate, target});
             result.push_back({.action   = {runtime::PauseKind::Relocate, target},
-                              .demand   = std::move(demand),
+                              .demand   = std::move(resources.demand),
                               .released = released});
         }
     }
@@ -82,7 +99,7 @@ bool Session::pause_contributes(SequenceHandle h, const PauseOption& option,
 }
 
 bool Session::prepare_pause(SequenceHandle h, runtime::PauseAction action,
-                            std::span<const CheckpointHandle> host_victims) {
+                            std::span<const CheckpointHandle> victims) {
     auto& p = *impl_;
     if (p.operation || execution_pending(h)) return false;
     if (p.pause_reservation) throw std::logic_error("pause preparation is already owned");
@@ -90,31 +107,15 @@ bool Session::prepare_pause(SequenceHandle h, runtime::PauseAction action,
     const auto selected = std::find_if(options.begin(), options.end(),
                                        [&](const auto& option) { return option.action == action; });
     if (selected == options.end()) return false;
-    if (!host_victims.empty())
-        throw std::invalid_argument("GLM5Next pause has no Host destination");
-    ContextReleaseSet released;
-    auto& sequence = p.sequence(h);
+    for (auto victim : victims)
+        if (!p.checkpoints.erasable(victim)) return false;
+    const auto released = p.footprint(victims, true);
+    auto& sequence      = p.sequence(h);
     sequence.capture.reset();
     sequence.capture_pending = false;
-    ContextDemand demand;
-    if (action.kind != runtime::PauseKind::ReleaseAndReplay) {
-        for (std::uint32_t pool = 0; pool < p.pool_count(); ++pool)
-            demand.add_growth(p.directory.pool(pool).histories(), sequence.histories[pool].handle(),
-                              0);
-    }
-    detail::RelocationTargets relocation;
-    if (action.kind == runtime::PauseKind::Relocate) {
-        relocation.state = demand.add_state({.count = 1, .variant = action.placement.value});
-        const std::array placement{action.placement.value};
-        for (std::uint32_t pool = 0; pool < p.pool_count(); ++pool) {
-            const auto f               = pool ? sequence.continuation.metadata.mtp_frontier.value()
-                                              : sequence.continuation.metadata.main_frontier;
-            relocation.histories[pool] = demand.add_history(
-                pool,
-                p.directory.pool(pool).histories().binding_demand(nullptr, 0, f, {}, placement));
-        }
-    }
-    const auto assessment = p.directory.assess(demand, released);
+    auto resources           = pause_resources(p, sequence, action);
+    auto& demand             = resources.demand;
+    const auto assessment    = p.directory.assess(demand, released);
     if (!assessment.feasible()) return false;
     if (assessment.requires_maintenance() && (p.compute || p.executor->has_pending_work()))
         return false;
@@ -129,7 +130,7 @@ bool Session::prepare_pause(SequenceHandle h, runtime::PauseAction action,
         detail::SessionImpl::PauseReservation{.sequence   = h,
                                               .action     = action,
                                               .demand     = std::move(demand),
-                                              .relocation = relocation,
+                                              .relocation = resources.relocation,
                                               .execution  = std::move(*execution),
                                               .checkpoint = std::move(checkpoint)});
     return true;

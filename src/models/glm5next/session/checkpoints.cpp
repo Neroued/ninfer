@@ -15,7 +15,9 @@ PreparedCheckpoint SessionImpl::prepare_checkpoint(Sequence& s) {
     for (std::uint32_t pool = 0; pool < pool_count(); ++pool)
         demand.add_growth(directory.pool(pool).histories(), s.histories[pool].handle(), 0);
     if (!directory.reserve(demand)) return {};
-    return {std::move(record), capture_identity(s)};
+    auto identity = capture_identity(s, recovery_metadata.identity_budget());
+    if (!identity) return {};
+    return {std::move(record), std::move(identity)};
 }
 
 std::optional<CheckpointHandle> SessionImpl::detach(Sequence& s, runtime::CheckpointRole role,
@@ -97,6 +99,9 @@ Session::prepare_capture(SequenceHandle h, std::span<const CheckpointHandle> vic
     auto ticket         = std::make_unique<detail::CaptureReservation>();
     ticket->states      = &p.directory.states();
     ticket->checkpoints = &p.checkpoints;
+    ticket->identity = s.request->identity->retention.retain(p.recovery_metadata.identity_budget(),
+                                                             s.request->identity);
+    if (!ticket->identity) return {};
     ticket->records.reserve(point.roles.size());
     for (const auto role : point.roles) {
         const auto record = p.checkpoints.reserve();
@@ -274,7 +279,7 @@ runtime::ContextStart Session::start_capture(SequenceHandle h) {
                                                 : s.continuation.metadata.mtp_frontier.value()));
         p.directory.states().freeze(s.continuation.image);
         tx.snapshot.emplace(p.directory.states(), s.continuation, std::move(prefixes),
-                            s.request->identity);
+                            std::move(reservation.identity));
         for (std::uint32_t rank = 0; rank < p.plan.states.size(); ++rank)
             if (const auto& field = p.plan.states[rank].draft_context)
                 migration.add_state_group(s.continuation.image, field->offset, field->bytes, rank);

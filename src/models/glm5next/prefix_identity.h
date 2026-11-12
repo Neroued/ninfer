@@ -27,6 +27,10 @@ bool complete_input_frontier(InputPrefixView input, std::size_t frontier);
 // Shortlisting only. Exact input comparison is still required before reusing model state.
 class PrefixDigests {
 public:
+    [[nodiscard]] std::size_t metadata_bytes() const noexcept {
+        return digests_.capacity() * sizeof(std::array<std::uint64_t, 2>);
+    }
+
     explicit PrefixDigests(InputPrefixView input = {});
     void reserve(std::size_t tokens);
     void append_generated(std::span<const TokenId>);

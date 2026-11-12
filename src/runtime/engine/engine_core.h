@@ -505,10 +505,16 @@ private:
         typename ResourceManagement::ReclaimCursor reclaim;
     };
 
+    struct ExecutionDecision {
+        ExecutionUnit unit;
+        typename ResourceManagement::ReclaimCursor reclaim;
+    };
+
     struct CaptureDecision {
         SequenceHandle sequence;
         std::uint32_t frontier = 0;
         typename ResourceManagement::ReclaimCursor reclaim;
+        std::optional<typename ResourceManagement::ReclaimActionQuote> pending;
     };
 
     [[nodiscard]] std::optional<GenerationTimingObservation>
@@ -583,11 +589,13 @@ private:
                             std::span<const Checkpoint> excluded               = {},
                             typename ResourceManagement::ReclaimCursor* cursor = nullptr);
 
-    bool pause_reclaim_victim(const ContextAssessment&);
+    bool pause_reclaim_victim(const ContextAssessment&,
+                              typename ResourceManagement::ReclaimCursor* = nullptr);
 
     enum class PauseGoal { YieldLane, ReleaseCapacity, RelocateOnly };
     bool pause_resident(std::uint32_t lane, PauseGoal goal = PauseGoal::YieldLane,
-                        const ContextAssessment* pressure = nullptr);
+                        const ContextAssessment* pressure           = nullptr,
+                        typename ResourceManagement::ReclaimCursor* = nullptr);
 
     void order_binding_sources(const std::shared_ptr<Request>&, LaneId,
                                std::vector<typename ResourceManagement::SourceChoice>&);
@@ -677,6 +685,7 @@ private:
     std::optional<AdmissionDecision> admission_decision_;
     std::uint64_t admission_generation_ = 1;
     std::array<std::optional<CaptureDecision>, kMaximumConcurrency> capture_decisions_;
+    std::array<std::optional<ExecutionDecision>, kMaximumConcurrency> execution_decisions_;
     std::shared_ptr<Request> context_owner_;
     std::vector<std::shared_ptr<Request>> paused_;
     Scheduling scheduler_;

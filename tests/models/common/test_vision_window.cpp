@@ -11,6 +11,64 @@ void require(bool ok, const char* message) {
 
 int main() {
     try {
+        using ninfer::models::frontend::VisionItem;
+        std::vector<VisionItem> media(2);
+        media[0].grid        = {1, 4, 4};
+        media[0].patch_count = 16;
+        media[0].token_spans = {{2, 4}};
+        media[1].grid        = {2, 2, 4};
+        media[1].patch_count = 16;
+        media[1].token_spans = {{10, 2}, {18, 2}};
+        const auto view      = [](const auto& item) -> const auto& { return item; };
+        const auto all       = v::recovery_work(media, view, 0, 24, 24, 4);
+        require(all.tokens == 24 && all.attention_pairs == 300 && all.vision_items == 3 &&
+                    all.vision_patches == 32 && all.chunks == 2,
+                "recovery must price image/frame units and capacity-limited chunks");
+        const auto partial = v::recovery_work(media, view, 11, 19, 4, 4);
+        require(partial.tokens == 8 && partial.attention_pairs == 124 &&
+                    partial.vision_items == 2 && partial.vision_patches == 16 &&
+                    partial.chunks == 2,
+                "partial media replay lost a whole encoder unit");
+        const auto gap = v::recovery_work(media, view, 12, 18, 4, 4);
+        require(gap.vision_items == 0 && gap.vision_patches == 0 && gap.chunks == 2,
+                "video text gap was charged for unreferenced frames");
+        const auto empty = v::recovery_work(media, view, 11, 11, 4, 4);
+        require(!empty.tokens && !empty.chunks && !empty.vision_items,
+                "empty recovery range retained media work");
+        std::vector<VisionItem> held(2);
+        for (auto& item : held) {
+            item.grid        = {1, 4, 4};
+            item.patch_count = 16;
+        }
+        held[0].token_spans  = {{6, 4}};
+        held[1].token_spans  = {{13, 4}};
+        const auto held_work = v::recovery_work(held, view, 0, 24, 8, 8);
+        require(held_work.chunks == 4 && held_work.vision_items == 2 &&
+                    held_work.vision_patches == 32,
+                "a held window must stop the next chunk before an unencoded frame");
+        const std::vector<v::Unit> held_units{{0, 0, 0, 16, 6, 4, 1}, {1, 0, 0, 16, 13, 4, 1}};
+        v::Window held_window;
+        const r::ExecutionMember held_owner{{3, 1}, {{0}, 1}};
+        std::vector<std::uint32_t> boundaries;
+        for (std::uint32_t begin = 0; begin < 24;) {
+            const auto end =
+                held_window.limit(held_owner, held_units, begin, std::min(24U, begin + 8), 8);
+            const auto planned =
+                held_window.current() ? nullptr : v::plan_window(held_units, begin, end, 8, 1);
+            if (planned || held_window.current()) {
+                const auto use = held_window.reserve(held_owner, planned);
+                const r::ExecutionTicket ticket{.epoch = {1}, .id = boundaries.size() + 1};
+                held_window.submitted(use.id, ticket);
+                held_window.consumed(use.id, end >= use.plan->consume_end);
+                held_window.retired(ticket);
+            }
+            boundaries.push_back(end);
+            begin = end;
+        }
+        require(
+            boundaries == std::vector<std::uint32_t>{8, 13, 21, 24} &&
+                held_work.chunks == boundaries.size(),
+            "reference chunk quotation disagrees with Native window publication and retirement");
         const std::vector<v::Unit> units{
             {0, 0, 0, 8, 3, 2, 8}, {1, 0, 0, 12, 7, 3, 20}, {2, 0, 0, 12, 14, 3, 20}};
         v::validate_units(units, 5, 20);

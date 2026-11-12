@@ -177,7 +177,9 @@ runtime::ContextCapacityPlan describe_execution_capacity(const ExecutionPlan& p)
     auto description = schema(p, 0, true);
     out.metadata     = session_metadata_plan(
         description, geometry, rank,
-        p.shape.purpose == EnginePurpose::Generation ? p.profile->public_tokens : 0);
+        p.shape.purpose == EnginePurpose::Generation ? p.profile->public_tokens : 0,
+        p.shape.purpose == EnginePurpose::Generation ? p.shape.max_concurrency : 0,
+        p.shape.max_context);
     return out;
 }
 

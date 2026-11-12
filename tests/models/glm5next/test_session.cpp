@@ -12,6 +12,7 @@
 #include <deque>
 #include <iostream>
 #include <fstream>
+#include <map>
 #include <sstream>
 #include <thread>
 
@@ -182,19 +183,30 @@ glm::SessionPlan plan(const glm::ModelDefinition& definition, bool pressure = fa
     p.shape                  = {.max_context     = 256,
                                 .max_concurrency = 3,
                                 .prefill_chunk   = 64,
-                                .draft_tokens    = definition.options().mtp() ? 3U : 0U,
-                                .kv_storage      = KvCacheStorage::BFloat16,
-                                .index_format    = KvCacheVectorFormat::BFloat16,
-                                .purpose         = EnginePurpose::Generation,
-                                .context_cache   = true,
-                                .gpu_timing      = false,
-                                .speculative     = definition.options().speculative};
+                                .draft_tokens =
+                   definition.options().speculative != SpeculativeBackend::None ? 3U : 0U,
+                                .kv_storage    = KvCacheStorage::BFloat16,
+                                .index_format  = KvCacheVectorFormat::BFloat16,
+                                .purpose       = EnginePurpose::Generation,
+                                .context_cache = true,
+                                .gpu_timing    = false,
+                                .speculative   = definition.options().speculative};
     const auto& c            = definition.config().text;
     auto profile             = std::make_shared<glm::execution::ModelProfile>();
     profile->config          = definition.config();
     profile->local.size      = 2;
     profile->local.kda_heads = {0, c.kda.heads / 2};
     if (definition.options().mtp()) profile->mtp.emplace();
+    if (definition.options().masked_draft()) {
+        const auto& draft                = *profile->config.draft;
+        profile->draft.emplace().context = {glm::dimension(c.hidden),
+                                            glm::dimension(draft.attention.head_dim),
+                                            glm::dimension(draft.attention.num_key_value_heads / 2),
+                                            draft.sliding_window.value(),
+                                            QType::BF16,
+                                            draft.rms_norm_eps,
+                                            draft.rope_theta};
+    }
     const auto state = glm::describe_state(glm::plan_state(*profile));
     p.states         = {state, state};
     p.caches.push_back(
@@ -233,10 +245,13 @@ glm::SessionPlan plan(const glm::ModelDefinition& definition, bool pressure = fa
     }
     if (pressure)
         for (auto& pool : p.context.pools) pool.logical_pages = 4;
-    const auto records              = p.context.state.logical_capacity * 8ULL;
-    p.context.metadata_budget_bytes = ctx::ContextDirectory::metadata_bytes(p.context) +
-                                      glm::detail::Checkpoints::metadata_bytes(records) +
-                                      ctx::RecoveryIndex<>::metadata_bytes(records);
+    const auto records = p.context.state.logical_capacity * 8ULL;
+    p.context.metadata_budget_bytes =
+        ctx::ContextDirectory::metadata_bytes(p.context) +
+        glm::detail::Checkpoints::metadata_bytes(records) +
+        ctx::RecoveryIndex<>::metadata_bytes(records) +
+        ctx::recovery_value_metadata_bytes(records, p.shape.max_concurrency, 2, 2) +
+        glm::InputIdentity::cache_bytes(p.shape.max_context, p.shape.max_concurrency);
     return p;
 }
 
@@ -337,6 +352,249 @@ struct Fixture {
     }
 };
 
+struct CopyWork {
+    std::uint64_t bytes = 0, operations = 0, images = 0, pages = 0;
+    bool operator==(const CopyWork&) const = default;
+};
+
+using LocalCopies = std::map<std::pair<std::uint32_t, std::size_t>, CopyWork>;
+
+LocalCopies local_copies(std::span<const rt::ContextTransferRequirement> requirements) {
+    LocalCopies result;
+    for (const auto& copy : requirements) {
+        require(copy.direction == rt::ContextTransferDirection::DeviceToDevice && !copy.peer,
+                "local quote unexpectedly uses another transfer route");
+        auto& work = result[{copy.rank, copy.resource.index()}];
+        work.bytes += copy.work.payload_bytes;
+        work.operations += copy.work.copy_operations;
+        work.images += copy.image_count;
+        work.pages += copy.page_groups;
+    }
+    return result;
+}
+
+LocalCopies local_copies(const glm::Work& submitted) {
+    LocalCopies result;
+    for (const auto& [rank, actions] : submitted.actions)
+        for (const auto& action : actions.operations) {
+            require(!std::holds_alternative<ctx::PeerCopy>(action),
+                    "local recovery submitted a peer copy");
+            if (const auto* copy = std::get_if<ctx::RecordCopy>(&action)) {
+                require(copy->source.memory == ctx::ContextMemory::Device &&
+                            copy->destination.memory == ctx::ContextMemory::Device,
+                        "local recovery submitted a Host copy");
+                auto& work = result[{rank, copy->resource.index()}];
+                work.bytes += copy->source.bytes;
+                ++work.operations;
+                work.images += copy->image_count;
+                work.pages += copy->page_groups;
+            }
+        }
+    return result;
+}
+
+void recovery_quotes_match_tail_copies(std::shared_ptr<const glm::ModelDefinition> definition) {
+    for (auto frontier : {4U, 64U}) {
+        Fixture f(definition);
+        auto request    = f.request(frontier);
+        const auto seed = f.bind(request, 0, 0);
+        f.commit(f.prefill(seed), true);
+        const auto finished = f.session.finish(seed);
+        require(finished.checkpoint.has_value(), "tail-copy seed did not publish");
+        f.idle();
+        auto longer = f.request(frontier + 4);
+        // One live writer owns the source's tail. A second replay must acquire its own copy.
+        const auto writer   = f.bind(longer, 1, 0, finished.checkpoint);
+        const auto points   = f.session.recovery_points({}, {&*finished.checkpoint, 1});
+        const auto& restore = points.front().description->restores.front();
+        require(restore.placement.value == 0 && restore.transfers.empty(),
+                "same-frontier recovery was charged for future KV writes");
+        const auto target = f.session.recovery_target(longer, frontier + 4, {0});
+        require(points.front().description->identity->prefix_of(*target->identity) &&
+                    target->identity->rebuild(frontier).tokens == 4,
+                "tail-copy test did not describe a later recovery target");
+        const auto candidate =
+            f.session.inspect_source(longer, finished.checkpoint, false, {}, {}, {0});
+        require(candidate.has_value(), "tail-copy replay source was rejected");
+        const auto replay    = f.bind(longer, 2, 0, finished.checkpoint);
+        const auto submitted = local_copies(f.executor.last);
+        require(local_copies(restore.replay_transfers) == submitted &&
+                    local_copies(candidate->transfers) == submitted,
+                "Native recovery/source quote omitted the submitted KV tail copy");
+        const auto expected = frontier % kPagedKVPageSize   ? f.layout.caches.size()
+                              : definition->options().mtp() ? 1U
+                                                            : 0U;
+        require(submitted.size() == expected,
+                "tail quotation ignored the Main/MTP page-boundary difference");
+        for (const auto& [key, work] : submitted)
+            require(key.first == 0 && key.second > 0 && work.operations == 1 && work.pages == 1 &&
+                        work.images == 0 && work.bytes != 0,
+                    "recovery comparison did not observe a KV page copy");
+        require(f.session.abort(writer).status == rt::ConsumeStatus::Consumed,
+                "tail-copy writer did not retire");
+        f.idle();
+        require(f.session.abort(replay).status == rt::ConsumeStatus::Consumed,
+                "tail-copy replay did not retire");
+        f.idle();
+        const auto idle_points = f.session.recovery_points({}, {&*finished.checkpoint, 1});
+        require(idle_points.front().description->restores.front().replay_transfers.empty(),
+                "retired writer remained in a refreshed recovery quote");
+        require(f.session.release_checkpoint(*finished.checkpoint),
+                "tail-copy seed did not retire");
+    }
+}
+
+void pause_quotes_match_shared_draft(std::shared_ptr<const glm::ModelDefinition> definition) {
+    for (auto sharing : {0U, 1U, 2U}) {
+        Fixture f(definition);
+        auto request  = f.request(4);
+        auto sequence = f.bind(request, 0, 0);
+        f.commit(f.prefill(sequence), sharing != 0);
+        std::optional<glm::CheckpointHandle> source;
+        if (sharing) {
+            source = f.session.finish(sequence).checkpoint;
+            require(source.has_value(), "draft pause seed did not publish");
+            f.idle();
+            sequence = f.bind(request, 1, 0, source);
+        }
+        const auto options = f.session.pause_options(sequence);
+        const auto keep    = std::find_if(options.begin(), options.end(), [](const auto& option) {
+            return option.action.kind == rt::PauseKind::KeepDevice;
+        });
+        require(keep != options.end(), "draft pause has no KeepDevice option");
+        std::vector<glm::CheckpointHandle> victims;
+        if (sharing == 2) victims.push_back(*source);
+        const auto quote = f.session.pause_cost(sequence, *keep, {}, victims);
+        require(quote.recovery.size() == 1 && !quote.recovery.front().rebuild.tokens &&
+                    !quote.unpriced_work,
+                "complete draft snapshot unexpectedly requires replay");
+        require(f.session.prepare_pause(sequence, keep->action, victims),
+                "draft KeepDevice preflight failed");
+        if (!victims.empty()) {
+            require(f.session.release_checkpoint(*source), "draft pause victim did not retire");
+            source.reset();
+        }
+        require(f.session.start_pause(sequence, keep->action), "draft KeepDevice did not start");
+        auto paused = f.event<glm::ContextProgress>();
+        f.idle();
+        require(paused.paused && paused.paused->has_snapshot(), "draft pause lost its snapshot");
+        const auto resumed =
+            f.bind(request, 1, 0, paused.paused->snapshot_handle(), &*paused.paused);
+        const auto submitted = local_copies(f.executor.last);
+        require(local_copies(quote.recovery.front().transfers) == submitted,
+                "KeepDevice recovery quote differs from submitted draft State copies");
+        require(submitted.size() == (sharing == 1 ? f.layout.states.size() : 0),
+                "KeepDevice quote failed to distinguish Move from shared-State Fork");
+        for (const auto& [key, work] : submitted)
+            require(key.second == 0 && work.images == 1 && work.operations == 1 &&
+                        work.pages == 0 &&
+                        work.bytes == f.layout.states[key.first].draft_context->bytes,
+                    "KeepDevice comparison did not observe a draft State field copy");
+        require(f.session.abort(resumed).status == rt::ConsumeStatus::Consumed,
+                "resumed draft did not retire");
+        f.idle();
+        if (source) require(f.session.release_checkpoint(*source), "draft seed did not retire");
+    }
+}
+
+void identity_budget_replacement(std::shared_ptr<const glm::ModelDefinition> definition) {
+    auto layout                  = plan(*definition);
+    layout.shape.max_concurrency = 1;
+    Fixture f(definition, std::move(layout));
+    const auto request  = f.request(220);
+    const auto sequence = f.bind(request, 0, 0);
+    std::vector<glm::CheckpointHandle> input;
+    for (unsigned chunk = 0; chunk < 4; ++chunk) {
+        const glm::ExecutionUnit unit{sequence, glm::ExecutionUnitKind::Prefill, 64};
+        require(bool(f.session.reserve_units({&unit, 1})), "long input could not reserve prefill");
+        const auto capture = f.session.prepare_capture(sequence);
+        require(f.session.start_prefill(sequence).has_value(), "long input prefill did not start");
+        auto progress = f.event<glm::PrefillProgress>();
+        f.idle();
+        if (capture) {
+            require(capture->reserved && progress.capture_ready && !progress.pending,
+                    "long input capture was not prepared before execution");
+            require(f.session.start_capture(sequence) == rt::ContextStart::Started,
+                    "long input capture did not start");
+            auto captured = f.event<glm::ContextProgress>();
+            input         = std::move(captured.captured_checkpoints);
+            f.idle();
+            break;
+        }
+        require(!progress.pending, "long input skipped its configured checkpoint");
+    }
+    require(!input.empty(), "long input identity was not retained");
+    f.commit(f.prefill(sequence), true);
+    const auto finished = f.session.finish(sequence);
+    require(finished.status == rt::ConsumeStatus::Consumed && finished.checkpoint,
+            "long retained input prevented preparation of its continuation identity");
+    require(f.session.release_checkpoint(*finished.checkpoint), "long continuation did not retire");
+    for (auto h : input) require(f.session.release_checkpoint(h), "long input did not retire");
+}
+
+void identity_budget_retirement(std::shared_ptr<const glm::ModelDefinition> definition) {
+    Fixture f(definition);
+    std::vector<std::shared_ptr<const rt::RecoveryIdentity>> retained;
+    bool exhausted = false;
+    for (unsigned i = 0; i < 32; ++i) {
+        const auto request  = f.request(128);
+        const auto sequence = f.bind(request, 0, 0);
+        f.commit(f.prefill(sequence), true);
+        const auto finished = f.session.finish(sequence);
+        require(finished.status == rt::ConsumeStatus::Consumed,
+                "identity pressure prevented a legal request from finishing");
+        f.idle();
+        if (!finished.checkpoint) {
+            exhausted = true;
+            break;
+        }
+        const auto points = f.session.recovery_points({}, {&*finished.checkpoint, 1});
+        require(points.size() == 1, "finished checkpoint has no recovery identity");
+        retained.push_back(points.front().description->identity);
+        require(f.session.release_checkpoint(*finished.checkpoint),
+                "retained quote prevented physical checkpoint retirement");
+    }
+    require(exhausted && !retained.empty(), "retired identity bytes escaped their finite pool");
+    const auto usage = f.session.physical_usage();
+    require(!usage.state_objects && !usage.history_objects,
+            "refused optional continuation retained native storage");
+
+    const auto request  = f.request(256);
+    const auto sequence = f.bind(request, 0, 0);
+    for (unsigned chunk = 0; chunk < 4; ++chunk) {
+        const glm::ExecutionUnit unit{sequence, glm::ExecutionUnitKind::Prefill, 64};
+        require(bool(f.session.reserve_units({&unit, 1})),
+                "identity cache pressure prevented necessary prefill");
+        const auto capture = f.session.prepare_capture(sequence);
+        require(!capture, "full identity cache accepted a new long capture");
+        require(f.session.start_prefill(sequence).has_value(), "identity pressure stalled prefill");
+        auto progress = f.event<glm::PrefillProgress>();
+        if (progress.pending)
+            f.commit(std::move(*progress.pending));
+        else
+            f.idle();
+    }
+    require(!f.session.prepare_pause(sequence, {rt::PauseKind::KeepDevice, {0}}),
+            "full identity cache prepared another pause snapshot");
+    const rt::PauseAction replay{rt::PauseKind::ReleaseAndReplay, {0}};
+    require(f.session.prepare_pause(sequence, replay) && f.session.start_pause(sequence, replay),
+            "full identity cache blocked the no-snapshot pause path");
+    auto paused = f.event<glm::ContextProgress>();
+    f.idle();
+    require(paused.paused && !paused.paused->has_snapshot(),
+            "identity-pressure fallback did not release and replay");
+
+    retained.clear();
+    const auto fresh   = f.request(128);
+    const auto resumed = f.bind(fresh, 0, 0);
+    f.commit(f.prefill(resumed), true);
+    const auto finished = f.session.finish(resumed);
+    require(finished.status == rt::ConsumeStatus::Consumed && finished.checkpoint,
+            "retired decision identities did not return optional-save capacity");
+    require(f.session.release_checkpoint(*finished.checkpoint),
+            "replacement identity checkpoint failed to retire");
+}
+
 void fragmented_capture(std::shared_ptr<const glm::ModelDefinition> definition) {
     auto layout = plan(*definition);
     // Pad the toy State images to reproduce production's large-State/small-KV geometry.
@@ -384,6 +642,13 @@ void fragmented_capture(std::shared_ptr<const glm::ModelDefinition> definition) 
             "capture returned a wait on its own discarded reservation");
     require(!pool.has_maintenance() && !f.session.has_context_operation(),
             "failed capture retained an unsubmitted maintenance plan");
+    auto held_context = f.executor.pool.try_reserve(rt::FrameKind::Context);
+    require(held_context.has_value() &&
+                f.session.start_maintenance(prepared->assessment) == rt::ContextStart::Deferred,
+            "maintenance did not defer without its frame");
+    held_context.reset();
+    require(!f.session.poll() && !f.session.has_context_operation(),
+            "deferred maintenance escaped its caller's retry/cost decision");
     require(f.session.start_maintenance(prepared->assessment) == rt::ContextStart::Started,
             "capture did not start the required compaction");
     const auto maintained = f.event<glm::ContextProgress>();
@@ -417,6 +682,61 @@ void fragmented_capture(std::shared_ptr<const glm::ModelDefinition> definition) 
                                        !p.pending_retirement_bytes && !p.future_reserved_bytes;
                             }),
             "compacted capture retained State, history or reservations");
+}
+
+void relocation_preflight_includes_destination_victims(
+    std::shared_ptr<const glm::ModelDefinition> definition) {
+    Fixture f(definition);
+    const auto request = f.request(4);
+    const auto donor   = f.bind(request, 0, 0);
+    f.commit(f.prefill(donor), true);
+    const auto done = f.session.finish(donor);
+    require(done.checkpoint.has_value(), "relocation victim was not published");
+    f.idle();
+    const auto active = f.bind(request, 1, 1);
+    f.commit(f.prefill(active));
+    auto options      = f.session.pause_options(active);
+    const auto option = std::find_if(options.begin(), options.end(), [](const auto& value) {
+        return value.action.kind == rt::PauseKind::Relocate && value.action.placement.value == 0;
+    });
+    require(option != options.end(), "native relocation option is absent");
+    std::vector<ctx::RecordLease> fillers;
+    for (;;) {
+        auto record = f.directory->records().reserve(
+            ctx::RecordDemand{ctx::state_record_layout(0), ctx::ContextMemory::Device, 1, {0}});
+        if (!record || !record->ready()) break;
+        fillers.push_back(record->materialize(0));
+    }
+    const std::array victims{*done.checkpoint};
+    const auto plan  = f.session.plan_releases(victims, {}, option->demand);
+    auto released    = plan.inventory->select();
+    const auto trial = released.probe(victims);
+    require(!f.session.assess(option->demand).feasible() &&
+                f.session.assess(option->demand, released.released()).feasible(),
+            "destination pressure did not require exactly the quoted victim");
+    auto frame = f.executor.pool.try_reserve(rt::FrameKind::Context);
+    require(frame && !f.session.prepare_pause(active, option->action, victims) &&
+                f.session.valid_checkpoint(victims.front()),
+            "failed pause preflight consumed its destination victim");
+    frame.reset();
+    require(f.session.prepare_pause(active, option->action, victims) &&
+                f.session.valid_checkpoint(victims.front()),
+            "native relocation did not prepare against the complete release set");
+    require(f.session.release_checkpoint(victims.front()), "prepared victim did not retire");
+    require(f.session.start_pause(active, option->action), "prepared relocation did not start");
+    auto paused = f.event<glm::ContextProgress>();
+    f.idle();
+    require(paused.paused && paused.paused->has_snapshot() &&
+                f.session.checkpoint_metadata(*paused.paused->snapshot_handle()).placement.value ==
+                    0,
+            "prepared relocation lost its target after victim retirement");
+    require(f.session.revoke_snapshot(*paused.paused), "relocated snapshot did not retire");
+    paused.paused.reset();
+    f.idle();
+    fillers.clear();
+    require(!f.session.physical_usage().state_objects &&
+                !f.session.physical_usage().history_objects,
+            "relocation preflight retained source or destination state");
 }
 
 void transactions(std::shared_ptr<const glm::ModelDefinition> definition) {
@@ -474,8 +794,20 @@ void transactions(std::shared_ptr<const glm::ModelDefinition> definition) {
         require(f.session.abort(sequence).status == rt::ConsumeStatus::Consumed,
                 "captured writer release failed");
         f.idle();
+        const auto quotes = f.session.recovery_points();
+        require(!quotes.empty() && quotes.front().description->identity->rebuild(2).tokens == 2,
+                "native recovery quote lost the captured target");
+        const auto repeated = f.session.recovery_points();
+        require(repeated.size() == quotes.size() &&
+                    repeated.front().handle == quotes.front().handle &&
+                    repeated.front().description->identity == quotes.front().description->identity,
+                "simultaneous recovery views duplicated immutable identity metadata");
         for (auto checkpoint : captured.captured_checkpoints)
-            require(f.session.release_checkpoint(checkpoint), "captured source release failed");
+            require(f.session.release_checkpoint(checkpoint), "quote retained a State/KV lease");
+        require(quotes.front().description->identity->rebuild(0).tokens == 4 &&
+                    quotes.front().description->identity->prefix_of(
+                        *quotes.front().description->identity),
+                "retired checkpoint invalidated its decision identity");
         const auto usage = f.session.physical_usage();
         require(!usage.state_objects && !usage.history_objects,
                 "capture retained its source or writer");
@@ -811,6 +1143,111 @@ void engine_stop(std::shared_ptr<const glm::ModelDefinition> definition) {
             "stop retained pending work or Context ownership");
 }
 
+// A Native retirement dependency ends between Engine calls. The retained identity is
+// observable evidence that the request still owns the same decision across that yield.
+class DeferredExecutionSession : public glm::Session {
+public:
+    using glm::Session::Session;
+    std::atomic<bool> arm{false}, survived{false};
+    enum class Stage { Idle, Need, Deferred, Finished } stage = Stage::Idle;
+    mutable std::weak_ptr<const rt::RecoveryIdentity> observed;
+    mutable bool captured = false;
+
+    glm::ResourceReservation reserve_units(std::span<const glm::ExecutionUnit> units) {
+        if (arm && stage == Stage::Idle) {
+            stage = Stage::Need;
+            return {.assessment = {.status = ctx::ContextAvailability::NeedsMaintenance}};
+        }
+        return glm::Session::reserve_units(units);
+    }
+
+    glm::ContextAssessment assess(const glm::ContextDemand& demand,
+                                  const glm::ContextReleaseSet& released = {}) const {
+        if (stage == Stage::Need)
+            return {.demand = demand, .status = ctx::ContextAvailability::NeedsMaintenance};
+        return glm::Session::assess(demand, released);
+    }
+
+    std::vector<RecoveryPoint>
+    recovery_points(const glm::ContextReleaseSet& removed           = {},
+                    std::span<const glm::CheckpointHandle> selected = {}) const {
+        auto points = glm::Session::recovery_points(removed, selected);
+        if (stage == Stage::Need && !captured && selected.empty() && !points.empty()) {
+            observed = points.front().description->identity;
+            captured = true;
+        }
+        return points;
+    }
+
+    rt::ContextStart start_maintenance(const glm::ContextAssessment& assessment) {
+        if (stage == Stage::Need) {
+            stage = Stage::Deferred;
+            return rt::ContextStart::Deferred;
+        }
+        return glm::Session::start_maintenance(assessment);
+    }
+
+    bool has_context_operation() const {
+        return stage == Stage::Deferred || glm::Session::has_context_operation();
+    }
+
+    std::optional<glm::SessionEvent> poll() {
+        if (stage == Stage::Deferred) {
+            survived = captured && !observed.expired();
+            stage    = Stage::Finished;
+        }
+        return glm::Session::poll();
+    }
+};
+
+struct DeferredExecutionRuntime : glm::RuntimeTypes {
+    using Session = DeferredExecutionSession;
+};
+
+void execution_decision_survives_deferral(std::shared_ptr<const glm::ModelDefinition> definition) {
+    auto layout   = plan(*definition);
+    auto frontend = make_frontend();
+    Executor executor({layout.shape, definition->config().text.vocabulary,
+                       definition->resources().text.public_token_count, 2});
+    DeferredExecutionSession session(
+        glm::prepare_session(definition, layout,
+                             std::make_unique<ctx::ContextDirectory>(layout.context)),
+        executor);
+
+    struct Instance {
+        using ModelContract = DeferredExecutionRuntime;
+        glm::Frontend& frontend;
+        Executor* executor;
+        DeferredExecutionSession* session;
+    } instance{frontend, &executor, &session};
+
+    EngineOptions options;
+    options.max_context           = 256;
+    options.max_concurrency       = 3;
+    options.context_cache.enabled = true;
+    rt::EngineCore<Instance> engine(instance, options, {});
+    rt::ResolvedRequestOptions request;
+    request.execution.requested_output_tokens = 1;
+    request.execution.allow_prefix_reuse      = true;
+    request.output.raw                        = true;
+    request.stop.include_model_defaults       = false;
+    const auto submit                         = [&](TokenId token) {
+        auto prompt        = frontend.prepare_tokens(std::vector<TokenId>(4, token), true);
+        const auto summary = prompt.summary();
+        return engine.submit(std::move(prompt), summary, 0, request, OutputConsumerMode::Aggregate,
+                                                     {});
+    };
+    require(submit(0).wait(nullptr, {}).finish_reason == FinishReason::OutputLimit,
+            "decision deferral seed did not finish");
+    (void)engine.measure({rt::MeasurementAction::Reset});
+    session.arm = true;
+    require(submit(1).wait(nullptr, {}).finish_reason == FinishReason::OutputLimit &&
+                session.survived,
+            "Engine dropped the executing request's decision at an asynchronous dependency");
+    (void)engine.measure({rt::MeasurementAction::Reset});
+    require(session.observed.expired(), "granted execution retained a completed decision");
+}
+
 // Hold one capture's external retirement dependency while independent requests may run.
 class WaitingCaptureSession : public glm::Session {
 public:
@@ -949,6 +1386,15 @@ int main(int argc, char** argv) {
     try {
         require(argc >= 2, "missing artifact directory");
         artifact::Reader reader(std::filesystem::path(argv[1]) / "model.ninfer");
+        identity_budget_replacement(glm::read_definition(reader, {}));
+        identity_budget_retirement(glm::read_definition(reader, {}));
+        recovery_quotes_match_tail_copies(glm::read_definition(reader, {}));
+        recovery_quotes_match_tail_copies(
+            glm::read_definition(reader, {.speculative = SpeculativeBackend::Mtp}));
+        pause_quotes_match_shared_draft(
+            glm::read_definition(reader, {.speculative = SpeculativeBackend::DFlash2}));
+        execution_decision_survives_deferral(glm::read_definition(reader, {}));
+        relocation_preflight_includes_destination_victims(glm::read_definition(reader, {}));
         transactions(glm::read_definition(reader, {}));
         capture_replacement_and_retry(glm::read_definition(reader, {}));
         fragmented_capture(glm::read_definition(reader, {}));

@@ -15,5 +15,6 @@ struct SessionPlan {
 
 [[nodiscard]] runtime::ContextMetadataPlan
 session_metadata_plan(const context::ContextDirectorySpec&, const ContextPoolGeometry&,
-                      std::uint32_t rank, std::uint32_t count_vocabulary);
+                      std::uint32_t rank, std::uint32_t count_vocabulary, std::uint32_t concurrency,
+                      std::uint32_t max_context);
 } // namespace ninfer::models::glm5next

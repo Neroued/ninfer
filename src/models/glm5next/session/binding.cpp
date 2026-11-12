@@ -60,15 +60,9 @@ Session::inspect_source(const RequestBasePlan& base, std::optional<CheckpointHan
     out.reused_tokens = h ? p.checkpoints.at(*h).frontier() : 0;
     const auto end    = resume ? resume->frontier() : base.summary().prompt_tokens;
     if (out.reused_tokens > end) return {};
-    out.remaining_work = runtime::make_prefill_work(out.reused_tokens, end - out.reused_tokens, 0,
-                                                    0, p.shape.prefill_chunk);
-    if (const auto& vision = base.plan_->vision; vision && out.reused_tokens < end)
-        for (const auto& unit : vision->units)
-            if (unit.end() > out.reused_tokens && unit.token_begin < end) {
-                // Each image/video frame is encoded in full, even for a partial replay range.
-                ++out.remaining_work.vision_items;
-                out.remaining_work.vision_patches += unit.patches;
-            }
+    out.remaining_work = models::vision::recovery_work(
+        base.plan_->identity->media, [](const auto& media) -> const auto& { return media.item; },
+        out.reused_tokens, end, p.shape.prefill_chunk, p.plan.vision_max_features);
     if (h) {
         const auto& c           = p.checkpoints.at(*h);
         const auto image        = c.snapshot.continuation().image;
@@ -77,7 +71,7 @@ Session::inspect_source(const RequestBasePlan& base, std::optional<CheckpointHan
         const bool local        = source_owner == target.value;
         const bool own          = resume && resume->snapshot_handle() == h;
         out.consume_source      = local && (consume || own) && p.checkpoints[h->index].pins == 0 &&
-                             states.checkpoint_references(image) == 1 && !states.source_pins(image);
+                             states.can_recover_exclusively(image);
         out.transfers = local ? c.snapshot.restore_requirements(p.directory)
                               : detail::conversion_requirements(p.plan, c.snapshot, target.value);
         if (local && !out.consume_source)
@@ -101,7 +95,19 @@ Session::inspect_source(const RequestBasePlan& base, std::optional<CheckpointHan
             p.checkpoints.at(point).frontier() <= out.reused_tokens)
             out.private_points.push_back(point);
     for (const auto point : retired)
-        if ((!h || point != *h) && valid_checkpoint(point)) out.retired_points.push_back(point);
+        if ((!h || point != *h) && valid_checkpoint(point) &&
+            std::find(out.retired_points.begin(), out.retired_points.end(), point) ==
+                out.retired_points.end())
+            out.retired_points.push_back(point);
+    if (h && p.checkpoints.at(*h).snapshot.continuation().metadata.placement == target) {
+        const auto& snapshot = p.checkpoints.at(*h).snapshot;
+        std::vector<const detail::Snapshot*> retired_snapshots;
+        for (auto point : out.retired_points)
+            retired_snapshots.push_back(&p.checkpoints.at(point).snapshot);
+        if (out.consume_source) retired_snapshots.push_back(&snapshot);
+        auto copies = snapshot.replay_requirements(p.directory, retired_snapshots);
+        out.transfers.insert(out.transfers.end(), copies.begin(), copies.end());
+    }
     return out;
 }
 
@@ -132,7 +138,7 @@ detail::SessionImpl::plan_binding(const RequestBasePlan& base, runtime::LaneId l
     const bool resident = checkpoint && states.device_resident(image);
     const bool consume  = !convert && checkpoint && (own || candidate.consume_source) &&
                          checkpoints[source->index].pins == 0 &&
-                         states.checkpoint_references(image) == 1 && !states.source_pins(image);
+                         states.can_recover_exclusively(image);
     const auto target = resume ? resume->frontier() : frontier;
     const auto requested_peak =
         resume
@@ -394,7 +400,16 @@ namespace ninfer::models::glm5next::detail {
 
 std::vector<runtime::ContextTransferRequirement>
 conversion_requirements(const SessionPlan& plan, const Snapshot& snapshot, std::uint32_t to) {
-    const auto from = snapshot.continuation().metadata.placement.value;
+    std::vector<std::uint32_t> frontiers;
+    for (std::uint16_t pool = 0; pool < plan.caches.size(); ++pool)
+        frontiers.push_back(snapshot.prefix(pool).frontier());
+    return conversion_requirements(plan, snapshot.continuation().metadata.placement.value, to,
+                                   frontiers);
+}
+
+std::vector<runtime::ContextTransferRequirement>
+conversion_requirements(const SessionPlan& plan, std::uint32_t from, std::uint32_t to,
+                        std::span<const std::uint32_t> frontiers) {
     std::vector<runtime::ContextTransferRequirement> out;
     for (const auto& field : state_conversion(plan.states, from, to)) {
         const bool peer = field.source_rank != field.destination_rank;
@@ -408,7 +423,7 @@ conversion_requirements(const SessionPlan& plan, const Snapshot& snapshot, std::
         out.push_back(r);
     }
     for (std::uint16_t pool = 0; pool < plan.caches.size(); ++pool) {
-        const auto f          = snapshot.prefix(pool).frontier();
+        const auto f          = frontiers[pool];
         const auto& page      = plan.caches[pool];
         const auto full_pages = f / page.geometry.page_tokens;
         auto bytes            = full_pages * page.page_bytes;

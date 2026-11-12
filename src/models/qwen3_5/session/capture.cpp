@@ -54,6 +54,9 @@ SessionImpl::reserve_capture_destination(std::uint32_t lane, std::uint32_t front
     auto ticket      = std::make_unique<CaptureReservation>();
     ticket->owner    = this;
     ticket->frontier = frontier;
+    ticket->identity =
+        group.identity->retention.retain(recovery_metadata.identity_budget(), group.identity);
+    if (!ticket->identity) return Status::Unavailable;
     ticket->points.reserve(group.roles.size());
     for (const auto role : group.roles) {
         const auto point = reserve_checkpoint();
@@ -314,7 +317,8 @@ runtime::ContextStart SessionImpl::start_capture(SequenceHandle handle) {
                         .backend_frontier = speculative_backend == SpeculativeBackend::Mtp
                                                 ? frontier - 1U
                                                 : backend_kv_valid(state),
-                        .points           = std::move(ticket->points)};
+                        .points           = std::move(ticket->points),
+                        .identity         = std::move(ticket->identity)};
     context_operation_ = std::make_unique<PendingContext>(directory, std::move(tx));
     context_operation_->reservation.emplace(std::move(*execution_reservation));
     auto& migration = context_operation_->transaction;
@@ -349,7 +353,7 @@ void SessionImpl::publish_capture(CaptureOperation& tx, context::ContextTransact
     if (state.kv->backend)
         prefixes.push_back(
             backend_kv_histories->retain_prefix(state.kv->backend->handle(), tx.backend_frontier));
-    const Snapshot snapshot(*state_store, captured, std::move(prefixes), group.identity);
+    const Snapshot snapshot(*state_store, captured, std::move(prefixes), std::move(tx.identity));
     for (const auto& [handle, role] : tx.points)
         checkpoints.publish(handle, CheckpointState{.snapshot = snapshot,
                                                     .role     = role,

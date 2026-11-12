@@ -217,6 +217,11 @@ public:
     [[nodiscard]] std::uint64_t content_epoch(StateId image) const;
     [[nodiscard]] std::uint32_t source_pins(StateId image) const;
     [[nodiscard]] std::uint32_t checkpoint_references(StateId image) const;
+    // Ownership after retiring checkpoints, publishing a replacement snapshot, and abandoning
+    // this request's prepared writer. Residency is handled independently by restore preparation.
+    [[nodiscard]] bool can_recover_exclusively(StateId image, std::uint32_t retired_checkpoints = 0,
+                                               std::uint32_t added_checkpoints = 0,
+                                               StateId abandoned_writer        = {}) const;
     [[nodiscard]] std::int64_t physical_offset(StateId image, std::uint32_t rank = 0) const;
     [[nodiscard]] ContextRecordBinding device_binding(StateId image, std::uint32_t rank = 0) const;
     [[nodiscard]] ContextRecordBinding host_binding(StateId image, std::uint32_t rank = 0) const;

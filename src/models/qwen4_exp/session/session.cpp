@@ -7,6 +7,13 @@ namespace ninfer::models::qwen4_exp::detail {
 SessionImpl::SessionImpl(std::shared_ptr<const ModelDefinition> model, SessionPlan prepared)
     : definition(std::move(model)), plan(std::move(prepared)), shape(plan.shape),
       directory(plan.context),
+      recovery_metadata(
+          directory.metadata_budget(),
+          shape.purpose == EnginePurpose::Generation ? shape.max_concurrency : 0,
+          plan.context.ranks.size(), 1,
+          Identity::cache_bytes(shape.max_context, shape.purpose == EnginePurpose::Generation
+                                                       ? shape.max_concurrency
+                                                       : 0)),
       checkpoints(Checkpoints::capacity_for_metadata(directory.metadata_budget().limit()),
                   directory.metadata_budget(), &recovery_index) {
     if (!definition) throw std::invalid_argument("invalid Qwen4Exp session definition");

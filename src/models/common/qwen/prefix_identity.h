@@ -25,6 +25,21 @@ public:
 
     [[nodiscard]] std::size_t size() const noexcept { return token_types_.size(); }
 
+    [[nodiscard]] std::size_t metadata_bytes() const noexcept {
+        auto bytes = token_types_.capacity() * sizeof(std::uint8_t) +
+                     vision_items_.capacity() * sizeof(models::frontend::VisionItem);
+        for (const auto& positions : positions_)
+            bytes += positions.capacity() * sizeof(std::int32_t);
+        for (const auto& item : vision_items_)
+            bytes += item.timestamps.capacity() * sizeof(double) +
+                     item.token_spans.capacity() * sizeof(models::frontend::TokenSpan);
+        return bytes;
+    }
+
+    [[nodiscard]] std::span<const models::frontend::VisionItem> vision_items() const noexcept {
+        return vision_items_;
+    }
+
     [[nodiscard]] bool matches(const PreparedPromptData& prompt, std::size_t count) const;
     [[nodiscard]] bool equals(const ResidentPrefixIdentity& other) const;
     [[nodiscard]] bool prefix_equals(const ResidentPrefixIdentity& other, std::size_t count) const;
@@ -43,6 +58,10 @@ private:
 // exact identity avoids retaining hash-only state in immutable capture backings.
 class PrefixShortlistDigests {
 public:
+    [[nodiscard]] std::size_t metadata_bytes() const noexcept {
+        return digests_.capacity() * sizeof(std::array<std::uint64_t, 2>);
+    }
+
     void reserve(std::size_t tokens);
     void clear() noexcept;
     void assign(const PreparedPromptData& prompt);

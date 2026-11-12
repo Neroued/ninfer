@@ -15,7 +15,9 @@ PreparedCheckpoint SessionImpl::prepare_checkpoint(Sequence& s) {
     for (std::uint32_t pool = 0; pool < pool_count(); ++pool)
         demand.add_growth(directory.pool(pool).histories(), s.histories[pool].handle(), 0);
     if (!directory.reserve(demand)) return {};
-    return {std::move(record), capture_identity(s)};
+    auto identity = capture_identity(s, recovery_metadata.identity_budget());
+    if (!identity) return {};
+    return {std::move(record), std::move(identity)};
 }
 
 std::optional<CheckpointHandle> SessionImpl::detach(Sequence& s, runtime::CheckpointRole role,
@@ -95,6 +97,9 @@ Session::prepare_capture(SequenceHandle h, std::span<const CheckpointHandle> vic
     auto ticket         = std::make_unique<detail::CaptureReservation>();
     ticket->states      = &p.directory.states();
     ticket->checkpoints = &p.checkpoints;
+    ticket->identity = s.request->identity->retention.retain(p.recovery_metadata.identity_budget(),
+                                                             s.request->identity);
+    if (!ticket->identity) return {};
     ticket->records.reserve(point.roles.size());
     for (const auto role : point.roles) {
         const auto record = p.checkpoints.reserve();
@@ -292,7 +297,7 @@ runtime::ContextStart Session::start_capture(SequenceHandle h) {
         context::prepare_capture_state(migration, p.directory.states(), s.continuation.image,
                                        reservation.host);
         tx.snapshot.emplace(p.directory.states(), s.continuation, std::move(prefixes),
-                            s.request->identity);
+                            std::move(reservation.identity));
         p.submit_context();
     } catch (...) {
         p.cancel_operation();
@@ -405,8 +410,6 @@ bool Session::prepare_pause(SequenceHandle h, runtime::PauseAction action,
     const auto selected = std::find_if(options.begin(), options.end(),
                                        [&](const auto& option) { return option.action == action; });
     if (selected == options.end()) return false;
-    if (!selected->host_write && !host_victims.empty())
-        throw std::invalid_argument("pause action does not require Host victims");
     ContextReleaseSet released;
     if (!host_victims.empty()) {
         for (const auto victim : host_victims)

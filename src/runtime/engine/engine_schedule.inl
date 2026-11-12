@@ -15,15 +15,21 @@ void EngineCore<Instance>::reserve_active_capture(const std::shared_ptr<Request>
     if (scheduler_.progress_owner()) {
         instance_.session->skip_capture(*request->sequence);
         request->capture_pending = false;
+        capture_decisions_[request->lane->value].reset();
         return;
     }
     if (!prepare_semantic_capture(request)) return;
     const auto started = instance_.session->start_capture(*request->sequence);
     if (started == ContextStart::Deferred) return;
+    auto& decision = capture_decisions_[request->lane->value];
     if (started == ContextStart::Stale) {
+        decision.reset();
         request->capture_pending = false;
         return;
     }
+    if (decision && decision->pending)
+        resources_.accept_action(decision->reclaim, *decision->pending);
+    decision.reset();
     context_owner_ = request;
 }
 
@@ -37,17 +43,18 @@ bool EngineCore<Instance>::prepare_semantic_capture(const std::shared_ptr<Reques
             decision.reset();
             continue;
         }
+        const auto cost = instance_.session->capture_cost(*request->sequence, capture->frontier);
         if (instance_.session->capture_is_shared(*request->sequence) &&
             resources_.retain_shared_checkpoint(
                 *instance_.session, *request->base_plan, capture->frontier,
-                instance_.session->placement(*request->sequence), capture->evidence)) {
+                instance_.session->placement(*request->sequence), capture->evidence, &cost)) {
             instance_.session->skip_capture(*request->sequence, CaptureSkip::Retained);
             decision.reset();
             continue;
         }
         if (const auto source = resources_.capture_source(
                 *instance_.session, *request->base_plan, capture->frontier,
-                instance_.session->placement(*request->sequence))) {
+                instance_.session->placement(*request->sequence), &cost)) {
             const auto shared = instance_.session->share_capture(*request->sequence, *source);
             if (!shared.empty()) {
                 for (const auto checkpoint : shared)
@@ -57,70 +64,86 @@ bool EngineCore<Instance>::prepare_semantic_capture(const std::shared_ptr<Reques
                 continue;
             }
         }
-        if (capture->reserved) {
-            decision.reset();
-            return true;
-        }
-        if (instance_.session->has_context_operation()) { return false; }
+        // Native zero-copy capture with available storage needs no catalog evaluation.
+        if (capture->reserved && !decision && !resources_.action_cost(cost.work)) return true;
         const auto admission = resources_.capture_admission(
             *instance_.session, request->continuation_owner, *request->base_plan, capture->frontier,
-            instance_.session->capture_is_input(*request->sequence)
-                ? CheckpointRole::InputReplay : CheckpointRole::SharedPrefix);
+            instance_.session->capture_is_input(*request->sequence) ? CheckpointRole::InputReplay
+                                                                    : CheckpointRole::SharedPrefix,
+            instance_.session->placement(*request->sequence), &cost);
         if (!decision || decision->frontier != capture->frontier) {
             decision.emplace(
-                CaptureDecision{*request->sequence, capture->frontier,
-                                resources_.begin_reclaim(*instance_.session, admission)});
+                CaptureDecision{*request->sequence,
+                                capture->frontier,
+                                resources_.begin_reclaim(*instance_.session, admission),
+                                {}});
         }
+        decision->reclaim.admission = admission;
+        if (capture->reserved) {
+            decision->pending =
+                resources_.quote_capture(*instance_.session, cost, decision->reclaim);
+            if (decision->pending) return true;
+            instance_.session->skip_capture(*request->sequence);
+            decision.reset();
+            continue;
+        }
+        if (instance_.session->has_context_operation()) return false;
         if (!capture->host.empty()) {
-            if (!instance_.session->can_place_host(capture->host)) {
-                (void)instance_.session->release_redundant_host({}, request->sequence);
-            }
-            if (const auto victims =
-                    resources_.host_victims(*instance_.session, capture->host, std::nullopt, {}, {},
-                                            admission, &decision->reclaim)) {
-                const auto loss  = resources_.release_cost(*instance_.session, *victims);
-                const auto retry = instance_.session->prepare_capture(
-                    *request->sequence, *victims, CaptureStorage::Host);
-                if (retry && !retry->retired_points.empty()) {
-                    if (retry->retired_points != *victims)
-                        throw std::logic_error("capture consumed only part of its victim quote");
-                    resources_.adopt_release(*instance_.session, retry->retired_points,
-                                             decision->reclaim, loss);
-                    request_admission_check();
+            const auto host_cost = instance_.session->capture_cost(
+                *request->sequence, capture->frontier, CaptureStorage::Host);
+            decision->reclaim.admission->target         = host_cost.retained;
+            decision->reclaim.admission->pending_action = resources_.action_cost(host_cost.work);
+            if (resources_.quote_capture(*instance_.session, host_cost, decision->reclaim)) {
+                if (!instance_.session->can_place_host(capture->host))
+                    (void)instance_.session->release_redundant_host({}, request->sequence);
+                if (const auto victims = resources_.host_victims(
+                        *instance_.session, capture->host, std::nullopt, {}, {},
+                        decision->reclaim.admission, &decision->reclaim);
+                    victims && resources_.quote_capture(*instance_.session, host_cost,
+                                                        decision->reclaim, *victims)) {
+                    auto quote =
+                        resources_.quote_release(*instance_.session, *victims, decision->reclaim);
+                    const auto retry = instance_.session->prepare_capture(
+                        *request->sequence, *victims, CaptureStorage::Host);
+                    if (retry && !retry->retired_points.empty()) {
+                        resources_.adopt_release(*instance_.session, retry->retired_points,
+                                                 decision->reclaim, std::move(quote));
+                        request_admission_check();
+                    }
+                    if (retry && retry->reserved) continue;
                 }
-                if (retry && retry->reserved) {
-                    decision.reset();
-                    return true;
-                }
             }
-            const auto preserved = resources_.preserve_capture(
+            decision->reclaim.admission = admission;
+            const auto preserved        = resources_.preserve_capture(
                 *instance_.session, capture->assessment, decision->reclaim);
-            if (preserved == ReclaimProgress::Transferring || preserved == ReclaimProgress::Deferred)
+            if (preserved == ReclaimProgress::Transferring ||
+                preserved == ReclaimProgress::Deferred)
                 return false;
             if (preserved == ReclaimProgress::Changed || preserved == ReclaimProgress::Retry)
                 continue;
         }
         if (capture->assessment.requires_maintenance()) {
-            const auto started = instance_.session->start_maintenance(capture->assessment);
-            if (started == ContextStart::Started || started == ContextStart::Deferred) return false;
+            const auto progress =
+                resources_.maintain(*instance_.session, capture->assessment, decision->reclaim);
+            if (progress == ReclaimProgress::Transferring || progress == ReclaimProgress::Deferred)
+                return false;
+            if (progress == ReclaimProgress::Changed || progress == ReclaimProgress::Retry)
+                continue;
         }
         if (capture->assessment.waiting()) return false;
-        if (const auto victims = resources_.capture_victims(
-                *instance_.session, capture->assessment, decision->reclaim)) {
-            const auto loss = resources_.release_cost(*instance_.session, *victims);
-            const auto retry = instance_.session->prepare_capture(
-                *request->sequence, *victims, CaptureStorage::Device);
+        if (const auto victims = resources_.capture_victims(*instance_.session, capture->assessment,
+                                                            decision->reclaim);
+            victims &&
+            resources_.quote_capture(*instance_.session, cost, decision->reclaim, *victims)) {
+            auto quote = resources_.quote_release(*instance_.session, *victims, decision->reclaim);
+            const auto retry = instance_.session->prepare_capture(*request->sequence, *victims,
+                                                                  CaptureStorage::Device);
             if (retry && !retry->retired_points.empty()) {
-                if (retry->retired_points != *victims)
-                    throw std::logic_error("capture consumed only part of its victim quote");
                 resources_.adopt_release(*instance_.session, retry->retired_points,
-                                         decision->reclaim, loss);
+                                         decision->reclaim, std::move(quote));
                 request_admission_check();
             }
-            if (retry && retry->reserved) {
-                decision.reset();
-                return true;
-            }
+            if (retry && retry->reserved) continue;
         }
         instance_.session->skip_capture(*request->sequence);
         decision.reset();
@@ -300,9 +323,7 @@ ReclaimProgress EngineCore<Instance>::reclaim(const ContextAssessment& assessmen
         cursor ? resources_.reclaim(*instance_.session, assessment, excluded, *cursor)
                : resources_.reclaim(*instance_.session, assessment, excluded);
     if (progress != ReclaimProgress::Blocked) {
-        if (progress == ReclaimProgress::Changed) {
-            request_admission_check();
-        }
+        if (progress == ReclaimProgress::Changed) { request_admission_check(); }
         return progress;
     }
     if (cursor && cursor->rights.purpose != ReclaimPurpose::Execution)
@@ -329,10 +350,12 @@ ReclaimProgress EngineCore<Instance>::reclaim(const ContextAssessment& assessmen
                 std::find_if(paused_.begin(), paused_.end(), [&](const auto& request) {
                     return request->suspended && request->suspended->snapshot_handle() == handle;
                 });
-            if (owner == paused_.end() ||
-                !instance_.session->revoke_snapshot(*(*owner)->suspended)) {
-                continue;
-            }
+            if (owner == paused_.end()) continue;
+            const auto quote = cursor ? std::optional{resources_.quote_release(
+                                            *instance_.session, {&handle, 1}, *cursor)}
+                                      : std::nullopt;
+            if (!instance_.session->revoke_snapshot(*(*owner)->suspended)) continue;
+            if (quote) resources_.adopt_release(*instance_.session, {&handle, 1}, *cursor, *quote);
             (*owner)->recovery.reset();
             observe_scheduling(*owner, GenerationSchedulingTransition::SnapshotRevoked);
             changed = true;
@@ -342,17 +365,18 @@ ReclaimProgress EngineCore<Instance>::reclaim(const ContextAssessment& assessmen
             return ReclaimProgress::Changed;
         }
     }
-    if (allow_pause && pause_reclaim_victim(assessment))
+    if (allow_pause && pause_reclaim_victim(assessment, cursor))
         return instance_.session->has_context_operation() ? ReclaimProgress::Transferring
                                                           : ReclaimProgress::Changed;
     return ReclaimProgress::Blocked;
 }
 
 template <class Instance>
-bool EngineCore<Instance>::pause_reclaim_victim(const ContextAssessment& pressure) {
+bool EngineCore<Instance>::pause_reclaim_victim(
+    const ContextAssessment& pressure, typename ResourceManagement::ReclaimCursor* cursor) {
     std::vector<std::uint32_t> skipped;
     while (const auto victim = scheduler_.preemption_victim(slots_, max_concurrency_, skipped)) {
-        if (pause_resident(*victim, PauseGoal::ReleaseCapacity, &pressure)) { return true; }
+        if (pause_resident(*victim, PauseGoal::ReleaseCapacity, &pressure, cursor)) { return true; }
         skipped.push_back(*victim);
     }
     return false;
@@ -360,80 +384,105 @@ bool EngineCore<Instance>::pause_reclaim_victim(const ContextAssessment& pressur
 
 template <class Instance>
 bool EngineCore<Instance>::pause_resident(std::uint32_t lane, PauseGoal goal,
-                                          const ContextAssessment* pressure) {
+                                          const ContextAssessment* pressure,
+                                          typename ResourceManagement::ReclaimCursor* parent) {
     if (instance_.session->has_context_operation()) { return false; }
     auto request = slots_[lane];
     if (!request || !request->sequence || instance_.session->execution_pending(*request->sequence))
         return false;
     std::optional<PauseAction> selected;
-    auto options = instance_.session->pause_options(*request->sequence);
-    for (const auto& option : options) {
-        if (goal == PauseGoal::RelocateOnly && option.action.kind != PauseKind::Relocate) {
-            continue;
-        }
-        if (pressure &&
-            !(goal == PauseGoal::RelocateOnly && option.action.kind == PauseKind::Relocate) &&
-            !instance_.session->pause_contributes(*request->sequence, option, *pressure)) {
-            continue;
-        }
-        if (option.action.kind == PauseKind::Relocate) {
-            const auto target = instance_.session->assess(option.demand);
-            if (!target.ready()) {
-                auto cursor =
-                    resources_.begin_reclaim(*instance_.session, std::nullopt,
-                                             ReclaimRights{ReclaimPurpose::Execution, request->id});
-                const auto progress =
-                    resources_.reclaim(*instance_.session, target, option.sources, cursor);
-                if (progress == ReclaimProgress::Transferring) { return true; }
-                if (progress == ReclaimProgress::Changed) {
-                    request_admission_check();
-                    return true;
+    std::optional<typename ResourceManagement::ReclaimCursor> local_reclaim;
+    auto* reclaim = parent;
+    std::optional<typename ResourceManagement::ReclaimActionQuote> accepted;
+    std::vector<PauseAction> unavailable;
+    const auto sources = resources_.pause_sources(*instance_.session);
+    for (;;) {
+        auto options = instance_.session->pause_options(*request->sequence);
+        if (std::any_of(options.begin(), options.end(),
+                        [&](const auto& option) {
+                            return option.host_write &&
+                                   !instance_.session->can_place_host(*option.host_write);
+                        }) &&
+            instance_.session->release_redundant_host({}, request->sequence))
+            options = instance_.session->pause_options(*request->sequence);
+
+        struct Candidate {
+            std::size_t index;
+            std::vector<Checkpoint> victims;
+            std::uint64_t cost;
+        };
+
+        std::optional<Candidate> best;
+        for (std::size_t i = 0; i < options.size(); ++i) {
+            const auto& option = options[i];
+            if (std::find(unavailable.begin(), unavailable.end(), option.action) !=
+                unavailable.end())
+                continue;
+            if (goal == PauseGoal::RelocateOnly && option.action.kind != PauseKind::Relocate)
+                continue;
+            if (pressure &&
+                !(goal == PauseGoal::RelocateOnly && option.action.kind == PauseKind::Relocate) &&
+                !instance_.session->pause_contributes(*request->sequence, option, *pressure))
+                continue;
+            std::vector<Checkpoint> victims;
+            if (!instance_.session->assess(option.demand).feasible()) {
+                if (!reclaim) {
+                    local_reclaim.emplace(resources_.begin_reclaim(
+                        *instance_.session, std::nullopt,
+                        ReclaimRights{ReclaimPurpose::Execution, request->id}));
+                    reclaim = &*local_reclaim;
                 }
-                if (progress != ReclaimProgress::Retry ||
-                    !instance_.session->assess(option.demand).ready()) {
-                    continue;
-                }
+                std::vector<Checkpoint> later;
+                if (option.host_write)
+                    for (auto it = paused_.rbegin(); it != paused_.rend(); ++it)
+                        if ((*it)->id > request->id && (*it)->suspended &&
+                            (*it)->suspended->has_snapshot())
+                            later.push_back(*(*it)->suspended->snapshot_handle());
+                auto candidate = resources_.pause_victims(*instance_.session, option.demand,
+                                                          *reclaim, option.sources, later);
+                if (!candidate) continue;
+                victims = std::move(*candidate);
             }
+            const auto quote =
+                instance_.session->pause_cost(*request->sequence, option, sources, victims);
+            const auto cost =
+                resources_.pause_cost(*instance_.session, quote, option, victims, reclaim);
+            if (!best || cost < best->cost) best = Candidate{i, std::move(victims), cost};
         }
-        std::vector<Checkpoint> victims;
-        if (option.host_write) {
-            if (!instance_.session->can_place_host(*option.host_write)) {
-                (void)instance_.session->release_redundant_host({}, request->sequence);
-            }
-            std::vector<Checkpoint> later;
-            for (auto it = paused_.rbegin(); it != paused_.rend(); ++it) {
-                if ((*it)->id > request->id && (*it)->suspended &&
-                    (*it)->suspended->has_snapshot()) {
-                    later.push_back(*(*it)->suspended->snapshot_handle());
-                }
-            }
-            auto candidate = resources_.host_victims(*instance_.session, *option.host_write,
-                                                     std::nullopt, later);
-            if (!candidate) { continue; }
-            victims = std::move(*candidate);
-        }
+        if (!best) return false;
+        const auto& option  = options[best->index];
+        const auto& victims = best->victims;
+        const auto native_quote =
+            instance_.session->pause_cost(*request->sequence, option, sources, victims);
+        const auto receipt =
+            reclaim ? std::optional{resources_.quote_pause_action(*instance_.session, native_quote,
+                                                                  option, victims, *reclaim)}
+                    : std::nullopt;
         if (!instance_.session->prepare_pause(*request->sequence, option.action, victims)) {
+            unavailable.push_back(option.action);
+            // Native may discard unused preparation on a failed attempt. Reprice the
+            // remaining alternatives against the current resources before choosing again.
             continue;
         }
-        for (const auto handle : victims) {
-            if (resources_.erase(*instance_.session, handle)) { continue; }
+        for (auto handle : victims) {
+            if (resources_.erase(*instance_.session, handle, reclaim->rights)) continue;
             const auto owner = std::find_if(paused_.begin(), paused_.end(), [&](const auto& other) {
                 return other->suspended && other->suspended->snapshot_handle() == handle;
             });
-            if (owner == paused_.end() ||
-                !instance_.session->revoke_snapshot(*(*owner)->suspended)) {
+            if (owner == paused_.end() || !instance_.session->revoke_snapshot(*(*owner)->suspended))
                 throw std::logic_error("pause victim changed after preflight");
-            }
             (*owner)->recovery.reset();
             observe_scheduling(*owner, GenerationSchedulingTransition::SnapshotRevoked);
         }
+        accepted = receipt;
         selected = option.action;
         break;
     }
-    if (!selected) { return false; }
     ExecutionCallScope call(*this);
     const auto pause_started = Clock::now();
-    if (!instance_.session->start_pause(*request->sequence, *selected)) { return false; }
+    if (!instance_.session->start_pause(*request->sequence, *selected))
+        throw std::logic_error("prepared pause did not start");
+    if (accepted) resources_.accept_pause(*instance_.session, *reclaim, *accepted);
     call.finish();
     if (!request->is_replaying()) { request->resume_phase = request->model_state; }
     request->model_state = EngineRequestState::Pausing;
@@ -444,6 +493,7 @@ bool EngineCore<Instance>::pause_resident(std::uint32_t lane, PauseGoal goal,
     observe_scheduling(request, GenerationSchedulingTransition::PauseStarted, pause_started);
     context_owner_ = request;
     capture_decisions_[lane].reset();
+    execution_decisions_[lane].reset();
     return true;
 }
 
@@ -560,7 +610,7 @@ void EngineCore<Instance>::order_binding_sources(
 template <class Instance>
 bool EngineCore<Instance>::try_admit_one(bool restoring) {
     if (instance_.session->has_context_operation()) { return false; }
-    const auto lane = free_lane();
+    const auto lane      = free_lane();
     const auto owner     = scheduler_.progress_owner();
     const auto suspended = restoring ? std::find_if(paused_.begin(), paused_.end(),
                                                     [&](const auto& r) { return r->id == owner; })
@@ -796,9 +846,7 @@ bool EngineCore<Instance>::try_admit_one(bool restoring) {
         }
         admission_decision_.reset();
         if (deferred) {
-            if (restoring) {
-                return false;
-            }
+            if (restoring) { return false; }
             continue;
         }
         if (admission_check_pending_.load(std::memory_order_acquire)) { return true; }
@@ -806,9 +854,7 @@ bool EngineCore<Instance>::try_admit_one(bool restoring) {
             throw std::logic_error("isolated request cannot reserve its first legal unit after "
                                    "context reclamation");
         }
-        if (restoring) {
-            return false;
-        }
+        if (restoring) { return false; }
     }
     return false;
 }
@@ -894,16 +940,20 @@ EngineCore<Instance>::reserve_resident_unit(std::uint32_t lane) {
         request->cancelled.load(std::memory_order_acquire) ||
         instance_.session->context_blocks(*request->sequence) ||
         instance_.session->execution_pending(*request->sequence) ||
-        !(request->is_control_ready() || request->is_decode_ready() ||
-          request->is_prefilling() || request->is_replaying()))
+        !(request->is_control_ready() || request->is_decode_ready() || request->is_prefilling() ||
+          request->is_replaying()))
         return ResidentReservation::Unavailable;
 
     const auto unit = execution_unit(*request);
-    std::optional<typename ResourceManagement::ReclaimCursor> cursor;
+    auto& decision  = execution_decisions_[lane];
+    if (decision && (decision->unit.sequence != unit.sequence || decision->unit.kind != unit.kind ||
+                     decision->unit.tokens != unit.tokens))
+        decision.reset();
     for (;;) {
         const auto result = instance_.session->reserve_units({&unit, 1});
         if (result) {
             reserved_units_[lane] = UnitPermit{unit, *request->residency};
+            decision.reset();
             return ResidentReservation::Ready;
         }
         if (result.status == UnitReservationStatus::ExecutionUnavailable ||
@@ -914,16 +964,20 @@ EngineCore<Instance>::reserve_resident_unit(std::uint32_t lane) {
             scheduler_.require_progress(request->id);
             return ResidentReservation::Unavailable;
         }
-        if (!cursor) cursor.emplace(resources_.begin_reclaim(*instance_.session));
-        const auto reclaimed = reclaim(result.assessment, false, {}, &*cursor);
+        if (!decision)
+            decision.emplace(ExecutionDecision{
+                unit,
+                resources_.begin_reclaim(*instance_.session, std::nullopt,
+                                         ReclaimRights{ReclaimPurpose::Execution, request->id})});
+        const auto reclaimed = reclaim(result.assessment, false, {}, &decision->reclaim);
         if (reclaimed == ReclaimProgress::Transferring || reclaimed == ReclaimProgress::Deferred)
             return ResidentReservation::Pending;
         if (reclaimed == ReclaimProgress::Changed || reclaimed == ReclaimProgress::Retry) continue;
         if (request->recovery_pending)
             throw std::logic_error("protected recovery exceeded its Native reservation");
         scheduler_.require_progress(request->id);
-        if (pause_resident(lane, PauseGoal::RelocateOnly, &result.assessment) ||
-            pause_reclaim_victim(result.assessment))
+        if (pause_resident(lane, PauseGoal::RelocateOnly, &result.assessment, &decision->reclaim) ||
+            pause_reclaim_victim(result.assessment, &decision->reclaim))
             return ResidentReservation::Pending;
         throw std::logic_error("progress owner cannot obtain its legal unit");
     }

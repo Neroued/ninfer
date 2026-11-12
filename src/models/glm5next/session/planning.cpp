@@ -7,17 +7,27 @@ namespace ninfer::models::glm5next {
 runtime::ContextMetadataPlan session_metadata_plan(const context::ContextDirectorySpec& schema,
                                                    const ContextPoolGeometry& geometry,
                                                    std::uint32_t rank,
-                                                   std::uint32_t count_vocabulary) {
+                                                   std::uint32_t count_vocabulary,
+                                                   std::uint32_t concurrency,
+                                                   std::uint32_t max_context) {
     auto metadata      = context::ContextDirectory::metadata_plan(schema, rank, 1);
     const auto records = std::size_t(schema.state.logical_capacity);
     if (rank == schema.ranks.front().rank)
-        metadata.fixed_bytes += TokenCountBuilder::capacity_bytes(count_vocabulary) +
-                                detail::Checkpoints::metadata_bytes(records) +
-                                context::RecoveryIndex<>::metadata_bytes(records);
+        metadata.fixed_bytes +=
+            TokenCountBuilder::capacity_bytes(count_vocabulary) +
+            detail::Checkpoints::metadata_bytes(records) +
+            context::RecoveryIndex<>::metadata_bytes(records) +
+            context::recovery_value_metadata_bytes(records, concurrency, schema.ranks.size(),
+                                                   schema.ranks.size()) +
+            detail::Identity::cache_bytes(max_context, concurrency);
     const auto checkpoint_cost =
         detail::Checkpoints::metadata_bytes(1) - detail::Checkpoints::metadata_bytes(0);
     const auto recovery_cost =
-        context::RecoveryIndex<>::metadata_bytes(1) - context::RecoveryIndex<>::metadata_bytes(0);
+        context::RecoveryIndex<>::metadata_bytes(1) - context::RecoveryIndex<>::metadata_bytes(0) +
+        context::recovery_value_metadata_bytes(1, concurrency, schema.ranks.size(),
+                                               schema.ranks.size()) -
+        context::recovery_value_metadata_bytes(0, concurrency, schema.ranks.size(),
+                                               schema.ranks.size());
     const auto ranks         = schema.ranks.size();
     std::size_t history_cost = 0;
     for (const auto& pool : schema.pools)

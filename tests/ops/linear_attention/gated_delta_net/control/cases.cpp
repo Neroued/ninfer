@@ -27,7 +27,7 @@ std::vector<Case> projection_cases(Profile p) {
         boundaries(outputs,
                    {1, 4, 8, 192, 448, 512, 896, 1024, 1280, 2048, 2688, 5120, 7168, 8192});
     else if (p.input_rows == 5120)
-        boundaries(outputs, {1, 8, 1024, 2048, 4096});
+        boundaries(outputs, {1, 8, 16, 64, 128, 1024, 2048, 4096});
     else
         boundaries(outputs, {127, 1024, 2048, 4096});
     outputs.push_back({8192});
@@ -35,7 +35,7 @@ std::vector<Case> projection_cases(Profile p) {
     // The paired representation is independently checked at every production route. Related
     // parent cases establish the complete seam neighborhoods and shared mechanism properties.
     if (p.storage == Storage::Pair) {
-        outputs = {{1}, {8}, {9}, {1024}, {1025}, {2049}, {4097}, {8192}};
+        outputs = {{1}, {8}, {9}, {17}, {65}, {129}, {1024}, {1025}, {2049}, {4097}, {8192}};
     }
     for (auto& c : outputs)
         if (c.columns == 1 || c.columns == 128 || c.columns == 4097) c.execution = Execution::Graph;

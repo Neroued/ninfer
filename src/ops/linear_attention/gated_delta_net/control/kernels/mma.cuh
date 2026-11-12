@@ -26,7 +26,7 @@ struct MmaGeometry {
     static constexpr int kHeads = Heads, kHidden = Hidden, kBlockN = BlockN;
     static constexpr int shared_bytes =
         kStages * (BlockN * kBlockK + (Paired ? 2 : 1) * kBlockM * kBlockK) * sizeof(__nv_bfloat16);
-    static_assert(BlockN == 64 || BlockN == 128);
+    static_assert(BlockN == 16 || BlockN == 32 || BlockN == 64 || BlockN == 128);
     static_assert(Heads % kBlockM == 0);
     static_assert(Hidden % kBlockK == 0);
 };
@@ -51,7 +51,7 @@ __global__ __launch_bounds__(Warps * 32, 1) void mma_kernel(
     constexpr int kKTiles      = kHidden / kBlockK;
     static_assert(SplitK >= 1 && kKTiles % SplitK == 0,
                   "BF16 GDN split-K must divide the exact geometry's K tiles");
-    static_assert(Warps == 8 || Warps == 16);
+    static_assert(Warps == 2 || Warps == 4 || Warps == 8 || Warps == 16);
     static_assert(kBlockN % Warps == 0);
     constexpr int kTilesPerSplit = kKTiles / SplitK;
     constexpr int kKSubtiles     = kBlockK / 16;

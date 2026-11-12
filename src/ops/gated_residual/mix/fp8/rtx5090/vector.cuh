@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/pdl.cuh"
 #include "ops/gated_residual/mix/fp8/kernel/output.cuh"
 #include "ops/common/cuda/pipeline.cuh"
 #include "ops/common/cuda/reduce.cuh"
@@ -28,6 +29,7 @@ __global__ __launch_bounds__(128, 2) void down_vector(const __nv_bfloat16* input
                                                       const std::uint8_t* weights,
                                                       const __nv_bfloat16* injection,
                                                       float* partials, int columns) {
+    if (threadIdx.x == 0) pdl::trigger_dependents();
     using S            = VectorDownSchedule<Columns>;
     constexpr int Rows = S::kRows, Values = S::kValues, Accumulators = S::kAccumulators;
     constexpr int Step = 32 * Values, Chunks = kTotal / Step;
@@ -156,6 +158,7 @@ __global__ __launch_bounds__(128, 2) void up_vector(Fp8A16Operands weights, UpOu
     };
     uint2 current = load(0), next{};
     if constexpr (Columns == 2) next = load(1);
+    pdl::wait_for_dependencies();
     for (int index = tid * 8; index < Columns * kRank; index += 128 * 8) {
         const bool valid = index / kRank < output.columns;
         common::cp_async_zfill<16, Cache::ca>(input + index, weights.x + (valid ? index : 0),

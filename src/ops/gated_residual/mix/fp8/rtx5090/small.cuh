@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/pdl.cuh"
 #include "ops/gated_residual/mix/fp8/kernel/output.cuh"
 #include "ops/linear/kernels/fp8/fp8_a8_tma_mma.cuh"
 #include "ops/common/cuda/pipeline.cuh"
@@ -20,6 +21,7 @@ template <int Columns>
 __global__ __launch_bounds__(SmallDownSchedule<Columns>::kThreads,
                              1) void down_small(const __grid_constant__ Fp8TmaDescriptors maps,
                                                 float* partials) {
+    if (threadIdx.x == 0) pdl::trigger_dependents();
     using S            = SmallDownSchedule<Columns>;
     constexpr int Rows = S::kBlockRows, K = S::kBlockK, Stages = S::kStages;
     constexpr int Steps = kSegmentK / K;
@@ -156,6 +158,8 @@ template <bool Segmented, bool EncodeUp, bool Injection, int PartialColumns = kS
 __global__ __launch_bounds__(kUpGroup) void finish_small_down(
     const float* partial, const __nv_bfloat16* weights, const float* control, __nv_bfloat16* u,
     std::uint8_t* codes, float* scales, float* injection, int columns) {
+    if (threadIdx.x == 0) pdl::trigger_dependents();
+    pdl::wait_for_dependencies();
     const int tid = threadIdx.x, token = blockIdx.y, group = blockIdx.x;
     const int row = group * kUpGroup + tid;
     float sum     = 0;
@@ -227,8 +231,8 @@ __global__ __launch_bounds__(128, 2) void grouped_up_kernel(const std::uint8_t* 
     auto* row_scales      = reinterpret_cast<__nv_bfloat16*>(shared + S::kWeightScaleOffset);
     auto* normalized      = reinterpret_cast<__nv_bfloat16*>(shared + S::kNormalizedOffset);
     const int tid = threadIdx.x, warp = tid / 32, lane = tid % 32;
-    const int row_begin = blockIdx.x * Rows;
-    const auto stage    = [&](int slot, int group) {
+    const int row_begin     = blockIdx.x * Rows;
+    const auto stage_weight = [&](int slot, int group) {
 #pragma unroll
         for (int i = 0; i < Rows * (Group / 16) / Threads; ++i) {
             const int row    = tid / (Group / 16) + i * Threads / (Group / 16);
@@ -238,6 +242,8 @@ __global__ __launch_bounds__(128, 2) void grouped_up_kernel(const std::uint8_t* 
                                                 fp8_mma_shared_byte<S>(row, k),
                                             weights + parent * kRank + group * Group + k);
         }
+    };
+    const auto stage_input = [&](int slot, int group) {
 #pragma unroll
         for (int i = 0; i < Tokens * (Group / 16) / Threads; ++i) {
             const int row    = tid / (Group / 16) + i * Threads / (Group / 16);
@@ -267,10 +273,20 @@ __global__ __launch_bounds__(128, 2) void grouped_up_kernel(const std::uint8_t* 
                     valid ? 16 : 0);
             }
         }
+    };
+    const auto stage = [&](int slot, int group) {
+        stage_weight(slot, group);
+        stage_input(slot, group);
         common::cp_commit();
     };
-    stage(0, 0);
-    stage(1, 1);
+    // Weight reads are independent of the preceding down projection.
+    stage_weight(0, 0);
+    stage_weight(1, 1);
+    pdl::wait_for_dependencies();
+    stage_input(0, 0);
+    common::cp_commit();
+    stage_input(1, 1);
+    common::cp_commit();
     float sum[S::kMmaTokens][S::kMmaRows][4]{};
 #pragma unroll
     for (int group = 0; group < Groups; ++group) {

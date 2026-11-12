@@ -125,11 +125,12 @@ void launch(Weights w, const Tensor& z, Tensor& out, Tensor* j, Scratch s, Plan 
             submit.template operator()<4>();
         CUDA_CHECK(cudaGetLastError());
         const auto finish = [&]<bool Encoded, bool Injection>() {
-            finish_small_down<false, Encoded, Injection>
-                <<<dim3(kRank / kUpGroup, m), kUpGroup, 0, stream>>>(
-                    s.encoded.partials, static_cast<const __nv_bfloat16*>(w.down.weight.scales),
-                    nullptr, s.u, s.encoded.codes, s.encoded.scales,
-                    j ? static_cast<float*>(j->data) : nullptr, m);
+            CUDA_CHECK(pdl::launch_dependent(
+                {dim3(kRank / kUpGroup, m), dim3(kUpGroup), 0, stream},
+                finish_small_down<false, Encoded, Injection>, s.encoded.partials,
+                static_cast<const __nv_bfloat16*>(w.down.weight.scales),
+                static_cast<const float*>(nullptr), s.u, s.encoded.codes, s.encoded.scales,
+                j ? static_cast<float*>(j->data) : nullptr, m));
         };
         if (p.grouped_up()) {
             if (j)
@@ -167,12 +168,12 @@ void launch(Weights w, const Tensor& z, Tensor& out, Tensor* j, Scratch s, Plan 
                 maps, s.encoded.partials);
             CUDA_CHECK(cudaGetLastError());
             const auto finish = [&]<bool Encoded, bool Injection>() {
-                finish_small_down<true, Encoded, Injection, Columns>
-                    <<<dim3(kRank / kUpGroup, m), kUpGroup, 0, stream>>>(
-                        s.encoded.partials, static_cast<const __nv_bfloat16*>(w.down.weight.scales),
-                        s.encoded.scales, s.u, s.encoded.codes,
-                        s.encoded.scales + down_control_elements(m, Injection),
-                        j ? static_cast<float*>(j->data) : nullptr, m);
+                CUDA_CHECK(pdl::launch_dependent(
+                    {dim3(kRank / kUpGroup, m), dim3(kUpGroup), 0, stream},
+                    finish_small_down<true, Encoded, Injection, Columns>, s.encoded.partials,
+                    static_cast<const __nv_bfloat16*>(w.down.weight.scales), s.encoded.scales, s.u,
+                    s.encoded.codes, s.encoded.scales + down_control_elements(m, Injection),
+                    j ? static_cast<float*>(j->data) : nullptr, m));
             };
             if (p.grouped_up()) {
                 if (j)
@@ -232,10 +233,11 @@ void launch(Weights w, const Tensor& z, Tensor& out, Tensor* j, Scratch s, Plan 
             using S               = GroupedUpSchedule<Tokens>;
             constexpr auto kernel = grouped_up_kernel<Tokens>;
             const int bytes       = common::prepare_shared<S::kSharedBytes, kernel>();
-            kernel<<<kTotal / S::kBlockRows, S::kThreads, bytes, stream>>>(
-                s.encoded.codes, s.encoded.scales + control,
+            CUDA_CHECK(pdl::launch_dependent(
+                {dim3(kTotal / S::kBlockRows), dim3(S::kThreads), std::size_t(bytes), stream},
+                kernel, s.encoded.codes, s.encoded.scales + control,
                 static_cast<const std::uint8_t*>(w.up.weight.qdata),
-                static_cast<const __nv_bfloat16*>(w.up.weight.scales), output);
+                static_cast<const __nv_bfloat16*>(w.up.weight.scales), output));
         };
         if (m <= 16)
             submit.template operator()<16>();
@@ -267,12 +269,16 @@ void launch(Weights w, const Tensor& z, Tensor& out, Tensor* j, Scratch s, Plan 
     } else {
         const auto a = fp8_a16_operands(u, w.up.weight);
         if (m <= kDownVectorColumns) {
+            const auto submit = [&]<int Columns>() {
+                CUDA_CHECK(pdl::launch_dependent({dim3(kWidth / 4), dim3(128), 0, stream},
+                                                 up_vector<Columns>, a, output));
+            };
             if (m == 1)
-                up_vector<1><<<kWidth / 4, 128, 0, stream>>>(a, output);
+                submit.template operator()<1>();
             else if (m == 2)
-                up_vector<2><<<kWidth / 4, 128, 0, stream>>>(a, output);
+                submit.template operator()<2>();
             else
-                up_vector<4><<<kWidth / 4, 128, 0, stream>>>(a, output);
+                submit.template operator()<4>();
             CUDA_CHECK(cudaGetLastError());
         } else if (m >= 17 && m <= 32) {
             using Up = Fp8ScheduleInstance<Fp8A16MmaSchedule<64, 32, 64, 16, 16, 2, 2>, kRank>;

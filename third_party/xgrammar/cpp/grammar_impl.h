@@ -420,6 +420,9 @@ class Grammar::Impl {
    */
   std::vector<std::optional<CompactFSMWithStartEndWithSize>> per_rule_fsms;
 
+  /*! \brief Whether complete_fsm has any kToken or kExcludeToken edge. */
+  bool has_token_edges = false;
+
   /*!
    * \brief The hash value for each rule's FSM.
    */
@@ -488,6 +491,8 @@ XGRAMMAR_MEMBER_TABLE(
     &Grammar::Impl::complete_fsm,
     "per_rule_fsms",
     &Grammar::Impl::per_rule_fsms,
+    "has_token_edges",
+    &Grammar::Impl::has_token_edges,
     "allow_empty_rule_ids",
     &Grammar::Impl::allow_empty_rule_ids,
     "optimized",

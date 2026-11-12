@@ -101,6 +101,60 @@ void check_compiled_grammar_lifetime() {
     require(allows(mask(*session), 2), "evicted grammar did not complete");
 }
 
+void check_mid_token_exclusion() {
+    // A token may finish a byte literal and enter ExcludeToken; Token still requires a boundary.
+    const std::vector<std::string> vocabulary{"\n\n",  "\n\n\n", "\n\n\n\n", "<",  "<hi",
+                                              "<end>", "<tool>", "x",        "hi", ""};
+    ninfer::text::GrammarCompiler compiler(vocabulary, {9}, 4 * 1024 * 1024);
+
+    struct Case {
+        std::string source;
+        std::vector<std::int32_t> prefix;
+        int token;
+        bool accepted;
+    };
+
+    const std::vector<Case> cases{
+        {"root ::= \"\\n\\n\" ExcludeToken(5)* Token(5)", {}, 1, true},
+        {"root ::= prefix ExcludeToken(5)*\nprefix ::= \"\\n\\n\" | \"x\"", {}, 1, true},
+        {"root ::= \"<\" ExcludeToken(5)*", {}, 5, false},
+        {"root ::= \"<\" ExcludeToken(5)*", {}, 4, true},
+        {"root ::= \"\\n\\n\" ExcludeToken(1)* Token(5)", {}, 2, true},
+        {"root ::= prefix ExcludeToken(1)*\nprefix ::= \"\\n\\n\" | \"x\"", {}, 2, true},
+        {"root ::= Token(6) prefix ExcludeToken(5)\nprefix ::= \"<\"", {6}, 4, true},
+        {"root ::= \"<\" Token(4)", {}, 4, false},
+        {"root ::= Token(6) prefix Token(5)\nprefix ::= \"<\"", {6}, 5, false},
+    };
+    for (const auto& item : cases) {
+        auto session = compile(compiler, item.source, {}, {});
+        session->accept(item.prefix);
+        session->confirm();
+        const auto before = mask(*session);
+        require(allows(before, item.token) == item.accepted,
+                "mid-token exclusion mask differs from token-boundary semantics");
+        const std::array<std::int32_t, 1> draft{item.token};
+        std::vector<std::uint32_t> draft_masks(2 * session->mask_words());
+        require(session->masks(draft, draft_masks) == 0,
+                "mid-token exclusion lookahead reached an unexpected dead end");
+        require(mask(*session) == before, "mid-token lookahead changed the legal token set");
+        bool accepted = true;
+        try {
+            session->accept(item.token);
+        } catch (const std::logic_error&) { accepted = false; }
+        require(accepted == item.accepted, "mid-token matcher disagrees with its mask");
+        session->discard();
+        require(mask(*session) == before, "mid-token rollback changed the legal token set");
+        if (item.accepted) {
+            session->accept(item.token);
+            session->confirm();
+            require(mask(*session) ==
+                        std::vector<std::uint32_t>(draft_masks.begin() + session->mask_words(),
+                                                   draft_masks.end()),
+                    "committed mid-token state differs from speculative lookahead");
+        }
+    }
+}
+
 void check_counted_units() {
     const std::vector<std::string> units{"a", "b", "你", "😀", "\\n", "\\u0000", "\\\"", "\\\\"};
     std::vector<std::string> vocabulary{
@@ -206,6 +260,7 @@ int main() {
         check_finite_language_masks();
         check_counted_units();
         check_compiled_grammar_lifetime();
+        check_mid_token_exclusion();
         check_draft_lookahead();
         std::vector<std::string> vocab;
         for (int byte = 0; byte < 256; ++byte) { vocab.emplace_back(1, static_cast<char>(byte)); }

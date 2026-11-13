@@ -324,14 +324,23 @@ ConstructedModel construct_model_on(const EngineOptions& requested, DeviceContex
         // capy-flash v0.7: ggml block expert banks run without prefill expert streaming, the
         // router-ahead prefetch and the miss split (not implemented for them): plan and run so.
         auto& e = options.routed_experts;
+        // capy-flash v0.11.2: without --stream-min-tokens the threshold follows the device count
+        // (13/11, server TTFT, 9900X DDR5 + RTX 5070 Ti PCIe 5.0 x8, 64 GB edition): at tp 2 the
+        // CPU path costs ~0.45 s + ~1 ms per token and the ring a flat ~0.85-0.95 s, even at
+        // ~600 tokens (355 tokens: 0.59 s vs 0.84 s); at one GPU the ring leaves part of each
+        // layer to the CPU (Qwen4OffloadOptions::gguf_cpu_hybrid).
+        const std::uint32_t gguf_min = e.stream_min_tokens_set ? e.stream_min_tokens
+                                       : execution != nullptr  ? 600U
+                                                               : 256U;
         if (e.stream_min_tokens > 0 || e.prefetch_slots > 0 || e.device_reads > 0 ||
             e.miss_split.mode != MissSplitMode::Off) {
             std::fprintf(stderr,
-                         "routed experts: ggml block banks; prefill experts zero-copy from "
-                         "%u tokens, prefetch and miss split off\n",
-                         e.stream_min_tokens);
+                         "routed experts: ggml block banks; prefill experts on the GPU from "
+                         "%u tokens%s, prefetch and miss split off\n",
+                         gguf_min,
+                         e.stream_min_tokens_set ? "" : " (default for this device count)");
         }
-        e.gguf_stream_min_tokens = e.stream_min_tokens; // the GGUF prefill ring
+        e.gguf_stream_min_tokens = e.stream_min_tokens > 0 ? gguf_min : 0; // the GGUF prefill ring
         e.cpu_threads            = e.gguf_cpu_threads;
         e.stream_min_tokens      = 0;
         e.prefetch_slots         = 0;

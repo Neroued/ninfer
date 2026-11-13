@@ -269,6 +269,22 @@ struct Qwen4OffloadOptions {
     double stream_cpu_token_us         = 9.0;
     double stream_link_us              = 105.0;
     std::int32_t stream_cpu_max_tokens = 2047;
+    // capy-flash v0.11.2, ggml block banks at one GPU: a prompt chunk on the GPU of at most
+    // stream_cpu_max_tokens columns leaves part of each layer's non-resident experts to the CPU
+    // (not copied, skipped by the grouped GGUF call, computed by the host executor meanwhile and
+    // added after it) while the CPU's estimated time stays within the copies' (CPU
+    // gguf_cpu_expert_us + gguf_cpu_route_us per routed token and expert, gguf_link_us per expert
+    // read over PCIe); wider chunks stream whole, as before. 13/11, 9900X 12 threads DDR5 + RTX
+    // 5070 Ti PCIe 5.0 x8 (64 GB edition): alone the CPU costs 27 + 2.65 us per route and the ring
+    // ~95 us per expert; side by side they share the RAM bandwidth, and 35 + 3.6 us and 100 us
+    // serve every prompt length best (server TTFT at 215/355/625/1157 tokens 0.49/0.67/0.79/1.07 s,
+    // v0.11.1 0.54/1.65/1.65/1.67 s; 27/2.65/90 gave 0.51/0.63/0.82/1.19, 40/4.5/100
+    // 0.48/0.73/0.86/1.05).
+    // NINFER_GGUF_HYBRID=0: off; NINFER_GGUF_HYBRID_COST=a,b,link: other costs.
+    bool gguf_cpu_hybrid      = true;
+    double gguf_cpu_expert_us = 35.0;
+    double gguf_cpu_route_us  = 3.6;
+    double gguf_link_us       = 100.0;
     // T42 borrowed prompt workspace: prompt chunks of more than `base_chunk` columns run on
     // `prompt_workspace_bytes` per GPU lent from the gate/up code plane of the cache layers just
     // below the streaming ring, for the duration of the prompt
@@ -691,6 +707,8 @@ private:
     // Chooses, per Text layer, the non-resident experts left to the CPU while streaming a chunk
     // of `tokens` columns, from the previous prompt window's routing (none without one).
     void select_cpu_tail(std::int32_t tokens);
+    // v0.11.2 GGUF hybrid prefill: the CPU share of every Text layer for a chunk of `tokens`.
+    void select_gguf_cpu(std::int32_t tokens);
     // Routing-log offset of a publish of `tokens` columns of `layer` (0 for the Text layers;
     // the calls of a later layer in one execution append, wrapping at the log's length).
     std::int32_t log_offset(std::int32_t layer, std::int32_t tokens);
@@ -756,8 +774,15 @@ public:
         return pool_slots_ + gguf_ring_slots_;
     }
 private:
-    void upload_gguf_host_rows(cudaStream_t stream);
-    std::int32_t pool_slots_ = 0; // one GPU's pool slots (all layers, staging, elastic)
+    void upload_gguf_host_rows(cudaStream_t stream, std::int32_t tokens);
+    // v0.11.2 GGUF hybrid prefill (one GPU): per Text layer whether the window gives the CPU a
+    // share, and the table publish_table reads (I32 [text_layers * 512]: -1 = the host computes
+    // the expert, 0 = not the host's), its host copy and the device copy (owned).
+    bool gguf_hybrid_ = false;
+    std::vector<std::uint8_t> gguf_cpu_layers_;
+    std::vector<std::int32_t> gguf_cpu_rows_;
+    std::int32_t* gguf_cpu_tables_ = nullptr;
+    std::int32_t pool_slots_       = 0; // one GPU's pool slots (all layers, staging, elastic)
 
     std::int32_t layers_     = 0;
     std::int32_t partitions_ = 1;            // GPUs the cache spans
@@ -853,6 +878,11 @@ private:
     // width; the streamed chunk's CPU selection ([layer][expert], 1 = stream).
     std::vector<std::vector<std::int32_t>> prompt_counts_;
     std::vector<std::int32_t> prompt_counts_tokens_;
+    // v0.11.2: prompt_counts_ come from the previous chunk of the prompt being run (no decode
+    // window since); otherwise they describe another prompt and the CPU shares assume uniform
+    // routing (a stale count of 0 made the CPU take nearly every expert: 1 GPU NVFP4, 1151
+    // tokens, 16 934 of 17 874 experts on the CPU, 5.4 s instead of ~2.3 s streaming).
+    bool prompt_counts_fresh_ = false;
     std::vector<std::vector<std::uint8_t>> stream_select_;
 
     // Trace.

@@ -311,6 +311,10 @@ struct RoutedExpertOptions {
     // 1.8-2.9 s at 250-380. At 256 the warm cost is even (and streaming saves 0.5-1.5 s cold);
     // below it the warm CPU path is cheaper. ninfer-serve --stream-min-tokens.
     std::uint32_t stream_min_tokens = 256;
+    // capy-flash v0.11.2: true when the caller set stream_min_tokens (--stream-min-tokens); then it
+    // is also the ggml block banks' threshold, otherwise the engine picks theirs by device count
+    // (model_instance.cpp: 13/11 server TTFT on the 9900X and RTX 5070 Ti).
+    bool stream_min_tokens_set = false;
     // ggml block expert banks (capy-flash v0.7): prompt chunks of at least this many tokens run
     // every routed expert on the GPU, the non-resident ones read in place from the host bank
     // (zero-copy, moe_grouped_gguf hybrid form), no ring and no lent workspace. The engine sets it

@@ -177,12 +177,17 @@ On Qwen3.8-Flash-Next:
 - Expert residency that follows the conversation (v0.6): a prompt that continues a cached conversation keeps the
   experts its next answer needs, a new conversation only updates their statistics. Prompt chunks of at least
   `--stream-min-tokens` tokens (default 256) stream the non-resident experts to the GPUs over PCIe; shorter ones
-  compute them on the CPU. The post-prompt slowdown of v0.5.x (about 250 ms per turn) is gone, and a cold 382-token
+  compute them on the CPU. On one GPU, streamed chunks of up to 2,047 tokens leave the experts the previous chunk
+  of the same prompt routed least to the CPU, in parallel with the copies (a new prompt assumes uniform routing, v0.11.2). The post-prompt slowdown of v0.5.x (about 250 ms per turn) is gone, and a cold 382-token
   prompt answers in 1.35 s (2.5-2.9 s with the earlier 512-token threshold).
 - GGUF i-quant experts (v0.7): IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS, IQ4_NL and Q2_0 blocks with variable-size expert slots
   per layer, GPU kernels from ggml (via fngine / ninfer-all), CPU kernels in AVX-512 VNNI and AVX2; the 64 GB edition
   takes its experts verbatim from ISTA-DASLab's GSQ-RCO GGUF. With these banks the prefill reads the non-resident
   experts in place from host RAM (zero-copy, from `--stream-min-tokens` tokens), and `--miss-split` is forced off.
+  Without `--stream-min-tokens` their threshold is 256 tokens on one GPU and 600 on two (v0.11.2: below 600 tokens
+  the CPU is cheaper than copying at tp 2). On one GPU, prompt chunks of 256-2,047 tokens leave part of each
+  layer's non-resident experts to the CPU, sized by a cost model so that the CPU and the copies of the others end
+  together (`NINFER_GGUF_HYBRID`, [diagnostics](capy-flash/diagnostics.md)); wider chunks copy them all.
 - `--turn-anchors` is 0 by default on Flash-Next, which saves one prefill pass per agentic turn (about 0.8 s on the
   test machine); the cost is that a cancelled or edited turn re-reads the whole conversation (`--turn-anchors 1`
   restores the anchor). Models that sit entirely on the GPU (Qwen3.8-27B) keep the anchor by default.

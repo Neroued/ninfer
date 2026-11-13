@@ -19,7 +19,7 @@ Anthropic-compatible HTTP API, so agent tools such as Claude Code, Codex CLI and
 
 capy-flash **is ninfer-tp2, renamed at v0.5.0**: the two-GPU tensor-parallel fork of
 [Neroued/ninfer](https://github.com/Neroued/ninfer) (v0.1-v0.4.9 under the old name); [NOTICE](NOTICE) lists every piece
-of prior work it builds on. Status: **v0.11.1**. Built, tested and measured on one machine ([below](#benchmarks));
+of prior work it builds on. Status: **v0.11.2**. Built, tested and measured on one machine ([below](#benchmarks));
 users report other setups. Not affiliated with Qwen or NVIDIA.
 
 ## Pick a model
@@ -322,6 +322,13 @@ artifacts, runs the integration tests (`GATE_CTEST_EXCLUDE` excludes more), then
 greedy texts against a recorded reference ([tools/tp2/README.md](tools/tp2/README.md)).
 
 ## What's new
+
+**v0.11.2** ([release notes](https://github.com/ValerioDolci/capy-flash/releases/tag/v0.11.2))
+- Shorter time to first token on short and medium Flash-Next prompts. 64 GB edition on one GPU: prompt chunks of
+  256-2,047 tokens leave part of each layer's missing experts to the CPU while the GPU copies the others (625 tokens:
+  1.65 -> 0.82 s; `NINFER_GGUF_HYBRID=0` restores v0.11.1). Two GPUs: the 64 GB edition copies its missing experts from
+  600 tokens (was 256; 355 tokens: 0.84 -> 0.66 s). NVFP4 on one GPU: fixed the CPU share of a new prompt (1,151 tokens:
+  5.6 -> 2.0 s). Two GPUs give the same tokens as v0.11.1; long prompts and decode speed are unchanged.
 
 **v0.11.1** ([release notes](https://github.com/ValerioDolci/capy-flash/releases/tag/v0.11.1))
 - The lossless receive of the tp-2 exchange by kernel ([PR #66](https://github.com/ValerioDolci/capy-flash/pull/66)) is on

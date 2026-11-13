@@ -383,7 +383,8 @@ GenerationService::GenerationService(ServeOptions options, StartupObserver start
         engine_options.routed_experts.gguf_cpu_threads = *options_.expert_cpu_threads;
     }
     if (options_.stream_min_tokens) {
-        engine_options.routed_experts.stream_min_tokens = *options_.stream_min_tokens;
+        engine_options.routed_experts.stream_min_tokens     = *options_.stream_min_tokens;
+        engine_options.routed_experts.stream_min_tokens_set = true;
     }
     engine_options.rope_yarn_factor         = options_.rope_yarn_factor;
     engine_options.enable_vision            = options_.enable_vision;

@@ -39,6 +39,16 @@
 // names complete slots. Until then the policy counts the expert as resident and the device does
 // not (observe reports it missing).
 //
+// Deterministic publication (publish lag >= 1, opt-in; set_publish_lag or
+// NINFER_QWEN4_FILL_PUBLISH_LAG): a batch is instead published at the begin_window fixed when it
+// was issued: with lag 1 the next one for a batch issued inside a window (it ran beside the rest of
+// the window, as a timed copy usually does), the one after for a batch issued between windows (it
+// would be waited for at once); begin_window waits for it if it has not completed. poll() does
+// nothing, and nothing else retires a batch except flush() (between windows, and while a prompt
+// chunk runs). Every decision then depends on the sequence of calls alone, never on how fast a
+// copy ran: with timed publication which experts the GPU holds, and so which ones the CPU computes
+// with another rounding, follows copy speed, and the greedy text can change between runs.
+//
 // Pageable banks (v0.7 pinned fallback): a layer whose bank planes are not page-locked host memory
 // (cudaPointerGetAttributes: unregistered) is filled through a ring of pinned staging slots of one
 // expert each, per GPU: the execution thread copies the expert into a free staging slot (memcpy)
@@ -99,13 +109,16 @@ struct ExpertLayout {
     [[nodiscard]] const std::byte* bank(std::int32_t layer, std::int32_t q,
                                         std::int32_t expert) const noexcept {
         const auto i = static_cast<std::size_t>(layer * planes + q);
-        return bank_base[i] + static_cast<std::int64_t>(expert) *
-                                  (variable() ? layer_bank_stride[i] : bank_stride[static_cast<std::size_t>(q)]);
+        return bank_base[i] +
+               static_cast<std::int64_t>(expert) *
+                   (variable() ? layer_bank_stride[i] : bank_stride[static_cast<std::size_t>(q)]);
     }
 
     [[nodiscard]] std::int64_t pool_offset(std::int32_t layer, std::int32_t q,
                                            std::int32_t slot) const noexcept {
-        if (!variable()) { return static_cast<std::int64_t>(slot) * pool_stride[static_cast<std::size_t>(q)]; }
+        if (!variable()) {
+            return static_cast<std::int64_t>(slot) * pool_stride[static_cast<std::size_t>(q)];
+        }
         return slot_offset[static_cast<std::size_t>(slot)] +
                layer_plane_offset[static_cast<std::size_t>(layer * planes + q)];
     }
@@ -156,6 +169,9 @@ struct CacheCounters {
     std::int64_t moved          = 0;
     // v0.7 pinned fallback: fills from pageable banks, copied through the staging ring.
     std::int64_t staged_fills = 0;
+    // Deterministic publication: begin_window calls that had to wait for a copy, and the wait.
+    std::int64_t publish_waits = 0;
+    double publish_wait_us     = 0;
 };
 
 // True when `p` is page-locked host memory registered with CUDA (cudaHostAlloc or
@@ -263,7 +279,8 @@ public:
     void prioritize_queue(std::span<const std::int32_t> rank);
 
     // Non-blocking: retires completed fill batches (they publish at the next begin_window) and
-    // issues queued fills up to the in-flight limit.
+    // issues queued fills up to the in-flight limit. Deterministic publication: does nothing (the
+    // other calls issue and retire at fixed points).
     void poll();
     // Issues and waits for every submitted fill.
     void flush();
@@ -350,6 +367,18 @@ public:
     // policy state does not move. Residency stays what it was when frozen.
     void set_frozen(bool frozen) noexcept { frozen_ = frozen; }
 
+    /**
+     * Deterministic publication: -1 = timed (a copy is published
+     * at the first begin_window after it completed), 1..3 = a copy is published at the begin_window
+     * fixed when it was issued (lag 1: the next one for a copy issued inside a window, the one
+     * after for a copy issued between windows; each step of lag adds one), waiting for it if
+     * needed, so the residency depends on the routing history alone.
+     * Before initialize() only. Default -1; NINFER_QWEN4_FILL_PUBLISH_LAG overrides.
+     */
+    void set_publish_lag(std::int32_t lag);
+
+    [[nodiscard]] std::int32_t publish_lag() const noexcept { return publish_lag_; }
+
     [[nodiscard]] bool frozen() const noexcept { return frozen_; }
 
     // T59: replace the whole residency by `profile` (one list per layer, as initialize), between
@@ -369,6 +398,7 @@ private:
 
     struct FillBatch {
         cudaEvent_t done = nullptr;
+        std::int64_t due = 0; // deterministic publication: begin_window (launched_) it is due at
         std::vector<PendingFill> fills;
         std::int32_t staged = 0; // staging slots it holds (pageable fills)
     };
@@ -407,6 +437,15 @@ private:
     void pump(Gpu& gpu);
     void issue(Gpu& gpu, std::span<const PendingFill> fills);
     void retire(Gpu& gpu, bool wait);
+    // The front batch's bookkeeping (its fills publish at the next begin_window).
+    void retire_front(Gpu& gpu);
+
+    [[nodiscard]] bool deterministic() const noexcept { return publish_lag_ > 0; }
+
+    // Deterministic publication: the begin_window `batch` is due at.
+    void schedule(FillBatch& batch) const noexcept;
+    // Deterministic publication, in begin_window: retires every batch due by now (waiting).
+    void retire_due();
     void check_streams(std::span<const cudaStream_t> streams) const;
 
     ExpertCachePolicy policy_;
@@ -437,6 +476,7 @@ private:
     // NINFER_QWEN4_FILL_SM=<ctas> (v07/decode-overheads A): CTAs of the kernel that copies fills
     // from the mapped host bank instead of the copy engine; 0 = copy engine (cudaMemcpyBatchAsync).
     std::int32_t sm_fill_ctas_ = 0;
+    std::int32_t publish_lag_  = -1; // set_publish_lag
 
     LayerDecision decision_;
     std::vector<ResidentExpert> resident_;

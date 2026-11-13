@@ -2,6 +2,7 @@
 #include "ops/softmax_attention/dense/causal_cache/int8/instances.h"
 #include "ops/softmax_attention/dense/causal_cache/int8/operands.h"
 #include <algorithm>
+#include <cstdlib>
 #include <stdexcept>
 
 namespace ninfer::ops::detail {
@@ -94,4 +95,29 @@ std::size_t int8_kv_workspace_bytes(int heads, int batch, int min_width, int max
     return maximum;
 }
 
+namespace {
+// int8_kv_pv_routes_for_test; -1 = default.
+int test_pv_half_acc  = -1;
+int test_pv_ping_pong = -1;
+} // namespace
+
+bool int8_kv_pv_half_acc_enabled() {
+    static const bool env = [] {
+        const char* e = std::getenv("NINFER_ATTN_PV_F16ACC");
+        return e != nullptr && e[0] == '1';
+    }();
+    return test_pv_half_acc >= 0 ? test_pv_half_acc != 0 : env;
+}
+
+bool int8_kv_pv_ping_pong_enabled() { return test_pv_ping_pong != 0; }
+
 } // namespace ninfer::ops::detail
+
+namespace ninfer::ops {
+
+void int8_kv_pv_routes_for_test(int pv_half_acc, int pv_ping_pong) noexcept {
+    detail::test_pv_half_acc  = pv_half_acc;
+    detail::test_pv_ping_pong = pv_ping_pong;
+}
+
+} // namespace ninfer::ops

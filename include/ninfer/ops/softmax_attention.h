@@ -164,4 +164,9 @@ void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,
     CausalAttentionExecutionEnvelope envelope, std::int32_t batch_size, std::int32_t min_tokens,
     std::int32_t max_tokens);
 
+// Test only: overrides the INT8-KV prefill PV routes for exactness tests; -1 keeps the default.
+// pv_half_acc stands for NINFER_ATTN_PV_F16ACC; pv_ping_pong selects the ping-pong kernel for the
+// FP16-accumulating PV (default on). Not thread-safe; applies to launches made afterwards.
+void int8_kv_pv_routes_for_test(int pv_half_acc, int pv_ping_pong) noexcept;
+
 } // namespace ninfer::ops

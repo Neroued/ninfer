@@ -7,7 +7,7 @@
 
 namespace ninfer::ops::detail {
 
-template <typename Geometry, typename Schedule, typename Metadata>
+template <typename Geometry, typename Schedule, typename Metadata, bool PvHalfAcc = false>
 __global__ __maxnreg__(Schedule::kMaxRegisters) void int8_kv_tiled_mma_kernel(
     const __nv_bfloat16* __restrict__ q, const std::int8_t* __restrict__ cache_k,
     const std::int8_t* __restrict__ cache_v, const __half* __restrict__ cache_k_scale,
@@ -344,6 +344,11 @@ __global__ __maxnreg__(Schedule::kMaxRegisters) void int8_kv_tiled_mma_kernel(
             acc[n][3] *= alpha1;
         }
 
+        unsigned hacc[PVNtPerWarp][2];
+        if constexpr (PvHalfAcc) {
+#pragma unroll
+            for (int n = 0; n < PVNtPerWarp; ++n) hacc[n][0] = hacc[n][1] = 0u;
+        }
 #pragma unroll
         for (int k = 0; k < PVKs; ++k) {
             unsigned pf[4];
@@ -359,8 +364,22 @@ __global__ __maxnreg__(Schedule::kMaxRegisters) void int8_kv_tiled_mma_kernel(
                 const int vcol = global_n * 8;
                 ldmatrix_x2_t(vf[0], vf[1],
                               smem_addr(&v_f16[vrow * D + causal_swizzle(vrow, vcol)]));
-                mma_f16(acc[n][0], acc[n][1], acc[n][2], acc[n][3], pf[0], pf[1], pf[2], pf[3],
-                        vf[0], vf[1]);
+                if constexpr (PvHalfAcc)
+                    mma_f16_hacc(hacc[n][0], hacc[n][1], pf[0], pf[1], pf[2], pf[3], vf[0], vf[1]);
+                else
+                    mma_f16(acc[n][0], acc[n][1], acc[n][2], acc[n][3], pf[0], pf[1], pf[2], pf[3],
+                            vf[0], vf[1]);
+            }
+        }
+        if constexpr (PvHalfAcc) {
+#pragma unroll
+            for (int n = 0; n < PVNtPerWarp; ++n) {
+                const float2 lo = __half22float2(*reinterpret_cast<const __half2*>(&hacc[n][0]));
+                const float2 hi = __half22float2(*reinterpret_cast<const __half2*>(&hacc[n][1]));
+                acc[n][0] += lo.x;
+                acc[n][1] += lo.y;
+                acc[n][2] += hi.x;
+                acc[n][3] += hi.y;
             }
         }
         if (has_next) { ninfer::ops::cp_wait<0>(); }

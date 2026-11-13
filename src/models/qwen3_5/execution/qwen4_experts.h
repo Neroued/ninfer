@@ -399,6 +399,9 @@ struct Qwen4OffloadWindowStats {
     double wall_us             = 0; // begin_window -> end_window
     double observe_us          = 0; // host policy work inside observe_window
     double fill_wait_us        = 0; // T59 sync_fills: end_window waiting for the window's fills
+    // Deterministic publication: the window's begin_window waited for copies due in it.
+    std::int64_t publish_waits = 0;
+    double publish_wait_us     = 0;
     double cpu_us              = 0; // host executor busy (doorbell seen -> done), all layers
     std::int64_t cpu_experts   = 0;
     // Device stamps (trace only), all layers: publish -> after the resident experts, -> wait
@@ -562,6 +565,9 @@ private:
     std::int64_t snapshot_saved_    = 0;
     bool snapshot_any_window_       = false;
     Qwen4Window snapshot_last_kind_ = Qwen4Window::Decode;
+    // T69 early reclaim: whether the refill lands before the chunk runs (mode 2, and with
+    // deterministic publication).
+    [[nodiscard]] bool early_reclaim_waits() const noexcept;
     void snapshot_save_block();
 public:
     // Null when prefetch is off.

@@ -100,6 +100,9 @@ struct AttentionCase {
     bool zero_q        = false;
     bool graph_replay  = false;
     float qk_amplitude = 0.25f;
+    // V values in [v_lo, v_hi], the new tokens and the cache alike.
+    float v_lo = -1.0f;
+    float v_hi = 1.0f;
 };
 
 enum class MappingPattern { Identity, Offset, Fragmented };
@@ -617,11 +620,12 @@ void encode_rotated_key_row(std::span<const float> source, std::size_t source_ba
 }
 
 HostCache make_cache(const Geometry& geometry, KvCacheStorage storage, std::int32_t max_context,
-                     std::uint32_t seed, float qk_amplitude = 0.25f) {
+                     std::uint32_t seed, float qk_amplitude = 0.25f, float v_lo = -1.0f,
+                     float v_hi = 1.0f) {
     const std::int32_t logical_capacity = align_up_page(max_context);
     const std::size_t elements          = cache_elements(geometry, logical_capacity);
     std::vector<float> logical_k = make_bf16_values(elements, seed, -qk_amplitude, qk_amplitude);
-    std::vector<float> logical_v = make_bf16_values(elements, seed + 1u, -1.0f, 1.0f);
+    std::vector<float> logical_v = make_bf16_values(elements, seed + 1u, v_lo, v_hi);
 
     HostCache cache{geometry, storage, max_context, logical_capacity};
     if (storage == KvCacheStorage::BFloat16) {
@@ -1706,7 +1710,8 @@ std::vector<T> select_query_columns(const std::vector<T>& values, std::size_t st
 
 int run_a1_case(const Geometry& geometry, KvCacheStorage storage, const AttentionCase& test_case,
                 MappingPattern mapping, std::span<const int> oracle_queries = {},
-                std::span<const std::uint32_t> graph_limits = {}) {
+                std::span<const std::uint32_t> graph_limits = {},
+                std::vector<std::uint16_t>* output          = nullptr) {
     const std::int32_t total       = test_case.base + test_case.tokens;
     const std::int32_t max_context = static_cast<std::int32_t>(
         std::max<std::uint32_t>(static_cast<std::uint32_t>(total + 3), test_case.envelope_max));
@@ -1721,7 +1726,8 @@ int run_a1_case(const Geometry& geometry, KvCacheStorage storage, const Attentio
     if (test_case.zero_q) std::fill(q.begin(), q.end(), 0.0f);
     std::vector<float> k =
         make_bf16_values(kv_elements, test_case.seed + 1u, -amplitude, amplitude);
-    std::vector<float> v = make_bf16_values(kv_elements, test_case.seed + 2u, -1.0f, 1.0f);
+    std::vector<float> v =
+        make_bf16_values(kv_elements, test_case.seed + 2u, test_case.v_lo, test_case.v_hi);
     inject_codec_edges(geometry, test_case.tokens, k, v);
     std::vector<std::int32_t> positions(static_cast<std::size_t>(test_case.tokens));
     for (std::int32_t token = 0; token < test_case.tokens; ++token) {
@@ -1730,9 +1736,9 @@ int run_a1_case(const Geometry& geometry, KvCacheStorage storage, const Attentio
     ops::CausalAttentionExecutionEnvelope envelope{static_cast<std::uint32_t>(total),
                                                    test_case.envelope_max};
 
-    const HostCache initial =
-        make_cache(geometry, storage, max_context, test_case.seed + 10u, amplitude);
-    HostCache expected = initial;
+    const HostCache initial = make_cache(geometry, storage, max_context, test_case.seed + 10u,
+                                         amplitude, test_case.v_lo, test_case.v_hi);
+    HostCache expected      = initial;
     append_cache(expected, k, v, positions);
     const std::vector<double> reference =
         ideal_attention(select_query_columns(q, kHeadDim * geometry.q_heads, oracle_queries),
@@ -1806,6 +1812,7 @@ int run_a1_case(const Geometry& geometry, KvCacheStorage storage, const Attentio
         case_label("causal_softmax_attention", geometry, storage, test_case, mapping);
     const std::vector<std::uint16_t> output_bits =
         copy_from_guarded<std::uint16_t>(dout, q_bits.size());
+    if (output) *output = output_bits;
     int failures = graph_failures +
                    verify_attention(label,
                                     bf16_bits_to_double(select_query_columns(
@@ -1836,7 +1843,8 @@ int run_a1_case(const Geometry& geometry, KvCacheStorage storage, const Attentio
 }
 
 int run_a3_case(const Geometry& geometry, KvCacheStorage storage, const AttentionCase& test_case,
-                MappingPattern mapping, std::span<const int> oracle_queries = {}) {
+                MappingPattern mapping, std::span<const int> oracle_queries = {},
+                std::vector<std::uint16_t>* output = nullptr) {
     const std::int32_t total       = test_case.base + test_case.tokens;
     const std::int32_t max_context = static_cast<std::int32_t>(
         std::max<std::uint32_t>(static_cast<std::uint32_t>(total + 3), test_case.envelope_max));
@@ -1853,8 +1861,8 @@ int run_a3_case(const Geometry& geometry, KvCacheStorage storage, const Attentio
     const ops::CausalAttentionExecutionEnvelope envelope{static_cast<std::uint32_t>(total),
                                                          test_case.envelope_max};
 
-    const HostCache cache_host =
-        make_cache(geometry, storage, max_context, test_case.seed + 10u, amplitude);
+    const HostCache cache_host = make_cache(geometry, storage, max_context, test_case.seed + 10u,
+                                            amplitude, test_case.v_lo, test_case.v_hi);
     const std::vector<double> reference =
         ideal_attention(select_query_columns(q, kHeadDim * geometry.q_heads, oracle_queries),
                         cache_host, select_query_columns(positions, 1, oracle_queries));
@@ -1888,6 +1896,7 @@ int run_a3_case(const Geometry& geometry, KvCacheStorage storage, const Attentio
         case_label("causal_softmax_attention_cached", geometry, storage, test_case, mapping);
     const std::vector<std::uint16_t> output_bits =
         copy_from_guarded<std::uint16_t>(dout, q_bits.size());
+    if (output) *output = output_bits;
     int failures = verify_attention(label,
                                     bf16_bits_to_double(select_query_columns(
                                         output_bits, kHeadDim * geometry.q_heads, oracle_queries)),
@@ -2651,6 +2660,99 @@ int run_tensor_parallel_geometry_cases(KvCacheStorage storage) {
     return failures;
 }
 
+// The ping-pong prefill kernel must reproduce the tiled kernel with FP16-accumulating PV
+// (NINFER_ATTN_PV_F16ACC) bit for bit; each side also passes the oracle.
+int run_int8_pv_route_parity_cases() {
+    constexpr auto storage = KvCacheStorage::Int8Group64;
+    int failures           = 0;
+    const auto parity = [&](const std::string& label, std::array<int, 2> a, std::array<int, 2> b,
+                            const auto& run) {
+        std::vector<std::uint16_t> out_a;
+        std::vector<std::uint16_t> out_b;
+        ops::int8_kv_pv_routes_for_test(a[0], a[1]);
+        failures += run(&out_a);
+        ops::int8_kv_pv_routes_for_test(b[0], b[1]);
+        failures += run(&out_b);
+        ops::int8_kv_pv_routes_for_test(-1, -1);
+        if (out_a.empty() || out_a != out_b) {
+            std::cerr << label << ": outputs differ\n";
+            ++failures;
+        } else {
+            std::cout << label << ": same bits\n";
+        }
+    };
+    const std::array<int, 5> prefill_queries{0, 63, 64, 511, 999};
+    for (const Geometry& geometry : {kGeometries[0], kTensorParallelGeometry}) {
+        const std::string name = geometry.name;
+        // 1000 columns: the last 64-row query tile is partial.
+        parity("INT8 ping-pong vs tiled PV FP16 append " + name, {1, 1}, {1, 0},
+               [&](std::vector<std::uint16_t>* out) {
+                   return run_a1_case(geometry, storage, {1000, 8191, 16384, 1901u},
+                                      MappingPattern::Fragmented, prefill_queries, {}, out);
+               });
+        parity("INT8 ping-pong vs tiled PV FP16 cached " + name, {1, 1}, {1, 0},
+               [&](std::vector<std::uint16_t>* out) {
+                   return run_a3_case(geometry, storage, {1000, 4096, 8192, 1902u},
+                                      MappingPattern::Offset, prefill_queries, out);
+               });
+    }
+    std::cout << (failures ? "FAIL" : "PASS") << " INT8 PV route parity (ping-pong)\n";
+    return failures;
+}
+
+// Range of the FP16-accumulating PV (NINFER_ATTN_PV_F16ACC). Each 64-key tile sums p * v in FP16,
+// with p = exp(s - m) <= 1, and only then adds the tile to the FP32 accumulator, so a tile
+// overflows once sum(p * v) over its 64 keys exceeds 65504. The relative error does not depend on
+// the scale of V below that, so random V up to |v| = 1000 must pass the same oracle criterion as V
+// in [-1, 1]. Equal scores (q = 0: every p = 1) and V in [0.9 A, A] put the boundary at A = 65504 /
+// 64 = 1023.5: A = 1000 (tiles of at most 64,000) must pass, and A = 1200 (tiles of at least
+// 69,120) must overflow, while the FP32-accumulating path passes it. Real Qwen3.8 V stays far below
+// that; this pins where the opt-in ends.
+int run_int8_pv_half_acc_range_cases() {
+    constexpr auto storage   = KvCacheStorage::Int8Group64;
+    const Geometry& geometry = kTensorParallelGeometry;
+    const std::array<int, 5> queries{0, 63, 64, 511, 999};
+    int failures   = 0;
+    const auto run = [&](AttentionCase test_case, int pv_half_acc) {
+        ops::int8_kv_pv_routes_for_test(pv_half_acc, -1);
+        const int result =
+            run_a1_case(geometry, storage, test_case, MappingPattern::Fragmented, queries);
+        ops::int8_kv_pv_routes_for_test(-1, -1);
+        return result;
+    };
+    for (const float amplitude : {1.0f, 64.0f, 256.0f, 1000.0f}) {
+        AttentionCase random{1000, 8191, 16384, 1931u};
+        random.v_lo      = -amplitude;
+        random.v_hi      = amplitude;
+        const int result = run(random, 1);
+        std::cout << "PV FP16 accumulation, random scores, V in [-" << amplitude << ", "
+                  << amplitude << "]: " << (result == 0 ? "passes the oracle" : "FAILS the oracle")
+                  << '\n';
+        failures += result;
+    }
+    AttentionCase flat{1000, 8191, 16384, 1932u, /*zero_q=*/true};
+    flat.v_lo       = 900.0f;
+    flat.v_hi       = 1000.0f;
+    const int below = run(flat, 1);
+    std::cout << "PV FP16 accumulation, equal scores, V in [900, 1000] (tile sums <= 64,000): "
+              << (below == 0 ? "passes the oracle" : "FAILS the oracle") << '\n';
+    failures += below;
+    flat.v_lo = 1080.0f;
+    flat.v_hi = 1200.0f;
+    std::cout << "PV FP16 accumulation, equal scores, V in [1080, 1200] (tile sums >= 69,120): "
+                 "expect the "
+                 "oracle to report non-finite output below\n";
+    const int above = run(flat, 1);
+    std::cout << "  -> " << (above != 0 ? "overflows, as expected" : "UNEXPECTEDLY passes") << '\n';
+    failures += above != 0 ? 0 : 1;
+    const int fp32 = run(flat, 0);
+    std::cout << "PV FP32 accumulation, the same input: "
+              << (fp32 == 0 ? "passes the oracle" : "FAILS the oracle") << '\n';
+    failures += fp32;
+    std::cout << (failures ? "FAIL" : "PASS") << " INT8 PV FP16 accumulation range\n";
+    return failures;
+}
+
 int run_storage_cases(KvCacheStorage storage) {
     int failures = verify_workspace_capacity_contract(storage);
     if (storage == KvCacheStorage::Nvfp4Group16) {
@@ -2682,6 +2784,10 @@ int run_storage_cases(KvCacheStorage storage) {
     failures += run_numerical_profile_cases(storage);
     failures += run_small_prefill_cases(storage);
     failures += run_tensor_parallel_geometry_cases(storage);
+    if (storage == KvCacheStorage::Int8Group64) {
+        failures += run_int8_pv_route_parity_cases();
+        failures += run_int8_pv_half_acc_range_cases();
+    }
     return failures;
 }
 

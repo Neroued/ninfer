@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstddef>
+#include <cstdlib>
 #include <cstdio>
 #include <iterator>
 #include <mutex>
@@ -791,6 +792,13 @@ void GenerationService::warmup() {
     turn.content.push_back(std::move(content));
     request.messages.push_back(std::move(turn));
     request.max_tokens = 4;
+    // Deterministic expert publication (NINFER_QWEN4_FILL_PUBLISH_LAG >= 1): greedy, because with
+    // sampling the drafts accepted, hence the decode rounds run, vary from start to start, and the
+    // Qwen4 expert cache learns its first residency from them.
+    if (const char* lag = std::getenv("NINFER_QWEN4_FILL_PUBLISH_LAG");
+        lag != nullptr && std::atoi(lag) > 0) {
+        request.sampling.temperature = 0.0;
+    }
     PreparedRequest prepared =
         prepare_impl(request, GenerationConsumerMode::Aggregate, {}, {}, {},
                      CacheParticipation::Disabled, DeadlinePolicy::UnboundedStartup, false);

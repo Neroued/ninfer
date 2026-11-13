@@ -13,6 +13,20 @@ namespace {
 
 using Json = nlohmann::ordered_json;
 
+// The arguments of an assistant tool call in the history, as the object the template renders as
+// named parameters. The request parsers keep them as the client sent them; a history from another
+// backend can carry truncated or non-object arguments, which is a request error, not an internal
+// one.
+Json history_tool_arguments(const ToolCall& call) {
+    if (call.arguments_json.empty()) return Json::object();
+    Json arguments = Json::parse(call.arguments_json, nullptr, false);
+    if (arguments.is_discarded() || !arguments.is_object()) {
+        throw std::invalid_argument("tool call '" + call.name +
+                                    "' in the history has arguments that are not a JSON object");
+    }
+    return arguments;
+}
+
 std::string_view role_name(ChatRole role) {
     switch (role) {
     case ChatRole::System:
@@ -226,10 +240,7 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
                     {{"id", call.id},
                      {"type", "function"},
                      {"function",
-                      {{"name", call.name},
-                       {"arguments",
-                        (call.arguments_json.empty() ? Json::object()
-                                                     : Json::parse(call.arguments_json))}}}});
+                      {{"name", call.name}, {"arguments", history_tool_arguments(call)}}}});
             }
         }
         if (!message.tool_call_id.empty()) value["tool_call_id"] = message.tool_call_id;

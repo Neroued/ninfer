@@ -116,6 +116,13 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
             return;
         }
         lifecycle->done(outcome);
+        if (outcome.finish_reason == ninfer::FinishReason::Cancelled) {
+            // Only the client cancels a non-streaming run (it disconnected): nothing to render,
+            // and an Anthropic message has no cancelled stop reason. Logged as Chat logs it.
+            lifecycle->response_failure(
+                make_client_disconnected_failure(RequestFailurePhase::Transport));
+            return;
+        }
         try {
             set_owned_json_content(
                 res, make_anthropic_messages_response(identity, outcome, request.hide_thinking),
@@ -209,6 +216,13 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
                 }
 
                 lifecycle->done(outcome);
+                if (outcome.finish_reason == ninfer::FinishReason::Cancelled) {
+                    // The client closed the stream (SseTransport::poll): no terminal events to
+                    // write, and an Anthropic message has no cancelled stop reason.
+                    lifecycle->response_failure(
+                        make_client_disconnected_failure(RequestFailurePhase::Transport));
+                    return false;
+                }
                 std::vector<std::string> terminal;
                 try {
                     terminal = encoder->finish(outcome);

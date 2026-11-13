@@ -4,6 +4,7 @@
 #include "core/device_scope.h" // ScopedCurrentDevice
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -227,6 +228,14 @@ ExpertCache::ExpertCache(const PolicyConfig& policy, ExpertLayout layout,
             g.staging = static_cast<std::byte*>(ring);
         }
     }
+    if (const char* v = std::getenv("NINFER_QWEN4_FILL_PUBLISH_LAG"); v != nullptr && *v != 0) {
+        char* end        = nullptr;
+        const long value = std::strtol(v, &end, 10);
+        if (*end != 0 || (value != -1 && (value < 1 || value > 3))) {
+            throw std::invalid_argument("NINFER_QWEN4_FILL_PUBLISH_LAG must be -1 or 1..3");
+        }
+        publish_lag_ = static_cast<std::int32_t>(value);
+    }
     if (const char* v = std::getenv("NINFER_QWEN4_FILL_SM"); v != nullptr && *v != 0) {
         sm_fill_ctas_ = std::clamp(std::atoi(v), 0, 1024);
     }
@@ -306,6 +315,14 @@ void ExpertCache::initialize(std::span<const std::vector<std::int32_t>> profile)
     initialized_ = true;
 }
 
+void ExpertCache::set_publish_lag(std::int32_t lag) {
+    if (initialized_) { throw std::logic_error("expert cache: set_publish_lag after initialize"); }
+    if (lag != -1 && (lag < 1 || lag > 3)) {
+        throw std::invalid_argument("expert cache: publish lag must be -1 or 1..3");
+    }
+    publish_lag_ = lag;
+}
+
 void ExpertCache::check_streams(std::span<const cudaStream_t> streams) const {
     if (!initialized_) {
         throw std::logic_error("expert cache: initialize before the first window");
@@ -320,9 +337,57 @@ void ExpertCache::begin_window(std::span<const cudaStream_t> streams) {
     if (fenced_ != launched_) {
         throw std::logic_error("expert cache: end_window missing for the previous window");
     }
-    poll();
+    if (!deterministic()) {
+        poll();
+        publish_targets(streams);
+        ++launched_;
+        return;
+    }
+    // Deterministic publication: the batches due now (waited for) and their updates, then the
+    // fill queue.
+    retire_due();
     publish_targets(streams);
+    // Fills issued from now on wait for a point after this publication on the compute stream, so
+    // after anything that could still read a slot unpublished here.
+    for (std::int32_t p = 0; p < gpus_; ++p) {
+        Gpu& g = gpu_[static_cast<std::size_t>(p)];
+        ScopedCurrentDevice scope(g.binding.device);
+        CUDA_CHECK(cudaEventRecord(g.fence, streams[static_cast<std::size_t>(p)]));
+    }
+    for (std::int32_t p = 0; p < gpus_; ++p) { pump(gpu_[static_cast<std::size_t>(p)]); }
     ++launched_;
+}
+
+void ExpertCache::retire_due() {
+    for (std::int32_t p = 0; p < gpus_; ++p) {
+        Gpu& g        = gpu_[static_cast<std::size_t>(p)];
+        std::size_t n = 0;
+        while (n < g.in_flight.size() && g.in_flight[n].due <= launched_) { ++n; }
+        if (n == 0) { continue; }
+        // One fill stream per GPU records the batches in order: the last one due covers the rest.
+        ScopedCurrentDevice scope(g.binding.device);
+        const cudaEvent_t last   = g.in_flight[n - 1].done;
+        const cudaError_t status = cudaEventQuery(last);
+        if (status == cudaErrorNotReady) {
+            const auto t0 = std::chrono::steady_clock::now();
+            CUDA_CHECK(cudaEventSynchronize(last));
+            ++counters_.publish_waits;
+            counters_.publish_wait_us +=
+                std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0)
+                    .count();
+        } else {
+            CUDA_CHECK(status);
+        }
+        // Their experts are published by this begin_window, before the window it opens.
+        for (std::size_t i = 0; i < n; ++i) { retire_front(g); }
+    }
+}
+
+void ExpertCache::schedule(FillBatch& batch) const noexcept {
+    // Inside window k (launched_ == k + 1, fenced_ == k): due at the next begin_window. Between
+    // windows (fenced_ == launched_, in end_window or begin_window before ++launched_): one later.
+    // Non-decreasing along the FIFO of batches, as retire_due needs.
+    batch.due = launched_ + (publish_lag_ - 1) + (fenced_ < launched_ ? 0 : 1);
 }
 
 void ExpertCache::publish_targets(std::span<const cudaStream_t> streams) {
@@ -770,6 +835,7 @@ void ExpertCache::prioritize_queue(std::span<const std::int32_t> rank) {
         std::stable_sort(
             g.queue.begin(), g.queue.end(),
             [&](const PendingFill& a, const PendingFill& b) { return key(a) < key(b); });
+        if (deterministic()) { pump(g); } // in place of the poll() that follows in timed mode
     }
 }
 
@@ -780,7 +846,7 @@ void ExpertCache::prioritize_queue(std::span<const std::int32_t> rank) {
 // later fence only waits longer). Fills from submit_fills_unfenced carry their caller's guarantee
 // and wait for nothing. Insertions whose slot was reassigned since are dropped without a copy.
 void ExpertCache::pump(Gpu& g) {
-    retire(g, false);
+    if (!deterministic()) { retire(g, false); }
     std::vector<PendingFill> batch;
     std::int32_t staged = 0; // pageable fills in `batch`: each needs a free staging slot
     while (!g.queue.empty() &&
@@ -882,6 +948,7 @@ void ExpertCache::issue(Gpu& g, std::span<const PendingFill> fills) {
         CUDA_CHECK(cudaEventRecord(batch.done, g.fill_stream));
         counters_.fills_issued += static_cast<std::int64_t>(n);
         g.in_flight_bytes += static_cast<std::int64_t>(n) * expert_bytes_;
+        if (deterministic()) { schedule(batch); }
         g.in_flight.push_back(std::move(batch));
     }
 }
@@ -897,28 +964,55 @@ void ExpertCache::retire(Gpu& g, bool wait) {
             if (status == cudaErrorNotReady) { break; }
             CUDA_CHECK(status);
         }
-        for (const PendingFill& f : b.fills) {
-            if (g.generation[static_cast<std::size_t>(f.slot)] == f.generation) {
-                set_target(static_cast<std::size_t>(f.cell), f.slot);
-            }
-        }
-        g.in_flight_bytes -= static_cast<std::int64_t>(b.fills.size()) * expert_bytes_;
-        g.staging_in_use -= b.staged;
-        g.spare_events.push_back(b.done);
-        g.in_flight.pop_front();
+        retire_front(g);
     }
 }
 
+void ExpertCache::retire_front(Gpu& g) {
+    FillBatch& b = g.in_flight.front();
+    for (const PendingFill& f : b.fills) {
+        if (g.generation[static_cast<std::size_t>(f.slot)] == f.generation) {
+            set_target(static_cast<std::size_t>(f.cell), f.slot);
+        }
+    }
+    g.in_flight_bytes -= static_cast<std::int64_t>(b.fills.size()) * expert_bytes_;
+    g.staging_in_use -= b.staged;
+    g.spare_events.push_back(b.done);
+    g.in_flight.pop_front();
+}
+
 void ExpertCache::poll() {
+    if (deterministic()) { return; } // every state change happens at a fixed point of the calls
     for (std::int32_t p = 0; p < gpus_; ++p) { pump(gpu_[static_cast<std::size_t>(p)]); }
 }
 
 void ExpertCache::flush() {
-    for (std::int32_t p = 0; p < gpus_; ++p) {
-        Gpu& g = gpu_[static_cast<std::size_t>(p)];
-        while (!g.queue.empty() || !g.in_flight.empty()) {
+    if (!deterministic()) {
+        for (std::int32_t p = 0; p < gpus_; ++p) {
+            Gpu& g = gpu_[static_cast<std::size_t>(p)];
+            while (!g.queue.empty() || !g.in_flight.empty()) {
+                retire(g, true);
+                pump(g);
+            }
+        }
+        return;
+    }
+    // Deterministic publication: round by round over the GPUs, so each one's next batches copy
+    // while another's are waited for (one GPU after the other doubled a prompt chunk's refill time
+    // on the link, and with the lag this flush runs in every prompt chunk).
+    std::array<bool, kMaxGpus> done{};
+    for (bool busy = true; busy;) {
+        busy = false;
+        for (std::int32_t p = 0; p < gpus_; ++p) {
+            Gpu& g = gpu_[static_cast<std::size_t>(p)];
+            if (done[static_cast<std::size_t>(p)]) { continue; }
+            if (g.queue.empty() && g.in_flight.empty()) {
+                done[static_cast<std::size_t>(p)] = true;
+                continue;
+            }
             retire(g, true);
             pump(g);
+            busy = true;
         }
     }
 }

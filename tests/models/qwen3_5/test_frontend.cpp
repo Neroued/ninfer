@@ -795,6 +795,28 @@ int test_selected_template_instruction_prefix() {
                       }),
                       "system turn carrying assistant tool metadata was accepted");
 
+    // History tool calls whose arguments are not a JSON object (another backend's truncated output)
+    // are a request error (std::invalid_argument -> 400), not a JSON parse exception (-> 500).
+    const auto history_with = [&](const std::string& arguments) {
+        fi::ChatMessage call = chat_message(ninfer::ChatRole::Assistant, "");
+        call.tool_calls.push_back({.id = "call", .name = "weather", .arguments_json = arguments});
+        fi::ChatMessage result = chat_message(ninfer::ChatRole::Tool, "sunny");
+        result.tool_call_id    = "call";
+        return std::vector<fi::ChatMessage>{chat_message(ninfer::ChatRole::User, "weather?"), call,
+                                            result};
+    };
+    failures += check(!throws_invalid_argument([&] {
+        (void)render_chat(history_with(R"({"city":"Rome"})"), no_generation);
+    }) && !throws_invalid_argument([&] { (void)render_chat(history_with(""), no_generation); }),
+                      "a valid tool-call history was refused");
+    for (const std::string bad :
+         {std::string(R"({"city": "Ro)"), std::string("[1, 2]"), std::string("not-json-yet")}) {
+        failures += check(
+            throws_invalid_argument([&] { (void)render_chat(history_with(bad), no_generation); }),
+            ("tool-call history arguments '" + bad + "' did not raise std::invalid_argument")
+                .c_str());
+    }
+
     fi::ChatMessage media_instruction = chat_message(ninfer::ChatRole::Developer, "diagnostics");
     media_instruction.parts.push_back(fi::ChatPart::image({}));
     failures +=

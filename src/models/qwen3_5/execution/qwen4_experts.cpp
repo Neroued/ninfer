@@ -166,6 +166,8 @@ void add(Qwen4OffloadWindowStats& sum, const Qwen4OffloadWindowStats& w) {
     sum.fills_issued += w.fills_issued;
     sum.fill_bytes += w.fill_bytes;
     sum.fills_pending += w.fills_pending;
+    sum.publish_waits += w.publish_waits;
+    sum.publish_wait_us += w.publish_wait_us;
     sum.wall_us += w.wall_us;
     sum.observe_us += w.observe_us;
     sum.cpu_us += w.cpu_us;
@@ -214,6 +216,8 @@ void write_stats(std::FILE* f, const Qwen4OffloadWindowStats& w, double n) {
                  static_cast<double>(w.streamed_experts) / n,
                  static_cast<double>(w.streamed_bytes) / n,
                  static_cast<double>(w.streamed_layers) / n);
+    std::fprintf(f, ",\"publish_waits\":%.3f,\"publish_wait_us\":%.2f",
+                 static_cast<double>(w.publish_waits) / n, w.publish_wait_us / n);
 }
 
 } // namespace
@@ -1227,11 +1231,15 @@ Qwen4OffloadSplitCounters Qwen4OffloadExperts::split_counters() const noexcept {
     return split_totals_;
 }
 
+bool Qwen4OffloadExperts::early_reclaim_waits() const noexcept {
+    // Deterministic publication waits as mode 2 does: with the refill overlapping the chunk (mode
+    // 1) and copies slowed down (NINFER_QWEN4_FILL_SM=2), the text of a 200k-token prompt still
+    // changed between runs; waiting first made it reproducible.
+    return options_.early_reclaim == 2 || (options_.early_reclaim > 0 && cache_->publish_lag() > 0);
+}
+
 void Qwen4OffloadExperts::snapshot_save_block() {
-    while (cache_->fills_pending() > 0) { // the residency the policy decided, landed
-        std::this_thread::sleep_for(std::chrono::microseconds(50));
-        cache_->poll();
-    }
+    cache_->flush(); // the residency the policy decided, landed
     std::FILE* f = std::fopen(options_.snapshot_save.c_str(), "a");
     if (f == nullptr) {
         throw std::runtime_error("NINFER_QWEN4_EXPERT_SNAPSHOT_SAVE: cannot open " +
@@ -2343,7 +2351,7 @@ void Qwen4OffloadExperts::begin_window(cudaStream_t stream, Qwen4Window kind) {
             // the first decode windows. Mode 2 waits for the refill first, so the chunk itself
             // finds the layers filled (published below).
             reclaim_lent(std::min(needed, text_layers_) - cache_->lent_first());
-            if (options_.early_reclaim == 2) { cache_->flush(); }
+            if (early_reclaim_waits()) { cache_->flush(); }
         }
         if (wide) {
             lend_prompt_layers(needed);
@@ -2360,7 +2368,7 @@ void Qwen4OffloadExperts::begin_window(cudaStream_t stream, Qwen4Window kind) {
         const std::int32_t needed = wide ? lend_first_ - chunk_workspace_layers_ : text_layers_;
         if (cache_->lending() && options_.early_reclaim > 0 && cache_->lent_first() < needed) {
             reclaim_lent(std::min(needed, text_layers_) - cache_->lent_first());
-            if (options_.early_reclaim == 2) { cache_->flush(); }
+            if (early_reclaim_waits()) { cache_->flush(); }
         }
         if (wide) {
             lend_prompt_layers(needed);
@@ -2369,8 +2377,9 @@ void Qwen4OffloadExperts::begin_window(cudaStream_t stream, Qwen4Window kind) {
             lend_prompt_layers(lend_first_); // the ring alone
         }
     }
-    const std::int32_t chunk_columns = prompt_columns_;
-    prompt_columns_                  = 0;
+    const std::int32_t chunk_columns               = prompt_columns_;
+    prompt_columns_                                = 0;
+    const expert_cache::CacheCounters before_begin = cache_->counters();
     cache_->begin_window(window_streams(stream));
     if (kind == Qwen4Window::Prompt && gguf_ && options_.gguf_stream_min_tokens > 0) {
         upload_gguf_host_rows(stream, chunk_columns);
@@ -2395,9 +2404,12 @@ void Qwen4OffloadExperts::begin_window(cudaStream_t stream, Qwen4Window kind) {
     observed_             = 0;
     begin_ns_             = ops::host::HostMoeMailbox::now_ns();
     host_served_at_begin_ = mailbox_->host_experts_served();
-    at_begin_             = cache_->counters();
-    window_               = Qwen4OffloadWindowStats{};
-    window_.kind          = kind;
+    // From before the cache's begin_window: its fills (and publication waits) count to this window.
+    at_begin_               = before_begin;
+    window_                 = Qwen4OffloadWindowStats{};
+    window_.kind            = kind;
+    window_.publish_waits   = cache_->counters().publish_waits - before_begin.publish_waits;
+    window_.publish_wait_us = cache_->counters().publish_wait_us - before_begin.publish_wait_us;
 }
 
 void Qwen4OffloadExperts::observe_layer(std::int32_t layer) {
@@ -2502,6 +2514,13 @@ void Qwen4OffloadExperts::observe_layer(std::int32_t layer) {
 
 void Qwen4OffloadExperts::observe_window(cudaStream_t stream) {
     if (!open_) { throw std::logic_error("Qwen4Exp offload experts: no open window"); }
+    if (kind_ == Qwen4Window::Prompt && cache_->publish_lag() > 0) {
+        // Deterministic publication retires nothing mid-window, so a chunk would issue no more
+        // than the in-flight limit while timed fills keep the queue moving for its whole run
+        // (e.g. the refill of layers reclaimed early, T69). Draining the queue now, while the
+        // device runs the chunk (seconds), lands the same backlog at a point fixed by the calls.
+        cache_->flush();
+    }
     if (kind_ == Qwen4Window::Prompt && options_.warm_start) {
         observe_prompt_layers(stream);
         return;
@@ -2579,8 +2598,19 @@ void Qwen4OffloadExperts::observe_prompt_layers(cudaStream_t stream) {
     // layer: its victims' slots are no longer read by this chunk), so the residency of the
     // prompt fills during the prefill. Between polls the fill queue keeps moving.
     CUDA_CHECK(cudaEventRecord(enqueued_, stream));
+    // Deterministic publication: every layer is observed here. Layers left to end_window would
+    // issue their fills between windows, one window later, depending on how fast the chunk ran.
+    const bool observe_all = cache_->publish_lag() > 0;
     for (;;) {
         cache_->poll();
+        bool done = false;
+        if (observe_all) {
+            // Once the chunk has completed its flags are final: take the status before reading
+            // them.
+            const cudaError_t status = cudaEventQuery(enqueued_);
+            if (status != cudaSuccess && status != cudaErrorNotReady) { CUDA_CHECK(status); }
+            done = status == cudaSuccess;
+        }
         while (observed_ < text_layers_ && *mailbox_->route_log(observed_).published != 0) {
             const std::int64_t t0 = ops::host::HostMoeMailbox::now_ns();
             if (observed_ > 0) {
@@ -2592,9 +2622,13 @@ void Qwen4OffloadExperts::observe_prompt_layers(cudaStream_t stream) {
             window_.observe_us +=
                 1e-3 * static_cast<double>(ops::host::HostMoeMailbox::now_ns() - t0);
         }
-        const cudaError_t status = cudaEventQuery(enqueued_);
-        if (status == cudaSuccess) { return; } // end_window observes what is left
-        if (status != cudaErrorNotReady) { CUDA_CHECK(status); }
+        if (observe_all) {
+            if (done) { return; } // every layer the chunk published has been observed
+        } else {
+            const cudaError_t status = cudaEventQuery(enqueued_);
+            if (status == cudaSuccess) { return; } // end_window observes what is left
+            if (status != cudaErrorNotReady) { CUDA_CHECK(status); }
+        }
         std::this_thread::sleep_for(std::chrono::microseconds(100));
     }
 }
@@ -2622,20 +2656,16 @@ void Qwen4OffloadExperts::end_window(cudaStream_t stream) {
     }
     if (options_.freeze_after_prompt && kind_ == Qwen4Window::Prompt) {
         // Validation: the prompt's residency lands before the next window begins (which
-        // publishes it), whatever the copy timing.
-        while (cache_->fills_pending() > 0) {
-            std::this_thread::sleep_for(std::chrono::microseconds(200));
-            cache_->poll();
-        }
+        // publishes it), whatever the copy timing. flush, not a poll() loop: with deterministic
+        // publication poll() does nothing.
+        cache_->flush();
     }
     window_.fill_wait_us = 0;
     if (options_.sync_fills) {
         // T59: the window's fills land before the next window begins (deterministic residency).
+        // flush, not a poll() loop: with deterministic publication poll() does nothing.
         const std::int64_t t0 = ops::host::HostMoeMailbox::now_ns();
-        while (cache_->fills_pending() > 0) {
-            std::this_thread::sleep_for(std::chrono::microseconds(20));
-            cache_->poll();
-        }
+        cache_->flush();
         window_.fill_wait_us = 1e-3 * static_cast<double>(ops::host::HostMoeMailbox::now_ns() - t0);
     }
 

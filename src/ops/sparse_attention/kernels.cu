@@ -353,10 +353,29 @@ __global__ void __launch_bounds__(32) qsa_publish_block_kernel(AppendArgs a, Ind
 // ---------------------------------------------------------------------------------------------
 // Selection: score kernel
 
-constexpr int kTileColumns     = 8;  // maximum columns of one lane per score CTA
-constexpr int kScoreBlocks     = 64; // blocks per score iteration (one thread per block/column)
-constexpr int kScoreKeyStride  = kIndexDim / 2 + 1; // bf16x2 words per staged key, padded
-constexpr int kScoreKeyBytes   = kScoreBlocks * kScoreKeyStride * 4;
+constexpr int kTileColumns    = 8;  // maximum columns of one lane per score CTA
+constexpr int kScoreBlocks    = 64; // blocks per score iteration (one thread per block/column)
+constexpr int kScoreKeyStride = kIndexDim / 2 + 1; // bf16x2 words per staged key, padded
+constexpr int kScoreKeyBytes  = kScoreBlocks * kScoreKeyStride * 4;
+// A full tile (prefill) scores four blocks of an iteration per thread (j, j + 16, ...) for one
+// column, so one load of the prepared query feeds four dots (the kernel was bound by shared-memory
+// loads: one key word and four query pairs per eight FMAs). A narrower tile (decode) keeps one
+// block per thread: it has few columns, so it needs the threads. Every dot keeps its FMA order: the
+// same bits.
+constexpr int kScoreRegBlocksFull = 4;
+static_assert(kScoreBlocks % kScoreRegBlocksFull == 0 && (kIndexDim / 2) % 2 == 0);
+
+[[nodiscard]] __host__ __device__ constexpr int score_reg_blocks(int tile_columns) {
+    return tile_columns >= kTileColumns ? kScoreRegBlocksFull : 1;
+}
+
+// Threads of a score CTA: kScoreBlocks / reg_blocks per column, at least one warp (the query
+// preparation runs per warp).
+__host__ __device__ constexpr int score_threads(int tile_columns) {
+    const int lanes = kScoreBlocks / score_reg_blocks(tile_columns);
+    return lanes * tile_columns < 32 ? 32 : lanes * tile_columns;
+}
+
 constexpr int kScoreTargetCtas = 512;
 constexpr int kPassTiles       = 32;
 
@@ -408,8 +427,10 @@ __device__ __forceinline__ TileColumn tile_column(const SelectArgs& a, std::int3
 
 // CTA (x, y): pass tile y, blocks [x * chunk_blocks, +chunk_blocks). Thread (j, c) of the
 // kScoreBlocks x tile_columns grid scores block j of the current iteration for tile column c.
-__global__ void __launch_bounds__(kScoreBlocks* kTileColumns)
+template <int kScoreRegBlocks>
+__global__ void __launch_bounds__((kScoreBlocks / kScoreRegBlocks) * kTileColumns)
     qsa_score_kernel(SelectArgs a, IndexGeometry g) {
+    constexpr int kScoreLanes = kScoreBlocks / kScoreRegBlocks; // threads per column
     // Dynamic: staged keys, then the prepared queries of this launch's tile_columns only, so a
     // narrow decode tile keeps several CTAs per SM.
     extern __shared__ __align__(16) std::uint8_t raw_shared[];
@@ -464,13 +485,13 @@ __global__ void __launch_bounds__(kScoreBlocks* kTileColumns)
         }
     }
 
-    const int j       = tid % kScoreBlocks;
-    const int c       = tid / kScoreBlocks;
+    const int j = tid % kScoreLanes;
+    const int c = min(tid / kScoreLanes, kTileColumns - 1); // threads past the tile: staging only
     const float* qc   = query + c * kMaxIndexHead * kIndexDim;
     const float scale = rsqrtf(static_cast<float>(kIndexDim));
     float* scores_row =
         a.scores + (static_cast<std::int64_t>(blockIdx.y) * kTileColumns + c) * a.max_blocks;
-    const std::int32_t my_blocks = block_count[c];
+    const std::int32_t my_blocks = tid / kScoreLanes < kTileColumns ? block_count[c] : 0;
     for (std::int32_t base = first; base < last; base += kScoreBlocks) {
         __syncthreads(); // queries ready / previous keys consumed
         // Stage up to 64 pooled keys, 16-byte vectors coalesced per 256-byte key.
@@ -491,31 +512,50 @@ __global__ void __launch_bounds__(kScoreBlocks* kTileColumns)
             staged[3]             = value.w;
         }
         __syncthreads();
-        const std::int32_t block = base + j;
-        if (block >= min(last, my_blocks)) { continue; }
-        float dot[kMaxIndexHead];
+        const std::int32_t limit = min(last, my_blocks);
+        if (base + j >= limit) {
+            continue;
+        } // its later blocks (j + kScoreLanes r) are past the limit too
+        float dot[kScoreRegBlocks][kMaxIndexHead];
 #pragma unroll
-        for (int h = 0; h < kMaxIndexHead; ++h) { dot[h] = 0.0F; }
-        const std::uint32_t* key = keys + j * kScoreKeyStride;
-#pragma unroll 8
-        for (int d2 = 0; d2 < kIndexDim / 2; ++d2) {
-            const std::uint32_t word = key[d2];
-            const float2 kk = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&word));
+        for (int r = 0; r < kScoreRegBlocks; ++r)
+#pragma unroll
+            for (int h = 0; h < kMaxIndexHead; ++h) { dot[r][h] = 0.0F; }
+#pragma unroll 4
+        for (int d2 = 0; d2 < kIndexDim / 2; d2 += 2) {
+            float2 k0[kScoreRegBlocks], k1[kScoreRegBlocks];
+#pragma unroll
+            for (int r = 0; r < kScoreRegBlocks; ++r) {
+                const std::uint32_t* key = keys + (j + r * kScoreLanes) * kScoreKeyStride;
+                const std::uint32_t w0 = key[d2], w1 = key[d2 + 1];
+                k0[r] = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&w0));
+                k1[r] = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&w1));
+            }
 #pragma unroll
             for (int h = 0; h < kMaxIndexHead; ++h) {
                 if (h < g.index_heads) {
-                    const float2 qq = *reinterpret_cast<const float2*>(qc + h * kIndexDim + 2 * d2);
-                    dot[h]          = fmaf(qq.x, kk.x, dot[h]);
-                    dot[h]          = fmaf(qq.y, kk.y, dot[h]);
+                    const float4 qq = *reinterpret_cast<const float4*>(qc + h * kIndexDim + 2 * d2);
+#pragma unroll
+                    for (int r = 0; r < kScoreRegBlocks; ++r) {
+                        dot[r][h] = fmaf(qq.x, k0[r].x, dot[r][h]);
+                        dot[r][h] = fmaf(qq.y, k0[r].y, dot[r][h]);
+                        dot[r][h] = fmaf(qq.z, k1[r].x, dot[r][h]);
+                        dot[r][h] = fmaf(qq.w, k1[r].y, dot[r][h]);
+                    }
                 }
             }
         }
-        float score = 0.0F;
 #pragma unroll
-        for (int h = 0; h < kMaxIndexHead; ++h) {
-            if (h < g.index_heads) { score += fmaxf(dot[h], 0.0F); }
+        for (int r = 0; r < kScoreRegBlocks; ++r) {
+            const std::int32_t block = base + j + r * kScoreLanes;
+            if (block >= limit) { continue; }
+            float score = 0.0F;
+#pragma unroll
+            for (int h = 0; h < kMaxIndexHead; ++h) {
+                if (h < g.index_heads) { score += fmaxf(dot[r][h], 0.0F); }
+            }
+            scores_row[block] = score * scale;
         }
-        scores_row[block] = score * scale;
     }
 }
 
@@ -750,18 +790,55 @@ key_row_data(const void* pages, KeyRow key, std::int32_t page_rows, std::int32_t
 
 // 16-bit K/V tiles: two BF16/FP16 buffers, or one FP16 buffer the quantized codes widen into.
 template <bool Quantized>
-struct Shared {
-    static constexpr int kTiles = Quantized ? 1 : 2;
+struct Shared;
+
+template <>
+struct Shared<false> {
+    static constexpr int kTiles = 2;
     alignas(16) std::uint8_t q[kRows * kRowBytes];
     alignas(16) std::uint8_t k[kTiles][kTileBytes];
     alignas(16) std::uint8_t v[kTiles][kTileBytes];
-    alignas(16) std::uint8_t codes[Quantized ? 2 : 1][2][Quantized ? kKeys * kHeadDim : 16];
-    KeyRow rows[Quantized ? 2 : 1][kKeys];
+    alignas(16) std::uint8_t codes[1][2][16];
+    KeyRow rows[1][kKeys];
     alignas(16) __half p[kRows * kPStride];
     float s[kRows * kKeys];
     float m[kRows], l[kRows], alpha[kRows];
     float k_scale[kKeys], v_scale[kKeys];
+
+    __device__ std::uint8_t* q_ptr() { return q; }
+
+    __device__ __half* p_ptr() { return p; }
+
+    __device__ float* s_ptr() { return s; }
 };
+
+// Quantized caches: 49,856 bytes, so that two CTAs share an SM (78,016 before: one CTA of
+// four warps, 8 % occupancy, no eligible warp 85 % of the cycles). Regions in use at the same time
+// stay apart: Q (prologue only, then in registers) and P (written after S has read K) live in the K
+// tile; S (written after the widening has read the codes, read by the softmax before the next
+// stage) lives in the single codes buffer.
+template <>
+struct Shared<true> {
+    static constexpr int kTiles = 1;
+    alignas(16) std::uint8_t k[kTiles][kTileBytes];
+    alignas(16) std::uint8_t v[kTiles][kTileBytes];
+    alignas(16) std::uint8_t codes[1][2][kKeys * kHeadDim];
+    KeyRow rows[1][kKeys];
+    float m[kRows], l[kRows], alpha[kRows];
+    float k_scale[kKeys], v_scale[kKeys];
+
+    __device__ std::uint8_t* q_ptr() { return k[0]; }
+
+    __device__ __half* p_ptr() { return reinterpret_cast<__half*>(k[0]); }
+
+    __device__ float* s_ptr() { return reinterpret_cast<float*>(codes[0][0]); }
+};
+
+static_assert(kRows * kRowBytes <= kTileBytes && kRows * kPStride * 2 <= kTileBytes &&
+              kRows * kKeys * 4 <= kKeys * kHeadDim);
+// Two CTAs per SM on sm_120 (102,400 bytes of shared memory, 1,024 reserved per CTA).
+static_assert(2 * (sizeof(Shared<true>) + 1024) <= 102400,
+              "the quantized layout must leave room for two CTAs");
 
 // Byte offset of 16-byte chunk `chunk` of row `row` in a swizzled 512-byte-row tile.
 __device__ __forceinline__ int swizzle(int row, int chunk) {
@@ -782,6 +859,8 @@ __device__ __forceinline__ void widen_tile(const std::uint8_t* codes, const KeyR
                                            std::uint8_t* target, int tid) {
     if constexpr (C == Codec::Nvfp4G16) {
         // 16 bytes hold 32 features: groups 2c and 2c + 1 of the row.
+        static_assert((kKeys * 8) % kThreads == 0);
+#pragma unroll
         for (int item = tid; item < kKeys * 8; item += kThreads) {
             const int j      = item / 8;
             const int chunk  = item % 8;
@@ -801,6 +880,10 @@ __device__ __forceinline__ void widen_tile(const std::uint8_t* codes, const KeyR
             }
         }
     } else {
+        // Unrolled (kKeys * 16 / kThreads = 4 items per thread): the group-scale loads of all items
+        // issue before the first is used instead of one dependent round trip per item.
+        static_assert((kKeys * 16) % kThreads == 0);
+#pragma unroll
         for (int item = tid; item < kKeys * 16; item += kThreads) {
             const int j       = item / 16;
             const int chunk   = item % 16;
@@ -946,7 +1029,7 @@ __global__ void __launch_bounds__(mma_attention::kThreads)
                         kHeadDim +
                     chunk * 8);
             }
-            *reinterpret_cast<uint4*>(&sh.q[swizzle(h, chunk)]) = value;
+            *reinterpret_cast<uint4*>(&sh.q_ptr()[swizzle(h, chunk)]) = value;
         }
     } else {
         // One warp per head: lane l rotates dimensions l + 32 r, then stores them as FP16.
@@ -965,7 +1048,7 @@ __global__ void __launch_bounds__(mma_attention::kThreads)
 #pragma unroll
             for (int r = 0; r < 8; ++r) {
                 const int d = lane_id + 32 * r;
-                *reinterpret_cast<__half*>(&sh.q[swizzle(h, d / 8) + (d % 8) * 2]) =
+                *reinterpret_cast<__half*>(&sh.q_ptr()[swizzle(h, d / 8) + (d % 8) * 2]) =
                     __float2half_rn(values[r]);
             }
         }
@@ -981,8 +1064,11 @@ __global__ void __launch_bounds__(mma_attention::kThreads)
 #pragma unroll
     for (int step = 0; step < kHeadDim / 16; ++step) {
         ldmatrix_x4(qf[step][0], qf[step][1], qf[step][2], qf[step][3],
-                    smem_addr(&sh.q[swizzle(lane_id & 15, 2 * step + (lane_id >> 4))]));
+                    smem_addr(&sh.q_ptr()[swizzle(lane_id & 15, 2 * step + (lane_id >> 4))]));
     }
+    // Every warp holds its Q fragments before Q's region is reused (the first widened K tile, or
+    // the rotated-V epilogue's row buffer when the CTA has no key at all).
+    __syncthreads();
 
     // This warp's output features [64 * warp, +64): eight n8 tiles.
     float acc[8][4];
@@ -991,7 +1077,10 @@ __global__ void __launch_bounds__(mma_attention::kThreads)
 
     int buf = 0;
     for (int base = first; base < count; base += kKeys, buf ^= 1) {
-        if (base + kKeys < count) {
+        if constexpr (kQuantized) {
+            buf = 0; // one codes buffer: tile t + 1 is staged after the softmax of tile t
+            cp_wait<0>();
+        } else if (base + kKeys < count) {
             stage(buf ^ 1, base + kKeys);
             cp_commit();
             cp_wait<1>();
@@ -1049,10 +1138,10 @@ __global__ void __launch_bounds__(mma_attention::kThreads)
             const int col                 = warp * 8 + 2 * lid;
             const float s0                = kKeyRowScale ? a.scale * sh.k_scale[col] : a.scale;
             const float s1                = kKeyRowScale ? a.scale * sh.k_scale[col + 1] : a.scale;
-            sh.s[gid * kKeys + col]       = c[0] * s0;
-            sh.s[gid * kKeys + col + 1]   = c[1] * s1;
-            sh.s[(gid + 8) * kKeys + col] = c[2] * s0;
-            sh.s[(gid + 8) * kKeys + col + 1] = c[3] * s1;
+            sh.s_ptr()[gid * kKeys + col] = c[0] * s0;
+            sh.s_ptr()[gid * kKeys + col + 1]       = c[1] * s1;
+            sh.s_ptr()[(gid + 8) * kKeys + col]     = c[2] * s0;
+            sh.s_ptr()[(gid + 8) * kKeys + col + 1] = c[3] * s1;
         }
         __syncthreads();
 
@@ -1064,7 +1153,7 @@ __global__ void __launch_bounds__(mma_attention::kThreads)
             float tile_max = -CUDART_INF_F;
 #pragma unroll
             for (int i = 0; i < 4; ++i) {
-                s[i]     = base + col0 + i < count ? sh.s[row * kKeys + col0 + i] : -CUDART_INF_F;
+                s[i] = base + col0 + i < count ? sh.s_ptr()[row * kKeys + col0 + i] : -CUDART_INF_F;
                 tile_max = fmaxf(tile_max, s[i]);
             }
 #pragma unroll
@@ -1088,7 +1177,7 @@ __global__ void __launch_bounds__(mma_attention::kThreads)
 #pragma unroll
                 for (int i = 0; i < 4; ++i) { pv[i] *= sh.v_scale[col0 + i]; }
             }
-            *reinterpret_cast<uint2*>(&sh.p[row * kPStride + col0]) =
+            *reinterpret_cast<uint2*>(&sh.p_ptr()[row * kPStride + col0]) =
                 make_uint2(pack_half2(pv[0], pv[1]), pack_half2(pv[2], pv[3]));
             __syncwarp();
             if ((tid & 7) == 0) {
@@ -1099,6 +1188,11 @@ __global__ void __launch_bounds__(mma_attention::kThreads)
             }
         }
         __syncthreads();
+
+        if constexpr (kQuantized) {
+            if (base + kKeys < count) { stage(0, base + kKeys); }
+            cp_commit();
+        }
 
         // O = alpha O + P V over this warp's 64 features.
         {
@@ -1116,7 +1210,8 @@ __global__ void __launch_bounds__(mma_attention::kThreads)
                 unsigned af[4];
                 ldmatrix_x4(
                     af[0], af[1], af[2], af[3],
-                    smem_addr(&sh.p[(lane_id & 15) * kPStride + step * 16 + (lane_id >> 4) * 8]));
+                    smem_addr(
+                        &sh.p_ptr()[(lane_id & 15) * kPStride + step * 16 + (lane_id >> 4) * 8]));
                 const int key = step * 16 + (lane_id & 7) + ((lane_id >> 3) & 1) * 8;
 #pragma unroll
                 for (int pair = 0; pair < 4; ++pair) {
@@ -1131,13 +1226,20 @@ __global__ void __launch_bounds__(mma_attention::kThreads)
                 }
             }
         }
-        __syncthreads(); // the next prefetch reuses this buffer
+        // No barrier here: P, V and alpha are next written after the loop-top barrier of the next
+        // tile. The codes buffer the next stage fills also holds the scores, which the softmax
+        // reads: the stage is safe because it is issued after the post-softmax barrier, so it must
+        // stay below that barrier. The BF16 path stages at the loop top into the buffer this
+        // tile's MMAs read, so it keeps the barrier.
+        if constexpr (!kQuantized) { __syncthreads(); }
     }
     cp_wait<0>();
 
     if constexpr (kRotatedValue) {
         // Gather O's unnormalized rows through the free K tile, then one warp per head rotates its
-        // row back before normalizing or writing the partial state.
+        // row back before normalizing or writing the partial state. The barrier: P of the last tile
+        // lives in the K tile and the loop no longer ends with one.
+        __syncthreads();
         auto* rows = reinterpret_cast<float*>(sh.k[0]);
         static_assert(sizeof(sh.k[0]) >= kRows * kHeadDim * sizeof(float));
 #pragma unroll
@@ -1380,8 +1482,14 @@ void qsa_select_launch(const Tensor& index_query, const Tensor& query_rope_posit
         const std::size_t score_shared =
             kScoreKeyBytes +
             static_cast<std::size_t>(plan.tile_columns) * kMaxIndexHead * kIndexDim * sizeof(float);
-        qsa_score_kernel<<<dim3(static_cast<unsigned>(chunks), static_cast<unsigned>(pass)),
-                           kScoreBlocks * plan.tile_columns, score_shared, stream>>>(args, g);
+        const dim3 score_grid(static_cast<unsigned>(chunks), static_cast<unsigned>(pass));
+        if (score_reg_blocks(plan.tile_columns) == kScoreRegBlocksFull) {
+            qsa_score_kernel<kScoreRegBlocksFull>
+                <<<score_grid, score_threads(plan.tile_columns), score_shared, stream>>>(args, g);
+        } else {
+            qsa_score_kernel<1>
+                <<<score_grid, score_threads(plan.tile_columns), score_shared, stream>>>(args, g);
+        }
         CUDA_CHECK(cudaGetLastError());
         const std::size_t staged =
             static_cast<std::size_t>(std::min(plan.max_blocks, kStagedBlocks));
@@ -1444,9 +1552,12 @@ void qsa_attention_launch(const Tensor& q, const Tensor& selected, const Tensor&
     args.partial    = split.splits == 1 ? nullptr : partial;
     dispatch_storage(kv.storage, [&]<KvCacheStorage Storage>() {
         constexpr int kShared = sizeof(mma_attention::Shared<Storage != KvCacheStorage::BFloat16>);
-        static FuncAttrPerDevice attribute;
+        static FuncAttrPerDevice attribute, carveout;
         attribute.ensure(qsa_attention_mma_kernel<Storage>,
                          cudaFuncAttributeMaxDynamicSharedMemorySize, kShared);
+        carveout.ensure(qsa_attention_mma_kernel<Storage>,
+                        cudaFuncAttributePreferredSharedMemoryCarveout,
+                        cudaSharedmemCarveoutMaxShared);
         qsa_attention_mma_kernel<Storage>
             <<<dim3(static_cast<unsigned>(blocks), static_cast<unsigned>(split.splits)),
                mma_attention::kThreads, kShared, stream>>>(args);

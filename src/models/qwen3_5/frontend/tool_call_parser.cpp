@@ -599,12 +599,14 @@ private:
                 pos += kParamClose.size();
                 continue;
             }
-            const FallbackReason failure = parse_parameter(pos, call);
+            const FallbackReason failure =
+                parse_parameter(pos, call, find_tool_contract(contract_, call.name));
             if (failure != FallbackReason::None) { return failure; }
         }
     }
 
-    FallbackReason parse_parameter(std::size_t& pos, RawToolCall& call) const {
+    FallbackReason parse_parameter(std::size_t& pos, RawToolCall& call,
+                                   const Contract::Tool* tool) const {
         if (!consume(pos, kParamOpen)) { return FallbackReason::MalformedStructure; }
         const std::size_t name_begin = pos;
         const std::size_t name_end   = text_.find('>', name_begin);
@@ -619,7 +621,7 @@ private:
 
         const std::size_t value_begin = name_end + 1;
         std::size_t value_end         = 0;
-        if (!find_parameter_close(value_begin, value_end)) {
+        if (!find_parameter_close(value_begin, value_end, tool)) {
             // Truncated at the end of the response: nothing after the value can end it (no call
             // markup follows - a closer, the next parameter, function or call), so the value is
             // exactly the bytes that remain. Any other unterminated case would make the value end
@@ -639,13 +641,44 @@ private:
         return FallbackReason::None;
     }
 
-    bool find_parameter_open_before(std::size_t scan, std::size_t limit,
-                                    std::size_t& open_end) const {
+    // Only a tool with declared parameters can tell a quoted delimiter from structure. A call to an
+    // undeclared tool, or to one declared without a schema or with conflicting schemas, keeps the
+    // strict reading of both delimiters.
+    static bool has_declared_parameters(const Contract::Tool* tool) {
+        return tool != nullptr && !tool->parameters.empty();
+    }
+
+    // A `<parameter=NAME>` inside a value is structure only when NAME is a declared parameter of
+    // the tool being called; any other name is text the model is quoting, as in a file or a draft
+    // about the tool-call format itself (`<parameter=command>` inside write.content).
+    static bool counts_as_parameter(std::string_view name, const Contract::Tool* tool) {
+        return !has_declared_parameters(tool) || find_parameter_contract(*tool, name) != nullptr;
+    }
+
+    // Whether what follows a `</parameter>` ending at `pos` may follow a value: another parameter
+    // (declared or not - undeclared parameters are legal and kept), the function or call closer,
+    // or the end of the response. For a tool with declared parameters, a closer followed by
+    // anything else is quoted text inside the value (`print('</parameter>')`).
+    bool structure_follows(std::size_t pos) const {
+        skip_format_whitespace(text_, pos);
+        if (pos == text_.size()) { return true; }
+        if (starts_with_at(text_, pos, kFunctionClose) || starts_with_at(text_, pos, kToolClose)) {
+            return true;
+        }
+        if (!starts_with_at(text_, pos, kParamOpen)) { return false; }
+        const std::size_t name_begin = pos + kParamOpen.size();
+        const std::size_t name_end   = text_.find('>', name_begin);
+        return name_end != std::string_view::npos && name_end != name_begin;
+    }
+
+    bool find_parameter_open_before(std::size_t scan, std::size_t limit, std::size_t& open_end,
+                                    const Contract::Tool* tool) const {
         std::size_t candidate = text_.find(kParamOpen, scan);
         while (candidate != std::string_view::npos && candidate < limit) {
             const std::size_t name_begin = candidate + kParamOpen.size();
             const std::size_t name_end   = text_.find('>', name_begin);
-            if (name_end != std::string_view::npos && name_end < limit && name_end != name_begin) {
+            if (name_end != std::string_view::npos && name_end < limit && name_end != name_begin &&
+                counts_as_parameter(text_.substr(name_begin, name_end - name_begin), tool)) {
                 open_end = name_end + 1;
                 return true;
             }
@@ -656,7 +689,8 @@ private:
 
     bool markup_follows(std::size_t pos) const { return contains_call_markup(text_.substr(pos)); }
 
-    bool find_parameter_close(std::size_t value_begin, std::size_t& value_end) const {
+    bool find_parameter_close(std::size_t value_begin, std::size_t& value_end,
+                              const Contract::Tool* tool) const {
         std::size_t depth = 1;
         std::size_t scan  = value_begin;
         for (;;) {
@@ -664,9 +698,15 @@ private:
             if (close == std::string_view::npos) { return false; }
 
             std::size_t nested_open_end = 0;
-            if (find_parameter_open_before(scan, close, nested_open_end)) {
+            if (find_parameter_open_before(scan, close, nested_open_end, tool)) {
                 ++depth;
                 scan = nested_open_end;
+                continue;
+            }
+
+            if (depth == 1 && has_declared_parameters(tool) &&
+                !structure_follows(close + kParamClose.size())) {
+                scan = close + kParamClose.size();
                 continue;
             }
 

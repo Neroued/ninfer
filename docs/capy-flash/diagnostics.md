@@ -24,7 +24,8 @@ at its default (on). Leave every other variable unset in a server.
 ## How to read the tables
 
 - **Class**: *production* (set or kept on in serving), *performance* (an adopted optimization with a switch back to
-  the old behaviour), *legacy A/B* (restores an older numerical path), *diagnostic* (dumps, logs, probes, self-tests),
+  the old behaviour), *opt-in* (off by default: a faster path that changes the arithmetic), *legacy A/B*
+  (restores an older numerical path), *diagnostic* (dumps, logs, probes, self-tests),
   *validation* (changes execution or tokens on purpose, for exactness checks), *benchmark* (kernel candidate
   selection).
 - **Results**: *numerics*: the arithmetic changes, so logits and possibly tokens change. *Same bits*: the code
@@ -114,6 +115,15 @@ CPU expert executor (all bit-identical by construction, T35):
 | `NINFER_QWEN4_SLOT_PROFILE` | on (default), `0` | Two GPUs, 48 text layers: expert slots per layer follow the measured usage profile; `0` gives every layer the same count. | performance | residency (tokens may change) | capy |
 | `NINFER_TP_EXCHANGE_PREFETCH_KIB` | KiB (12288), `0` = off | `--tp 2`: prefetch window of the decode exchange buffers. | performance | same bits | capy |
 | `NINFER_TP_PREFILL_OVERLAP` | on (default), `0` | `--tp 2` text prefill: each chunk runs as two halves (multiples of 128 columns) so one half's exchange overlaps the other half's compute; `0` runs the chunk as one call. | performance | same bits | capy |
+| `NINFER_TP_XIN_KERNEL` | `1` / unset (off) | `--tp 2` on a pair without peer access: the receive leg of the T62 prefill exchange (MoE output and mixer output projection) is read from the peer's pinned buffer by a 16-block kernel on a stream of the device's greatest priority instead of a host-to-device copy, so it does not queue behind streamed expert weights on the copy engine. Pieces that are not 16-byte aligned keep the copy; a pair with peer access keeps the copy. | performance | same bits | capy |
+
+### Opt-in, off by default
+
+Faster paths that change the arithmetic (lossy, or a different summation order). Unset keeps the default path.
+
+| variable | values (default) | effect | class | results | scope |
+|---|---|---|---|---|---|
+| `NINFER_Q8_A8` | `32` (or `1`), `128`, unset / `0` (off) | Q8_G32 projections at prefill widths (64 tokens and more; the four dense shapes of one Flash-Next rank at tp 2) on int8 tensor cores: activations quantized per token and 32- or 128-value group into the optional linear workspace (A16 tiles when it has no room). It overrides the artifact's activation policy: the published Flash-Next artifacts declare these weights `A16Only`. Decode and verification calls stay below 64 columns and keep the A16 tiles. | opt-in | numerics | capy |
 
 ## 4. Numerical paths of the TP2 exchanges (legacy A/B)
 
@@ -123,7 +133,7 @@ equivalent transports.
 | variable | values (default) | effect | class | results | scope |
 |---|---|---|---|---|---|
 | `NINFER_TP_AR` | on (default), `0` | `0` turns off the T62 prefill MoE exchange (narrow payload, column groups) and goes back to the T56 FP32 path. | legacy A/B | numerics (prefill only) | capy |
-| `NINFER_TP_AR_PAYLOAD` | `fp16` (default since T127), `bf16`, `fp32` | Payload of the TP2 prefill MoE exchange. BF16 was the T62 default. Decode MoE exchanges are always FP32. | legacy A/B | numerics | capy |
+| `NINFER_TP_AR_PAYLOAD` | `fp16` (default since T127), `bf16`, `fp32`, `int8` | Payload of the TP2 prefill MoE exchange. BF16 was the T62 default. Decode MoE exchanges are always FP32. `int8` (opt-in, lossy): 32-row blocks of int8 codes with binary16 scales, 2,720 instead of 5,120 bytes per 2,560-row column, also for the mixer output projection; columns whose rows are not a multiple of 32 use FP16. `int8` applies to Flash-Next only: the 27B has no MoE exchange and its mixer output projections are not Q8/MXFP8, so the value has no effect there. | legacy A/B | numerics | capy |
 | `NINFER_TP_AR_SHIFT` | `2` (0..14) | The FP16 payload carries v·2^-k, saturated to the FP16 range, and is rescaled exactly on receipt; this rules out overflow (T128b). | production default | numerics (tiny) | capy |
 | `NINFER_TP_AR_GROUP` | 2,048 columns (default), `0` = one group, multiples of 2,048 | Column groups that overlap the prefill exchange with the expert GEMM (T62). | performance | same bits | capy |
 | `NINFER_TP_AR_PIPE` | `1` / unset | `1` uses the pipelined exchange even with an FP32 payload and no groups. | performance | timing | capy |

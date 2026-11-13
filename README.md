@@ -19,7 +19,7 @@ Anthropic-compatible HTTP API, so agent tools such as Claude Code, Codex CLI and
 
 capy-flash **is ninfer-tp2, renamed at v0.5.0**: the two-GPU tensor-parallel fork of
 [Neroued/ninfer](https://github.com/Neroued/ninfer) (v0.1-v0.4.9 under the old name); [NOTICE](NOTICE) lists every piece
-of prior work it builds on. Status: **v0.10.0**. Built, tested and measured on one machine ([below](#benchmarks));
+of prior work it builds on. Status: **v0.11.0**. Built, tested and measured on one machine ([below](#benchmarks));
 users report other setups. Not affiliated with Qwen or NVIDIA.
 
 ## Pick a model
@@ -305,6 +305,15 @@ artifacts, runs the integration tests (`GATE_CTEST_EXCLUDE` excludes more), then
 greedy texts against a recorded reference ([tools/tp2/README.md](tools/tp2/README.md)).
 
 ## What's new
+
+**v0.11.0** ([release notes](https://github.com/ValerioDolci/capy-flash/releases/tag/v0.11.0))
+- Faster prefill, same bits at the default: Flash-Next +13 % at 30k-100k (QSA attention at two CTAs per SM, fused
+  hyper-connection Up, wider GDN tiles), 27B +2-5 % prefill and −1 % per decode round. Eleven PRs by @Mici81.
+- Opt-in: `NINFER_TP_XIN_KERNEL=1` (same bits, tp-2 exchange without P2P off the copy engine),
+  `NINFER_TP_AR_PAYLOAD=int8` and `NINFER_Q8_A8=128` (Flash-Next, change numerics): all three together +28 % on
+  Flash-Next prefill, GSM8K and MMLU-Pro at the level of v0.10.0. See [docs/capy-flash/diagnostics.md](docs/capy-flash/diagnostics.md).
+- Fixed: tool-call arguments that quote the tool-call markup no longer fall back to text
+  ([#59](https://github.com/ValerioDolci/capy-flash/issues/59)).
 
 **v0.10.0** ([release notes](https://github.com/ValerioDolci/capy-flash/releases/tag/v0.10.0))
 - Structured output ([#17](https://github.com/ValerioDolci/capy-flash/issues/17)): JSON mode, JSON Schema, GBNF

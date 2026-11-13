@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstring>
 #include <cstddef>
 #include <cstdint>
 #include <iomanip>
@@ -645,6 +646,62 @@ int contract_rejection_cases() {
 
 } // namespace
 
+// Every value tile of the chunked recurrence computes the same bits (each output and state element
+// keeps its summation order); the launch rule only picks the fastest. Geometry: the two-device
+// shard of Qwen3.8-27B / Flash-Next (8 query/key heads, 24 value heads), one chunked prefill call.
+int tile_parity_case() {
+    const Case test_case{"tile parity", 8, 24, 2049, true};
+    const gdn_ref::Inputs in = make_inputs(test_case, 17001U, InputPattern::Ordinary);
+    const float scale        = 1.0F / std::sqrt(static_cast<float>(kStateDim));
+    DeviceInputs device(in);
+    GuardedDeviceBuffer state_in(in.state.size() * sizeof(float));
+    GuardedDeviceBuffer state_out(in.state.size() * sizeof(float));
+    GuardedDeviceBuffer out(in.v.size() * sizeof(std::uint16_t));
+    state_in.copy_from_host(in.state.data(), state_in.bytes());
+    Tensor q(device.q.p, DType::BF16, {kStateDim, test_case.qk_heads, test_case.tokens});
+    Tensor k(device.k.p, DType::BF16, {kStateDim, test_case.qk_heads, test_case.tokens});
+    Tensor v(device.v.p, DType::BF16, {kStateDim, test_case.value_heads, test_case.tokens});
+    Tensor g(device.g.p, DType::FP32, {test_case.value_heads, test_case.tokens});
+    Tensor beta(device.beta.p, DType::FP32, {test_case.value_heads, test_case.tokens});
+    Tensor output(out.data(), DType::BF16, {kStateDim, test_case.value_heads, test_case.tokens});
+    Tensor input_state(state_in.data(), DType::FP32, {kStateDim, kStateDim, test_case.value_heads});
+    Tensor output_state(state_out.data(), DType::FP32,
+                        {kStateDim, kStateDim, test_case.value_heads});
+    const auto workspace_bytes = ops::gated_delta_net_workspace_capacity_bytes(
+        test_case.qk_heads, test_case.value_heads, 1, test_case.tokens);
+    GuardedDeviceBuffer scratch(std::max<std::size_t>(workspace_bytes, 256));
+    WorkspaceArena workspace(DeviceSpan{scratch.data(), scratch.bytes()});
+    std::vector<std::uint16_t> first_out;
+    std::vector<float> first_state;
+    int failures = 0;
+    for (const int tile : {64, 32, 16, 8}) {
+        ops::gated_delta_net_force_value_tile_for_test(tile);
+        out.fill(0xff);
+        state_out.fill(0xff);
+        ops::gated_delta_net(q, k, v, g, beta, scale, test_case.normalize_qk, workspace,
+                             input_state, output_state, output, execution());
+        cuda_synchronize();
+        auto got_out   = from_device<std::uint16_t>(out.data(), in.v.size());
+        auto got_state = from_device<float>(state_out.data(), in.state.size());
+        if (first_out.empty()) {
+            first_out   = std::move(got_out);
+            first_state = std::move(got_state);
+            continue;
+        }
+        if (std::memcmp(got_out.data(), first_out.data(),
+                        first_out.size() * sizeof(std::uint16_t)) != 0 ||
+            std::memcmp(got_state.data(), first_state.data(), first_state.size() * sizeof(float)) !=
+                0) {
+            std::cerr << "GDN tile parity: tile " << tile << " differs from tile 64\n";
+            ++failures;
+        }
+    }
+    ops::gated_delta_net_force_value_tile_for_test(0);
+    std::cout << "GDN tile parity 64/32/16/8: " << (failures == 0 ? "same bits" : "FAIL")
+              << std::endl;
+    return failures;
+}
+
 int main() {
     if (cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";
@@ -670,6 +727,7 @@ int main() {
         ++failures;
     } catch (const std::invalid_argument&) {}
     failures += contract_rejection_cases();
+    failures += tile_parity_case();
 
     failures += run_case({"27b recurrent", 16, 48, 1, true}, 12001U, InputPattern::Ordinary, true);
     failures += run_case({"27b recurrent", 16, 48, 7, false}, 12007U);

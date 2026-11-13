@@ -438,7 +438,7 @@ Qwen4Forward<WorkspaceArena>
 TextContext::qwen4_forward(const std::array<Qwen4Rank<WorkspaceArena>, 2>& ranks,
                            std::int32_t columns) const {
     const Qwen4Collectives collectives =
-        tp2() ? Qwen4Collectives{tp_->execution, tp_->events} : Qwen4Collectives{};
+        tp2() ? Qwen4Collectives{tp_->execution, tp_->events, tp_->gdn_gating} : Qwen4Collectives{};
     return Qwen4Forward<WorkspaceArena>(config_, ranks, qwen4_width(), collectives, columns,
                                         columns);
 }

@@ -364,11 +364,24 @@ void launch(const Arguments& args, const QkChunk* qk, const ControlChunk* contro
 
 } // namespace
 
+int forced_value_tile = 0; // gated_delta_net_force_value_tile_for_test
+
 int value_tile(int value_heads, int multiprocessor_count) {
+    if (forced_value_tile == 64 || forced_value_tile == 32 || forced_value_tile == 16 ||
+        forced_value_tile == 8) {
+        return forced_value_tile;
+    }
     // Small grids need the narrowest stripe. Otherwise use fixed relative tile costs
     // to weight the SM-wave count. These are launch-heuristic weights, not measured latency.
     // Wider stripes reduce replicated packet reads but retain more state per CTA.
     if (static_cast<std::int64_t>(value_heads) * 16 <= multiprocessor_count) return 8;
+    // 16-wide tiles take 31 KB of shared memory and run three CTAs per SM, which the wave count
+    // below ignores. When they fit in one such wave they win: TP2 shard of Qwen3.8-27B (24 value
+    // heads), 5120 tokens, tiles 64/32/16/8 = 424/432/352/446 us on an RTX 5070 Ti (70 SMs),
+    // 419/426/348/444 us on an RTX 5080 (84 SMs).
+    static_assert(3 * sizeof(RecurrenceShared<16>) <= 96 * 1024);
+    if (static_cast<std::int64_t>(value_heads) * (kStateDim / 16) <= 3 * multiprocessor_count)
+        return 16;
     int best               = 64;
     std::int64_t best_work = INT64_MAX;
 
@@ -403,3 +416,11 @@ void launch_recurrence(const Arguments& args, const QkChunk* qk, const ControlCh
 }
 
 } // namespace ninfer::ops::detail::gated_delta_net::chunked
+
+namespace ninfer::ops {
+
+void gated_delta_net_force_value_tile_for_test(int tile) noexcept {
+    detail::gated_delta_net::chunked::forced_value_tile = tile;
+}
+
+} // namespace ninfer::ops

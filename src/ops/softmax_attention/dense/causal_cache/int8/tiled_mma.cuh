@@ -49,7 +49,9 @@ __global__ __maxnreg__(Schedule::kMaxRegisters) void int8_kv_tiled_mma_kernel(
     __nv_bfloat16* q_b16 = reinterpret_cast<__nv_bfloat16*>(q_i8);
     __nv_bfloat16* k_b16 = reinterpret_cast<__nv_bfloat16*>(k_i8);
 
-    const int q_block = static_cast<int>(blockIdx.x);
+    // Query tiles in reverse: the last tiles of a chunk see the most keys and start first, so the
+    // grid does not end on them.
+    const int q_block = static_cast<int>(gridDim.x) - 1 - static_cast<int>(blockIdx.x);
     const int q_head  = static_cast<int>(blockIdx.y);
     const int tid     = static_cast<int>(threadIdx.x);
     const int warp    = tid >> 5;
@@ -225,20 +227,14 @@ __global__ __maxnreg__(Schedule::kMaxRegisters) void int8_kv_tiled_mma_kernel(
                         mma_s8(c0, c1, c2, c3, af[kk][0], af[kk][1], af[kk][2], af[kk][3], bf[0],
                                bf[1]);
                     }
-                    const int keya = nt * 8 + 2 * lid;
-                    const int keyb = keya + 1;
-                    float ks0      = 0.0f;
-                    float ks1      = 0.0f;
-                    if (gid == 0) {
-                        ks0 = __half2float(k_scale_s[keya * Groups + grp]);
-                        ks1 = __half2float(k_scale_s[keyb * Groups + grp]);
-                    }
-                    ks0          = __shfl_sync(FullMask, ks0, lid);
-                    ks1          = __shfl_sync(FullMask, ks1, lid);
-                    score[nt][0] = __fmaf_rn(qs0 * ks0, static_cast<float>(c0), score[nt][0]);
-                    score[nt][1] = __fmaf_rn(qs0 * ks1, static_cast<float>(c1), score[nt][1]);
-                    score[nt][2] = __fmaf_rn(qs1 * ks0, static_cast<float>(c2), score[nt][2]);
-                    score[nt][3] = __fmaf_rn(qs1 * ks1, static_cast<float>(c3), score[nt][3]);
+                    const int keya  = nt * 8 + 2 * lid;
+                    const int keyb  = keya + 1;
+                    const float ks0 = __half2float(k_scale_s[keya * Groups + grp]);
+                    const float ks1 = __half2float(k_scale_s[keyb * Groups + grp]);
+                    score[nt][0]    = __fmaf_rn(qs0 * ks0, static_cast<float>(c0), score[nt][0]);
+                    score[nt][1]    = __fmaf_rn(qs0 * ks1, static_cast<float>(c1), score[nt][1]);
+                    score[nt][2]    = __fmaf_rn(qs1 * ks0, static_cast<float>(c2), score[nt][2]);
+                    score[nt][3]    = __fmaf_rn(qs1 * ks1, static_cast<float>(c3), score[nt][3]);
                 }
             }
 

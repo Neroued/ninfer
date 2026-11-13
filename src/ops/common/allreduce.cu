@@ -377,19 +377,90 @@ void detail::require_allreduce_sum_arguments(const std::array<Tensor, 2>& buffer
 #endif
 }
 
+namespace {
+// NINFER_TP_XIN_KERNEL=1 moves the T62 exchange's host-to-device leg off the copy engine on a pair
+// without peer access (with peer access the copy stays as it is). A GPU's host-to-device copies run
+// one after another from a single queue (an 8 MiB copy issued during a 512 MiB upload on another
+// stream finishes with the upload: 16.6 ms instead of 0.31 ms, whatever the stream priority or the
+// upload's piece size), so in a streamed prefill each exchange copy waits behind the next layer's
+// expert weights (93-650 MiB per layer and card). A kernel reading the peer's pinned buffer over
+// PCIe does not queue there: 24 GB/s from 4 blocks, the same 8 MiB in 0.6 ms during the upload.
+bool xin_kernel_enabled() {
+    static const bool on = [] {
+        const char* v = std::getenv("NINFER_TP_XIN_KERNEL");
+        return v != nullptr && v[0] == '1';
+    }();
+    return on;
+}
+
+// The same rule as enable_peer_access(): P2P only when both directions report support.
+bool pair_can_access_peer(int a, int b) {
+    int forward = 0, reverse = 0;
+    CUDA_CHECK(cudaDeviceCanAccessPeer(&forward, a, b));
+    CUDA_CHECK(cudaDeviceCanAccessPeer(&reverse, b, a));
+    return forward != 0 && reverse != 0;
+}
+
+// Blocks of 512 threads. Alone 4 blocks already read at the link's 24 GB/s, but beside the
+// prefill's kernels more blocks win: 100k-token prefill (Qwen3.8 Flash, 8192-column groups, RTX
+// 5080 + 5070 Ti, three interleaved runs) 2 / 4 / 8 / 16 / 32 blocks: 3.90 / 4.01 / 4.30 / 4.35
+// / 4.33k tok/s; copy engine 3.88k. The large kernels of the prefill (dense q8, attention) keep
+// their times with 16 blocks beside them (nsys).
+constexpr int kXinBlocks = 16;
+
+// Ordering and visibility come from the stream's wait on the peer's device-to-host event;
+// ld.global.cv is defensive only (the same host lines are rewritten by the peer every call).
+__global__ void xin_read_kernel(uint4* __restrict__ dst, const uint4* __restrict__ src,
+                                std::size_t n) {
+    const std::size_t stride = static_cast<std::size_t>(gridDim.x) * blockDim.x;
+    for (std::size_t i = blockIdx.x * static_cast<std::size_t>(blockDim.x) + threadIdx.x; i < n;
+         i += stride) {
+        dst[i] = __ldcv(src + i);
+    }
+}
+
+// The T62 receive copy: by kernel when the exchange reads by kernel and the piece is 16-byte
+// aligned (odd rows x payload sizes keep the copy).
+void receive_to_device(void* dst, const void* src, std::size_t bytes, cudaStream_t stream,
+                       bool by_kernel) {
+    if (by_kernel && reinterpret_cast<std::uintptr_t>(dst) % 16 == 0 &&
+        reinterpret_cast<std::uintptr_t>(src) % 16 == 0 && bytes % 16 == 0) {
+        xin_read_kernel<<<kXinBlocks, 512, 0, stream>>>(static_cast<uint4*>(dst),
+                                                        static_cast<const uint4*>(src), bytes / 16);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+    CUDA_CHECK(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyHostToDevice, stream));
+}
+
+// With the kernel, the receive stream gets the device's greatest priority: its blocks are
+// dispatched ahead of the waiting blocks of the compute kernels (8 blocks: 4.29 / 4.34k tok/s with
+// it, 4.21-4.24 / 4.27-4.28k without).
+cudaStream_t create_receive_stream(bool by_kernel) {
+    int least = 0, greatest = 0;
+    CUDA_CHECK(cudaDeviceGetStreamPriorityRange(&least, &greatest));
+    cudaStream_t s = nullptr;
+    CUDA_CHECK(
+        cudaStreamCreateWithPriority(&s, cudaStreamNonBlocking, by_kernel ? greatest : least));
+    return s;
+}
+} // namespace
+
 HostExchange::HostExchange(const ExecutionContext& ec, std::size_t chunk_bytes)
     : chunk_bytes_(chunk_bytes) {
     require_two_devices(ec, "HostExchange: requires an ExecutionContext with two distinct devices");
     require(chunk_bytes_ > 0 && chunk_bytes_ % 256 == 0,
             "HostExchange: chunk must be a multiple of 256 bytes");
     const CurrentDeviceGuard guard;
+    receive_by_kernel_ =
+        xin_kernel_enabled() && !pair_can_access_peer(ec.dev[0]->device, ec.dev[1]->device);
     for (int rank = 0; rank < 2; ++rank) {
         devices_[static_cast<std::size_t>(rank)] = ec.dev[rank]->device;
         CurrentDeviceGuard::set(ec.dev[rank]->device);
         CUDA_CHECK(cudaStreamCreateWithFlags(&side_[static_cast<std::size_t>(rank)],
                                              cudaStreamNonBlocking));
         const auto r = static_cast<std::size_t>(rank);
-        CUDA_CHECK(cudaStreamCreateWithFlags(&receive_[r], cudaStreamNonBlocking));
+        receive_[r]  = create_receive_stream(receive_by_kernel_);
         CUDA_CHECK(cudaEventCreateWithFlags(&begun_[r], cudaEventDisableTiming));
         CUDA_CHECK(cudaEventCreateWithFlags(&received_[r], cudaEventDisableTiming));
         CUDA_CHECK(cudaStreamCreateWithFlags(&lane_send_[r], cudaStreamNonBlocking));
@@ -617,6 +688,78 @@ __global__ void exchange_narrow_combine_kernel(float* __restrict__ partial,
     }
 }
 
+// ---- INT8 payload (allreduce.h, Payload::INT8, NINFER_TP_AR_PAYLOAD=int8) ----
+// Per column `rows` int8 codes then rows / 32 binary16 scales. Both ranks dequantize the same bytes
+// to the same floats and add the same two values, so their sums are bitwise equal. q * s is exact
+// in FP32 (8-bit code times an 11-bit significand), so contraction could not change it; __fmul_rn /
+// __fadd_rn state the intent.
+constexpr int kInt8Block = 32;
+
+__host__ __device__ constexpr std::size_t int8_column_bytes(std::int64_t rows) {
+    return static_cast<std::size_t>(rows + rows / 16);
+}
+
+// One warp per 32-row block of `columns` columns starting at src (column-major, `rows` per column).
+__global__ void exchange_int8_narrow_kernel(const float* __restrict__ src,
+                                            std::byte* __restrict__ dst, std::int64_t rows,
+                                            std::int64_t columns) {
+    const std::int64_t per_column = rows / kInt8Block;
+    const std::int64_t blocks     = per_column * columns;
+    const int lane                = static_cast<int>(threadIdx.x & 31U);
+    const std::int64_t warps      = static_cast<std::int64_t>(gridDim.x) * (blockDim.x / 32);
+    for (std::int64_t w =
+             static_cast<std::int64_t>(blockIdx.x) * (blockDim.x / 32) + threadIdx.x / 32;
+         w < blocks; w += warps) {
+        const std::int64_t column = w / per_column, block = w % per_column;
+        const float v  = src[column * rows + block * kInt8Block + lane];
+        const bool bad = __any_sync(0xFFFFFFFFU, !isfinite(v));
+        float amax     = fabsf(v);
+        for (int o = 16; o > 0; o >>= 1) {
+            amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFFU, amax, o));
+        }
+        __half scale = __float2half(0.0F);
+        int q        = 0;
+        if (bad) {
+            scale =
+                __ushort_as_half(static_cast<unsigned short>(0x7E00)); // NaN: the block becomes NaN
+        } else if (amax > 0.0F) {
+            const float s   = fminf(fmaxf(__fdiv_rn(amax, 127.0F), 6.103515625e-05F), 65504.0F);
+            scale           = __float2half_ru(s);
+            const float inv = __fdiv_rn(1.0F, __half2float(scale));
+            q = static_cast<int>(fminf(fmaxf(rintf(__fmul_rn(v, inv)), -127.0F), 127.0F));
+        }
+        std::byte* col = dst + column * static_cast<std::int64_t>(int8_column_bytes(rows));
+        reinterpret_cast<std::int8_t*>(col)[block * kInt8Block + lane] =
+            static_cast<std::int8_t>(q);
+        if (lane == 0) { reinterpret_cast<__half*>(col + rows)[block] = scale; }
+    }
+}
+
+__device__ __forceinline__ float int8_value(const std::byte* base, std::int64_t rows,
+                                            std::size_t i) {
+    const auto column    = static_cast<std::int64_t>(i) / rows;
+    const auto row       = static_cast<std::int64_t>(i) % rows;
+    const std::byte* col = base + column * static_cast<std::int64_t>(int8_column_bytes(rows));
+    const float s = __half2float(reinterpret_cast<const __half*>(col + rows)[row / kInt8Block]);
+    return __fmul_rn(static_cast<float>(reinterpret_cast<const std::int8_t*>(col)[row]), s);
+}
+
+// S = fl32(value(own) + value(peer)); partial <- S; out <- RNE_bf16(S). The own operand is read
+// back from the bytes the peer received.
+__global__ void exchange_int8_combine_kernel(float* __restrict__ partial,
+                                             const std::byte* __restrict__ own,
+                                             const std::byte* __restrict__ peer,
+                                             __nv_bfloat16* __restrict__ bf16_out,
+                                             std::int64_t rows, std::size_t count) {
+    const std::size_t stride = static_cast<std::size_t>(gridDim.x) * blockDim.x;
+    for (std::size_t i = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x; i < count;
+         i += stride) {
+        const float sum = __fadd_rn(int8_value(own, rows, i), int8_value(peer, rows, i));
+        partial[i]      = sum;
+        if (bf16_out != nullptr) { bf16_out[i] = __float2bfloat16_rn(sum); }
+    }
+}
+
 // stats[0] = max |v| bits (non-negative floats order as unsigned ints), [1] = |v| > 65504,
 // [2] = 0 < |v| < 2^-14 (FP16 subnormal), [3] = non-finite.
 __global__ void exchange_stats_kernel(const float* __restrict__ v, std::size_t count,
@@ -707,6 +850,7 @@ bool HostExchange::begin_sum_f32(const std::array<Tensor, 2>& partial,
     p.payload = payload;
     p.rows    = partial[0].ne[0];
     p.columns = static_cast<std::int64_t>(partial[0].numel()) / std::max<std::int64_t>(p.rows, 1);
+    if (p.payload == Payload::INT8 && p.rows % kInt8Block != 0) { p.payload = Payload::FP16; }
     const std::size_t esize = payload == Payload::FP32 ? 4 : 2;
     const std::size_t bytes = static_cast<std::size_t>(partial[0].numel()) * esize;
     reserve(bytes, 0, ec);
@@ -732,11 +876,27 @@ void HostExchange::columns_ready(int rank, std::int64_t first, std::int64_t coun
     if (count == 0) { return; }
     const ExecutionContext& ec = *p.ec;
     const CurrentDeviceGuard guard;
-    const std::size_t esize  = p.payload == Payload::FP32 ? 4 : 2;
-    const std::size_t total  = static_cast<std::size_t>(p.rows * p.columns);
-    const std::size_t begin  = static_cast<std::size_t>(p.rows * first);
-    const std::size_t n      = static_cast<std::size_t>(p.rows * count);
-    const std::size_t offset = begin * esize, bytes = n * esize;
+    const std::size_t total = static_cast<std::size_t>(p.rows * p.columns);
+    const std::size_t begin = static_cast<std::size_t>(p.rows * first);
+    const std::size_t n     = static_cast<std::size_t>(p.rows * count);
+    // Bytes per column on the links: FP32 4 * rows, FP16 / BF16 2 * rows, INT8 rows * 17 / 16.
+    std::size_t column_bytes = 0;
+    switch (p.payload) {
+    case Payload::FP32:
+        column_bytes = 4 * static_cast<std::size_t>(p.rows);
+        break;
+    case Payload::FP16:
+    case Payload::BF16:
+        column_bytes = 2 * static_cast<std::size_t>(p.rows);
+        break;
+    case Payload::INT8:
+        column_bytes = int8_column_bytes(p.rows);
+        break;
+    default:
+        require(false, "HostExchange: unknown payload");
+    }
+    const std::size_t offset  = static_cast<std::size_t>(first) * column_bytes;
+    const std::size_t bytes   = static_cast<std::size_t>(count) * column_bytes;
     const cudaStream_t stream = ec.dev[rank]->stream;
     CurrentDeviceGuard::set(ec.dev[rank]->device);
     const std::byte* source = nullptr;
@@ -744,6 +904,16 @@ void HostExchange::columns_ready(int rank, std::int64_t first, std::int64_t coun
     if (p.payload == Payload::FP32) {
         source      = static_cast<const std::byte*>(p.partial[r].data) + offset;
         destination = static_cast<std::byte*>(p.staging[peer].data) + offset;
+    } else if (p.payload == Payload::INT8) {
+        // Own bytes in the first part of staging[r]; the peer receives at byte 2 * total of
+        // staging[peer] (where the 16-bit payloads' second half starts; staging holds 4 * total
+        // bytes).
+        std::byte* own = static_cast<std::byte*>(p.staging[r].data) + offset;
+        exchange_int8_narrow_kernel<<<grid_for(n), 256, 0, stream>>>(
+            static_cast<const float*>(p.partial[r].data) + begin, own, p.rows, count);
+        CUDA_CHECK(cudaGetLastError());
+        source      = own;
+        destination = static_cast<std::byte*>(p.staging[peer].data) + 2 * total + offset;
     } else {
         auto* own = static_cast<std::uint16_t*>(p.staging[r].data) + begin;
         exchange_narrow_kernel<<<grid_for(n), 256, 0, stream>>>(
@@ -771,8 +941,8 @@ void HostExchange::columns_ready(int rank, std::int64_t first, std::int64_t coun
         CUDA_CHECK(cudaEventRecord(done, side_[r]));
         CurrentDeviceGuard::set(ec.dev[1 - rank]->device);
         CUDA_CHECK(cudaStreamWaitEvent(receive_[peer], done, 0));
-        CUDA_CHECK(cudaMemcpyAsync(destination + o, host_[r] + offset + o, m,
-                                   cudaMemcpyHostToDevice, receive_[peer]));
+        receive_to_device(destination + o, host_[r] + offset + o, m, receive_[peer],
+                          receive_by_kernel_);
     }
     p.done[r] += count;
 }
@@ -824,6 +994,12 @@ void HostExchange::finish_sum_f32() {
         if (p.payload == Payload::FP32) {
             allreduce_f32_combine(static_cast<float*>(p.partial[r].data),
                                   static_cast<const float*>(p.staging[r].data), out, count, stream);
+        } else if (p.payload == Payload::INT8) {
+            const auto* staged = static_cast<const std::byte*>(p.staging[r].data);
+            exchange_int8_combine_kernel<<<grid_for(count), 256, 0, stream>>>(
+                static_cast<float*>(p.partial[r].data), staged, staged + 2 * count, out, p.rows,
+                count);
+            CUDA_CHECK(cudaGetLastError());
         } else {
             exchange_narrow_combine_kernel<<<grid_for(count), 256, 0, stream>>>(
                 static_cast<float*>(p.partial[r].data),

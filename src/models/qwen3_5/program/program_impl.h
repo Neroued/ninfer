@@ -4,6 +4,7 @@
 #include "core/arena.h"
 #include "core/elastic_arena.h"
 #include "models/qwen3_5/program/tp2/program_tp2.h"
+#include "models/qwen3_5/execution/tp2/gdn_gating_overlap.h"
 #include "core/gdn_replay_records.h"
 #include "core/host_kv_arena.h"
 #include "core/disk_kv_cache.h"

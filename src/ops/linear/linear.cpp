@@ -10,6 +10,7 @@
 #include "ops/linear/q4/q4_dispatch.h"
 #include "ops/linear/q5/q5_dispatch.h"
 #include "ops/linear/q6/q6_dispatch.h"
+#include "ops/linear/q8/q8_a8.h"
 #include "ops/linear/q8/q8_dispatch.h"
 
 #include <cstdint>
@@ -101,6 +102,9 @@ void dispatch_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy
         detail::q6_dispatch(x, w, out, policy, stream);
         return;
     case QType::Q8_G32_FP16:
+        // Prefill widths of the admitted shapes on int8 tensor cores when NINFER_Q8_A8 is set
+        // and the workspace has room (ops/linear/q8/q8_a8.h); otherwise the A16 tiles.
+        if (detail::q8_a8_try_dispatch(x, w, out, workspace, stream)) return;
         detail::q8_dispatch(x, w, out, policy, stream);
         return;
     case QType::BF16:
@@ -123,6 +127,17 @@ void dispatch_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy
 }
 
 } // namespace
+
+std::size_t linear_optional_workspace_bytes(QType qtype, std::int32_t output_rows,
+                                            std::int32_t input_rows, std::int32_t max_tokens) {
+    if (qtype != QType::Q8_G32_FP16 || max_tokens < detail::kQ8A8MinTokens ||
+        !detail::q8_a8_admitted(output_rows, input_rows)) {
+        return 0;
+    }
+    const detail::Q8A8Mode mode = detail::q8_a8_mode();
+    if (mode == detail::Q8A8Mode::Off) return 0;
+    return detail::q8_a8_workspace_bytes(input_rows, max_tokens, mode) + 256; // + the alignment pad
+}
 
 std::size_t linear_workspace_capacity_bytes(QType qtype, std::int32_t output_rows,
                                             std::int32_t input_rows, LinearPolicy policy,

@@ -128,10 +128,15 @@ struct Qwen4Rank {
     Qwen4State state;
 };
 
+struct GdnGatingOverlap; // tp2/gdn_gating_overlap.h
+
 // The two-device transport of an executing tp 2 forward.
 struct Qwen4Collectives {
     const ExecutionContext* execution = nullptr;
     const ops::PeerEvents* events     = nullptr;
+    // Program-owned side streams of the tp 2 GDN gating (tp2/gdn_gating_overlap.h); null keeps
+    // the gating on the main streams.
+    GdnGatingOverlap* gating = nullptr;
 };
 
 template <class Arena>
@@ -633,9 +638,10 @@ private:
     // The pipelined MoE exchange of a prompt chunk at tp 2, read once: an FP16 payload (the bytes
     // of BF16 with an 8x smaller rounding of the partial sums) by column groups of 2048, which
     // overlap the routed experts of the later columns. NINFER_TP_AR=0 takes one allreduce_sum_f32
-    // call (FP32) instead; NINFER_TP_AR_PAYLOAD = fp32 | fp16 | bf16 sets the payload;
-    // NINFER_TP_AR_GROUP the column group (rounded down to whole 2048-column pieces; 0 = one
-    // group); NINFER_TP_AR_PIPE=1 takes the pipelined exchange even at FP32 with one group.
+    // call (FP32) instead; NINFER_TP_AR_PAYLOAD = fp32 | fp16 | bf16 | int8 sets the payload (int8
+    // also for the mixer output); NINFER_TP_AR_GROUP the column group (rounded down to whole
+    // 2048-column pieces; 0 = one group); NINFER_TP_AR_PIPE=1 takes the pipelined exchange even at
+    // FP32 with one group.
     struct T62Exchange {
         bool enabled                       = false;
         ops::HostExchange::Payload payload = ops::HostExchange::Payload::FP16;
@@ -658,6 +664,10 @@ private:
     const TextConfig& config_;
     std::array<Rank, 2> r_;
     std::array<const Qwen4MtpParameters*, 2> mtp_{};
+    // The GDN gating forked onto side streams (gdn_controls), joined before the
+    // recurrence reads g/beta (gdn_join_gating); null when not forked.
+    GdnGatingOverlap* gating_fork_ = nullptr;
+    void gdn_join_gating();
     int width_ = 1;
     Qwen4Collectives tp_;
     std::int32_t first_ = 1;

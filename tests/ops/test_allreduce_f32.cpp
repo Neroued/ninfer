@@ -27,6 +27,7 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <limits>
 #include <cstdlib>
 #include <cstdint>
 #include <cstdio>
@@ -659,6 +660,61 @@ float narrow_host(float v, ops::HostExchange::Payload payload) {
     }
 }
 
+// INT8 payload (opt-in): per column, 32-row blocks; s = fp16 rounded up of min(max(amax / 127,
+// 2^-14), 65504), q = rint(x / s) clamped to [-127, 127], value q * s; an all-zero block is 0; a
+// block with NaN or Inf is NaN. Every float operation is rounded on its own (volatile), as the
+// device kernel does (no contraction). Columns whose rows are not a multiple of 32 use the FP16
+// payload, as begin_sum_f32 does.
+std::vector<float> narrow_columns_host(const std::vector<float>& v, std::int32_t rows,
+                                       ops::HostExchange::Payload payload) {
+    using Payload = ops::HostExchange::Payload;
+    std::vector<float> out(v.size());
+    if (payload != Payload::INT8 || rows % 32 != 0) {
+        const Payload p = payload == Payload::INT8 ? Payload::FP16 : payload;
+        for (std::size_t i = 0; i < v.size(); ++i) { out[i] = narrow_host(v[i], p); }
+        return out;
+    }
+    for (std::size_t base = 0; base < v.size(); base += 32) {
+        bool bad   = false;
+        float amax = 0.0F;
+        for (std::size_t j = 0; j < 32; ++j) {
+            const float x = v[base + j];
+            if (!std::isfinite(x)) { bad = true; }
+            amax = std::fmax(amax, std::fabs(x));
+        }
+        if (bad) {
+            for (std::size_t j = 0; j < 32; ++j) {
+                out[base + j] = std::numeric_limits<float>::quiet_NaN();
+            }
+            continue;
+        }
+        if (amax == 0.0F) {
+            for (std::size_t j = 0; j < 32; ++j) { out[base + j] = 0.0F; }
+            continue;
+        }
+        volatile float s = amax / 127.0F;
+        const float c    = std::fmin(std::fmax(s, 6.103515625e-05F), 65504.0F);
+        _Float16 h       = static_cast<_Float16>(c);
+        if (static_cast<float>(h) < c) { // round up: the next binary16 above
+            std::uint16_t bits = 0;
+            std::memcpy(&bits, &h, 2);
+            ++bits;
+            std::memcpy(&h, &bits, 2);
+        }
+        const float sf     = static_cast<float>(h);
+        volatile float inv = 1.0F / sf;
+        for (std::size_t j = 0; j < 32; ++j) {
+            volatile float prod = v[base + j] * inv;
+            // The code is an integer: a code of zero is +0 whatever the sign of x.
+            const float q = static_cast<float>(
+                static_cast<int>(std::fmin(std::fmax(std::nearbyint(prod), -127.0F), 127.0F)));
+            volatile float val = q * sf;
+            out[base + j]      = val;
+        }
+    }
+    return out;
+}
+
 int run_pipelined_case(const char* label, std::int32_t ne0, std::int32_t ne1,
                        ops::HostExchange::Payload payload,
                        const std::array<std::vector<std::int32_t>, 2>& groups, int calls,
@@ -674,8 +730,10 @@ int run_pipelined_case(const char* label, std::int32_t ne0, std::int32_t ne1,
     synchronize_both(ec);
     std::vector<float> sum(count);
     for (int call = 0; call < calls; ++call) {
+        const auto na = narrow_columns_host(a, ne0, payload);
+        const auto nb = narrow_columns_host(b, ne0, payload);
         for (std::size_t i = 0; i < count; ++i) {
-            const volatile float s = narrow_host(a[i], payload) + narrow_host(b[i], payload);
+            const volatile float s = na[i] + nb[i];
             sum[i]                 = s;
         }
         a = sum;
@@ -710,6 +768,71 @@ int run_pipelined_case(const char* label, std::int32_t ne0, std::int32_t ne1,
     expected.bf16.resize(count);
     for (std::size_t i = 0; i < count; ++i) { expected.bf16[i] = f32_to_bf16(sum[i]); }
     return buffers.verify(ec, label, expected, true);
+}
+
+// INT8 payload blocks at the edges, one call: an all-zero column, subnormal-only and tiny blocks, a
+// value beyond the scale range (saturates to 127 * 65504), a NaN and an Inf (each turns its 32-row
+// block into NaN on both ranks).
+int run_int8_special_case(const ExecutionContext& ec, ops::HostExchange& exchange) {
+    using Payload              = ops::HostExchange::Payload;
+    constexpr std::int32_t ne0 = 64;
+    constexpr std::int32_t ne1 = 6;
+    const std::size_t count    = static_cast<std::size_t>(ne0) * ne1;
+    auto a                     = make_partial(count, 401u);
+    auto b                     = make_partial(count, 402u);
+    for (std::int32_t i = 0; i < ne0; ++i) {
+        a[static_cast<std::size_t>(i)]           = 0.0F;
+        b[static_cast<std::size_t>(i)]           = 0.0F;
+        a[static_cast<std::size_t>(ne0 + i)]     = 1.0e-40F;
+        b[static_cast<std::size_t>(ne0 + i)]     = 1.0e-30F;
+        a[static_cast<std::size_t>(2 * ne0 + i)] = 1.0F;
+    }
+    a[static_cast<std::size_t>(2 * ne0 + 7)]  = 1.0e8F;
+    a[static_cast<std::size_t>(3 * ne0 + 5)]  = std::numeric_limits<float>::quiet_NaN();
+    a[static_cast<std::size_t>(4 * ne0 + 40)] = std::numeric_limits<float>::infinity();
+    RankBuffers buffers(ec, ne0, ne1);
+    buffers.upload(ec, a, b);
+    const auto na = narrow_columns_host(a, ne0, Payload::INT8);
+    const auto nb = narrow_columns_host(b, ne0, Payload::INT8);
+    std::vector<float> sum(count);
+    for (std::size_t i = 0; i < count; ++i) {
+        const volatile float v = na[i] + nb[i];
+        sum[i]                 = v;
+    }
+    if (!exchange.begin_sum_f32(buffers.partial_t, buffers.staging_t, &buffers.out_t, Payload::INT8,
+                                ec)) {
+        std::cerr << "int8 edge blocks: begin_sum_f32 refused an eager call\n";
+        return 1;
+    }
+    exchange.columns_ready(0, 0, ne1);
+    exchange.columns_ready(1, 0, 3);
+    exchange.columns_ready(1, 3, 3);
+    exchange.finish_sum_f32();
+    synchronize_both(ec);
+    int failures = 0;
+    for (int rank = 0; rank < 2; ++rank) {
+        set_device(ec, rank);
+        const auto got = from_device<std::uint32_t>(buffers.partial[rank]->data(), count);
+        const auto out = from_device<std::uint16_t>(buffers.out[rank]->data(), count);
+        int bad        = 0;
+        for (std::size_t i = 0; i < count; ++i) {
+            float g = 0.0F;
+            std::memcpy(&g, &got[i], 4);
+            std::uint32_t want = 0;
+            std::memcpy(&want, &sum[i], 4);
+            const bool ok = std::isnan(sum[i]) ? std::isnan(g) && (out[i] & 0x7FFFu) > 0x7F80u
+                                               : got[i] == want && out[i] == f32_to_bf16(sum[i]);
+            if (!ok && bad++ < 4) {
+                std::cerr << "int8 edge blocks rank " << rank << " [" << i % ne0 << "," << i / ne0
+                          << "]: got " << g << " want " << sum[i] << '\n';
+            }
+        }
+        failures += bad != 0 ? 1 : 0;
+        failures += buffers.staging[rank]->verify_guards("int8 edge blocks staging");
+    }
+    std::cout << "pipelined int8 edge blocks (zero, subnormal, saturated, NaN, Inf): "
+              << (failures ? "FAIL" : "ok") << '\n';
+    return failures;
 }
 
 } // namespace
@@ -1003,6 +1126,16 @@ int main(int argc, char** argv) {
         failures +=
             run_pipelined_case("pipelined fp16 [17,5] empty group", 17, 5, Payload::FP16,
                                {{{0, 5}, {2, 3}}}, 1, false, 307u, ec, exchange, host_events);
+        failures += run_pipelined_case("pipelined int8 [2560,100] groups 10+40+50 / 64+36 x3",
+                                       kHidden, 100, Payload::INT8, {{{10, 40, 50}, {64, 36}}}, 3,
+                                       false, 313u, ec, exchange, host_events);
+        failures += run_pipelined_case("pipelined int8 [192,40] groups 7+33 / 40 x2 + pull", 192,
+                                       40, Payload::INT8, {{{7, 33}, {40}}}, 2, true, 315u, ec,
+                                       exchange, host_events);
+        failures +=
+            run_pipelined_case("pipelined int8 [17,5] falls back to fp16", 17, 5, Payload::INT8,
+                               {{{0, 5}, {2, 3}}}, 1, false, 317u, ec, exchange, host_events);
+        failures += run_int8_special_case(ec, exchange);
         failures += run_abandoned_case(ec, exchange, host_events);
         ops::HostExchange wide(ec);
         ops::PeerEvents wide_events(ec);
@@ -1013,6 +1146,9 @@ int main(int argc, char** argv) {
         failures += run_pipelined_case(
             "pipelined fp16 8 MiB chunks [2560,2048] 4x512 / 2048", kHidden, 2048, Payload::FP16,
             {{{512, 512, 512, 512}, {2048}}}, 2, false, 311u, ec, wide, wide_events);
+        failures += run_pipelined_case(
+            "pipelined int8 8 MiB chunks [2560,2048] 4x512 / 2048", kHidden, 2048, Payload::INT8,
+            {{{512, 512, 512, 512}, {2048}}}, 2, false, 319u, ec, wide, wide_events);
     }
 
     {

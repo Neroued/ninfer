@@ -125,9 +125,11 @@ void Qwen4Forward<Arena>::linear(int r, const Tensor& x, const LinearParameters&
     if constexpr (kExecute) {
         ops::linear(x, p.weight, out, p.policy, work(r), s(r));
     } else {
-        reserve(ops::linear_workspace_capacity_bytes(p.weight.qtype, p.weight.n, p.weight.k,
-                                                     p.policy, first_, last_),
-                r);
+        reserve(
+            ops::linear_workspace_capacity_bytes(p.weight.qtype, p.weight.n, p.weight.k, p.policy,
+                                                 first_, last_) +
+                ops::linear_optional_workspace_bytes(p.weight.qtype, p.weight.n, p.weight.k, last_),
+            r);
     }
 }
 

@@ -3,6 +3,7 @@
 // ninfer::ops::detail - private launch prototypes of the hyper-connection family.
 
 #include "core/tensor.h"
+#include "core/weight.h"
 
 #include <cuda.h>
 #include <cuda_bf16.h>
@@ -28,6 +29,15 @@ void grouped_offset_rmsnorm_launch(const Tensor& x, const Tensor& weight, std::i
 // sigmoid(p/S)
 void hyper_connection_gates_launch(const Tensor& projection, std::int32_t streams, Tensor& lowrank,
                                    Tensor* inject, cudaStream_t stream);
+// up_collapse.cu: the general route's Up projection fused with the collapse for a Q8
+// Up at T > 128 (bit for bit the unfused Linear + collapse). force_for_test: -1 automatic, 0 never,
+// 1 whenever supported.
+[[nodiscard]] bool hc_up_collapse_supported(const Weight& up, std::int32_t hidden,
+                                            std::int32_t tokens);
+void hc_up_collapse_launch(const Tensor& lowrank, const Weight& up, const Tensor& normalized,
+                           Tensor& mixed, cudaStream_t stream);
+void hc_up_collapse_force_for_test(int mode);
+
 void hyper_connection_collapse_launch(const Tensor& up, const Tensor& normalized,
                                       std::int32_t streams, Tensor& mixed, cudaStream_t stream);
 void hyper_connection_combine_launch(const Tensor& y, const Tensor& inject, Tensor& residual,

@@ -187,6 +187,7 @@ void ProgramImpl::construct_tensor_parallel(const SequencePlanImpl& plan,
             const ScopedCurrentDevice rank1(execution_context->dev[1]->device);
             peer = std::make_unique<PeerRuntime>(*execution_context->dev[1], plan);
             peer_events.emplace(*execution_context);
+            gdn_gating_overlap.emplace(*execution_context);
             // T56: eager exchanges (prefill chunks) through pinned host buffers, asynchronously,
             // instead of the driver-staged peer copy that blocks the host per call. That copy is
             // only staged without P2P: with peer access it is a direct device-to-device copy and
@@ -338,6 +339,7 @@ void ProgramImpl::bind_tensor_parallel_execution() {
         .mtp                  = mtp ? &*peer->io.mtp : nullptr,
         .prefill_hidden       = mtp ? peer->prefill_hidden : Tensor{},
     });
+    tp_execution->gdn_gating = gdn_gating_overlap ? &*gdn_gating_overlap : nullptr;
     if (peer->drafter) { tp_execution->dflash = &*peer->drafter; }
     const char* draft_env = std::getenv("NINFER_TP_MAILBOX_DRAFT");
     if (mtp && peer_mailbox && draft_env != nullptr && std::string_view(draft_env) == "copies") {

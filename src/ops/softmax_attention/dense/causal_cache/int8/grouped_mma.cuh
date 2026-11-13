@@ -224,18 +224,31 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
     for (int i = tid; i < RowCount * Groups; i += Threads) { q_scale_tmp[i] = 0.0f; }
     __syncthreads();
 
-    for (int row = warp; row < RowCount; row += Wc) {
-        int q_head = 0;
-        int token  = 0;
-        causal_row_to_qt<Geometry>(row, kv_head, q_head, token);
-        float q_values[8];
+    // All of a warp's Q rows are loaded before any is transformed: one memory round trip
+    // instead of one per row.
+    constexpr int RowsPerWarp = (RowCount + Wc - 1) / Wc;
+    __nv_bfloat16 q_raw[RowsPerWarp][8];
+#pragma unroll
+    for (int i = 0; i < RowsPerWarp; ++i) {
+        const int row = warp + i * Wc;
+        int q_head    = 0;
+        int token     = 0;
+        if (row < RowCount) { causal_row_to_qt<Geometry>(row, kv_head, q_head, token); }
 #pragma unroll
         for (int r = 0; r < 8; ++r) {
             const int d = lane + 32 * r;
-            q_values[r] = token < valid_tokens
-                              ? __bfloat162float(q[causal_q_index<Geometry>(q_head, d, token)])
-                              : 0.0f;
+            q_raw[i][r] = (row < RowCount && token < valid_tokens)
+                              ? q[causal_q_index<Geometry>(q_head, d, token)]
+                              : __float2bfloat16(0.0f);
         }
+    }
+#pragma unroll
+    for (int i = 0; i < RowsPerWarp; ++i) {
+        const int row = warp + i * Wc;
+        if (row >= RowCount) { continue; }
+        float q_values[8];
+#pragma unroll
+        for (int r = 0; r < 8; ++r) { q_values[r] = __bfloat162float(q_raw[i][r]); }
         normalized_hadamard_d256_inplace(q_values, lane);
 
 #pragma unroll

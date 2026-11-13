@@ -98,6 +98,8 @@ void proposal_argmax_split(const std::array<Tensor, 2>& hidden,
                            const std::array<WorkspaceArena*, 2>& workspace,
                            const ExecutionContext& execution, const ops::PeerEvents& events);
 
+struct GdnGatingOverlap; // tp2/gdn_gating_overlap.h
+
 // Everything a TextContext needs to drive rank 1 in lockstep with its own rank-0 operands. The
 // TextContext's DeviceContext must be `execution->dev[0]`. All members are borrowed and must
 // outlive the context; the pointers into Program storage are stable for the Program's lifetime.
@@ -128,6 +130,8 @@ struct TpExecution {
     // Rank 1's runtime inputs of the Text forward (with routed experts its backend over the odd
     // expert IDs, its PLE convolution states and decode PLE rows).
     const Qwen4Runtime* qwen4 = nullptr;
+    // Side streams of the tp 2 GDN gating overlap (tp2/gdn_gating_overlap.h), Program-owned.
+    GdnGatingOverlap* gdn_gating = nullptr;
 
     // --- DFlash2 with the split drafter (load/sharding.h; null otherwise)
     // ------------------------- Rank 1's drafter operands and state; every DFlash2 call that

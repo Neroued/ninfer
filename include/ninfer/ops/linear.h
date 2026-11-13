@@ -37,6 +37,14 @@ enum class LinearPolicy : std::uint8_t {
     return policy == LinearPolicy::AllowA4;
 }
 
+// Transient bytes a linear may use when the workspace has room for them (an optional faster route:
+// Q8 prefill on int8 tensor cores, NINFER_Q8_A8). Never required - without them the route falls
+// back - so linear_workspace_capacity_bytes and the split validators do not count them; a planner
+// that wants the route reserves them on top. 0 when there is no such route.
+[[nodiscard]] std::size_t linear_optional_workspace_bytes(QType qtype, std::int32_t output_rows,
+                                                          std::int32_t input_rows,
+                                                          std::int32_t max_tokens);
+
 /**
  * Returns the caller-owned transient capacity required by Linear for every T in the inclusive
  * `[min_tokens,max_tokens]` interval. Invalid registered profiles, policies, or intervals throw;
@@ -96,6 +104,8 @@ enum class LinearPolicy : std::uint8_t {
  * `policy` specifies the permitted private activation-compute set. A permission does not require a
  * corresponding low-precision route: the resolved plan may remain A16 when that is the qualified
  * choice. Every policy permits the existing A16 implementations of BF16 and Q4/Q5/Q6/Q8.
+ * Operator override: with NINFER_Q8_A8 set (opt-in, ops/linear/q8/q8_a8.h) the admitted Q8 shapes
+ * run int8 activations at 64 tokens and more under every policy, A16Only included.
  * FP8 accepts all three policies; AllowA8 and AllowA4 permit the private resolver to select a
  * qualified A16 or A8 route for the registered problem and T. FP8 `[248320,5120]` retains A16
  * compute under every policy at every positive T. NVFP4 uses A16 for A16Only and

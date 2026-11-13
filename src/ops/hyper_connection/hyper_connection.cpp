@@ -211,6 +211,13 @@ void run_general(const Tensor& residual, const HyperConnectionWeights& weights, 
                                           stream);
     linear(normalized, weights.down, projection, stream);
     detail::hyper_connection_gates_launch(projection, kHcStreams, lowrank, inject, stream);
+    // The fused epilogue reads `normalized` and writes `mixed` 16 bytes at a time; a misaligned
+    // operand keeps the unfused route, whose collapse falls back to its scalar kernel.
+    if (detail::hc_up_collapse_supported(weights.up, geometry.hidden, tokens) &&
+        aligned16(normalized.data) && aligned16(mixed.data)) {
+        detail::hc_up_collapse_launch(lowrank, weights.up, normalized, mixed, stream);
+        return;
+    }
     linear(lowrank, weights.up, up, stream);
     detail::hyper_connection_collapse_launch(up, normalized, kHcStreams, mixed, stream);
 }

@@ -214,19 +214,117 @@ int test_string_values_preserve_embedded_tool_markup() {
     return failures;
 }
 
+// A quoted `<parameter=NAME>` whose NAME is no declared parameter of the called tool, and a quoted
+// `</parameter>` followed by more text, are unambiguous text inside a value (issue #59).
+int check_single_string(const std::string& text, const fi::ToolCallOutputContract& contract,
+                        const std::string& key, const std::string& expected,
+                        const std::string& message) {
+    const auto parsed = fi::parse_qwen_tool_call_output(text, 64, contract);
+    if (!parsed.is_tool_call_response || parsed.tool_calls.size() != 1) { return fail(message); }
+    const Json args = Json::parse(parsed.tool_calls.front().arguments_json);
+    return check(args.contains(key) && args.at(key) == expected, message);
+}
+
 int test_unrepresentable_parameter_delimiters_fall_back() {
-    const auto contract = contract_for("bash", Json{{"command", Json{{"type", "string"}}}});
+    const auto contract = contract_for("bash", Json{{"command", Json{{"type", "string"}}},
+                                                    {"timeout", Json{{"type", "integer"}}}});
     const std::string unmatched_open =
         tool_call("bash", {{"command", "echo '<parameter=unterminated>'"}});
     const std::string standalone_close = tool_call("bash", {{"command", "echo '</parameter>'"}});
+    const std::string declared_open =
+        tool_call("bash", {{"command", "echo '<parameter=timeout>'"}});
 
     int failures = 0;
-    failures += check_rejected(unmatched_open, contract,
+    failures +=
+        check_single_string(unmatched_open, contract, "command", "echo '<parameter=unterminated>'",
+                            "quoted open of an undeclared name was not kept as text");
+    failures += check_single_string(standalone_close, contract, "command", "echo '</parameter>'",
+                                    "quoted parameter close followed by text was not kept");
+    failures += check_rejected(declared_open, contract,
                                ninfer::ToolCallParseFallbackReason::MalformedStructure,
-                               "unbalanced nested parameter open was silently repaired");
-    failures += check_rejected(standalone_close, contract,
-                               ninfer::ToolCallParseFallbackReason::MalformedStructure,
-                               "standalone parameter close was guessed to be string content");
+                               "unbalanced open of a declared parameter was silently repaired");
+    return failures;
+}
+
+int test_drafts_about_tool_call_markup_stay_calls() {
+    // Calls from agent traffic that fell back to text, shortened: a Czech text-check draft quoting
+    // the markup, and a file whose content carries an unterminated call.
+    const auto check_contract =
+        contract_for("kontrola_cestiny", Json{{"text", Json{{"type", "string"}}}});
+    const std::string draft =
+        "## Co se d\u011bje\n"
+        "- V relac\u00edch jsou **4 p\u0159\u00edpady**, kdy se vol\u00e1n\u00ed objevilo jako "
+        "text (`<tool_call>\u2026<parameter=command>\u2026`), a jeden obsahuje i `<|im_start|>`.\n"
+        "- Server strukturovan\u00e9 vol\u00e1n\u00ed um\u00ed.";
+
+    const auto write_contract = contract_for(
+        "write", Json{{"path", Json{{"type", "string"}}}, {"content", Json{{"type", "string"}}}});
+    const std::string content =
+        "#!/usr/bin/env python3\n"
+        "LEAK = \"<tool_call>\\n<function=bash>\\n<parameter=command>\\nls\"\n"
+        "print('</parameter> ve stringu')";
+
+    int failures = 0;
+    failures +=
+        check_single_string(tool_call("kontrola_cestiny", {{"text", draft}}), check_contract,
+                            "text", draft, "Czech-check draft quoting call markup became text");
+    const std::string write_call =
+        tool_call("write", {{"path", "probe-toolcall.py"}, {"content", content}});
+    failures += check_single_string(write_call, write_contract, "content", content,
+                                    "file content with call markup became text");
+    failures += check_single_string(write_call, write_contract, "path", "probe-toolcall.py",
+                                    "parameter after a value with call markup was lost");
+    // An unterminated call quoted in the content, with no closer to balance it.
+    const std::string unbalanced =
+        "LEAK = \"<tool_call>\n<function=bash>\n<parameter=command>\nls\"";
+    failures += check_single_string(tool_call("write", {{"path", "x.py"}, {"content", unbalanced}}),
+                                    write_contract, "content", unbalanced,
+                                    "unbalanced quoted call in file content became text");
+    return failures;
+}
+
+// The boundary of the rule: a value quoting a declared parameter of the same tool cannot be told
+// from a nested parameter, so the call is still rejected, whichever parameter comes first.
+int test_quoted_declared_parameter_open_is_rejected() {
+    const auto contract = contract_for(
+        "write", Json{{"path", Json{{"type", "string"}}}, {"content", Json{{"type", "string"}}}});
+    const std::string quoted = "see <parameter=path> below";
+
+    int failures = 0;
+    failures += check_rejected(tool_call("write", {{"content", quoted}, {"path", "x.md"}}),
+                               contract, ninfer::ToolCallParseFallbackReason::MalformedStructure,
+                               "quoted declared open before the next parameter was accepted");
+    failures += check_rejected(tool_call("write", {{"path", "x.md"}, {"content", quoted}}),
+                               contract, ninfer::ToolCallParseFallbackReason::MalformedStructure,
+                               "quoted declared open in the last parameter was accepted");
+    return failures;
+}
+
+// A tool declared without a schema, or twice with conflicting schemas, has no parameter names to
+// tell structure from quoted text, so both delimiters keep the strict reading.
+int test_tools_without_schema_keep_strict_delimiters() {
+    const std::vector<std::string> schemaless = {
+        Json{{"type", "function"}, {"function", Json{{"name", "run"}}}}.dump()};
+    const std::vector<std::string> conflicting = {
+        tool_definition("run", Json{{"command", Json{{"type", "string"}}}}),
+        tool_definition("run", Json{{"cmd", Json{{"type", "string"}}}})};
+
+    int failures = 0;
+    for (const auto& definitions : {schemaless, conflicting}) {
+        const auto contract = contract_from_definitions(definitions);
+        const auto plain =
+            fi::parse_qwen_tool_call_output(tool_call("run", {{"command", "ls"}}), 64, *contract);
+        failures += check(plain.is_tool_call_response && plain.tool_calls.size() == 1,
+                          "call to a tool without a schema was not parsed");
+        failures +=
+            check_rejected(tool_call("run", {{"command", "echo '<parameter=unterminated>'"}}),
+                           *contract, ninfer::ToolCallParseFallbackReason::MalformedStructure,
+                           "tool without a schema accepted an unbalanced quoted open");
+        failures +=
+            check_rejected(tool_call("run", {{"command", "echo '</parameter>'"}}), *contract,
+                           ninfer::ToolCallParseFallbackReason::MalformedStructure,
+                           "tool without a schema accepted a quoted parameter close");
+    }
     return failures;
 }
 
@@ -1047,6 +1145,9 @@ int main() {
     failures += test_declared_strings_preserve_text();
     failures += test_string_values_preserve_embedded_tool_markup();
     failures += test_unrepresentable_parameter_delimiters_fall_back();
+    failures += test_drafts_about_tool_call_markup_stay_calls();
+    failures += test_quoted_declared_parameter_open_is_rejected();
+    failures += test_tools_without_schema_keep_strict_delimiters();
     failures += test_declared_json_types();
     failures += test_boolean_boundary();
     failures += test_exact_integer_boundary();

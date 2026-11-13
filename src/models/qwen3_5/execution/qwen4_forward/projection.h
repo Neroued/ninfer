@@ -82,8 +82,12 @@ void Qwen4Forward<Arena>::output_projection(const RankTensors& x,
             }
             ops::HostExchange* pipe = c(0).prefill ? tp_.events->host_exchange() : nullptr;
             if (pipe != nullptr &&
-                pipe->begin_sum_f32(part, stage, &y, ops::HostExchange::Payload::FP16,
-                                    *tp_.execution)) {
+                pipe->begin_sum_f32(
+                    part, stage, &y,
+                    t62_exchange().payload == ops::HostExchange::Payload::INT8
+                        ? ops::HostExchange::Payload::INT8 // same payload as the MoE exchange
+                        : ops::HostExchange::Payload::FP16,
+                    *tp_.execution)) {
                 const OpenExchangeSum open_sum{pipe};
                 pipe->columns_ready(0, 0, T);
                 pipe->columns_ready(1, 0, T);

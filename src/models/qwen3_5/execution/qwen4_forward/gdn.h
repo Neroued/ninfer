@@ -16,6 +16,7 @@
 #include "ninfer/ops/gdn_gating.h"
 #include "ninfer/ops/gdn_gating_proj.h"
 #include "ninfer/ops/gdn_input_proj.h"
+#include "models/qwen3_5/execution/tp2/gdn_gating_overlap.h"
 #include "ninfer/ops/hyper_connection.h"
 
 #include <algorithm>
@@ -24,6 +25,18 @@
 #include <variant>
 
 namespace ninfer::models::qwen3_5::execution {
+
+template <class Arena>
+void Qwen4Forward<Arena>::gdn_join_gating() {
+    if constexpr (kExecute) {
+        if (gating_fork_ == nullptr) { return; }
+        for (int r = 0; r < width_; ++r) {
+            const ScopedCurrentDevice scope(r_[at(r)].device);
+            CUDA_CHECK(cudaStreamWaitEvent(s(r), gating_fork_->join[at(r)], 0));
+        }
+        gating_fork_ = nullptr;
+    }
+}
 
 // The one parent of a GDN projection that the generic chain runs (a paired projection has fused
 // routes only).
@@ -73,6 +86,7 @@ void Qwen4Forward<Arena>::gdn(std::size_t layer, const RankTensors& in, RankTens
         generic_gdn_input(layer, x, gl, gidx, z, zs, qc, kc, vc);
     }
 
+    gdn_join_gating();
     gdn_recurrence(layer, gl, gidx, qc, kc, vc, decay, beta, zs, o, on);
     const RankTensors flat{on[0].view({vw, T}), width_ == 2 ? on[1].view({vw, T}) : Tensor{}};
     close(flat, {&p(0).output, width_ == 2 ? &p(1).output : nullptr}, y, staging,
@@ -109,7 +123,24 @@ void Qwen4Forward<Arena>::gdn_controls(std::size_t layer, const RankTensors& in,
                                          p(0).dt_bias, work(0), decay[0], beta[0], r_[0].execution);
                 } else {
                     const std::array<WorkspaceArena*, 2> ws{&work(0), &work(1)};
-                    gdn_control_split(x, {&p(0), &p(1)}, decay, beta, ws, *tp_.execution);
+                    if (plain && T <= 32 && tp_.gating != nullptr) {
+                        GdnGatingOverlap& overlap = *tp_.gating;
+                        for (std::size_t r = 0; r < 2; ++r) {
+                            const ScopedCurrentDevice scope(tp_.execution->dev[r]->device);
+                            CUDA_CHECK(cudaEventRecord(overlap.fork[r], s(static_cast<int>(r))));
+                            CUDA_CHECK(cudaStreamWaitEvent(overlap.side.dev[r]->stream,
+                                                           overlap.fork[r], 0));
+                        }
+                        gdn_control_split(x, {&p(0), &p(1)}, decay, beta, ws, overlap.side);
+                        for (std::size_t r = 0; r < 2; ++r) {
+                            const ScopedCurrentDevice scope(tp_.execution->dev[r]->device);
+                            CUDA_CHECK(
+                                cudaEventRecord(overlap.join[r], overlap.side.dev[r]->stream));
+                        }
+                        gating_fork_ = &overlap;
+                    } else {
+                        gdn_control_split(x, {&p(0), &p(1)}, decay, beta, ws, *tp_.execution);
+                    }
                 }
             } else {
                 reserve(width_ == 1

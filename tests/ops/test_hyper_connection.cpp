@@ -668,6 +668,55 @@ int chain_case(const MixFixture& first, const MixFixture& second, std::int32_t t
 // The small-T route at T against the general route on the same tokens (the general route at T = 9,
 // whose first T columns are the small-T input), with the oracle criteria taking the general route
 // as reference. Both routes are also qualified against the oracle (mix_case).
+// At T > 128 the general route fuses the Up projection with the collapse (the Up output
+// is never stored). The fused and the unfused route must give the same bits: mixed, inject and
+// (combine) residual.
+int fused_collapse_parity_case(const MixFixture& f, std::int32_t tokens, bool combine,
+                               std::uint32_t seed) {
+    const std::size_t wide   = static_cast<std::size_t>(kWide) * tokens;
+    const std::size_t narrow = static_cast<std::size_t>(kHidden) * tokens;
+    const std::size_t gates  = static_cast<std::size_t>(kStreams) * tokens;
+    const auto residual      = random_bf16(wide, seed, -0.75F, 0.75F);
+    const auto previous_y    = random_bf16(narrow, seed + 1U, -0.5F, 0.5F);
+    std::vector<float> previous_inject(gates);
+    fill_uniform(previous_inject, seed + 2U, 0.0F, 2.0F);
+    DeviceBuffer d_y        = to_device(bits(previous_y));
+    DeviceBuffer d_inj_prev = to_device(previous_inject);
+    DeviceContext device;
+    std::array<std::vector<std::uint16_t>, 2> mixed, res;
+    std::array<std::vector<double>, 2> inj;
+    for (int fused = 0; fused < 2; ++fused) {
+        ops::detail::hc_up_collapse_force_for_test(fused);
+        DeviceBuffer d_residual = to_device(bits(residual));
+        DeviceBuffer d_mixed(narrow * 2), d_inject(gates * 4);
+        Tensor t_residual(d_residual.p, DType::BF16, {kWide, tokens});
+        Tensor t_y(d_y.p, DType::BF16, {kHidden, tokens});
+        Tensor t_inj_prev(d_inj_prev.p, DType::FP32, {kStreams, tokens});
+        Tensor t_mixed(d_mixed.p, DType::BF16, {kHidden, tokens});
+        Tensor t_inject(d_inject.p, DType::FP32, {kStreams, tokens});
+        Tensor* inject = f.inject ? &t_inject : nullptr;
+        WorkspaceArena workspace(
+            ops::hyper_connection_mix_workspace_bytes(tokens, tokens, f.inject, kHidden, kRank));
+        if (combine)
+            ops::hyper_connection_combine_mix(t_residual, t_y, t_inj_prev, f.weights, kEps, t_mixed,
+                                              inject, workspace, device.stream);
+        else
+            ops::hyper_connection_mix(t_residual, f.weights, kEps, t_mixed, inject, workspace,
+                                      device.stream);
+        cuda_synchronize(device.stream);
+        mixed[fused] = from_device<std::uint16_t>(d_mixed.p, narrow);
+        res[fused]   = from_device<std::uint16_t>(d_residual.p, wide);
+        if (f.inject) inj[fused] = read_f32(d_inject.p, gates);
+    }
+    ops::detail::hc_up_collapse_force_for_test(-1);
+    const std::string label = std::string("fused collapse parity ") +
+                              (combine ? "combine_mix" : "mix") + (f.inject ? " inject" : " head") +
+                              " T=" + std::to_string(tokens);
+    const bool same = mixed[0] == mixed[1] && res[0] == res[1] && inj[0] == inj[1];
+    std::cout << label << ": " << (same ? "ok" : "FAIL") << '\n';
+    return same ? 0 : 1;
+}
+
 int route_parity_case(const MixFixture& f, std::int32_t tokens, bool combine, std::uint32_t seed) {
     constexpr std::int32_t kGeneral = 9; // first T of the general route
     const std::size_t wide          = static_cast<std::size_t>(kWide) * kGeneral;
@@ -900,6 +949,13 @@ int main(int argc, char** argv) {
         for (const std::int32_t tokens : {1, 4, 8, 9}) {
             failures += mix_case(with_inject, tokens, true, Execution::Graph, 0x8000U + tokens);
             failures += mix_case(head, tokens, false, Execution::Graph, 0x8100U + tokens);
+        }
+        for (const std::int32_t tokens : {129, 300, 1000}) {
+            for (const bool combine : {false, true}) {
+                failures +=
+                    fused_collapse_parity_case(with_inject, tokens, combine, 0xC000U + tokens);
+                failures += fused_collapse_parity_case(head, tokens, combine, 0xC100U + tokens);
+            }
         }
         const MixFixture second(true, 0x9100U);
         for (const std::int32_t tokens : {1, 4, 8}) {

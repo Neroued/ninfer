@@ -28,6 +28,9 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <stdexcept>
+#include <cstdlib>
+#include <cstdio>
 #include <iostream>
 #include <map>
 #include <memory>
@@ -436,6 +439,17 @@ int attend(const Layer& layer, const std::string& label, std::int32_t width,
     WorkspaceArena workspace(ops::qsa_attention_workspace_bytes(g, width * B));
     ops::qsa_attention(tq, ts, tc, layer.rows(), layer.kv, scale, workspace, tout, nullptr);
     cuda_synchronize();
+    if (const char* dir = std::getenv("NINFER_TEST_DUMP_DIR"); dir != nullptr && *dir != '\0') {
+        // The raw output of every call, numbered in call order, for bit comparisons between builds.
+        static int dump_index = 0;
+        const auto host       = from_device<std::uint16_t>(out.data(), q.size());
+        const std::string path =
+            std::string(dir) + "/attend_" + std::to_string(dump_index++) + ".bin";
+        if (std::FILE* f = std::fopen(path.c_str(), "wb")) {
+            std::fwrite(host.data(), 2, host.size(), f);
+            std::fclose(f);
+        }
+    }
     std::vector<double> reference(q.size(), 0.0);
     const int group = query_heads / layer.kv_heads;
     for (int b = 0; b < B; ++b) {
@@ -559,6 +573,20 @@ SelectResult run_select(const Layer& layer, const QueryWindow& qw, std::uint32_t
                     layer.rows(), Tensor(dqn.p, DType::BF16, {kIndexDim}), layer.index, kGeometry,
                     max_visible, workspace, tsel, tcnt, stream);
     cuda_synchronize(stream);
+    if (const char* dir = std::getenv("NINFER_TEST_DUMP_DIR"); dir != nullptr && *dir != '\0') {
+        // Every selection (ids, then counts), numbered in call order, for bit comparisons.
+        static int select_index = 0;
+        const auto ids =
+            from_device<int>(selected.data(), static_cast<std::size_t>(max_sel) * columns);
+        const auto cnt = from_device<int>(counts.data(), columns);
+        const std::string path =
+            std::string(dir) + "/select_" + std::to_string(select_index++) + ".bin";
+        if (std::FILE* f = std::fopen(path.c_str(), "wb")) {
+            std::fwrite(ids.data(), 4, ids.size(), f);
+            std::fwrite(cnt.data(), 4, cnt.size(), f);
+            std::fclose(f);
+        }
+    }
     if (selected.verify_guards("qsa_select selected") + counts.verify_guards("qsa_select counts") !=
         0) {
         throw std::runtime_error("qsa_select wrote outside its outputs");
@@ -1045,14 +1073,106 @@ int test_graph_replay() {
     return failures;
 }
 
+// --bench [tokens] [columns] [reps]: times qsa_attention on the int8 G64 cache of the
+// Flash-Next profile with 12 query heads and one KV head (one rank at tp 2): `columns` query
+// columns at the end of a `tokens`-token cache, each selecting the budget - the last 64 blocks
+// before its position and 448 random earlier blocks (sorted), 2048 keys - as a prefill chunk does
+// at long context. Prints ms per call; --dump OUT writes the output for bit comparisons between
+// kernel builds.
+int bench_attention(int tokens, int columns, int reps, const char* dump) {
+    Layer layer(1, tokens, KvCacheStorage::Int8Group64, /*kv_heads=*/1);
+    std::vector<std::uint16_t> kn(kIndexDim);
+    for (int d = 0; d < kIndexDim; ++d) kn[d] = f32_to_bf16(kKeyNorm[d]);
+    DeviceBuffer dkn = to_device(kn);
+    for (int first = 0; first < tokens; first += 8192) {
+        append(layer, bulk(1, first, std::min(8192, tokens - first)), dkn, nullptr);
+    }
+    const int max_sel = kGeometry.max_selected();
+    std::vector<int> sel(static_cast<std::size_t>(max_sel) * columns, 0), cnt(columns, 0);
+    std::uint64_t rs = 12345;
+    auto rnd         = [&]() {
+        rs = rs * 6364136223846793005ULL + 1442695040888963407ULL;
+        return static_cast<std::uint32_t>(rs >> 33);
+    };
+    for (int c = 0; c < columns; ++c) {
+        const int pos = tokens - columns + c, last = pos / kRatio;
+        std::set<int> blocks;
+        for (int b = std::max(0, last - 63); b <= last; ++b) blocks.insert(b);
+        const int older = std::max(0, last - 63);
+        while (static_cast<int>(blocks.size()) < kGeometry.block_topk() &&
+               static_cast<int>(blocks.size()) < last + 1) {
+            blocks.insert(static_cast<int>(rnd() % static_cast<std::uint32_t>(std::max(older, 1))));
+        }
+        int n = 0;
+        for (const int b : blocks) {
+            for (int t = b * kRatio; t < b * kRatio + kRatio && t <= pos; ++t) {
+                sel[static_cast<std::size_t>(c) * max_sel + n++] = t;
+            }
+        }
+        cnt[c] = n;
+    }
+    const int qh = 12;
+    std::vector<std::uint16_t> qb(static_cast<std::size_t>(kHeadDim) * qh * columns);
+    for (std::size_t i = 0; i < qb.size(); ++i)
+        qb[i] = f32_to_bf16(hashed(mix(77, i), -1.0F, 1.0F));
+    DeviceBuffer dq = to_device(qb), dsel = to_device_i32(sel), dcnt = to_device_i32(cnt);
+    DeviceBuffer out(qb.size() * 2);
+    Tensor tq(dq.p, DType::BF16, {kHeadDim, qh, columns, 1});
+    Tensor ts(dsel.p, DType::I32, {max_sel, columns, 1});
+    Tensor tc(dcnt.p, DType::I32, {columns, 1});
+    Tensor tout(out.p, DType::BF16, {kHeadDim, qh, columns, 1});
+    ops::QsaGeometry g = kGeometry;
+    g.query_heads      = qh;
+    g.kv_heads         = 1;
+    WorkspaceArena workspace(ops::qsa_attention_workspace_bytes(g, columns));
+    const auto run = [&] {
+        workspace.reset();
+        ops::qsa_attention(tq, ts, tc, layer.rows(), layer.kv, 1.0F / 16.0F, workspace, tout,
+                           nullptr);
+    };
+    run();
+    cuda_synchronize();
+    cudaEvent_t e0, e1;
+    cuda_check(cudaEventCreate(&e0), "event");
+    cuda_check(cudaEventCreate(&e1), "event");
+    cuda_check(cudaEventRecord(e0, nullptr), "record");
+    for (int r = 0; r < reps; ++r) run();
+    cuda_check(cudaEventRecord(e1, nullptr), "record");
+    cuda_check(cudaEventSynchronize(e1), "sync");
+    float ms = 0.0F;
+    cuda_check(cudaEventElapsedTime(&ms, e0, e1), "elapsed");
+    std::cout << "qsa_attention bench: tokens " << tokens << " columns " << columns
+              << " keys/column " << cnt[columns / 2] << ": " << ms / reps << " ms per call\n";
+    if (dump != nullptr) {
+        const auto host = from_device<std::uint16_t>(out.p, qb.size());
+        std::FILE* f    = std::fopen(dump, "wb");
+        if (f == nullptr) throw std::runtime_error(std::string("cannot write ") + dump);
+        std::fwrite(host.data(), 2, host.size(), f);
+        std::fclose(f);
+    }
+    return 0;
+}
+
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
     if (cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;
     }
     try {
+        if (argc > 1 && std::strcmp(argv[1], "--bench") == 0) {
+            const char* dump = nullptr;
+            int nums[3] = {100352, 24576, 5}, k = 0;
+            for (int i = 2; i < argc; ++i) {
+                if (std::strcmp(argv[i], "--dump") == 0 && i + 1 < argc) {
+                    dump = argv[++i];
+                } else if (k < 3) {
+                    nums[k++] = std::atoi(argv[i]);
+                }
+            }
+            return bench_attention(nums[0], nums[1], nums[2], dump);
+        }
         int failures = 0;
         failures += test_append_profiles();
         failures += test_incremental_publication();

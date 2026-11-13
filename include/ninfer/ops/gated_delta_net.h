@@ -108,4 +108,8 @@ void gated_delta_net_replay_record(const Tensor& q, const Tensor& k, const Tenso
                                    Tensor& value_record, Tensor& gate_record, Tensor& out,
                                    cudaStream_t stream);
 
+// Test hook: the chunked prefill recurrence's value tile (64, 32, 16 or 8 state columns per CTA)
+// instead of the launch rule; 0 restores the rule. Every tile computes the same bits.
+void gated_delta_net_force_value_tile_for_test(int tile) noexcept;
+
 } // namespace ninfer::ops

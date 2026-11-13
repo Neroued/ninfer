@@ -81,6 +81,9 @@ std::optional<ops::HostExchange> host_exchange;
 // Declared before peer_events, which points to it.
 std::optional<ops::PeerLanes> peer_lanes;
 std::optional<ops::PeerEvents> peer_events;
+// PR #64: the side streams of the tp 2 GDN gating overlap. Declared before the graph families,
+// which capture work on its streams and events: they are destroyed first.
+std::optional<execution::GdnGatingOverlap> gdn_gating_overlap;
 std::optional<DecodeGraphPeerBridge> graph_bridge;
 std::optional<execution::TpExecution> tp_execution;
 // Filled at construction: which transport the captured all-reduces ended up with.

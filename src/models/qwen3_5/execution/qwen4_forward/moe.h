@@ -198,6 +198,7 @@ auto Qwen4Forward<Arena>::t62_exchange() -> const T62Exchange& {
         if (payload == "fp32") { v.payload = ops::HostExchange::Payload::FP32; }
         if (payload == "fp16") { v.payload = ops::HostExchange::Payload::FP16; }
         if (payload == "bf16") { v.payload = ops::HostExchange::Payload::BF16; }
+        if (payload == "int8") { v.payload = ops::HostExchange::Payload::INT8; }
         const std::string group = get("NINFER_TP_AR_GROUP");
         if (!group.empty()) {
             const auto g    = static_cast<std::int32_t>(std::strtol(group.c_str(), nullptr, 10));

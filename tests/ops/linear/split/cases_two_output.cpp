@@ -147,6 +147,14 @@ void add_two_output_cases(Suite& suite) {
         std::vector<Invocation> calls{
             {.t = 1, .input_seed = 601U, .columns = Columns::Seven},
             {.t = 4, .policy = Policy::AllowA8, .input_seed = 601U, .columns = Columns::Seven}};
+        for (int t : {17, 32, 33, 64, 65, 96, 97, 128, 129, 2048, 4096})
+            calls.push_back({.t = t, .input_seed = 601U, .columns = Columns::Seven});
+        calls.push_back({.t            = 4097,
+                         .graph        = true,
+                         .input_seed   = 601U,
+                         .changed_seed = 1601U,
+                         .columns      = Columns::Seven});
+        calls.push_back({.t = 0, .workspace_intervals = true});
         for (int t : {1, 2, 17, 1023, 1024, 1025})
             calls.push_back(
                 {.t = t, .policy = Policy::AllowA4, .input_seed = 601U, .columns = Columns::Seven});

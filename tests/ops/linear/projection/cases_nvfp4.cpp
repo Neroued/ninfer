@@ -28,6 +28,10 @@ void run_nvfp4_a16(Suite& suite) {
               {34816, 5120, 704U, Comparison::Sampled, true, invocations});
     add_shape(suite, ninfer::QType::NVFP4, ActivationRecipe::TokenBlocks, make_nvfp4_weight,
               {5120, 6144, 705U, Comparison::Sampled, true, invocations});
+    const std::vector<Invocation> output_prefill{
+        {2048}, {4096}, {4097, CallForm::Policy, ops::LinearPolicy::A16Only, true}};
+    add_shape(suite, QType::NVFP4, ActivationRecipe::Hashed, make_nvfp4_weight,
+              {5120, 6144, 709U, Comparison::Sampled, true, output_prefill});
     add_shape(suite, ninfer::QType::NVFP4, ActivationRecipe::TokenBlocks, make_nvfp4_weight,
               {5120, 17408, 707U, Comparison::Sampled, true, invocations});
     for (auto [n, k] : {std::pair{14336, 5120}, std::pair{16384, 5120}, std::pair{34816, 5120},
@@ -178,6 +182,10 @@ void run_nvfp4_n5120_k14336(Suite& suite) {
                                       {33, CallForm::Policy, ops::LinearPolicy::AllowA8}};
     add_shape(suite, QType::NVFP4, ActivationRecipe::TokenBlocks, make_nvfp4_weight,
               {5120, 14336, 751U, Comparison::Sampled, true, a16});
+    const std::vector<Invocation> prefill{
+        {4096}, {4097, CallForm::Policy, ops::LinearPolicy::A16Only, true}};
+    add_shape(suite, QType::NVFP4, ActivationRecipe::Hashed, make_nvfp4_weight,
+              {5120, 14336, 753U, Comparison::Sampled, true, prefill});
     const std::vector<Invocation> a4{{1, CallForm::Policy, ops::LinearPolicy::AllowA4},
                                      {5, CallForm::Policy, ops::LinearPolicy::AllowA4, true},
                                      {17, CallForm::Policy, ops::LinearPolicy::AllowA4},

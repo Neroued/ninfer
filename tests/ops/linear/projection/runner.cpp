@@ -471,6 +471,7 @@ int verify_workspace_envelopes(QType qtype, std::int32_t n, std::int32_t k) {
     int failures = 0;
     std::vector<std::pair<int, int>> intervals{{1, 4},  {2, 4},    {1, 128},
                                                {9, 25}, {24, 129}, {1, 2048}};
+    if (qtype == QType::NVFP4) intervals.emplace_back(1, 4097);
     const bool block_tail = qtype == QType::FP8_E4M3FN_BLOCK128X128_FP32 && n == 4096 && k == 16384;
     if (block_tail) {
         intervals.insert(intervals.end(), {{1, 4096},

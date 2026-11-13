@@ -77,6 +77,17 @@ std::vector<SnapshotCase> cases(Profile p) {
                   {17, Policy::AllowA4, 0},
                   {1024, Policy::AllowA4}};
         batch(6, 3, {6, 3, 1}, 829, Policy::AllowA4);
+        for (int b = 2; b <= 8; ++b) {
+            batch(1, b, {}, 831U + b);
+            result.back().graph = b == 8;
+        }
+        for (auto [b, w] : {std::pair{1, 4}, std::pair{8, 4}, std::pair{4, 8}, std::pair{8, 16},
+                            std::pair{2, 4}}) {
+            std::vector<int> valid(b);
+            for (int row = 0; row < b; ++row) valid[row] = w - row % w;
+            batch(w, b, std::move(valid), 853U + b + w);
+            result.back().graph = true;
+        }
     } else {
         result = {{.width = 1},
                   {3},
@@ -98,6 +109,7 @@ std::vector<SnapshotCase> cases(Profile p) {
     // The persistent single-token publication has its own public entry and offset mapping.
     batch(1, 1, {}, 977U);
     result.back().graph = true;
+    result.back().full_reference = p.format == QType::NVFP4;
     return result;
 }
 } // namespace
@@ -164,6 +176,28 @@ int snapshot_capacity_contract() {
             }
         }
 #endif
+    const ops::SingleProjectionWeight nvfp4_a16{capacity_weight(QType::NVFP4, 16384, 5120),
+                                                ops::LinearPolicy::A16Only};
+    for (int b = 1; b <= 8; ++b) {
+        for (int first = 1; first <= 16; ++first) {
+            std::size_t snapshot_peak = 0, record_peak = 0;
+            for (int last = first; last <= 16; ++last) {
+                const auto snapshot = [&](int lo, int hi) {
+                    return ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(nvfp4_a16, b,
+                                                                                      lo, hi);
+                };
+                snapshot_peak = std::max(snapshot_peak, snapshot(last, last));
+                if (snapshot(first, last) < snapshot_peak) ++failures;
+                if (first < 2) continue;
+                const auto record = [&](int lo, int hi) {
+                    return ops::gdn_input_proj_conv_record_workspace_capacity_bytes(nvfp4_a16, b,
+                                                                                    lo, hi);
+                };
+                record_peak = std::max(record_peak, record(last, last));
+                if (record(first, last) < record_peak) ++failures;
+            }
+        }
+    }
     const std::size_t nvfp4_a4_4 = ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
         ops::SingleProjectionWeight{capacity_weight(QType::NVFP4, 16384, 5120),
                                     ops::LinearPolicy::AllowA4},

@@ -36,7 +36,7 @@ struct Fixture {
           z(make_zeros(std::size_t(value_rows) * columns * 2)),
           conv(make_bf16(std::size_t(channels) * 4, 103U)),
           history(make_bf16(std::size_t(channels) * 3 * slots, 107U)),
-          saved(o.op == "snapshot" ? std::make_unique<SavedBuffer>(history) : nullptr),
+          saved(o.op != "record" ? std::make_unique<SavedBuffer>(history) : nullptr),
           q(make_zeros(std::size_t(query_rows) * columns * 2)),
           k(make_zeros(std::size_t(query_rows) * columns * 2)),
           v(make_zeros(std::size_t(value_rows) * columns * 2)),
@@ -63,7 +63,7 @@ struct Fixture {
     }
 
     std::size_t workspace_capacity() const {
-        if (options.op == "snapshot")
+        if (options.op != "record")
             return ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
                 weights, options.batch, tokens, tokens);
         return ops::gdn_input_proj_conv_record_workspace_capacity_bytes(weights, options.batch,
@@ -89,16 +89,14 @@ struct Fixture {
                                 Tensor(k.span(), DType::BF16, {query_rows, tokens, b}),
                                 Tensor(v.span(), DType::BF16, {value_rows, tokens, b}),
                                 Tensor(z.span(), DType::BF16, {value_rows, tokens, b})};
-        if (options.op == "snapshot") {
-            if (tokens == 1) {
-                auto target                 = source_view;
-                target.records.byte_offsets = Tensor(destination.span(), DType::I64, {b});
-                ops::gdn_input_proj_conv_update(input, weights, weight, source_view, target, mask,
-                                                out, arena, cuda);
-            } else {
-                ops::gdn_input_proj_conv_snapshot(input, weights, weight, {source_view, state, dst},
-                                                  mask, out, arena, cuda);
-            }
+        if (options.op == "update") {
+            auto target                 = source_view;
+            target.records.byte_offsets = Tensor(destination.span(), DType::I64, {b});
+            ops::gdn_input_proj_conv_update(input, weights, weight, source_view, target, mask, out,
+                                            arena, cuda);
+        } else if (options.op == "snapshot") {
+            ops::gdn_input_proj_conv_snapshot(input, weights, weight, {source_view, state, dst},
+                                              mask, out, arena, cuda);
         } else {
             Tensor record(records.span(), DType::BF16, {channels, tokens, b});
             ops::gdn_input_proj_conv_record(input, weights, weight, source_view, mask, out, record,

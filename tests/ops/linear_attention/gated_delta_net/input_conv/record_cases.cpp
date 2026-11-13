@@ -49,6 +49,8 @@ std::vector<RecordCase> cases(Profile p) {
                 result.push_back({t, 1, {}, (fp8 ? 1700U : 1600U) + t, policy});
                 result.push_back({t, 8, ragged(t, 8), (fp8 ? 1750U : 1650U) + t, policy});
             }
+            if (!fp8 && policy == Policy::A16Only)
+                result.push_back({8, 4, ragged(8, 4), 1671U, policy});
             if (fp8)
                 for (int b : {2, 3, 4}) result.push_back({4, b, ragged(4, b), 1810U + b, policy});
         }

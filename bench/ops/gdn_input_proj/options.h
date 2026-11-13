@@ -18,7 +18,7 @@ inline Options parse_options(int argc, char** argv) {
         const std::string_view flag = argv[i];
         if (flag == "--help" || flag == "-h") {
             std::cout << "GDN input Op benchmark\n"
-                         "  --op snapshot|record --format q4q5|q8|fp8|nvfp4\n"
+                         "  --op update|snapshot|record --format q4q5|q8|fp8|nvfp4\n"
                          "  --n N --k K --query-rows Q --policy a16|allow-a8|allow-a4\n"
                          "  --tokens T[,T...] or --sweep START:END[:STEP]\n"
                          "  --batch B --valid-columns T[,T...]\n"
@@ -55,7 +55,11 @@ inline Options parse_options(int argc, char** argv) {
         else if (!measurement::parse(o.timing, flag, value))
             throw std::invalid_argument("unknown option: " + std::string(flag));
     }
-    if (o.op != "snapshot" && o.op != "record") throw std::invalid_argument("unknown input Op");
+    if (o.op != "update" && o.op != "snapshot" && o.op != "record")
+        throw std::invalid_argument("unknown input Op");
+    if (o.op == "update" &&
+        std::any_of(o.tokens.begin(), o.tokens.end(), [](int t) { return t != 1; }))
+        throw std::invalid_argument("update requires W=1");
     if (o.policy != "a16" && o.policy != "allow-a8" && o.policy != "allow-a4")
         throw std::invalid_argument("unknown activation policy");
     if (o.format == "q4q5" && o.policy != "a16")

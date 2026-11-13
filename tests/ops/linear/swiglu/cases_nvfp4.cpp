@@ -71,7 +71,15 @@ void ninfer::test::linear_swiglu::add_nvfp4_cases(Suite& suite) {
                 std::array{1, 4, 7, 8, 16, 17, 33, 64, 65, 128, 385, 512, 1024, 2048},
                 std::array{129, 513});
     add_profile(suite, {QType::NVFP4, 28672, 5120, 14336, 2013U, ops::LinearPolicy::A16Only},
-                std::array{4, 16});
+                std::array{1,  4,   8,   16,  17,  32,  33,  64,   65,   80,   81,  96,
+                           97, 112, 113, 128, 129, 192, 193, 1024, 2048, 4096, 4097},
+                std::array{17, 33, 81, 113, 129, 4097});
+    add_negative_gate(suite, {QType::NVFP4, 28672, 5120, 14336, 2017U, ops::LinearPolicy::A16Only},
+                      std::array{17, 33, 97, 4097}, std::array{0, 16},
+                      [] { return make_negative_gate_weight(28672); });
+    add_negative_gate(suite, {QType::NVFP4, 28672, 5120, 14336, 2019U, ops::LinearPolicy::A16Only},
+                      std::array{17, 33, 4097}, std::array<int, 0>{},
+                      [] { return make_negative_gate_weight(28672); });
     add_negative_gate(suite, {QType::NVFP4, 28672, 5120, 14336, 2015U, ops::LinearPolicy::AllowA4},
                       std::array{1, 8, 17, 385}, std::array{0, 16},
                       [] { return make_negative_gate_weight(28672); });

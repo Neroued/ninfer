@@ -541,7 +541,7 @@ void add_profile(Suite& suite, const Profile& profile, std::span<const std::int3
     if (profile.policy == ops::LinearPolicy::A16Only) {
         if (profile.clamp_limit == 0)
             calls.push_back({tokens.back(), false, CallForm::Convenience});
-        if (profile.qtype == QType::NVFP4 && profile.gate_up_rows != 34816)
+        if (profile.qtype == QType::NVFP4 && profile.gate_up_rows == 12288)
             calls.push_back({17, false, CallForm::RejectA16Extent});
     }
     std::vector<linear_suite::Case> cases;

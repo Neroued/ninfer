@@ -6,6 +6,7 @@
 #include "core/device.h"
 #include "core/decode_graph.h"
 #include "ninfer/ops/linear_swiglu.h"
+#include "ninfer/ops/weight_input.h"
 #include "ops/linear_common.h"
 #include "ops/linear/weights.h"
 #include "ops/op_tester.h"
@@ -274,7 +275,17 @@ static int run_profile(std::string_view label, const Profile& profile,
 
     test::GuardedDeviceBuffer device_weight(host_weight.payload.size());
     device_weight.copy_from_host(host_weight.payload.data(), host_weight.payload.size());
-    const Weight weight = host_weight.device_weight(device_weight.span());
+    Weight weight = host_weight.device_weight(device_weight.span());
+    if (profile.qtype == QType::NVFP4 && profile.policy == ops::LinearPolicy::A16Only) {
+        const std::array<std::uint64_t, 2> shape{std::uint64_t(profile.gate_up_rows),
+                                                 std::uint64_t(profile.input_rows)};
+        const WeightParent parent{weight_geometry(weight.qtype, weight.layout, shape),
+                                  weight.device,
+                                  static_cast<const std::byte*>(device_weight.data()),
+                                  std::span(&host_weight.weight.weight_scale, 1)};
+        const WeightView view{parent.geometry.shape, {{&parent, 0, parent.geometry.elements}}};
+        weight = ops::prepare_linear_weight({view, profile.policy, {}}).weight;
+    }
 
     test::GuardedDeviceBuffer device_activation(host_activation.size() * sizeof(std::uint16_t));
     device_activation.copy_from_host(host_activation.data(),
@@ -306,7 +317,9 @@ static int run_profile(std::string_view label, const Profile& profile,
                                         policy, tokens, tokens);
         if (capacity > interval_capacity)
             throw std::runtime_error("SwiGLU interval capacity is insufficient");
-        GuardedDeviceBuffer scratch(capacity);
+        constexpr std::size_t prefix = 256;
+        GuardedDeviceBuffer scratch(prefix + capacity);
+        scratch.fill(0x5a);
         MemoryArena workspace(scratch.span());
         if (tokens == 1 && !replay &&
             (profile.qtype == QType::NVFP4 || profile.qtype == QType::FP8_E4M3FN_ROW_BF16)) {
@@ -352,6 +365,7 @@ static int run_profile(std::string_view label, const Profile& profile,
                                                   preserved.size());
         }
         workspace.reset();
+        (void)workspace.alloc_bytes(prefix, 1);
         workspace.reset_peak();
         const auto cuda =
             replay ? graph_context->execution_view() : cuda_environment().default_execution;
@@ -403,7 +417,7 @@ static int run_profile(std::string_view label, const Profile& profile,
                 const auto exact = ops::linear_swiglu_workspace_capacity_bytes(
                     profile.qtype, profile.gate_up_rows, profile.input_rows, policy, tokens,
                     tokens);
-                if (workspace.used() != 0 || workspace.peak_used() != exact) {
+                if (workspace.used() != prefix || workspace.peak_used() != prefix + exact) {
                     std::cerr << label_case << ": exact workspace query/execution mismatch\n";
                     ++failures;
                 }
@@ -412,6 +426,20 @@ static int run_profile(std::string_view label, const Profile& profile,
                 const auto actual = read_bf16_output(output, elements);
                 failures += compare_output(label_case, actual, expected.data(), profile.policy,
                                                     profile.clamp_limit > 0);
+                const std::vector<std::byte> prefix_bytes(prefix, std::byte{0x5a});
+                failures += linear_common::verify_preserved(scratch.data(), prefix_bytes,
+                                                            label_case + " arena prefix");
+                if (!replay && profile.qtype == QType::NVFP4 &&
+                    profile.policy == ops::LinearPolicy::A16Only && profile.clamp_limit == 0) {
+                    auto calibrated        = weight;
+                    calibrated.input_scale = 19.0F;
+                    ops::linear_swiglu(x, calibrated, destination, policy, workspace, cuda);
+                    test::cuda_check(cudaStreamSynchronize(stream), "A16 input scale invariance");
+                    if (read_bf16_output(output, elements) != actual) {
+                        std::cerr << label_case << ": A16 depends on activation calibration\n";
+                        ++failures;
+                    }
+                }
                 if (replay)
                     failures += verify_unchanged(label_case + " input", device_activation,
                                                           input_bits.data(),
@@ -512,9 +540,9 @@ void add_profile(Suite& suite, const Profile& profile, std::span<const std::int3
     for (int t : graphs) calls.push_back({t, true});
     if (profile.policy == ops::LinearPolicy::A16Only) {
         if (profile.clamp_limit == 0)
-            calls.push_back({profile.qtype == QType::NVFP4 ? 16 : tokens.front(), false,
-                             CallForm::Convenience});
-        if (profile.qtype == QType::NVFP4) calls.push_back({17, false, CallForm::RejectA16Extent});
+            calls.push_back({tokens.back(), false, CallForm::Convenience});
+        if (profile.qtype == QType::NVFP4 && profile.gate_up_rows != 34816)
+            calls.push_back({17, false, CallForm::RejectA16Extent});
     }
     std::vector<linear_suite::Case> cases;
     for (auto& call : calls) {

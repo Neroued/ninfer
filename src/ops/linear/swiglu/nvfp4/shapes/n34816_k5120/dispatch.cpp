@@ -16,6 +16,7 @@ namespace {
 enum class Nvfp4LinearSwiGluRoute {
     DecodeFusedA16,
     SmallTFusedA16,
+    LargeTFusedA16,
     FusedA4,
     TmaFusedA4,
 };
@@ -28,7 +29,7 @@ Nvfp4LinearSwiGluRoute select_route(LinearPolicy policy, std::int32_t tokens) {
     if (policy == LinearPolicy::A16Only || policy == LinearPolicy::AllowA8) {
         if (tokens == 1) { return Nvfp4LinearSwiGluRoute::DecodeFusedA16; }
         if (tokens <= 16) { return Nvfp4LinearSwiGluRoute::SmallTFusedA16; }
-        throw std::invalid_argument("nvfp4 linear_swiglu A16 is registered only through T=16");
+        return Nvfp4LinearSwiGluRoute::LargeTFusedA16;
     }
     if (tokens == 1) { return Nvfp4LinearSwiGluRoute::DecodeFusedA16; }
     if (tokens <= 4) { return Nvfp4LinearSwiGluRoute::SmallTFusedA16; }
@@ -75,6 +76,9 @@ void nvfp4_linear_swiglu_dispatch(const Tensor& x, const Weight& weight, Tensor&
         return;
     case Nvfp4LinearSwiGluRoute::SmallTFusedA16:
         launch_nvfp4_swiglu_small_t(x, weight, out, stream);
+        return;
+    case Nvfp4LinearSwiGluRoute::LargeTFusedA16:
+        launch_nvfp4_swiglu_large_t(x, weight, out, stream);
         return;
     case Nvfp4LinearSwiGluRoute::FusedA4:
         launch_nvfp4_swiglu_a4(x, weight, out, workspace, stream);

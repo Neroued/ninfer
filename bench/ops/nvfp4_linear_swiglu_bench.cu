@@ -34,6 +34,8 @@ struct Options {
     int gate_up_rows         = 34816;
     ops::LinearPolicy policy = ops::LinearPolicy::A16Only;
     std::vector<std::int32_t> t_sweep{1, 4, 8, 16};
+    double memory_gbs  = bench::kRoofline.memory_gbs;
+    double bf16_tflops = bench::kRoofline.bf16_f32_tflops;
     int warmup   = 5;
     int repeat   = 30;
     bool profile = false;
@@ -46,6 +48,10 @@ struct Result {
     double effective_gbs;
     double useful_tflops;
     double nvfp4_percent;
+    double bf16_percent;
+    double traffic_bytes;
+    double workspace_bytes;
+    double roofline_us;
 };
 
 Options parse_options(int argc, char** argv) {
@@ -71,6 +77,15 @@ Options parse_options(int argc, char** argv) {
             }
         } else if (argument == "--t-sweep") {
             options.t_sweep = bench::measurement::integers(next("--t-sweep"));
+        } else if (argument == "--memory-gbs" || argument == "--bf16-tflops") {
+            const std::string text(next("hardware reference"));
+            std::size_t end    = 0;
+            const double value = std::stod(text, &end);
+            if (end != text.size() || !std::isfinite(value) || value <= 0)
+                throw std::invalid_argument("hardware reference must be finite and positive");
+            (argument == "--memory-gbs" ? options.memory_gbs : options.bf16_tflops) = value;
+        } else if (argument == "--sweep") {
+            options.t_sweep = bench::measurement::sweep(next("--sweep"));
         } else if (argument == "--warmup") {
             options.warmup = bench::measurement::integer(next("--warmup"), 0);
         } else if (argument == "--repeat") {
@@ -82,7 +97,9 @@ Options parse_options(int argc, char** argv) {
         } else if (argument == "--help" || argument == "-h") {
             std::printf("Usage: %s --policy a16|a4 [--rows N] [--t-sweep 1,4,...] [--warmup N] "
                         "[--repeat N] "
-                        "[--profile] [--csv-out PATH]\n",
+                        "[--profile] [--csv-out PATH] [--sweep START:END:STEP]\n"
+                        "  --memory-gbs GBS --bf16-tflops TFLOPS: references at measured clocks\n"
+                        "  Timing: cold cache, eager CUDA events around the complete Op.\n",
                         argv[0]);
             std::exit(0);
         } else {
@@ -101,10 +118,6 @@ Options parse_options(int argc, char** argv) {
     if (options.profile && options.t_sweep.size() != 1) {
         throw std::invalid_argument("--profile requires exactly one T");
     }
-    if (options.policy == ops::LinearPolicy::A16Only &&
-        *std::max_element(options.t_sweep.begin(), options.t_sweep.end()) > 16) {
-        throw std::invalid_argument("A16 policy is registered only through T=16");
-    }
     return options;
 }
 
@@ -120,13 +133,19 @@ void write_csv(const Options& options, const std::vector<Result>& results,
     std::ofstream out(path);
     if (!out) { throw std::runtime_error("failed to open CSV: " + options.csv_out); }
     out << "op,weight_type,policy,N,K,T,weight_bytes,median_us,min_us,p95_us,effective_gbs,"
-           "useful_tflops,nvfp4_peak_percent,warmup,repeat,flush_bytes\n";
+           "useful_tflops,nvfp4_peak_percent,bf16_fp32_peak_percent,traffic_bytes,workspace_bytes,"
+           "roofline_us,memory_reference_gbs,bf16_fp32_reference_tflops,cache,execution,timer,"
+           "warmup,repeat,flush_bytes\n";
     for (const Result& result : results) {
         out << "linear_swiglu,NVFP4," << policy_name(options.policy) << ',' << options.gate_up_rows
             << ',' << kHidden << ',' << result.tokens << ',' << weight_bytes << ','
             << result.timing.median_us << ',' << result.timing.min_us << ',' << result.timing.p95_us
             << ',' << result.effective_gbs << ',' << result.useful_tflops << ','
-            << bench::format_metric(result.nvfp4_percent, 6, "") << ',' << options.warmup << ','
+            << bench::format_metric(result.nvfp4_percent, 6, "") << ','
+            << bench::format_metric(result.bf16_percent, 6, "") << ',' << result.traffic_bytes
+            << ',' << result.workspace_bytes << ','
+            << bench::format_metric(result.roofline_us, 6, "") << ',' << options.memory_gbs << ','
+            << options.bf16_tflops << ",cold,eager,cuda_events," << options.warmup << ','
             << options.repeat << ',' << kFlushBytes << '\n';
     }
 }
@@ -186,9 +205,10 @@ int main(int argc, char** argv) {
 
         std::vector<Result> results;
         results.reserve(options.t_sweep.size());
-        std::printf("# reference_target=%s dense_nvfp4_fp32_accumulate_peak_tflops=%s cache=cold\n",
-                    bench::kRoofline.target,
-                    bench::format_metric(bench::kRoofline.nvfp4_f32_tflops, 1).c_str());
+        std::printf("# reference_target=%s memory_gbs=%.3f bf16_fp32_tflops=%.3f "
+                    "nvfp4_fp32_tflops=%.3f cache=cold execution=eager timer=cuda_events\n",
+                    bench::kRoofline.target, options.memory_gbs, options.bf16_tflops,
+                    bench::kRoofline.nvfp4_f32_tflops);
         std::printf("%-14s %3s %8s %8s %6s %11s %11s %11s %10s %10s %8s\n", "op", "pol", "N", "K",
                     "T", "median_us", "min_us", "p95_us", "eff_GB/s", "TFLOP/s", "NVFP4_%");
         for (const std::int32_t tokens : options.t_sweep) {
@@ -197,12 +217,33 @@ int main(int argc, char** argv) {
                 bench::measure_cold_launch(launch, flush, cuda, options.warmup, options.repeat);
             const double seconds      = timing.median_us * 1.0e-6;
             const double useful_flops = 2.0 * static_cast<double>(kGateUpRows) * kHidden * tokens;
-            const double model_bytes  = static_cast<double>(packed.model_weight_bytes()) +
-                                       2.0 * static_cast<double>(kHidden + kOutputRows) * tokens;
             const double useful_tflops = useful_flops / seconds / 1.0e12;
-            const double effective_gbs = model_bytes / seconds / 1.0e9;
             const bool a4              = options.policy == ops::LinearPolicy::AllowA4 &&
                             tokens >= (options.gate_up_rows == 28672 ? 8 : 5);
+            const bool mma               = a4 || tokens > (kGateUpRows == 34816 ? 2 : 1);
+            const double workspace_bytes = ops::linear_swiglu_workspace_capacity_bytes(
+                QType::NVFP4, kGateUpRows, kHidden, options.policy, tokens, tokens);
+            // Codes are written/read once; tiled scale writes include the padded token tail.
+            // Padding is allocation rather than traffic for the row-major small-T route.
+            const int scale_tile = !a4                    ? 1
+                                   : kGateUpRows == 34816 ? (tokens >= 256 ? 256 : 1)
+                                                          : (tokens <= 128   ? 1
+                                                             : tokens <= 384 ? 128
+                                                                             : 256);
+            const double scale_tokens =
+                (std::int64_t(tokens) + scale_tile - 1) / scale_tile * scale_tile;
+            const double scratch_traffic =
+                a4 ? double(kHidden) * tokens + double(kHidden) / 8 * scale_tokens : 0;
+            const double traffic_bytes = double(packed.model_weight_bytes()) +
+                                         2.0 * (kHidden + kOutputRows) * tokens + scratch_traffic;
+            const double effective_gbs = traffic_bytes / seconds / 1.0e9;
+            const double compute_tflops =
+                a4 ? bench::kRoofline.nvfp4_f32_tflops : options.bf16_tflops;
+            const double roofline_us  = mma ? std::max(traffic_bytes / options.memory_gbs / 1e3,
+                                                       useful_flops / compute_tflops / 1e6)
+                                            : traffic_bytes / options.memory_gbs / 1e3;
+            const double bf16_percent = mma && !a4 ? 100 * useful_tflops / options.bf16_tflops
+                                                   : std::numeric_limits<double>::quiet_NaN();
             const double nvfp4_percent =
                 a4 ? 100.0 * useful_tflops / bench::kRoofline.nvfp4_f32_tflops
                    : std::numeric_limits<double>::quiet_NaN();
@@ -210,7 +251,10 @@ int main(int argc, char** argv) {
                         "linear_swiglu", policy_name(options.policy), kGateUpRows, kHidden, tokens,
                         timing.median_us, timing.min_us, timing.p95_us, effective_gbs,
                         useful_tflops, bench::format_metric(nvfp4_percent).c_str());
-            results.push_back({tokens, timing, effective_gbs, useful_tflops, nvfp4_percent});
+            std::printf("  BF16_FP32_%%=%s roofline_us=%.3f workspace_bytes=%.0f\n",
+                        bench::format_metric(bf16_percent).c_str(), roofline_us, workspace_bytes);
+            results.push_back({tokens, timing, effective_gbs, useful_tflops, nvfp4_percent,
+                               bf16_percent, traffic_bytes, workspace_bytes, roofline_us});
         }
         write_csv(options, results, packed.model_weight_bytes());
         CUDA_CHECK(cudaStreamDestroy(stream));

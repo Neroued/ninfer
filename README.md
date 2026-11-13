@@ -19,7 +19,7 @@ Anthropic-compatible HTTP API, so agent tools such as Claude Code, Codex CLI and
 
 capy-flash **is ninfer-tp2, renamed at v0.5.0**: the two-GPU tensor-parallel fork of
 [Neroued/ninfer](https://github.com/Neroued/ninfer) (v0.1-v0.4.9 under the old name); [NOTICE](NOTICE) lists every piece
-of prior work it builds on. Status: **v0.11.0**. Built, tested and measured on one machine ([below](#benchmarks));
+of prior work it builds on. Status: **v0.11.1**. Built, tested and measured on one machine ([below](#benchmarks));
 users report other setups. Not affiliated with Qwen or NVIDIA.
 
 ## Pick a model
@@ -185,12 +185,13 @@ How the engine runs these models, every server flag, the RAM tiers, the chat tem
 
 ### Optional speed switches (off by default)
 
-Three environment variables make prefill faster. All three are **off by default**: without them v0.11.0 gives the
-same tokens as v0.10.0. Set them in the server's environment, e.g. `NINFER_TP_AR_PAYLOAD=int8 ninfer-serve ...`.
+Two environment variables make Flash-Next prefill faster at the price of a small change in the numbers. Both are
+**off by default**. Set them in the server's environment, e.g. `NINFER_TP_AR_PAYLOAD=int8 ninfer-serve ...`. A third
+one, lossless, is on by default since v0.11.1 on pairs without P2P (`NINFER_TP_XIN_KERNEL=0` turns it off).
 
 | Variable | Applies to | What it changes | Prefill gain on Flash-Next (2x RTX 5070 Ti, fresh 30k-100k prompts) | Loss, our measurements |
 |---|---|---|---|---|
-| `NINFER_TP_XIN_KERNEL=1` | tp 2 without P2P | nothing in the numbers: the exchange between the GPUs is received by a kernel instead of queueing on the copy engine | 0 to +3 % on our setup; +6-7 % with `--kv-ram-active` | none, same tokens |
+| `NINFER_TP_XIN_KERNEL` (on by default without P2P since v0.11.1) | tp 2 without P2P | nothing in the numbers: the exchange between the GPUs is received by a kernel instead of queueing on the copy engine | 0 to +3 % on our setup; +6-7 % with `--kv-ram-active` | none, same tokens |
 | `NINFER_TP_AR_PAYLOAD=int8` | Flash-Next (no effect on the 27B) | the prefill exchange between the GPUs carries int8 codes with an FP16 scale per 32 rows instead of FP16 | +7-8 % | perplexity −0.22 % (NVFP4), −0.26 % (GSQ-RCO): within noise |
 | `NINFER_Q8_A8=128` (or `32`) | Flash-Next | the dense Q8 projections of the prefill run with int8 activations on the int8 tensor cores | +7-8 % | perplexity +0.21 % (NVFP4), +0.004 % (GSQ-RCO): within noise |
 
@@ -321,6 +322,10 @@ artifacts, runs the integration tests (`GATE_CTEST_EXCLUDE` excludes more), then
 greedy texts against a recorded reference ([tools/tp2/README.md](tools/tp2/README.md)).
 
 ## What's new
+
+**v0.11.1** ([release notes](https://github.com/ValerioDolci/capy-flash/releases/tag/v0.11.1))
+- The lossless receive of the tp-2 exchange by kernel ([PR #66](https://github.com/ValerioDolci/capy-flash/pull/66)) is on
+  by default on pairs without P2P; `NINFER_TP_XIN_KERNEL=0` restores the copy engine. Same tokens as v0.11.0.
 
 **v0.11.0** ([release notes](https://github.com/ValerioDolci/capy-flash/releases/tag/v0.11.0))
 - Faster prefill, same bits at the default: Flash-Next +13 % at 30k-100k (QSA attention at two CTAs per SM, fused

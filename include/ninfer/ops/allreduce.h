@@ -369,8 +369,8 @@ private:
     Pending pending_;
     std::int64_t calls_ = 0;
     std::array<cudaStream_t, 2> receive_{nullptr, nullptr};
-    // NINFER_TP_XIN_KERNEL=1 on a pair without peer access: the T62 receive leg is read by a
-    // kernel.
+    // On a pair without peer access (unless NINFER_TP_XIN_KERNEL=0): the T62 receive leg is read by
+    // a kernel.
     bool receive_by_kernel_ = false;
     std::array<cudaEvent_t, 2> begun_{nullptr, nullptr};
     std::array<cudaEvent_t, 2> received_{nullptr, nullptr};

@@ -56,10 +56,13 @@ endforeach()
 add_test(NAME ninfer_moe_route_simt_test COMMAND ninfer_moe_route_test)
 set_tests_properties(ninfer_moe_route_simt_test PROPERTIES ENVIRONMENT "NINFER_QWEN4_ROUTER_MMA=0")
 
-# The T62 exchange with its receive leg read by a kernel instead of the copy engine (NINFER_TP_XIN_KERNEL=1, on
-# a pair without peer access) through the same test; skips with fewer than two GPUs like the test itself.
+# The T62 exchange receives by kernel on a pair without peer access by default (since v0.11.1); the same test
+# with NINFER_TP_XIN_KERNEL=0 keeps the copy-engine path covered. Skips with fewer than two GPUs like the test.
 add_test(NAME ninfer_allreduce_f32_xin_test COMMAND ninfer_allreduce_f32_test)
 set_tests_properties(ninfer_allreduce_f32_xin_test PROPERTIES ENVIRONMENT "NINFER_TP_XIN_KERNEL=1"
+                     SKIP_RETURN_CODE 77)
+add_test(NAME ninfer_allreduce_f32_copy_test COMMAND ninfer_allreduce_f32_test)
+set_tests_properties(ninfer_allreduce_f32_copy_test PROPERTIES ENVIRONMENT "NINFER_TP_XIN_KERNEL=0"
                      SKIP_RETURN_CODE 77)
 # Q8 prefill on int8 tensor cores (ops/linear/q8/q8_a8.h) against an exact float oracle.
 ninfer_add_op_test(ninfer_q8_a8_test

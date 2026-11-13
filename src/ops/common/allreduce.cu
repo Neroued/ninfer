@@ -378,8 +378,9 @@ void detail::require_allreduce_sum_arguments(const std::array<Tensor, 2>& buffer
 }
 
 namespace {
-// NINFER_TP_XIN_KERNEL=1 moves the T62 exchange's host-to-device leg off the copy engine on a pair
-// without peer access (with peer access the copy stays as it is). A GPU's host-to-device copies run
+// On a pair without peer access the T62 exchange's host-to-device leg is read by a kernel, off the
+// copy engine (default since v0.11.1; NINFER_TP_XIN_KERNEL=0 keeps the copy; with peer access the
+// copy stays as it is). A GPU's host-to-device copies run
 // one after another from a single queue (an 8 MiB copy issued during a 512 MiB upload on another
 // stream finishes with the upload: 16.6 ms instead of 0.31 ms, whatever the stream priority or the
 // upload's piece size), so in a streamed prefill each exchange copy waits behind the next layer's
@@ -388,7 +389,7 @@ namespace {
 bool xin_kernel_enabled() {
     static const bool on = [] {
         const char* v = std::getenv("NINFER_TP_XIN_KERNEL");
-        return v != nullptr && v[0] == '1';
+        return v == nullptr || v[0] != '0';
     }();
     return on;
 }

@@ -2,6 +2,10 @@ ninfer_add_op_test(ninfer_kimi_delta_attention_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/kimi_delta_attention/recurrence.cpp"
   LIBRARIES ninfer_ops)
 
+ninfer_add_op_test(ninfer_video_delta_attention_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/video_delta_attention/test.cpp"
+  LIBRARIES ninfer_ops)
+
 ninfer_add_op_test(ninfer_kda_replay_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/kimi_delta_attention/replay.cpp"
   LIBRARIES ninfer_ops)

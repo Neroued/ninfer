@@ -15,6 +15,8 @@ ninfer_add_op_bench(ninfer_linear_topk_keys_bench
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/linear_topk_keys_bench.cu")
 ninfer_add_op_bench(ninfer_kimi_delta_attention_bench
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/linear_attention/kimi_delta_attention/main.cu")
+ninfer_add_op_bench(ninfer_video_delta_attention_bench
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/linear_attention/video_delta_attention/main.cu")
 ninfer_add_op_bench(ninfer_rope_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/rope_bench.cu")
 ninfer_add_op_bench(ninfer_rmsnorm_rope_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/rmsnorm_rope_bench.cu")
 ninfer_add_op_bench(ninfer_axial_rope_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/axial_rope_bench.cu")

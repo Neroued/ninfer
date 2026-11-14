@@ -19,8 +19,6 @@ namespace {
 
 using Json = RequestJson;
 
-constexpr std::size_t kMaxToolNameLength = 128;
-
 enum class ParsePurpose {
     Messages,
     CountTokens,

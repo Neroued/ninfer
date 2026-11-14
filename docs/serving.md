@@ -230,10 +230,14 @@ or perform recursive JSON Schema validation on this non-strict route.
 
 On Qwen's unconstrained route, string parameters preserve function/tool-call markers and balanced nested
 `<parameter=...>...</parameter>` text as value bytes. The Qwen wire format has no delimiter escape,
-so an unmatched nested parameter opener or a standalone `</parameter>` cannot be represented
-unambiguously. After a declared function header has started, malformed structure fails that request
-with `invalid_tool_output`; earlier tool events are never retracted into ordinary content.
-An unrecognized Qwen header on the free-generation route can still be returned as text.
+so an unmatched nested parameter opener cannot be represented unambiguously. A standalone
+`</parameter>` ends the value only when whitespace and the next `<parameter=` or `</function>`
+follow it; otherwise it is value text, and a closer whose continuation cannot be decided fails
+the request with `invalid_tool_output`. After a declared function header has started, malformed
+structure fails that request with `invalid_tool_output`; earlier tool events are never retracted
+into ordinary content. An unrecognized Qwen header on the free-generation route is returned as
+text, and scanning continues: prose that quotes a tool-call opener stays content, and a later
+complete call is still decoded. A malformed header after a completed call still fails the request.
 GLM uses `<tool_call>`, `<arg_key>` and `<arg_value>` framing. Its raw argument values end at
 `</arg_value>`; clients continue to send and receive protocol tool objects, not these model markers.
 

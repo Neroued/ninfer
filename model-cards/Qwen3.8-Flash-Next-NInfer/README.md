@@ -146,7 +146,7 @@ The optimized head does not crop the vocabulary. Select it with
 Build the current NInfer checkout using its
 [build instructions](https://github.com/Neroued/ninfer#build). One Spark uses the
 `dgx-spark-release` preset. For two Sparks, build the same revision on each node with
-`-DNINFER_ENABLE_DISTRIBUTED=ON` and NCCL development dependencies installed.
+`-DNINFER_ENABLE_DISTRIBUTED=ON` and NCCL/libibverbs development dependencies installed.
 
 From the NInfer repository root:
 
@@ -175,7 +175,7 @@ memory requirement: KV/State, workspace and enabled components also affect capac
 
 - Text, image/video prompts, streaming, tool calls and constrained output.
 - Native MTP with 1..5 drafts, full or optimized head; enable Vision with `--vision`.
-- CUDA Graph decode, prefix reuse and up to eight active requests.
+- CUDA Graph decode, prefix reuse and configurable resident-request capacity.
 - CLI, OpenAI Chat/Responses and Anthropic Messages through the same Engine.
 - Thinking enabled by default. The maintained template supports `low`, `medium`, `xhigh` effort;
   `high`/`max` map to `xhigh`, `minimal` to `low`, and `none` disables thinking.

@@ -12,7 +12,7 @@
 | L | 各 ADP rank 共同使用的局部 Attention 行数 | 同一模型计划 |
 | W | 当前数学阶段的 token 列数 | 模型/backend |
 
-并发没有固定八行上限。配置解释正整数；资源规划验证实际工作集；Op 负责自己的数学和表示范围。
+并发容量由配置给出；资源规划验证实际工作集；Op 负责自己的数学和表示范围。
 调用方不复制这些限制。C 是驻留容量，不是每轮计算量，也不承诺所有请求同时达到最大上下文。
 
 Runtime 处理逻辑成员、票据与生命周期，不决定 Graph 桶或 ADP 行布局。Session 的模型 Work 持有
@@ -21,8 +21,9 @@ ContextWork 只描述存储动作，不携带计算批次。其绑定合同为�
 
 ## Graph 几何
 
-共享 `models/common/batch` 只负责桶、取整和可行几何，各模型保留自己的数学组合与 Graph 组织。
-默认桶为 `1..8, 10,12,14,16, 20,24,28,32, ...`，每个倍增区间分四档，并包含最终 C。
+共享 [BatchExecutionPlan](../../src/models/common/batch.h)负责桶、取整和可行几何，
+各模型保留自己的数学组合与 Graph 组织。小批次采用精确桶，大容量使用稀疏桶并覆盖最终 C；
+具体分桶策略由[实现](../../src/models/common/batch.cpp)维护。
 关闭 Graph 时 Decode 使用精确几何；Prefill、Replay、Score 和 Control 保持各自的精确几何。
 
 Qwen Decode 使用 P；GLM 的 ADP Decode 使用 `(P,L)`。P 对 B 向上取整，L 对实际最大 owner
@@ -73,8 +74,8 @@ padding selectors 为 -1，长度和计数为零；有效域判断先于选中�
 
 ## Frame 与生命周期
 
-每个模型由自己的 Layout、Region 与 typed view 定义帧，不依赖固定 C++ 数组的 `sizeof/offsetof`。
-启动时分配实际峰值 backing，各 Graph 桶共享它；桶只持有轻量布局和视图，不复制 logits、records
+每个模型拥有帧布局及对应视图。启动时分配实际峰值 backing，各 Graph 桶共享它；
+桶只持有轻量布局和视图，不复制 logits、records
 或 workspace。资源的索引域保持明确：
 
 - 驻留 token counts、conditioning 等按 C，使用真实 residency 身份访问。
@@ -83,8 +84,8 @@ padding selectors 为 -1，长度和计数为零；有效域判断先于选中�
 - 持久 State/page selectors 属于 Context owner，不把物理行号当成持久 slot。
 
 控制区采用当前 P/L/W 的紧凑布局，Host/Device 视图和复制范围由 frame owner 同时生成。
-小 B 不上传整份 C 容量控制区。绑定时的 pinned token-count staging 只需一行词表，Device 驻留
-计数表仍覆盖 C。不同 Graph 桶可以使用同一 backing 的不同控制偏移，遵守 frame 复用边界。
+小 B 只上传本轮控制数据。Context 绑定 staging 按绑定事务分配，Device 驻留计数表覆盖 C。
+不同 Graph 桶可以使用同一 backing 的不同控制偏移，遵守 frame 复用边界。
 
 PLE producer window 拥有容量化 metadata；真实 identity 只有 B 项，embedding 视图覆盖 P/W。
 producer 不为 padding 读取 SSD 或生成 identity，pipeline 保持窗口到最后消费者结束。
@@ -99,14 +100,9 @@ Host producer 或来源借用，lane 复用不能改变旧 ticket 的统计归�
 区间内的非单调分派。GLM 将局部 Attention 容量与全局 roots 分开求高水位，避免逐层重复枚举
 所有 global/local 组合。Vision 沿用共享有界窗口，不随 C 为每个请求复制 encoder workspace。
 
-Session 用 resident identity 索引与 sequence 自有在途状态判断成员；临时检重只处理本轮成员。
-Engine 维护请求在途事实和 placement 负载，避免每次观测、准入重复反查整批或全体驻留请求。
-准入扫描按独立的有界工作批次推进游标，保持 FIFO 旁路额度与 service turn；终态、取消和候选
-枚举使用单遍或排序，配置容量不决定一次控制轮必须处理多少昂贵候选。
-
-ResourceManager 在发生压力后才建立回收计划。checkpoint 反向引用、owner 索引和压缩前缀边索引
-支持直接查询；原生 checkpoint revision 与策略引用变化决定是否需要清理目录。回收仍按共享资源
-实际边际收益选择，不能用静态评分替代集合释放语义。
+Session 持有成员身份与在途状态，Engine 持有请求和 placement 负载。准入扫描的单次工作量
+与 C 解耦，保持公平推进；批量结束先结算成员与快照，再通知各请求，各自保留独立计时截止点。
+缓存来源与回收沿用 [Context 策略](context-management.md)，复杂度按实际候选与动作评估。
 
 模型声明完整 Work/Decision/Commit payload 上界，Executor 根据 frame 数与 rank 数准备 Transport
 的独立发送、continuation 和接收额度。额度是有界传输合同，不等于立即分配其上限大小的 buffer；

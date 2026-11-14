@@ -29,7 +29,7 @@ V3 的一个入口和可选续卷组成有序逻辑 payload。对象偏移属于
 不改变对象的 codec 或身份。Reader 通过目录定位文件，调用者不从续卷名称猜参数位置。
 
 Binding 描述逻辑参数与对象区域的关系，Use 描述它在某个输入位置的 activation permission
-和辅助值。同一权重可有不同用途；weight divisor 属于权重表示，activation divisor 属于使用位置。
+和辅助值。同一权重可有不同用途；weight scale 属于权重表示，activation scale 属于使用位置。
 资源是带明确消费者的 bytes，可承载 tokenizer/template，也可承载 PLE hash controls。
 
 可选组件只绑定和物化实际选择的依赖。Main head 与 optimized draft head 可以有不同表示；
@@ -46,13 +46,20 @@ Format 定义 codes、scales 与重建值；layout 定义这些 words 的 packin
 | 表示 | 需要保留的数值关系 |
 |---|---|
 | Groupwise INT | 有符号 code 乘实际存储的 FP16 group scale；group 轴与合法 code 域由格式固定 |
-| NVFP4 | E2M1 code × E4M3 block scale ÷ FP32 matrix divisor；每个矩阵有自己的 divisor 域 |
-| Row / block FP8 | E4M3 code 乘对应行或块的 BF16 scale |
+| `nvfp4` | E2M1 code × E4M3 block scale ÷ FP32 matrix divisor |
+| `nvfp4_mul` | E2M1 code × E4M3 block scale × FP32 matrix multiplier |
+| MXFP8 | E4M3FN code × 每 K32 group 的 UE8M0 multiplier |
+| Row / block FP8 | E4M3 code × 对应行或块的 scale；row 使用 BF16，block 按格式保留 BF16 或 FP32 |
 | NF4 | 固定 codebook、E4M3 group scale 与 divisor；PLE 的 BF16 lookup 有精确舍入要求 |
 
-NVFP4 源若使用 multiplier，导入为 divisor 会产生 FP32 reciprocal 舍入；保留 codes/scales
-不等于承诺所有重建值与源逐位相同。量化 encoder 使用实际存储 scale 的规则、零值、尾部和
-舍入顺序由对应实现及独立数值测试维护，不在模型文档复制算法。
+NVFP4 的 matrix scale 域随每个矩阵保留。将源 multiplier 导入为 divisor 会产生 FP32 reciprocal
+舍入；`nvfp4_mul` 则直接保留 multiplier。Activation divisor/multiplier 属于 Use，并可按 expert
+分别绑定，不能混用乘除语义。
+
+FP4 Local 的 CSF 是 block scales 的压缩布局。转换、编码分片与设备 backing 保留压缩 planes，
+Op 在计算中直接解码所需 scales，不物化整份展开副本。CSF 的寻址、异常项及分片重组由
+[Weight views](../../src/core/weight_view.h)和 [encoded slice](../../src/artifact/encoded_slice.h)维护。
+Encoder 的 scale 舍入、零值与尾部规则由对应实现及独立数值测试维护。
 
 `A16Only`、`AllowA8`、`AllowA4` 表达允许的 activation 表示集合。融合共享量化取相关 Use
 的交集；许可不承诺实际执行某种 MMA。验证标准按公开许可选择，见[Op 开发](op-development.md#数值验证)。

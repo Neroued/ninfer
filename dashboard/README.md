@@ -63,6 +63,8 @@ The dashboard can run on a different machine from the engine.
 The dashboard reads `/monitor/info`, `/monitor/snapshot`, and `/monitor/events`.
 It has no authentication or engine-control actions. GPU timing details are available
 when GPU timing is enabled in the engine; missing measurements appear as `—`.
+The collector sends no API credentials; use a Serve endpoint it can access without authentication.
+The engine endpoints are described in the [monitoring API](../docs/serving.md#monitoring-api).
 
 Configuration paths are relative to the configuration file. Defaults in the example:
 
@@ -111,10 +113,14 @@ aggregation as history, and zooming restores detail within the stored resolution
 Window summaries preserve counts, elapsed totals, histogram bins and time-weighted gauges.
 Queries select complete stored observations by their end time.
 
-Context usage represents physical backing and includes reservations, retirement and
-layout space. KV and State are subsets of the pool. Token capacity is the engine's
-estimate. GPU intervals are per measured interval and can overlap. Communication
-payload is the quantity passed to collectives, not measured network traffic.
+The Context headline shows request/execution use divided by pool capacity. Bars distinguish
+`in use`, cache-only records, reservations and retirement/layout space; hover shows their
+KV/State breakdown. Shared records count once, with request use taking precedence over cache
+ownership. Free space includes assigned and unassigned free capacity. Token capacity is the
+engine's estimate. The underlying accounting is defined in
+[observability](../docs/maintainer/observability.md#资源的边界).
+GPU intervals can overlap. Communication payload is the quantity passed to collectives, not
+measured network traffic.
 
 Engine restarts create separate histories. Connection gaps stay unobserved, and live
 events have no upstream replay. Request fields that were not observed remain unknown.

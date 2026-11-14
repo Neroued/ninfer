@@ -10,7 +10,8 @@
 不重新选择请求、缓存来源或逻辑页。
 
 本地进程通过 posix_spawn、远端通过非交互 SSH 启动。Bootstrap 在 CUDA 初始化前交付 rank、
-节点、设备和环境。SSH 承担启动与进程日志；持久控制连接承担命令和结果；GPU 数据通过 NCCL。
+节点、设备和环境。SSH 承担启动与进程日志；持久控制连接承担命令和结果；设备数据由公共通信
+接口交给选定的 Native 或 NCCL 后端。
 
 模型 ParallelPlan 从全局 config 与绑定派生权重切片、局部几何、状态 placement、通信角色和
 拓扑。全局 config 不改成局部 head 数。参数切片、输出组合和 State/history 必须来自同一计划。
@@ -66,9 +67,19 @@ Compute 的结果由指定结果方交付，退役覆盖全部必要参与者；
 模型定义哪里需要完整结果、局部贡献或按行汇集；collective Op 和通信后端实现相应数学与 stream
 效果。Op 不持有请求调度，通信后端不解释层序、缓存价值或 speculative 前沿。
 
+模型声明 group、collective 的 dtype/count 范围及 peer 传输需求。通信准备收集各 rank 的能力，
+按目标策略选择共同覆盖这些需求的路线，达成一致后才连接并预热。执行只使用已准备的路线。
+双 rank Spark 的自动策略优先 Native；其他需求按能力选择 NCCL。后端选择和支持判断属于
+[communication](../../src/distributed/communication.h)，模型不固定某个库或复制消息尺寸阈值。
+
+Native 使用 RDMA 链路、设备 kernel 与 Host progress 线程完成传输和归约；NCCL 实现同一合同。
+只为选中的后端建立执行资源，按声明需求准备容量与预热操作。通信资源由执行组持有，跨 Program
+和 Graph 重建保留；销毁前先结束所有设备与网络消费者。
+网络设备选择见[启动配置](../startup-configuration.md#environment-controls)。
+
 同一执行要求各参与方匹配通信次序、count、dtype 与角色。某侧没有本地 expert 或 attention 行，
 仍履行已安排的通信。多个 communicator 的相对提交顺序也属于模型执行合同。
-NCCL 的入队进度与设备完成分别处理，后续设备工作按实际入队和 stream 依赖推进。
+Host 入队、网络推进与设备完成分别处理，后续工作按实际 stream 依赖推进。
 
 计算和通信可以一起捕获。上下文长度只改变局部 Attention kernel 时，在固定外层图内更新 child，
 保持通信节点和缓冲稳定。只有实际需要不同计算几何或通信形状时才创建图变体，

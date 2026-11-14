@@ -39,8 +39,10 @@ Flash Next's current execution scope is documented [here](maintainer/qwen4_exp-m
 | How long does the full fixed request set take? | Corpus makespan, Corpus decode, Requests/s |
 | What aggregate decode rate is sustained at a full batch? | Steady decode |
 
-These rates use different time boundaries. Server TTFT is an internal phase sum; external
-streaming TTFT has its [own benchmark contract](../tools/bench/ttft/README.md). Stochastic runs
+These rates use different time boundaries. Current server TTFT follows the production first-token
+boundary; older serial reports used a phase sum. Preserve each run's metric definition, as described
+in the [methodology](performance/methodology.md#metrics-and-statistics). External streaming TTFT has
+its [own benchmark contract](../tools/bench/ttft/README.md). Stochastic runs
 can generate different token totals even with the same prompts and seeds. Output-limit and
 repetition samples remain labeled in the measured corpus; throughput alone does not establish
 successful task completion. See the [35B termination and anomalies](performance/qwen3.6-35b-a3b.md#termination-and-anomalies)

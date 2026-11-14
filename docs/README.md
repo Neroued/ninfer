@@ -11,6 +11,7 @@ run the CLI or HTTP server.
 | [Deployment configurations](../examples/configs/) | RTX 5090, single Spark and dual-Spark TOML examples |
 | [CLI](cli.md) | text, chat-history, image/video input, output streams, sampling, MTP, and common runtime options |
 | [HTTP serving](serving.md) | OpenAI Responses/Chat Completions, Anthropic Messages, state, streaming, token counting, authentication, and tool calls |
+| [Dashboard](../dashboard/README.md) | independent monitoring service, shared history, deployment and display semantics |
 | [Performance](performance.md) | RTX 5090 measurement coverage, per-model serving results, methodology, and publication rules |
 | [Weight conversion](weight-conversion.md) | official recipes, custom formats and sources, conversion methods, optional components and artifact output |
 | [Perplexity](perplexity.md) | fixed-corpus and custom-text causal perplexity, comparison rules, progress, and reports |
@@ -29,14 +30,14 @@ Published artifact downloads are listed in the [project README](../README.md).
 | Document | Responsibility |
 |---|---|
 | [Engine architecture](maintainer/engine-architecture.md) | 所有权、启动预算、请求与执行事务、提交和退役 |
-| [Concurrency execution](designs/concurrency-contract.md) | 驻留容量、逻辑成员、Graph 桶、ADP 行映射与 padding |
+| [Concurrent execution](maintainer/concurrent-execution.md) | 驻留容量、逻辑成员、Graph 桶、ADP 行映射与 padding |
 | [Distributed execution](maintainer/distributed-execution.md) | 集中调度、rank 准备、控制与数据通信、完整完成与失败 |
 | [Context management](maintainer/context-management.md) | KV/State 统一容量、身份、预留、前缀策略、ADP 与恢复 |
 | [Frontend](maintainer/frontend.md) | 模型策略与共享文本/媒体基础、输入身份、输出与 grammar 事务 |
 | [Weights and loading](maintainer/weights-and-loading.md) | 表示、绑定、转换、保值分片物化与 backing |
 | [Qwen3.5](maintainer/qwen3_5-model.md) | Dense/MoE、Main/MTP/DFlash、Vision 与状态组合 |
 | [Qwen4Exp](maintainer/qwen4_exp-model.md) | Flash Next、HC/QSA/PLE、量化、TP/EP 与执行组合 |
-| [GLM5Next](maintainer/glm5next-model.md) | KDA/MLA/mHC、量化、ADP、MTP/Vision 与 Graph |
+| [GLM5Next](maintainer/glm5next-model.md) | KDA/MLA/mHC、权重表示、ADP、MTP/DFlash2、Vision 与 Graph |
 | [Speculative execution](maintainer/speculative-decoding.md) | MTP 对齐、ReplaySSM、DFlash 分布与接受前缀 |
 | [Expert cache](maintainer/expert-weight-cache.md) | 固定与流式缓存、CPU/GPU 分工、上传和消费寿命 |
 | [Observability](maintainer/observability.md) | 时间和资源口径、测量窗口、rank 统计与日志边界 |
@@ -53,7 +54,6 @@ Published artifact downloads are listed in the [project README](../README.md).
 ## Open work
 
 [未完成事项](issue-checklist.md)保留待处理问题与 MLA 性能工作。
-Qwen4-27B 的[架构与量化](designs/qwen4-27b-rtx5090.md)及
-[Op 需求](designs/qwen4-27b-op-checklist.md)属于独立适配计划。
+Qwen4-27B 的[架构与量化](designs/qwen4-27b-rtx5090.md)保留独立预研的几何假设与表示选择。
 
 Qwen3.8-Flash-Next 使用 Qwen4Exp；Qwen3.8-27B 使用 Qwen3.5。

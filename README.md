@@ -5,7 +5,8 @@
 NInfer runs text and image/video generation through a local CLI or OpenAI- and
 Anthropic-compatible HTTP APIs. It supports single-device execution and model-parallel execution
 across two DGX Sparks, with CUDA Graph decode, speculative decoding, and shared-prefix caching.
-One Engine serves one model with up to eight active requests.
+One Engine serves one model with a configurable resident-request capacity. Startup checks the
+resources required by that capacity; decode batches use the requests currently ready to run.
 
 ## Supported models and deployments
 
@@ -14,7 +15,7 @@ One Engine serves one model with up to eight active requests.
 | Qwen3.6-27B / Qwen3.8-27B | Qwen3.5 Dense | RTX 5090 | MTP; DFlash2 for Qwen3.8-27B with companion weights |
 | Qwen3.6-35B-A3B | Qwen3.5 MoE | RTX 5090, resident or CPU expert offload | MTP or DFlash with companion weights |
 | Qwen3.8-Flash-Next | Qwen4Exp | RTX 5090 with CPU expert offload; one or two Sparks | MTP |
-| GLM-5.3-Flash | GLM5Next | Two Sparks | MTP |
+| GLM-5.3-Flash | GLM5Next | Two Sparks | MTP or DFlash2 with companion weights |
 
 All rows support text, Vision, tools, constrained output, and offline perplexity scoring.
 Vision and speculative decoding require the corresponding components in the artifact and must be
@@ -43,12 +44,17 @@ cmake --build build/rtx5090-release -j
 ```
 
 For a single Spark, use `dgx-spark-release` and `build/dgx-spark-release`.
-For two Sparks, install NCCL development headers and libraries and build on **both nodes**:
+For two Sparks, install NCCL and libibverbs development headers and libraries
+(`libibverbs-dev` on Debian/Ubuntu), then build on **both nodes**:
 
 ```bash
 cmake --preset dgx-spark-release -DNINFER_ENABLE_DISTRIBUTED=ON
 cmake --build build/dgx-spark-release -j
 ```
+
+Communication is selected during preparation. Two-rank Spark groups prefer the Native RDMA
+backend; NCCL remains available for other supported routes. See the
+[deployment guide](docs/startup-configuration.md#distributed-deployment) for network selection.
 
 Product binaries are `apps/ninfer`, `apps/ninfer-serve`, `apps/ninfer-perplexity`, and, with
 distributed execution enabled, `apps/ninfer-worker`. Run them from the build tree; keep its `lib/`
@@ -95,7 +101,9 @@ the entry file and pass only the entry path to NInfer. For two Sparks, place the
 node; rank-specific slicing happens during loading. The model cards describe their mixed precision,
 components and deployment options.
 
-For custom weights, follow [weight conversion](docs/weight-conversion.md). Older v2 files can be
+For custom weights, including GLM FP4 Local and additional companion components, follow
+[weight conversion](docs/weight-conversion.md). The download table describes the
+published artifacts recorded by their model cards. Older v2 files can be
 [upgraded locally](docs/weight-conversion.md#upgrade-an-existing-v2-artifact).
 
 ## Run
@@ -242,6 +250,7 @@ docker run --rm --gpus '"device=0"' --publish 8080:8080 \
 
 - [Deployment configurations](examples/configs/) and [startup parameters](docs/startup-configuration.md)
 - [CLI](docs/cli.md), [HTTP serving](docs/serving.md), and [perplexity](docs/perplexity.md)
+- [Monitoring API](docs/serving.md#monitoring-api) and [Dashboard](dashboard/README.md)
 - [Weight conversion](docs/weight-conversion.md)
 - [Recorded performance](docs/performance.md), [benchmarks](bench/README.md), and [evaluation](eval/README.md)
 - [Documentation index](docs/README.md) and [contributing](CONTRIBUTING.md)

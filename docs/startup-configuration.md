@@ -93,6 +93,10 @@ Weight formats are stored in the artifact and are independent of `kv_dtype`. Opt
 must be present when enabled. Supported model/deployment combinations are listed in the
 [README](../README.md#supported-models-and-deployments).
 
+`max_concurrency` has no fixed eight-request ceiling. Increasing it reserves a larger resident
+working set and may require more execution and Graph storage. Actual decode work and metrics use
+the batch selected for that step; startup rejects capacities that do not fit the available resources.
+
 ## Context and memory
 
 `max_context` is a logical limit. `context_capacity` is a physical byte budget shared by KV histories
@@ -221,9 +225,10 @@ coordinator node. It starts local workers directly and remote workers through no
 passes each worker its rank and deployment, and owns worker shutdown. Clients connect to one HTTP
 server; workers are internal execution processes.
 
-Both nodes need matching builds with `NINFER_ENABLE_DISTRIBUTED=ON`, NCCL, the artifact entry and all
-its parts. `model.path` is visible to the coordinator; each node's `artifact` is its local copy of
-the same model. Keep each worker's build `lib/` alongside `apps/`.
+Both nodes need matching builds with `NINFER_ENABLE_DISTRIBUTED=ON`, NCCL and libibverbs development
+dependencies, the artifact entry and all its parts. `model.path` is visible to the coordinator;
+each node's `artifact` is its local copy of the same model. Keep each worker's build `lib/` alongside
+`apps/`.
 
 Distributed settings are TOML fields; there are no `--tp`/`--ep` command-line aliases.
 
@@ -243,7 +248,7 @@ Distributed settings are TOML fields; there are no `--tp`/`--ep` command-line al
 | `distributed.nodes[].ssh` | SSH destination | Required for remote nodes; omitted for the coordinator node |
 | `distributed.nodes[].worker` | Required absolute path | Product `ninfer-worker` on that node |
 | `distributed.nodes[].artifact` | Required absolute path | Artifact entry on that node |
-| `distributed.nodes[].environment` | String-to-string table / empty | Worker environment, including NCCL network selection |
+| `distributed.nodes[].environment` | String-to-string table / empty | Worker environment, including Native RDMA or NCCL network selection |
 | `distributed.ranks[].rank` | Required unique integer | Global rank; contiguous from 0 |
 | `distributed.ranks[].node` | Required node ID | Hosting node |
 | `distributed.ranks[].device` | Nonnegative integer / 0 | CUDA ordinal on that node |
@@ -260,10 +265,14 @@ whole experts while other TP partitions remain. GLM attention DP places each req
 on an attention owner within the same model execution group; it is not an independent model replica.
 The concurrency setting is the group-wide active-request limit.
 
-NCCL handles GPU collectives. `control_host` selects the control listener, not the NCCL data path.
-Use per-node `environment` entries to select the intended network/HCA; the examples show their
-placement. Startup logs identify rank/node phases and actual resources. One-device execution needs
-no `[distributed]` section.
+Communication preparation selects routes from the declared operations, payload ranges and the
+capabilities shared by the participating ranks. Two-rank Spark groups prefer Native RDMA;
+NCCL covers other supported routes. Only selected backends establish execution resources.
+
+`control_host` selects the control listener. Select the data-path HCA through each node's
+`environment`, using `NINFER_COMM_HCA` for Native or the relevant `NCCL_*` controls for NCCL.
+These are backend-specific settings. Startup observations identify the selected backends and their
+resources. One-device execution needs no `[distributed]` section.
 
 ## Environment controls
 
@@ -272,9 +281,12 @@ no `[distributed]` section.
 | `NINFER_VRAM_BUDGET_MIB` | Positive integer MiB cap on the Engine's device allocation budget; useful for RTX 5090 expert offload |
 | `NINFER_CUDA_SYNC` | `spin` (default), `blocking`, `yield`, or `auto`; CUDA host-wait scheduling |
 | `NINFER_KPOOL_INDEXER_BF16` | GLM indexer uses FP8 by default; `1` selects BF16 at startup, independently of latent `kv_dtype` |
+| `NINFER_COMM_HCA` | Native RDMA: comma-separated local HCA names; unset allows discovery of available devices |
+| `NINFER_COMM_CPU` | Native progress thread: OS CPU index; unset selects from the process's permitted CPUs |
 
 `spin` prioritizes host wakeup latency; `blocking` sleeps while waiting. `auto` selects CUDA's
 scheduling heuristic. These environment controls are separate from TOML. Set the GLM indexer override
 on the coordinator before launch; the selected format is passed to every rank. CUDA synchronization,
 VRAM budget and `NCCL_*` environment settings are forwarded to workers; per-node environment entries
-override the forwarded values.
+override the forwarded values. Set `NINFER_COMM_HCA` and `NINFER_COMM_CPU` in each node's environment
+table when needed; they are not automatically forwarded from the coordinator environment.

@@ -119,7 +119,7 @@ positions、有效长度和行映射进入。图变体只表达必要的物理�
 
 需要 Host grammar、CPU expert 或最终接受结果的边界显式交接。可捕获的连续设备段保持完整，
 PLE 的数据来源本身不决定 Main 切图。图、事件和注册视图先于其借用的 backing 销毁。
-批次容量、物理桶、空行与存储 stride 见[并发执行合同](../designs/concurrency-contract.md)。
+批次容量、物理桶、空行与存储 stride 见[并发执行合同](concurrent-execution.md)。
 各模型的组合差异见模型文档和[Speculative 执行](speculative-decoding.md)。
 
 ## 维护入口

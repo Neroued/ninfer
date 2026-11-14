@@ -46,6 +46,9 @@ See [thinking options](cli.md#thinking-and-sampling) before copying model-specif
 |---|---|
 | `GET /health` | Engine readiness |
 | `GET /metrics` | Prometheus counters, gauges and latency histograms |
+| `GET /monitor/info` | Instance identity, effective configuration, topology and startup resources |
+| `GET /monitor/snapshot` | Published Engine/Service counters, resources and current request observations |
+| `GET /monitor/events` | Live monitoring events over SSE |
 | `GET /v1/models` | configured OpenAI model alias and effective `max_model_len` |
 | `GET /v1/models/{id}` | lookup of the configured alias and effective `max_model_len` |
 | `POST /v1/chat/completions` | OpenAI-style chat generation |
@@ -924,6 +927,29 @@ request bodies, credentials, or arbitrary client error messages.
 If a tool marker is returned to text because its structure or tool identity cannot be represented,
 Serve emits one warning with only the failure classification, never the generated markup.
 
+## Monitoring API
+
+`/monitor/info`, `/monitor/snapshot` and `/monitor/events` are read-only endpoints on the same
+listener and follow the server's API-key authentication. The first two return JSON; events use SSE.
+They expose observations without submitting model work or resetting counters.
+
+- Info describes the instance, selected model/backend, effective configuration, rank/placement
+  topology and startup resources. Credentials are redacted.
+- Snapshot contains `engine` and `service` observations, including execution samples, per-rank
+  resources and current requests. Missing timing samples remain unmeasured.
+- Events describe live request/service transitions. Subscribers are bounded; capacity exhaustion
+  returns HTTP 503. The stream has no historical replay.
+
+Use `server_instance_id` to separate engine runs. Rates come from counter deltas over observed time;
+decode timings are grouped by actual batch. Context `live` bytes split into `in_use` and `cached`:
+request/execution references take precedence over cache ownership, and shared records count once.
+Reservations, pending retirement and layout overhead are separate occupancies.
+
+The independent [Dashboard](../dashboard/README.md) collects these endpoints and owns its SQLite
+history. Historical storage and window aggregation belong to the observer. Monitoring payloads do
+not include prompts, generated text or media. Metric boundaries are defined in
+[observability](maintainer/observability.md).
+
 ## Live metrics
 
 `GET /metrics` serves Prometheus text format 0.0.4 on the same port. It follows the server's
@@ -943,8 +969,10 @@ curl http://127.0.0.1:8080/metrics
 | `ninfer_prefill_tokens_total`, `ninfer_replayed_tokens_total` | Actual initial prefill and separate recovery recomputation |
 | `ninfer_generation_tokens_total`, `ninfer_decode_tokens_total` | All committed outputs, or decode/control outputs excluding the first token; include thinking and injected control tokens |
 | `ninfer_spec_decode_{rounds,draft_tokens,accepted_tokens,fallback_steps}_total` | Live native speculative work, including MTP and DFlash/DFlash2 |
+| `ninfer_spec_decode_position_tokens_total{kind,position}` | Attempted and accepted draft tokens at each zero-based position |
 | `ninfer_{preemptions,snapshot_restores,replay_restores}_total` | Pressure pauses and recovery routes |
 | `ninfer_context_pool_bytes{rank,domain,kind}` | Per-rank Device/Host capacity, live, reserved, pending retirement, padding, assigned/unassigned free and tail bytes |
+| `ninfer_context_pool_live_bytes{rank,domain,kind}` | Disjoint `in_use` and `cached` portions of live records |
 | `ninfer_context_pool_reserved_detail_bytes{rank,domain,kind}`, `ninfer_context_pool_peak_bytes{rank,domain}` | Relocation subset, future reservations and peak physical occupancy |
 | `ninfer_context_{state,history}_objects`, `ninfer_context_kv_page_groups{pool_id}` | Logical object counts, without independent capacity quotas |
 | `ninfer_context_metadata_{budget,allocated,reserved}_bytes` | Coordinator Context metadata budget and usage |
@@ -955,6 +983,7 @@ curl http://127.0.0.1:8080/metrics
 | `ninfer_constraint_draft_wait_seconds_total` | Live draft-ready wait counted once per batch; a subset of device wait |
 | `ninfer_requests_total{outcome}`, `ninfer_response_failures_total` | Generation attempts entering preparation and subsequent response failures; protocol/model validation failures and token-count requests are excluded |
 | `ninfer_rank_gpu_interval_seconds_total`, `ninfer_rank_gpu_interval_samples_total` | Per-rank CUDA stream totals and sample counts; require GPU timing |
+| `ninfer_execution_units_total`, `ninfer_execution_rows_total`, `ninfer_execution_positions_total`, `ninfer_execution_elapsed_seconds_total` | Completed work and all-rank retirement time by execution kind |
 | `ninfer_memory_allocation_bytes{rank,node,resource,location}` | Explicit per-rank allocations, separate from physical-memory snapshots |
 | `ninfer_communication_calls_total`, `ninfer_communication_payload_bytes_total` | Collectives by rank/group/path/operation; API payload bytes, not NIC traffic |
 | `ninfer_time_to_first_token_seconds` | Histogram updated once at the first committed token, including preparation, queueing and binding |
@@ -981,7 +1010,9 @@ in append mode and flushes every event, so successive model or MTP blocks may sh
 file. The parent directory must already exist. Failure to open the file aborts startup; the log path
 is also rejected if it resolves to the model artifact.
 
-Every line is one `ninfer_serve_request_log` schema-v31 JSON object. All events carry
+Every line is one `ninfer_serve_request_log` JSON object with a `schema_version` identifying its
+field contract. The current version is defined in [request_log.h](../src/serve/request_log.h).
+All events carry
 `timestamp_unix_ms` and a process-unique `server_instance_id`; request IDs are monotonic only within
 that server instance. Successful request-start records include request-scoped acquisition,
 media-preprocessing wall/work, tokenizer, cache hit/miss/single-flight, and payload-size fields;

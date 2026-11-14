@@ -1,7 +1,7 @@
 # 观测与日志
 
 观测描述实际发生的工作、资源和时间。生产者拥有事实，公共类型承担交接，产品层决定展示。
-Pretty 日志、JSONL、metrics 与 bench 不通过解析彼此的文本获得数据。
+Pretty 日志、JSONL、metrics、monitor API 与 Engine bench 消费共同的 typed observations。
 
 ## 所有权
 
@@ -17,7 +17,8 @@ Engine 记录请求生命周期、调度工作和协调侧执行边界；模型/
 
 | 指标 | 解释 |
 |---|---|
-| 请求 TTFT | 首次有效输出对应的请求边界；不以 prepare、Vision、prefill 相加代替 |
+| 服务端 TTFT | 请求准备开始至第一个已提交生成 token，包含准备、排队与绑定 |
+| First output | 首个非空文本或工具参数增量的发布边界，与首 token 分开记录 |
 | 执行 Result | 从提交到结果可供控制侧读取 |
 | Resolution | 结果可用之后的解释、决定及提交交接区间 |
 | Retirement | 后续设备提交与最终资源退役区间 |
@@ -29,6 +30,7 @@ Prefill chunk 和 decode step 使用执行样本。Decode 按实际 batch 分组
 解释目标并发的延迟。Spec 的实际接受量与执行时间分开，token/s 不能代替每步计算成本。
 
 首 token、结果返回、提交被接受和最后消费者退出不是同一个时刻。
+批量请求结束先发布结算后的快照，再通知请求完成；每个请求按自己的完成时点结算 Host exposure。
 Replay 单独计工作，不重复计公开输出；取消保留已经发生的工作成本。
 CPU grammar、GPU forward 和通信可以重叠，细分时间不能无条件加到总 wall time。
 
@@ -43,6 +45,11 @@ CPU grammar、GPU forward 和通信可以重叠，细分时间不能无条件加
 Context capacity 是 KV 与 State 共享的 backing。Token capacity 展示使用模型提供的参考工作集
 与容量模型估计，说明在该配置下可承载的量级；不是划出的纯 KV 配额，也不是并发满长保证。
 ADP 的独立 owner 容量与 TP 的共同分片约束由模型聚合，展示层不自行求和或取最小值。
+
+Materialized live records 按用途分成互斥的 `in_use` 与 `cached`。存在请求或执行引用时归入
+`in_use`，仅由缓存持有时归入 `cached`；共享记录只计一次，KV 与 State 使用相同口径。
+`live = in_use + cached`。Reserved、待退役和布局空间分别计费，不混入 live。
+面板主百分比使用 `in_use / capacity`，同时展示 cached、free 及各 rank 的明细。
 
 启动预算分列可消耗 headroom、必须保留的 Host 容量和规划余量。最后的可用物理内存不是
 规划余量，二者不可互换。Graph/通信准备的内存增长含驱动与惰性资源；Graph 释放后仍驻留的
@@ -77,3 +84,12 @@ profiler 并保留原始错误。窗口可以复用自然预热的缓存，不�
 请求机器终态与后续响应传输错误分开，避免一次请求产生两份相互矛盾的结算。
 
 呈现与资源写出入口在 [product](../../src/product/)和 [serve](../../src/serve/)。
+
+## 对外监控
+
+Serve 的 `/monitor/info` 提供实例配置与启动资源，`/monitor/snapshot` 提供当前 Engine/Service
+快照，`/monitor/events` 提供有界的实时事件流。它们与 Prometheus `/metrics` 共用生产观测；
+HTTP 合同见[Serve 指南](../serving.md#monitoring-api)。
+
+长期采样、窗口聚合和历史存储由观察者持有。独立 [Dashboard](../../dashboard/README.md)负责
+持续采集与 SQLite 历史，Engine 只维护执行所需状态、累计计数和有界分布。

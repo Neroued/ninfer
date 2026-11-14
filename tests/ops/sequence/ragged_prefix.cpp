@@ -50,16 +50,17 @@ int run_case(int rows, int width, int batch, bool padded, int mode, bool replay)
             for (auto& bits : source) bits ^= 0xa35c;
         std::fill(expected.begin(), expected.end(), 0);
         for (int b = 0; b < batch; ++b) {
-            lanes[b]           = LaneOrder[(b + 3 * phase) % 8];
-            starts[b]          = 1023 + 317 * b + 259001 * phase;
-            const int pattern  = (b + width + phase) % 4;
-            const int count    = mode == 0      ? 0
-                                 : mode == 2    ? width
-                                 : mode == 3    ? 1
-                                 : pattern == 0 ? width
-                                 : pattern == 1 ? std::max(width - 1, 0)
-                                 : pattern == 2 ? 1
-                                                : 0;
+            lanes[b]          = LaneOrder[(b + 3 * phase) % 8];
+            starts[b]         = 1023 + 317 * b + 259001 * phase;
+            const int pattern = (b + width + phase) % 4;
+            const int count   = mode == 0      ? 0
+                                : mode == 2    ? width
+                                : mode == 3    ? 1
+                                : pattern == 0 ? width
+                                : pattern == 1 ? std::max(width - 1, 0)
+                                : pattern == 2 ? 1
+                                               : 0;
+            if (!count) lanes[b] = -1;
             ends[b]            = starts[b] + count;
             expected_counts[b] = count;
             for (int column = 0; column < width; ++column) {
@@ -122,8 +123,12 @@ void add_ragged_prefix_cases(ninfer::test::OpSuite& suite) {
         const auto id = "ragged_prefix/" + std::to_string(rows) + "/w" + std::to_string(width) +
                         "/b" + std::to_string(batch) + "/mode" + std::to_string(mode) +
                         (padded ? "/padded" : "/contiguous") + (replay ? "/graph" : "/eager");
-        suite.add(id, [=] { return run_case(rows, width, batch, padded, mode, replay); },
-                  {{"execution", replay ? "graph" : "eager"}});
+        std::vector<std::pair<std::string, std::string>> tags{
+            {"execution", replay ? "graph" : "eager"}};
+        if (batch > 8) tags.emplace_back("suite", "concurrency");
+        suite.add(
+            id, [=] { return run_case(rows, width, batch, padded, mode, replay); },
+            std::move(tags));
     };
 
     for (int batch = 1; batch <= 8; ++batch)
@@ -135,4 +140,6 @@ void add_ragged_prefix_cases(ninfer::test::OpSuite& suite) {
     for (int rows : {8, 24, 16384})
         for (int width : {1, 3, 16}) add(rows, width, 8, true, 1, true);
     add(25600, 17, 1, true, 1, true);
+    add(256, 7, 17, true, 1, true);
+    add(256, 1, 64, false, 1, true);
 }

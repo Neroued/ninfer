@@ -10,7 +10,8 @@ using namespace ninfer::test;
 using namespace ninfer::test::ple;
 
 namespace {
-int run(DeviceContext& device, int batch, int layout, bool inplace, bool sliced) {
+int run(DeviceContext& device, int batch, int layout, bool inplace, bool sliced,
+        bool masked = false) {
     constexpr int capacity = 19;
     const int slots        = batch + 3;
     Words source({D, 9, slots}, layout == 1, history_strides(slots, layout));
@@ -33,10 +34,14 @@ int run(DeviceContext& device, int batch, int layout, bool inplace, bool sliced)
                       Tensor(dd.span(), DType::I64, {batch}))};
     ops::PleConvRecordReadView read{records.tensor, Tensor(dv.span(), DType::I32, {batch})};
     Tensor counts(da.span(), DType::I32, {batch});
+    std::vector<int> active(batch, 1);
+    auto live_storage = to_device(active);
+    Tensor live       = masked ? Tensor(live_storage.span(), DType::I32, {batch}) : Tensor{};
     DecodeGraphDefinition definition;
     DecodeGraphExecutable graph;
     int failures = 0;
     for (int extent = 0; extent <= capacity; ++extent) {
+        if (masked && extent != 0 && extent != 2 && extent != 9 && extent != 19) continue;
         source.upload();
         destination.upload();
         records.upload();
@@ -44,33 +49,40 @@ int run(DeviceContext& device, int batch, int layout, bool inplace, bool sliced)
             sources[b]      = inplace ? b + 2 : (extent % 2 ? 1 : b + 2);
             destinations[b] = inplace ? (sliced ? b : b + 2) : batch - b;
             accepted[b]     = (extent + b) % (capacity + 1);
+            active[b]       = !masked || (b + extent) % 3 != 0;
         }
-        upload_offsets(ds, before, sources);
-        upload_offsets(dd, after, destinations);
+        auto source_offsets      = history_offsets(before, sources);
+        auto destination_offsets = history_offsets(after, destinations);
+        for (int b = 0; b < batch; ++b)
+            if (!active[b]) source_offsets[b] = destination_offsets[b] = -1;
+        ds.copy_from_host(source_offsets.data(), ds.size());
+        dd.copy_from_host(destination_offsets.data(), dd.size());
+        upload_i32(live_storage, active);
         upload_i32(da, accepted);
         auto expected = inplace ? source.host : destination.host;
         for (int b = 0; b < batch; ++b)
-            for (int c = 0; c < D; ++c) {
-                std::array<std::uint16_t, capacity + 9> sequence;
-                for (int j = 0; j < 9; ++j)
-                    sequence[j] = source.host[source.index(c, j, sources[b])];
-                for (int j = 0; j < accepted[b]; ++j)
-                    sequence[9 + j] = records.host[records.index(c, j, b)];
-                for (int j = 0; j < 9; ++j) {
-                    const auto dst = inplace ? source.index(c, j, b + 2)
-                                             : destination.index(c, j, destinations[b]);
-                    expected[dst]  = sequence[accepted[b] + j];
+            if (active[b])
+                for (int c = 0; c < D; ++c) {
+                    std::array<std::uint16_t, capacity + 9> sequence;
+                    for (int j = 0; j < 9; ++j)
+                        sequence[j] = source.host[source.index(c, j, sources[b])];
+                    for (int j = 0; j < accepted[b]; ++j)
+                        sequence[9 + j] = records.host[records.index(c, j, b)];
+                    for (int j = 0; j < 9; ++j) {
+                        const auto dst = inplace ? source.index(c, j, b + 2)
+                                                 : destination.index(c, j, destinations[b]);
+                        expected[dst]  = sequence[accepted[b] + j];
+                    }
                 }
-            }
         cuda_synchronize();
         if (!extent) {
             definition.capture(device.stream(), [&] {
-                ops::ple_state_extract(input, read, counts, output, device.execution_view());
+                ops::ple_state_extract(input, read, counts, output, live, device.execution_view());
             });
             graph.instantiate(definition);
         }
         if (extent % 2)
-            ops::ple_state_extract(input, read, counts, output, device.execution_view());
+            ops::ple_state_extract(input, read, counts, output, live, device.execution_view());
         else
             graph.launch(device.stream());
         device.synchronize();
@@ -85,10 +97,9 @@ int run(DeviceContext& device, int batch, int layout, bool inplace, bool sliced)
         failures += source.device->verify_guards(label) + destination.device->verify_guards(label);
         failures += verify_exact("accepted preserved", from_device<int>(da, batch), accepted);
         failures += verify_exact("source slots preserved", from_device<std::int64_t>(ds, batch),
-                                 history_offsets(before, sources));
-        failures +=
-            verify_exact("destination slots preserved", from_device<std::int64_t>(dd, batch),
-                         history_offsets(after, destinations));
+                                 source_offsets);
+        failures += verify_exact("destination slots preserved",
+                                 from_device<std::int64_t>(dd, batch), destination_offsets);
         failures += verify_exact("valid preserved", from_device<int>(dv, batch), valid);
     }
     return failures;
@@ -103,6 +114,9 @@ void add_ple_state_extract_cases(ninfer::test::OpSuite& suite) {
                   [=] { return run(cuda_environment().context, batch, layout, inplace, sliced); },
                   {{"execution", "graph"}});
     };
+    suite.add("ple_state_extract/b17/masked",
+              [] { return run(cuda_environment().context, 17, 0, false, false, true); },
+              {{"execution", "graph"}, {"suite", "concurrency"}});
     for (int layout : {0, 1, 2}) {
         add(1, layout, false, false);
         add(8, layout, false, false);

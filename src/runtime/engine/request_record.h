@@ -9,12 +9,14 @@
 #include "runtime/executor/contract.h"
 #include "runtime/observability/execution.h"
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <exception>
 #include <memory>
+#include <map>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -28,6 +30,11 @@ enum class RequestEngineHostPhase : std::uint8_t {
     Boundary,
     CommitOutput,
     Maintenance,
+};
+
+struct HostExposureClock {
+    std::array<std::uint64_t, 3> engine{};
+    std::array<std::uint64_t, 4> calls{};
 };
 
 struct RequestHostTiming {
@@ -82,6 +89,16 @@ struct RequestHostTiming {
             else
                 decode_host_exposed_ns += elapsed;
         }
+    }
+
+    void expose_since(const HostExposureClock& first, const HostExposureClock& last,
+                      bool decode_member) noexcept {
+        for (std::size_t i = 0; i < first.engine.size(); ++i)
+            expose_engine(static_cast<RequestEngineHostPhase>(i), last.engine[i] - first.engine[i],
+                          decode_member);
+        for (std::size_t i = 0; i < first.calls.size(); ++i)
+            expose_call(static_cast<CoordinatorCall>(i), last.calls[i] - first.calls[i],
+                        decode_member);
     }
 
     [[nodiscard]] GenerationEngineTiming public_snapshot() const noexcept {
@@ -236,10 +253,12 @@ struct RequestRecord {
     std::optional<Clock::time_point> paused_at;
     std::uint32_t computed_prompt_tokens = 0;
     RequestExecutionStatistics executions;
-    std::vector<ExecutionExposure> decode_by_batch;
+    std::map<std::uint32_t, ExecutionExposure> decode_by_batch;
+    bool execution_in_flight = false;
     GpuIntervalCounters max_rank_gpu{};
     std::optional<ExecutionSample> pending_execution;
     RequestHostTiming host_timing;
+    std::optional<std::size_t> completion_index, completion_exposure_row;
     std::uint64_t initial_binding_ns = 0;
     std::vector<ContextTransferSeries> context_transfers;
     std::optional<GenerationFirstOutputTiming> first_output_timing;

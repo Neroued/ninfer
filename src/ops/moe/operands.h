@@ -19,6 +19,7 @@ class MoeOperands {
 public:
     MoeOperands(const char* operation, CudaExecutionView execution);
     int input(const Tensor& x, int hidden);
+    void validity(const MoeTokenValidity&, int tokens);
     void output(const Tensor& y, int hidden, int tokens, MoeEpilogue epilogue);
     void control(const Weight& control, const RouteProfile& profile);
     void sigmoid_control(const Weight& control, const RouteProfile& profile);

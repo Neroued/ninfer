@@ -1,5 +1,7 @@
 #pragma once
 
+#include <map>
+
 #include "models/qwen4_exp/program/graphs.h"
 
 namespace ninfer::models::qwen4_exp::detail {
@@ -42,7 +44,7 @@ private:
     [[nodiscard]] std::size_t bound(std::uint32_t visible) const;
     RankProgramImpl& owner_;
     std::vector<std::uint32_t> bounds_;
-    std::vector<Batch> batches_;
+    std::map<std::uint32_t, Batch> batches_;
     std::size_t workspace_peak_ = 0;
 };
 

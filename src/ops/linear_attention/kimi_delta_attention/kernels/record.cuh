@@ -2,16 +2,27 @@
 #include "ops/linear_attention/kimi_delta_attention/kernels/transition.cuh"
 
 namespace ninfer::ops::detail::kimi_delta_attention {
-template <int Steps, int Rows>
-__global__ __launch_bounds__(128, 2) void staged_record_kernel(Arguments a,
-                                                               const std::int64_t* sources,
-                                                               const std::int32_t* lengths,
-                                                               RecurrenceRecords records) {
+template <int Steps, int Rows, bool GroupStateTiles = false, int TokenUnroll = Steps,
+          bool PackedTransition = false>
+__global__
+__launch_bounds__(128, 2) void staged_record_kernel(Arguments a, const std::int64_t* sources,
+                                                    const std::int32_t* lengths,
+                                                    RecurrenceRecords records, int row_begin) {
     const int lane = threadIdx.x, warp = threadIdx.y;
-    const int head = blockIdx.x, batch = blockIdx.y, tile = blockIdx.z;
+    constexpr int tiles = 128 / (4 * Rows);
+    const int head      = GroupStateTiles ? blockIdx.x / tiles : blockIdx.x;
+    const int tile      = GroupStateTiles ? blockIdx.x % tiles : blockIdx.z;
+    const int batch     = row_begin + blockIdx.y;
     const int qhead = head / (a.value_heads / a.qk_heads), dk = lane * 4;
     const int dv    = tile * (4 * Rows) + warp * Rows;
     const int valid = lengths ? lengths[batch] : a.tokens;
+    if (!valid) {
+        if (lane < Rows)
+            for (int t = 0; t < a.tokens; ++t)
+                a.out[((std::int64_t(batch) * a.tokens + t) * a.value_heads + head) * 128 + dv +
+                      lane] = __float2bfloat16(0.0F);
+        return;
+    }
     const auto state_base =
         sources[batch] / sizeof(float) + static_cast<std::int64_t>(head) * 128 * 128;
     __align__(16) float state[Rows][4];
@@ -27,7 +38,7 @@ __global__ __launch_bounds__(128, 2) void staged_record_kernel(Arguments a,
     float a_scale = lane == 0 ? expf(a.a_log[head]) : 0.0F;
     a_scale       = __shfl_sync(common::kFullWarpMask, a_scale, 0);
     for (int begin = 0; begin < valid; begin += Steps) {
-#pragma unroll
+#pragma unroll TokenUnroll
         for (int offset = warp; offset < Steps; offset += 4) {
             const int t = begin + offset;
             if (t < valid) {
@@ -70,7 +81,7 @@ __global__ __launch_bounds__(128, 2) void staged_record_kernel(Arguments a,
             }
         }
         __syncthreads();
-#pragma unroll
+#pragma unroll TokenUnroll
         for (int offset = 0; offset < Steps; ++offset)
             if (begin + offset < valid) {
                 float key[4], query[4], alpha[4];
@@ -78,7 +89,31 @@ __global__ __launch_bounds__(128, 2) void staged_record_kernel(Arguments a,
                 common::store_vec(query, common::load_vec<float4>(stage.query[offset] + dk));
                 common::store_vec(alpha, common::load_vec<float4>(stage.alpha[offset] + dk));
                 const float value = lane < Rows ? stage.value[offset][dv + lane] : 0.0F;
-                apply_transition(state, key, alpha, value, stage.beta[offset]);
+                if constexpr (PackedTransition) {
+                    static_assert(Rows % 4 == 0);
+                    float values[Rows];
+#pragma unroll
+                    for (int part = 0; part < Rows / 4; ++part)
+                        common::store_vec(
+                            values + part * 4,
+                            common::load_vec<float4>(stage.value[offset] + dv + part * 4));
+#pragma unroll
+                    for (int row = 0; row < Rows; ++row) {
+                        float prediction = 0.0F;
+#pragma unroll
+                        for (int column = 0; column < 4; ++column) {
+                            state[row][column] *= alpha[column];
+                            prediction = fmaf(state[row][column], key[column], prediction);
+                        }
+                        prediction        = common::warp_sum<32>(prediction);
+                        const float delta = stage.beta[offset] * (values[row] - prediction);
+#pragma unroll
+                        for (int column = 0; column < 4; ++column)
+                            state[row][column] = fmaf(delta, key[column], state[row][column]);
+                    }
+                } else {
+                    apply_transition(state, key, alpha, value, stage.beta[offset]);
+                }
                 const auto col = static_cast<std::int64_t>(batch) * a.tokens + begin + offset;
                 store_readout(state, query, a.out + (col * a.value_heads + head) * 128, dv, lane,
                               a.scale);

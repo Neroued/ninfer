@@ -10,7 +10,7 @@ std::size_t workspace_bytes(const ops::MoeProfile& profile, ops::MoeEpilogue epi
 
 void execute(const Tensor& hidden, const Parameters& parameters,
              const ExpertBankDeviceView& experts, ops::MoeEpilogue epilogue, Tensor& output,
-             MemoryArena& workspace, CudaExecutionView execution,
+             ops::MoeTokenValidity validity, MemoryArena& workspace, CudaExecutionView execution,
              const ops::MoeExecutionHints& hints) {
     auto scope         = workspace.scope();
     const auto columns = hidden.ne[1];
@@ -20,7 +20,7 @@ void execute(const Tensor& hidden, const Parameters& parameters,
     const ops::MoeWeights weights{
         parameters.control, {experts, parameters.activation_calibration}, parameters.shared};
     ops::topk_softmax_swiglu_moe(hidden, parameters.profile, weights, parameters.subset, epilogue,
-                                 output, scratch, execution, hints);
+                                 output, validity, scratch, execution, hints);
 }
 
 } // namespace ninfer::models::moe

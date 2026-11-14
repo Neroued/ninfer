@@ -25,13 +25,16 @@ struct Case {
     bool mask                 = false;
     bool dense                = false;
     float input_scale         = 1.F;
+    bool padded               = false;
+    bool none                 = false;
 };
 
 std::string case_id(Profile profile, const Case& c) {
     return "native/" + std::string(profile_name(profile)) + "/" +
            (c.complete ? "complete" : "routed") + "/T" + std::to_string(c.tokens) + "/" +
            c.distribution + "/" + c.locality + (c.dense ? "/dense" : "") +
-           (c.input_scale != 1.F ? "/small-input" : "");
+           (c.input_scale != 1.F ? "/small-input" : "") + (c.padded ? "/validity" : "") +
+           (c.none ? "/shared-only" : "");
 }
 
 int run(Fixture& f, const Case& c, CudaExecutionView cuda) {
@@ -44,6 +47,7 @@ int run(Fixture& f, const Case& c, CudaExecutionView cuda) {
     if (c.mask)
         subset = {ops::ExpertSubsetKind::MaskZeros,
                   Tensor(mask_storage.span(), DType::I32, {Fixture::experts_count})};
+    if (c.none) subset = {ops::ExpertSubsetKind::None, {}};
     const auto capacity =
         c.complete
             ? ops::topk_sigmoid_swiglu_moe_workspace_capacity_bytes(f.complete_profile(),
@@ -59,14 +63,26 @@ int run(Fixture& f, const Case& c, CudaExecutionView cuda) {
     const auto profile          = f.routed_profile();
     const auto complete_profile = f.complete_profile();
     const auto experts          = f.expert_weights();
-    const auto weights          = f.complete_weights();
-    const auto call             = [&] {
+    auto weights                = f.complete_weights();
+    if (c.none) {
+        weights.control         = {};
+        weights.correction_bias = {};
+        weights.routed          = {};
+    }
+    std::vector<int> columns(c.padded ? c.tokens / 2 : 0);
+    DeviceBuffer valid(cuda.device(), columns.size() * sizeof(int));
+    const ops::MoeTokenValidity validity{
+        c.padded ? Tensor(valid.span(), DType::I32, {int(columns.size())}) : Tensor{}, 2};
+    const auto call = [&] {
         if (c.complete)
-            ops::topk_sigmoid_swiglu_moe(x, complete_profile, weights, subset, y, workspace, cuda);
+            ops::topk_sigmoid_swiglu_moe(x, complete_profile, weights, subset, y, validity,
+                                         workspace, cuda);
         else
             ops::routed_swiglu(x, profile, experts, routes, subset, c.epilogue, y, workspace, cuda);
     };
     const auto prepare = [&](int phase) {
+        for (std::size_t row = 0; row < columns.size(); ++row) columns[row] = (row + phase) % 3;
+        if (c.padded) valid.copy_from_host(columns.data(), valid.size());
         const auto* offset              = std::getenv("NINFER_NATIVE_MOE_EXPERT_OFFSET");
         const std::string_view locality = std::string_view(c.locality) == "transition"
                                               ? (phase ? "remote" : "local")
@@ -118,6 +134,12 @@ int run(Fixture& f, const Case& c, CudaExecutionView cuda) {
         if (std::any_of(output.begin(), output.end(), [](double x) { return !std::isfinite(x); }))
             throw std::runtime_error(label + ": non-finite or unwritten output");
         Oracle oracle(f);
+        if (c.padded)
+            for (int token = 0; token < c.tokens; ++token) {
+                if (token % 2 < columns[token / 2]) continue;
+                for (int row = 0; row < Fixture::hidden; ++row)
+                    if (output[std::size_t(token) * Fixture::hidden + row] != 0) ++failures;
+            }
         std::vector<double> got, expected;
         std::set<int> rows{0, 1, 31, 32, 63, 64, 127, 128, 1023, 1024, 2047, 2048, 4094, 4095};
         for (int i = 0; i < 128; ++i) rows.insert(i * (Fixture::hidden - 1) / 127);
@@ -126,13 +148,16 @@ int run(Fixture& f, const Case& c, CudaExecutionView cuda) {
             allowed.resize(mask.size());
             std::transform(mask.begin(), mask.end(), allowed.begin(), [](int v) { return 1 - v; });
         }
+        if (c.none) allowed.assign(Fixture::experts_count, 0);
         // Adjacent tail tokens cover both halves of alternating expert pools.
         for (int token : std::set<int>{0, std::max(0, c.tokens - 2), c.tokens - 1})
             for (int row : rows) {
                 const auto index = std::size_t(token) * Fixture::hidden + row;
                 got.push_back(output[index]);
-                expected.push_back(oracle.output(row, token, c.complete, allowed) +
-                                   bf16_to_f32(residual[index]));
+                expected.push_back(c.padded && token % 2 >= columns[token / 2]
+                                       ? 0
+                                       : oracle.output(row, token, c.complete, allowed) +
+                                             bf16_to_f32(residual[index]));
             }
         failures += verify_reduction(label, got, expected, criterion);
         failures +=
@@ -152,6 +177,7 @@ int run(Fixture& f, const Case& c, CudaExecutionView cuda) {
 void add_native_cases(OpSuite& suite) {
     for (Profile profile : {Profile::MainTp, Profile::MainEp, Profile::MtpTp, Profile::MtpEp}) {
         std::vector<Case> calls{
+            {.tokens = 18, .complete = true, .graph = true, .padded = true},
             {1, false, false, DType::FP32},
             {3, false, false, DType::BF16, ops::MoeEpilogue::AddResidual, "tail"},
             {17, false, true, DType::BF16, ops::MoeEpilogue::Write, "pool", "mixed", true},
@@ -211,6 +237,11 @@ void add_native_cases(OpSuite& suite) {
             calls.push_back({2049, true, true, DType::BF16, ops::MoeEpilogue::Write, "pool"});
         }
         if (profile == Profile::MtpTp || profile == Profile::MtpEp) {
+            if (profile == Profile::MtpTp)
+                calls.push_back({.tokens = 512, .complete = true, .graph = true, .padded = true});
+            if (profile == Profile::MtpTp)
+                calls.push_back(
+                    {.tokens = 512, .complete = true, .graph = true, .padded = true, .none = true});
             calls.push_back(
                 {.tokens = 1, .distribution = "reuse", .dense = true, .input_scale = 1e-4F});
             calls.push_back({.tokens       = 33,
@@ -291,7 +322,7 @@ void add_native_cases(OpSuite& suite) {
                 {2049, true, true, DType::BF16, ops::MoeEpilogue::Write, "pool", "mixed"});
         }
         std::vector<OpCase> catalogue;
-        for (const auto& c : calls)
+        for (const auto& c : calls) {
             catalogue.push_back(
                 {case_id(profile, c),
                  {{"format", "nvfp4_mul"},
@@ -299,6 +330,8 @@ void add_native_cases(OpSuite& suite) {
                   {"policy", profile == Profile::MainTp || profile == Profile::MainEp ? "a4"
                              : c.complete                                             ? "a8"
                                                                                       : "a16"}}});
+            if (c.padded) catalogue.back().tags.emplace_back("suite", "concurrency");
+        }
         suite.add(std::move(catalogue), [profile, calls](auto selected) {
             const auto cuda = cuda_environment().context.execution_view();
             int maximum     = 1;

@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cassert>
+#include <map>
 #include <stdexcept>
 #include <tuple>
 #include <utility>
@@ -57,6 +58,7 @@ void finalize_mappings(ContextActions& actions) {
     };
 
     std::vector<RowUpdates> rows;
+    std::map<std::pair<std::uint32_t, std::int32_t>, std::size_t> row_index;
     ContextActions ordered;
     ordered.operations.reserve(actions.operations.size());
     for (auto& action : actions.operations) {
@@ -66,14 +68,10 @@ void finalize_mappings(ContextActions& actions) {
             continue;
         }
         if (update->offsets.empty()) continue;
-        auto row = std::find_if(rows.begin(), rows.end(), [&](const auto& existing) {
-            return existing.pool_id == update->pool_id && existing.row == update->row;
-        });
-        if (row == rows.end()) {
-            rows.push_back({update->pool_id, update->row, {}});
-            row = rows.end() - 1;
-        }
-        auto& ranges         = row->ranges;
+        const auto [row, inserted] =
+            row_index.try_emplace({update->pool_id, update->row}, rows.size());
+        if (inserted) { rows.push_back({update->pool_id, update->row, {}}); }
+        auto& ranges         = rows[row->second].ranges;
         const auto new_begin = update->logical_begin;
         const auto new_end   = new_begin + update->offsets.size();
         auto first           = std::lower_bound(ranges.begin(), ranges.end(), new_begin,
@@ -520,33 +518,10 @@ ContextAssessment ContextDirectory::assess(const ContextDemand& demand,
     const auto releases = normalized_releases(released.records);
     result.placement    = records_.assess(requests, releases);
     result.status       = ContextAvailability::Ready;
-    for (const auto& rank : spec_.ranks) {
-        std::vector<RecordSpec> specs;
-        for (const auto& layout : record_layouts(spec_))
-            for (const auto& part : layout.parts)
-                if (part.rank == rank.rank) specs.push_back(part.record);
-        const auto geometry = describe_context_pool(specs);
-        for (const auto memory : {ContextMemory::Device, ContextMemory::Host}) {
-            std::vector<RecordRequest> local;
-            for (const auto& request : requests) {
-                if (request.memory != memory || !request.count) continue;
-                if (!request.ranks.empty() && std::find(request.ranks.begin(), request.ranks.end(),
-                                                        rank.rank) == request.ranks.end())
-                    continue;
-                const auto& layout = records_.layout(request.layout);
-                const auto part =
-                    std::find_if(layout.parts.begin(), layout.parts.end(),
-                                 [&](const auto& value) { return value.rank == rank.rank; });
-                if (part == layout.parts.end()) continue;
-                const auto index =
-                    std::find(specs.begin(), specs.end(), part->record) - specs.begin();
-                local.push_back({geometry.spec_classes[index], request.count});
-            }
-            if (geometry.required_bytes(local) >
-                records_.pool({rank.rank, memory}).capacity_bytes()) {
-                result.status = ContextAvailability::Impossible;
-                return result;
-            }
+    for (const auto& domain : result.placement.domains) {
+        if (domain.minimum_bytes > records_.pool(domain.domain).capacity_bytes()) {
+            result.status = ContextAvailability::Impossible;
+            return result;
         }
     }
 

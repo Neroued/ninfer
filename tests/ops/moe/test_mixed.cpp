@@ -47,7 +47,8 @@ int test_mixed(Fixture& fixture, CudaExecutionView execution, CpuExecutionView c
             {fixture.weights().shared, device_batch.shared}, MoeEpilogue::Write, gpu_output,
             gpu_arena, execution);
         const std::array contributions{cpu_on_device, gpu_output};
-        ops::sum_contributions(contributions, &device_batch.residual, destination, execution);
+        ops::sum_contributions(contributions, &device_batch.residual, destination, {}, 1,
+                               execution);
         cuda_synchronize(execution.stream());
         const auto reference = fixture.contribution(batch, ExpertSubsetKind::All, {}, true, true);
         const auto actual    = from_device_bf16(destination.data, reference.size());

@@ -127,5 +127,9 @@ int run(int width, int batch, int axes, bool mapped) {
 void add_causal_pairs_cases(OpSuite& suite) {
     suite.add("causal_pairs/identity", [] { return run(1, 1, 0, false); });
     suite.add("causal_pairs/owner_rope", [] { return run(6, 8, 3, true); });
+    suite.add("causal_pairs/b17/identity", [] { return run(4, 17, 1, false); },
+              {{"suite", "concurrency"}});
+    suite.add("causal_pairs/b17/owner", [] { return run(4, 17, 3, true); },
+              {{"suite", "concurrency"}});
     suite.add("causal_pairs/sequence_rope", [] { return run(65, 1, 1, false); });
 }

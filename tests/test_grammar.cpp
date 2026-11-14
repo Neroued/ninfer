@@ -346,6 +346,12 @@ int main() {
         thinking->confirm();
         require(allows(mask(*thinking), 256), "thinking wrapper did not reach content completion");
 
+        auto closed = compile(compiler, "root ::= \"answer\"", "\n</think>\n\n", {});
+        consume(*closed, "reason\n</think>\n\n");
+        const auto content = mask(*closed);
+        require(allows(content, 'a') && !allows(content, '<') && !allows(content, '\n'),
+                "reasoning delimiter overlap admitted a second close before content");
+
         for (const auto& source : {"bad grammar", "root ::= missing", "root ::= Token(256)",
                                    "root ::= Regex(\".*\")", "root[temperature=0.5] ::= \"a\""}) {
             bool rejected = false;

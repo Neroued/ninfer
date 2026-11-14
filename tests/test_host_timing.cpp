@@ -58,6 +58,21 @@ int main() {
     request.expose_call(CoordinatorCall::Yield, 30, true);
     check(request.decode_host_exposed_ns == 35 && request.decode_scheduler_yield_exposed_ns == 30,
           "yield/relock latency is not host-active time or GPU time");
+    const HostExposureClock initial{};
+    const HostExposureClock first_end{{3, 5, 7}, {11, 13, 17, 19}};
+    const HostExposureClock batch_end{{30, 50, 70}, {110, 130, 170, 190}};
+    RequestHostTiming early, survivor;
+    auto first_output = early;
+    first_output.expose_since(initial, first_end, true);
+    check(early.decode_host_exposed_ns == 0 && first_output.decode_host_exposed_ns == 56,
+          "first-output exposure preview must not mutate pending counters");
+    early.expose_since(initial, first_end, true);
+    survivor.expose_since(initial, batch_end, false);
+    check(early.engine_commit_output_exposed_ns == 5 && early.decode_host_exposed_ns == 56 &&
+              early.decode_scheduler_yield_exposed_ns == 19 &&
+              survivor.engine_commit_output_exposed_ns == 50 &&
+              survivor.executor_flush_exposed_ns == 170 && survivor.decode_host_exposed_ns == 0,
+          "batch cleanup must preserve each completion cutoff and frozen decode membership");
     GpuExecutionObservation gpu;
     merge_gpu_intervals(gpu, {.result_stream_ns = 20, .prefill_stream_ns = 50});
     merge_gpu_intervals(gpu,

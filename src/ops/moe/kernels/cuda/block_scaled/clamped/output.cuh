@@ -11,9 +11,11 @@ struct DenseContributionWithValidity {
     float* values;
     int* valid_tokens;
 
-    __device__ __forceinline__ float initial(std::int64_t) const { return 0; }
+    __device__ __forceinline__ bool is_live(int) const { return true; }
 
-    __device__ __forceinline__ void store(std::int64_t index, float value) const {
+    __device__ __forceinline__ float initial(std::int64_t, bool) const { return 0; }
+
+    __device__ __forceinline__ void store(std::int64_t index, float value, bool) const {
         values[index] = value;
         if (index % kHidden == 0) valid_tokens[index / kHidden] = 1;
     }

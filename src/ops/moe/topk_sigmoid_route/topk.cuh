@@ -5,9 +5,16 @@ namespace ninfer::ops::detail::moe_cuda::routing {
 template <int Warps>
 __global__ __launch_bounds__(Warps * 32) void sigmoid_correction_top8(
     const float* logits, const float* bias, int* ids, float* coefficients, int tokens,
-    float scaling_factor, float normalization_epsilon) {
+    float scaling_factor, float normalization_epsilon, TokenValidity validity) {
     const int token = blockIdx.x * Warps + threadIdx.x / 32, lane = threadIdx.x & 31;
     if (token >= tokens) return;
+    if (!validity.contains(token)) {
+        if (lane < 8) {
+            ids[std::int64_t(token) * 8 + lane]          = -1;
+            coefficients[std::int64_t(token) * 8 + lane] = 0;
+        }
+        return;
+    }
     const float* scores = logits + std::int64_t(token) * 288;
     float value[9], probability[9];
 #pragma unroll

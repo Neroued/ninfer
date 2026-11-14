@@ -9,11 +9,12 @@
 namespace ninfer::ops::detail::qsa {
 namespace {
 template <KvCacheStorage Storage, bool Vector, SparseGqaLoad Load, int N, int Parts,
-          int PrefixQueries = 0, int KvHeads>
+          int PrefixQueries = 0, bool ScaleTile = false, int KvHeads>
 void launch_columns(SparseGqaKernelArguments<KvHeads> a, int queries, cudaStream_t stream) {
     constexpr bool SharedScales =
         SparseGqaCodec<Storage, true>::format == KvCacheVectorFormat::Fp8E4m3fnGroup128Ue8m0 &&
-        N == 16 && Parts == 2 && PrefixQueries == 8 && Vector && Load == SparseGqaLoad::Staged;
+        N == 16 && Parts == 2 && (PrefixQueries == 8 || ScaleTile) && Vector &&
+        Load == SparseGqaLoad::Staged;
     constexpr auto kernel = sparse_gqa_columns_kernel<Storage, N, Parts, Vector, Load,
                                                       PrefixQueries, SharedScales, KvHeads>;
     constexpr int bytes =
@@ -25,10 +26,13 @@ void launch_columns(SparseGqaKernelArguments<KvHeads> a, int queries, cudaStream
 
 template <KvCacheStorage Storage, bool Vector, SparseGqaLoad Load, int KvHeads>
 void launch_mma(SparseGqaKernelArguments<KvHeads> a, SparseGqaLaunchPlan plan, int queries,
-                cudaStream_t stream) {
+                cudaStream_t stream, bool direct_short = false) {
     switch (plan.kernel) {
     case SparseGqaKernel::Columns16:
-        launch_columns<Storage, Vector, Load, 16, 2>(a, queries, stream);
+        if (direct_short)
+            launch_columns<Storage, Vector, Load, 16, 2, 0, true>(a, queries, stream);
+        else
+            launch_columns<Storage, Vector, Load, 16, 2>(a, queries, stream);
         break;
     case SparseGqaKernel::Columns32:
         launch_columns<Storage, Vector, Load, 32, 2>(a, queries, stream);
@@ -87,6 +91,9 @@ void launch(const SparseGqaArguments& arguments, SparseGqaPlan plan, SparseGqaLa
         launch_columns<Storage, Vector, load, 16, 2, Queries>(a, queries, stream);
         return;
     }
+    const bool direct_short =
+        !plan.partial &&
+        queries >= sparse_gqa_direct_queries(a.kv_heads, execution.multiprocessor_count());
     if (plan.instance == SparseGqaInstance::Simt) {
         if (selected.kernel == SparseGqaKernel::Simt4)
             sparse_gqa_simt_kernel<Storage, 4, Vector>
@@ -96,14 +103,19 @@ void launch(const SparseGqaArguments& arguments, SparseGqaPlan plan, SparseGqaLa
                 <<<dim3(queries * a.query_heads, a.splits), 256, 0, stream>>>(a);
     } else if constexpr (Async) {
         if (selected.load == SparseGqaLoad::InPlace)
-            launch_mma<Storage, Vector, SparseGqaLoad::InPlace>(a, selected, queries, stream);
+            launch_mma<Storage, Vector, SparseGqaLoad::InPlace>(a, selected, queries, stream,
+                                                                direct_short);
         else
-            launch_mma<Storage, Vector, SparseGqaLoad::Staged>(a, selected, queries, stream);
+            launch_mma<Storage, Vector, SparseGqaLoad::Staged>(a, selected, queries, stream,
+                                                               direct_short);
     } else {
-        launch_mma<Storage, Vector, SparseGqaLoad::Direct>(a, selected, queries, stream);
+        launch_mma<Storage, Vector, SparseGqaLoad::Direct>(a, selected, queries, stream,
+                                                           direct_short);
     }
-    if (plan.partial)
-        sparse_gqa_merge_kernel<Storage><<<queries * a.query_heads, 128, 0, stream>>>(a);
+    if (plan.partial || plan.merge_node) {
+        const int blocks = plan.partial ? queries * a.query_heads : 1;
+        sparse_gqa_merge_kernel<Storage><<<blocks, 128, 0, stream>>>(a);
+    }
 }
 } // namespace
 

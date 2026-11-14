@@ -8,7 +8,7 @@
 #include <stdexcept>
 
 namespace ninfer::ops::detail::gated_delta_net {
-inline constexpr std::int32_t kMaximumReplayRows = 8;
+inline constexpr std::int32_t kHostFoldRows = 8;
 
 enum class FoldGeometryId { Layers48Heads48, Layers30Heads32, Layers36Heads48, Layers36Heads24 };
 
@@ -34,7 +34,7 @@ struct alignas(16) GdnReplayFoldKernelRow {
 };
 
 struct alignas(16) GdnReplayFoldKernelRows {
-    GdnReplayFoldKernelRow row[kMaximumReplayRows];
+    GdnReplayFoldKernelRow row[kHostFoldRows];
 };
 
 struct GdnReplayFoldDeviceRows {
@@ -50,8 +50,9 @@ void launch_recurrent_record(const Tensor& q, const Tensor& k, const Tensor& v, 
 
 void launch_replay_fold(const GdnReplayRecords& records, LinearAttentionStateAllLayersView states,
                         const GdnReplayFoldKernelRows& rows, std::int32_t active_rows,
-                        cudaStream_t stream);
+                        std::int32_t record_begin, cudaStream_t stream);
 void launch_replay_fold(const GdnReplayRecords&, LinearAttentionStateAllLayersView,
-                        const GdnReplayFoldDeviceRows&, std::int32_t active_rows, cudaStream_t);
+                        const GdnReplayFoldDeviceRows&, std::int32_t active_rows,
+                        std::int32_t record_begin, cudaStream_t);
 
 } // namespace ninfer::ops::detail::gated_delta_net

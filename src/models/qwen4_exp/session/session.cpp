@@ -15,8 +15,13 @@ SessionImpl::SessionImpl(std::shared_ptr<const ModelDefinition> model, SessionPl
                                                        ? shape.max_concurrency
                                                        : 0)),
       checkpoints(Checkpoints::capacity_for_metadata(directory.metadata_budget().limit()),
-                  directory.metadata_budget(), &recovery_index) {
+                  directory.metadata_budget(), &recovery_index),
+      sequences(shape.max_concurrency), epochs(shape.max_concurrency) {
+    resident_sequences.reserve(shape.max_concurrency);
     if (!definition) throw std::invalid_argument("invalid Qwen4Exp session definition");
+    if (!plan.batches || plan.batches->resident_capacity() != shape.max_concurrency ||
+        plan.batches->attention_owners() != 1)
+        throw std::invalid_argument("Qwen4Exp session has no matching batch plan");
     if (shape.purpose == EnginePurpose::Generation) {
         count_storage.acquire(
             TokenCountBuilder::capacity_bytes(definition->resources().text.public_token_count));
@@ -32,14 +37,14 @@ SessionImpl::~SessionImpl() { cleanup(); }
 std::uint32_t SessionImpl::pool_count() const noexcept { return plan.context.pools.size(); }
 
 bool SessionImpl::valid(SequenceHandle handle) const noexcept {
-    return std::any_of(sequences.begin(), sequences.end(), [&](const auto& s) {
-        return s && s->id == handle.value && s->epoch == handle.generation;
-    });
+    const auto found = resident_sequences.find(handle.value);
+    return found != resident_sequences.end() && found->second->epoch == handle.generation;
 }
 
 Sequence& SessionImpl::sequence(SequenceHandle handle) const {
-    for (const auto& s : sequences)
-        if (s && s->id == handle.value && s->epoch == handle.generation) return *s;
+    const auto found = resident_sequences.find(handle.value);
+    if (found != resident_sequences.end() && found->second->epoch == handle.generation)
+        return *found->second;
     throw std::logic_error("stale Qwen4Exp sequence");
 }
 
@@ -111,6 +116,10 @@ void SessionImpl::submit_releases() {
 }
 
 void SessionImpl::clear(Sequence& s) noexcept {
+    s.computing = false;
+    if (const auto found = resident_sequences.find(s.id);
+        found != resident_sequences.end() && found->second == &s)
+        resident_sequences.erase(found);
     vision_window.revoke(member(s));
     try {
         release_residency(member(s).residency);
@@ -344,9 +353,9 @@ bool Session::has_context_operation() const noexcept {
 }
 
 bool Session::execution_pending(SequenceHandle handle) const noexcept {
-    return impl_->compute &&
-           std::find(impl_->compute->members.begin(), impl_->compute->members.end(), handle) !=
-               impl_->compute->members.end();
+    const auto found = impl_->resident_sequences.find(handle.value);
+    return found != impl_->resident_sequences.end() && found->second->epoch == handle.generation &&
+           found->second->computing;
 }
 
 bool Session::context_blocks(SequenceHandle handle) const noexcept {

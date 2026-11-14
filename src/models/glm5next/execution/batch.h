@@ -15,7 +15,7 @@ struct AttentionBatchView {
 
 struct BatchView {
     std::int32_t tokens, rows;
-    Tensor ids, positions, valid_columns, source_offsets, destination_offsets;
+    Tensor ids, positions, valid_columns, source_offsets, destination_offsets, live_rows;
     AttentionBatchView attention;
     // Sequence execution has one owner and broadcasts its attention result. Decode uses
     // the fixed local capacity and an equal-size gather, independent of live owner counts.

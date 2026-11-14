@@ -202,9 +202,11 @@ void launch_batched_sequence_snapshot(const Tensor& x, const Tensor& weight,
     const std::int32_t C     = x.ne[0];
     const std::int32_t width = x.ne[1];
     const std::int32_t batch = x.ne[2];
-    const int block          = width == 1 ? 256 : 32;
-    const dim3 grid(grid_for(C, block, "batched sequence snapshot"),
-                    static_cast<unsigned int>(batch));
+    const int block          = width == 1 ? 256 : NINFER_TARGET_SPARK && batch > 8 ? 128 : 32;
+    const int batch_rows     = std::min(batch, 65535);
+    const dim3 grid(
+        grid_for(C, block, "batched sequence snapshot"), static_cast<unsigned int>(batch_rows),
+        static_cast<unsigned int>(common::div_up(std::int64_t(batch), std::int64_t(batch_rows))));
     causal_conv1d_batched_sequence_snapshot_kernel<Masked><<<grid, block, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(x.data), static_cast<const __nv_bfloat16*>(weight.data),
         reinterpret_cast<const __nv_bfloat16*>(
@@ -214,7 +216,7 @@ void launch_batched_sequence_snapshot(const Tensor& x, const Tensor& weight,
         Masked ? static_cast<const std::int32_t*>(valid_columns.data) : nullptr,
         static_cast<const std::int64_t*>(source.records.byte_offsets.data),
         static_cast<const std::int32_t*>(snapshot_base_slots.data),
-        static_cast<__nv_bfloat16*>(out.data), C, width, slot_stride);
+        static_cast<__nv_bfloat16*>(out.data), C, width, slot_stride, batch);
 }
 
 template <bool Masked>
@@ -226,9 +228,12 @@ void launch_batched_parallel_snapshot(const Tensor& x, const Tensor& weight,
     const std::int32_t C     = x.ne[0];
     const std::int32_t width = x.ne[1];
     const std::int32_t batch = x.ne[2];
+    const int batch_rows     = std::min(batch, 65535);
     const dim3 block(kCausalConvChannelTile, static_cast<unsigned int>(width));
-    const dim3 grid(grid_for(C, kCausalConvChannelTile, "batched small-T snapshot"),
-                    static_cast<unsigned int>(batch));
+    const dim3 grid(
+        grid_for(C, kCausalConvChannelTile, "batched small-T snapshot"),
+        static_cast<unsigned int>(batch_rows),
+        static_cast<unsigned int>(common::div_up(std::int64_t(batch), std::int64_t(batch_rows))));
     causal_conv1d_batched_snapshot_smallt_kernel<Masked><<<grid, block, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(x.data), static_cast<const __nv_bfloat16*>(weight.data),
         reinterpret_cast<const __nv_bfloat16*>(
@@ -238,7 +243,7 @@ void launch_batched_parallel_snapshot(const Tensor& x, const Tensor& weight,
         Masked ? static_cast<const std::int32_t*>(valid_columns.data) : nullptr,
         static_cast<const std::int64_t*>(source.records.byte_offsets.data),
         static_cast<const std::int32_t*>(snapshot_base_slots.data),
-        static_cast<__nv_bfloat16*>(out.data), C, width, slot_stride);
+        static_cast<__nv_bfloat16*>(out.data), C, width, slot_stride, batch);
 }
 
 } // namespace

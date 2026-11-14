@@ -124,7 +124,7 @@ qsa_indexer_workspace_capacity_bytes(std::int32_t min_tokens, std::int32_t max_t
  * C<=512 selects every g without reading Q, keys or page-table contents.
  *
  * Domain / numeric:
- * T>0, B=1..8. index_query is contiguous, 16-byte-aligned BF16 [128,4,T,B]. Cache keys
+ * T>0, B>=1. index_query is contiguous, 16-byte-aligned BF16 [128,4,T,B]. Cache keys
  * are naturally aligned, dense BF16 [128,16,1] per 64-token record. Tables are contiguous
  * I64 byte offsets from their record arena.
  * Positions are contiguous I32 [T,B]; valid_columns and table_rows are Device I32 [B].
@@ -186,7 +186,7 @@ struct QsaSparseGqaExecutionEnvelope {
  * K8V4 values represent R*V, so apply R^T to the fully reduced attention before the gate.
  *
  * Domain / numeric:
- * T>0, B=1..8. Query, gate and out are contiguous, 16-byte-aligned BF16 [256,Hq,T,B].
+ * T>0, B>=1. Query, gate and out are contiguous, 16-byte-aligned BF16 [256,Hq,T,B].
  * Supported Hq/Hkv combinations belong to the implementation catalog. Cache supports
  * BFloat16 (BF16 K / FP16 V), Fp8E4m3fnGroup128Ue8m0, Int8Group64,
  * Nvfp4Group16 and Fp8KeyNvfp4Value. Data/scale planes follow paged_kv_storage_layout(storage,256),
@@ -257,7 +257,7 @@ void qsa_sparse_gqa(const Tensor& query, const Tensor& output_gate,
  * Logical shapes / supported domain:
  * The current rotary implementation accepts rotary_dim=64, interleaved sections [11,11,10].
  * Supported Hq/Hkv combinations belong to the implementation catalog; index queries always
- * have four heads. Cache and projections agree on Hkv. T>0, B in [1,8], A=1 or 3.
+ * have four heads. Cache and projections agree on Hkv. T>0, B>=1, A=1 or 3.
  * Projections and both outputs have the shapes above, are
  * contiguous and 16-byte aligned. Norm weights are contiguous, naturally aligned BF16 vectors.
  * Positions are contiguous I32 [T,B]; rho is contiguous I32 [T,A,B]. Metadata is contiguous Device
@@ -339,14 +339,17 @@ void qsa_prepare_kv(const QsaKvProjectionView& projected, const QsaKvPreparePara
  * that block's first token coordinates, or three I32 zeros when F0%4==0.
  *
  * Logical shapes / supported domain:
- * B is in [1,8]; R and L are positive. Each state's two fields agree on B/L.
+ * B, R and L are positive. Each state's two fields agree on B/L.
  * Record raw keys are BF16 [128,R,B,L], coordinates I32 [3,R,B,L], with contiguous features
  * and explicit disjoint outer strides. Each layer independently applies the equations above;
  * base_positions, valid_columns and accepted_columns are shared across layers.
- * accepted_columns is contiguous Device I32 [B]. Each row has 0<=a<=u<=R, F0>=0, and F0+u
+ * accepted_columns is contiguous Device I32 [B]. Each live row has 0<=a<=u<=R, F0>=0, and F0+u
  * representable as nonnegative I32. The caller supplies the input-prefix length, not an emitted
  * token count, and ensures that before corresponds to F0. Source/destination record offsets are
- * valid even for a=0. Host-visible layouts are checked without reading Device metadata to Host;
+ * valid even for a=0 in a live row. live_rows is empty for all-live input or contiguous
+ * Device I32 [B] with values 0/1. An inactive row accesses no selected state, record, position
+ * or accepted-count value and leaves destination storage unchanged; its offsets may be -1.
+ * Host-visible layouts are checked without reading Device metadata to Host;
  * count/index values and selected-region alias relationships are caller guarantees.
  *
  * Numeric / effects:
@@ -370,6 +373,6 @@ void qsa_prepare_kv(const QsaKvProjectionView& projected, const QsaKvPreparePara
  */
 void qsa_tail_extract(const ConstQsaTailStateView& before, const QsaRawRecordReadView& records,
                       const Tensor& accepted_columns, QsaTailStateView after,
-                      CudaExecutionView execution);
+                      const Tensor& live_rows, CudaExecutionView execution);
 
 } // namespace ninfer::ops

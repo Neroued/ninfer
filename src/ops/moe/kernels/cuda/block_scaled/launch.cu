@@ -10,10 +10,6 @@
 namespace ninfer::ops::detail::moe_cuda::block_scaled {
 namespace {
 
-__device__ __forceinline__ bool selected(ExpertSubsetKind kind, const int* mask, int e) {
-    return kind == ExpertSubsetKind::All || mask[e] == (kind == ExpertSubsetKind::MaskOnes);
-}
-
 __global__ void count_assignments(const int* ids, ExpertSubsetKind kind, const int* mask,
                                   int* counts, int assignments) {
     __shared__ int histogram[kExperts];
@@ -22,7 +18,7 @@ __global__ void count_assignments(const int* ids, ExpertSubsetKind kind, const i
     const int a = blockIdx.x * blockDim.x + threadIdx.x;
     if (a < assignments) {
         const int e = ids[a];
-        if (selected(kind, mask, e)) { atomicAdd(histogram + e, 1); }
+        if (expert_in_subset(kind, mask, e)) { atomicAdd(histogram + e, 1); }
     }
     __syncthreads();
     for (int e = threadIdx.x; e < kExperts; e += blockDim.x) {
@@ -76,7 +72,7 @@ __global__ void index_assignments(const int* ids, ExpertSubsetKind kind, const i
     const int a = blockIdx.x * blockDim.x + threadIdx.x;
     if (a >= assignments) { return; }
     const int expert = ids[a];
-    if (!selected(kind, mask, expert)) {
+    if (!expert_in_subset(kind, mask, expert)) {
         if (g.inverse) { g.inverse[a] = -1; }
         return;
     }
@@ -94,7 +90,7 @@ __global__ void group_small(const int* ids, ExpertSubsetKind kind, const int* ma
     __syncthreads();
     for (int a = tid; a < assignments; a += kExperts) {
         const int e = ids[a];
-        ranks[a]    = selected(kind, mask, e) ? atomicAdd(counts + e, 1) : -1;
+        ranks[a]    = expert_in_subset(kind, mask, e) ? atomicAdd(counts + e, 1) : -1;
     }
     __syncthreads();
     const int count = counts[tid];
@@ -141,8 +137,11 @@ template <class Output>
 __global__ void reduce(Storage storage, const float* coefficients, Output output, int elements) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < elements) {
-        output.store(i, output.initial(i) +
-                            routed_value(i / kHidden, i % kHidden, storage, coefficients));
+        const int token = i / kHidden;
+        const bool live = output.is_live(token);
+        output.store(
+            i, output.initial(i, live) + routed_value(token, i % kHidden, storage, coefficients),
+            live);
     }
 }
 

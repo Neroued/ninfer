@@ -223,7 +223,7 @@ private:
     std::vector<SequenceHandle> members_;
     std::vector<TokenId> tokens_;
     std::vector<std::int32_t> counts_;
-    std::vector<bool> failed_;
+    std::vector<std::uint8_t> failed_;
     std::uint32_t stride_ = 1;
     ExecutionSample execution_;
     friend class detail::SessionImpl;
@@ -241,12 +241,11 @@ struct PrefillProgress {
 struct CommitRowResult {
     runtime::CommitDisposition disposition = runtime::CommitDisposition::Active;
     SpeculativeStats speculative;
+    bool capture_ready = false;
 };
 
 struct CommitResult {
-    std::array<CommitRowResult, kMaximumConcurrency> rows{};
-    std::array<bool, kMaximumConcurrency> capture_ready{};
-    std::size_t row_count = 0;
+    std::vector<CommitRowResult> rows;
 };
 
 struct DiscardResult {
@@ -390,6 +389,7 @@ public:
     [[nodiscard]] context::RecoveryEvaluation<>
     evaluate_recovery(std::span<const CheckpointHandle> advertised) const;
     [[nodiscard]] std::size_t checkpoint_extent() const noexcept;
+    [[nodiscard]] std::uint64_t checkpoint_catalog_revision() const noexcept;
     [[nodiscard]] std::vector<runtime::ContextTransferRequirement>
         checkpoint_restore_requirements(CheckpointHandle) const;
     [[nodiscard]] bool valid_checkpoint(CheckpointHandle checkpoint) const noexcept;
@@ -460,7 +460,7 @@ public:
     [[nodiscard]] std::optional<runtime::ExecutionTicket> start_replay(SequenceHandle);
     [[nodiscard]] std::optional<runtime::ExecutionTicket>
     start_decode(std::span<const SequenceHandle>, std::span<const runtime::RoundBudget>,
-                 std::span<const bool> constrained = {});
+                 std::span<const std::uint8_t> constrained = {});
     [[nodiscard]] std::optional<runtime::ExecutionTicket>
     start_control(std::span<const SequenceHandle>, std::span<const TokenId>, std::uint32_t stride);
     [[nodiscard]] std::optional<runtime::ExecutionTicket> start_score(qwen::PreparedPrompt&&,

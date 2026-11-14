@@ -35,6 +35,8 @@ ninfer_add_test(ninfer_qwen4_exp_state_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_state.cpp"
   LIBRARIES ninfer_model_execution)
 set_tests_properties(ninfer_qwen4_exp_state_test PROPERTIES SKIP_RETURN_CODE 77 LABELS "gpu")
+add_test(NAME ninfer_qwen4_exp_state_layout_test COMMAND ninfer_qwen4_exp_state_test --host)
+set_tests_properties(ninfer_qwen4_exp_state_layout_test PROPERTIES ENVIRONMENT "CUDA_VISIBLE_DEVICES=")
 
 ninfer_add_test(ninfer_qwen4_exp_reclaim_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_reclaim_real.cpp"

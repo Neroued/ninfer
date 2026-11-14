@@ -3,34 +3,8 @@
 #include "ops/common/numeric/math.h"
 
 #include <cuda_runtime.h>
-#include <cstdint>
-#include <stdexcept>
 
 namespace ninfer::ops::common {
-
-// Exact division for numerator and positive divisor in [0, 2^31). The bounded
-// numerator keeps the high-product addition representable in 32 bits.
-struct FastDivisorU31 {
-    std::uint32_t multiplier, shift, divisor;
-
-    static FastDivisorU31 make(std::uint32_t divisor) {
-        if (divisor == 0 || divisor >= (std::uint32_t{1} << 31))
-            throw std::invalid_argument("FastDivisorU31: divisor must be in [1,2^31)");
-        std::uint32_t shift = 0;
-        while ((std::uint32_t{1} << shift) < divisor) ++shift;
-        const auto multiplier = static_cast<std::uint32_t>(
-            ((std::uint64_t{1} << 32) * ((std::uint64_t{1} << shift) - divisor)) / divisor + 1);
-        return {multiplier, shift, divisor};
-    }
-
-    __host__ __device__ std::uint32_t divide(std::uint32_t numerator) const {
-#if defined(__CUDA_ARCH__)
-        return (__umulhi(numerator, multiplier) + numerator) >> shift;
-#else
-        return numerator / divisor;
-#endif
-    }
-};
 
 __device__ __forceinline__ float silu(float x) { return x / (1.0f + expf(-x)); }
 

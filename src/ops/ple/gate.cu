@@ -1,3 +1,4 @@
+#include "ops/common/host/launch.h"
 #include "ops/ple/operands.h"
 #include "ops/common/cuda/reduce.cuh"
 #include "ops/common/numeric/convert.cuh"
@@ -132,7 +133,18 @@ template <int Block, int Width>
 void launch_gate(const GateArguments& args, cudaStream_t stream) {
     const auto groups = std::int64_t(args.tokens) * kStreams;
     const auto grid   = static_cast<unsigned>(groups < 65535 ? groups : 65535);
-    gate_kernel<Block, Width><<<dim3(grid, args.batch), Block, 0, stream>>>(args);
+    common::for_each_token_slice(args.batch, 1, [&](int offset, int count) {
+        auto slice = args;
+        slice.key += std::int64_t(offset) * args.key_batch;
+        slice.value += std::int64_t(offset) * args.value_batch;
+        slice.residual += std::int64_t(offset) * args.tokens * kChannels;
+        slice.gated += std::int64_t(offset) * args.tokens * kChannels;
+        slice.records += std::int64_t(offset) * args.record_batch;
+        slice.valid += offset;
+        slice.offsets += offset;
+        slice.batch = count;
+        gate_kernel<Block, Width><<<dim3(grid, count), Block, 0, stream>>>(slice);
+    });
     CUDA_CHECK(cudaGetLastError());
 }
 

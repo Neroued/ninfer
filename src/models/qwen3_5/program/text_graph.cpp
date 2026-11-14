@@ -101,7 +101,7 @@ TextGraph& TextGraph::operator=(TextGraph&&) noexcept = default;
 
 void TextGraph::prepare(TextRun& run, const Parameters& parameters, moe::Schedule* schedule,
                         std::span<const GraphProfile> profiles, std::uint32_t width,
-                        const std::function<void()>& prologue,
+                        moe::TokenGeometry geometry, const std::function<void()>& prologue,
                         const std::function<void()>& epilogue, MemoryArena& workspace,
                         DeviceContext& device, GraphPreparation& preparation) {
     if (impl_) throw std::logic_error("text graph is already prepared");
@@ -203,7 +203,7 @@ void TextGraph::prepare(TextRun& run, const Parameters& parameters, moe::Schedul
                 if (routed) {
                     const auto prior = profile ? graph.profiles.front()[layer].offloaded : nullptr;
                     definition.offloaded = schedule->capture_layer(
-                        routed->bank, cuda, run.residual().ne[1], [&] { run.mixer(layer); },
+                        routed->bank, cuda, geometry, [&] { run.mixer(layer); },
                         [&](const moe::GpuCall& call) { run.post_mixer(layer, &call); },
                         [&] { run.capture_features(layer); }, prior);
                 } else {
@@ -288,7 +288,7 @@ void TextGraph::select(std::uint32_t frontier) {
     impl_->installed = index;
 }
 
-bool TextGraph::start(CudaExecutionView cuda) {
+bool TextGraph::start(CudaExecutionView cuda, std::uint32_t active_tokens) {
     if (!impl_) throw std::logic_error("text graph has not been prepared");
     if (auto* graph = std::get_if<Resident>(&impl_->graph)) {
         graph->main.executable.launch(cuda.stream());
@@ -296,7 +296,7 @@ bool TextGraph::start(CudaExecutionView cuda) {
     }
     auto& graph = std::get<Offloaded>(impl_->graph);
     if (graph.cuda) throw std::logic_error("text graph is already active");
-    graph.activity.emplace(std::move(*graph.schedule->begin(graph.residual.ne[1])));
+    graph.activity.emplace(std::move(*graph.schedule->begin(graph.residual.ne[1], active_tokens)));
     graph.cuda       = cuda;
     graph.next_layer = 0;
     graph.waiting    = false;

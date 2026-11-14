@@ -64,15 +64,18 @@ void gated_delta_net(const Tensor& q, const Tensor& k, const Tensor& v, const Te
  * One-token update for B independent records. q/k are contiguous BF16 [128,Hqk,1,B],
  * v/out BF16 [128,Hv,1,B], and g/beta FP32 [Hv,1,B]. Source and destination fields are dense
  * FP32 [128,128,Hv] within caller-owned records, selected by device I64 [B] arena-relative byte
- * offsets. B is in [1,8]. Each selected field must be 16-byte aligned and fully inside its arena.
+ * offsets. B is positive. valid_columns is empty for dense rows or Device I32 [B] with
+ * values 0 or 1. A zero row reads no input values, offsets or state, writes exact BF16 zero
+ * output, and preserves every state field. Each live selected field must be 16-byte aligned
+ * and fully inside its arena.
  * A row may update in place. Destinations are distinct and do not overwrite other active sources.
  * Input/output tensors do not overlap selected state fields. This form uses no arena allocation.
  */
 void gated_delta_net_batch_update(const Tensor& q, const Tensor& k, const Tensor& v,
                                   const Tensor& g, const Tensor& beta, float scale,
                                   bool normalize_qk, ConstStateFieldView source_state,
-                                  StateFieldView destination_state, Tensor& out,
-                                  CudaExecutionView execution);
+                                  StateFieldView destination_state, const Tensor& valid_columns,
+                                  Tensor& out, CudaExecutionView execution);
 
 struct GdnRecurrenceRecords {
     Tensor key;   // BF16 [128,Hq,T,B], raw represented key words.
@@ -84,10 +87,11 @@ struct GdnRecurrenceRecords {
  * Evaluates B independent normalized Gated DeltaNet recurrences without modifying initial state.
  * q/k are BF16 [128,Hq,T,B], v/out BF16 [128,Hv,T,B], and g/beta FP32 [Hv,T,B].
  * initial_state selects dense FP32 [128,128,Hv] fields using device I64 [B] record byte offsets.
- * Every selected field is 16-byte aligned and in bounds. B=1..8, T=2..16; (Hq,Hv) is one of
+ * Every live selected field is 16-byte aligned and in bounds. B>0, T=2..16; (Hq,Hv) is one of
  * (16,32), (16,48), (8,24). scale is 1/sqrt(128).
  *
- * valid_columns is empty for dense rows or device I32 [B] with values in [1,T]. Each valid
+ * valid_columns is empty for dense rows or device I32 [B] with values in [0,T]. A zero row
+ * accesses no input values, state offsets or state fields. Each valid
  * transition copies raw k, v and {g,beta} into the corresponding record fields. Invalid record
  * suffixes remain unchanged; invalid output suffixes are exact BF16 zero. Inputs, selected state
  * fields, records and output do not overlap. Valid outputs are bit-identical to normalized

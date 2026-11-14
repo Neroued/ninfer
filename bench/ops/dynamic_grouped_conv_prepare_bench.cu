@@ -1,3 +1,4 @@
+#include <climits>
 #include "ninfer/ops/dynamic_grouped_conv.h"
 #include "direct_bf16_weight.cuh"
 #include "op_measurement.cuh"
@@ -35,8 +36,8 @@ Options parse(int argc, char** argv) {
         else if (!measurement::parse(o.timing, flag, value))
             throw std::invalid_argument("unknown dynamic prepare option");
     }
-    if (o.width < 0 || o.width == 1 || o.width > 16 || o.batch < 0 || o.batch > 8 ||
-        !std::isfinite(o.epsilon) || o.epsilon <= 0)
+    if (o.width < 0 || o.width == 1 || o.width > 16 || o.batch < 0 || !std::isfinite(o.epsilon) ||
+        o.epsilon <= 0)
         throw std::invalid_argument("invalid width, batch or epsilon");
     return o;
 }
@@ -45,15 +46,20 @@ Options parse(int argc, char** argv) {
 int main(int argc, char** argv) {
     try {
         const auto o        = parse(argc, argv);
-        const auto capacity = ops::rmsnorm_dynamic_grouped_conv_prepare_workspace_capacity_bytes(
-            o.hidden, 2, 16, 1, 8);
+        const int min_width = o.width ? o.width : 2, max_width = o.width ? o.width : 16;
+        const int min_batch = o.batch ? o.batch : 1, max_batch = o.batch ? o.batch : 8;
+        if (std::int64_t(max_width) * max_batch > INT_MAX)
+            throw std::invalid_argument("too many columns");
+        const int max_columns = max_width * max_batch;
+        const auto capacity   = ops::rmsnorm_dynamic_grouped_conv_prepare_workspace_capacity_bytes(
+            o.hidden, min_width, max_width, min_batch, max_batch);
         const int groups = o.hidden / 16, rows = groups * 4;
-        auto residual   = make_bf16(std::size_t(o.hidden) * 128, 101U);
+        auto residual   = make_bf16(std::size_t(o.hidden) * max_columns, 101U);
         auto norm       = make_bf16(o.hidden, 103U, .8F, 1.2F);
         auto base       = make_bf16(std::size_t(o.hidden) * 4, 105U);
         auto projection = make_direct_bf16_weight(rows, o.hidden, 0x31U);
-        auto prepared   = make_buffer(std::size_t(o.hidden) * 128 * 2);
-        auto finish     = make_buffer(std::size_t(groups) * 2 * 128 * 2);
+        auto prepared   = make_buffer(std::size_t(o.hidden) * max_columns * 2);
+        auto finish     = make_buffer(std::size_t(groups) * 2 * max_columns * 2);
         auto storage    = make_buffer(capacity);
         MemoryArena arena(storage.span());
         Tensor norm_weight(norm.span(), DType::BF16, {o.hidden});
@@ -63,10 +69,8 @@ int main(int argc, char** argv) {
         measurement::Csv csv(
             o.timing.csv_out,
             "width,columns,necessary_bytes,useful_flops,effective_gbs,roofline_us");
-        for (int width = 2; width <= 16; ++width) {
-            if (o.width && width != o.width) continue;
-            for (int batch = 1; batch <= 8; ++batch) {
-                if (o.batch && batch != o.batch) continue;
+        for (int width = min_width; width <= max_width; ++width) {
+            for (int batch = min_batch; batch <= max_batch; ++batch) {
                 const int m = width * batch;
                 Tensor x(residual.span(), DType::BF16, {o.hidden, width, batch});
                 Tensor y(prepared.span(), DType::BF16, {o.hidden, width, batch});

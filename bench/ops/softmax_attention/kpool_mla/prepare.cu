@@ -3,6 +3,8 @@
 #include "../../../../tools/support/kpool_prepare_fixture.h"
 #include "prepare_traffic.cuh"
 
+#include <climits>
+
 using namespace ninfer;
 using namespace ninfer::bench;
 namespace kp = ninfer::tool::kpool;
@@ -21,15 +23,14 @@ int main(int argc, char** argv) {
         for (int i = 1; i < argc; ++i) {
             const std::string flag = argv[i];
             if (flag == "--help") {
-                std::cout
-                    << "Kpool MLA complete Prepare entry, fixed "
-                       "H4096/Dc512/Di128/Rq1536/Hi32.\n"
-                       "  --projection full|query-history|history --form record|update\n"
-                       "  --tokens N,... --batch 1..8 --phase 0..3 --ragged 0|1 --inplace 0|1\n"
-                       "  --inactive 0|1  zero valid columns in every physical row\n"
-                       "  --active-rows 0..B  leading active request rows (default B)\n"
-                       "  --index-cache bf16|fp8 --latent-cache bf16|fp8\n"
-                       "  --weight-format bf16|block-fp8|mxfp8\n";
+                std::cout << "Kpool MLA complete Prepare entry, fixed "
+                             "H4096/Dc512/Di128/Rq1536/Hi32.\n"
+                             "  --projection full|query-history|history --form record|update\n"
+                             "  --tokens N,... --batch B --phase 0..3 --ragged 0|1 --inplace 0|1\n"
+                             "  --inactive 0|1  zero valid columns in every physical row\n"
+                             "  --active-rows 0..B  leading active request rows (default B)\n"
+                             "  --index-cache bf16|fp8 --latent-cache bf16|fp8\n"
+                             "  --weight-format bf16|block-fp8|mxfp8\n";
                 measurement::help();
                 return 0;
             }
@@ -42,7 +43,7 @@ int main(int argc, char** argv) {
                                 : v == "mxfp8" ? kp::ProjectionFormat::Mxfp8
                                                : kp::ProjectionFormat::BlockFp8;
             else if (flag == "--batch")
-                batch = measurement::integer(v, 1, 8);
+                batch = measurement::integer(v, 1, INT_MAX);
             else if (flag == "--phase")
                 phase = measurement::integer(v, 0, 3);
             else if (flag == "--ragged")
@@ -52,7 +53,7 @@ int main(int argc, char** argv) {
             else if (flag == "--inactive")
                 inactive = measurement::integer(v, 0, 1);
             else if (flag == "--active-rows")
-                active_rows = measurement::integer(v, 0, 8);
+                active_rows = measurement::integer(v, 0, INT_MAX);
             else if (flag == "--index-cache" && (v == "bf16" || v == "fp8"))
                 index_format = v == "fp8" ? KvCacheVectorFormat::Fp8E4m3fnGroup128Ue8m0
                                           : KvCacheVectorFormat::BFloat16;

@@ -14,7 +14,7 @@ __device__ inline int candidate_count(int count, int partition) {
 
 // Score windows can contain very different live histories inside one captured
 // envelope. Enumerate actual partitions so short requests share all resident CTAs.
-template <int MinBlocks>
+template <int MinBlocks, int Items>
 __global__ __launch_bounds__(256, MinBlocks) void indexer_partition_words_kernel(
     const __grid_constant__ IndexerArguments a) {
     if (a.columns <= kIndexSelected) return;
@@ -36,10 +36,10 @@ __global__ __launch_bounds__(256, MinBlocks) void indexer_partition_words_kernel
         const auto column = a.column(slot);
         const int visible = a.ends[column] / 4, first = part * kIndexPartition;
         const int count = min(kIndexPartition, visible - first);
-        unsigned scores[kIndexPartition / 256];
+        unsigned scores[Items];
         const Top512DenseIds ids{first};
 #pragma unroll
-        for (int j = 0; j < kIndexPartition / 256; ++j) {
+        for (int j = 0; j < Items; ++j) {
             const int i = j * 256 + tid;
             scores[j]   = i < count ? common::ordered_score_bits(
                                         a.scores[std::int64_t(slot) * a.columns + first + i])

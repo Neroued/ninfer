@@ -35,6 +35,26 @@ std::vector<T> integers(Decoder& in) {
     return out;
 }
 
+void batch(Encoder& out, const BatchPlan& plan) {
+    out.u32(plan.shape.rows);
+    out.u32(plan.shape.attention_rows);
+    integers(out, plan.members);
+    out.u64(plan.owners.size());
+    for (auto range : plan.owners) {
+        out.u32(range.begin);
+        out.u32(range.size);
+    }
+}
+
+BatchPlan batch(Decoder& in) {
+    BatchPlan plan;
+    plan.shape   = {in.u32(), in.u32()};
+    plan.members = integers<std::uint32_t>(in);
+    plan.owners.resize(in.count(8));
+    for (auto& range : plan.owners) range = {in.u32(), in.u32()};
+    return plan;
+}
+
 void residency(Encoder& out, runtime::ResidencyId id) {
     out.u32(id.lane.value);
     out.u64(id.generation);
@@ -160,18 +180,13 @@ vision::Work VisionInputBindings::get(std::uint64_t id, bool produce) const {
 
 void encode_work(Encoder& out, const Work& work, std::uint32_t rank) {
     out.u32(rank);
-    integers(out, work.batch.members);
-    out.u64(work.batch.owners.size());
-    for (auto range : work.batch.owners) {
-        out.u32(range.begin);
-        out.u32(range.size);
-    }
     context::encode_actions(out, local_actions(work.actions, rank));
     std::visit(
         [&](const auto& v) {
             using T = std::decay_t<decltype(v)>;
             if constexpr (std::is_same_v<T, ForwardWork>) {
                 out.u8(1);
+                batch(out, v.batch);
                 out.u8(static_cast<std::uint8_t>(v.kind));
                 out.u8(static_cast<std::uint8_t>(v.sample));
                 rows(out, v.rows);
@@ -182,6 +197,7 @@ void encode_work(Encoder& out, const Work& work, std::uint32_t rank) {
                 }
             } else if constexpr (std::is_same_v<T, SpeculativeWork>) {
                 out.u8(2);
+                batch(out, v.batch);
                 rows(out, v.rows);
                 integers(out, v.draft_extents);
             } else if constexpr (std::is_same_v<T, ContextWork>) {
@@ -195,6 +211,7 @@ void encode_work(Encoder& out, const Work& work, std::uint32_t rank) {
                 for (auto id : v.releases) residency(out, id);
             } else {
                 out.u8(4);
+                batch(out, v.batch);
                 row(out, v.row);
                 integers(out, v.targets);
                 out.u32(v.first_target_column);
@@ -205,14 +222,12 @@ void encode_work(Encoder& out, const Work& work, std::uint32_t rank) {
 
 Work decode_work(Decoder& in, const VisionInputBindings& inputs) {
     Work work;
-    const auto rank    = in.u32();
-    work.batch.members = integers<std::uint32_t>(in);
-    work.batch.owners.resize(in.count(8));
-    for (auto& range : work.batch.owners) range = {in.u32(), in.u32()};
+    const auto rank = in.u32();
     work.actions.emplace(rank, context::decode_actions(in));
     switch (in.u8()) {
     case 1: {
         ForwardWork v;
+        v.batch  = batch(in);
         v.kind   = static_cast<ForwardKind>(in.u8());
         v.sample = static_cast<SampleKind>(in.u8());
         v.rows   = rows(in);
@@ -225,6 +240,7 @@ Work decode_work(Decoder& in, const VisionInputBindings& inputs) {
     }
     case 2: {
         SpeculativeWork v;
+        v.batch         = batch(in);
         v.rows          = rows(in);
         v.draft_extents = integers<std::uint32_t>(in);
         work.operation  = std::move(v);
@@ -244,6 +260,7 @@ Work decode_work(Decoder& in, const VisionInputBindings& inputs) {
     }
     case 4: {
         ScoreWork v;
+        v.batch               = batch(in);
         v.row                 = row(in);
         v.targets             = integers<TokenId>(in);
         v.first_target_column = in.u32();

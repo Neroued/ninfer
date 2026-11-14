@@ -9,7 +9,7 @@
 namespace ninfer::models::glm5next::detail {
 
 void RankProgramImpl::copy_result(int rows, bool verify) {
-    const auto& io = resources.plan.frame;
+    const auto& io = frame;
     if (verify)
         copy_bytes_async(resources.egress().subspan(0, io.result_egress.bytes),
                          io.result_egress.bind(resources.fixed()), cuda);
@@ -21,7 +21,7 @@ void RankProgramImpl::copy_result(int rows, bool verify) {
 }
 
 DistributedVocabulary RankProgramImpl::vocabulary() {
-    const auto& io = resources.plan.frame;
+    const auto& io = frame;
     return {parameters.profile->local.vocabulary.begin,
             parameters.profile->public_tokens,
             io.candidates->region.bind(resources.fixed()),
@@ -32,7 +32,7 @@ DistributedVocabulary RankProgramImpl::vocabulary() {
 }
 
 void RankProgramImpl::sample(int b, SampleKind kind) {
-    const auto& io    = resources.plan.frame;
+    const auto& io    = frame;
     const auto& local = parameters.profile->local;
     auto logits       = resources.packed(*io.logits, {dimension(local.vocabulary.size), 1, b});
     auto ids          = resources.packed(*io.sampled_ids, {b});
@@ -43,10 +43,11 @@ void RankProgramImpl::sample(int b, SampleKind kind) {
         kind == SampleKind::FirstToken ? ops::kSamplePurposePrefill : ops::kSamplePurposeDecode;
     if (!parallel) {
         ops::sample(logits.view({logits.ne[0], b}), ids, parameters.profile->public_tokens, configs,
-                    positions, purpose, resources.workspace, cuda);
+                    positions, purpose, row(io.rows.live_rows, b), resources.workspace, cuda);
         return;
     }
-    vocabulary().sample(logits, configs, row(io.rows.sampling_columns, b), positions, purpose, ids);
+    vocabulary().sample(logits, configs, row(io.rows.sampling_columns, b),
+                        row(io.rows.live_rows, b), positions, purpose, ids);
 }
 
 void RankProgramImpl::score() {
@@ -67,7 +68,7 @@ void RankProgramImpl::score() {
     auto logits  = resources.workspace.alloc(DType::BF16, {dimension(local.vocabulary.size), n});
     auto targets = resources.workspace.alloc(DType::I32, {n});
     auto output  = resources.workspace.alloc(DType::FP32, {n});
-    auto* input  = static_cast<TokenId*>(host(resources.plan.frame.main.ids).data);
+    auto* input       = static_cast<TokenId*>(host(frame.main.ids).data);
     std::copy_n(work.targets.begin() + f.score_at, n, input);
     copy_bytes_async({targets.data, targets.bytes(), cuda.device()},
                      {input, targets.bytes(), Device::cpu(), true}, cuda);

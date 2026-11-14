@@ -62,7 +62,7 @@ void RankProgramImpl::progress() {
                     align_mtp_history(operation);
                 if (!operation.projected) {
                     resources.work.reset();
-                    project_decode(operation.batch, operation.width);
+                    project_decode(operation.shape.rows, operation.width);
                     gpu_timer.end_target();
                     operation.projected = true;
                 }

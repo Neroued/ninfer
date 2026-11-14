@@ -12,10 +12,6 @@
 namespace ninfer::ops::detail::moe_cuda::block_scaled::clamped {
 namespace {
 
-__device__ __forceinline__ bool selected(ExpertSubsetKind kind, const int* mask, int e) {
-    return kind == ExpertSubsetKind::All || mask[e] == (kind == ExpertSubsetKind::MaskOnes);
-}
-
 __global__ void count_assignments(const int* ids, ExpertSubsetKind kind, const int* mask,
                                   int* counts, int assignments) {
     __shared__ int histogram[kExperts];
@@ -24,7 +20,7 @@ __global__ void count_assignments(const int* ids, ExpertSubsetKind kind, const i
     const int a = blockIdx.x * blockDim.x + threadIdx.x;
     if (a < assignments) {
         const int e = ids[a];
-        if (selected(kind, mask, e)) { atomicAdd(histogram + e, 1); }
+        if (expert_in_subset(kind, mask, e)) { atomicAdd(histogram + e, 1); }
     }
     __syncthreads();
     for (int e = threadIdx.x; e < kExperts; e += blockDim.x) {
@@ -100,7 +96,7 @@ __global__ void index_assignments(const int* ids, ExpertSubsetKind kind, const i
     const int a = blockIdx.x * blockDim.x + threadIdx.x;
     if (a >= assignments) { return; }
     const int expert = ids[a];
-    if (!selected(kind, mask, expert)) {
+    if (!expert_in_subset(kind, mask, expert)) {
         if (g.inverse) { g.inverse[a] = -1; }
         return;
     }
@@ -120,7 +116,7 @@ __global__ void group_small(const int* ids, ExpertSubsetKind kind, const int* ma
     __syncthreads();
     for (int a = tid; a < assignments; a += kExperts) {
         const int e = ids[a];
-        ranks[a]    = selected(kind, mask, e) ? atomicAdd(counts + e, 1) : -1;
+        ranks[a]    = expert_in_subset(kind, mask, e) ? atomicAdd(counts + e, 1) : -1;
     }
     __syncthreads();
     const int count = counts[tid];
@@ -170,8 +166,11 @@ __global__ void reduce(Storage storage, const float* coefficients, Output output
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < elements) {
         if (storage.partial_output && !storage.active_tokens[i / kHidden]) return;
-        output.store(i, output.initial(i) +
-                            routed_value(i / kHidden, i % kHidden, storage, coefficients));
+        const int token = i / kHidden;
+        const bool live = output.is_live(token);
+        output.store(
+            i, output.initial(i, live) + routed_value(token, i % kHidden, storage, coefficients),
+            live);
     }
 }
 
@@ -338,8 +337,7 @@ void launch(const Tensor& x, const CudaSwiGLUExperts& experts, const ExpertRoute
     if (s.partial_output && plan.atomic_output) return;
     with_output(destination, mode, [&](auto output) {
         const int elements = x.ne[1] * kHidden;
-        if (plan.format == QType::NVFP4_MUL && plan.intermediate == 2048 &&
-            s.routed_sum &&
+        if (plan.format == QType::NVFP4_MUL && plan.intermediate == 2048 && s.routed_sum &&
             reinterpret_cast<std::uintptr_t>(s.routed_sum) % 16 == 0 &&
             reinterpret_cast<std::uintptr_t>(output.data) % 16 == 0) {
             reduce_atomic_vectors<<<(elements + 2047) / 2048, 256, 0, stream>>>(s, output,

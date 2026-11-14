@@ -113,7 +113,8 @@ void TextRun::ffn(std::uint32_t layer) {
     else {
         const auto& m = std::get<MoeParameters>(p);
         ops::topk_sigmoid_swiglu_moe(roots_.input, std::get<MoeProfile>(profile).math, m.weights,
-                                     m.subset, roots_.output, execution_.workspace, cuda_);
+                                     m.subset, roots_.output, {batch_.valid_columns, batch_.tokens},
+                                     execution_.workspace, cuda_);
     }
 }
 

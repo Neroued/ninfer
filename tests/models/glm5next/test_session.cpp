@@ -48,7 +48,10 @@ public:
     std::vector<std::uint32_t> accept;
     glm::ComputeResult computed;
 
-    explicit Executor(glm::WorkContract c) : contract(c) {}
+    explicit Executor(glm::WorkContract c)
+        : rt::Executor<glm::ExecutionTypes>(c.shape.max_concurrency), contract(std::move(c)) {}
+
+    void observe_sample(const ExecutionSample& sample) { observe_execution(sample); }
 
     void bind_to_current_thread() override {}
 
@@ -178,19 +181,22 @@ public:
     void measure(rt::MeasurementCommand) override {}
 };
 
-glm::SessionPlan plan(const glm::ModelDefinition& definition, bool pressure = false) {
+glm::SessionPlan plan(const glm::ModelDefinition& definition, bool pressure = false,
+                      std::uint32_t concurrency = 3) {
     glm::SessionPlan p;
-    p.shape                  = {.max_context     = 256,
-                                .max_concurrency = 3,
-                                .prefill_chunk   = 64,
-                                .draft_tokens =
+    p.shape   = {.max_context     = 256,
+                 .max_concurrency = concurrency,
+                 .prefill_chunk   = 64,
+                 .draft_tokens =
                    definition.options().speculative != SpeculativeBackend::None ? 3U : 0U,
-                                .kv_storage    = KvCacheStorage::BFloat16,
-                                .index_format  = KvCacheVectorFormat::BFloat16,
-                                .purpose       = EnginePurpose::Generation,
-                                .context_cache = true,
-                                .gpu_timing    = false,
-                                .speculative   = definition.options().speculative};
+                 .kv_storage    = KvCacheStorage::BFloat16,
+                 .index_format  = KvCacheVectorFormat::BFloat16,
+                 .purpose       = EnginePurpose::Generation,
+                 .context_cache = true,
+                 .gpu_timing    = false,
+                 .speculative   = definition.options().speculative};
+    p.batches = std::make_shared<const models::BatchExecutionPlan>(
+        models::make_batch_execution_spec(p.shape.max_concurrency, 2, true));
     const auto& c            = definition.config().text;
     auto profile             = std::make_shared<glm::execution::ModelProfile>();
     profile->config          = definition.config();
@@ -229,7 +235,7 @@ glm::SessionPlan plan(const glm::ModelDefinition& definition, bool pressure = fa
                                .logical_pages = 512,
                                .histories     = 256,
                                .page_capacity = 4,
-                               .table_rows    = 3,
+                               .table_rows    = concurrency,
                                .parts         = {{0, {page.page_bytes, page.alignment}},
                                                  {1, {page.page_bytes, page.alignment}}}});
     if (definition.options().mtp()) {
@@ -253,6 +259,55 @@ glm::SessionPlan plan(const glm::ModelDefinition& definition, bool pressure = fa
         ctx::recovery_value_metadata_bytes(records, p.shape.max_concurrency, 2, 2) +
         glm::InputIdentity::cache_bytes(p.shape.max_context, p.shape.max_concurrency);
     return p;
+}
+
+void batch_geometry() {
+    Executor executor({.shape = {.max_concurrency = 128}});
+    executor.observe_sample({.work    = {ExecutionKind::Decode, 128, 128, 512},
+                             .latency = {.result_ns = 11, .retirement_ns = 3, .total_ns = 14}});
+    const auto statistics = executor.decode_statistics();
+    require(statistics.size() == 128 && statistics.back().units == 1 &&
+                statistics.back().rows == 128 && statistics.back().scheduled_positions == 512 &&
+                statistics.back().exposure.total.total_ns == 14 && statistics.front().units == 0,
+            "executor decode counters do not preserve high-concurrency samples");
+    const models::BatchExecutionPlan plan(models::make_batch_execution_spec(256, 3, true));
+    std::vector<glm::WorkRow> rows(17);
+    for (std::size_t i = 0; i < rows.size(); ++i) rows[i].attention_rank = i % 3;
+    const auto physical = glm::plan_batch(rows, plan, true);
+    require(physical.shape == models::PhysicalBatchShape{20, 6} && physical.members.size() == 17 &&
+                physical.owners.size() == 3,
+            "ADP row catalog cannot represent padded global rows beyond owner slots");
+    std::vector<std::uint32_t> expected;
+    for (std::uint32_t owner = 0; owner < 3; ++owner)
+        for (std::uint32_t row = 0; row < rows.size(); ++row)
+            if (rows[row].attention_rank == owner) expected.push_back(row);
+    require(physical.members == expected, "owner grouping changed logical member order");
+#if NINFER_ENABLE_DISTRIBUTED
+    glm::ForwardWork operation;
+    operation.rows  = rows;
+    operation.batch = physical;
+    const glm::Work work{{}, std::move(operation)};
+    distributed::wire::Encoder encoded;
+    glm::encode_work(encoded, work, 0);
+    const auto bytes = std::move(encoded).take();
+    distributed::wire::Decoder decoder(bytes);
+    const auto decoded = glm::decode_work(decoder);
+    decoder.finish();
+    require(glm::work_batch(decoded) == physical && glm::work_rows(decoded).size() == 17,
+            "wire lost frozen physical shape or added padded members");
+#endif
+
+    require(glm::plan_batch(rows, plan, false).shape == models::PhysicalBatchShape{17, 6},
+            "non-decode work was padded by the graph policy");
+    for (const auto shape : plan.graph_shapes()) {
+        const auto owners = plan.representative_owners(shape);
+        rows.clear();
+        for (std::uint32_t owner = 0; owner < owners.size(); ++owner)
+            for (std::uint32_t n = 0; n < owners[owner]; ++n)
+                rows.emplace_back().attention_rank = owner;
+        require(glm::plan_batch(rows, plan, true).shape == shape,
+                "graph witness cannot reproduce its frozen physical geometry");
+    }
 }
 
 glm::Frontend make_frontend() {
@@ -283,7 +338,7 @@ struct Fixture {
 
     Fixture(std::shared_ptr<const glm::ModelDefinition> d, glm::SessionPlan p)
         : definition(d), frontend(make_frontend()), layout(std::move(p)),
-          executor({layout.shape, d->config().text.vocabulary,
+          executor({layout.shape, layout.batches, d->config().text.vocabulary,
                     d->resources().text.public_token_count, 2}),
           session(glm::prepare_session(d, layout, make_directory()), executor) {}
 
@@ -351,6 +406,61 @@ struct Fixture {
         idle();
     }
 };
+
+void expanded_membership(std::shared_ptr<const glm::ModelDefinition> definition) {
+    Fixture f(definition, plan(*definition, false, 17));
+    const auto input = f.request(4);
+    std::vector<glm::SequenceHandle> members;
+    for (std::uint32_t lane = 0; lane < 17; ++lane) {
+        members.push_back(f.bind(input, lane, 0));
+        f.commit(f.prefill(members.back()));
+    }
+    for (const auto count : {10U, 9U, 17U}) {
+        f.executor.accept.resize(count);
+        std::vector<glm::ExecutionUnit> units;
+        std::vector<rt::RoundBudget> budgets;
+        std::vector<glm::SequenceHandle> ordered;
+        for (std::uint32_t i = 0; i < count; ++i) {
+            f.executor.accept[i] = i % 2;
+            const auto h         = members[(i + 5) % members.size()];
+            const auto budget    = 1U + i % 4;
+            ordered.push_back(h);
+            units.push_back({h, glm::ExecutionUnitKind::Decode, budget});
+            budgets.push_back({budget});
+        }
+        require(bool(f.session.reserve_units(units)), "expanded decode reservation failed");
+        require(f.session.start_decode(ordered, budgets).has_value(),
+                "expanded decode not started");
+        const auto& physical = glm::work_batch(f.executor.last);
+        require(physical.shape.rows == (count == 17 ? 17 : 10) &&
+                    physical.owners[0].size == count && physical.owners[1].size == 0 &&
+                    physical.members.size() == count,
+                "expanded work lost real membership or invented empty-rank rows");
+        auto pending = f.event<glm::PendingBatch>();
+        std::vector<rt::CommitDecision> decisions(count);
+        for (std::uint32_t i = 0; i < count; ++i) {
+            require(f.session.execution_pending(ordered[i]), "submitted membership disappeared");
+            decisions[i].accepted_tokens = pending.row_counts()[i];
+        }
+        decisions[2]       = {.terminal = true, .cancelled = true};
+        const auto retired = ordered[2];
+        (void)f.session.commit(std::move(pending), decisions);
+        require(f.session.execution_pending(retired),
+                "cancelled member released before retirement");
+        f.idle();
+        require(f.session.abort(retired).status != rt::ConsumeStatus::Consumed &&
+                    !f.session.execution_pending(retired),
+                "retired member remained resident");
+        const auto lane = 7U;
+        members[lane]   = f.bind(input, lane, 0);
+        f.commit(f.prefill(members[lane]));
+        require(f.session.abort(retired).status != rt::ConsumeStatus::Consumed,
+                "lane reuse revived a stale identity");
+    }
+    for (auto h : members) (void)f.session.abort(h);
+    f.idle();
+    require(f.session.physical_usage().state_objects == 0, "expanded membership retained State");
+}
 
 struct CopyWork {
     std::uint64_t bytes = 0, operations = 0, images = 0, pages = 0;
@@ -500,6 +610,8 @@ void pause_quotes_match_shared_draft(std::shared_ptr<const glm::ModelDefinition>
 void identity_budget_replacement(std::shared_ptr<const glm::ModelDefinition> definition) {
     auto layout                  = plan(*definition);
     layout.shape.max_concurrency = 1;
+    layout.batches               = std::make_shared<const models::BatchExecutionPlan>(
+        models::make_batch_execution_spec(1, 2, true));
     Fixture f(definition, std::move(layout));
     const auto request  = f.request(220);
     const auto sequence = f.bind(request, 0, 0);
@@ -824,7 +936,7 @@ void transactions(std::shared_ptr<const glm::ModelDefinition> definition) {
     std::array<rt::RoundBudget, 2> budgets;
     for (auto& v : budgets) v.generated_tokens_remaining = 4;
     require(f.session.start_decode(members, budgets).has_value(), "decode start failed");
-    require(f.executor.last.batch.members == std::vector<std::uint32_t>{1, 0},
+    require(glm::work_batch(f.executor.last).members == std::vector<std::uint32_t>{1, 0},
             "physical owner order not planned");
     auto result = f.event<glm::PendingBatch>();
     require(result.tokens()[0] == s1.value % 2 && result.tokens()[1] == s0.value % 2,
@@ -933,7 +1045,7 @@ void mtp_transactions(std::shared_ptr<const glm::ModelDefinition> definition) {
         require(f.session.start_decode(members, budgets).has_value(), "MTP did not start");
         const auto& work = std::get<glm::SpeculativeWork>(f.executor.last.operation);
         require(work.draft_extents == std::vector<std::uint32_t>{3, 0} &&
-                    f.executor.last.batch.members == std::vector<std::uint32_t>{1, 0},
+                    glm::work_batch(f.executor.last).members == std::vector<std::uint32_t>{1, 0},
                 "mixed MTP rows lost extents or ownership");
         require(work.rows[0].mtp_frontier == 62 && work.rows[1].mtp_frontier == 3,
                 "MTP canonical frontier is not Main minus one");
@@ -1207,7 +1319,7 @@ struct DeferredExecutionRuntime : glm::RuntimeTypes {
 void execution_decision_survives_deferral(std::shared_ptr<const glm::ModelDefinition> definition) {
     auto layout   = plan(*definition);
     auto frontend = make_frontend();
-    Executor executor({layout.shape, definition->config().text.vocabulary,
+    Executor executor({layout.shape, layout.batches, definition->config().text.vocabulary,
                        definition->resources().text.public_token_count, 2});
     DeferredExecutionSession session(
         glm::prepare_session(definition, layout,
@@ -1277,7 +1389,7 @@ struct WaitingCaptureRuntime : glm::RuntimeTypes {
 void independent_prefill(std::shared_ptr<const glm::ModelDefinition> definition) {
     auto layout   = plan(*definition);
     auto frontend = make_frontend();
-    Executor executor({layout.shape, definition->config().text.vocabulary,
+    Executor executor({layout.shape, layout.batches, definition->config().text.vocabulary,
                        definition->resources().text.public_token_count, 2});
     WaitingCaptureSession session(
         glm::prepare_session(definition, layout,
@@ -1384,6 +1496,7 @@ void cancelled_prefix_statistics(std::shared_ptr<const glm::ModelDefinition> def
 
 int main(int argc, char** argv) {
     try {
+        batch_geometry();
         require(argc >= 2, "missing artifact directory");
         artifact::Reader reader(std::filesystem::path(argv[1]) / "model.ninfer");
         identity_budget_replacement(glm::read_definition(reader, {}));
@@ -1405,6 +1518,7 @@ int main(int argc, char** argv) {
         cancelled_prefix_statistics(glm::read_definition(reader, {}));
         engine_pressure(glm::read_definition(reader, {}), false, true);
         auto mtp = glm::read_definition(reader, {.speculative = SpeculativeBackend::Mtp});
+        expanded_membership(mtp);
         mtp_transactions(std::move(mtp));
         std::cout << "PASS GLM ADP binding, continuation, conversion, relocation and retirement\n";
     } catch (const std::exception& e) {

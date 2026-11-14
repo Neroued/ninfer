@@ -488,6 +488,7 @@ int main(int argc, char** argv) {
         const bool graph =
             !narrow && (batch == 8 || (batch == 1 && (width == 1 || width == 8 || width >= 16)));
         catalogue.push_back({id, {{"format", "q8"}, {"execution", graph ? "graph" : "eager"}}});
+        if (batch > 8) catalogue.back().tags.emplace_back("suite", "concurrency");
     };
     const std::vector<int> widths{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
     for (int width : widths)
@@ -505,6 +506,17 @@ int main(int argc, char** argv) {
             add("W=" + std::to_string(width) + " B=" + std::to_string(batch), width, batch, counts,
                 slots, positions, 0x701U + width);
         }
+    for (int batch : {9, 17, 129}) {
+        const int width = batch == 129 ? 1 : 3;
+        std::vector<int> counts(batch, 0), slots(batch, -1), positions(width * batch, -1);
+        counts.front()    = 1;
+        counts.back()     = width;
+        slots.front()     = 7;
+        slots.back()      = 2;
+        positions.front() = 2047;
+        for (int i = 0; i < width; ++i) positions[(batch - 1) * width + i] = 262142 + i;
+        add("padded B=" + std::to_string(batch), width, batch, counts, slots, positions, 0x706U);
+    }
     const auto add_narrow = [&](int width, int count) {
         std::vector<int> positions(width * 8, -1), counts(8, count), slots(8, -1);
         for (int b = 0; b < 8; ++b) {

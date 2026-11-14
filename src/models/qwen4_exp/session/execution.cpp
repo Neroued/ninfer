@@ -8,9 +8,11 @@ using Kind = detail::ComputeTransaction::Kind;
 
 void submit(detail::SessionImpl& session, runtime::ExecutionReservation reservation, Work work) {
     auto& tx = *session.compute;
+    plan_work_batch(work, *session.plan.batches);
     tx.context.prepare_actions();
     work.actions = session.actions(tx.context);
     tx.ticket    = session.executor->submit(std::move(reservation), std::move(work));
+    for (auto h : tx.members) session.sequence(h).computing = true;
     tx.context.mark_submitted();
     if (tx.vision_id) session.vision_window.submitted(tx.vision_id, tx.ticket);
 }
@@ -100,7 +102,7 @@ std::optional<runtime::ExecutionTicket> Session::start_replay(SequenceHandle han
 std::optional<runtime::ExecutionTicket>
 Session::start_decode(std::span<const SequenceHandle> members,
                       std::span<const runtime::RoundBudget> budgets,
-                      std::span<const bool> constrained) {
+                      std::span<const std::uint8_t> constrained) {
     auto& p = *impl_;
     if (p.compute) return {};
     if (members.empty() || members.size() > p.shape.max_concurrency ||
@@ -109,13 +111,15 @@ Session::start_decode(std::span<const SequenceHandle> members,
         throw std::logic_error("invalid decode members");
     std::vector<std::uint32_t> extents(members.size());
     bool speculative = false;
+    const auto mark  = p.next_membership_mark();
     for (std::size_t b = 0; b < members.size(); ++b) {
-        const auto& s = p.sequence(members[b]);
-        const auto f  = s.continuation.metadata.main_frontier;
+        auto& s      = p.sequence(members[b]);
+        const auto f = s.continuation.metadata.main_frontier;
         if (s.phase != detail::Phase::Active || !s.permit ||
             !budgets[b].generated_tokens_remaining || s.identity.tokens.size() != f + 1 ||
-            std::find(members.begin(), members.begin() + b, members[b]) != members.begin() + b)
+            s.membership_mark == mark)
             throw std::logic_error("decode row is not executable");
+        s.membership_mark = mark;
         extents[b] = std::min({p.shape.draft_tokens, budgets[b].generated_tokens_remaining - 1,
                                p.shape.max_context - f - 1});
         speculative |= extents[b] != 0;
@@ -160,8 +164,11 @@ Session::start_control(std::span<const SequenceHandle> members, std::span<const 
         stride > p.definition->resources().text.control_tokens->size() ||
         tokens.size() != members.size() * stride)
         throw std::logic_error("invalid forced control window");
+    const auto mark = p.next_membership_mark();
     for (std::size_t b = 0; b < members.size(); ++b) {
-        const auto& s = p.sequence(members[b]);
+        auto& s = p.sequence(members[b]);
+        if (s.membership_mark == mark) throw std::logic_error("duplicate control member");
+        s.membership_mark = mark;
         if (s.phase != detail::Phase::Active || !s.permit ||
             s.permit->kind != ExecutionUnitKind::Control ||
             s.identity.tokens.size() != s.continuation.metadata.main_frontier + 1 ||

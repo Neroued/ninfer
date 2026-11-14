@@ -3,6 +3,7 @@
 #include "models/common/context/directory.h"
 
 #include <algorithm>
+#include <unordered_set>
 #include <limits>
 #include <map>
 #include <stdexcept>
@@ -472,14 +473,14 @@ HistoryDirectory::metadata_requirement(std::span<const HistoryMetadataDemand> de
         bytes += vector_bytes(history ? history->prefixes.capacity() : 0, prefixes,
                               sizeof(PrefixReferences));
     };
-    std::vector<HistoryId> writers;
+    std::unordered_set<std::uint32_t> writers;
+    writers.reserve(demands.size());
     for (const auto& demand : demands) {
         std::uint32_t index;
         if (demand.history.valid()) {
             (void)require(demand.history);
-            if (std::find(writers.begin(), writers.end(), demand.history) != writers.end())
+            if (!writers.insert(demand.history.index).second)
                 throw std::invalid_argument("duplicate KV writer metadata demand");
-            writers.push_back(demand.history);
             index = demand.history.index;
         } else {
             const auto next = descriptor();

@@ -3,7 +3,6 @@
 #include "core/tensor.h"
 #include "core/device.h"
 
-
 namespace ninfer::ops {
 
 /**
@@ -17,9 +16,16 @@ namespace ninfer::ops {
  * is positive and finite. Nonnegative empty shapes perform no device work. Nonempty backing is
  * naturally BF16-aligned. Input, weight, and output must not overlap.
  * Preserves inputs and writes out; no workspace or persistent state.
+ *
+ * The overload with inverse also writes inv_r to contiguous FP32 [ne[1],ne[2],ne[3]],
+ * without the weight multiplier. For nonempty x, inverse belongs to the execution device,
+ * is naturally FP32-aligned, and must not overlap x, weight, or out. Empty x performs no
+ * writes to either output, including when D is zero and the trailing extents are positive.
  */
 void rmsnorm(const Tensor& x, const Tensor& weight, float eps, bool unit_offset, Tensor& out,
              CudaExecutionView execution);
+void rmsnorm(const Tensor& x, const Tensor& weight, float eps, bool unit_offset, Tensor& out,
+             Tensor& inverse, CudaExecutionView execution);
 
 /**
  * Applies RMS normalization over ne[0] and an elementwise SiLU gate. For each logical row r:

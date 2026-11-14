@@ -284,11 +284,11 @@ __global__ __launch_bounds__(256) void context_kv_key_post_kernel(
     const int local           = physical_column % width;
     const int count           = counts[batch];
     if (count < min_count || count > max_count || local >= count) return;
-    const auto layer   = layers.layer[layer_index];
-    const int head     = threadIdx.x >> 5;
-    const float* input = key_scratch +
-                         kRows * (packed_column + max_count * batch_size * layer_index) +
-                         head * kHeadDim;
+    const auto layer = layers.layer[layer_index];
+    const int head   = threadIdx.x >> 5;
+    const float* input =
+        key_scratch + std::int64_t(kRows) * (packed_column + max_count * batch_size * layer_index) +
+        head * kHeadDim;
     store_key_head(input, layer, positions, layer.offsets, physical_column, width, head,
                    layers.epsilon, layers.frequencies);
 }

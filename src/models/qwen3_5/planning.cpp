@@ -80,6 +80,11 @@ std::uint32_t SequencePlan::max_concurrency() const noexcept {
     return impl_ != nullptr ? impl_->max_concurrency : 0;
 }
 
+const BatchExecutionPlan& SequencePlan::batch_execution() const {
+    if (!impl_ || !impl_->batch_execution) throw std::logic_error("sequence batch plan is empty");
+    return *impl_->batch_execution;
+}
+
 std::size_t SequencePlan::device_reservation_bytes() const noexcept {
     return impl_ != nullptr ? impl_->device_reservation_bytes : 0;
 }
@@ -152,6 +157,7 @@ SessionPlan plan_session(const SequencePlan& sequence) {
     if (!sequence.impl_) throw std::invalid_argument("sequence plan is empty");
     const auto& source = *sequence.impl_;
     SessionPlan out;
+    out.batch_execution     = source.batch_execution;
     out.profile             = source.profile;
     out.capacity            = source.capacity;
     out.max_concurrency     = source.max_concurrency;

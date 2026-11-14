@@ -38,6 +38,7 @@ struct Options {
     bool counts_active = true;
     bool mask          = false;
     std::vector<std::int32_t> row_extents;
+    std::vector<std::int32_t> live_rows;
     measurement::Options timing{.warmup = 8, .repeat = 60, .cache = "cold"};
     Mode mode          = Mode::Stochastic;
     int batch          = 1;
@@ -53,9 +54,9 @@ struct Options {
 
 void usage(const char* argv0) {
     std::printf("usage: %s [--sample|--mtp|--dflash2|--matrix] [--mode greedy|stochastic] "
-                "[--batch 1..8] [--mtp-k 1..5] [--drafts 1..15] [--extent 0..K] [--top-k 1..20] "
+                "[--batch N] [--mtp-k 1..5] [--drafts 1..15] [--extent 0..K] [--top-k 1..20] "
                 "[--no-counts] [--general] [--mixed] [--reject-at J] [--warmup N] [--repeat N] "
-                "[--row-extents N,...] [--mask]\n",
+                "[--row-extents N,...] [--live-rows 0,1,...] [--mask]\n",
                 argv0);
     measurement::help();
 }
@@ -124,6 +125,8 @@ Options parse_args(int argc, char** argv) {
             options.mask = true;
         } else if (arg == "--row-extents") {
             options.row_extents = measurement::integers(need_value("--row-extents"), 0);
+        } else if (arg == "--live-rows") {
+            options.live_rows = measurement::integers(need_value("--live-rows"), 0);
         } else if (arg == "--no-counts") {
             options.counts_active = false;
         } else if (arg == "-h" || arg == "--help") {
@@ -146,9 +149,7 @@ Options parse_args(int argc, char** argv) {
     if (options.mtp_k < 1 || options.mtp_k > 5) {
         throw std::invalid_argument("--mtp-k must be in [1,5]");
     }
-    if (options.batch < 1 || options.batch > 8) {
-        throw std::invalid_argument("--batch must be in [1,8]");
-    }
+    if (options.batch < 1) { throw std::invalid_argument("--batch must be positive"); }
     if (options.drafts < 1 || options.drafts > 15)
         throw std::invalid_argument("--drafts must be in [1,15]");
     const int drafts = options.dflash2 ? options.drafts : options.matrix ? 5 : options.mtp_k;
@@ -161,8 +162,8 @@ Options parse_args(int argc, char** argv) {
         (options.row_extents.size() != std::size_t(options.batch) ||
          *std::max_element(options.row_extents.begin(), options.row_extents.end()) > drafts))
         throw std::invalid_argument("row extents must fit B and K");
-    if (options.matrix &&
-        (!options.row_extents.empty() || options.extent_set || options.reject_at >= 0))
+    if (options.matrix && (!options.row_extents.empty() || !options.live_rows.empty() ||
+                           options.extent_set || options.reject_at >= 0))
         throw std::invalid_argument("explicit extents/rejection require one acceptance profile");
     if (options.force_general && !options.dflash2)
         throw std::invalid_argument("--general requires --dflash2");
@@ -171,6 +172,10 @@ Options parse_args(int argc, char** argv) {
     if (options.top_k < 1 || options.top_k > 20) {
         throw std::invalid_argument("--top-k must be in [1,20]");
     }
+    if (!options.live_rows.empty() &&
+        (options.live_rows.size() != std::size_t(options.batch) ||
+         *std::max_element(options.live_rows.begin(), options.live_rows.end()) > 1))
+        throw std::invalid_argument("--live-rows requires one 0/1 flag per batch row");
     return options;
 }
 
@@ -303,8 +308,13 @@ std::vector<std::int32_t> extents(const Options& o, int columns) {
 
 std::size_t decision_bytes(const Options& o, int columns, const std::vector<std::int32_t>& active,
                            bool acceptance) {
-    std::size_t bytes = std::size_t(o.batch) * sizeof(ops::SamplingConfig);
+    std::size_t bytes = o.live_rows.empty() ? 0 : std::size_t(o.batch) * sizeof(std::int32_t);
     for (int b = 0; b < o.batch; ++b) {
+        if (!o.live_rows.empty() && !o.live_rows[b]) {
+            bytes += std::size_t(acceptance ? columns + 1 : 1) * sizeof(std::int32_t);
+            continue;
+        }
+        bytes += sizeof(ops::SamplingConfig);
         const bool stochastic = o.mixed ? b % 3 == 2 : o.mode == Mode::Stochastic;
         const bool penalties  = o.mixed ? b % 3 != 0 : stochastic && o.counts_active;
         const int used        = acceptance ? active[b] + 1 : 1;
@@ -330,8 +340,10 @@ void run_sample(DeviceBuffer& logits, const Options& o, DecisionBenchmark& bench
     auto masks      = make_masks(1, batch, o.mask);
     auto configs =
         make_batch_configs(counts, batch, o.mode, o.counts_active, o.top_k, o.mixed, masks, 1);
-    auto out       = make_zeros(std::size_t(batch) * 4);
-    auto positions = make_i32(std::vector<std::int32_t>(batch, 4096));
+    auto out          = make_zeros(std::size_t(batch) * 4);
+    auto positions    = make_i32(std::vector<std::int32_t>(batch, 4096));
+    auto live         = o.live_rows.empty() ? DeviceBuffer{} : make_i32(o.live_rows);
+    const auto active = live.size() ? Tensor(live.span(), DType::I32, {batch}) : Tensor{};
     Tensor tl(logits.span(), DType::BF16, {kPhysicalRows, batch}),
         to(out.span(), DType::I32, {batch}), tp(positions.span(), DType::I32, {batch});
     const auto bytes = ops::sampling_workspace_capacity_bytes(kTokenDomain, batch, batch);
@@ -348,7 +360,7 @@ void run_sample(DeviceBuffer& logits, const Options& o, DecisionBenchmark& bench
         [&](CudaExecutionView cuda) {
             ops::sample(tl, to, kTokenDomain,
                         static_cast<const ops::SamplingConfig*>(configs.data()), tp,
-                        ops::kSamplePurposeDecode, workspace, cuda);
+                        ops::kSamplePurposeDecode, active, workspace, cuda);
             row.workspace_peak = workspace.peak_used();
         },
         [](CudaExecutionView) {});
@@ -369,7 +381,9 @@ void run_mtp(DeviceBuffer& logits, const Options& o, DecisionBenchmark& benchmar
         }
     const auto active = extents(o, columns);
     auto dt = make_i32(targets), dd = make_i32(drafts), de = make_i32(active);
-    auto lengths  = make_i32(std::vector<std::int32_t>(batch, 4096));
+    auto lengths           = make_i32(std::vector<std::int32_t>(batch, 4096));
+    auto live              = o.live_rows.empty() ? DeviceBuffer{} : make_i32(o.live_rows);
+    const auto live_tensor = live.size() ? Tensor(live.span(), DType::I32, {batch}) : Tensor{};
     auto licensed = make_zeros(std::size_t(columns) * batch * 4), num = make_zeros(batch * 4);
     Tensor tt(dt.span(), DType::I32, {columns, batch}),
         tl(logits.span(), DType::BF16, {kPhysicalRows, columns, batch}),
@@ -393,7 +407,8 @@ void run_mtp(DeviceBuffer& logits, const Options& o, DecisionBenchmark& benchmar
         [&](CudaExecutionView cuda) {
             ops::speculative_accept_greedy_drafts(
                 tt, tl, td, te, tlen, tout, tn, kTokenDomain,
-                static_cast<const ops::SamplingConfig*>(configs.data()), workspace, cuda);
+                static_cast<const ops::SamplingConfig*>(configs.data()), live_tensor, workspace,
+                cuda);
             row.workspace_peak = workspace.peak_used();
         },
         [](CudaExecutionView) {});
@@ -478,10 +493,12 @@ void run_dflash2(DeviceBuffer& logits, const Options& options, DecisionBenchmark
                                            std::max<std::size_t>(workspace_bytes, 256));
     MemoryArena workspace(workspace_storage.span());
     const auto* config_ptr = static_cast<const ops::SamplingConfig*>(configs.data());
+    auto live = options.live_rows.empty() ? DeviceBuffer{} : make_i32(options.live_rows);
+    const auto live_tensor = live.size() ? Tensor(live.span(), DType::I32, {batch}) : Tensor{};
     const auto launch      = [&](CudaExecutionView cuda) {
         ops::speculative_accept_sparse_drafts(ttargets, tlogits, tdrafts, tcandidates, tq, textents,
                                                    tlengths, tlicensed, tlicensed_counts, kTokenDomain,
-                                                   config_ptr, envelope, workspace, cuda);
+                                                   config_ptr, envelope, live_tensor, workspace, cuda);
     };
 
     measurement::Row row{.op              = "accept-sparse-drafts",

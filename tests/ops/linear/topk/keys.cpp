@@ -263,6 +263,8 @@ void add_topk_keys_cases(ninfer::test::linear_suite::Suite& suite) {
                       {33, 1}, {64, 1}, {65, 1}, {96, 1}, {97, 1}, {128, 1}, {129, 1}}})
                 calls.push_back({d, b, begin, Domain, Recipe::Dense,
                                  (d == 7 && b == 8) || (d == 15 && b == 8) || d == 129});
+            for (auto [d, b] : std::array<std::array<int, 2>, 2>{{{7, 9}, {1, 17}}})
+                calls.push_back({d, b, begin, Domain, Recipe::Dense, true});
             for (int d : {1, 7, 9, 16, 17, 32, 33, 65, 96, 97, 120})
                 calls.push_back({d, 1, begin, Domain, Recipe::Precise});
             calls.push_back({33, 1, begin, begin + 16, Recipe::Precise, false, true});

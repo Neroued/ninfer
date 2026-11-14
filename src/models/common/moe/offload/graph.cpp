@@ -34,20 +34,21 @@ void upload(DecodeGraphExecutable& executable, cudaStream_t stream) {
 }
 } // namespace
 
-GraphPlan graph_plan(const Plan& schedule, ExpertBankId bank, std::int32_t tokens) {
+GraphPlan graph_plan(const Plan& schedule, ExpertBankId bank, TokenGeometry geometry) {
+    if (geometry.minimum_active_tokens < 1 ||
+        geometry.minimum_active_tokens > geometry.physical_tokens)
+        throw std::invalid_argument("invalid MoE graph token geometry");
     const auto& plan   = schedule.layer(bank);
     const auto experts = std::uint32_t(plan.spec.profile.routed.experts);
+    const bool hybrid  = !plan.requires_full_bank(geometry.minimum_active_tokens);
+    const bool full    = plan.requires_full_bank(geometry.physical_tokens);
     using Kind         = ops::ExpertSubsetKind;
     GraphPlan out;
-    if (plan.requires_full_bank(tokens)) {
-        out.subsets[moe_graph_index(Kind::All)] = true;
-    } else {
-        out.subsets[moe_graph_index(Kind::All)]  = plan.cache_experts == experts;
-        out.subsets[moe_graph_index(Kind::None)] = plan.fixed_experts == 0;
-        out.subsets[moe_graph_index(Kind::MaskOnes)] =
-            plan.cache_experts > 0 && plan.fixed_experts < experts;
-    }
-    if (!plan.requires_full_bank(tokens) || plan.stream_layout.empty())
+    out.subsets[moe_graph_index(Kind::All)]  = full || (hybrid && plan.cache_experts == experts);
+    out.subsets[moe_graph_index(Kind::None)] = hybrid && plan.fixed_experts == 0;
+    out.subsets[moe_graph_index(Kind::MaskOnes)] =
+        hybrid && plan.cache_experts > 0 && plan.fixed_experts < experts;
+    if (hybrid || plan.stream_layout.empty())
         out.steady = plan.cache_experts == 0         ? Kind::None
                      : plan.cache_experts == experts ? Kind::All
                                                      : Kind::MaskOnes;
@@ -55,7 +56,7 @@ GraphPlan graph_plan(const Plan& schedule, ExpertBankId bank, std::int32_t token
 }
 
 LayerGraphExecutable::LayerGraphExecutable(const LayerGraphDefinition& source)
-    : plan_(source.plan) {
+    : plan_(source.plan), validity_(source.validity) {
     instantiate(mixer_, source.mixer);
     instantiate(steady_, source.steady);
     instantiate(feature_, source.feature);
@@ -69,6 +70,7 @@ void LayerGraphExecutable::update(const LayerGraphDefinition& source) {
     offload::update(mixer_, source.mixer);
     offload::update(steady_, source.steady);
     offload::update(feature_, source.feature);
+    validity_ = source.validity;
 }
 
 void LayerGraphExecutable::upload(cudaStream_t stream) {
@@ -80,10 +82,12 @@ void LayerGraphExecutable::upload(cudaStream_t stream) {
 }
 
 void capture_layer(LayerGraphDefinition& definition, Resources& resources, ExpertBankId bank,
-                   CudaExecutionView cuda, std::int32_t tokens, const std::function<void()>& mixer,
+                   CudaExecutionView cuda, TokenGeometry geometry,
+                   const std::function<void()>& mixer,
                    const std::function<void(const PreparedExecution&)>& gpu_moe,
                    const std::function<void()>& feature) {
-    definition.plan = graph_plan(resources.plan(), bank, tokens);
+    definition.plan   = graph_plan(resources.plan(), bank, geometry);
+    const auto tokens = geometry.physical_tokens;
     definition.mixer.capture(cuda.stream(), mixer);
     using Kind = ops::ExpertSubsetKind;
     for (auto kind : {Kind::All, Kind::None, Kind::MaskOnes}) {
@@ -161,7 +165,7 @@ bool LayerGraphExecutable::advance() {
                 resources.gpu_submitted(bank);
                 invocation.stage = Stage::Complete;
             }
-            const auto complete = try_complete(*invocation.call, invocation.output);
+            const auto complete = try_complete(*invocation.call, invocation.output, validity_);
             if (!complete) return false;
             resources.finish_layer(*complete);
             invocation.call.reset();
@@ -181,7 +185,7 @@ bool LayerGraphExecutable::advance() {
             invocation.stage = Stage::Complete;
             if (invocation.after_gpu_submit) invocation.after_gpu_submit();
         }
-        const auto complete = try_complete(*invocation.call, invocation.output);
+        const auto complete = try_complete(*invocation.call, invocation.output, validity_);
         if (!complete) return false;
         resources.finish_layer(*complete);
     }

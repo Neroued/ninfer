@@ -150,7 +150,8 @@ std::vector<BenchRow> run_batch_update(const Options& options, std::int32_t toke
         const Tensor& q_input = composed ? q_norm : q;
         const Tensor& k_input = composed ? k_norm : k;
         ops::gated_delta_net_batch_update(q_input, k_input, v, g, beta, gated_delta_net_scale(),
-                                                  !composed, source_state, destination_state, out, cuda);
+                                          !composed, source_state, destination_state, {}, out,
+                                          cuda);
     };
     BenchRow row;
     row.normalization  = composed ? "composed" : "fused";

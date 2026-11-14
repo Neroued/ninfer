@@ -29,7 +29,7 @@ inline Options parse_options(int argc, char** argv) {
                    "  --tokens T[,T...] or --sweep START:END[:STEP] --batch B\n"
                    "  --commits dense|one|mixed|N[,N...] --valid dense|mixed|N[,N...]\n"
                    "  --row-metadata host|device (fold only, default host)\n"
-                   "Head dimension=128, T=2..16, B=1..8.\n"
+                   "Head dimension=128, T=2..16, B>0.\n"
                    "Fold times all specified layers; record times one recurrence layer.\n";
             measurement::help();
             std::exit(0);
@@ -69,7 +69,6 @@ inline Options parse_options(int argc, char** argv) {
     if (o.op != "fold" && o.op != "record") throw std::invalid_argument("unknown Replay Op");
     if (o.op != "fold" && o.row_metadata != "host")
         throw std::invalid_argument("row-metadata applies to fold");
-    if (o.batch > 8) throw std::invalid_argument("B must be <=8");
     for (int t : o.tokens)
         if (t < 2 || t > 16) throw std::invalid_argument("T must be in [2,16]");
     return o;
@@ -84,10 +83,10 @@ inline std::vector<int> extents(const std::string& selection, int width, int bat
     else if (selection == "mixed") {
         constexpr int pattern[] = {0, 1, 2, 3, 16, 7, 12, 5};
         for (int b = 0; b < batch; ++b)
-            result.push_back(commits ? std::min(width, pattern[b])
-                                     : std::max(1, width - b % width));
+            result.push_back(commits ? std::min(width, pattern[b % std::size(pattern)])
+                                     : (width - b % (width + 1)));
     } else
-        result = measurement::integers(selection, commits ? 0 : 1);
+        result = measurement::integers(selection, 0);
     if (result.size() != std::size_t(batch) ||
         *std::max_element(result.begin(), result.end()) > width)
         throw std::invalid_argument("prefix extents must match T/B");

@@ -226,7 +226,7 @@ void serial(const Tensor& x, const model_moe::Parameters& p, offload::PartitionV
     auto& host = *execution.host;
     ops::topk_softmax_route(
         x, {p.profile.routed.ffn.hidden, p.profile.routed.experts, p.profile.routed.top_k},
-        p.control, frame.gpu_routes, frame.shared, work, execution.cuda);
+        p.control, frame.gpu_routes, frame.shared, {}, work, execution.cuda);
     host.route_ready.record(execution.cuda.stream());
     host.route_ready.wait(host.transfer.stream());
     copy_bytes_async(bytes(frame.x_host, true), bytes(x), host.transfer);
@@ -251,10 +251,10 @@ void serial(const Tensor& x, const model_moe::Parameters& p, offload::PartitionV
                        frame.gpu_device, work, execution.cuda);
     if (cpu_work) {
         const std::array partials{frame.gpu_device, frame.cpu_device};
-        ops::sum_contributions(partials, &residual, residual, execution.cuda);
+        ops::sum_contributions(partials, &residual, residual, {}, 1, execution.cuda);
     } else {
         const std::array partials{frame.gpu_device};
-        ops::sum_contributions(partials, &residual, residual, execution.cuda);
+        ops::sum_contributions(partials, &residual, residual, {}, 1, execution.cuda);
     }
 }
 
@@ -331,7 +331,7 @@ void run(const Options& options) {
     std::vector<int> routes(std::size_t(k) * options.tokens);
     for (auto& input : inputs) {
         const Tensor x(input.span(), DType::BF16, {h, options.tokens});
-        ops::topk_softmax_route(x, {h, e, k}, p.control, frame.gpu_routes, frame.shared, work,
+        ops::topk_softmax_route(x, {h, e, k}, p.control, frame.gpu_routes, frame.shared, {}, work,
                                 execution.cuda);
         device.synchronize();
         CUDA_CHECK(cudaMemcpy(routes.data(), frame.gpu_routes.ids.data, routes.size() * 4,
@@ -407,7 +407,8 @@ void run(const Options& options) {
             Tensor x(inputs[i].span(), DType::BF16, {h, options.tokens});
             DecodeGraphDefinition definition;
             definition.capture(execution.cuda.stream(), [&] {
-                offload::enqueue_gpu(x, prepared, residual, work, offload::GpuSubmission::Capture);
+                offload::enqueue_gpu(x, prepared, residual, {}, work,
+                                     offload::GpuSubmission::Capture);
             });
             graphs[i].instantiate(definition);
             graphs[i].upload(execution.cuda.stream());
@@ -423,9 +424,10 @@ void run(const Options& options) {
             if (!graphs.empty()) {
                 graphs[sample % graphs.size()].launch(execution.cuda.stream());
             } else {
-                offload::enqueue_gpu(x, prepared, residual, work, offload::GpuSubmission::Eager);
+                offload::enqueue_gpu(x, prepared, residual, {}, work,
+                                     offload::GpuSubmission::Eager);
             }
-            while (!offload::try_complete(prepared, residual)) std::this_thread::yield();
+            while (!offload::try_complete(prepared, residual, {})) std::this_thread::yield();
         }
         device.synchronize();
     };

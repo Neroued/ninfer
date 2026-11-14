@@ -1,3 +1,4 @@
+#include "ops/common/host/launch.h"
 #include "ops/common/host/operands.h"
 #include "ninfer/ops/sequence.h"
 #include <algorithm>
@@ -23,7 +24,7 @@ __global__ void prepare_verify_inputs_kernel(
     extent        = extent < 0 ? 0 : (extent > k ? k : extent);
     for (int j = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x; j < T;
          j += blockDim.x * gridDim.x) {
-        const int off   = row * T + j;
+        const auto off  = std::int64_t(row) * T + j;
         verify_ids[off] = j == 0 ? anchors[row]
                                  : (j <= extent ? drafts[row * draft_row + (j - 1) * draft_column]
                                                 : anchors[row]);
@@ -39,15 +40,19 @@ void prepare_verify_inputs_launch(const Tensor& anchors, const Tensor& drafts,
     constexpr int kBlock = 32;
     const int k          = drafts.ne[0];
     const int batch      = drafts.ne[1];
-    const dim3 grid(static_cast<unsigned int>(div_up(k + 1, kBlock)),
-                    static_cast<unsigned int>(batch));
-    prepare_verify_inputs_kernel<<<grid, kBlock, 0, stream>>>(
-        static_cast<const std::int32_t*>(anchors.data),
-        static_cast<const std::int32_t*>(drafts.data),
-        static_cast<const std::int32_t*>(base_positions.data),
-        static_cast<const std::int32_t*>(current_extents.data),
-        static_cast<std::int32_t*>(verify_ids.data), static_cast<std::int32_t*>(positions.data), k,
-        drafts.nb[0] / 4, drafts.nb[1] / 4);
+    common::for_each_token_slice(batch, 1, [&](int offset, int count) {
+        const dim3 grid(static_cast<unsigned int>(div_up(k + 1, kBlock)),
+                        static_cast<unsigned int>(count));
+        prepare_verify_inputs_kernel<<<grid, kBlock, 0, stream>>>(
+            static_cast<const std::int32_t*>(anchors.data) + offset,
+            static_cast<const std::int32_t*>(drafts.data) +
+                std::int64_t(offset) * (drafts.nb[1] / 4),
+            static_cast<const std::int32_t*>(base_positions.data) + offset,
+            static_cast<const std::int32_t*>(current_extents.data) + offset,
+            static_cast<std::int32_t*>(verify_ids.data) + std::int64_t(offset) * (k + 1),
+            static_cast<std::int32_t*>(positions.data) + std::int64_t(offset) * (k + 1), k,
+            drafts.nb[0] / 4, drafts.nb[1] / 4);
+    });
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -57,14 +62,17 @@ void prepare_verify_ids_launch(const Tensor& anchors, const Tensor& drafts,
     constexpr int kBlock = 32;
     const int k          = drafts.ne[0];
     const int batch      = drafts.ne[1];
-    const dim3 grid(static_cast<unsigned int>(div_up(k + 1, kBlock)),
-                    static_cast<unsigned int>(batch));
-    prepare_verify_inputs_kernel<<<grid, kBlock, 0, stream>>>(
-        static_cast<const std::int32_t*>(anchors.data),
-        static_cast<const std::int32_t*>(drafts.data), nullptr,
-        static_cast<const std::int32_t*>(current_extents.data),
-        static_cast<std::int32_t*>(verify_ids.data), nullptr, k, drafts.nb[0] / 4,
-        drafts.nb[1] / 4);
+    common::for_each_token_slice(batch, 1, [&](int offset, int count) {
+        const dim3 grid(static_cast<unsigned int>(div_up(k + 1, kBlock)),
+                        static_cast<unsigned int>(count));
+        prepare_verify_inputs_kernel<<<grid, kBlock, 0, stream>>>(
+            static_cast<const std::int32_t*>(anchors.data) + offset,
+            static_cast<const std::int32_t*>(drafts.data) +
+                std::int64_t(offset) * (drafts.nb[1] / 4),
+            nullptr, static_cast<const std::int32_t*>(current_extents.data) + offset,
+            static_cast<std::int32_t*>(verify_ids.data) + std::int64_t(offset) * (k + 1), nullptr,
+            k, drafts.nb[0] / 4, drafts.nb[1] / 4);
+    });
     CUDA_CHECK(cudaGetLastError());
 }
 

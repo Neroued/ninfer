@@ -17,7 +17,7 @@ struct KdaReplayFoldRow {
  * Replays records [0,m) from source into destination across all layers, preserving the FP32
  * recurrent state of ordinary KDA updates on those represented inputs, bit for bit. Convolution
  * history becomes tail_3(source.conv || records.conv[0:m]). No projection or readout is performed.
- * Record row b is fixed throughout the call; 1<=B<=record_capacity<=8, 0<=m<=width.
+ * Record row b is fixed throughout the call; 1<=B<=record_capacity, 0<=m<=width.
  *
  * State fields are dense and 256-byte aligned, selected by arena-relative I64 byte offsets.
  * Positive rows may update in place; destinations are distinct and cannot overwrite another

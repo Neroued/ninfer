@@ -31,7 +31,7 @@ RankPreparation::RankPreparation(const artifact::Reader& reader, RankLoadRequest
     auto profile = execution::describe_model(load_->definition(), load_->weight_data(),
                                              load_->expert_data(), load_->rank_plan());
     plan_        = plan_execution(std::move(profile), options_, request.index_format,
-                                  device.multiprocessor_count());
+                                  device.multiprocessor_count(), std::move(request.batches));
     capacity_    = describe_execution_capacity(plan_);
 }
 
@@ -150,6 +150,7 @@ RankResourceDescription RankPreparation::describe() const {
     const auto& c = p.capacity;
     RankResourceDescription out{.rank    = p.profile->local.rank,
                                 .shape   = p.shape,
+                                .batches = p.batches->spec(),
                                 .state   = describe_state(p.state),
                                 .context = describe_context(p)};
     out.observation.rank     = out.rank;
@@ -210,9 +211,12 @@ std::unique_ptr<RankPreparation> Startup::preparation(const artifact::Reader& re
                                                       DeviceContext& device) const {
     return std::make_unique<RankPreparation>(
         reader,
-        RankLoadRequest{.artifact     = definition_->artifact_id(),
-                        .rank         = rank_,
-                        .options      = options,
+        RankLoadRequest{.artifact = definition_->artifact_id(),
+                        .rank     = rank_,
+                        .options  = options,
+                        .batches  = make_batch_execution_spec(
+                            options.max_concurrency, 1,
+                            options.use_cuda_graph && options.purpose == EnginePurpose::Generation),
                         .index_format = index_format_,
                         .host_reservation_bytes =
                             options.enable_vision ? options.media_live_bytes : 0,

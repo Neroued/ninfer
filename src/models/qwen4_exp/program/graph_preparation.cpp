@@ -5,8 +5,10 @@
 namespace ninfer::models::qwen4_exp {
 
 GraphPreparationPlan describe_graph_preparation(const EngineOptions& options,
+                                                const BatchExecutionPlan& batches,
                                                 const moe::Plan* plan) {
     GraphPreparationPlan out;
+    out.batches = batches.spec();
     if (!options.use_cuda_graph) return out;
     out.enabled         = true;
     out.offload         = plan != nullptr;
@@ -17,27 +19,30 @@ GraphPreparationPlan describe_graph_preparation(const EngineOptions& options,
     out.kv_cache        = options.kv_cache;
     out.vision          = options.enable_vision;
     if (!plan) return out;
-    for (std::uint32_t batch = 1; batch <= options.max_concurrency; ++batch)
+    for (const auto batch : batches.graph_rows())
         for (const auto& layer : plan->description().layers) {
-            out.ordinary.push_back(plan->graph_plan(layer.bank, batch));
+            out.ordinary.push_back(
+                plan->graph_plan(layer.bank, moe::decode_geometry(batches, batch, 1)));
             if (options.speculative.backend == SpeculativeBackend::Mtp)
-                out.verify.push_back(
-                    plan->graph_plan(layer.bank, batch * (options.speculative.draft_tokens + 1)));
+                out.verify.push_back(plan->graph_plan(
+                    layer.bank,
+                    moe::decode_geometry(batches, batch, options.speculative.draft_tokens + 1)));
         }
     return out;
 }
 
 GraphCalibration calibrate_graphs(const execution::Parameters& parameters, DeviceContext& device,
                                   const EngineOptions& options,
+                                  std::shared_ptr<const BatchExecutionPlan> batches,
                                   std::shared_ptr<const moe::Plan> moe) {
     GraphCalibration result;
-    result.plan = describe_graph_preparation(options, moe.get());
+    result.plan = describe_graph_preparation(options, *batches, moe.get());
     if (!options.use_cuda_graph) return result;
     StartupPhaseScope phase(options.startup_observer, StartupPhase::CudaGraphCalibration);
     auto plan = plan_graph_probe(
         parameters.profile,
         std::get<std::shared_ptr<const ple::disk::Table>>(parameters.model.ple_table())->geometry(),
-        options, device, moe);
+        options, batches, device, moe);
     auto probe    = std::make_unique<detail::RankProgramImpl>(parameters, std::move(plan), device);
     result.memory = begin_graph_calibration(
         device, [&](GraphPreparationMode mode) { return probe->initialize_graphs(mode); },
@@ -47,7 +52,7 @@ GraphCalibration calibrate_graphs(const execution::Parameters& parameters, Devic
     plan = plan_graph_probe(
         parameters.profile,
         std::get<std::shared_ptr<const ple::disk::Table>>(parameters.model.ple_table())->geometry(),
-        options, device, moe, GraphProbeBacking::StartupWorkingSet);
+        options, batches, device, moe, GraphProbeBacking::StartupWorkingSet);
     probe = std::make_unique<detail::RankProgramImpl>(parameters, std::move(plan), device);
     complete_graph_calibration(
         result.memory, device,

@@ -66,7 +66,11 @@ Startup::plan(DeviceContext& device, const EngineOptions& options, WeightPlaceme
     const auto max_tokens = static_cast<std::int32_t>(
         std::max(std::min(chunk, options.max_context),
                  options.max_concurrency * (options.speculative.draft_tokens + 1)));
-    auto moe = offload_->resolve(available - required_bytes, max_tokens, options.moe.cpu_workers);
+    const BatchExecutionPlan batches(
+        make_batch_execution_spec(options.max_concurrency, 1, options.use_cuda_graph));
+    const auto geometries = moe::decode_geometries(batches, options.speculative.draft_tokens + 1);
+    auto moe              = offload_->resolve(available - required_bytes, max_tokens, geometries,
+                                              options.moe.cpu_workers);
     if (!moe) return std::nullopt;
     auto final                 = make_sequence_planner(profile, device, trial, moe);
     const auto& final_capacity = final.capacity_plan();

@@ -163,7 +163,7 @@ void SessionImpl::receive_result(runtime::ResultReady<ExecutionTypes>&& event) {
 void SessionImpl::commit_completed_unit() {
     auto& current      = *execution;
     current.settlement = std::make_unique<context::ContextTransaction>(directory);
-    std::array<bool, kMaximumConcurrency> recovery{};
+    std::vector<std::uint8_t> recovery(current.members.size());
     Commit physical;
     physical.rows.reserve(current.members.size());
     for (std::size_t b = 0; b < current.members.size(); ++b) {
@@ -217,8 +217,8 @@ CommitResult SessionImpl::commit(PendingBatch&& pending,
             throw std::logic_error("invalid accepted-prefix decision");
     }
     CommitResult result;
-    result.row_count = decisions.size();
-    std::array<bool, kMaximumConcurrency> recovery{};
+    result.rows.resize(decisions.size());
+    std::vector<std::uint8_t> recovery(current.members.size());
     try {
         current.decisions.assign(decisions.begin(), decisions.end());
         current.settlement = std::make_unique<context::ContextTransaction>(directory);
@@ -306,13 +306,13 @@ CommitResult SessionImpl::commit(PendingBatch&& pending,
             stats.accepted_tokens += accepted;
             for (std::uint32_t j = 0; j < accepted; ++j) ++stats.accepted_per_position[j];
         }
-        auto& row               = result.rows[b];
-        row.disposition         = d.cancelled  ? runtime::CommitDisposition::CancelledReleased
-                                  : d.failed   ? runtime::CommitDisposition::FailedReleased
-                                  : d.terminal ? runtime::CommitDisposition::Finishable
-                                               : runtime::CommitDisposition::Active;
-        row.speculative         = stats;
-        result.capture_ready[b] = !d.terminal && request.capture_pending;
+        auto& row         = result.rows[b];
+        row.disposition   = d.cancelled  ? runtime::CommitDisposition::CancelledReleased
+                            : d.failed   ? runtime::CommitDisposition::FailedReleased
+                            : d.terminal ? runtime::CommitDisposition::Finishable
+                                         : runtime::CommitDisposition::Active;
+        row.speculative   = stats;
+        row.capture_ready = !d.terminal && request.capture_pending;
     }
     pending.ticket_ = {};
     return result;
@@ -364,6 +364,7 @@ void SessionImpl::retire(runtime::DeviceRetired event) {
     }
     auto current = std::move(*execution);
     execution.reset();
+    for (auto h : current.members) sequences[lane(h)].computing = false;
     current.preparation->mark_completed();
     current.preparation->publish();
     if (current.settlement) {

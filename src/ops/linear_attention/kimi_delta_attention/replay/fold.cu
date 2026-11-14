@@ -4,6 +4,8 @@
 #include "ops/linear_attention/kimi_delta_attention/kernels/transition.cuh"
 #include "ops/common/host/operands.h"
 
+#include <algorithm>
+
 namespace ninfer::ops::detail::kimi_delta_attention {
 namespace {
 __device__ KdaReplayFoldRow select_row(const KdaReplayFoldKernelRows& rows, int b) {
@@ -22,7 +24,7 @@ struct FoldArguments {
     float* recurrent;
     __nv_bfloat16* history;
     std::int64_t recurrent_stride, history_stride;
-    int qk_heads, value_heads, conv_channels, width, capacity;
+    int qk_heads, value_heads, conv_channels, width, capacity, row_begin, layer_begin;
 };
 
 template <class Rows, int Warps, int Values>
@@ -31,13 +33,13 @@ __global__ __launch_bounds__(32 * Warps, 1) void fold_kernel(FoldArguments a, Ro
     const auto row         = select_row(rows, blockIdx.y);
     if (!row.commit_columns) return;
     const int head = blockIdx.x / (kStateDim / kBlockDv);
-    const int tile = blockIdx.x % (kStateDim / kBlockDv), layer = blockIdx.z;
+    const int tile = blockIdx.x % (kStateDim / kBlockDv), layer = a.layer_begin + blockIdx.z;
     const int lane = threadIdx.x, warp = threadIdx.y, tid = warp * 32 + lane;
     const int dv = tile * kBlockDv + warp * Values, dk = lane * kQkPerLane;
     const auto base = static_cast<std::int64_t>(layer) * a.recurrent_stride +
                       static_cast<std::int64_t>(head) * kStateDim * kStateDim;
     const auto record_begin =
-        (static_cast<std::int64_t>(layer) * a.capacity + blockIdx.y) * a.width;
+        (static_cast<std::int64_t>(layer) * a.capacity + a.row_begin + blockIdx.y) * a.width;
     __align__(16) float state[Values][kQkPerLane];
     load_state(state, a.recurrent + base + row.source_offset / sizeof(float), dv, dk);
     for (int t = 0; t < row.commit_columns; ++t) {
@@ -81,11 +83,11 @@ __global__ __launch_bounds__(32 * Warps, 1) void staged_fold_kernel(FoldArgument
     if (!row.commit_columns) return;
     constexpr int Tile = Warps * Values;
     const int head = blockIdx.x / (128 / Tile), tile = blockIdx.x % (128 / Tile),
-              layer = blockIdx.z;
+              layer = a.layer_begin + blockIdx.z;
     const int lane = threadIdx.x, warp = threadIdx.y, tid = warp * 32 + lane, dk = lane * 4,
               dv     = tile * Tile + warp * Values;
     const auto base  = std::int64_t(layer) * a.recurrent_stride + std::int64_t(head) * 128 * 128;
-    const auto start = (std::int64_t(layer) * a.capacity + blockIdx.y) * a.width;
+    const auto start = (std::int64_t(layer) * a.capacity + a.row_begin + blockIdx.y) * a.width;
     __align__(16) float state[Values][4];
     load_state(state, a.recurrent + base + row.source_offset / 4, dv, dk);
 
@@ -144,7 +146,8 @@ __global__ __launch_bounds__(32 * Warps, 1) void staged_fold_kernel(FoldArgument
 
 template <class Rows>
 void launch(const KdaReplayRecords& r, LinearAttentionStateAllLayersView s, const Rows& rows,
-            int batch, int multiprocessors, cudaStream_t stream) {
+            int row_begin, int batch, int layer_begin, int layers, int multiprocessors,
+            cudaStream_t stream) {
     const FoldArguments a{static_cast<const __nv_bfloat16*>(r.key.data),
                           static_cast<const __nv_bfloat16*>(r.value.data),
                           static_cast<const __nv_bfloat16*>(r.conv.data),
@@ -158,10 +161,12 @@ void launch(const KdaReplayRecords& r, LinearAttentionStateAllLayersView s, cons
                           r.spec.value_heads,
                           r.spec.conv_channels,
                           r.spec.width,
-                          r.spec.record_capacity};
+                          r.spec.record_capacity,
+                          row_begin,
+                          layer_begin};
     const auto submit = [&]<int Warps, int Values>() {
         fold_kernel<Rows, Warps, Values>
-            <<<dim3(r.spec.value_heads * (kStateDim / (Warps * Values)), batch, r.spec.layers),
+            <<<dim3(r.spec.value_heads * (kStateDim / (Warps * Values)), batch, layers),
                dim3(32, Warps), 0, stream>>>(a, rows);
     };
     const auto schedule = select_fold_schedule(r.spec.layers, r.spec.value_heads, r.spec.width,
@@ -169,8 +174,8 @@ void launch(const KdaReplayRecords& r, LinearAttentionStateAllLayersView s, cons
 #if NINFER_TARGET_SPARK
     const auto staged = [&]<int Steps, int Values>() {
         staged_fold_kernel<Rows, Steps, 4, Values>
-            <<<dim3(r.spec.value_heads * (kStateDim / (4 * Values)), batch, r.spec.layers),
-               dim3(32, 4), 0, stream>>>(a, rows);
+            <<<dim3(r.spec.value_heads * (kStateDim / (4 * Values)), batch, layers), dim3(32, 4), 0,
+               stream>>>(a, rows);
     };
     if (schedule.steps == 8)
         staged.template operator()<8, 8>();
@@ -201,14 +206,23 @@ void launch(const KdaReplayRecords& r, LinearAttentionStateAllLayersView s, cons
 } // namespace
 
 void launch_replay_fold(const KdaReplayRecords& r, LinearAttentionStateAllLayersView s,
-                        const KdaReplayFoldKernelRows& rows, int batch, int multiprocessors,
-                        cudaStream_t stream) {
-    launch(r, s, rows, batch, multiprocessors, stream);
+                        const KdaReplayFoldKernelRows& rows, int row_begin, int batch,
+                        int multiprocessors, cudaStream_t stream) {
+    for (std::int64_t begin = 0; begin < r.spec.layers; begin += 65535)
+        launch(r, s, rows, row_begin, batch, static_cast<int>(begin),
+               std::min<std::int64_t>(65535, r.spec.layers - begin), multiprocessors, stream);
 }
 
 void launch_replay_fold(const KdaReplayRecords& r, LinearAttentionStateAllLayersView s,
                         const KdaReplayFoldDeviceRows& rows, int batch, int multiprocessors,
                         cudaStream_t stream) {
-    launch(r, s, rows, batch, multiprocessors, stream);
+    for (std::int64_t first = 0; first < batch; first += 65535) {
+        const KdaReplayFoldDeviceRows group{rows.sources + first, rows.destinations + first,
+                                            rows.columns + first};
+        for (std::int64_t layer = 0; layer < r.spec.layers; layer += 65535)
+            launch(r, s, group, static_cast<int>(first),
+                   std::min<std::int64_t>(65535, batch - first), static_cast<int>(layer),
+                   std::min<std::int64_t>(65535, r.spec.layers - layer), multiprocessors, stream);
+    }
 }
 } // namespace ninfer::ops::detail::kimi_delta_attention

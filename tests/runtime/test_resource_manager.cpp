@@ -406,6 +406,8 @@ struct Program {
 
     std::size_t checkpoint_extent() const { return contents.size(); }
 
+    std::uint64_t checkpoint_catalog_revision() const { return checkpoint_revision; }
+
     std::vector<ninfer::runtime::ContextTransferRequirement>
     checkpoint_restore_requirements(Handle h) const {
         return inspect_source(Base{contents[h.index].tokens}, h)->transfers;
@@ -895,6 +897,46 @@ void test_candidates_keep_all_frontiers_and_independent_contents() {
     const auto surviving = f.cache.candidates(f.program, base);
     require(surviving.front().source.checkpoint == recomputed,
             "removing one same-key checkpoint erased its surviving index peer");
+}
+
+void test_candidates_survive_branch_retirement_and_republication() {
+    Fixture f(0);
+    const auto publish = [&](Key tokens) {
+        auto h = f.program.add(std::move(tokens));
+        f.publish(h);
+        return h;
+    };
+    const auto first  = publish({1, 2, 3, 4});
+    const auto second = publish({1, 2, 5, 6});
+    const auto prefix = publish({1, 2});
+    (void)publish({7, 8});
+    const auto check = [&] {
+        for (const Key tokens : {Key{1, 2, 3, 4, 9}, Key{1, 2, 5, 6, 7}, Key{1, 2, 3, 9}, Key{1, 2},
+                                 Key{7, 8}, Key{9}}) {
+            std::vector<std::uint32_t> expected, actual;
+            for (std::uint32_t i = 0; i < f.program.contents.size(); ++i) {
+                const auto& point = f.program.contents[i];
+                if (point.alive && point.tokens.size() <= tokens.size() &&
+                    std::equal(point.tokens.begin(), point.tokens.end(), tokens.begin()))
+                    expected.push_back(i);
+            }
+            for (const auto& candidate : f.cache.candidates(f.program, Base{tokens}))
+                if (candidate.source.checkpoint)
+                    actual.push_back(candidate.source.checkpoint->index);
+            std::sort(actual.begin(), actual.end());
+            require(actual == expected, "cache branch changes lost an exact prefix source");
+        }
+    };
+    check();
+    require(f.cache.erase(f.program, prefix) && f.cache.erase(f.program, first),
+            "could not retire branch sources");
+    auto moved = std::move(f.cache);
+    f.cache    = std::move(moved);
+    check();
+    (void)publish({1, 2, 3, 9});
+    check();
+    require(f.cache.erase(f.program, second), "could not retire remaining old branch");
+    check();
 }
 
 void test_shared_publication_deduplicates_complete_snapshots() {
@@ -3418,6 +3460,7 @@ int main() {
         test_cold_writeback_protects_reused_history();
         test_host_preflight_counts_aliases_and_has_no_partial_deletion();
         test_candidates_keep_all_frontiers_and_independent_contents();
+        test_candidates_survive_branch_retirement_and_republication();
         test_private_continuation_advances_with_adoption_heat();
         test_branch_adoption_time_is_independent_of_finish_order();
         test_shared_source_does_not_inherit_private_heat();

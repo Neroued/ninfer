@@ -74,8 +74,8 @@ std::size_t topk_softmax_swiglu_moe_workspace_capacity_bytes(const MoeProfile& p
 
 void topk_softmax_swiglu_moe(const Tensor& x, const MoeProfile& profile, const MoeWeights& weights,
                              ExpertSubset subset, MoeEpilogue mode, Tensor& destination,
-                             MemoryArena& workspace, CudaExecutionView execution,
-                             const MoeExecutionHints& hints) {
+                             MoeTokenValidity validity, MemoryArena& workspace,
+                             CudaExecutionView execution, const MoeExecutionHints& hints) {
     const auto& shape = impl::shape_dispatch(profile);
     if (destination.dtype != DType::BF16) {
         throw std::invalid_argument("complete MoE requires BF16 destination");
@@ -83,6 +83,7 @@ void topk_softmax_swiglu_moe(const Tensor& x, const MoeProfile& profile, const M
     detail::MoeOperands operands("topk_softmax_swiglu_moe", execution);
     const auto& p    = profile.routed;
     const int tokens = operands.input(x, p.ffn.hidden);
+    operands.validity(validity, tokens);
     operands.output(destination, p.ffn.hidden, tokens, mode);
     operands.control(weights.control, {p.ffn.hidden, p.experts, p.top_k});
     operands.subset(subset, p.experts);
@@ -96,18 +97,21 @@ void topk_softmax_swiglu_moe(const Tensor& x, const MoeProfile& profile, const M
     nvtx::ScopedRange range(nvtx::Name::TopkSoftmaxSwiGLUMoe, nvtx::Category::Moe, tokens);
     const int slice = shape.slice_tokens(subset.kind);
     for (std::int64_t start = 0; start < tokens; start += slice) {
-        const int offset   = static_cast<int>(start);
-        const int count    = std::min(tokens - offset, slice);
-        const auto plan    = shape.select(count, profile.shared.intermediate, subset.kind);
-        const auto input   = x.slice(1, offset, count);
-        auto output        = destination.slice(1, offset, count);
-        auto scope         = scratch.scope();
-        const auto storage = allocate(scratch, plan, count, profile, subset.kind);
+        const int offset          = static_cast<int>(start);
+        const int count           = std::min(tokens - offset, slice);
+        const auto plan           = shape.select(count, profile.shared.intermediate, subset.kind);
+        const auto input          = x.slice(1, offset, count);
+        auto output               = destination.slice(1, offset, count);
+        auto scope                = scratch.scope();
+        auto storage              = allocate(scratch, plan, count, profile, subset.kind);
+        const auto token_validity = kernel::token_validity(validity, offset);
+        storage.experts.token_validity      = token_validity;
+        storage.block_scaled.token_validity = token_validity;
         const ScaledSwiGLUTerm shared{weights.shared, storage.shared};
         if (plan.implementation == kernel::ExpertImplementation::BlockScaled) {
-            block_scaled::launch_control_shared(input, weights, storage.routes, subset,
-                                                storage.shared, storage.route.scores,
-                                                storage.block_scaled, plan.block_scaled, execution);
+            block_scaled::launch_control_shared(
+                input, weights, storage.routes, subset, storage.shared, storage.route.scores,
+                storage.block_scaled, plan.block_scaled, token_validity, execution);
             block_scaled::launch(input, weights.routed, storage.routes, subset, &shared, mode,
                                  output, plan.block_scaled, storage.block_scaled, execution,
                                  {.shared_activation = true,
@@ -115,7 +119,8 @@ void topk_softmax_swiglu_moe(const Tensor& x, const MoeProfile& profile, const M
             continue;
         }
         if (subset.kind == ExpertSubsetKind::None) {
-            routing::launch_shared_gate(input, weights.control, storage.shared, execution);
+            routing::launch_shared_gate(input, weights.control, storage.shared, token_validity,
+                                        execution);
             integer::launch_shared_swiglu(input, shared, mode, output, storage.experts,
                                           plan.integer.shared, execution);
             continue;
@@ -127,7 +132,7 @@ void topk_softmax_swiglu_moe(const Tensor& x, const MoeProfile& profile, const M
             hints.read_ahead, std::min(hints.read_ahead_bytes, std::size_t{8} << 20)};
         routing::launch_route(input, weights.control, storage.routes, storage.shared, plan.router,
                               storage.route, count == 1 ? shared_prefetch : MoeExecutionHints{},
-                              execution);
+                              token_validity, execution);
         if (plan.integer.grouped) {
             if (!plan.router.count_assignments) {
                 integer::launch_group_count(storage.routes, subset, storage.experts.groups,

@@ -10,14 +10,15 @@
 namespace ninfer::models::qwen3_5::detail {
 namespace {
 
-void bind_row(FrameIngress& input, std::size_t index, const ExecutionRow& row) {
+void bind_row(FrameIngressView& input, std::size_t index, const ExecutionRow& row) {
+    input.live_rows[index]          = 1;
     input.frontiers[index]          = static_cast<std::int32_t>(row.main_frontier);
     input.sampling_positions[index] = static_cast<std::int32_t>(row.main_frontier);
     input.history_skip[index]       = row.main_frontier == 0;
     input.backend_frontiers[index]  = static_cast<std::int32_t>(row.backend_frontier);
     input.main_table_rows[index]    = static_cast<std::int32_t>(row.main_table.index);
     input.backend_table_rows[index] =
-        row.backend_table ? static_cast<std::int32_t>(row.backend_table->index) : 0;
+        row.backend_table ? static_cast<std::int32_t>(row.backend_table->index) : -1;
     input.state_source_offsets[index]      = row.state_offsets.source;
     input.state_destination_offsets[index] = row.state_offsets.destination;
     input.residency_slots[index] = static_cast<std::int32_t>(row.member.residency.lane.value);
@@ -52,8 +53,9 @@ ops::SamplingConfig RankProgramImpl::sampling_config(const ExecutionRow& row,
 }
 
 void RankProgramImpl::upload_ingress() {
-    CUDA_CHECK(cudaMemcpyAsync(resources.frame.ingress.data, resources.frame.host_ingress,
-                               sizeof(FrameIngress), cudaMemcpyHostToDevice, device.stream()));
+    CUDA_CHECK(
+        cudaMemcpyAsync(resources.frame.ingress.data, resources.frame.host_ingress_bytes.data,
+                        resources.frame.ingress.bytes, cudaMemcpyHostToDevice, device.stream()));
 }
 
 void RankProgramImpl::upload_input(std::uint32_t width, std::uint32_t batch) {
@@ -79,15 +81,17 @@ void RankProgramImpl::initialize_forward(ComputeOperation& operation, const Forw
         operation.rows     = work.rows;
         operation.sampling = work.sampling;
         operation.batch    = static_cast<std::uint32_t>(work.rows.size());
-        operation.result   = Result{ForwardResult{}};
+        operation.shape    = work.shape;
+        operation.dead_positions.resize(operation.batch);
+        operation.result = Result{ForwardResult{}};
     }
     const auto index   = operation.forward_row;
     const auto& window = work.inputs[index];
     const auto offset  = operation.forward_offset;
     const auto columns = static_cast<std::uint32_t>(window.tokens.size());
     const auto end     = std::min(columns, offset + prefill_chunk);
-    auto& row = operation.rows[index];
-    row       = work.rows[index];
+    auto& row          = operation.rows[index];
+    row                = work.rows[index];
     if (offset) {
         row.source_state         = row.destination_state;
         row.state_offsets.source = row.state_offsets.destination;
@@ -101,14 +105,15 @@ void RankProgramImpl::initialize_forward(ComputeOperation& operation, const Forw
     operation.width        = end - offset;
     operation.row_finished = false;
     auto& frame            = resources.frame;
-    *frame.host_ingress    = {};
-    bind_row(*frame.host_ingress, 0, row);
-    frame.host_ingress->valid_columns[0] = static_cast<std::int32_t>(operation.width);
+    frame.bind_rows(1);
+    frame.clear_ingress();
+    bind_row(frame.host_ingress, 0, row);
+    frame.host_ingress.valid_columns[0] = static_cast<std::int32_t>(operation.width);
     if (work.sample != SamplePurpose::None)
-        frame.host_ingress->sampling[0] = sampling_config(row, work.sampling[index], index);
-    frame.host_ingress->sampling_positions[0] += operation.width;
+        frame.host_ingress.sampling[0] = sampling_config(row, work.sampling[index], index);
+    frame.host_ingress.sampling_positions[0] += operation.width;
     for (int axis = 0; axis < 3; ++axis)
-        frame.host_ingress->previous_rope[axis] = row.tail_rope_position[axis];
+        frame.host_ingress.previous_rope[axis] = row.tail_rope_position[axis];
     upload_ingress();
     operation.input_embeddings.reset();
     if (!operation.width) return;
@@ -168,29 +173,34 @@ void RankProgramImpl::initialize_forward(ComputeOperation& operation, const Forw
 }
 
 void RankProgramImpl::initialize_decode(ComputeOperation& operation, const DecodeWork& work) {
-    auto& frame         = resources.frame;
-    *frame.host_ingress = {};
-    operation.batch     = static_cast<std::uint32_t>(work.rows.size());
+    auto& frame     = resources.frame;
+    operation.batch = static_cast<std::uint32_t>(work.rows.size());
+    operation.shape = work.shape;
+    operation.dead_positions.resize(operation.batch);
+    operation.rows.reserve(operation.batch);
+    operation.sampling.reserve(operation.batch);
+    frame.bind_rows(operation.shape.rows);
+    frame.clear_ingress();
     for (std::size_t i = 0; i < work.rows.size(); ++i) {
         const auto& row = work.rows[i];
         operation.rows.push_back(row.binding);
         operation.sampling.push_back(row.sampling);
         operation.drafts = std::max(operation.drafts, row.draft_extent);
-        bind_row(*frame.host_ingress, i, row.binding);
-        frame.host_ingress->anchors[i]                = row.anchor;
-        frame.host_ingress->extents[i]                = static_cast<int>(row.draft_extent);
-        frame.host_ingress->valid_columns[i]          = static_cast<int>(row.draft_extent + 1);
-        frame.host_ingress->proposal_valid_columns[i] = static_cast<int>(draft_window + 1);
-        frame.host_ingress->budgets[i]  = static_cast<int>(row.output_tokens_remaining);
-        frame.host_ingress->sampling[i] = sampling_config(row.binding, row.sampling, i);
+        bind_row(frame.host_ingress, i, row.binding);
+        frame.host_ingress.anchors[i]                = row.anchor;
+        frame.host_ingress.extents[i]                = static_cast<int>(row.draft_extent);
+        frame.host_ingress.valid_columns[i]          = static_cast<int>(row.draft_extent + 1);
+        frame.host_ingress.proposal_valid_columns[i] = static_cast<int>(draft_window + 1);
+        frame.host_ingress.budgets[i]  = static_cast<int>(row.output_tokens_remaining);
+        frame.host_ingress.sampling[i] = sampling_config(row.binding, row.sampling, i);
     }
     operation.speculative = operation.drafts != 0;
     operation.width       = operation.speculative ? draft_window + 1 : 1;
     auto host             = frame.host_decode_view(static_cast<int>(operation.width),
-                                                   static_cast<int>(operation.batch));
+                                                   static_cast<int>(operation.shape.rows));
     auto* positions       = static_cast<std::int32_t*>(host.cache_positions.data);
     auto* rope            = static_cast<std::int32_t*>(host.rope_positions.data);
-    const auto columns    = operation.width * operation.batch;
+    const auto columns    = operation.width * operation.shape.rows;
     for (std::size_t row = 0; row < work.rows.size(); ++row) {
         for (std::uint32_t column = 0; column < operation.width; ++column) {
             const auto offset = row * operation.width + column;
@@ -202,9 +212,9 @@ void RankProgramImpl::initialize_decode(ComputeOperation& operation, const Decod
         }
     }
     for (std::size_t row = 0; row < work.rows.size(); ++row) {
-        frame.host_ingress->history_skip[row] = operation.speculative ? 1 : 0;
+        frame.host_ingress.history_skip[row] = operation.speculative ? 1 : 0;
         for (int axis = 0; axis < 3; ++axis)
-            frame.host_ingress->previous_rope[axis * operation.batch + row] =
+            frame.host_ingress.previous_rope[axis * operation.shape.rows + row] =
                 work.rows[row].binding.tail_rope_position[axis];
     }
     if (operation.speculative && backend == SpeculativeBackend::Mtp) prepare_mtp_draft(operation);
@@ -213,10 +223,13 @@ void RankProgramImpl::initialize_decode(ComputeOperation& operation, const Decod
 
 void RankProgramImpl::initialize_score(ComputeOperation& operation, const ScoreWork& work) {
     ForwardWork forward;
+    forward.shape = work.shape;
     forward.rows.push_back(work.row);
     forward.inputs.push_back(work.input);
     operation.rows  = forward.rows;
     operation.batch = 1;
+    operation.shape = work.shape;
+    operation.dead_positions.resize(1);
     initialize_forward(operation, forward);
     operation.scores.resize(work.targets.size());
 }
@@ -230,12 +243,14 @@ void RankProgramImpl::initialize_inputs(ComputeOperation& operation) {
     else if (const auto* work = std::get_if<ScoreWork>(&operation.request.work.operation))
         initialize_score(operation, *work);
     else if (const auto* work = std::get_if<NormalizeWork>(&operation.request.work.operation)) {
-        operation.rows                = work->rows;
-        operation.batch               = static_cast<std::uint32_t>(work->rows.size());
-        operation.width               = draft_window + 1;
-        *resources.frame.host_ingress = {};
+        operation.rows  = work->rows;
+        operation.batch = static_cast<std::uint32_t>(work->rows.size());
+        operation.width = draft_window + 1;
+        operation.shape = work->shape;
+        resources.frame.bind_rows(operation.shape.rows);
+        resources.frame.clear_ingress();
         for (std::size_t i = 0; i < work->rows.size(); ++i)
-            bind_row(*resources.frame.host_ingress, i, work->rows[i]);
+            bind_row(resources.frame.host_ingress, i, work->rows[i]);
         upload_ingress();
     }
 }

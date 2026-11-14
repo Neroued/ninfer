@@ -75,14 +75,17 @@ void GraphInputs::set(int g, int c, int depth) {
     auto& p = owner_;
     auto& r = p.resources;
     p.device.synchronize();
-    const auto& io = r.plan.frame;
+    p.select_frame({std::uint32_t(g), std::uint32_t(c)});
+    const auto& io = p.frame;
     const auto& a  = io.attention;
     const int rank = p.parameters.profile->local.rank, ranks = p.parameters.profile->local.size;
-    std::vector<int> counts(ranks), begins(ranks);
-    for (int remaining = g, i = 0; i < ranks; ++i) {
-        counts[i] = std::min(c, remaining);
-        remaining -= counts[i];
-        if (i) begins[i] = begins[i - 1] + counts[i - 1];
+    const auto counts =
+        p.resources.plan.batches->representative_owners({std::uint32_t(g), std::uint32_t(c)});
+    std::vector<std::uint32_t> begins(ranks);
+    std::uint32_t real_rows = 0;
+    for (int i = 0; i < ranks; ++i) {
+        begins[i] = real_rows;
+        real_rows += counts[i];
     }
     const int width  = depth ? p.shape.draft_tokens + 1 : 1;
     const int base   = std::max(0, std::min(4, int(p.shape.max_context) - width));
@@ -97,22 +100,25 @@ void GraphInputs::set(int g, int c, int depth) {
         for (int j = 0; j < g; ++j) {
             for (int k = 0; k < t; ++k) {
                 if (ids) i32(b.ids)[j * t + k] = 0;
-                i32(b.positions)[j * t + k] = start + std::min(k, std::max(0, valid - 1));
+                i32(b.positions)[j * t + k] =
+                    j < int(real_rows) ? start + std::min(k, std::max(0, valid - 1)) : 0;
             }
-            i32(b.valid_columns)[j] = valid;
+            i32(b.valid_columns)[j] = j < int(real_rows) ? valid : 0;
         }
     };
     batch(io.decode, width, base, extent + 1, false);
     for (int j = 0; j < g; ++j) i32(io.rows.anchors)[j] = 0;
     for (int j = 0; j < g; ++j) {
-        i64(io.rows.source_offsets)[j]      = states_[j];
-        i64(io.rows.destination_offsets)[j] = states_[j];
-        i32(io.rows.base_positions)[j]      = base;
-        i32(io.rows.accepted_columns)[j]    = 1;
+        const bool live                     = j < int(real_rows);
+        i32(io.rows.live_rows)[j]           = live;
+        i64(io.rows.source_offsets)[j]      = live ? states_[j] : -1;
+        i64(io.rows.destination_offsets)[j] = live ? states_[j] : -1;
+        i32(io.rows.base_positions)[j]      = live ? base : 0;
+        i32(io.rows.accepted_columns)[j]    = live;
         i32(io.rows.count_columns)[j]       = 0;
-        i32(io.rows.count_slots)[j]         = j;
-        i32(io.rows.sampling_positions)[j]  = base;
-        i32(io.rows.sampling_columns)[j]    = 1;
+        i32(io.rows.count_slots)[j]         = live ? j : -1;
+        i32(io.rows.sampling_positions)[j]  = live ? base : 0;
+        i32(io.rows.sampling_columns)[j]    = live;
     }
     for (int j = 0; j < c; ++j) {
         const bool live               = j < counts[rank];
@@ -129,21 +135,24 @@ void GraphInputs::set(int g, int c, int depth) {
         i32(a.accepted_columns)[j]    = live ? 1 : 0;
         i32(a.active_columns)[j]      = live ? 0 : -1;
     }
+    std::fill_n(i32(a.from_gather), g, -1);
     for (int rank = 0; rank < ranks; ++rank)
         for (int j = 0; j < counts[rank]; ++j) i32(a.from_gather)[begins[rank] + j] = rank * c + j;
     if (io.speculative)
         for (int j = 0; j < g; ++j) {
-            i32(io.speculative->extents)[j]      = extent;
-            i32(io.speculative->last_columns)[j] = 0;
+            i32(io.speculative->extents)[j]      = j < int(real_rows) ? extent : 0;
+            i32(io.speculative->last_columns)[j] = j < int(real_rows) ? 0 : -1;
         }
     if (io.dflash)
-        for (int j = 0; j < g; ++j) i32(io.dflash->valid_columns)[j] = p.shape.draft_tokens + 1;
+        for (int j = 0; j < g; ++j)
+            i32(io.dflash->valid_columns)[j] = j < int(real_rows) ? p.shape.draft_tokens + 1 : 0;
     if (io.mtp) {
         const auto& m = *io.mtp;
         for (int s = 0; s < depth; ++s)
             batch(m.draft_steps[s], 1, std::max(base - 1, 0) + std::min(s, extent), s < extent,
                   false);
-        for (int j = 0; j < g; ++j) i32(m.skip_first)[j] = depth ? extent != 0 : base == 0;
+        for (int j = 0; j < g; ++j)
+            i32(m.skip_first)[j] = j < int(real_rows) && (depth ? extent != 0 : base == 0);
     }
     p.fill_local_metadata(io.decode, width, c);
     if (io.mtp)

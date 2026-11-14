@@ -49,7 +49,8 @@ Options parse(int argc, char** argv) {
     if (o.policy.empty()) o.policy = o.format == "mxfp8" ? "a8" : "a16";
     if (o.policy != "a16" && o.policy != "a8" && o.policy != "a4")
         throw std::invalid_argument("invalid policy");
-    if (o.batch < 1 || o.batch > 8) throw std::invalid_argument("invalid batch");
+    if (o.batch < 1 || (o.drafts && std::int64_t(o.drafts) * o.batch > INT32_MAX))
+        throw std::invalid_argument("invalid batch");
     if (o.drafts)
         o.columns = {o.drafts * o.batch};
     else if (o.batch != 1)
@@ -88,16 +89,23 @@ void run(const Options& o, Fixture& fixture) {
         bool a8 = false, a16 = false;
         int producer_rows = 0;
         for (int first = 0; valid && first < m;) {
-            const int columns = std::min(m - first, 128);
+            const int columns = ops::detail::linear_topk_chunk_columns(
+                m - first, ops::detail::topk_keys::large_threshold(fixture.weight.qtype));
             const auto plan =
                 ops::detail::topk_keys::select(fixture.weight.qtype, N, K, policy, columns);
-            WorkspaceLayoutBuilder layout;
-            const auto work    = ops::detail::topk_keys::allocate(layout, plan, N, K, columns);
             const auto encoded = plan.a8 ? std::uint64_t(columns) * (K + K / 32) : 0;
             activation += encoded;
-            traffic +=
-                2 * (work.candidates.partial_keys.bytes() + work.candidates.group_keys.bytes() +
-                     work.candidates.secondary_keys.bytes() + encoded);
+            traffic += 2 * encoded;
+            const int window = plan.row_window ? plan.row_window : N;
+            for (int row = 0; row < N; row += window) {
+                WorkspaceLayoutBuilder layout;
+                const auto work = ops::detail::topk_keys::allocate_window(
+                    layout, plan, std::min(window, N - row), columns, {});
+                traffic +=
+                    2 * (work.candidates.partial_keys.bytes() + work.candidates.group_keys.bytes() +
+                         work.candidates.secondary_keys.bytes() + work.scores.bytes());
+                if (row) traffic += 256ULL * columns;
+            }
             compute_floor +=
                 2. * valid * K * columns /
                 (1.e6 * (plan.a8 ? kRoofline.mxfp8_f32_tflops : kRoofline.bf16_f32_tflops));

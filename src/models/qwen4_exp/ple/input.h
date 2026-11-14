@@ -30,13 +30,15 @@ struct Append {
     std::span<const std::int32_t> ids;
 };
 
+// Metadata is borrowed from a sealed producer window until its ticket is released.
+// batch and valid_columns cover physical rows; identities covers only logical rows.
 struct InputWindow {
     std::uint32_t tokens, batch;
-    std::array<std::uint32_t, 8> valid_columns;
-    std::array<SequenceIdentity, 8> identities;
+    std::span<const std::uint32_t> valid_columns;
+    std::span<const SequenceIdentity> identities;
 };
 
-// Ready BF16 [2560,T,B] words, dimension zero fastest; inactive columns are exact +0.
+// Ready BF16 [2560,T,P] words, dimension zero fastest; inactive columns are exact +0.
 // Borrows a sealed producer window. No writer may alter it through its last consumer.
 // This view does not own a readiness event or extend the producer's lifetime.
 struct HostEmbedding {

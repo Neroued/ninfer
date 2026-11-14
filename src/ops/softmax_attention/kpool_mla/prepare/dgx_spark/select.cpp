@@ -27,7 +27,7 @@ PrepareGeometry prepare_geometry(const KpoolMlaPrepareProfile& p, KpoolMlaStorag
          index_format != KvCacheVectorFormat::Fp8E4m3fnGroup128Ue8m0) ||
         p.rows.latent.rows != 512 || p.rows.index_key.rows != 128 || p.rows.pool_gate.rows != 128 ||
         p.rows.query.rows != q || p.rows.coefficients.rows != heads ||
-        p.pool_size != kKpoolPoolSize || batch < 1 || batch > 8 || lo <= 0 || hi < lo || sms <= 0)
+        p.pool_size != kKpoolPoolSize || batch < 1 || lo <= 0 || hi < lo || sms <= 0)
         throw std::invalid_argument("Kpool Prepare: unsupported geometry, format or extent");
     const auto valid_weight = [](const LinearProfile& w) {
         return w.k == 4096 && w.n > 0 && valid_linear_policy(w.policy) &&
@@ -83,7 +83,6 @@ static SelectedProjection select_bf16_projection(int columns, int rows) {
         if (columns <= 512) return {ProjectionRoute::TmaSmall, 512};
         return {ProjectionRoute::TmaHistory, std::numeric_limits<int>::max()};
     }
-    if (columns <= 4) return {ProjectionRoute::Simt4, 4};
     if (columns <= 8) return {ProjectionRoute::Sliced8, 8};
     if (columns <= 16) return {ProjectionRoute::Sliced16, 16};
     if (columns <= 64) return {ProjectionRoute::Mma32, 64};

@@ -37,7 +37,7 @@ constexpr FieldSpec kFields[] = {
      "Collect result/commit CUDA stream intervals at existing completion boundaries.",
      Scope::Common},
     {Field::MaxConcurrency, "engine.max_concurrency", "--max-concurrency", "", "N",
-     "Resident execution lanes (1..8)."},
+     "Resident execution lane capacity."},
     {Field::MaxPendingRequests, "engine.max_pending_requests", "--max-pending-requests", "", "N",
      "Pending request capacity (16)."},
     {Field::PendingTimeout, "engine.pending_timeout", "--pending-timeout", "", "DURATION",
@@ -332,7 +332,7 @@ FieldValue parse_field_value(Field field, const RawValue& value, bool command_li
     case Field::DraftTokens:
         return integer(value, command_line, 0, kU32Max);
     case Field::MaxConcurrency:
-        return integer(value, command_line, 1, kMaximumConcurrency);
+        return integer(value, command_line, 1, kU32Max);
     case Field::ServerPort:
         return integer(value, command_line, 1, 65535);
     case Field::ResponseRecords:

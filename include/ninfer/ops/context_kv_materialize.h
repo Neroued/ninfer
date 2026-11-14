@@ -42,7 +42,7 @@ struct ContextKVMaterializeExecutionEnvelope {
  * Project normalized context into five layer-local cyclic K/V caches.
  *
  * context is contiguous BF16 [H,C,B], positions is Device I32 [C,B], counts is Device I32 [B].
- * C=1..16/B=1..8 or C=1..2048/B=1. Profile epsilon/theta are positive and finite.
+ * C=1..16/B>0 or C=1..2048/B=1. Profile epsilon/theta are positive and finite.
  * Registered (H,D,Hkv,capacity,weight_type) are (5120,128,8,2048,Q8_G32_FP16) and
  * (4096,128,4,2048,BF16). Per-layer key/value weights are [D*Hkv,H]. Q8 uses RowSplit
  * FP16 scales; BF16 uses Contiguous consecutive K/V row views of one [2*D*Hkv,H]

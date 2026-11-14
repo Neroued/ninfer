@@ -10,6 +10,7 @@ ExecutionCodec::ExecutionCodec(const ModelDefinition& definition,
                                const distributed::ExecutionTopology& topology)
     : rank_(rank.rank), ranks_(topology.ranks.size()),
       contract_{rank.shape,
+                std::make_shared<const BatchExecutionPlan>(rank.batches),
                 definition.config().text.vocabulary,
                 definition.resources().text.public_token_count,
                 ranks_,

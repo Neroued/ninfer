@@ -7,7 +7,7 @@ namespace {
 constexpr detail::qsa::ViewValidation v{"qsa_indexer"};
 
 void profile(int lo, int hi, int batch, QsaIndexerExecutionEnvelope envelope) {
-    v.require(lo > 0 && hi >= lo && batch >= 1 && batch <= 8, "T/B interval");
+    v.require(lo > 0 && hi >= lo && batch >= 1, "T/B interval");
     v.require(envelope.max_visible_tokens <= detail::qsa::kIndexerMaxVisibleTokens,
               "visible-token capacity");
 }
@@ -18,12 +18,18 @@ std::size_t qsa_indexer_workspace_capacity_bytes(std::int32_t min_tokens, std::i
                                                  std::int32_t batch_size,
                                                  QsaIndexerExecutionEnvelope envelope) {
     profile(min_tokens, max_tokens, batch_size, envelope);
-    // The allocation grows monotonically with T until the bounded window is full.
+    // Group geometry can change within the interval. Beyond one full query window
+    // the scratch repeats, so planning remains bounded independently of T and B.
     WorkspaceLayoutBuilder layout;
-    detail::qsa::allocate_indexer_workspace(
-        layout,
-        detail::qsa::select_indexer_plan(max_tokens, batch_size, envelope.max_visible_tokens),
-        batch_size);
+    const int limit = detail::qsa::indexer_window_capacity(batch_size);
+    const int first =
+        batch_size <= 8 || max_tokens >= limit ? std::min(max_tokens, limit) : min_tokens;
+    for (int tokens = first; tokens <= std::min(max_tokens, limit); ++tokens) {
+        auto scope = layout.scope();
+        detail::qsa::allocate_indexer_workspace(
+            layout,
+            detail::qsa::select_indexer_plan(tokens, batch_size, envelope.max_visible_tokens));
+    }
     return layout.peak_bytes(1);
 }
 
@@ -55,7 +61,7 @@ void qsa_indexer(const Tensor& query, const ConstQsaIndexCacheView& cache,
         for (const auto* src : inputs) v.require(!v.overlap(*dst, *src), "output/input overlap");
     const auto plan = detail::qsa::select_indexer_plan(tokens, rows, envelope.max_visible_tokens);
     auto scope      = workspace.scope();
-    const auto scratch = detail::qsa::allocate_indexer_workspace(workspace, plan, rows);
+    const auto scratch = detail::qsa::allocate_indexer_workspace(workspace, plan);
     for (const auto* work : {&scratch.scores, &scratch.candidates}) {
         if (!work->data) continue;
         for (const auto* src : inputs)

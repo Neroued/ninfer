@@ -11,7 +11,7 @@ namespace ninfer::models::moe::offload {
 
 struct LayerPlan {
     LayerSpec spec;
-    std::int32_t hybrid_max_tokens = 0;
+    std::int32_t hybrid_max_tokens = 0, hybrid_physical_tokens = 0;
     std::uint32_t fixed_experts = 0, cache_experts = 0;
     std::vector<ExpertPlacement> stream_layout;
 
@@ -49,7 +49,8 @@ private:
 [[nodiscard]] bool plan_cache(Plan&);
 [[nodiscard]] std::optional<Plan> resolve_plan(Plan, std::span<const ExpertBankCacheSpec> banks,
                                                std::size_t available_bytes, std::int32_t max_tokens,
-                                               const CpuTopology&, std::uint32_t workers);
+                                               std::span<const TokenGeometry>, const CpuTopology&,
+                                               std::uint32_t workers);
 
 [[nodiscard]] std::shared_ptr<const moe::Plan>
     describe_schedule(std::span<const ExpertBankCacheSpec>, std::span<const LayerSpec>);

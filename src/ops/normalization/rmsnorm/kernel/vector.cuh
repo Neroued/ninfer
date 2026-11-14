@@ -4,10 +4,11 @@
 
 namespace ninfer::ops::detail::rmsnorm {
 // Fixed-width plain RMSNorm retains input and gain in packed registers across reduction.
-template <int D, int Threads>
+template <int D, int Threads, bool SaveInverse = false>
 __global__ __launch_bounds__(Threads) void rmsnorm_vector_kernel(const __nv_bfloat16* x,
                                                                  const __nv_bfloat16* w,
-                                                                 __nv_bfloat16* y, float eps) {
+                                                                 __nv_bfloat16* y, float eps,
+                                                                 float* inverse_output) {
     constexpr int Groups = D / (Threads * 8);
     static_assert(Groups > 0 && D % (Threads * 8) == 0);
     auto row = std::int64_t(blockIdx.x);
@@ -31,6 +32,9 @@ __global__ __launch_bounds__(Threads) void rmsnorm_vector_kernel(const __nv_bflo
     if (threadIdx.x == 0) sums[0] = rsqrtf(sum / float(D) + eps);
     __syncthreads();
     float inv = sums[0];
+    if constexpr (SaveInverse) {
+        if (threadIdx.x == 0) inverse_output[row] = inv;
+    }
 #pragma unroll
     for (int g = 0; g < Groups; ++g) {
         common::Bf16Vector<8> out;

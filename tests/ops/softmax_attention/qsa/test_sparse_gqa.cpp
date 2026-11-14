@@ -289,6 +289,41 @@ int graph_update(DeviceContext& device, int tokens, int batch,
     return failures;
 }
 
+int graph_envelope_contract(DeviceContext& device) {
+    constexpr int tokens = 4, batch = 17;
+    constexpr auto storage = KvCacheStorage::BFloat16;
+    Fixture f(tokens, batch, 8192, false, storage, false, 12, 1);
+    const auto bytes = ops::qsa_sparse_gqa_workspace_capacity_bytes(
+        storage, f.q_heads, f.kv_heads, tokens, tokens, batch, {8192},
+        device.execution_view().multiprocessor_count());
+    GuardedDeviceBuffer scratch(std::max<std::size_t>(256, bytes));
+    MemoryArena workspace(scratch.span());
+    DecodeGraphDefinition outer;
+    DecodeGraphExecutable graph;
+    DecodeGraphChild child;
+    int failures = 0;
+    for (unsigned history : {8192u, 0u, 8u, 8192u}) {
+        f.history                     = std::max(1u, history);
+        f.envelope.max_visible_tokens = history;
+        f.reset(history ? 0 : 2, 17);
+        DecodeGraphDefinition definition;
+        definition.capture(device.stream(), [&] { f.launch(workspace, device.execution_view()); });
+        if (graph.ready()) {
+            graph.update_child(child, definition);
+        } else {
+            outer.capture(device.stream(), [&] { child = definition.append_to(device.stream()); });
+            graph.instantiate(outer);
+        }
+        graph.launch(device.stream());
+        device.synchronize();
+        const auto label = "sparse graph envelope=" + std::to_string(history);
+        failures += verify(f, label) + scratch.verify_guards(label);
+        failures += workspace.used() != 0 || workspace.peak_used() > bytes;
+        if (failures) return failures;
+    }
+    return failures;
+}
+
 int smaller_envelope_capacity(DeviceContext& device, int tokens, unsigned history) {
     constexpr auto storage            = KvCacheStorage::Nvfp4Group16;
     constexpr unsigned reserved_bound = 2052;
@@ -770,9 +805,35 @@ int main(int argc, char** argv) {
     for (auto storage : {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64,
                          KvCacheStorage::Fp8E4m3fnGroup128Ue8m0, KvCacheStorage::Nvfp4Group16,
                          KvCacheStorage::Fp8KeyNvfp4Value}) {
+        suite.add(
+            std::string("sparse_gqa/") + kv_cache_storage_name(storage) + "/concurrency/b65",
+            [=] { return run(cuda_environment().context, 4, 65, 65, false, 8, 1, true, storage); },
+            {{"format", kv_cache_storage_name(storage)},
+             {"execution", "graph"},
+             {"suite", "concurrency"}});
         add_cases(suite, storage);
         add_local_cases(suite, storage);
     }
+    suite.add("sparse_gqa/bf16/concurrency/b129",
+              [] { return run(cuda_environment().context, 1, 129, 65, false, 512, 1, true); },
+              {{"format", "bf16"}, {"execution", "graph"}, {"suite", "concurrency"}});
+    suite.add("sparse_gqa/fp8/concurrency/b9",
+              [] {
+                  return run(cuda_environment().context, 16, 9, 257, true, 32, 1, true,
+                             KvCacheStorage::Fp8E4m3fnGroup128Ue8m0,
+                             std::numeric_limits<int>::max(), 12);
+              },
+              {{"format", "fp8"}, {"execution", "graph"}, {"suite", "concurrency"}});
+    suite.add("sparse_gqa/fp8/concurrency/b129_local",
+              [] {
+                  return run(cuda_environment().context, 4, 129, 17, false, 4, 1, true,
+                             KvCacheStorage::Fp8E4m3fnGroup128Ue8m0,
+                             std::numeric_limits<int>::max(), 12);
+              },
+              {{"format", "fp8"}, {"execution", "graph"}, {"suite", "concurrency"}});
+    suite.add("sparse_gqa/bf16/concurrency/envelope_child_update",
+              [] { return graph_envelope_contract(cuda_environment().context); },
+              {{"format", "bf16"}, {"execution", "graph"}, {"suite", "concurrency"}});
 #if NINFER_TARGET_RTX5090
     add_four_head_cases(suite);
     add_four_head_storage_cases(suite, KvCacheStorage::BFloat16);

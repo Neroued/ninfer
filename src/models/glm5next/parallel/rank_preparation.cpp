@@ -46,6 +46,7 @@ RankPreparation::RankPreparation(const artifact::Reader& reader, std::span<const
     : RankPreparation(reader, request(payload, identity, observer), device,
                       context_group(topology, communication)) {
     const WorkContract contract{plan_.shape,
+                                plan_.batches,
                                 plan_.profile->config.text.vocabulary,
                                 plan_.profile->public_tokens,
                                 plan_.profile->local.size,

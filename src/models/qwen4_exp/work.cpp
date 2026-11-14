@@ -3,6 +3,9 @@
 #include "runtime/executor/protocol.h"
 
 #include <algorithm>
+#include <set>
+#include <unordered_map>
+#include <unordered_set>
 #include <type_traits>
 
 namespace ninfer::models::qwen4_exp {
@@ -65,6 +68,36 @@ std::span<const WorkRow> work_rows(const Work& work) {
         work.operation);
 }
 
+const PhysicalBatchShape& work_shape(const Work& work) {
+    return std::visit(
+        [](const auto& operation) -> const PhysicalBatchShape& {
+            using T = std::decay_t<decltype(operation)>;
+            if constexpr (std::is_same_v<T, ContextWork>)
+                throw std::logic_error("Qwen4Exp Context work has no computation shape");
+            else
+                return operation.shape;
+        },
+        work.operation);
+}
+
+void plan_work_batch(Work& work, const BatchExecutionPlan& plan) {
+    const auto count = work_rows(work).size();
+    if (count > plan.resident_capacity())
+        throw std::invalid_argument("Qwen4Exp work exceeds resident capacity");
+    std::visit(
+        [&](auto& operation) {
+            using T = std::decay_t<decltype(operation)>;
+            if constexpr (!std::is_same_v<T, ContextWork>) {
+                bool decode = std::is_same_v<T, MtpWork>;
+                if constexpr (std::is_same_v<T, ForwardWork>)
+                    decode = operation.kind == ForwardKind::Ordinary;
+                const auto rows = static_cast<std::uint32_t>(count);
+                operation.shape = decode ? plan.decode(rows, rows) : plan.exact(rows, rows);
+            }
+        },
+        work.operation);
+}
+
 const context::ContextActions& local_actions(const ContextActions& actions, std::uint32_t rank) {
     const auto found = actions.find(rank);
     static const context::ContextActions empty;
@@ -79,18 +112,17 @@ runtime::WorkPayloadCapacity WorkContract::payload_capacity(std::uint32_t rank_c
         return context::write_action_capacity(rows, pools, tokens);
     };
     const auto payload = [&](std::size_t rows, std::size_t span, std::size_t token_bytes) {
-        return header + actions(rows, span) + 128 + rows * (204 + token_bytes);
+        return header + actions(rows, span) + 136 + rows * (204 + token_bytes);
     };
     const std::size_t width = shape.draft_tokens + 1;
     const auto work         = std::max({payload(1, chunk, 20 * chunk), payload(batch, width, 16),
                                         payload(batch, control_token_limit, 8ULL * control_token_limit)});
-    const auto context      = header + context::action_batch_capacity() + 128 +
-                         batch * (88 + TokenCounts::encoded_capacity(public_tokens));
+    const auto context      = header + context::action_batch_capacity() + 128 + 88 +
+                         TokenCounts::encoded_capacity(public_tokens) + 16 * batch;
     const auto decision = header + 12 + batch * (20 + 4 * width * ((public_tokens + 31ULL) / 32));
     const auto commit   = header + 64 + batch * (64 + 20 * rank_count) + actions(batch, width);
-    const auto context_rows =
-        sizeof(Work) + sizeof(ContextWork) +
-        batch * (sizeof(ResidencyBinding) + sizeof(runtime::ResidencyId) + 4ULL * public_tokens);
+    const auto context_rows = sizeof(Work) + sizeof(ContextWork) + sizeof(ResidencyBinding) +
+                              4ULL * public_tokens + batch * sizeof(runtime::ResidencyId);
     const auto actions_storage = context::action_batch_storage_capacity() + 128;
     return {work,
             context,
@@ -108,6 +140,17 @@ void WorkContract::validate(const Work& work, runtime::FrameKind kind) const {
         if (kind != runtime::FrameKind::Compute || rows.empty() ||
             rows.size() > shape.max_concurrency)
             throw std::invalid_argument("Qwen4Exp compute shape differs from its reservation");
+        if (!batches || batches->resident_capacity() != shape.max_concurrency ||
+            batches->attention_owners() != 1)
+            throw std::logic_error("Qwen4Exp work contract has no matching batch plan");
+        const auto count  = static_cast<std::uint32_t>(rows.size());
+        const bool decode = std::holds_alternative<MtpWork>(work.operation) ||
+                            (forward && forward->kind == ForwardKind::Ordinary);
+        const auto expected = decode ? batches->decode(count, count) : batches->exact(count, count);
+        if (work_shape(work) != expected)
+            throw std::invalid_argument("Qwen4Exp physical shape differs from prepared batch plan");
+        std::set<std::pair<std::uint64_t, std::uint64_t>> sequences;
+        std::unordered_set<std::uint32_t> lanes, main_tables, mtp_tables;
         for (std::size_t b = 0; b < rows.size(); ++b) {
             const auto& row = rows[b];
             if (row.control_last_token.has_value() != control ||
@@ -137,14 +180,12 @@ void WorkContract::validate(const Work& work, runtime::FrameKind kind) const {
                 for (auto position : row.previous_rope)
                     if (position < 0)
                         throw std::invalid_argument("negative previous Qwen4Exp RoPE position");
-            for (std::size_t i = 0; i < b; ++i) {
-                const auto& other = rows[i];
-                if (row.member.residency.lane == other.member.residency.lane ||
-                    row.member.sequence == other.member.sequence ||
-                    row.main_table.index == other.main_table.index ||
-                    (mtp && row.mtp_table.index == other.mtp_table.index))
-                    throw std::invalid_argument("Qwen4Exp batch rows have overlapping writes");
-            }
+            if (!sequences.emplace(row.member.sequence.value, row.member.sequence.generation)
+                     .second ||
+                !lanes.insert(row.member.residency.lane.value).second ||
+                !main_tables.insert(row.main_table.index).second ||
+                (mtp && !mtp_tables.insert(row.mtp_table.index).second))
+                throw std::invalid_argument("Qwen4Exp batch rows have overlapping writes");
         }
     }
     std::visit(
@@ -235,31 +276,34 @@ void WorkContract::validate(const Work& work, runtime::FrameKind kind) const {
                     throw std::invalid_argument("invalid Qwen4Exp scoring work");
                 tokens(operation.targets, public_tokens);
             } else {
-                if (kind != runtime::FrameKind::Context ||
-                    operation.bindings.size() > shape.max_concurrency ||
+                if (kind != runtime::FrameKind::Context || operation.bindings.size() > 1 ||
                     operation.releases.size() > shape.max_concurrency)
                     throw std::invalid_argument("invalid Qwen4Exp context reservation");
-                std::array<bool, kMaximumConcurrency> installed{}, released{};
-                for (auto r : operation.releases) {
-                    if (r.lane.value >= shape.max_concurrency || !r.generation ||
-                        released[r.lane.value])
+                std::vector<std::uint32_t> installed, released;
+                std::vector<std::pair<std::uint64_t, std::uint64_t>> sequences;
+                installed.reserve(operation.bindings.size());
+                released.reserve(operation.releases.size());
+                sequences.reserve(operation.bindings.size());
+                for (auto residency : operation.releases) {
+                    if (residency.lane.value >= shape.max_concurrency || !residency.generation)
                         throw std::invalid_argument("invalid Qwen4Exp residency release");
-                    released[r.lane.value] = true;
+                    released.push_back(residency.lane.value);
                 }
                 for (const auto& binding : operation.bindings) {
                     member(binding.member, shape.max_concurrency);
-                    if (installed[binding.member.residency.lane.value])
-                        throw std::invalid_argument("duplicate Qwen4Exp binding lane");
-                    installed[binding.member.residency.lane.value] = true;
-                    for (const auto& previous : operation.bindings) {
-                        if (&previous == &binding) break;
-                        if (previous.member.sequence == binding.member.sequence)
-                            throw std::invalid_argument("duplicate Qwen4Exp sequence binding");
-                    }
+                    installed.push_back(binding.member.residency.lane.value);
+                    sequences.emplace_back(binding.member.sequence.value,
+                                           binding.member.sequence.generation);
                     binding.counts.validate(public_tokens, shape.max_context);
                     if (shape.purpose != EnginePurpose::Generation && !binding.counts.empty())
                         throw std::invalid_argument("scoring residency has generation counts");
                 }
+                const auto distinct = [](auto& values) {
+                    std::sort(values.begin(), values.end());
+                    return std::adjacent_find(values.begin(), values.end()) == values.end();
+                };
+                if (!distinct(released) || !distinct(installed) || !distinct(sequences))
+                    throw std::invalid_argument("duplicate Qwen4Exp residency mutation");
             }
         },
         work.operation);
@@ -269,9 +313,7 @@ void validate_decision_rows(const runtime::DecisionInput& input, std::uint32_t s
                             std::uint32_t vocabulary, std::span<const std::uint32_t> positions) {
     if (input.stage != stage) throw std::invalid_argument("Qwen4Exp decision stage differs");
     const auto words = (std::size_t(vocabulary) + 31) / 32;
-    std::array<bool, kMaximumConcurrency> seen{};
-    if (positions.size() > seen.size())
-        throw std::invalid_argument("Qwen4Exp decision batch is too large");
+    std::vector<std::uint8_t> seen(positions.size());
     for (const auto& row : input.rows) {
         if (row.member >= positions.size() || seen[row.member] || !positions[row.member] ||
             row.positions != positions[row.member] || row.words.size() != words * row.positions ||
@@ -288,8 +330,8 @@ void validate_decision_rows(const runtime::DecisionInput& input, std::uint32_t s
 void WorkContract::validate(const Work& work, const runtime::DecisionRequest& request,
                             const runtime::DecisionInput& input) const {
     const auto rows = work_rows(work);
-    std::array<std::uint32_t, kMaximumConcurrency> positions{};
-    if (rows.size() > positions.size() || request.vocabulary != public_tokens)
+    std::vector<std::uint32_t> positions(rows.size());
+    if (request.vocabulary != public_tokens)
         throw std::invalid_argument("Qwen4Exp decision request differs from its work");
     for (const auto& row : request.rows) {
         if (row.member >= rows.size() || !rows[row.member].constrained || positions[row.member])
@@ -321,6 +363,7 @@ void WorkContract::validate_commit(const Work& work, std::span<const RowResult> 
     const bool sampled  = verify || (forward && forward->sample != SampleKind::None);
     if (commit.rows.size() != rows.size() || (!scoring && results.size() != rows.size()))
         throw std::logic_error("Qwen4Exp commit rows differ from its result");
+    std::unordered_map<std::uint32_t, std::unordered_set<std::int64_t>> reads, writes;
     for (std::size_t b = 0; b < rows.size(); ++b) {
         const auto& row    = commit.rows[b];
         const auto& source = rows[b];
@@ -349,11 +392,15 @@ void WorkContract::validate_commit(const Work& work, std::span<const RowResult> 
                 (row.cancelled ? (!row.terminal || row.accepted != 0) : row.accepted != processed))
                 throw std::invalid_argument("invalid Qwen4Exp processed-input commit");
         }
-        for (const auto& [rank, offsets] : row.states)
-            for (std::size_t i = 0; i < rows.size(); ++i)
-                if (i != b && (offsets.destination == commit.rows[i].states.at(rank).destination ||
-                               offsets.destination == rows[i].states.at(rank).source))
-                    throw std::invalid_argument("Qwen4Exp commit rows have overlapping writes");
+        for (const auto& [rank, offsets] : row.states) {
+            auto& rank_reads  = reads[rank];
+            auto& rank_writes = writes[rank];
+            if (rank_writes.contains(offsets.destination) || rank_writes.contains(offsets.source) ||
+                rank_reads.contains(offsets.destination))
+                throw std::invalid_argument("Qwen4Exp commit rows have overlapping writes");
+            rank_reads.insert(offsets.source);
+            rank_writes.insert(offsets.destination);
+        }
     }
 }
 

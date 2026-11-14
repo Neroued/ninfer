@@ -297,22 +297,31 @@ __global__ void causal_conv1d_batched_sequence_snapshot_kernel(
     const __nv_bfloat16* x, const __nv_bfloat16* weight, const __nv_bfloat16* source,
     __nv_bfloat16* snapshots, const std::int32_t* valid_columns, const std::int64_t* source_offsets,
     const std::int32_t* snapshot_base_slots, __nv_bfloat16* out, std::int32_t C, std::int32_t width,
-    std::int64_t slot_stride) {
-    const std::int32_t batch = static_cast<std::int32_t>(blockIdx.y);
-    const std::int64_t c64   = blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x;
-    const std::int64_t C64   = static_cast<std::int64_t>(C);
+    std::int64_t slot_stride, std::int32_t batch_count) {
+    const auto row = std::int64_t(blockIdx.z) * gridDim.y + blockIdx.y;
+    if (row >= batch_count) return;
+    const auto batch       = static_cast<std::int32_t>(row);
+    const std::int64_t c64 = blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x;
+    const std::int64_t C64 = static_cast<std::int64_t>(C);
     if (c64 >= C64) { return; }
 
     const std::int32_t valid    = Masked ? valid_columns[batch] : width;
-    const __nv_bfloat16* init   = source + source_offsets[batch] / 2;
-    __nv_bfloat16 s0            = init[c64];
-    __nv_bfloat16 s1            = init[C64 + c64];
-    __nv_bfloat16 s2            = init[2 * C64 + c64];
-    const float w0              = __bfloat162float(weight[c64]);
-    const float w1              = __bfloat162float(weight[C64 + c64]);
-    const float w2              = __bfloat162float(weight[2 * C64 + c64]);
-    const float w3              = __bfloat162float(weight[3 * C64 + c64]);
-    const std::int64_t row_base = static_cast<std::int64_t>(batch) * width * C64;
+    const std::int64_t row_base = row * width * C64;
+    if constexpr (Masked) {
+        if (!valid) {
+            for (std::int32_t column = 0; column < width; ++column)
+                out[row_base + std::int64_t(column) * C64 + c64] = __float2bfloat16(0.0f);
+            return;
+        }
+    }
+    const __nv_bfloat16* init = source + source_offsets[batch] / 2;
+    __nv_bfloat16 s0          = init[c64];
+    __nv_bfloat16 s1          = init[C64 + c64];
+    __nv_bfloat16 s2          = init[2 * C64 + c64];
+    const float w0            = __bfloat162float(weight[c64]);
+    const float w1            = __bfloat162float(weight[C64 + c64]);
+    const float w2            = __bfloat162float(weight[2 * C64 + c64]);
+    const float w3            = __bfloat162float(weight[3 * C64 + c64]);
 
     for (std::int32_t column = 0; column < width; ++column) {
         const std::int64_t out_idx = row_base + static_cast<std::int64_t>(column) * C64 + c64;
@@ -401,16 +410,27 @@ __global__ void causal_conv1d_batched_snapshot_smallt_kernel(
     const __nv_bfloat16* x, const __nv_bfloat16* weight, const __nv_bfloat16* source,
     __nv_bfloat16* snapshots, const std::int32_t* valid_columns, const std::int64_t* source_offsets,
     const std::int32_t* snapshot_base_slots, __nv_bfloat16* out, std::int32_t C, std::int32_t width,
-    std::int64_t slot_stride) {
+    std::int64_t slot_stride, std::int32_t batch_count) {
     __shared__ __nv_bfloat16 history[3][kCausalConvChannelTile];
     __shared__ __nv_bfloat16 weights[4][kCausalConvChannelTile];
 
-    const std::int32_t batch  = static_cast<std::int32_t>(blockIdx.y);
+    const auto row = std::int64_t(blockIdx.z) * gridDim.y + blockIdx.y;
+    if (row >= batch_count) return;
+    const auto batch            = static_cast<std::int32_t>(row);
     const std::int32_t lane   = static_cast<std::int32_t>(threadIdx.x);
     const std::int32_t column = static_cast<std::int32_t>(threadIdx.y);
     const std::int64_t c64 = static_cast<std::int64_t>(blockIdx.x) * kCausalConvChannelTile + lane;
     const std::int64_t C64 = static_cast<std::int64_t>(C);
-    const bool channel_valid = c64 < C64;
+    const bool channel_valid    = c64 < C64;
+    const std::int32_t valid    = Masked ? valid_columns[batch] : width;
+    const std::int64_t row_base = row * width * C64;
+    const std::int64_t out_idx  = row_base + std::int64_t(column) * C64 + c64;
+    if constexpr (Masked) {
+        if (!valid) {
+            if (channel_valid) out[out_idx] = __float2bfloat16(0.0f);
+            return;
+        }
+    }
 
     if (column == 0) {
         const __nv_bfloat16* init = source + source_offsets[batch] / 2;
@@ -426,9 +446,6 @@ __global__ void causal_conv1d_batched_snapshot_smallt_kernel(
     __syncthreads();
     if (!channel_valid) { return; }
 
-    const std::int32_t valid    = Masked ? valid_columns[batch] : width;
-    const std::int64_t row_base = static_cast<std::int64_t>(batch) * width * C64;
-    const std::int64_t out_idx  = row_base + static_cast<std::int64_t>(column) * C64 + c64;
     if (column >= valid) {
         out[out_idx] = __float2bfloat16(0.0f);
         return;

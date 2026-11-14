@@ -35,13 +35,12 @@ using namespace ninfer;
 namespace {
 
 constexpr std::int32_t kFullHeadDim         = 256;
-constexpr std::int32_t kPrefixHeadDim       = 128;
-constexpr std::int32_t kPrefixKvHeads       = 8;
 constexpr std::int32_t kPagedPrefixCapacity = 4096;
 constexpr std::size_t kFlushBytes           = std::size_t{256} << 20;
 
 enum class Mode : std::uint8_t { Full, Prefix, All };
 enum class FullGeometryChoice : std::uint8_t { Kv4, Kv2, All };
+enum class PrefixGeometryChoice : std::uint8_t { Kv8, Kv4, Kv2, All };
 enum class KvChoice : std::uint8_t { Bf16, Int8, Fp8, Nvfp4, K8V4, All };
 enum class LayoutChoice : std::uint8_t { Paged, Cyclic, All };
 enum class Execution : std::uint8_t { Eager, Graph, Both };
@@ -56,13 +55,24 @@ struct FullGeometry {
 constexpr FullGeometry kFullKv4{"d256-kv4", 4};
 constexpr FullGeometry kFullKv2{"d256-kv2", 2};
 
+struct PrefixGeometry {
+    const char* name;
+    std::int32_t head_dim;
+    std::int32_t kv_heads;
+};
+
+constexpr PrefixGeometry kPrefixKv8{"d128-kv8", 128, 8};
+constexpr PrefixGeometry kPrefixKv4{"d256-kv4", 256, 4};
+constexpr PrefixGeometry kPrefixKv2{"d256-kv2", 256, 2};
+
 struct Options {
-    Mode mode                        = Mode::All;
-    FullGeometryChoice full_geometry = FullGeometryChoice::All;
-    KvChoice kv                      = KvChoice::All;
-    LayoutChoice layout              = LayoutChoice::All;
-    Execution execution              = Execution::Graph;
-    CacheMode cache                  = CacheMode::Cold;
+    Mode mode                            = Mode::All;
+    FullGeometryChoice full_geometry     = FullGeometryChoice::All;
+    PrefixGeometryChoice prefix_geometry = PrefixGeometryChoice::Kv8;
+    KvChoice kv                          = KvChoice::All;
+    LayoutChoice layout                  = LayoutChoice::All;
+    Execution execution                  = Execution::Graph;
+    CacheMode cache                      = CacheMode::Cold;
     std::vector<std::int32_t> tokens{1, 2, 4, 8, 16, 1024};
     std::vector<std::int32_t> counts{0, 1, 4, 8, 16};
     std::int32_t cyclic_capacity = 4096;
@@ -103,6 +113,7 @@ struct Result {
                  "error: %s\n"
                  "usage: ninfer_kv_cache_append_bench [--mode full|prefix|all] "
                  "[--full-geometry d256-kv4|d256-kv2|all] "
+                 "[--prefix-geometry d128-kv8|d256-kv4|d256-kv2|all] "
                  "[--kv-dtype bf16|int8|fp8|nvfp4|k8v4|all] "
                  "[--layout paged|cyclic|all] [--tokens T,...] [--counts C,...] "
                  "[--cyclic-capacity 2048|4096] [--batch B] "
@@ -170,6 +181,18 @@ Options parse_options(int argc, char** argv) {
                 options.full_geometry = FullGeometryChoice::All;
             else
                 usage("--full-geometry expects d256-kv4, d256-kv2, or all");
+        } else if (argument == "--prefix-geometry") {
+            const std::string_view value(next("--prefix-geometry requires a value"));
+            if (value == "d128-kv8")
+                options.prefix_geometry = PrefixGeometryChoice::Kv8;
+            else if (value == "d256-kv4")
+                options.prefix_geometry = PrefixGeometryChoice::Kv4;
+            else if (value == "d256-kv2")
+                options.prefix_geometry = PrefixGeometryChoice::Kv2;
+            else if (value == "all")
+                options.prefix_geometry = PrefixGeometryChoice::All;
+            else
+                usage("--prefix-geometry expects d128-kv8, d256-kv4, d256-kv2, or all");
         } else if (argument == "--kv-dtype") {
             const std::string_view value(next("--kv-dtype requires a value"));
             if (value == "bf16")
@@ -209,7 +232,7 @@ Options parse_options(int argc, char** argv) {
                 usage("--cyclic-capacity expects 2048 or 4096");
             }
         } else if (argument == "--batch") {
-            options.batch = parse_i32(next("--batch requires a value"), 1, 8, "--batch");
+            options.batch = parse_i32(next("--batch requires a value"), 1, INT32_MAX, "--batch");
         } else if (argument == "--context") {
             options.context = parse_i32(next("--context requires a value"), 0, 262144, "--context");
         } else if (argument == "--execution") {
@@ -269,10 +292,19 @@ Options parse_options(int argc, char** argv) {
         (options.layout == LayoutChoice::All || options.counts.size() != 1)) {
         usage("prefix --profile requires one layout and one count");
     }
-    if (options.batch != 1 &&
-        (options.mode != Mode::Prefix || options.layout != LayoutChoice::Cyclic)) {
-        usage("--batch greater than one requires --mode prefix --layout cyclic");
+    if (options.batch != 1 && options.mode != Mode::Prefix)
+        usage("--batch greater than one requires --mode prefix");
+    if (options.profile && options.mode == Mode::Prefix) {
+        if (options.prefix_geometry == PrefixGeometryChoice::All)
+            usage("prefix --profile requires one geometry");
+        if (options.prefix_geometry != PrefixGeometryChoice::Kv8 &&
+            (options.layout != LayoutChoice::Paged || options.kv == KvChoice::All))
+            usage("D256 prefix --profile requires paged layout and one KV dtype");
     }
+    if (options.mode != Mode::Full && options.layout == LayoutChoice::Cyclic &&
+        options.prefix_geometry != PrefixGeometryChoice::Kv8 &&
+        options.prefix_geometry != PrefixGeometryChoice::All)
+        usage("cyclic prefix requires d128-kv8");
     if (options.graph_calls > 1 && (options.execution != Execution::Graph || options.profile))
         usage("graph bundles require --execution graph and no --profile");
     return options;
@@ -346,40 +378,41 @@ private:
 
 class PrefixCase {
 public:
-    PrefixCase(std::int32_t tokens, std::int32_t committed, bool cyclic,
-               std::int32_t cyclic_capacity, std::int32_t batch, int maximum)
+    PrefixCase(PrefixGeometry geometry, KvCacheStorage storage, std::int32_t tokens,
+               std::int32_t committed, bool cyclic, std::int32_t cyclic_capacity,
+               std::int32_t batch, int maximum, int context)
         : cyclic_(cyclic),
-          k_(bench::make_bf16(
-              static_cast<std::size_t>(kPrefixHeadDim) * kPrefixKvHeads * tokens * batch, 105U)),
-          v_(bench::make_bf16(
-              static_cast<std::size_t>(kPrefixHeadDim) * kPrefixKvHeads * tokens * batch, 107U)),
-          positions_(bench::device_context().device(), tokens * batch * sizeof(std::int32_t)),
-          commit_count_(bench::device_context().device(), batch * sizeof(std::int32_t)),
-          selector_(bench::device_context().device(), batch * (cyclic ? 8 : 4)),
-          k_tensor_(k_.span(), DType::BF16, {kPrefixHeadDim, kPrefixKvHeads, tokens, batch}),
-          v_tensor_(v_.span(), DType::BF16, {kPrefixHeadDim, kPrefixKvHeads, tokens, batch}),
+          k_(bench::make_bf16(std::size_t(geometry.head_dim) * geometry.kv_heads * tokens * batch,
+                              105U)),
+          v_(bench::make_bf16(std::size_t(geometry.head_dim) * geometry.kv_heads * tokens * batch,
+                              107U)),
+          positions_(bench::device_context().device(),
+                     std::size_t(tokens) * batch * sizeof(std::int32_t)),
+          commit_count_(bench::device_context().device(),
+                        std::size_t(batch) * sizeof(std::int32_t)),
+          selector_(bench::device_context().device(), std::size_t(batch) * (cyclic ? 8 : 4)),
+          k_tensor_(k_.span(), DType::BF16, {geometry.head_dim, geometry.kv_heads, tokens, batch}),
+          v_tensor_(v_.span(), DType::BF16, {geometry.head_dim, geometry.kv_heads, tokens, batch}),
           positions_tensor_(positions_.span(), DType::I32, {tokens, batch}),
           count_tensor_(commit_count_.span(), DType::I32, {batch}),
           selector_tensor_(selector_.span(), cyclic ? DType::I64 : DType::I32, {batch}),
           envelope_{0, static_cast<std::uint32_t>(maximum)} {
         if (maximum > tokens || committed > maximum)
             throw std::invalid_argument("prefix count/envelope exceeds extent");
-        if (!cyclic && batch != 1)
-            throw std::invalid_argument("paged prefix benchmark requires B=1");
         if (cyclic && (maximum > cyclic_capacity || committed > cyclic_capacity))
             throw std::invalid_argument("cyclic prefix extent exceeds capacity");
-        const std::int32_t start = cyclic ? 2 * cyclic_capacity - 3 : 0;
-        std::vector<std::int32_t> host_positions(tokens * batch);
+        const std::int32_t start = cyclic ? 2 * cyclic_capacity - 3 : context;
+        std::vector<std::int32_t> host_positions(std::size_t(tokens) * batch, -1);
         for (int b = 0; b < batch; ++b)
-            for (int token = 0; token < tokens; ++token)
-                host_positions[b * tokens + token] = start + token;
+            for (int token = 0; token < committed; ++token)
+                host_positions[std::size_t(b) * tokens + token] = start + token;
         positions_.copy_from_host(host_positions.data(), positions_.size());
         const std::vector<std::int32_t> host_counts(batch, committed);
         commit_count_.copy_from_host(host_counts.data(), commit_count_.size());
         if (cyclic) {
             StateImageBuilder builder;
-            const auto cache_layout =
-                plan_cyclic_kv_cache(builder, 1, cyclic_capacity, kPrefixKvHeads, kPrefixHeadDim);
+            const auto cache_layout = plan_cyclic_kv_cache(builder, 1, cyclic_capacity,
+                                                           geometry.kv_heads, geometry.head_dim);
             const auto state_layout = builder.finish();
             state_ =
                 DeviceBuffer(bench::device_context().device(), state_layout.image_bytes * batch);
@@ -388,25 +421,40 @@ public:
             const CyclicKVCacheView view(images, cache_layout);
             cyclic_view_ = view.layer_view(0, selector_tensor_);
             std::vector<std::int64_t> offsets(batch);
-            for (int b = 0; b < batch; ++b) offsets[b] = b * state_layout.image_bytes;
+            for (int b = 0; b < batch; ++b)
+                offsets[b] =
+                    committed ? static_cast<std::int64_t>(b * state_layout.image_bytes) : -1;
             selector_.copy_from_host(offsets.data(), selector_.size());
         } else {
-            constexpr int pages = kPagedPrefixCapacity / kPagedKVPageSize;
-            packed_.emplace(bench::device_context().device(),
-                            KVPageGeometry{kPagedKVPageSize,
-                                           {{DType::BF16, kPrefixHeadDim, kPrefixKvHeads},
-                                            {DType::FP16, kPrefixHeadDim, kPrefixKvHeads}}},
-                            pages);
-            table_ = DeviceBuffer(bench::device_context().device(), pages * sizeof(std::int64_t));
-            std::vector<std::int32_t> mapping(pages);
-            for (int page = 0; page < pages; ++page) mapping[page] = page;
+            const int pages           = align_context(context + tokens) / kPagedKVPageSize;
+            const auto physical_pages = std::int64_t(pages) * batch;
+            if (physical_pages > INT32_MAX)
+                throw std::overflow_error("prefix page count exceeds int32");
+            const auto page_geometry =
+                geometry.head_dim == 256
+                    ? full_page_geometry({geometry.name, geometry.kv_heads}, storage)
+                    : KVPageGeometry{kPagedKVPageSize,
+                                     {{DType::BF16, geometry.head_dim, geometry.kv_heads},
+                                      {DType::FP16, geometry.head_dim, geometry.kv_heads}}};
+            packed_.emplace(bench::device_context().device(), page_geometry,
+                            static_cast<std::int32_t>(physical_pages));
+            table_ = DeviceBuffer(bench::device_context().device(),
+                                  physical_pages * sizeof(std::int64_t));
+            std::vector<std::int32_t> mapping(physical_pages), rows(batch);
+            for (int page = 0; page < physical_pages; ++page) mapping[page] = page;
+            for (int b = 0; b < batch; ++b) rows[b] = committed ? b : -1;
+            selector_.copy_from_host(rows.data(), selector_.size());
             const auto offsets = packed_->table_offsets(mapping);
             table_.copy_from_host(offsets.data(), table_.size());
-            const Tensor table(table_.span(), DType::I64, {pages, 1});
-            paged_view_ = {
-                packed_->plane(0, table), packed_->plane(1, table), {}, {}, kPrefixHeadDim,
-                kPrefixKvHeads,           KvCacheStorage::BFloat16};
-            selector_.fill();
+            const Tensor table(table_.span(), DType::I64, {pages, batch});
+            const bool scaled = storage != KvCacheStorage::BFloat16;
+            paged_view_       = {packed_->plane(0, table),
+                                 packed_->plane(1, table),
+                           scaled ? packed_->plane(2, table) : PagedPlaneView{},
+                           scaled ? packed_->plane(3, table) : PagedPlaneView{},
+                           geometry.head_dim,
+                                 geometry.kv_heads,
+                                 storage};
         }
     }
 
@@ -462,10 +510,6 @@ double full_useful_bytes(const FullGeometry& geometry, KvCacheStorage storage,
     const double output = geometry.kv_heads * tokens *
                           (full_vector_bytes(layout.key) + full_vector_bytes(layout.value));
     return input + output;
-}
-
-double prefix_useful_bytes(std::int32_t committed, std::int32_t batch) {
-    return static_cast<double>(committed) * batch * 8192.0;
 }
 
 template <class Case>
@@ -564,6 +608,13 @@ std::vector<FullGeometry> selected_geometries(FullGeometryChoice choice) {
     return {kFullKv4, kFullKv2};
 }
 
+std::vector<PrefixGeometry> selected_prefix_geometries(PrefixGeometryChoice choice) {
+    if (choice == PrefixGeometryChoice::Kv8) return {kPrefixKv8};
+    if (choice == PrefixGeometryChoice::Kv4) return {kPrefixKv4};
+    if (choice == PrefixGeometryChoice::Kv2) return {kPrefixKv2};
+    return {kPrefixKv8, kPrefixKv4, kPrefixKv2};
+}
+
 std::vector<KvCacheStorage> selected_storages(KvChoice choice) {
     if (choice == KvChoice::Bf16) return {KvCacheStorage::BFloat16};
     if (choice == KvChoice::Int8) return {KvCacheStorage::Int8Group64};
@@ -654,6 +705,7 @@ int main(int argc, char** argv) {
         bench::L2FlushBuffer flush(kFlushBytes);
         const std::vector<FullGeometry> geometries = selected_geometries(options.full_geometry);
         const std::vector<KvCacheStorage> storages = selected_storages(options.kv);
+        const auto prefix_geometries = selected_prefix_geometries(options.prefix_geometry);
 
         if (options.profile) {
             if (options.mode == Mode::Full) {
@@ -674,14 +726,17 @@ int main(int argc, char** argv) {
                      options.counts.front() > options.cyclic_capacity)) {
                     usage("cyclic prefix extent exceeds capacity");
                 }
-                PrefixCase data(options.tokens.front(), options.counts.front(), cyclic,
-                                options.cyclic_capacity, options.batch,
-                                options.max_count < 0 ? options.tokens.front() : options.max_count);
-                const std::string label =
-                    std::string("mode=prefix layout=") +
-                    (cyclic ? "cyclic capacity=" + std::to_string(options.cyclic_capacity) +
-                                  " B=" + std::to_string(options.batch)
-                            : "paged");
+                const auto geometry = prefix_geometries.front();
+                const auto storage =
+                    geometry.head_dim == 128 ? KvCacheStorage::BFloat16 : storages.front();
+                PrefixCase data(geometry, storage, options.tokens.front(), options.counts.front(),
+                                cyclic, options.cyclic_capacity, options.batch,
+                                options.max_count < 0 ? options.tokens.front() : options.max_count,
+                                options.context);
+                const std::string label = std::string("mode=prefix geometry=") + geometry.name +
+                                          " kv=" + storage_name(storage) +
+                                          " layout=" + (cyclic ? "cyclic" : "paged") +
+                                          " B=" + std::to_string(options.batch);
                 profile_case(data, label.c_str(), options, flush, cuda);
             }
             CUDA_CHECK(cudaStreamDestroy(stream));
@@ -709,36 +764,45 @@ int main(int argc, char** argv) {
             }
         }
         if (options.mode != Mode::Full) {
-            for (const bool cyclic : {false, true}) {
-                if ((options.layout == LayoutChoice::Paged && cyclic) ||
-                    (options.layout == LayoutChoice::Cyclic && !cyclic)) {
-                    continue;
-                }
-                for (const std::int32_t tokens : options.tokens) {
-                    for (const std::int32_t committed : options.counts) {
-                        if (committed > tokens ||
-                            (options.max_count >= 0 && committed > options.max_count)) {
+            for (const auto geometry : prefix_geometries) {
+                const auto cache_storages =
+                    geometry.head_dim == 128 ? std::vector{KvCacheStorage::BFloat16} : storages;
+                for (const auto storage : cache_storages)
+                    for (const bool cyclic : {false, true}) {
+                        if ((cyclic && geometry.head_dim != 128) ||
+                            (options.layout == LayoutChoice::Paged && cyclic) ||
+                            (options.layout == LayoutChoice::Cyclic && !cyclic))
                             continue;
-                        }
-                        if (cyclic && ((options.max_count < 0 ? tokens : options.max_count) >
-                                           options.cyclic_capacity ||
-                                       committed > options.cyclic_capacity)) {
-                            continue;
-                        }
-                        PrefixCase data(tokens, committed, cyclic, options.cyclic_capacity,
-                                        options.batch,
-                                        options.max_count < 0 ? tokens : options.max_count);
-                        constexpr double kPrefixVectorBytes = kPrefixHeadDim * 2.0;
-                        const double cache_bytes = static_cast<double>(committed) * options.batch *
-                                                   kPrefixKvHeads * (2.0 * kPrefixVectorBytes);
-                        collect_case(data, Mode::Prefix, "d128-kv8", KvCacheStorage::BFloat16,
-                                     cyclic ? "cyclic" : "paged", options.batch,
-                                     cyclic ? options.cyclic_capacity : 0, tokens, committed,
-                                     cache_bytes, kPrefixVectorBytes, kPrefixVectorBytes,
-                                     cache_bytes, prefix_useful_bytes(committed, options.batch),
-                                     options, flush, cuda, results);
+                        for (const std::int32_t tokens : options.tokens)
+                            for (const std::int32_t committed : options.counts) {
+                                const int maximum =
+                                    options.max_count < 0 ? tokens : options.max_count;
+                                if (committed > tokens || committed > maximum) continue;
+                                if (cyclic && (maximum > options.cyclic_capacity ||
+                                               committed > options.cyclic_capacity))
+                                    continue;
+                                PrefixCase data(geometry, storage, tokens, committed, cyclic,
+                                                options.cyclic_capacity, options.batch, maximum,
+                                                options.context);
+                                double key_bytes = geometry.head_dim * 2.0, value_bytes = key_bytes;
+                                if (geometry.head_dim == 256) {
+                                    const auto format =
+                                        paged_kv_storage_layout(storage, geometry.head_dim);
+                                    key_bytes   = full_vector_bytes(format.key);
+                                    value_bytes = full_vector_bytes(format.value);
+                                }
+                                const double vectors =
+                                    double(committed) * options.batch * geometry.kv_heads;
+                                const double logical_bytes  = vectors * geometry.head_dim * 4.0;
+                                const double physical_bytes = vectors * (key_bytes + value_bytes);
+                                collect_case(data, Mode::Prefix, geometry.name, storage,
+                                             cyclic ? "cyclic" : "paged", options.batch,
+                                             cyclic ? options.cyclic_capacity : 0, tokens,
+                                             committed, logical_bytes, key_bytes, value_bytes,
+                                             physical_bytes, logical_bytes + physical_bytes,
+                                             options, flush, cuda, results);
+                            }
                     }
-                }
             }
         }
         write_csv(options, results);

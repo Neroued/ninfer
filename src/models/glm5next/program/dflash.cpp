@@ -2,12 +2,12 @@
 
 namespace ninfer::models::glm5next::detail {
 Tensor RankProgramImpl::draft_features(int tokens, int rows) {
-    const auto& field = resources.plan.frame.dflash->features;
+    const auto& field = frame.dflash->features;
     return resources.packed(field, {field.shape[0], tokens, rows});
 }
 
 execution::DFlashRun RankProgramImpl::dflash_run(int b, std::uint32_t bound) {
-    const auto& io  = resources.plan.frame;
+    const auto& io  = frame;
     const auto& d   = *io.dflash;
     const auto& s   = *io.speculative;
     const int steps = dimension(shape.draft_tokens), w = steps + 1;
@@ -15,7 +15,7 @@ execution::DFlashRun RankProgramImpl::dflash_run(int b, std::uint32_t bound) {
     return execution::DFlashRun(
         parameters, {resources.workspace, resources.states, *parallel},
         {row(io.rows.anchors, b), row(io.rows.base_positions, b), row(d.valid_columns, b),
-         row(io.rows.source_offsets, b),
+         row(io.rows.source_offsets, b), row(io.rows.live_rows, b),
          static_cast<const ops::SamplingConfig*>(resources.tensor(*io.sampling).data), bound},
         {resources.packed(d.ids, {w, b}), resources.packed(d.positions, {w, b}),
          resources.packed(s.drafts, {steps, b}), resources.packed(d.candidate_ids, {k, steps, b}),
@@ -37,7 +37,7 @@ void RankProgramImpl::append_dflash_context(const execution::BatchView& call, co
         const auto begin = call.tokens - capacity;
         features         = features.slice(1, begin, capacity);
         positions        = positions.slice(0, begin, capacity);
-        live             = resources.tensor(resources.plan.frame.dflash->window_count);
+        live             = resources.tensor(frame.dflash->window_count);
         envelope         = {capacity, capacity};
     }
     execution::draft_append_context(parameters, {resources.workspace, resources.states, *parallel},
@@ -46,7 +46,7 @@ void RankProgramImpl::append_dflash_context(const execution::BatchView& call, co
 }
 
 void RankProgramImpl::accept_dflash(int b) {
-    const auto& io  = resources.plan.frame;
+    const auto& io  = frame;
     const auto& d   = *io.dflash;
     const int steps = dimension(shape.draft_tokens), w = steps + 1;
     const int k = dimension(parameters.profile->config.draft->dflash2->selector_top_k);
@@ -56,10 +56,10 @@ void RankProgramImpl::accept_dflash(int b) {
     auto counts   = row(*io.output_counts, b);
     const auto* configs =
         static_cast<const ops::SamplingConfig*>(resources.tensor(*io.sampling).data);
-    vocabulary().accept_sparse(logits, configs, row(io.decode.valid_columns, b), draft_proposals(b),
-                               resources.packed(d.candidate_ids, {k, steps, b}),
-                               resources.packed(d.proposal_q, {k, steps, b}),
-                               row(io.speculative->extents, b), row(io.rows.sampling_positions, b),
-                               licensed, counts);
+    vocabulary().accept_sparse(
+        logits, configs, row(io.decode.valid_columns, b), row(io.rows.live_rows, b),
+        draft_proposals(b), resources.packed(d.candidate_ids, {k, steps, b}),
+        resources.packed(d.proposal_q, {k, steps, b}), row(io.speculative->extents, b),
+        row(io.rows.sampling_positions, b), licensed, counts);
 }
 } // namespace ninfer::models::glm5next::detail

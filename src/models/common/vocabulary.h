@@ -16,15 +16,15 @@ struct DistributedVocabulary {
     CudaExecutionView cuda;
 
     void sample(const Tensor& logits, const ops::SamplingConfig*, const Tensor& valid,
-                const Tensor& positions, int purpose, Tensor& ids) const;
+                const Tensor& live_rows, const Tensor& positions, int purpose, Tensor& ids) const;
     void accept(const Tensor& logits, const ops::SamplingConfig*, const Tensor& valid,
-                const Tensor& drafts, const Tensor& extents, const Tensor& positions,
-                Tensor& licensed, Tensor& counts) const;
+                const Tensor& live_rows, const Tensor& drafts, const Tensor& extents,
+                const Tensor& positions, Tensor& licensed, Tensor& counts) const;
 
     void accept_sparse(const Tensor& logits, const ops::SamplingConfig*, const Tensor& valid,
-                       const Tensor& drafts, const Tensor& candidate_ids, const Tensor& q,
-                       const Tensor& extents, const Tensor& positions, Tensor& licensed,
-                       Tensor& counts) const;
+                       const Tensor& live_rows, const Tensor& drafts, const Tensor& candidate_ids,
+                       const Tensor& q, const Tensor& extents, const Tensor& positions,
+                       Tensor& licensed, Tensor& counts) const;
 
 private:
     [[nodiscard]] Tensor collect(const Tensor& logits, const ops::SamplingConfig*,

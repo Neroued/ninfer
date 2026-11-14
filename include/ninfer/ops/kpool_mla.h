@@ -17,7 +17,7 @@ namespace ninfer::ops {
 /**
  * Kpool history uses original-token ordinals and 64-token page records. Each complete pool
  * represents four consecutive tokens; selection holds at most 512 pools. T is the positive
- * physical token extent, B=1..8, and native Tensor dimension zero is contiguous.
+ * physical token extent, B is positive, and native Tensor dimension zero is contiguous.
  *
  * All execution views borrow caller-owned storage on execution.device(). Activations and
  * contraction weights are contiguous and at least 16-byte aligned. Parameter vectors, APE and
@@ -402,7 +402,7 @@ void kpool_sparse_mla(const Tensor& query, const KpoolMlaFactors& factors,
 
 /**
  * Restore the raw tail of an accepted prefix, across L layers in one call. accepted_columns
- * is Device I32 [B], 1<=B<=R<=8; L and R come from records.raw_keys.ne[3] and ne[2]. Both tail
+ * is Device I32 [B], 1<=B<=R; L and R come from records.raw_keys.ne[3] and ne[2]. Both tail
  * fields have L layers and B selected records; before is canonical at F0=base_positions[b].
  * For every positive acceptance a, require 0<a<=u=valid_columns[b]<=W and
  * 0<=F0<=F0+u<=kKpoolMaxVisibleTokens. Define F1=F0+a, r=F1%4, s=F1-r. For each layer, K/G

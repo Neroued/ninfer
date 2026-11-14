@@ -9,16 +9,23 @@ __launch_bounds__(S::kSamplerBlock) __global__ void speculative_accept_greedy_dr
     const std::int32_t* target_tokens, const __nv_bfloat16* logits, TokenRows drafts,
     const std::int32_t* current_extents, const std::int32_t* base_positions,
     std::int32_t* licensed_tokens, std::int32_t* licensed_counts, const SamplingConfig* configs,
-    std::int32_t token_domain, std::int32_t physical_rows, std::int32_t k) {
-    const int tid                   = threadIdx.x;
-    const int row                   = static_cast<int>(blockIdx.x);
-    const int cols                  = k + 1;
+    std::int32_t token_domain, std::int32_t physical_rows, std::int32_t k,
+    const std::int32_t* live) {
+    const int tid  = threadIdx.x;
+    const int row  = static_cast<int>(blockIdx.x);
+    const int cols = k + 1;
+    if (live && !live[row]) {
+        for (int column = tid; column < cols; column += blockDim.x)
+            licensed_tokens[std::int64_t(row) * cols + column] = 0;
+        if (tid == 0) licensed_counts[row] = 0;
+        return;
+    }
     int extent                      = current_extents[row];
     extent                          = extent < 0 ? 0 : (extent > k ? k : extent);
     const SamplingConfig cfg        = configs[row];
-    const std::int32_t* row_targets = target_tokens + row * cols;
+    const std::int32_t* row_targets = target_tokens + std::int64_t(row) * cols;
     const auto row_drafts           = drafts[row];
-    std::int32_t* row_tokens        = licensed_tokens + row * cols;
+    std::int32_t* row_tokens        = licensed_tokens + std::int64_t(row) * cols;
     const __nv_bfloat16* row_logits =
         logits + static_cast<std::int64_t>(row) * cols * physical_rows;
     const bool penalties = cfg.presence_penalty != 0.0f || cfg.frequency_penalty != 0.0f;

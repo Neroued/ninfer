@@ -36,8 +36,8 @@ GraphInvocation invocation(GraphPhase phase, std::uint32_t batch, std::uint32_t 
 
 class PreparationInputs {
 public:
-    PreparationInputs(Resources& resources, DeviceContext& device)
-        : resources_(resources), device_(device),
+    PreparationInputs(Resources& resources, DeviceContext& device, const BatchExecutionPlan& plan)
+        : resources_(resources), device_(device), plan_(plan),
           pool_(0, resources.context.size(), resources.context_records) {
         const auto batch = resources.frame.spec.batch_capacity;
         std::vector<RecordRequest> demand;
@@ -58,36 +58,39 @@ public:
     }
 
     void prepare(const GraphInvocation& call) {
-        auto& frame         = resources_.frame;
-        const auto cuda     = device_.execution_view();
-        *frame.host_ingress = {};
-        *frame.host_commit  = {};
-        *frame.host_egress  = {};
+        auto& frame     = resources_.frame;
+        const auto cuda = device_.execution_view();
+        frame.bind_rows(call.batch);
+        frame.clear_ingress();
+        frame.clear_commit();
+        frame.clear_egress();
+        const auto live     = plan_.representative_owners({call.batch, call.batch}).front();
         const auto maximum  = resources_.decoder.text_kv.max_context() - 1;
         const auto frontier = std::min(maximum, std::max(1U, call.profile.min));
         const auto extent   = std::min(frame.spec.draft_window, maximum - frontier);
         const auto input    = frame.host_decode_view(call.width, call.batch);
         auto* positions     = static_cast<std::int32_t*>(input.cache_positions.data);
         auto* rope          = static_cast<std::int32_t*>(input.rope_positions.data);
-        for (std::uint32_t row = 0; row < call.batch; ++row) {
-            auto& host                               = *frame.host_ingress;
-            host.frontiers[row]                      = frontier;
-            host.sampling_positions[row]             = frontier;
-            host.history_skip[row]                   = 1;
-            frame.host_commit->accepted_columns[row] = extent + 1;
-            host.backend_frontiers[row]              = frame.spec.backend == SpeculativeBackend::Mtp
-                                                           ? (frontier ? frontier - 1 : 0)
-                                                           : frontier;
-            host.extents[row]                        = extent;
-            host.valid_columns[row]                  = std::min(call.width, extent + 1);
-            host.proposal_valid_columns[row]         = frame.spec.draft_window + 1;
-            host.budgets[row]                        = frame.spec.draft_window + 1;
-            host.main_table_rows[row]                = row;
-            host.backend_table_rows[row]             = row;
-            host.state_source_offsets[row]           = state_offsets_[row];
-            host.state_destination_offsets[row]      = state_offsets_[row];
-            host.residency_slots[row]                = row;
-            frame.host_commit->state_destination_offsets[row] = state_offsets_[row];
+        for (std::uint32_t row = 0; row < live; ++row) {
+            auto& host                              = frame.host_ingress;
+            host.live_rows[row]                     = 1;
+            host.frontiers[row]                     = frontier;
+            host.sampling_positions[row]            = frontier;
+            host.history_skip[row]                  = 1;
+            frame.host_commit.accepted_columns[row] = extent + 1;
+            host.backend_frontiers[row]             = frame.spec.backend == SpeculativeBackend::Mtp
+                                                          ? (frontier ? frontier - 1 : 0)
+                                                          : frontier;
+            host.extents[row]                       = extent;
+            host.valid_columns[row]                 = std::min(call.width, extent + 1);
+            host.proposal_valid_columns[row]        = frame.spec.draft_window + 1;
+            host.budgets[row]                       = frame.spec.draft_window + 1;
+            host.main_table_rows[row]               = row;
+            host.backend_table_rows[row]            = row;
+            host.state_source_offsets[row]          = state_offsets_[row];
+            host.state_destination_offsets[row]     = state_offsets_[row];
+            host.residency_slots[row]               = row;
+            frame.host_commit.state_destination_offsets[row] = state_offsets_[row];
             for (std::uint32_t column = 0; column < call.width; ++column) {
                 const auto index = row * call.width + column;
                 positions[index] = frontier + std::min(column, extent);
@@ -100,8 +103,8 @@ public:
             const auto ids = frame.decode_view(call.width, call.batch).ids;
             CUDA_CHECK(cudaMemsetAsync(ids.data, 0, ids.bytes(), cuda.stream()));
         }
-        CUDA_CHECK(cudaMemcpyAsync(frame.commit.data, frame.host_commit, sizeof(FrameCommit),
-                                   cudaMemcpyHostToDevice, cuda.stream()));
+        CUDA_CHECK(cudaMemcpyAsync(frame.commit.data, frame.host_commit_bytes.data,
+                                   frame.commit.bytes, cudaMemcpyHostToDevice, cuda.stream()));
         CUDA_CHECK(cudaMemsetAsync(frame.egress.data, 0, frame.egress.bytes, cuda.stream()));
         for (const auto offset : state_offsets_)
             resources_.state_images.storage().clear(offset, cuda);
@@ -117,15 +120,15 @@ public:
             auto* cache       = static_cast<std::int32_t*>(frame.host_step_positions.data);
             auto* step_rope   = static_cast<std::int32_t*>(frame.host_step_rope_positions.data);
             auto* valid       = static_cast<std::int32_t*>(frame.host_step_valid_columns.data);
-            const auto stride = frame.spec.batch_capacity;
+            const auto stride = call.batch;
             for (std::uint32_t step = 0; step < frame.spec.draft_window; ++step) {
                 for (std::uint32_t row = 0; row < stride; ++row) {
                     const auto p = std::min(maximum, (frontier ? frontier - 1 : 0) + step);
-                    cache[step * stride + row] = p;
-                    valid[step * stride + row] = row < call.batch && (step == 0 || step < extent);
+                    cache[step * stride + row] = row < live ? p : 0;
+                    valid[step * stride + row] = row < live && (step == 0 || step < extent);
                 }
                 for (std::uint32_t axis = 0; axis < 3; ++axis) {
-                    for (std::uint32_t row = 0; row < call.batch; ++row) {
+                    for (std::uint32_t row = 0; row < live; ++row) {
                         step_rope[step * 3 * stride + axis * call.batch + row] =
                             cache[step * stride + row];
                     }
@@ -137,8 +140,8 @@ public:
             CUDA_CHECK(cudaMemsetAsync(state.pending_features.data, 0,
                                        state.pending_features.bytes(), cuda.stream()));
         }
-        CUDA_CHECK(cudaMemcpyAsync(frame.ingress.data, frame.host_ingress, sizeof(FrameIngress),
-                                   cudaMemcpyHostToDevice, cuda.stream()));
+        CUDA_CHECK(cudaMemcpyAsync(frame.ingress.data, frame.host_ingress_bytes.data,
+                                   frame.ingress.bytes, cudaMemcpyHostToDevice, cuda.stream()));
         device_.synchronize();
     }
 
@@ -184,6 +187,7 @@ private:
 
     Resources& resources_;
     DeviceContext& device_;
+    const BatchExecutionPlan& plan_;
     ContextPool pool_;
     std::vector<AllocationId> records_;
     std::vector<std::int64_t> state_offsets_;
@@ -225,8 +229,8 @@ std::vector<GraphProfile> draft_graph_profiles(const GraphSpec& spec) {
 }
 
 Graphs::Graphs(GraphSpec spec) : spec_(spec) {
-    if (!spec.capacity || !spec.batch_capacity || spec.batch_capacity > kMaximumConcurrency ||
-        spec.draft_window > 15 ||
+    if (!spec.capacity || !spec.batch_execution || spec.batch_execution->attention_owners() != 1 ||
+        spec.batch_execution->graph_rows().empty() || spec.draft_window > 15 ||
         (spec.backend == SpeculativeBackend::None) != (spec.draft_window == 0)) {
         throw std::invalid_argument("Qwen3.5 graph geometry is invalid");
     }
@@ -289,13 +293,12 @@ void Graphs::prepare(Resources& resources, const execution::Parameters& paramete
     nvtx::ScopedRange range(nvtx::Name::CudaGraphPrepare, nvtx::Category::Graph);
     std::optional<moe::Schedule::Preparation> preparation;
     if (resources.moe) preparation.emplace(*resources.moe);
-    PreparationInputs inputs(resources, device);
-    batches_.resize(spec_.batch_capacity);
+    PreparationInputs inputs(resources, device, *spec_.batch_execution);
     const auto ordinary_profiles = target_graph_profiles(spec_.capacity, 1);
     const auto verify_profiles   = target_graph_profiles(spec_.capacity, spec_.draft_window + 1);
     const auto draft_profiles    = draft_graph_profiles(spec_);
-    for (std::uint32_t batch = 1; batch <= spec_.batch_capacity; ++batch) {
-        auto& target            = batches_[batch - 1];
+    for (const auto batch : spec_.batch_execution->graph_rows()) {
+        auto& target            = batches_[batch];
         const auto prepare_main = [&](GraphPhase phase, execution::TextGraph& graph,
                                       std::uint32_t width, const auto& profiles) {
             const auto call = invocation(phase, batch, width, profiles.front(), spec_.capacity);
@@ -306,6 +309,7 @@ void Graphs::prepare(Resources& resources, const execution::Parameters& paramete
             if (!run) throw std::logic_error("graph target body returned no traversal");
             graph.prepare(
                 *run, parameters, resources.moe.get(), profiles, width,
+                moe::decode_geometry(*spec_.batch_execution, batch, width),
                 [&] { bodies.prologue(call); },
                 [&] {
                     auto scope = resources.work.scope();
@@ -313,7 +317,7 @@ void Graphs::prepare(Resources& resources, const execution::Parameters& paramete
                 },
                 resources.work, device, observation);
             if (observation.capturing()) {
-                if (!graph.start(device.execution_view()))
+                if (!graph.start(device.execution_view(), run->active_tokens()))
                     while (!graph.poll()) {
                         if (resources.moe) resources.moe->synchronize();
                         device.synchronize();
@@ -377,11 +381,6 @@ void Graphs::prepare(Resources& resources, const execution::Parameters& paramete
         if (bodies.mtp_commit && spec_.draft_window) {
             inputs.prepare(invocation(GraphPhase::Verify, batch, spec_.draft_window + 1,
                                       {0, spec_.capacity - 1, 0}, spec_.capacity));
-            auto& frame = resources.frame;
-            for (std::uint32_t row = 0; row < batch; ++row)
-                frame.host_commit->accepted_columns[row] = spec_.draft_window + 1;
-            CUDA_CHECK(cudaMemcpyAsync(frame.commit.data, frame.host_commit, sizeof(FrameCommit),
-                                       cudaMemcpyHostToDevice, device.stream()));
             resources.work.reset_peak();
             if (!observation.capturing()) {
                 bodies.mtp_commit(batch, nullptr, nullptr);
@@ -406,10 +405,11 @@ void Graphs::prepare(Resources& resources, const execution::Parameters& paramete
 }
 
 bool Graphs::start(GraphPhase phase, std::uint32_t batch, std::uint32_t frontier,
-                   CudaExecutionView cuda) {
+                   std::uint32_t target_tokens, CudaExecutionView cuda) {
     if (pending_) throw std::logic_error("a Qwen3.5 graph phase is already pending");
-    if (!batch || batch > batches_.size()) throw std::out_of_range("graph batch is unprepared");
-    auto& family               = batches_[batch - 1];
+    const auto found = batches_.find(batch);
+    if (found == batches_.end()) throw std::out_of_range("graph batch is unprepared");
+    auto& family               = found->second;
     execution::TextGraph* text = nullptr;
     switch (phase) {
     case GraphPhase::Main:
@@ -431,7 +431,7 @@ bool Graphs::start(GraphPhase phase, std::uint32_t batch, std::uint32_t frontier
     text->select(frontier);
     pending_ = text;
     try {
-        if (!text->start(cuda)) return false;
+        if (!text->start(cuda, target_tokens)) return false;
         pending_ = nullptr;
         return true;
     } catch (...) {
@@ -449,7 +449,7 @@ bool Graphs::poll() {
 
 void Graphs::commit_mtp(std::uint32_t batch, bool repair, bool counts, CudaExecutionView cuda) {
     if (pending_) throw std::logic_error("MTP history cannot precede its completed target");
-    auto& commit = batches_.at(batch - 1).mtp_commit;
+    auto& commit = batches_.at(batch).mtp_commit;
     commit.repair.set_enabled(commit.executable, repair);
     commit.counts.set_enabled(commit.executable, counts);
     commit.executable.launch(cuda.stream());

@@ -1,3 +1,4 @@
+#include "ops/common/host/launch.h"
 #include "ninfer/ops/rmsnorm_pack_tail.h"
 #include "core/device.h"
 #include "ops/common/host/operands.h"
@@ -5,6 +6,7 @@
 #include <cmath>
 #include <cuda_bf16.h>
 #include <cstdint>
+#include <limits>
 #include <stdexcept>
 #include <string>
 
@@ -40,9 +42,9 @@ __global__ __launch_bounds__(kBlock) void rmsnorm_pack_tail_kernel(
     const int tail  = static_cast<int>(blockIdx.x);
     const int batch = static_cast<int>(blockIdx.y);
     const std::int64_t input_base =
-        static_cast<std::int64_t>(batch * width + tail + 1) * (Hidden / 2);
+        (static_cast<std::int64_t>(batch) * width + tail + 1) * (Hidden / 2);
     const std::int64_t output_base =
-        static_cast<std::int64_t>(batch * (width - 1) + tail) * (Hidden / 2);
+        (static_cast<std::int64_t>(batch) * (width - 1) + tail) * (Hidden / 2);
 
     __nv_bfloat162 values[kPairsPerThread];
     __nv_bfloat162 weights[kPairsPerThread];
@@ -73,11 +75,15 @@ __global__ __launch_bounds__(kBlock) void rmsnorm_pack_tail_kernel(
 template <int Hidden, int Threads>
 void launch_rmsnorm_pack_tail(const Tensor& input, const Tensor& weight, float epsilon,
                               Tensor& output, cudaStream_t stream) {
-    const dim3 grid(input.ne[1] - 1, input.ne[2]);
-    rmsnorm_pack_tail_kernel<Hidden, Threads><<<grid, Threads, 0, stream>>>(
-        static_cast<const __nv_bfloat162*>(input.data),
-        static_cast<const __nv_bfloat162*>(weight.data), static_cast<__nv_bfloat162*>(output.data),
-        input.ne[1], epsilon);
+    common::for_each_token_slice(input.ne[2], 1, [&](int offset, int count) {
+        const auto input_offset  = std::int64_t(offset) * input.ne[1] * (Hidden / 2);
+        const auto output_offset = std::int64_t(offset) * (input.ne[1] - 1) * (Hidden / 2);
+        const dim3 grid(input.ne[1] - 1, count);
+        rmsnorm_pack_tail_kernel<Hidden, Threads><<<grid, Threads, 0, stream>>>(
+            static_cast<const __nv_bfloat162*>(input.data) + input_offset,
+            static_cast<const __nv_bfloat162*>(weight.data),
+            static_cast<__nv_bfloat162*>(output.data) + output_offset, input.ne[1], epsilon);
+    });
 }
 
 void require_bf16_contiguous_aligned(const Tensor& tensor, const char* name) {
@@ -107,10 +113,10 @@ void rmsnorm_pack_tail(const Tensor& input, const Tensor& weight, float epsilon,
     const std::int32_t batch = input.ne[2];
     const std::int32_t width = input.ne[1];
     const int hidden         = input.ne[0];
-    if ((hidden != 4096 && hidden != 5120) || (width < 2 || width > 16) || batch < 1 || batch > 8 ||
-        input.ne[3] != 1) {
+    if ((hidden != 4096 && hidden != 5120) || (width < 2 || width > 16) || batch < 1 ||
+        std::int64_t(width - 1) * batch > std::numeric_limits<int>::max() || input.ne[3] != 1) {
         throw std::invalid_argument(
-            "rmsnorm_pack_tail: input must have shape [H,W,B], H=4096 or 5120, W=2..16, B=1..8");
+            "rmsnorm_pack_tail: invalid [H,W,B] geometry or flattened output extent");
     }
     if (weight.ne[0] != hidden || weight.ne[1] != 1 || weight.ne[2] != 1 || weight.ne[3] != 1) {
         throw std::invalid_argument("rmsnorm_pack_tail: weight must have shape [H]");

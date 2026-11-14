@@ -36,6 +36,6 @@ void validate_conv(const Tensor& residual, const Tensor& gated, const Tensor& ke
                    CudaExecutionView execution);
 void validate_extract(const ConstPleConvStateView& before, const PleConvRecordReadView& records,
                       const Tensor& accepted, const PleConvStateView& after,
-                      CudaExecutionView execution);
+                      const Tensor& live_rows, CudaExecutionView execution);
 
 } // namespace ninfer::ops::detail::ple

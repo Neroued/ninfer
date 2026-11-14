@@ -199,7 +199,7 @@ Options parse_options(int argc, char** argv) {
         } else if (argument == "--tokens") {
             options.tokens = parse_list(next("--tokens requires a value"), 1, 262144, "--tokens");
         } else if (argument == "--batch") {
-            options.batches = parse_list(next("--batch requires a value"), 1, 8, "--batch");
+            options.batches = parse_list(next("--batch requires a value"), 1, INT32_MAX, "--batch");
         } else if (argument == "--context") {
             options.contexts =
                 parse_list(next("--context requires a value"), 0, 262144, "--context");
@@ -211,7 +211,7 @@ Options parse_options(int argc, char** argv) {
                 parse_list(next("--valid-columns requires a value"), 0, 16, "--valid-columns");
         } else if (argument == "--table-rows") {
             options.table_rows =
-                parse_list(next("--table-rows requires a value"), 0, 7, "--table-rows");
+                parse_list(next("--table-rows requires a value"), 0, INT32_MAX, "--table-rows");
         } else if (argument == "--execution") {
             const std::string_view value(next("--execution requires a value"));
             if (value == "eager")

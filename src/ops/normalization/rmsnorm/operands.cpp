@@ -35,7 +35,8 @@ void same_shape(const Tensor& x, const Tensor& other, const char* op) {
 } // namespace
 
 Operands validate(const Tensor& x, const Tensor& weight, const Tensor* gate, float eps,
-                  const Tensor& out, Epilogue kind, CudaExecutionView execution, const char* op) {
+                  const Tensor& out, const Tensor* inverse, Epilogue kind,
+                  CudaExecutionView execution, const char* op) {
     require(x.dtype == DType::BF16 && weight.dtype == DType::BF16 && out.dtype == DType::BF16 &&
                 (!gate || gate->dtype == DType::BF16),
             op, "operands must be BF16");
@@ -45,6 +46,12 @@ Operands validate(const Tensor& x, const Tensor& weight, const Tensor* gate, flo
     if (gate) same_shape(x, *gate, op);
     require(weight.ne[0] == x.ne[0] && weight.ne[1] == 1 && weight.ne[2] == 1 && weight.ne[3] == 1,
             op, "weight must be a vector of the reduced dimension");
+    if (inverse) {
+        require(inverse->dtype == DType::FP32, op, "inverse must be FP32");
+        require(inverse->ne[0] == x.ne[1] && inverse->ne[1] == x.ne[2] &&
+                    inverse->ne[2] == x.ne[3] && inverse->ne[3] == 1,
+                op, "inverse shape must match the trailing input extents");
+    }
     if (!count) return {x.ne[0], 0, 0};
     const std::array<const Tensor*, 4> tensors{&x, &weight, &out, gate};
     std::uintptr_t addresses = 0;
@@ -66,6 +73,18 @@ Operands validate(const Tensor& x, const Tensor& weight, const Tensor* gate, flo
         common::operand::disjoint(output, common::operand::range(gate->data, bytes, op), op);
     else
         common::operand::disjoint(input, gain, op);
+    if (inverse) {
+        require(inverse->device == execution.device(), op, "inverse belongs to another device");
+        require(inverse->is_contiguous() && common::operand::aligned(inverse->data, sizeof(float)),
+                op, "inverse requires contiguous FP32-aligned backing");
+        const auto saved = common::operand::range(
+            inverse->data, common::operand::bytes(count / x.ne[0], sizeof(float), op), op);
+        common::operand::disjoint(saved, input, op);
+        common::operand::disjoint(saved, gain, op);
+        common::operand::disjoint(saved, output, op);
+        if (gate)
+            common::operand::disjoint(saved, common::operand::range(gate->data, bytes, op), op);
+    }
     const int alignment = 1 << std::countr_zero(addresses | std::uintptr_t{16});
     return {x.ne[0], count / x.ne[0], alignment};
 }

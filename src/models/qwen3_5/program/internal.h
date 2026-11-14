@@ -12,7 +12,6 @@
 #include "models/qwen3_5/program/graphs.h"
 #include "models/qwen3_5/program/planning/startup.h"
 
-#include <array>
 #include <chrono>
 #include <deque>
 #include <memory>
@@ -64,7 +63,8 @@ struct ComputeOperation {
     bool row_finished            = false;
     bool graph_started           = false;
     bool projected               = false;
-    std::array<std::uint32_t, kMaximumConcurrency> dead_positions{};
+    std::vector<std::uint32_t> dead_positions;
+    PhysicalBatchShape shape;
     std::optional<runtime::DecisionInput> decision;
     std::optional<Commit> commit;
     std::optional<Result> result;
@@ -103,6 +103,7 @@ public:
     void reset_measurement_peaks() noexcept;
 
     void validate_row(const ExecutionRow&) const;
+    std::uint64_t next_validation_mark() const;
     void install_residencies(const ContextWork&);
     void initialize_inputs(ComputeOperation&);
     void initialize_decode(ComputeOperation&, const DecodeWork&);
@@ -147,6 +148,7 @@ public:
     DeviceContext& device;
     const std::uint32_t capacity;
     const std::uint32_t max_concurrency;
+    const std::shared_ptr<const BatchExecutionPlan> batch_execution;
     const std::uint32_t prefill_chunk;
     const std::uint32_t draft_window;
     const SpeculativeBackend backend;
@@ -160,8 +162,10 @@ public:
     std::unique_ptr<context::ContextMigration> context_actions;
     std::unique_ptr<ContextOperation> context_operation;
     PinnedHostBuffer context_counts;
-    std::array<Residency, kMaximumConcurrency> residencies;
-    std::size_t workspace_peak = 0;
+    std::vector<Residency> residencies;
+    mutable std::vector<std::uint64_t> validation_marks;
+    mutable std::uint64_t validation_generation = 0;
+    std::size_t workspace_peak                  = 0;
     std::unique_ptr<ComputeOperation> compute;
     CudaCompletionEvent result_ready;
     CudaCompletionEvent drafts_ready;

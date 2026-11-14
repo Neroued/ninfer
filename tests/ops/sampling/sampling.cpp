@@ -7,8 +7,10 @@
 // input.  The test never reproduces the device RNG algorithm or uses another
 // production path as a golden.
 #include "ninfer/ops/sampling.h"
+#include "ninfer/ops/speculative_accept.h"
 #include "cuda_fixture.h"
 #include "core/buffer.h"
+#include "core/decode_graph.h"
 #include "ops/op_tester.h"
 
 #include <algorithm>
@@ -192,7 +194,7 @@ RunResult run_batch(const std::vector<float>& logits, int physical_rows, int tok
     MemoryArena workspace(workspace_storage.span());
     ops::sample(logits_tensor, out_tensor, token_domain,
                 static_cast<const ops::SamplingConfig*>(device_configs.data()), positions_tensor,
-                purpose, workspace, ninfer::test::cuda_environment().default_execution);
+                purpose, {}, workspace, ninfer::test::cuda_environment().default_execution);
     cuda_synchronize();
 
     RunResult result;
@@ -274,7 +276,7 @@ RunResult run_repeated(const std::vector<float>& column, int token_domain, int t
                                 DType::I32, {batch});
         ops::sample(logits_tensor, out_tensor, token_domain,
                     static_cast<const ops::SamplingConfig*>(device_configs.data()),
-                    positions_tensor, purpose, workspace,
+                    positions_tensor, purpose, {}, workspace,
                     ninfer::test::cuda_environment().default_execution);
     }
     cuda_synchronize();
@@ -646,6 +648,159 @@ int increment_counts_contract() {
     return failures;
 }
 
+int padded_batch_contract(int batch, int domain) {
+    const auto cuda = cuda_environment().context.execution_view();
+    std::vector<std::uint16_t> logits(std::size_t(domain) * batch, f32_to_bf16(-20.F));
+    std::vector<int> positions(batch, 17), live(batch), expected(batch);
+    std::vector<ops::SamplingConfig> configs(batch);
+    for (int row = 0; row < batch; ++row)
+        logits[std::size_t(row) * domain + 3 + row % 17] = f32_to_bf16(10.F);
+    auto input = to_device(logits), pos = to_device(positions), enabled = to_device(live);
+    auto parameters = to_device(configs);
+    GuardedDeviceBuffer result(std::size_t(batch) * sizeof(int));
+    Tensor x(input.span(), DType::BF16, {domain, batch});
+    Tensor out(result.span(), DType::I32, {batch}), p(pos.span(), DType::I32, {batch});
+    Tensor active(enabled.span(), DType::I32, {batch});
+    DeviceBuffer storage(
+        cuda.device(),
+        std::max<std::size_t>(256, ops::sampling_workspace_capacity_bytes(domain, batch, batch)));
+    MemoryArena workspace(storage.span());
+    DecodeGraphDefinition definition;
+    definition.capture(cuda.stream(), [&] {
+        ops::sample(x, out, domain, static_cast<const ops::SamplingConfig*>(parameters.data()), p,
+                    ops::kSamplePurposeDecode, active, workspace, cuda);
+    });
+    DecodeGraphExecutable graph;
+    graph.instantiate(definition);
+    int failures = 0;
+    for (int replay = 0; replay < 2; ++replay) {
+        for (int row = 0; row < batch; ++row) {
+            live[row]    = (row + replay) % 3 != 1;
+            configs[row] = {.temperature = row % 2 ? 1.F : 0.F, .top_k = 1};
+            if (!live[row]) {
+                configs[row].presence_penalty = 1;
+                configs[row].token_counts     = reinterpret_cast<const int*>(std::uintptr_t{1});
+                configs[row].mask = {reinterpret_cast<const std::uint32_t*>(std::uintptr_t{1}), 1};
+            }
+            expected[row] = live[row] ? 3 + row % 17 : 0;
+        }
+        enabled.copy_from_host(live.data(), live.size() * sizeof(int));
+        parameters.copy_from_host(configs.data(), configs.size() * sizeof(configs.front()));
+        result.fill(0x5a);
+        graph.launch(cuda.stream());
+        cuda_synchronize(cuda.stream());
+        failures += verify_exact("sample padded live rows", from_device<int>(result.data(), batch),
+                                 expected);
+        failures += result.verify_guards("sample padded output guards");
+    }
+    std::fill(live.begin(), live.end(), 0);
+    enabled.copy_from_host(live.data(), live.size() * sizeof(int));
+    x.data = p.data = reinterpret_cast<void*>(std::uintptr_t{256});
+    result.fill(0x5a);
+    ops::sample(x, out, domain, reinterpret_cast<const ops::SamplingConfig*>(std::uintptr_t{256}),
+                p, ops::kSamplePurposeDecode, active, workspace, cuda);
+    cuda_synchronize(cuda.stream());
+    failures += verify_exact("sample inactive input isolation",
+                             from_device<int>(result.data(), batch), std::vector<int>(batch));
+    return failures;
+}
+
+int large_alignment_contract() {
+    constexpr int rows = 16387, domain = 16381, batch = 17, width = 2;
+    constexpr int words = (domain + 31) / 32;
+    std::vector<int> history(domain + 1, 0);
+    history.front() = 777;
+    history.back()  = 2;
+    std::vector<std::uint32_t> masks(1 + width * words, 0);
+    masks.front() = 0x12345678;
+    for (int col = 0; col < width; ++col)
+        masks[1 + col * words + (domain - 1) / 32] = 1U << ((domain - 1) % 32);
+    auto dc = to_device(history), dm = to_device(masks);
+    ops::SamplingConfig config{
+        .temperature = 1.F, .top_k = 1, .presence_penalty = .25F, .frequency_penalty = .125F};
+    config.token_counts = static_cast<const int*>(dc.data()) + 1;
+    config.mask         = {static_cast<const std::uint32_t*>(dm.data()) + 1, words};
+    std::vector<float> logits(std::size_t(rows) * batch, -9.F);
+    for (int b = 0; b < batch; ++b) {
+        logits[std::size_t(b) * rows + domain - 1] = 12.F;
+        for (int token = domain; token < rows; ++token)
+            logits[std::size_t(b) * rows + token] = 100.F;
+    }
+    const auto sampled =
+        run_homogeneous_batch(logits, rows, domain, batch, config, 100, ops::kSamplePurposeDecode);
+    int failures =
+        sampled.integrity_failures +
+        verify_exact("large odd-row sampling", sampled.tokens, std::vector<int>(batch, domain - 1));
+    std::vector<std::uint16_t> verify_logits(std::size_t(rows) * width * batch);
+    for (int b = 0; b < batch; ++b)
+        for (int col = 0; col < width; ++col)
+            for (int token = 0; token < rows; ++token)
+                verify_logits[(std::size_t(b) * width + col) * rows + token] =
+                    f32_to_bf16(logits[std::size_t(b) * rows + token]);
+    std::vector<int> extents(batch), expected(width * batch, 0);
+    for (int b = 0; b < batch; ++b) {
+        extents[b]          = b % width;
+        expected[b * width] = domain - 1;
+    }
+    auto x      = to_device(verify_logits),
+         target = to_device(std::vector<int>(width * batch, domain - 1)),
+         drafts = to_device(std::vector<int>(batch, 0)), n = to_device(extents),
+         pos     = to_device(std::vector<int>(batch, 100)),
+         configs = to_device(std::vector<ops::SamplingConfig>(batch, config));
+    GuardedDeviceBuffer output(width * batch * sizeof(int)), counts(batch * sizeof(int));
+    Tensor xt(x.span(), DType::BF16, {rows, width, batch}),
+        tt(target.span(), DType::I32, {width, batch}), dt(drafts.span(), DType::I32, {1, batch}),
+        nt(n.span(), DType::I32, {batch}), pt(pos.span(), DType::I32, {batch}),
+        ot(output.span(), DType::I32, {width, batch}), ct(counts.span(), DType::I32, {batch});
+    const auto cuda = cuda_environment().context.execution_view();
+    DeviceBuffer backing(
+        cuda.device(),
+        ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(domain, 1, 1, batch, batch));
+    MemoryArena workspace(backing.span());
+    DecodeGraphDefinition definition;
+    definition.capture(cuda.stream(), [&] {
+        ops::speculative_accept_greedy_drafts(
+            tt, xt, dt, nt, pt, ot, ct, domain,
+            static_cast<const ops::SamplingConfig*>(configs.data()), {}, workspace, cuda);
+    });
+    DecodeGraphExecutable graph;
+    graph.instantiate(definition);
+    graph.launch(cuda.stream());
+    cuda_synchronize(cuda.stream());
+    failures += verify_exact("large odd-row acceptance",
+                             from_device<int>(output.data(), expected.size()), expected);
+    failures += verify_exact("large odd-row counts", from_device<int>(counts.data(), batch),
+                             std::vector<int>(batch, 1));
+    failures +=
+        verify_exact("unaligned count input", from_device<int>(dc, history.size()), history);
+    failures +=
+        verify_exact("unaligned mask input", from_device<std::uint32_t>(dm, masks.size()), masks);
+    failures += output.verify_guards("large alignment output") +
+                counts.verify_guards("large alignment counts");
+    return failures;
+}
+
+int padded_counts_contract() {
+    constexpr int batch = 17, width = 3, domain = 32, slots = 2;
+    std::vector<int> ids(width * batch, -1), lengths(batch), indices(batch, -1);
+    std::vector<int> expected(domain * slots);
+    for (int row = 0; row < batch; row += 2) {
+        lengths[row] = row % (width + 1);
+        indices[row] = (row / 2) % slots;
+        for (int t = 0; t < lengths[row]; ++t) {
+            ids[row * width + t] = (row + t) % domain;
+            ++expected[indices[row] * domain + ids[row * width + t]];
+        }
+    }
+    auto input = to_device(ids), valid = to_device(lengths), lanes = to_device(indices);
+    auto output = to_device(std::vector<int>(domain * slots));
+    Tensor x(input.span(), DType::I32, {width, batch}), n(valid.span(), DType::I32, {batch}),
+        s(lanes.span(), DType::I32, {batch}), counts(output.span(), DType::I32, {domain, slots});
+    ops::increment_token_counts_batch(x, n, s, counts, cuda_environment().default_execution);
+    cuda_synchronize();
+    return verify_exact("padded batch counts", from_device<int>(output, expected.size()), expected);
+}
+
 } // namespace
 
 namespace {
@@ -653,10 +808,18 @@ int capacity_contract() {
     int failures            = 0;
     const std::size_t at_16 = ops::sampling_workspace_capacity_bytes(257, 16, 16);
     if (ops::sampling_workspace_capacity_bytes(256, 1, 16) != 0 || at_16 == 0 ||
-        ops::sampling_workspace_capacity_bytes(257, 17, 17) != 0 ||
-        ops::sampling_workspace_capacity_bytes(257, 1, 17) != at_16) {
+        ops::sampling_workspace_capacity_bytes(257, 17, 17) <= at_16 ||
+        ops::sampling_workspace_capacity_bytes(257, 1, 17) !=
+            ops::sampling_workspace_capacity_bytes(257, 17, 17) ||
+        ops::sampling_workspace_capacity_bytes(257, 65535, 65535) !=
+            ops::sampling_workspace_capacity_bytes(257, 65536, 65536)) {
         std::cerr << "sampling workspace route boundary contract failed\n";
         ++failures;
+    }
+    for (auto [first, last] : {std::pair{1, 32}, {5, 9}, {8, 128}, {64, 128}}) {
+        const auto capacity = ops::sampling_workspace_capacity_bytes(248077, first, last);
+        for (int rows = first; rows <= last; ++rows)
+            failures += ops::sampling_workspace_capacity_bytes(248077, rows, rows) > capacity;
     }
     try {
         (void)ops::sampling_workspace_capacity_bytes(257, 0, 16);
@@ -679,4 +842,10 @@ void add_sampling_cases(ninfer::test::OpSuite& suite) {
     suite.add("sample/workspace_route_boundary", workspace_route_boundary_contract);
     suite.add("sample/increment_counts", increment_counts_contract);
     suite.add("sample/grammar_mask", grammar_mask_contract);
+    for (const auto [batch, domain] : {std::pair{9, 257}, {17, 257}, {64, 64}})
+        suite.add("sample/padded_batch" + std::to_string(batch),
+                  [=] { return padded_batch_contract(batch, domain); }, {{"suite", "concurrency"}});
+    suite.add("sample/large_alignment", large_alignment_contract,
+              {{"suite", "concurrency"}, {"execution", "graph"}});
+    suite.add("sample/padded_counts", padded_counts_contract, {{"suite", "concurrency"}});
 }

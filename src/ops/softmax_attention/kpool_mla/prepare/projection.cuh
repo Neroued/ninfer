@@ -46,20 +46,35 @@ struct ProjectionPartialOutput {
 };
 
 struct ProjectionOutput {
-    PrepareArguments args;
+    const int *valid, *record_offsets;
+    float *projected, *coefficients;
+    __nv_bfloat16* gates;
+    RawField gate_records;
     std::int64_t begin;
     ProjectionRowMap mapping;
+    int tokens, norm_dim, first_row, first_column, first_span;
+    std::uint32_t token_multiplier, token_shift;
+    bool update;
+
+    ProjectionOutput(const PrepareArguments& a, std::int64_t begin, ProjectionRowMap mapping)
+        : valid(a.valid), record_offsets(a.record_offsets), projected(a.projected),
+          coefficients(a.coefficients), gates(a.gates), gate_records(a.records[1]), begin(begin),
+          mapping(mapping), tokens(a.tokens), norm_dim(a.norm_dim), first_row(a.first_row),
+          first_column(a.first_column), first_span(a.first_span),
+          token_multiplier(a.token_multiplier), token_shift(a.token_shift), update(a.update) {}
 
     __device__ bool clear_if_empty(int first_row, int first_column, int rows, int columns) const {
-        if (__ldg(args.valid)) return false;
-        for (int b = 1; b < args.batch; ++b)
-            if (__ldg(args.valid + b)) return false;
+        int first_batch, first_token, last_batch, last_token;
+        coordinate(*this, first_column, first_batch, first_token);
+        coordinate(*this, first_column + columns - 1, last_batch, last_token);
+        for (int b = first_batch; b <= last_batch; ++b)
+            if (__ldg(valid + b) > (b == first_batch ? first_token : 0)) return false;
         const int first = max(first_row, mapping.begin[4]);
         const int count = min(first_row + rows, mapping.end[4]) - first;
         if (count <= 0) return true;
         for (int i = threadIdx.x; i < count * columns; i += blockDim.x)
-            args.coefficients[(begin + first_column + i / count) * 32 + first - mapping.begin[4] +
-                              i % count] = 0.F;
+            coefficients[(begin + first_column + i / count) * 32 + first - mapping.begin[4] +
+                         i % count] = 0.F;
         return true;
     }
 
@@ -67,24 +82,24 @@ struct ProjectionOutput {
         row          = mapping(row);
         const auto m = begin + column;
         int b, t;
-        coordinate(args, column, b, t);
-        const bool live = t < args.valid[b];
+        coordinate(*this, column, b, t);
+        const bool live = t < valid[b];
         if (row >= 2304) {
-            args.coefficients[m * 32 + row - 2304] = live ? value : 0.F;
+            coefficients[m * 32 + row - 2304] = live ? value : 0.F;
         } else if (live) {
             if (row >= 640 && row < 768) {
                 __nv_bfloat16* dst;
-                if (args.update)
-                    dst = args.gates + std::int64_t(column) * 128;
+                if (update)
+                    dst = gates + std::int64_t(column) * 128;
                 else {
-                    const auto& field = args.records[1];
+                    const auto& field = gate_records;
                     dst               = field.data + std::int64_t(b) * field.row_stride +
-                          (std::int64_t(args.record_offsets[b]) + t) * field.column_stride;
+                          (std::int64_t(record_offsets[b]) + t) * field.column_stride;
                 }
                 dst[row - 640] = __float2bfloat16_rn(value);
             } else {
-                const int feature = row < 640 ? row : row - 128;
-                args.projected[std::int64_t(column) * args.norm_dim + feature] = value;
+                const int feature                                    = row < 640 ? row : row - 128;
+                projected[std::int64_t(column) * norm_dim + feature] = value;
             }
         }
     }
@@ -93,27 +108,27 @@ struct ProjectionOutput {
         row          = mapping(row);
         const auto m = begin + column;
         int b, t;
-        coordinate(args, column, b, t);
-        const bool live = t < args.valid[b];
+        coordinate(*this, column, b, t);
+        const bool live = t < valid[b];
         if (row >= 2304) {
-            *reinterpret_cast<float4*>(args.coefficients + m * 32 + row - 2304) =
+            *reinterpret_cast<float4*>(coefficients + m * 32 + row - 2304) =
                 live ? value : make_float4(0, 0, 0, 0);
         } else if (live) {
             if (row >= 640 && row < 768) {
-                const auto& field = args.records[1];
-                auto* dst         = args.update ? args.gates + std::int64_t(column) * 128
-                                                : field.data + std::int64_t(b) * field.row_stride +
-                                              (std::int64_t(args.record_offsets[b]) + t) *
-                                                  field.column_stride;
+                const auto& field = gate_records;
+                auto* dst         = update
+                                        ? gates + std::int64_t(column) * 128
+                                        : field.data + std::int64_t(b) * field.row_stride +
+                                      (std::int64_t(record_offsets[b]) + t) * field.column_stride;
                 dst += row - 640;
                 dst[0] = __float2bfloat16_rn(value.x);
                 dst[1] = __float2bfloat16_rn(value.y);
                 dst[2] = __float2bfloat16_rn(value.z);
                 dst[3] = __float2bfloat16_rn(value.w);
             } else {
-                const int feature                   = row < 640 ? row : row - 128;
-                *reinterpret_cast<float4*>(args.projected + std::int64_t(column) * args.norm_dim +
-                                           feature) = value;
+                const int feature = row < 640 ? row : row - 128;
+                *reinterpret_cast<float4*>(projected + std::int64_t(column) * norm_dim + feature) =
+                    value;
             }
         }
     }

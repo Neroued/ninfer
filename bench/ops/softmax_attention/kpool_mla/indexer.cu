@@ -19,7 +19,7 @@ int main(int argc, char** argv) {
             if (flag == "--help") {
                 std::cout
                     << "Complete Kpool weighted Indexer + exact Top512.\n"
-                       "  --tokens N,... --batch 1..8 --end E --layers 1|11 --ragged 0|1\n"
+                       "  --tokens N,... --batch B --end E --layers 1|11 --ragged 0|1\n"
                        "  --latent-cache bf16|fp8 --index-cache bf16|fp8\n"
                        "  --inactive 0|1  zero valid columns in every physical row\n"
                        "  --active-rows 0..B  leading active request rows (default B)\n"
@@ -32,7 +32,7 @@ int main(int argc, char** argv) {
             if (flag == "--tokens")
                 tokens = measurement::integers(value);
             else if (flag == "--batch")
-                batch = measurement::integer(value, 1, 8);
+                batch = measurement::integer(value);
             else if (flag == "--end")
                 end = measurement::integer(value, 1, 1048576);
             else if (flag == "--layers") {
@@ -54,7 +54,7 @@ int main(int argc, char** argv) {
             else if (flag == "--inactive")
                 inactive = measurement::integer(value, 0, 1);
             else if (flag == "--active-rows")
-                active_rows = measurement::integer(value, 0, 8);
+                active_rows = measurement::integer(value, 0);
             else
                 throw std::invalid_argument("unknown option: " + flag);
         }

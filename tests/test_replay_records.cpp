@@ -1,4 +1,5 @@
 #include "core/gdn_replay_records.h"
+#include "core/kda_replay_records.h"
 #include "core/buffer.h"
 #include "core/linear_attention_state.h"
 
@@ -6,6 +7,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <stdexcept>
 #include <utility>
@@ -53,10 +55,48 @@ std::size_t record_bytes(const ninfer::GdnReplayRecordSpec& spec) {
     return builder.finish(256);
 }
 
+int large_record_capacity() {
+    int failures = 0;
+    for (const int capacity : {9, 64, 128}) {
+        constexpr int layers = 3, width = 4, dim = 16, heads = 2;
+        const ninfer::GdnReplayRecordSpec gdn{layers, capacity, width, 3 * dim * heads,
+                                              heads,  heads,    dim,   dim};
+        ninfer::LayoutBuilder gdn_builder;
+        const auto gdn_layout = ninfer::plan_gdn_replay_records(gdn_builder, gdn);
+        ninfer::HostBuffer gdn_memory(gdn_builder.finish(256));
+        const ninfer::GdnReplayRecords gdn_records(gdn_memory.span(), gdn_layout);
+        const ninfer::KdaReplayRecordSpec kda{layers, capacity, width, 3 * dim * heads,
+                                              heads,  heads,    dim,   dim};
+        ninfer::LayoutBuilder kda_builder;
+        const auto kda_layout = ninfer::plan_kda_replay_records(kda_builder, kda);
+        ninfer::HostBuffer kda_memory(kda_builder.finish(256));
+        const ninfer::KdaReplayRecords kda_records(kda_memory.span(), kda_layout);
+        for (const int active : {1, 8, capacity}) {
+            const auto g                 = gdn_records.layer(2, active);
+            const auto k                 = kda_records.layer(2, active);
+            const std::size_t key_offset = 2ULL * capacity * dim * heads * width * 2;
+            failures += expect_size(static_cast<const std::byte*>(g.key.data) -
+                                        static_cast<const std::byte*>(gdn_records.key.data),
+                                    key_offset, "GDN layer offset depends on active rows");
+            failures += expect_size(static_cast<const std::byte*>(k.key.data) -
+                                        static_cast<const std::byte*>(kda_records.key.data),
+                                    key_offset, "KDA layer offset depends on active rows");
+            failures += expect_shape(g.key, dim, heads, width, active, "large GDN layer");
+            failures += expect_shape(k.key, dim, heads, width, active, "large KDA layer");
+            failures += expect_shape(k.log_decay, dim, heads, width, active, "large KDA decay");
+        }
+        failures += expect_throw([&] { (void)gdn_records.layer(0, capacity + 1); },
+                                 "GDN row outside allocated capacity");
+        failures += expect_throw([&] { (void)kda_records.layer(0, capacity + 1); },
+                                 "KDA row outside allocated capacity");
+    }
+    return failures;
+}
+
 } // namespace
 
 int main() {
-    int failures = 0;
+    int failures = large_record_capacity();
 
     const ninfer::GdnReplayRecordSpec spec{
         .layers          = 3,
@@ -145,7 +185,7 @@ int main() {
         [&] {
             ninfer::LayoutBuilder invalid;
             (void)ninfer::plan_gdn_replay_records(invalid, {.layers          = 1,
-                                                            .record_capacity = 9,
+                                                            .record_capacity = 0,
                                                             .width           = 2,
                                                             .conv_channels   = 1,
                                                             .qk_heads        = 1,
@@ -153,7 +193,22 @@ int main() {
                                                             .key_dim         = 1,
                                                             .value_dim       = 1});
         },
-        "record capacity above eight");
+        "zero record capacity");
+    failures += expect_throw(
+        [&] {
+            auto overflow   = spec;
+            overflow.layers = std::numeric_limits<std::int32_t>::max();
+            ninfer::LayoutBuilder invalid;
+            (void)ninfer::plan_gdn_replay_records(invalid, overflow);
+        },
+        "GDN layer/row product overflow");
+    failures += expect_throw(
+        [&] {
+            ninfer::LayoutBuilder invalid;
+            (void)ninfer::plan_kda_replay_records(
+                invalid, {std::numeric_limits<std::int32_t>::max(), 2, 1, 3, 1, 1, 1, 1});
+        },
+        "KDA layer/row product overflow");
 
     ninfer::StateImageBuilder state_builder;
     const auto state_layout =
@@ -185,5 +240,5 @@ int main() {
     failures += expect_size(static_cast<std::size_t>(records.spec.record_capacity), 5,
                             "independent record capacity");
 
-    return failures == 0 ? 0 : fail("GDN replay record storage test failed");
+    return failures == 0 ? 0 : fail("Replay record storage test failed");
 }

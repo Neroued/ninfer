@@ -1,13 +1,9 @@
 #pragma once
 
-#include "distributed/wire.h"
+#include "distributed/transport.h"
 #include "runtime/executor/contract.h"
 
 #include <string_view>
-
-namespace ninfer::distributed {
-struct TransportLimits;
-}
 
 namespace ninfer::runtime::protocol {
 void encode(distributed::wire::Encoder&, const RankMemoryBudget&);
@@ -43,8 +39,10 @@ struct ControlBudget {
 [[nodiscard]] std::size_t work_payload_memory(const WorkPayloadCapacity&, ExecutionCapacity,
                                               std::size_t ranks, bool coordinator);
 
-void validate_control_capacity(const ControlBudget&, ExecutionCapacity,
-                               const distributed::TransportLimits&, std::size_t ranks);
+[[nodiscard]] distributed::TransportLimits control_transport_limits(const ControlBudget&,
+                                                                    ExecutionCapacity,
+                                                                    std::size_t ranks,
+                                                                    bool coordinator);
 
 struct Scope {
     std::vector<distributed::RankId> owners;

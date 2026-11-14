@@ -58,11 +58,12 @@ void test_resources_and_units() {
     const auto controls =
         parse({"ninfer-serve", "--pending-timeout", "1.25s", "model.ninfer", "--stats-interval",
                "0ms", "--media-cache-capacity", "0B", "--max-request-size", "1.5MiB",
-               "--max-concurrency", "4", "--media-preprocess-threads", "auto", "--context-capacity",
-               "auto", "--checkpoint-interval", "16384"});
+               "--max-concurrency", "128", "--media-preprocess-threads", "auto",
+               "--context-capacity", "auto", "--checkpoint-interval", "16384"});
     require(controls.launch.engine.pending_timeout_ms == 1250 &&
                 controls.launch.logging.stats_interval_ms == 0 &&
                 controls.max_request_bytes == 1572864 &&
+                controls.launch.engine.max_concurrency == 128 &&
                 controls.launch.engine.context_cache.checkpoint_interval == 16384 &&
                 controls.launch.engine.media_cache_bytes == 0 &&
                 controls.launch.engine.context_capacity.mode ==
@@ -78,7 +79,8 @@ void test_resources_and_units() {
                                                {"--pending-timeout", "0.1ms"},
                                                {"--pending-timeout", "4294967296ms"},
                                                {"--media-live-capacity", "0B"},
-                                               {"--max-concurrency", "9"},
+                                               {"--max-concurrency", "0"},
+                                               {"--max-concurrency", "4294967296"},
                                                {"--checkpoint-interval", "0"},
                                                {"--port", "65536"},
                                                {"--top-k", "21"},

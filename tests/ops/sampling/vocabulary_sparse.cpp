@@ -132,7 +132,7 @@ int run(int d, int b, int mode, int accepted, F::Pattern pattern, bool graph, in
     auto launch  = [&] {
         ops::accept_vocabulary_candidates_sparse(
             f.keys(), static_cast<const ops::SamplingConfig*>(f.config_buffer.data()), drafts,
-            f.id_view(), f.q_view(), f.extent_view(), f.position_view(), out, counts, e);
+            f.id_view(), f.q_view(), f.extent_view(), f.position_view(), out, counts, {}, e);
     };
     DecodeGraphDefinition definition;
     DecodeGraphExecutable executable;
@@ -210,7 +210,7 @@ int run(int d, int b, int mode, int accepted, F::Pattern pattern, bool graph, in
             auto t = tokens, c = n;
             ops::accept_vocabulary_candidates_sparse(
                 f.keys(), static_cast<const ops::SamplingConfig*>(f.config_buffer.data()), drafts,
-                id, q, f.extent_view(), f.position_view(), t, c, e);
+                id, q, f.extent_view(), f.position_view(), t, c, {}, e);
             ++failures;
         } catch (const std::invalid_argument&) {}
     };

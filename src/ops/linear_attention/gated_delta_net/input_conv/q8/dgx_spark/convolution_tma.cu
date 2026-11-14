@@ -94,13 +94,18 @@ struct BatchEpilogue {
             // Admission requires one complete physical block in this CTA's token
             // tile. A row has a single owner, including its initial history reads,
             // so an own-source/destination overlap remains valid.
-            const int batch            = (n0 + first) / conv.width;
-            const std::int64_t initial = conv.source_offsets[batch] / 2;
-            float s0                   = __bfloat162float(conv.state_read[initial + row]);
-            float s1  = __bfloat162float(conv.state_read[initial + Geometry::channels + row]);
-            float s2  = __bfloat162float(conv.state_read[initial + 2LL * Geometry::channels + row]);
+            const int batch = (n0 + first) / conv.width;
             int valid = conv.valid_columns == nullptr ? conv.width : conv.valid_columns[batch];
             valid     = max(0, min(valid, conv.width));
+            if (!valid) {
+                for (int token = 0; token < conv.width; ++token)
+                    *destination.at(n0 + first + token) = __float2bfloat16_rn(0.0F);
+                continue;
+            }
+            const std::int64_t initial = conv.source_offsets[batch] / 2;
+            float s0                   = __bfloat162float(conv.state_read[initial + row]);
+            float s1 = __bfloat162float(conv.state_read[initial + Geometry::channels + row]);
+            float s2 = __bfloat162float(conv.state_read[initial + 2LL * Geometry::channels + row]);
             for (int token = 0; token < conv.width; ++token) {
                 const int column = n0 + first + token;
                 if (token >= valid) {
@@ -126,8 +131,8 @@ void launch(const Tensor& x, const Weight& weight, const Tensor& conv_weight,
             const ConstStateFieldView& state, const Tensor& valid, Tensor& query, Tensor& key,
             Tensor& value, Tensor& z, Publish publish, cudaStream_t stream) {
     const int columns = x.ne[1] * x.ne[2];
-    if (weight.n != 16384 || weight.k != 2560 || x.ne[2] < 2 || x.ne[2] > 8 || x.ne[1] < 1 ||
-        x.ne[1] > 16 || columns <= 64 || columns > 128)
+    if (weight.n != 16384 || weight.k != 2560 || x.ne[2] < 2 || x.ne[1] < 1 || x.ne[1] > 16 ||
+        columns <= 64 || columns > 128)
         throw std::invalid_argument("Q8 fused batch TMA: unsupported physical block");
     const auto flat     = x.view({2560, columns});
     const auto operands = q8_linear_operands(flat, weight);

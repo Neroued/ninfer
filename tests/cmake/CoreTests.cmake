@@ -73,8 +73,8 @@ ninfer_add_test(ninfer_state_store_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_state_store.cpp"
   LIBRARIES ninfer_core)
 
-ninfer_add_test(ninfer_gdn_replay_records_test
-  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_gdn_replay_records.cpp"
+ninfer_add_test(ninfer_replay_records_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_replay_records.cpp"
   LIBRARIES ninfer_core)
 
 set_tests_properties(

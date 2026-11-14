@@ -22,8 +22,7 @@ Resources::Resources(ExecutionPlan input, DeviceContext& device, ContextCommunic
       context_(device.device(), plan.capacity.device_bytes),
       fixed_(device.device(), plan.fixed_bytes), workspace_(device.device(), plan.workspace.bytes),
       ingress_(plan.frame.host_ingress.bytes), sampling_(plan.frame.sampling_ingress.bytes),
-      egress_(plan.pinned_output_bytes),
-      context_counts_(plan.frame.token_counts ? plan.frame.token_counts->region.bytes : 0),
+      egress_(plan.pinned_output_bytes), context_counts_(plan.pinned_context_counts_bytes()),
       workspace(workspace_.span().subspan(0, plan.workspace.general_bytes)),
       states(context_.span(), plan.state), main(context_.span(), fixed_.span(), plan.main) {
     if (plan.workspace.vision) vision.emplace(device, *plan.workspace.vision);
@@ -73,19 +72,12 @@ Resources::Resources(ExecutionPlan input, DeviceContext& device, ContextCommunic
                    device.execution_view());
     }
     if (const auto& m = plan.frame.mtp) {
-        std::array<ops::SamplingConfig, kMaximumConcurrency> proposal;
-        std::array<std::int32_t, kMaximumConcurrency> columns;
+        std::vector<ops::SamplingConfig> proposal(plan.shape.max_concurrency);
         for (std::uint32_t i = 0; i < plan.shape.max_concurrency; ++i) {
             proposal[i] = {.temperature = 0, .top_k = 1, .top_p = 1};
-            columns[i]  = 1;
         }
-        // Every physical proposal row produces a vocabulary ID, including inert rows whose
-        // dense stem still reads that ID in the next recursive step.
         copy_bytes(m->proposal_sampling.region.bind(fixed_.span()),
                    {proposal.data(), m->proposal_sampling.region.bytes, Device::cpu()},
-                   device.execution_view());
-        copy_bytes(m->proposal_columns.region.bind(fixed_.span()),
-                   {columns.data(), m->proposal_columns.region.bytes, Device::cpu()},
                    device.execution_view());
     }
     const auto clear = [&](const TensorRegion& r, int value) {

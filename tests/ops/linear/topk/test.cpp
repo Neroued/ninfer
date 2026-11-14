@@ -248,13 +248,29 @@ int verify_invocation(const char* profile, std::int32_t columns, const Tensor& i
     int failures = 0;
     for (std::int32_t column = 0; column < columns; ++column) {
         for (std::int32_t rank = 0; rank < kTopK; ++rank) {
-            const std::size_t offset       = static_cast<std::size_t>(column) * kTopK + rank;
-            const std::int32_t expected_id = expected[rank].second;
+            const std::size_t offset = static_cast<std::size_t>(column) * kTopK + rank;
+            const auto candidate =
+                std::find_if(expected.begin(), expected.end(),
+                             [&](const auto& value) { return value.second == ids[offset]; });
             const double expected_score =
                 base_score[static_cast<int>(expected[rank].first) * kMaxColumns + column];
-            if (ids[offset] != expected_id) {
+            // Equal reference dots may round differently under valid reduction orders.
+            // Membership follows the reference; ordering follows the published FP32 scores.
+            if (candidate == expected.end() || candidate->first != expected[rank].first) {
                 std::cerr << profile << " U=" << columns << " column=" << column << " rank=" << rank
-                          << " id got=" << ids[offset] << " expected=" << expected_id << '\n';
+                          << " id=" << ids[offset] << " is outside the reference rank group\n";
+                ++failures;
+            }
+            const auto first = ids.begin() + static_cast<std::size_t>(column) * kTopK;
+            if (std::find(first, first + rank, ids[offset]) != first + rank) {
+                std::cerr << profile << " U=" << columns << " column=" << column
+                          << " repeated id=" << ids[offset] << '\n';
+                ++failures;
+            }
+            if (rank && (scores[offset - 1] < scores[offset] ||
+                         (scores[offset - 1] == scores[offset] && ids[offset - 1] > ids[offset]))) {
+                std::cerr << profile << " U=" << columns << " column=" << column << " rank=" << rank
+                          << " candidates are not ordered by computed score/id\n";
                 ++failures;
             }
             actual_scores[offset]    = static_cast<double>(scores[offset]);

@@ -13,8 +13,8 @@ namespace ninfer::ops {
 
 /**
  * Returns the transient capacity required by rmsnorm_dynamic_grouped_conv_prepare for every
- * width/batch pair for hidden in the inclusive intervals. Width endpoints lie in [2,16], batch
- * endpoints in [1,8]. Capacity covers every shape-selected route in the requested domain.
+ * width/batch pair for hidden in the inclusive intervals. Width endpoints lie in [2,16];
+ * batch endpoints are positive. Capacity covers every shape-selected route in the requested domain.
  */
 [[nodiscard]] std::size_t rmsnorm_dynamic_grouped_conv_prepare_workspace_capacity_bytes(
     std::int32_t hidden, std::int32_t min_width, std::int32_t max_width,
@@ -38,7 +38,7 @@ namespace ninfer::ops {
  *
  * Residual/prepared are contiguous BF16 [H,W,B], norm_weight [H], base_kernel
  * [H,2,2] with axes [channel,tap,side], and finish_delta [G,2,W,B]. The projection
- * weight is contiguous BF16 [4*G,H]. W is in [2,16], B in [1,8]; tensor and weight
+ * weight is contiguous BF16 [4*G,H]. W is in [2,16], B>=1; tensor and weight
  * bases are 16-byte aligned. Eps is positive and finite. Position zero has no previous
  * contribution; the Op never reads another request or an earlier round.
  *
@@ -58,8 +58,8 @@ void rmsnorm_dynamic_grouped_conv_prepare(const Tensor& residual, const Tensor& 
 
 /**
  * Returns the transient capacity required by linear_dynamic_grouped_conv_add for every width/batch
- * pair in the inclusive intervals. input_rows is 4096 or 17408, widths lie in [2,16], and batch
- * sizes in [1,8]. Capacity follows every shape-selected production route.
+ * pair in the inclusive intervals. input_rows is 4096 or 17408, widths lie in [2,16],
+ * and batch endpoints are positive. Capacity follows every shape-selected production route.
  */
 [[nodiscard]] std::size_t linear_dynamic_grouped_conv_add_workspace_capacity_bytes(
     std::int32_t input_rows, std::int32_t min_width, std::int32_t max_width,
@@ -78,7 +78,7 @@ void rmsnorm_dynamic_grouped_conv_prepare(const Tensor& residual, const Tensor& 
  *
  * Contiguous BF16 x [C,W,B], base_kernel [H,2,2] with axes [channel,tap,side],
  * finish_delta [G,2,W,B], and residual [H,W,B]. The projection weight is Q8_G32_FP16
- * RowSplit [H,C] without padding. W is in [2,16], B in [1,8]; tensor and weight-plane
+ * RowSplit [H,C] without padding. W is in [2,16], B>=1; tensor and weight-plane
  * bases are 16-byte aligned. Position zero has no previous contribution; the Op never
  * reads another request or an earlier round.
  *
@@ -103,7 +103,7 @@ void linear_dynamic_grouped_conv_add(const Tensor& x, const Weight& projection_w
  *
  * x [C,W,B], partial [H,W,B], base [H,2,2] and delta [H/16,2,W,B] are contiguous,
  * 16-byte-aligned BF16. Projection uses native contiguous BF16 [H,C] and A16 computation.
- * W is in [2,16], B in [1,8]. Position zero has no previous contribution. All input,
+ * W is in [2,16], B>=1. Position zero has no previous contribution. All input,
  * weight and output storage is pairwise disjoint. Inputs are preserved; every partial
  * element is written. z has no observable cast boundary. The Op needs no caller workspace,
  * allocates or retains no device storage, and supports Graph replay.

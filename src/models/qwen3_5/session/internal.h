@@ -11,6 +11,7 @@
 
 #include <array>
 #include <deque>
+#include <unordered_map>
 #include <memory>
 #include <optional>
 #include <span>
@@ -116,6 +117,7 @@ struct SequenceState {
     qwen::PrefixShortlistDigests prefix_digests;
     SequenceHandle id;
     runtime::ResidencyId residency;
+    bool computing = false;
 
     [[nodiscard]] context::StateId write_state() const noexcept {
         return pending_write.valid() ? pending_write : continuation.image;
@@ -316,6 +318,7 @@ struct PendingContext {
 class SessionImpl {
 public:
     SessionImpl(std::shared_ptr<const ModelDefinition>, SessionPlan);
+    std::uint64_t next_lane_mark();
     ~SessionImpl();
     [[nodiscard]] RequestBasePlan plan_request(qwen::PreparedPromptData&& prompt,
                                                const runtime::ResolvedExecutionOptions& options);
@@ -402,7 +405,7 @@ public:
     [[nodiscard]] std::optional<runtime::ExecutionTicket> start_replay(SequenceHandle);
     [[nodiscard]] std::optional<runtime::ExecutionTicket>
     start_decode(std::span<const SequenceHandle>, std::span<const runtime::RoundBudget>,
-                 std::span<const bool> constrained = {});
+                 std::span<const std::uint8_t> constrained = {});
     [[nodiscard]] std::optional<runtime::ExecutionTicket>
     start_control(std::span<const SequenceHandle>, std::span<const TokenId>, std::uint32_t stride);
     [[nodiscard]] std::optional<runtime::ExecutionTicket> start_score(qwen::PreparedPromptData&&,
@@ -441,10 +444,13 @@ public:
     const ContextCacheOptions context_cache;
     const bool vision_enabled;
     const bool causal_scoring;
-    std::array<SequenceState, kMaximumConcurrency> sequences;
-    std::array<RequestControl, kMaximumConcurrency> requests;
-    std::array<std::uint64_t, kMaximumConcurrency> lane_epochs{};
-    std::uint64_t next_sequence = 1;
+    std::vector<SequenceState> sequences;
+    std::vector<RequestControl> requests;
+    std::vector<std::uint64_t> lane_epochs;
+    std::vector<std::uint64_t> lane_marks;
+    std::unordered_map<std::uint64_t, std::uint32_t> resident_sequences;
+    std::uint64_t lane_mark_generation = 0;
+    std::uint64_t next_sequence        = 1;
     context::RecoveryMetadata recovery_metadata;
     mutable context::RecoveryIndex<> recovery_index{directory.metadata_budget(),
                                                     &recovery_metadata};

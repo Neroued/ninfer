@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ninfer/ops/moe.h"
+#include "ops/moe/kernels/cuda/launch.h"
 
 namespace ninfer::ops::detail {
 
@@ -10,6 +11,7 @@ namespace ninfer::ops::detail {
 struct RoutedSwiGLUContribution {
     const float* values;
     const int* valid_tokens;
+    moe_cuda::TokenValidity token_validity;
 };
 
 namespace moe_routed {

@@ -85,7 +85,7 @@ are not opened.
 | `engine.memory_headroom` | `--memory-headroom` | Nonnegative bytes / `512MiB` | Per-rank startup planning allowance; `0B` adds no headroom |
 | `engine.prefill_chunk` | `--prefill-chunk` | Positive multiple of 128 or `default` | Qwen4Exp, GLM5Next and CPU expert offload default to 4096; other paths to 1024; bounded by max context |
 | `engine.cuda_graph` | `--cuda-graph` / `--no-cuda-graph` | bool / true | CUDA Graph decode; prefill and Vision encoding remain eager |
-| `engine.max_concurrency` | `--max-concurrency` | 1..8 / 1 | Maximum active request lanes, across the deployment |
+| `engine.max_concurrency` | `--max-concurrency` | positive integer / 1 | Maximum resident request lanes across the deployment; startup checks the required resources |
 | `engine.max_pending_requests` | `--max-pending-requests` | Positive uint32 / 16 | Additional waiting requests |
 | `engine.pending_timeout` | `--pending-timeout` | Positive duration / `30s` | Deadline before execution; not a generation time limit |
 

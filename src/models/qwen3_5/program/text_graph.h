@@ -26,11 +26,11 @@ public:
     TextGraph& operator=(const TextGraph&) = delete;
 
     void prepare(TextRun&, const Parameters&, moe::Schedule*, std::span<const GraphProfile>,
-                 std::uint32_t width, const std::function<void()>& prologue,
-                 const std::function<void()>& epilogue, MemoryArena&, DeviceContext&,
-                 GraphPreparation&);
+                 std::uint32_t width, moe::TokenGeometry geometry,
+                 const std::function<void()>& prologue, const std::function<void()>& epilogue,
+                 MemoryArena&, DeviceContext&, GraphPreparation&);
     void select(std::uint32_t frontier);
-    [[nodiscard]] bool start(CudaExecutionView);
+    [[nodiscard]] bool start(CudaExecutionView, std::uint32_t active_tokens);
     [[nodiscard]] bool poll();
     void cancel();
     [[nodiscard]] std::size_t workspace_peak() const noexcept;

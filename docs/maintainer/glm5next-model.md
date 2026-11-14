@@ -105,10 +105,11 @@ hidden。Stem 拼接归一化 embedding 与 conditioning，ordinal 0 的 embeddi
 最终采用先复用合法首步，再按真实 Main conditioning 补齐 canonical history；递归 hidden
 不能仅因 proposal 被接受就当成真实 Main hidden。
 
-Decode 主体按全局容量 G 和各 rank 共同的本地 attention 容量 C 组织，owner 分布通过设备行映射
+Decode 主体按全局物理桶 P 和各 rank 共同的本地 Attention 桶 L 组织，owner 分布通过设备行映射
 进入，不枚举 owner 向量。采样参数、实际 draft/accepted 长度是输入数据；Indexer/MLA 局部 child
 随上下文更新，外层通信保持固定。Decision 与最终 commit 依赖独立，Prefill/Replay 使用 eager。
-共享原则见[Speculative 执行](speculative-decoding.md)与[分布式执行](distributed-execution.md)。
+批次与 padding 合同见[并发执行](../designs/concurrency-contract.md)，其他共享原则见
+[Speculative 执行](speculative-decoding.md)与[分布式执行](distributed-execution.md)。
 
 ## Vision 与 Frontend
 

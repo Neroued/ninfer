@@ -195,9 +195,10 @@ void EngineCore<Instance>::resolve_context_progress(
         owner->speculative_stats = std::move(progress.request_speculative);
     }
     if (materializing_) {
-        const auto control  = std::move(*materializing_);
-        const auto& request = control.request;
+        const auto request  = materializing_->request;
+        const auto& control = *materializing_;
         if (!progress.published) {
+            (void)retain_completion(request);
             materializing_.reset();
             complete_cancelled(request);
             request_admission_check();
@@ -225,9 +226,9 @@ void EngineCore<Instance>::resolve_context_progress(
         if (!request->sequence) {
             throw std::logic_error("binding completed without a native sequence");
         }
-        request->placement = instance_.session->placement(*request->sequence);
-        request->placement_tokens =
-            std::max(request->placement_tokens, instance_.session->load_tokens(*request->sequence));
+        set_placement_load(*request, instance_.session->placement(*request->sequence),
+                           std::max(request->placement_tokens,
+                                    instance_.session->load_tokens(*request->sequence)));
         request->model_state = progress.recovery.route == GenerationRecoveryRoute::Replay
                                    ? EngineRequestState::Replay
                                : control.resumed ? request->resume_phase
@@ -261,7 +262,7 @@ void EngineCore<Instance>::resolve_context_progress(
             // Generation start was published when the first binding obtained its resources.
         }
         finish_engine_phase(boundary, EngineHostPhase::Boundary);
-        slots_[control.destination.value] = request;
+        set_resident(control.destination.value, request);
         materializing_.reset();
         boundary = begin_host_phase();
     } else if (context_owner_) {
@@ -275,16 +276,15 @@ void EngineCore<Instance>::resolve_context_progress(
                 boundary = begin_host_phase();
                 return;
             }
-            request->placement.reset();
-            request->placement_tokens = 0;
-            request->suspended        = std::move(progress.paused);
-            request->model_state      = EngineRequestState::Paused;
+            set_placement_load(*request, {}, 0);
+            request->suspended   = std::move(progress.paused);
+            request->model_state = EngineRequestState::Paused;
             observe_scheduling(request, GenerationSchedulingTransition::Paused);
             paused_.push_back(request);
             std::sort(paused_.begin(), paused_.end(),
                       [](const auto& a, const auto& b) { return a->id < b->id; });
             finish_engine_phase(boundary, EngineHostPhase::Boundary);
-            slots_[lane].reset();
+            set_resident(lane, {});
             request->lane.reset();
             request->residency.reset();
             request->sequence.reset();
@@ -374,11 +374,8 @@ ReclaimProgress EngineCore<Instance>::reclaim(const ContextAssessment& assessmen
 template <class Instance>
 bool EngineCore<Instance>::pause_reclaim_victim(
     const ContextAssessment& pressure, typename ResourceManagement::ReclaimCursor* cursor) {
-    std::vector<std::uint32_t> skipped;
-    while (const auto victim = scheduler_.preemption_victim(slots_, max_concurrency_, skipped)) {
-        if (pause_resident(*victim, PauseGoal::ReleaseCapacity, &pressure, cursor)) { return true; }
-        skipped.push_back(*victim);
-    }
+    for (const auto victim : scheduler_.preemption_candidates(slots_))
+        if (pause_resident(victim, PauseGoal::ReleaseCapacity, &pressure, cursor)) return true;
     return false;
 }
 
@@ -526,27 +523,10 @@ void EngineCore<Instance>::order_binding_sources(
     if (placements.size() <= 1) { return; }
     std::vector<PlacementLoad> loads;
     std::vector<PlacementCandidate> targets;
-    for (const auto placement : placements) {
-        loads.push_back({placement});
-        targets.push_back({placement});
-    }
-    const auto account = [&](const std::shared_ptr<Request>& active) {
-        if (!active || !active->placement) { return; }
-        auto found = std::find_if(loads.begin(), loads.end(), [&](const auto& load) {
-            return load.placement == *active->placement;
-        });
-        if (found == loads.end()) {
-            loads.push_back({*active->placement});
-            found = std::prev(loads.end());
-        }
-        if (active->placement_tokens > UINT64_MAX - found->tokens) {
-            throw std::overflow_error("placement token load overflow");
-        }
-        found->tokens += active->placement_tokens;
-        ++found->requests;
-    };
-    for (const auto& active : slots_) { account(active); }
-    if (materializing_) { account(materializing_->request); }
+    for (const auto placement : placements)
+        placement_loads_.try_emplace(placement.value, PlacementLoad{placement});
+    for (const auto& [id, load] : placement_loads_) loads.push_back(load);
+    for (const auto placement : placements) targets.push_back({placement});
     const auto* resume = request->suspended ? &*request->suspended : nullptr;
     const auto kind    = request->resume_phase == EngineRequestState::Prefill ? UnitKind::Prefill
                          : request->resume_phase == EngineRequestState::ControlReady
@@ -608,6 +588,27 @@ void EngineCore<Instance>::order_binding_sources(
 }
 
 template <class Instance>
+void EngineCore<Instance>::set_placement_load(Request& request,
+                                              std::optional<PlacementId> placement,
+                                              std::uint64_t tokens) {
+    if (placement) placement_loads_.try_emplace(placement->value, PlacementLoad{*placement});
+    if (request.placement) {
+        auto& previous = placement_loads_.at(request.placement->value);
+        previous.tokens -= request.placement_tokens;
+        --previous.requests;
+    }
+    request.placement        = placement;
+    request.placement_tokens = tokens;
+    if (placement) {
+        auto& load = placement_loads_.at(placement->value);
+        if (tokens > UINT64_MAX - load.tokens)
+            throw std::overflow_error("placement token load overflow");
+        load.tokens += tokens;
+        ++load.requests;
+    }
+}
+
+template <class Instance>
 bool EngineCore<Instance>::try_admit_one(bool restoring) {
     if (instance_.session->has_context_operation()) { return false; }
     const auto lane      = free_lane();
@@ -617,8 +618,8 @@ bool EngineCore<Instance>::try_admit_one(bool restoring) {
                                      : paused_.end();
     if (restoring && suspended == paused_.end()) return false;
     if (!lane && restoring) {
-        if (const auto victim = scheduler_.preemption_victim(slots_, max_concurrency_))
-            return pause_resident(*victim);
+        const auto victims = scheduler_.preemption_candidates(slots_);
+        if (!victims.empty()) return pause_resident(victims.front());
         return false;
     }
     if (admission_decision_ && (admission_decision_->restoring != restoring ||
@@ -650,6 +651,7 @@ bool EngineCore<Instance>::try_admit_one(bool restoring) {
                 // request rejection therefore ends only this pending request.
                 if (restoring) throw;
                 const auto error = std::current_exception();
+                (void)retain_completion(request);
                 {
                     std::lock_guard lock(queue_mutex_);
                     std::erase(pending_, request);
@@ -684,9 +686,7 @@ bool EngineCore<Instance>::try_admit_one(bool restoring) {
                     request->admission.fallback_reason = AdmissionFallbackReason::CostChanged;
                 }
             }
-            admission_decision_.emplace(AdmissionDecision{
-                request, restoring, std::move(sources), 0,
-                resources_.begin_reclaim(*instance_.session, std::nullopt, rights)});
+            admission_decision_.emplace(AdmissionDecision{request, restoring, std::move(sources)});
         }
         auto& decision = *admission_decision_;
         ContextAssessment assessment;
@@ -750,7 +750,10 @@ bool EngineCore<Instance>::try_admit_one(bool restoring) {
                 const auto excluded         = protected_source
                                                   ? std::span<const Checkpoint>(&*protected_source, 1)
                                                   : std::span<const Checkpoint>{};
-                const auto reclaimed = reclaim(assessment, restoring, excluded, &decision.reclaim);
+                if (!decision.reclaim)
+                    decision.reclaim.emplace(
+                        resources_.begin_reclaim(*instance_.session, std::nullopt, rights));
+                const auto reclaimed = reclaim(assessment, restoring, excluded, &*decision.reclaim);
                 if (reclaimed == ReclaimProgress::Transferring) return true;
                 if (reclaimed == ReclaimProgress::Deferred) {
                     if (!waiting_choice) { waiting_choice = choice; }
@@ -801,10 +804,10 @@ bool EngineCore<Instance>::try_admit_one(bool restoring) {
                     continue;
                 }
             }
-            request->placement = choice.source.placement;
-            request->placement_tokens =
+            set_placement_load(
+                *request, choice.source.placement,
                 std::max<std::uint64_t>(request->base_plan->summary().prompt_tokens,
-                                        restoring ? request->suspended->frontier() : 0);
+                                        restoring ? request->suspended->frontier() : 0));
             next_placement_tie_.value = choice.source.placement.value + 1;
             resources_.binding_started(request->id, reservation.retired_points,
                                        reservation.consumed_source);
@@ -919,8 +922,8 @@ EngineCore<Instance>::execution_unit(const Request& request) const {
 }
 
 template <class Instance>
-std::optional<std::uint32_t> EngineCore<Instance>::next_prefill(
-    const std::array<std::shared_ptr<Request>, kMaximumConcurrency>& candidates) const {
+std::optional<std::uint32_t>
+EngineCore<Instance>::next_prefill(std::span<const std::shared_ptr<Request>> candidates) const {
     const auto preferred = instance_.session->prefill_continuation();
     if (preferred)
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
@@ -985,7 +988,7 @@ EngineCore<Instance>::reserve_resident_unit(std::uint32_t lane) {
 
 template <class Instance>
 void EngineCore<Instance>::reserve_resident_units(ReservationScope scope) {
-    reserved_units_.fill(std::nullopt);
+    std::fill(reserved_units_.begin(), reserved_units_.end(), std::nullopt);
     const auto owner = scheduler_.progress_owner();
     std::optional<std::uint32_t> priority;
     for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
@@ -1004,7 +1007,8 @@ void EngineCore<Instance>::reserve_resident_units(ReservationScope scope) {
             instance_.session->yield_prefill(*continuation);
     }
     const auto prefill = priority_prefill ? priority_prefill : next_prefill(slots_);
-    std::vector<std::uint32_t> candidates;
+    auto& candidates   = reservation_candidates_;
+    candidates.clear();
     for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
         const auto& request = slots_[lane];
         if (!request) continue;
@@ -1018,14 +1022,7 @@ void EngineCore<Instance>::reserve_resident_units(ReservationScope scope) {
         return slots_[a]->id < slots_[b]->id;
     });
     const auto primary_count = candidates.size();
-    if (prefill) {
-        auto remaining = slots_;
-        remaining[*prefill].reset();
-        while (const auto fallback = scheduler_.next_prefill(remaining, max_concurrency_)) {
-            candidates.push_back(*fallback);
-            remaining[*fallback].reset();
-        }
-    }
+    if (prefill) scheduler_.append_prefill_candidates(slots_, candidates, *prefill);
     // Necessary Control/Decode capacity precedes optional capture reservations.
     for (std::size_t i = 0; i < primary_count; ++i) {
         const auto lane   = candidates[i];
@@ -1068,7 +1065,8 @@ template <class Instance>
 
 template <class Instance>
 void EngineCore<Instance>::begin_cycle(HostPhaseMeasurement& boundary) {
-    control_executed_.fill(false);
+    std::fill(control_executed_.begin(), control_executed_.end(), 0);
+    CompletionScope completions(*this);
     (void)expire_pending_requests();
     if (!instance_.session->has_context_operation()) {
         for (const auto& request : slots_) {
@@ -1081,16 +1079,22 @@ void EngineCore<Instance>::begin_cycle(HostPhaseMeasurement& boundary) {
     }
     (void)settle_terminal_requests(boundary);
     cancel_active_requests(snapshot_cancellations(), boundary);
-    for (auto it = paused_.begin();
-         !instance_.session->has_context_operation() && it != paused_.end();) {
-        const auto request = *it;
-        if (!request->cancelled.load(std::memory_order_acquire)) {
-            ++it;
-            continue;
-        }
-        request->suspended.reset();
-        it = paused_.erase(it);
-        complete_cancelled(request);
+    if (!instance_.session->has_context_operation()) {
+        std::vector<std::shared_ptr<Request>> cancelled;
+        std::erase_if(paused_, [&](const auto& request) {
+            if (!request->cancelled.load(std::memory_order_acquire)) return false;
+            (void)retain_completion(request);
+            cancelled.push_back(request);
+            return true;
+        });
+        for (const auto& request : cancelled) complete_cancelled(request);
+    }
+    if (!pending_completions_.empty()) {
+        finish_engine_phase(boundary, EngineHostPhase::Boundary);
+        completions.publish();
+        boundary = begin_host_phase();
+    } else {
+        completions.publish();
     }
     const bool recovering = std::any_of(slots_.begin(), slots_.end(),
                                         [](const auto& r) { return r && r->recovery_pending; }) ||
@@ -1134,16 +1138,9 @@ template <class Instance>
     while (!compute_ && cycle_step_ != CycleStep::Boundary) {
         switch (cycle_step_) {
         case CycleStep::Control: {
-            auto all = scheduler_.build_control_membership(slots_, max_concurrency_);
-            ControlMembership selected;
-            selected.row_stride = all.row_stride;
-            for (std::size_t row = 0; row < all.size; ++row) {
-                if (!unit_runnable(all.lanes[row])) continue;
-                selected.lanes[selected.size]       = all.lanes[row];
-                selected.sequences[selected.size++] = all.sequences[row];
-                const auto begin                    = all.tokens.begin() + row * all.row_stride;
-                selected.tokens.insert(selected.tokens.end(), begin, begin + all.row_stride);
-            }
+            auto& selected = control_membership_;
+            scheduler_.build_control_membership(
+                slots_, [&](std::uint32_t lane) { return unit_runnable(lane); }, selected);
             if (!selected.empty()) {
                 set_host_work_class(HostWorkClass::Control);
                 if (!start_control(selected)) return submitted;
@@ -1153,14 +1150,11 @@ template <class Instance>
             break;
         }
         case CycleStep::Decode: {
-            const auto all = scheduler_.build_round_membership(slots_, max_concurrency_);
-            RoundMembership selected;
-            for (std::size_t row = 0; row < all.size; ++row) {
-                if (!unit_runnable(all.lanes[row]) || control_executed_[all.lanes[row]]) continue;
-                selected.lanes[selected.size]     = all.lanes[row];
-                selected.sequences[selected.size] = all.sequences[row];
-                selected.budgets[selected.size++] = all.budgets[row];
-            }
+            auto& selected = round_membership_;
+            scheduler_.build_round_membership(
+                slots_,
+                [&](std::uint32_t lane) { return unit_runnable(lane) && !control_executed_[lane]; },
+                selected);
             if (!selected.empty()) {
                 set_host_work_class(HostWorkClass::Decode, selected.lane_span());
                 if (!start_decode(selected)) return submitted;
@@ -1176,11 +1170,14 @@ template <class Instance>
                 finish_engine_phase(boundary, EngineHostPhase::Boundary);
             }
             reserve_resident_units(ReservationScope::Prefill);
-            auto eligible = slots_;
+            auto& eligible = candidate_slots_;
+            eligible       = slots_;
             for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
                 if (!unit_runnable(lane)) eligible[lane].reset();
             }
-            if (const auto lane = next_prefill(eligible)) {
+            const auto lane = next_prefill(eligible);
+            eligible.clear();
+            if (lane) {
                 set_host_work_class(HostWorkClass::Prefill);
                 if (!start_prefill(*lane)) return submitted;
                 submitted = true;
@@ -1294,17 +1291,17 @@ void EngineCore<Instance>::worker_loop() noexcept {
             }
             outstanding = execution_outstanding();
             if (!outstanding) progressed |= process_measurement();
+            if (outstanding) {
+                const auto exposed = active_exposure_set();
+                const auto started = Clock::now();
+                std::this_thread::yield();
+                record_coordinator_call(CoordinatorCall::Yield, elapsed_ns(started, Clock::now()),
+                                        *exposed);
+            }
         } catch (...) {
             log_worker_failure(std::current_exception());
             fail_all(std::current_exception());
             return;
-        }
-        if (outstanding) {
-            const auto exposed = active_exposure_set();
-            const auto started = Clock::now();
-            std::this_thread::yield();
-            record_coordinator_call(CoordinatorCall::Yield, elapsed_ns(started, Clock::now()),
-                                    exposed);
         }
         if (!outstanding && !progressed) {
             std::unique_lock lock(queue_mutex_);

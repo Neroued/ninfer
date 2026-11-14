@@ -7,9 +7,9 @@
 namespace ninfer {
 namespace {
 int outer_extent(const KdaReplayRecordSpec& s) {
-    if (s.layers <= 0 || s.record_capacity <= 0 || s.record_capacity > 8 || s.width <= 0 ||
-        s.conv_channels <= 0 || s.qk_heads <= 0 || s.value_heads < s.qk_heads ||
-        s.value_heads % s.qk_heads || s.key_dim <= 0 || s.value_dim <= 0)
+    if (s.layers <= 0 || s.record_capacity <= 0 || s.width <= 0 || s.conv_channels <= 0 ||
+        s.qk_heads <= 0 || s.value_heads < s.qk_heads || s.value_heads % s.qk_heads ||
+        s.key_dim <= 0 || s.value_dim <= 0)
         throw std::invalid_argument("KDA replay: invalid record geometry");
     if (s.layers > std::numeric_limits<int>::max() / s.record_capacity)
         throw std::overflow_error("KDA replay: layer/row extent exceeds int32");

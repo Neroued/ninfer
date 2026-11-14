@@ -15,11 +15,12 @@ struct alignas(Words * sizeof(unsigned)) NormVector {
 // Implements: include/ninfer/ops/rmsnorm.h. Match: RTX 5090, aligned D=20480 rows.
 // A whole row remains in packed BF16 registers across the FP32 reduction. The vector width
 // is an alignment requirement owned by the selector, not a restriction on the public Op.
-template <Epilogue Kind, int D, int Block, int Words>
+template <Epilogue Kind, int D, int Block, int Words, bool SaveInverse = false>
 __launch_bounds__(Block) __global__
     void rmsnorm_vector_cta_kernel(const __nv_bfloat16* __restrict__ x,
                                    const __nv_bfloat16* __restrict__ weight,
-                                   __nv_bfloat16* __restrict__ out, float eps) {
+                                   __nv_bfloat16* __restrict__ out, float eps,
+                                   float* inverse_output) {
     static_assert(!is_gated<Kind>);
     static_assert(Words == 2 || Words == 4);
     static_assert(D % (Block * Words * 2) == 0);
@@ -50,6 +51,9 @@ __launch_bounds__(Block) __global__
     if (threadIdx.x == 0) inverse = rsqrtf(reduced * (1.F / static_cast<float>(D)) + eps);
     __syncthreads();
     const float inv = inverse;
+    if constexpr (SaveInverse) {
+        if (threadIdx.x == 0) inverse_output[blockIdx.x] = inv;
+    }
 #pragma unroll
     for (int k = 0; k < Groups; ++k) {
         const int feature = (k * Block + threadIdx.x) * Words * 2;

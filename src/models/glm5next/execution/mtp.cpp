@@ -80,7 +80,8 @@ void MtpRun::finish_attention() {
 void MtpRun::ffn() {
     const auto& m = parameters_.mtp->moe;
     ops::topk_sigmoid_swiglu_moe(roots_.input, parameters_.profile->mtp->moe.math, m.weights,
-                                 m.subset, roots_.output, execution_.workspace, cuda_);
+                                 m.subset, roots_.output, {batch_.valid_columns, batch_.tokens},
+                                 execution_.workspace, cuda_);
 }
 
 void MtpRun::finish(Tensor& hidden) {

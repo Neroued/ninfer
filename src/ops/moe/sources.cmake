@@ -11,13 +11,13 @@ target_sources(ninfer_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/topk_softmax_route/entry.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/topk_softmax_swiglu_moe/dispatch.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/topk_softmax_swiglu_moe/entry.cpp"
-  "${CMAKE_CURRENT_LIST_DIR}/topk_softmax_swiglu_moe/q4_q5/shapes/h2048_i512_e256_k8/dispatch.cpp"
-  "${CMAKE_CURRENT_LIST_DIR}/topk_softmax_swiglu_moe/q4_q6/shapes/h2048_i512_e256_k8/dispatch.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/topk_softmax_swiglu_moe/q4_q5/${NINFER_TARGET}/shapes/h2048_i512_e256_k8/dispatch.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/topk_softmax_swiglu_moe/q4_q6/${NINFER_TARGET}/shapes/h2048_i512_e256_k8/dispatch.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/topk_softmax_swiglu_moe/q8_q8/shapes/h2048_i512_e256_k8/dispatch.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/routed_swiglu/cuda/dispatch.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/routed_swiglu/cuda/entry.cpp"
-  "${CMAKE_CURRENT_LIST_DIR}/routed_swiglu/cuda/q4_q5/shapes/h2048_i512_e256_k8/dispatch.cpp"
-  "${CMAKE_CURRENT_LIST_DIR}/routed_swiglu/cuda/q4_q6/shapes/h2048_i512_e256_k8/dispatch.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/routed_swiglu/cuda/q4_q5/${NINFER_TARGET}/shapes/h2048_i512_e256_k8/dispatch.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/routed_swiglu/cuda/q4_q6/${NINFER_TARGET}/shapes/h2048_i512_e256_k8/dispatch.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/routed_swiglu/cuda/q8_q8/shapes/h2048_i512_e256_k8/dispatch.cpp"
 )
 include("${CMAKE_CURRENT_LIST_DIR}/routed_swiglu/cpu/sources.cmake")

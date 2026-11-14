@@ -316,7 +316,7 @@ void propose_dflash2_batch(DraftExecutionView& execution, const DraftInputs& inp
             projected.view({dimension(config.dflash2->selector_rank), k, batch}), anchors,
             weights.selector->predecessor_codebook, weights.selector->successor_codebook,
             dimension(execution.parameters.profile->public_tokens), frontiers, inputs.sampling,
-            drafts, proposal_q, work, cuda);
+            drafts, proposal_q, inputs.live_rows, work, cuda);
         work.reset();
     }
 }
@@ -519,8 +519,8 @@ void draft_propose(DraftExecutionView execution, const DraftInputs& inputs, Draf
                    DraftEnvelopes envelopes) {
     if (!execution.parameters.draft) throw std::logic_error("draft parameters are unavailable");
     const auto width = outputs.ids.ne[0], batch = outputs.ids.ne[1];
-    if (width < 2 || width > 16 || batch < 1 || batch > static_cast<int>(kMaximumConcurrency) ||
-        outputs.drafts.ne[0] != width - 1 || outputs.drafts.ne[1] != batch) {
+    if (width < 2 || width > 16 || batch < 1 || outputs.drafts.ne[0] != width - 1 ||
+        outputs.drafts.ne[1] != batch) {
         throw std::invalid_argument("draft proposal has invalid geometry");
     }
     propose_batch_impl(execution, inputs, outputs, batch, width - 1, envelopes);

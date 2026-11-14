@@ -63,7 +63,7 @@ Options parse_options(int argc, char** argv) {
                 next("flush MiB"), 1, std::numeric_limits<std::size_t>::max() >> 20);
             options.flush_bytes = mib << 20;
         } else if (!std::strcmp(argv[index], "--help") || !std::strcmp(argv[index], "-h")) {
-            std::printf("usage: %s [--steps 1..15] [--batch 1..8] [--warmup N] [--repeat N] "
+            std::printf("usage: %s [--steps 1..15] [--batch N] [--warmup N] [--repeat N] "
                         "[--flush-mib N]\n",
                         argv[0]);
             std::exit(0);
@@ -72,9 +72,8 @@ Options parse_options(int argc, char** argv) {
         }
     }
     if (options.steps < 0 || options.steps > 15) throw std::invalid_argument("invalid steps");
-    if (options.batch_size < 0 || options.batch_size > 8) {
-        throw std::invalid_argument("batch must be in [1,8]");
-    }
+    if (options.batch_size < 0 || std::int64_t(options.batch_size) * kMaxSteps > INT32_MAX)
+        throw std::invalid_argument("batch extent is not representable");
     if (options.warmup < 0 || options.repeat <= 0) {
         throw std::invalid_argument("warmup must be nonnegative and repeat positive");
     }
@@ -88,17 +87,16 @@ const char* mode_name(Mode mode) {
 }
 
 struct Fixture {
-    int kSteps;
-    std::array<std::int32_t, kCandidates * kMaxSteps * 8> host_candidates{};
-    std::array<float, kCandidates * kMaxSteps * 8> host_unary{};
-    std::array<std::int32_t, 8> host_anchors{};
-    std::array<std::int32_t, 8> host_positions{};
+    int kSteps, capacity;
+    std::vector<std::int32_t> host_candidates;
+    std::vector<float> host_unary;
+    std::vector<std::int32_t> host_anchors, host_positions;
     DeviceBuffer candidate_ids{ninfer::bench::device_context().device(),
                                host_candidates.size() * sizeof(std::int32_t)};
     DeviceBuffer unary_scores{ninfer::bench::device_context().device(),
                               host_unary.size() * sizeof(float)};
     DeviceBuffer projected_hidden =
-        make_bf16(static_cast<std::size_t>(kRank) * kMaxSteps * 8, 101U);
+        make_bf16(static_cast<std::size_t>(kRank) * kMaxSteps * capacity, 101U);
     DeviceBuffer anchors{ninfer::bench::device_context().device(),
                          host_anchors.size() * sizeof(std::int32_t)};
     DeviceBuffer predecessor_codebook{ninfer::bench::device_context().device(),
@@ -109,16 +107,23 @@ struct Fixture {
                                         sizeof(std::uint16_t)};
     DeviceBuffer base_positions{ninfer::bench::device_context().device(),
                                 host_positions.size() * sizeof(std::int32_t)};
-    DeviceBuffer configs{ninfer::bench::device_context().device(), 8 * sizeof(ops::SamplingConfig)};
+    DeviceBuffer configs{ninfer::bench::device_context().device(),
+                         capacity * sizeof(ops::SamplingConfig)};
     DeviceBuffer drafts{ninfer::bench::device_context().device(),
-                        static_cast<std::size_t>(kMaxSteps) * 8 * sizeof(std::int32_t)};
+                        static_cast<std::size_t>(kMaxSteps) * capacity * sizeof(std::int32_t)};
     DeviceBuffer proposal_q{ninfer::bench::device_context().device(),
-                            static_cast<std::size_t>(kCandidates) * kMaxSteps * 8 * sizeof(float)};
+                            static_cast<std::size_t>(kCandidates) * kMaxSteps* capacity *
+                                sizeof(float)};
 
-    explicit Fixture(int steps) : kSteps(steps) {
-        for (std::int32_t batch = 0; batch < 8; ++batch) {
-            host_anchors[static_cast<std::size_t>(batch)]   = 220000 + batch * 131;
-            host_positions[static_cast<std::size_t>(batch)] = 4096 + batch * 97;
+    Fixture(int steps, int rows)
+        : kSteps(steps), capacity(rows),
+          host_candidates(std::size_t(kCandidates) * kMaxSteps * rows),
+          host_unary(host_candidates.size()), host_anchors(rows), host_positions(rows) {
+        for (std::int32_t batch = 0; batch < capacity; ++batch) {
+            host_anchors[static_cast<std::size_t>(batch)] =
+                (220000ULL + std::uint64_t(batch) * 131) % kTokenDomain;
+            host_positions[static_cast<std::size_t>(batch)] =
+                (4096ULL + std::uint64_t(batch) * 97) % 1048576;
             for (std::int32_t step = 0; step < kSteps; ++step) {
                 for (std::int32_t candidate = 0; candidate < kCandidates; ++candidate) {
                     const std::size_t offset =
@@ -189,7 +194,8 @@ void run(std::int32_t batch_size, Mode mode, const Options& options, Fixture& fi
     TimedGraph graph;
     graph.capture(cuda, [&](CudaExecutionView cuda) {
         ops::candidate_selector_path(ids, unary, hidden, anchor, predecessor, successor,
-                                     kTokenDomain, positions, configs, draft, q, workspace, cuda);
+                                     kTokenDomain, positions, configs, draft, q, {}, workspace,
+                                     cuda);
     });
     const auto timing = measure_cold_graph(graph, flush, cuda, options.warmup, options.repeat);
     std::printf("%d,%d,%s,%.3f,%.3f,%.3f,%zu,%zu\n", fixture.kSteps, batch_size, mode_name(mode),
@@ -221,8 +227,10 @@ int main(int argc, char** argv) {
         std::printf("K,B,mode,median_us,min_us,p95_us,graph_nodes,workspace_bytes\n");
         for (int steps = 1; steps <= 15; ++steps) {
             if (options.steps && options.steps != steps) continue;
-            Fixture fixture(steps);
-            for (std::int32_t batch_size = 1; batch_size <= 8; ++batch_size) {
+            const auto maximum_batch = options.batch_size ? options.batch_size : 8;
+            Fixture fixture(steps, maximum_batch);
+            for (std::int32_t batch_size = options.batch_size ? options.batch_size : 1;
+                 batch_size <= maximum_batch; ++batch_size) {
                 if (options.batch_size != 0 && options.batch_size != batch_size) continue;
                 for (const Mode mode : std::array{Mode::Greedy, Mode::Stochastic, Mode::Mixed}) {
                     if (mode == Mode::Mixed && batch_size == 1) continue;

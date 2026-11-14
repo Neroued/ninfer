@@ -140,8 +140,10 @@ void tma_folded_up(Operands o, Scratch scratch, cudaStream_t stream) {
 
 template <bool Prefetched>
 void tma_wide_up(Operands o, Scratch scratch, cudaStream_t stream) {
-    using S = Bf16ScheduleInstance<Bf16A16TmaMmaSchedule<128, 64, 64, 64, 16, 2, 1>, kRank>;
-    using E = std::conditional_t<Prefetched, TmaPrefetchedMixEpilogue, TmaMixEpilogue>;
+    using S =
+        Bf16ScheduleInstance<Bf16A16TmaMmaSchedule<128, 64, 64, 64, 16, 2, Prefetched ? 2 : 1>,
+                             kRank>;
+    using E = std::conditional_t<Prefetched, TmaEarlyMixEpilogue, TmaMixEpilogue>;
     const Bf16A16Operands p{static_cast<const __nv_bfloat16*>(scratch.activation),
                             static_cast<const __nv_bfloat16*>(o.up), kResidualWidth, kRank,
                             o.columns};

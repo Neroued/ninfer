@@ -6,12 +6,16 @@
 #include <algorithm>
 
 namespace ninfer::models::glm5next::detail {
+void RankProgramImpl::select_frame(PhysicalBatchShape shape) {
+    reshape_frame_controls(frame, shape, this->shape.draft_tokens + 1);
+}
+
 Tensor RankProgramImpl::row(const TensorRegion& region, int rows) {
     return resources.tensor(region).slice(0, 0, rows);
 }
 
 MemorySpan RankProgramImpl::output(const TensorRegion& region) {
-    return resources.egress().subspan(region.region.offset - resources.plan.frame.egress.offset,
+    return resources.egress().subspan(region.region.offset - frame.egress.offset,
                                       region.region.bytes);
 }
 
@@ -44,9 +48,10 @@ void RankProgramImpl::upload_region(const LayoutRegion& region, std::size_t byte
 void RankProgramImpl::prepare_inputs(std::span<const WorkRow> rows, const BatchPlan& plan,
                                      std::uint32_t width,
                                      std::span<const std::uint32_t> valid_columns) {
-    auto& f            = *compute;
-    const auto& io     = f.sequence ? resources.plan.frame.main : resources.plan.frame.decode;
-    const auto& global = resources.plan.frame.rows;
+    auto& f = *compute;
+    select_frame(plan.shape);
+    const auto& io     = f.sequence ? frame.main : frame.decode;
+    const auto& global = frame.rows;
     const auto rank    = parameters.profile->local.rank;
     const auto i32     = [&](const TensorRegion& r) {
         return static_cast<std::int32_t*>(host(r).data);
@@ -54,12 +59,28 @@ void RankProgramImpl::prepare_inputs(std::span<const WorkRow> rows, const BatchP
     const auto i64 = [&](const TensorRegion& r) {
         return static_cast<std::int64_t*>(host(r).data);
     };
+    const int physical_rows = dimension(plan.shape.rows);
+    const auto clear_i32    = [&](const TensorRegion& region, int value) {
+        auto* data = i32(region);
+        std::fill_n(data, region.shape[0], value);
+    };
+    clear_i32(global.live_rows, 0);
+    std::fill_n(i32(io.valid_columns), physical_rows, 0);
+    clear_i32(global.count_slots, -1);
+    clear_i32(global.sampling_columns, 0);
+    clear_i32(global.base_positions, 0);
+    clear_i32(global.sampling_positions, 0);
+    clear_i32(global.anchors, 0);
+    std::fill_n(i32(io.positions), std::size_t(width) * physical_rows, 0);
+    std::fill_n(i64(global.source_offsets), physical_rows, -1);
+    std::fill_n(i64(global.destination_offsets), physical_rows, -1);
     for (std::size_t b = 0; b < plan.members.size(); ++b) {
         const auto logical                 = plan.members[b];
         const auto& row                    = rows[logical];
         const auto offsets                 = row.states.at(rank);
         const auto count                   = row.ids.size();
         const auto valid                   = valid_columns.empty() ? count : valid_columns[logical];
+        i32(global.live_rows)[b]           = 1;
         i32(io.valid_columns)[b]           = valid;
         i64(global.source_offsets)[b]      = offsets.source;
         i64(global.destination_offsets)[b] = offsets.destination;
@@ -74,14 +95,13 @@ void RankProgramImpl::prepare_inputs(std::span<const WorkRow> rows, const BatchP
                 row.main_frontier + std::min<std::size_t>(t, valid ? valid - 1 : 0);
         }
     }
-    if (resources.plan.frame.dflash)
-        for (std::size_t j = 0; j < plan.members.size(); ++j)
-            i32(resources.plan.frame.dflash->valid_columns)[j] = shape.draft_tokens + 1;
-    const int t = width, b = plan.members.size();
-    const auto c = std::max_element(plan.owners.begin(), plan.owners.end(), [](auto a, auto b) {
-                       return a.size < b.size;
-                   })->size;
-    const auto& local = resources.plan.frame.attention;
+    if (frame.dflash)
+        for (int j = 0; j < physical_rows; ++j)
+            i32(frame.dflash->valid_columns)[j] =
+                j < int(plan.members.size()) ? shape.draft_tokens + 1 : 0;
+    const int t = width, b = physical_rows;
+    const auto c      = plan.shape.attention_rows;
+    const auto& local = frame.attention;
     const auto own    = plan.owners[rank];
     if (f.tokens && (!f.sequence || own.size)) {
         ++f.attention.forwards;
@@ -106,14 +126,16 @@ void RankProgramImpl::prepare_inputs(std::span<const WorkRow> rows, const BatchP
         i32(local.main_tables)[j] = live ? rows[plan.members[own.begin + j]].main_table.index : -1;
         i32(local.mtp_tables)[j]  = live ? rows[plan.members[own.begin + j]].mtp_table.index : -1;
     }
-    for (int j = 0; j < b; ++j) {
+    std::fill_n(i32(local.from_gather), b, -1);
+    for (std::size_t j = 0; j < plan.members.size(); ++j) {
         const auto owner          = rows[plan.members[j]].attention_rank;
         i32(local.from_gather)[j] = owner * c + j - plan.owners[owner].begin;
     }
     fill_local_metadata(io, t, c);
-    const auto& layout = resources.plan.frame;
+    const auto& layout = frame;
     if (layout.sampling) {
         auto* configs = static_cast<ops::SamplingConfig*>(host(*layout.sampling).data);
+        std::fill_n(configs, b, ops::SamplingConfig{.temperature = 0, .top_k = 1, .top_p = 1});
         for (std::size_t i = 0; i < plan.members.size(); ++i) {
             const auto& row = rows[plan.members[i]];
             const auto& p   = row.sampling;
@@ -156,8 +178,8 @@ void RankProgramImpl::prepare_inputs(std::span<const WorkRow> rows, const BatchP
 execution::BatchView RankProgramImpl::batch(const BatchLayout& io, int t, int g, int c,
                                             std::uint32_t visible,
                                             std::optional<std::uint32_t> sequence_owner) {
-    const auto& a      = resources.plan.frame.attention;
-    const auto& global = resources.plan.frame.rows;
+    const auto& a      = frame.attention;
+    const auto& global = frame.rows;
     return {t,
             g,
             resources.packed(io.ids, {t, g}),
@@ -165,6 +187,7 @@ execution::BatchView RankProgramImpl::batch(const BatchLayout& io, int t, int g,
             row(io.valid_columns, g),
             row(global.source_offsets, g),
             row(global.destination_offsets, g),
+            row(global.live_rows, g),
             {c, resources.packed(io.attention.positions, {t, c}),
              row(io.attention.valid_columns, c), row(a.source_offsets, c),
              row(a.destination_offsets, c), row(io.attention.table_rows, c),
@@ -174,14 +197,13 @@ execution::BatchView RankProgramImpl::batch(const BatchLayout& io, int t, int g,
 }
 
 execution::BatchView RankProgramImpl::decode_batch(int t, int g, int c, std::uint32_t visible) {
-    auto io = resources.plan.frame.decode;
-    if (t > 1) io.ids = resources.plan.frame.speculative->verify_ids;
+    auto io = frame.decode;
+    if (t > 1) io.ids = frame.speculative->verify_ids;
     return batch(io, t, g, c, visible);
 }
 
 void RankProgramImpl::fill_local_metadata(const BatchLayout& layout, int t, int c) {
-    const auto* mapping =
-        static_cast<const int*>(host(resources.plan.frame.attention.to_global).data);
+    const auto* mapping   = static_cast<const int*>(host(frame.attention.to_global).data);
     const auto* positions = static_cast<const int*>(host(layout.positions).data);
     const auto* valid     = static_cast<const int*>(host(layout.valid_columns).data);
     auto* local_positions = static_cast<int*>(host(layout.attention.positions).data);
@@ -208,16 +230,16 @@ void RankProgramImpl::request_decision() {
     runtime::DecisionRequest request;
     request.vocabulary = parameters.profile->public_tokens;
     const auto rows    = work_rows(f.request.work);
-    for (std::uint32_t i = 0; i < rows.size(); ++i) {
+    // Forward masks are requested before the device frame is prepared.
+    const auto& members = work_batch(f.request.work).members;
+    for (std::size_t physical = 0; physical < members.size(); ++physical) {
+        const auto i = members[physical];
         if (!rows[i].constrained) continue;
         runtime::DecisionRequest::Row input{i, {}};
         if (speculative) {
-            const auto physical =
-                std::find(f.physical.members.begin(), f.physical.members.end(), i) -
-                f.physical.members.begin();
             const auto* drafts =
-                static_cast<const TokenId*>(output(resources.plan.frame.speculative->drafts).data);
-            const auto view = draft_proposals(rows.size());
+                static_cast<const TokenId*>(output(frame.speculative->drafts).data);
+            const auto view = draft_proposals(f.batch.rows);
             for (std::uint32_t step = 0; step < speculative->draft_extents[i]; ++step)
                 input.drafts.push_back(
                     drafts[(step * view.nb[0] + physical * view.nb[1]) / sizeof(TokenId)]);
@@ -234,19 +256,19 @@ void RankProgramImpl::request_decision() {
 
 void RankProgramImpl::upload_sampling() {
     auto& f            = *compute;
-    const auto& layout = resources.plan.frame;
+    const auto& layout = frame;
     const auto rows    = work_rows(f.request.work);
     auto mask_host     = host(*layout.grammar_masks);
     auto mask_device   = resources.tensor(*layout.grammar_masks);
     runtime::DecisionConsumed consumed{f.request.ticket, f.decision->stage, {}};
+    std::vector<const runtime::DecisionInput::Row*> masks(rows.size());
+    for (const auto& mask : f.decision->rows) masks.at(mask.member) = &mask;
     for (std::size_t b = 0; b < f.physical.members.size(); ++b) {
         const auto logical = f.physical.members[b];
         const auto& row    = rows[logical];
         if (row.constrained) {
-            const auto mask = std::find_if(f.decision->rows.begin(), f.decision->rows.end(),
-                                           [&](const auto& r) { return r.member == logical; });
-            if (mask == f.decision->rows.end())
-                throw std::logic_error("GLM5Next missing decision mask");
+            const auto* mask = masks[logical];
+            if (!mask) throw std::logic_error("GLM5Next missing decision mask");
             auto dst = mask_device.slice(2, b, 1), src = mask_host.slice(2, b, 1);
             std::copy(mask->words.begin(), mask->words.end(),
                       static_cast<std::uint32_t*>(src.data));

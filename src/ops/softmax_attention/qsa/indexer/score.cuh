@@ -8,7 +8,7 @@ namespace ninfer::ops::detail::qsa {
 
 __device__ __forceinline__ int indexer_swizzle(int row, int d) { return d ^ ((row & 7) << 3); }
 
-template <int QueryTile, bool VectorCache>
+template <int QueryTile, bool VectorCache, int MaxQueries = 64>
 __global__ __launch_bounds__((QueryTile > 16 ? QueryTile * 8 : 128)) void indexer_score_mma_kernel(
     const __grid_constant__ IndexerArguments a) {
     static_assert(QueryTile == 4 || QueryTile == 8 || QueryTile == 16 || QueryTile == 32);
@@ -16,11 +16,11 @@ __global__ __launch_bounds__((QueryTile > 16 ? QueryTile * 8 : 128)) void indexe
     constexpr int KeyGroups = QueryTile > 16 ? 1 : 16 / QueryTile;
     constexpr int WarpKeys  = kIndexerKeyTile / KeyGroups;
     constexpr int NTiles    = WarpKeys / 8;
-    __shared__ IndexerJobs<> jobs;
+    __shared__ IndexerJobs<MaxQueries> jobs;
     extern __shared__ __align__(16) __nv_bfloat16 shared[];
     auto* qs = shared;
     auto* ks = qs + QueryTile * 4 * 128;
-    if (!jobs.build<QueryTile, kIndexerKeyTile>(a)) return;
+    if (!jobs.template build<QueryTile, kIndexerKeyTile>(a)) return;
     const int tid = threadIdx.x, lane = tid % 32, warp = tid / 32;
     const int per_row  = (a.width + QueryTile - 1) / QueryTile;
     int previous_group = -1;

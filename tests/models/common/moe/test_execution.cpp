@@ -58,9 +58,10 @@ private:
     std::jthread fallback_;
 };
 
-bool finish(const offload::PreparedExecution& prepared, Tensor& output) {
+bool finish(const offload::PreparedExecution& prepared, Tensor& output,
+            ops::MoeTokenValidity validity) {
     while (true) {
-        if (auto completed = offload::try_complete(prepared, output)) return *completed;
+        if (auto completed = offload::try_complete(prepared, output, validity)) return *completed;
         std::this_thread::yield();
     }
 }
@@ -119,6 +120,10 @@ struct Call {
     GuardedDeviceBuffer output;
     Tensor destination;
     std::vector<double> expected;
+    std::vector<std::uint16_t> inactive_bits;
+    std::vector<int> valid_columns;
+    std::optional<DeviceBuffer> validity_storage;
+    ops::MoeTokenValidity validity;
     DecodeGraphExecutable graph;
     std::unique_ptr<offload::LayerGraphExecutable> scheduled_graph;
 
@@ -132,9 +137,49 @@ struct Call {
         output.copy_from_host(initial.data(), output.bytes());
     }
 
+    void set_validity(std::vector<int> columns, int width, Epilogue epilogue) {
+        require(std::size_t(width) * columns.size() == std::size_t(device.x.ne[1]),
+                "test validity shape differs from input");
+        valid_columns = std::move(columns);
+        validity_storage.emplace(to_device(valid_columns));
+        validity     = {Tensor(validity_storage->span(), DType::I32, {int(valid_columns.size())}),
+                        width};
+        auto values  = batch.input;
+        auto initial = batch.residual;
+        inactive_bits.resize(initial.size());
+        for (int token = 0; token < device.x.ne[1]; ++token) {
+            if (token % width < valid_columns[token / width]) continue;
+            for (int row = 0; row < moe::kHidden; ++row) {
+                const auto i     = std::size_t(token) * moe::kHidden + row;
+                values[i]        = 0x7fc1;
+                initial[i]       = row % 2 ? 0x8000 : 0x7fc5;
+                inactive_bits[i] = epilogue == Epilogue::Write ? 0 : initial[i];
+                expected[i]      = 0;
+            }
+        }
+        cuda_check(
+            cudaMemcpy(device.x.data, values.data(), values.size() * 2, cudaMemcpyHostToDevice),
+            "seed inactive inputs");
+        output.copy_from_host(initial.data(), output.bytes());
+    }
+
     int verify(const std::string& label) {
-        return verify_reduction(label, from_device_bf16(destination.data, expected.size()),
-                                expected, moe::kCompleteA16) +
+        auto actual  = from_device_bf16(destination.data, expected.size());
+        int failures = 0;
+        if (validity.valid_columns.data) {
+            const auto bits = from_device<std::uint16_t>(destination.data, expected.size());
+            for (int token = 0; token < device.x.ne[1]; ++token) {
+                if (token % validity.tokens_per_row <
+                    valid_columns[token / validity.tokens_per_row])
+                    continue;
+                for (int row = 0; row < moe::kHidden; ++row) {
+                    const auto i = std::size_t(token) * moe::kHidden + row;
+                    if (bits[i] != inactive_bits[i]) ++failures;
+                    actual[i] = 0;
+                }
+            }
+        }
+        return failures + verify_reduction(label, actual, expected, moe::kCompleteA16) +
                output.verify_guards(label);
     }
 };
@@ -192,8 +237,8 @@ int qualify(QType down, const DeviceContext& device, const CpuTopology& topology
             if (graph && !call.graph.ready()) {
                 DecodeGraphDefinition definition;
                 definition.capture(execution.cuda.stream(), [&] {
-                    offload::enqueue_gpu(call.device.x, prepared, call.destination, workspace,
-                                         offload::GpuSubmission::Capture);
+                    offload::enqueue_gpu(call.device.x, prepared, call.destination, call.validity,
+                                         workspace, offload::GpuSubmission::Capture);
                 });
                 call.graph.instantiate(definition);
             }
@@ -203,17 +248,21 @@ int qualify(QType down, const DeviceContext& device, const CpuTopology& topology
             if (graph) {
                 call.graph.launch(execution.cuda.stream());
             } else {
-                offload::enqueue_gpu(call.device.x, prepared, call.destination, workspace,
-                                     offload::GpuSubmission::Eager);
+                offload::enqueue_gpu(call.device.x, prepared, call.destination, call.validity,
+                                     workspace, offload::GpuSubmission::Eager);
             }
             if (gate) {
-                const auto ready = offload::try_complete(prepared, call.destination);
+                const auto ready = offload::try_complete(prepared, call.destination, call.validity);
                 gate->release();
                 require(!ready,
                         "MoE completion waited for delayed D2H instead of returning pending");
                 gate.reset();
             }
-            (void)finish(prepared, call.destination);
+            const bool cpu_work = finish(prepared, call.destination, call.validity);
+            if (!call.valid_columns.empty() &&
+                std::all_of(call.valid_columns.begin(), call.valid_columns.end(),
+                            [](int count) { return count == 0; }))
+                require(!cpu_work, "inactive MoE tokens entered CPU execution");
         } catch (...) {
             if (use) cache.release(*use, execution.cuda);
             throw;
@@ -272,6 +321,17 @@ int qualify(QType down, const DeviceContext& device, const CpuTopology& topology
     resources.synchronize();
     failures += cpu_only.verify("CPU routed plus GPU shared");
 
+    Call mixed_prefix(fixture, 18, 0, epilogue);
+    mixed_prefix.set_validity({0, 1, 2, 0, 2, 1, 0, 1, 2}, 2, epilogue);
+    run(mixed_prefix, mixed);
+    resources.synchronize();
+    failures += mixed_prefix.verify("mixed MoE prefixes");
+    Call empty_prefix(fixture, 18, 0, epilogue);
+    empty_prefix.set_validity(std::vector<int>(9, 0), 2, epilogue);
+    run(empty_prefix, none);
+    resources.synchronize();
+    failures += empty_prefix.verify("inactive CPU and shared MoE");
+
     // The same fixed partial partition sees batches with zero/all CPU assignments.
     std::vector<int> selected;
     for (int e : fixture.logical(0).route.ids) { selected.push_back(e); }
@@ -316,13 +376,13 @@ int qualify(QType down, const DeviceContext& device, const CpuTopology& topology
                                        epilogue, call.device.x.ne[1], execution);
         CudaCompletionEvent compute_done(device);
         StreamGate gate(execution.host->transfer.stream());
-        offload::enqueue_gpu(call.device.x, prepared, call.destination, workspace,
+        offload::enqueue_gpu(call.device.x, prepared, call.destination, {}, workspace,
                              offload::GpuSubmission::Eager);
         cache.release(*use, execution.cuda);
         // Retire GPU arithmetic first so it cannot hide a missing transfer dependency.
         compute_done.record(execution.cuda.stream());
         compute_done.synchronize();
-        const auto completed = offload::try_complete(prepared, call.destination);
+        const auto completed = offload::try_complete(prepared, call.destination, {});
         offload::enqueue_discard(prepared);
         compute_done.record(execution.cuda.stream());
         const auto deadline = Clock::now() + std::chrono::milliseconds(2);
@@ -477,7 +537,7 @@ int qualify_schedule(const DeviceContext& device, const CpuTopology& topology,
         }
         const auto kind = Kind::MaskOnes;
         bridge.include(offload::describe_execution(parameters[i].profile, kind, spec.epilogue, 1,
-                                                   spec.hybrid.max_tokens));
+                                                   std::max(spec.hybrid.max_tokens, 9)));
         bridge.include(
             offload::describe_execution(parameters[i].profile, Kind::All, spec.epilogue, 1, 1024));
         largest_bank =
@@ -509,19 +569,34 @@ int qualify_schedule(const DeviceContext& device, const CpuTopology& topology,
     MemoryArena workspace(storage.span());
     int failures      = 0;
     bool check_cancel = !graph && bank_capacity == 1 && !one_large_layer;
-    for (const int tokens : {1, 1, 8, 8, 9, 48, 1024, 1, 1, 8, 9, 1}) {
+    for (const auto [tokens, active] : std::array<std::pair<int, int>, 14>{{{1, 1},
+                                                                            {1, 1},
+                                                                            {8, 8},
+                                                                            {9, 8},
+                                                                            {9, 9},
+                                                                            {9, 8},
+                                                                            {48, 48},
+                                                                            {1024, 1024},
+                                                                            {1, 1},
+                                                                            {1, 1},
+                                                                            {8, 8},
+                                                                            {9, 9},
+                                                                            {9, 8},
+                                                                            {1, 1}}}) {
         std::array<std::unique_ptr<Call>, 4> calls;
         for (std::size_t i = 0; i < calls.size(); ++i) {
             calls[i] =
                 std::make_unique<Call>(*fixtures[i], tokens, i % 3, plan->layers[i].spec.epilogue);
+            if (active < tokens)
+                calls[i]->set_validity({active}, tokens, plan->layers[i].spec.epilogue);
         }
         if (check_cancel) {
-            const auto cpu_activity = resources.begin(tokens);
+            const auto cpu_activity = resources.begin(tokens, active);
             auto& call              = *calls[0];
             {
                 StreamGate gate(device.stream());
-                const bool completed =
-                    resources.start(order[0], call.device.x, call.destination, workspace, {});
+                const bool completed = resources.start(order[0], call.device.x, call.destination,
+                                                       call.validity, workspace, {});
                 resources.cancel();
                 const bool idle = resources.poll();
                 gate.release();
@@ -532,17 +607,20 @@ int qualify_schedule(const DeviceContext& device, const CpuTopology& topology,
             check_cancel = false;
         }
         {
-            const auto cpu_activity = resources.begin(tokens);
+            const auto cpu_activity = resources.begin(tokens, active);
             for (std::size_t i = 0; i < calls.size(); ++i) {
                 if (graph && !calibration) {
                     auto& call = *calls[i];
                     offload::LayerGraphDefinition definition;
-                    definition.moe = std::make_shared<offload::SubsetGraphDefinitions>();
+                    definition.moe      = std::make_shared<offload::SubsetGraphDefinitions>();
+                    definition.validity = call.validity;
                     offload::capture_layer(
-                        definition, resources, order[i], device.execution_view(), tokens, [] {},
+                        definition, resources, order[i], device.execution_view(),
+                        {tokens, tokens == 9 ? 8 : tokens}, [] {},
                         [&](const offload::PreparedExecution& prepared) {
                             offload::enqueue_gpu(call.device.x, prepared, call.destination,
-                                                 workspace, offload::GpuSubmission::Capture);
+                                                 call.validity, workspace,
+                                                 offload::GpuSubmission::Capture);
                         });
                     call.scheduled_graph =
                         std::make_unique<offload::LayerGraphExecutable>(definition);
@@ -566,16 +644,17 @@ int qualify_schedule(const DeviceContext& device, const CpuTopology& topology,
                     }();
                     DecodeGraphDefinition definition;
                     definition.capture(device.stream(), [&] {
-                        offload::enqueue_gpu(call.device.x, prepared, call.destination, workspace,
+                        offload::enqueue_gpu(call.device.x, prepared, call.destination,
+                                             call.validity, workspace,
                                              offload::GpuSubmission::Capture);
                     });
                     call.graph.instantiate(definition);
                     call.graph.launch(device.stream());
                     resources.gpu_submitted(order[i]);
-                    resources.finish_layer(finish(prepared, call.destination));
+                    resources.finish_layer(finish(prepared, call.destination, call.validity));
                 } else {
                     if (!resources.start(order[i], calls[i]->device.x, calls[i]->destination,
-                                         workspace, {}))
+                                         calls[i]->validity, workspace, {}))
                         while (!resources.poll()) std::this_thread::yield();
                 }
             }
@@ -631,7 +710,7 @@ void qualify_top10_bridge_routes(const DeviceContext& device, const CpuTopology&
                                                    tokens, bridge.execution_view());
         auto x = Tensor(inputs.span().subspan(0, 2560 * tokens * 2), DType::BF16, {2560, tokens});
         ops::topk_softmax_route(x, {2560, 512, 10}, p.control, prepared.frame.device_routes,
-                                prepared.frame.shared, workspace, device.execution_view());
+                                prepared.frame.shared, {}, workspace, device.execution_view());
         device.synchronize();
         const auto ids = from_device<int>(prepared.frame.device_routes.ids.data, 10 * tokens);
         const auto coefficients =

@@ -21,7 +21,8 @@ std::size_t linear(const ops::LinearProfile& p, int first, int last) {
 std::size_t body(const ModelProfile& p, const EngineOptions& options, int first, int last,
                  int batch, bool prefill, bool mtp, int sm_count, const moe::Plan* offload) {
     WorkspaceLayoutBuilder a;
-    const auto columns = last * batch, minimum = first * batch;
+    const auto columns = dimension(std::uint64_t(last) * batch),
+               minimum = dimension(std::uint64_t(first) * batch);
     (void)workspace::roots(a, p.config.text, columns);
     const auto scratch = [&](std::size_t bytes) {
         auto scope = a.scope();
@@ -78,7 +79,7 @@ std::size_t body(const ModelProfile& p, const EngineOptions& options, int first,
         scratch(moe::workspace_bytes(layer.moe.math, ops::MoeEpilogue::Write, minimum, columns,
                                      layer.moe.subset));
         if (!mtp && offload) {
-            scratch(offload->workspace_bytes(layer.moe.bank, minimum, columns));
+            scratch(offload->workspace_bytes(layer.moe.bank, minimum, columns, !prefill));
         }
     };
     if (mtp)
@@ -94,8 +95,9 @@ std::size_t body(const ModelProfile& p, const EngineOptions& options, int first,
 
 std::size_t history(const ModelProfile& p, int first, int last, int batch) {
     WorkspaceLayoutBuilder a;
-    const auto columns = last * batch, minimum = first * batch;
-    const auto& mtp = *p.mtp;
+    const auto columns = dimension(std::uint64_t(last) * batch),
+               minimum = dimension(std::uint64_t(first) * batch);
+    const auto& mtp    = *p.mtp;
     (void)workspace::history_roots(a, p.config.text, columns);
     const auto scratch = [&](std::size_t bytes) {
         auto scope = a.scope();
@@ -133,10 +135,11 @@ WorkspacePlan plan_workspace(const ModelProfile& p, const EngineOptions& o, std:
         }
     }
     if (p.mtp) out.history = std::max(out.history, history(p, 1, chunk, 1));
-    const auto head_columns = o.purpose == EnginePurpose::CausalScoring
-                                  ? std::min(chunk, 1024U)
-                                  : o.max_concurrency * (o.speculative.draft_tokens + 1);
-    out.finish              = linear(p.text.head, 1, head_columns);
+    const auto head_columns =
+        o.purpose == EnginePurpose::CausalScoring
+            ? std::min(chunk, 1024U)
+            : dimension(std::uint64_t(o.max_concurrency) * (o.speculative.draft_tokens + 1));
+    out.finish = linear(p.text.head, 1, head_columns);
     if (p.mtp) out.finish = std::max(out.finish, linear(p.mtp->head, 1, o.max_concurrency));
     if (o.purpose == EnginePurpose::Generation) {
         if (p.local.size > 1)

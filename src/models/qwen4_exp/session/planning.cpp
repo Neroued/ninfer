@@ -13,7 +13,7 @@ std::uint32_t count(std::uint64_t value) {
 } // namespace
 
 SessionPlan plan_session(const ExecutionPlan& execution) {
-    SessionPlan plan{execution.shape};
+    SessionPlan plan{execution.shape, execution.batches};
     plan.checkpoint_interval = execution.checkpoint_interval;
     const auto rank          = execution.profile->local.rank;
     const auto& image        = execution.persistent.state.images;

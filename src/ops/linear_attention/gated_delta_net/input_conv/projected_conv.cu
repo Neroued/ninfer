@@ -3,6 +3,7 @@
 #include "core/platform.h"
 #include "ops/linear_attention/gated_delta_net/input_conv/kernels/conv.cuh"
 #include <cuda_bf16.h>
+#include <algorithm>
 #include <cstdint>
 #include <stdexcept>
 
@@ -15,50 +16,47 @@ __global__ void gdn_projected_conv_kernel(
     const __nv_bfloat16* state_read, const std::int32_t* __restrict__ valid_columns,
     const std::int64_t* __restrict__ source_offsets, __nv_bfloat16* __restrict__ query,
     __nv_bfloat16* __restrict__ key, __nv_bfloat16* __restrict__ value, std::int32_t width,
-    Publish publish) {
+    std::int32_t batch_count, Publish publish) {
     static_assert(Channels == QueryRows + KeyRows + ValueRows);
     const std::int32_t row = static_cast<std::int32_t>(blockIdx.x * blockDim.x + threadIdx.x);
     if (row >= Channels) { return; }
-    const std::int32_t batch = static_cast<std::int32_t>(blockIdx.y);
     if constexpr (StaticWidth != 0) { width = StaticWidth; }
 
-    std::int32_t valid              = valid_columns == nullptr ? width : valid_columns[batch];
-    valid                           = valid < 0 ? 0 : (valid > width ? width : valid);
-    const std::int64_t initial_base = source_offsets[batch] / 2;
-    float s0                        = __bfloat162float(state_read[initial_base + row]);
-    float s1                        = __bfloat162float(state_read[initial_base + Channels + row]);
-    float s2       = __bfloat162float(state_read[initial_base + 2LL * Channels + row]);
-    const float w0 = __bfloat162float(conv_weight[row]);
-    const float w1 = __bfloat162float(conv_weight[Channels + row]);
-    const float w2 = __bfloat162float(conv_weight[2LL * Channels + row]);
-    const float w3 = __bfloat162float(conv_weight[3LL * Channels + row]);
-
-    for (std::int32_t token = 0; token < width; ++token) {
-        const std::int64_t column = static_cast<std::int64_t>(batch) * width + token;
-        if (token >= valid) {
-            if (row < QueryRows) {
-                query[column * QueryRows + row] = __float2bfloat16_rn(0.0F);
-            } else if (row < QueryRows + KeyRows) {
-                key[column * KeyRows + row - QueryRows] = __float2bfloat16_rn(0.0F);
-            } else {
-                value[column * ValueRows + row - QueryRows - KeyRows] = __float2bfloat16_rn(0.0F);
-            }
+    const auto destination =
+        CausalConvSplitOutput3<__nv_bfloat16, QueryRows, KeyRows, ValueRows>{query, key, value}
+            .column(row);
+    for (std::int64_t batch = blockIdx.y; batch < batch_count; batch += gridDim.y) {
+        std::int32_t valid = valid_columns == nullptr ? width : valid_columns[batch];
+        valid              = valid < 0 ? 0 : (valid > width ? width : valid);
+        if (!valid) {
+            for (int token = 0; token < width; ++token)
+                *destination.at(batch * width + token) = __float2bfloat16_rn(0.0F);
             continue;
         }
+        const std::int64_t initial_base = source_offsets[batch] / 2;
+        float s0                        = __bfloat162float(state_read[initial_base + row]);
+        float s1       = __bfloat162float(state_read[initial_base + Channels + row]);
+        float s2       = __bfloat162float(state_read[initial_base + 2LL * Channels + row]);
+        const float w0 = __bfloat162float(conv_weight[row]);
+        const float w1 = __bfloat162float(conv_weight[Channels + row]);
+        const float w2 = __bfloat162float(conv_weight[2LL * Channels + row]);
+        const float w3 = __bfloat162float(conv_weight[3LL * Channels + row]);
 
-        const float p              = __bfloat162float(projected[column * Channels + row]);
-        const __nv_bfloat16 output = causal_conv4_silu(w0, w1, w2, w3, s0, s1, s2, p);
-        if (row < QueryRows) {
-            query[column * QueryRows + row] = output;
-        } else if (row < QueryRows + KeyRows) {
-            key[column * KeyRows + row - QueryRows] = output;
-        } else {
-            value[column * ValueRows + row - QueryRows - KeyRows] = output;
+        for (std::int32_t token = 0; token < width; ++token) {
+            const std::int64_t column = static_cast<std::int64_t>(batch) * width + token;
+            if (token >= valid) {
+                *destination.at(column) = __float2bfloat16_rn(0.0F);
+                continue;
+            }
+
+            const float p              = __bfloat162float(projected[column * Channels + row]);
+            const __nv_bfloat16 output = causal_conv4_silu(w0, w1, w2, w3, s0, s1, s2, p);
+            *destination.at(column)    = output;
+            publish.publish(token, batch, row, s1, s2, p);
+            s0 = s1;
+            s1 = s2;
+            s2 = p;
         }
-        publish.publish(token, batch, row, s1, s2, p);
-        s0 = s1;
-        s1 = s2;
-        s2 = p;
     }
 }
 
@@ -84,13 +82,13 @@ void launch(const Tensor& projected, const Tensor& conv_weight,
                         : static_cast<const std::int32_t*>(valid_columns.data),
                     static_cast<const std::int64_t*>(state_read.records.byte_offsets.data),
                     static_cast<__nv_bfloat16*>(query.data), static_cast<__nv_bfloat16*>(key.data),
-                    static_cast<__nv_bfloat16*>(value.data), width, publish);
+                    static_cast<__nv_bfloat16*>(value.data), width, batch, publish);
             CUDA_CHECK(cudaGetLastError());
             return;
         }
     }
     const dim3 grid((Channels + kDefaultThreads - 1) / kDefaultThreads,
-                    static_cast<unsigned>(batch));
+                    static_cast<unsigned>(std::min(batch, 65535)));
     gdn_projected_conv_kernel<Channels, QueryRows, KeyRows, ValueRows, 0>
         <<<grid, kDefaultThreads, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(projected.data),
@@ -102,7 +100,7 @@ void launch(const Tensor& projected, const Tensor& conv_weight,
                                           : static_cast<const std::int32_t*>(valid_columns.data),
             static_cast<const std::int64_t*>(state_read.records.byte_offsets.data),
             static_cast<__nv_bfloat16*>(query.data), static_cast<__nv_bfloat16*>(key.data),
-            static_cast<__nv_bfloat16*>(value.data), width, publish);
+            static_cast<__nv_bfloat16*>(value.data), width, batch, publish);
     CUDA_CHECK(cudaGetLastError());
 }
 

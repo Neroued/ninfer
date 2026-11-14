@@ -18,7 +18,7 @@ struct DraftExecution {
 };
 
 struct DraftInputs {
-    Tensor anchors, frontiers, valid_columns, state_offsets;
+    Tensor anchors, frontiers, valid_columns, state_offsets, live_rows;
     const ops::SamplingConfig* sampling;
     std::uint32_t context_bound;
 };

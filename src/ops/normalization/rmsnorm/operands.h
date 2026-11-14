@@ -11,5 +11,6 @@ struct Operands {
 };
 
 Operands validate(const Tensor& x, const Tensor& weight, const Tensor* gate, float eps,
-                  const Tensor& out, Epilogue kind, CudaExecutionView execution, const char* op);
+                  const Tensor& out, const Tensor* inverse, Epilogue kind,
+                  CudaExecutionView execution, const char* op);
 } // namespace ninfer::ops::detail::rmsnorm

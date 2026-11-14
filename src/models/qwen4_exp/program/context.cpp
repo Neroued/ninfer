@@ -19,21 +19,18 @@ void RankProgramImpl::advance_context() {
             retire_vision(resident);
             bindings[id.lane.value].reset();
         }
-        for (std::size_t b = 0; b < work.bindings.size(); ++b) {
-            const auto& input = work.bindings[b];
-            const auto lane   = input.member.residency.lane.value;
+        for (const auto& input : work.bindings) {
+            const auto lane = input.member.residency.lane.value;
             if (bindings[lane]) retire_vision(*bindings[lane]);
             bindings[lane].emplace(ResidentBinding{input.member});
-            if (resources.plan.persistent.buffers.token_counts) {
-                auto output = device_tensor(*resources.plan.persistent.buffers.token_counts)
-                                  .slice(1, lane, 1);
+            if (resources.buffers().token_counts) {
+                auto output = device_tensor(*resources.buffers().token_counts).slice(1, lane, 1);
                 if (input.counts.empty()) {
                     CUDA_CHECK(cudaMemsetAsync(output.data, 0, output.bytes(), transfer.stream()));
                 } else {
-                    auto* row = counts + b * vocabulary;
-                    input.counts.restore({row, vocabulary});
+                    input.counts.restore({counts, vocabulary});
                     copy_bytes_async({output.data, output.bytes(), transfer.device()},
-                                     {row, output.bytes(), Device::cpu(), true}, transfer);
+                                     {counts, output.bytes(), Device::cpu(), true}, transfer);
                 }
             }
         }

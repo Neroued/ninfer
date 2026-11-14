@@ -34,8 +34,8 @@ Options parse(int argc, char** argv) {
         if (flag == "--help") {
             std::cout << "usage: ninfer_rmsnorm_rope_bench [--form pair|single] "
                          "[--key-heads 4|8] [--epsilon E] [--theta T] [--position P]\n"
-                         "  --widths W,... (2..16) --batches B,... (1..8) "
-                         "--tokens T,... (1..2048)\n"
+                         "  --widths W,... (2..16) --batches B,... (B>=1) "
+                         "--tokens T,... (T>=1)\n"
                          "  --calls N (1..64): independent restored operands, warm cache only\n"
                          "Pair uses Hq=4*Hkv. Defaults: Hkv=8, epsilon=1e-6, theta=1e7.\n";
             m::help();
@@ -56,13 +56,13 @@ Options parse(int argc, char** argv) {
         else if (flag == "--theta")
             o.theta = positive_float(value);
         else if (flag == "--position")
-            o.position = m::integer(value, 0, INT_MAX - 2048);
+            o.position = m::integer(value, 0);
         else if (flag == "--widths")
             o.widths = m::integers(value, 2, 16);
         else if (flag == "--batches")
-            o.batches = m::integers(value, 1, 8);
+            o.batches = m::integers(value, 1);
         else if (flag == "--tokens")
-            o.tokens = m::integers(value, 1, 2048);
+            o.tokens = m::integers(value, 1);
         else if (!m::parse(o.timing, flag, value))
             throw std::invalid_argument("unknown flag: " + std::string(flag));
     }
@@ -76,8 +76,11 @@ Options parse(int argc, char** argv) {
 
 void run(const Options& o, int width, int batch, bench::L2FlushBuffer& flush, m::Csv& csv,
          CudaExecutionView e) {
-    const bool pair  = o.form == "pair";
-    const int tokens = width * batch, qh = pair ? 4 * o.key_heads : 0;
+    const bool pair   = o.form == "pair";
+    const auto extent = std::int64_t(width) * batch;
+    if (extent > INT_MAX || std::int64_t(o.position) + extent - 1 > INT_MAX)
+        throw std::invalid_argument("token extent or position is not representable");
+    const int tokens = static_cast<int>(extent), qh = pair ? 4 * o.key_heads : 0;
     const std::size_t q_count = std::size_t(128) * qh * tokens;
     const std::size_t k_count = std::size_t(128) * o.key_heads * tokens;
     auto q                    = bench::make_bf16(std::max(q_count * o.calls, std::size_t(1)), 101U);

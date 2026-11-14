@@ -9,7 +9,7 @@ namespace ninfer::ops {
 
 enum class CandidateSelectorInput { Candidates, GatheredKeys };
 
-// Capacity for every K/B pair in the inclusive intervals, K=1..15 and B=1..8.
+// Capacity for every K/B pair in the inclusive intervals, K=1..15 and B>=1, K*B<=INT32_MAX.
 [[nodiscard]] std::size_t
 candidate_selector_path_workspace_capacity_bytes(CandidateSelectorInput input,
                                                  std::int32_t min_steps, std::int32_t max_steps,
@@ -18,7 +18,7 @@ candidate_selector_path_workspace_capacity_bytes(CandidateSelectorInput input,
 /**
  * Op: candidate_selector_path
  *
- * For K in [1,15] and B in [1,8], the inputs are contiguous candidate_ids I32 [16,K,B],
+ * For K in [1,15], B>=1 and K*B<=INT32_MAX, the inputs are contiguous candidate_ids I32 [16,K,B],
  * unary_scores FP32 [16,K,B], projected_hidden BF16 [256,K,B], anchors I32 [B],
  * predecessor_codebook and successor_codebook BF16 [256,V], base_positions I32 [B], and a
  * device-resident SamplingConfig[B]. Candidate rank is the fastest axis. The 16 candidate ids in
@@ -44,13 +44,17 @@ candidate_selector_path_workspace_capacity_bytes(CandidateSelectorInput input,
  * completely overwritten. Inputs, outputs, codebooks, and the config array must be pairwise
  * non-overlapping. The Op has no persistent state or internal allocation. Caller workspace is
  * transient and must not overlap any input or output.
+ * live_rows is empty for dense execution, or disjoint contiguous Device I32 [B] with values 0/1.
+ * A zero row reads no IDs, scores, hidden, codebooks, positions or sampling config and writes
+ * exact zero drafts/probabilities. Device validity is consumed on every Graph replay.
  */
 void candidate_selector_path(const Tensor& candidate_ids, const Tensor& unary_scores,
                              const Tensor& projected_hidden, const Tensor& anchors,
                              const Tensor& predecessor_codebook, const Tensor& successor_codebook,
                              std::int32_t token_domain, const Tensor& base_positions,
                              const SamplingConfig* configs, Tensor& drafts, Tensor& proposal_q,
-                             MemoryArena& workspace, CudaExecutionView execution);
+                             const Tensor& live_rows, MemoryArena& workspace,
+                             CudaExecutionView execution);
 
 /**
  * Gathered input form. keys is contiguous I64 [16,K,B,2], using vocabulary.h's lossless
@@ -64,12 +68,14 @@ void candidate_selector_path(const Tensor& candidate_ids, const Tensor& unary_sc
  * positions; the Op has no rank-dependent random key. Config fields other than temperature/seed
  * remain ignored. Anchors are valid IDs. All other operands, ownership, storage and effects follow
  * the separate-input form. Merge is part of path execution, with no standalone merge allocation.
+ * Inactive rows also write zero candidate_ids; their gathered keys and anchors are not read.
  */
 void candidate_selector_path(const Tensor& keys, const Tensor& projected_hidden,
                              const Tensor& anchors, const Tensor& predecessor_codebook,
                              const Tensor& successor_codebook, std::int32_t token_domain,
                              const Tensor& base_positions, const SamplingConfig* configs,
                              Tensor& candidate_ids, Tensor& drafts, Tensor& proposal_q,
-                             MemoryArena& workspace, CudaExecutionView execution);
+                             const Tensor& live_rows, MemoryArena& workspace,
+                             CudaExecutionView execution);
 
 } // namespace ninfer::ops

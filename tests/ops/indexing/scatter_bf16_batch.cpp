@@ -24,12 +24,13 @@ std::vector<std::uint16_t> bits(std::size_t count, unsigned salt) {
 }
 
 int run_case(int d, int width, int batch, bool padded, int mode, bool replay, int features = 5) {
+    const int slots                  = std::max(8, batch);
     const std::int64_t column_stride = features * d + (padded ? 8 : 0);
     const std::int64_t lane_stride =
         column_stride * (padded ? std::max(width, 16) : width) + (padded ? 16 : 0);
     const std::size_t source_count = std::size_t(d) * width * batch;
     auto source                    = bits(features * source_count, 0x1726);
-    auto pool                      = bits(lane_stride * 8, 0xa913);
+    auto pool                      = bits(lane_stride * slots, 0xa913);
     GuardedDeviceBuffer input(source.size() * 2), destination(pool.size() * 2), lanes(batch * 4),
         valid(batch * 4);
     Tensor l(lanes.span(), DType::I32, {batch}), v(valid.span(), DType::I32, {batch});
@@ -37,10 +38,11 @@ int run_case(int d, int width, int batch, bool padded, int mode, bool replay, in
     for (int slice = 0; slice < features; ++slice) {
         x[slice] =
             Tensor(input.span().subspan(slice * source_count * 2), DType::BF16, {d, width, batch});
-        y[slice] = Tensor(destination.span().subspan(slice * d * 2), DType::BF16, {d, width, 8});
+        y[slice] =
+            Tensor(destination.span().subspan(slice * d * 2), DType::BF16, {d, width, slots});
         y[slice].nb[1] = column_stride * 2;
         y[slice].nb[2] = lane_stride * 2;
-        y[slice].nb[3] = lane_stride * 8 * 2;
+        y[slice].nb[3] = lane_stride * slots * 2;
     }
     DeviceContext device;
     DecodeGraphDefinition definition;
@@ -55,7 +57,7 @@ int run_case(int d, int width, int batch, bool padded, int mode, bool replay, in
         if (phase)
             for (auto& value : source) value ^= 0xa531;
         for (int b = 0; b < batch; ++b) {
-            hl[b]             = order[(b + 3 * phase) % 8];
+            hl[b]             = batch <= 8 ? order[(b + 3 * phase) % 8] : (b + phase) % slots;
             const int pattern = (b + width + phase) % 4;
             hv[b]             = mode == 0      ? 0
                                 : mode == 2    ? width
@@ -64,6 +66,7 @@ int run_case(int d, int width, int batch, bool padded, int mode, bool replay, in
                                 : pattern == 1 ? width - 1
                                 : pattern == 2 ? 1
                                                : 0;
+            if (!hv[b]) hl[b] = -1;
         }
         input.copy_from_host(source.data(), source.size() * 2);
         destination.copy_from_host(pool.data(), pool.size() * 2);
@@ -126,8 +129,12 @@ void add_scatter_batch_cases(ninfer::test::OpSuite& suite) {
                         std::to_string(batch) + "/mode" + std::to_string(mode) + "/f" +
                         std::to_string(features) + (padded ? "/padded" : "/contiguous") +
                         (replay ? "/graph" : "/eager");
-        suite.add(id, [=] { return run_case(d, width, batch, padded, mode, replay, features); },
-                  {{"execution", replay ? "graph" : "eager"}});
+        std::vector<std::pair<std::string, std::string>> tags{
+            {"execution", replay ? "graph" : "eager"}};
+        if (batch > 8) tags.emplace_back("suite", "concurrency");
+        suite.add(
+            id, [=] { return run_case(d, width, batch, padded, mode, replay, features); },
+            std::move(tags));
     };
 
     for (int w = 1; w <= 16; ++w)
@@ -137,5 +144,6 @@ void add_scatter_batch_cases(ninfer::test::OpSuite& suite) {
             for (int mode : {0, 2, 3}) add(5120, w, b, true, mode, true);
     for (int d : {8, 24, 16384}) add(d, 3, 8, true, 1, true);
     add(5120, 17, 1, true, 1, true);
+    add(24, 4, 17, true, 1, true, 3);
     add(2048, 16, 8, true, 1, true, 8);
 }

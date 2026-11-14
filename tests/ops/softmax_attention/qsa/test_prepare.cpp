@@ -232,14 +232,24 @@ int verify(Fixture& f, const std::string& label) {
 }
 
 int run(DeviceContext& device, int t, int b, int axes, int alias, int layout, int capacity = 0,
-        KvCacheStorage storage = KvCacheStorage::BFloat16, int kv_heads = 2, bool kv_only = false) {
+        KvCacheStorage storage = KvCacheStorage::BFloat16, int kv_heads = 2, bool kv_only = false,
+        bool empty_replay = false) {
     Fixture f(t, b, axes, alias, layout, capacity, storage, kv_heads);
     f.kv_only = kv_only;
     DecodeGraphDefinition definition;
     DecodeGraphExecutable graph;
     int failures = 0;
-    for (int phase = 0; phase < 3; ++phase) {
+    for (int phase = 0; phase < (empty_replay ? 4 : 3); ++phase) {
         f.reset(phase, phase == 1);
+        if (phase == 3) {
+            std::fill(f.valid.host.begin(), f.valid.host.end(), 0);
+            std::fill(f.slots.host.begin(), f.slots.host.end(), -1);
+            std::fill(f.table_rows.host.begin(), f.table_rows.host.end(), -1);
+            f.valid.upload();
+            f.slots.upload();
+            f.table_rows.upload();
+            f.upload_offsets();
+        }
         if (phase == 1) {
             f.parameters.kv.rms_epsilon = 2e-5F;
             f.parameters.kv.rope_theta  = 500000;
@@ -278,7 +288,7 @@ int continuation(DeviceContext& device, KvCacheStorage storage = KvCacheStorage:
     ops::qsa_tail_extract(
         f.before,
         {f.records.view, f.record_rope.view, Tensor(base.span(), DType::I32, {1}), f.valid.view},
-        Tensor(count.span(), DType::I32, {1}), f.before, device.execution_view());
+        Tensor(count.span(), DType::I32, {1}), f.before, {}, device.execution_view());
     device.synchronize();
     for (int c = 0; c < 128; ++c) f.tail.at(c, 2, 1) = f.ik.at(c, 0, 0);
     failures += f.tail.preserved("accepted-one canonical tail") +
@@ -354,7 +364,7 @@ int chunking(DeviceContext& device, KvCacheStorage storage = KvCacheStorage::BFl
                               {f.records.view.slice(1, offset, n),
                                f.record_rope.view.slice(1, offset, n),
                                Tensor(base.span(), DType::I32, {1}), f.valid.view},
-                              f.valid.view, f.before, device.execution_view());
+                              f.valid.view, f.before, {}, device.execution_view());
         device.synchronize();
         offset += n;
     }
@@ -588,6 +598,30 @@ int scale_edges(DeviceContext& device, KvCacheStorage storage, bool kv_only = fa
 
 int main(int argc, char** argv) {
     OpSuite suite;
+    for (auto storage : {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64,
+                         KvCacheStorage::Fp8E4m3fnGroup128Ue8m0, KvCacheStorage::Nvfp4Group16,
+                         KvCacheStorage::Fp8KeyNvfp4Value}) {
+        suite.add(std::string("qsa_prepare/") + kv_cache_storage_name(storage) + "/concurrency/b17",
+                  [=] {
+                      return run(cuda_environment().context, 4, 17, 3, 0, 1, 0, storage, 2, false,
+                                 true);
+                  },
+                  {{"format", kv_cache_storage_name(storage)},
+                   {"execution", "graph"},
+                   {"suite", "concurrency"}});
+    }
+    suite.add("qsa_prepare/bf16/concurrency/b129",
+              [] {
+                  return run(cuda_environment().context, 1, 129, 1, 0, 0, 0,
+                             KvCacheStorage::BFloat16, 2, false, true);
+              },
+              {{"format", "bf16"}, {"execution", "graph"}, {"suite", "concurrency"}});
+    suite.add("qsa_prepare_kv/fp8/concurrency/b9",
+              [] {
+                  return run(cuda_environment().context, 16, 9, 3, 0, 2, 0,
+                             KvCacheStorage::Fp8E4m3fnGroup128Ue8m0, 1, true, true);
+              },
+              {{"format", "fp8"}, {"execution", "graph"}, {"suite", "concurrency"}});
     const auto add = [&](int t, int b, int axes, int alias, int layout, int capacity = 0,
                          KvCacheStorage storage = KvCacheStorage::BFloat16) {
         const std::string format = kv_cache_storage_name(storage);

@@ -37,8 +37,14 @@ struct WindowEpilogue {
         for (int begin = 0; begin + window <= Columns; begin += window) {
             if constexpr (Width > 0)
                 if (begin + Width > live) break;
-            const int b       = Width ? (first + begin) / window : 0;
-            const int n       = a.valid ? a.valid[b] : stride;
+            const int b = Width ? (first + begin) / window : 0;
+            const int n = a.valid ? a.valid[b] : stride;
+            if (!n) {
+#pragma unroll
+                for (int t = 0; t < window; ++t)
+                    if (Width > 0 || t < a.width) store_output(a, c, t, b, 0.0F);
+                continue;
+            }
             const auto source = a.source_offsets[b] / 2 + c;
             float h0          = __bfloat162float(a.source[source]);
             float h1          = __bfloat162float(a.source[source + channels]);
@@ -113,6 +119,7 @@ struct ParallelWindowEpilogue : WindowEpilogue<Width, __nv_bfloat16, true> {
                 const int r = i % BR, b = first_request + i / BR, c = row_begin + r;
                 if (c >= rows) continue;
                 const int valid = a.valid ? a.valid[b] : stride;
+                if (!valid) continue;
                 __nv_bfloat16 history[3];
 #pragma unroll
                 for (int j = 0; j < 3; ++j) {
@@ -141,56 +148,60 @@ struct FloatOutput {
 template <class ConvWeight = float>
 __global__ void conv_kernel(Arguments a, const float* projected) {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
-    const int b = blockIdx.z;
-    for (std::int64_t t0 = 4LL * blockIdx.y; t0 < a.width; t0 += 4LL * gridDim.y) {
-        const int n     = a.valid ? a.valid[b] : a.width;
-        const auto load = [&](std::int64_t t) {
-            if (t < 0)
-                return __bfloat162float(
-                    a.source[a.source_offsets[b] / 2 + (t + 3LL) * channels + c]);
-            return projected[(static_cast<std::int64_t>(b) * a.width + t) * channels + c];
-        };
-        if (t0 < n) {
-            float h0 = load(t0 - 3), h1 = load(t0 - 2), h2 = load(t0 - 1);
+    for (std::int64_t b = blockIdx.z; b < a.batch; b += gridDim.z)
+        for (std::int64_t t0 = 4LL * blockIdx.y; t0 < a.width; t0 += 4LL * gridDim.y) {
+            const int n     = a.valid ? a.valid[b] : a.width;
+            const auto load = [&](std::int64_t t) {
+                if (t < 0)
+                    return __bfloat162float(
+                        a.source[a.source_offsets[b] / 2 + (t + 3LL) * channels + c]);
+                return projected[(static_cast<std::int64_t>(b) * a.width + t) * channels + c];
+            };
+            if (t0 < n) {
+                float h0 = load(t0 - 3), h1 = load(t0 - 2), h2 = load(t0 - 1);
 #pragma unroll
-            for (int i = 0; i < 4; ++i) {
-                const int t = t0 + i;
-                if (t < n) {
-                    const float p = load(t);
-                    store_output(a, c, t, b, convolution<ConvWeight>(a.weights, c, h0, h1, h2, p));
-                    if (a.records)
-                        a.records[(static_cast<std::int64_t>(b) * a.width + t) * channels + c] =
-                            __float2bfloat16_rn(p);
-                    h0 = h1;
-                    h1 = h2;
-                    h2 = p;
-                } else if (t < a.width)
-                    store_output(a, c, t, b, 0.0F);
+                for (int i = 0; i < 4; ++i) {
+                    const int t = t0 + i;
+                    if (t < n) {
+                        const float p = load(t);
+                        store_output(a, c, t, b,
+                                     convolution<ConvWeight>(a.weights, c, h0, h1, h2, p));
+                        if (a.records)
+                            a.records[(static_cast<std::int64_t>(b) * a.width + t) * channels + c] =
+                                __float2bfloat16_rn(p);
+                        h0 = h1;
+                        h1 = h2;
+                        h2 = p;
+                    } else if (t < a.width)
+                        store_output(a, c, t, b, 0.0F);
+                }
+            } else {
+#pragma unroll
+                for (int i = 0; i < 4; ++i)
+                    if (t0 + i < a.width) store_output(a, c, t0 + i, b, 0.0F);
             }
-        } else {
-#pragma unroll
-            for (int i = 0; i < 4; ++i)
-                if (t0 + i < a.width) store_output(a, c, t0 + i, b, 0.0F);
         }
-    }
 }
 
 static __global__ void history_kernel(Arguments a, const float* projected) {
-    const int c = blockIdx.x * blockDim.x + threadIdx.x, b = blockIdx.y;
-    const int n = a.valid ? a.valid[b] : a.width;
-    __nv_bfloat16 tail[3];
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    for (std::int64_t b = blockIdx.y; b < a.batch; b += gridDim.y) {
+        const int n = a.valid ? a.valid[b] : a.width;
+        if (!n) continue;
+        __nv_bfloat16 tail[3];
 #pragma unroll
-    for (int j = 0; j < 3; ++j) {
-        const int t = n - 3 + j;
-        tail[j]     = t < 0
-                          ? a.source[a.source_offsets[b] / 2 + (t + 3LL) * channels + c]
-                          : __float2bfloat16_rn(
+        for (int j = 0; j < 3; ++j) {
+            const int t = n - 3 + j;
+            tail[j] =
+                t < 0 ? a.source[a.source_offsets[b] / 2 + (t + 3LL) * channels + c]
+                      : __float2bfloat16_rn(
                             projected[(static_cast<std::int64_t>(b) * a.width + t) * channels + c]);
-    }
+        }
 #pragma unroll
-    for (int j = 0; j < 3; ++j)
-        a.destination[a.destination_offsets[b] / 2 + static_cast<std::int64_t>(j) * channels + c] =
-            tail[j];
+        for (int j = 0; j < 3; ++j)
+            a.destination[a.destination_offsets[b] / 2 + static_cast<std::int64_t>(j) * channels +
+                          c] = tail[j];
+    }
 }
 
 } // namespace ninfer::ops::detail::kda_input

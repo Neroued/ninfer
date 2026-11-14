@@ -70,10 +70,6 @@ __device__ __forceinline__ int swizzle(int row, int byte) {
     return byte ^ ((row & (S::bk / 16 - 1)) << 4);
 }
 
-__device__ __forceinline__ bool includes(ExpertSubsetKind kind, const int* mask, int expert) {
-    return kind == ExpertSubsetKind::All || mask[expert] == (kind == ExpertSubsetKind::MaskOnes);
-}
-
 __device__ __forceinline__ float dot_four(unsigned codes, float4 x) {
     const float2 lo = fp8_code2_to_float2(codes), hi = fp8_code2_to_float2(codes >> 16);
     return fmaf(hi.y, x.w, fmaf(hi.x, x.z, fmaf(lo.y, x.y, lo.x * x.x)));

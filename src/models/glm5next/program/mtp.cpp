@@ -9,7 +9,7 @@
 
 namespace ninfer::models::glm5next::detail {
 void RankProgramImpl::stage_conditioning(int rows) {
-    const auto& io = resources.plan.frame;
+    const auto& io = frame;
     auto out       = resources.packed(io.mtp->previous_hidden,
                                       {dimension(parameters.profile->config.text.hidden), rows});
     ops::gather(resources.states.hidden(row(io.rows.source_offsets, rows)),
@@ -17,7 +17,7 @@ void RankProgramImpl::stage_conditioning(int rows) {
 }
 
 void RankProgramImpl::gather_decode_state(const execution::BatchView& call) {
-    const auto& io = resources.plan.frame;
+    const auto& io = frame;
     const auto& m  = *io.mtp;
     const int c = call.attention.rows, h = parameters.profile->config.text.hidden;
     const int d                      = m.tail_keys.shape[0] * m.tail_keys.shape[1];
@@ -36,16 +36,16 @@ void RankProgramImpl::gather_decode_state(const execution::BatchView& call) {
 }
 
 Tensor RankProgramImpl::mtp_output_ids(int step, int batch) {
-    return resources.tensor(resources.plan.frame.speculative->drafts)
+    return resources.packed(frame.speculative->drafts, {batch, dimension(shape.draft_tokens)})
         .slice(1, step, 1)
-        .slice(0, 0, batch)
         .view({batch});
 }
 
 void RankProgramImpl::prepare_history_metadata(std::span<const WorkRow> rows,
                                                std::span<const std::uint32_t> skip_first) {
-    const auto& m = *resources.plan.frame.mtp;
+    const auto& m = *frame.mtp;
     auto* values  = static_cast<std::int32_t*>(host(m.skip_first).data);
+    std::fill_n(values, compute->batch.rows, 0);
     for (std::size_t b = 0; b < rows.size(); ++b) {
         const auto logical = compute->physical.members[b];
         values[b] = skip_first.empty() ? rows[logical].main_frontier == 0 : skip_first[logical];
@@ -54,7 +54,7 @@ void RankProgramImpl::prepare_history_metadata(std::span<const WorkRow> rows,
 }
 
 void RankProgramImpl::align_history(const execution::BatchView& main, Tensor hidden, int width) {
-    const auto& m = *resources.plan.frame.mtp;
+    const auto& m = *frame.mtp;
     const int b = main.rows, t = main.tokens, h = parameters.profile->config.text.hidden;
     const int c = main.attention.rows;
     auto call =
@@ -87,11 +87,9 @@ void RankProgramImpl::align_history(const execution::BatchView& main, Tensor hid
             return resources.tensor(input).slice(3, 0, 1).slice(2, 0, c).view({d, 1, c});
         };
         const std::array fields{
-            ops::StateColumnScatter{scratch(m.tail_keys),
-                                    row(resources.plan.frame.attention.live_columns, c),
+            ops::StateColumnScatter{scratch(m.tail_keys), row(frame.attention.live_columns, c),
                                     destination.raw_keys},
-            ops::StateColumnScatter{scratch(m.tail_gates),
-                                    row(resources.plan.frame.attention.live_columns, c),
+            ops::StateColumnScatter{scratch(m.tail_gates), row(frame.attention.live_columns, c),
                                     destination.raw_gates}};
         ops::scatter_state_fields(fields, cuda);
     }
@@ -109,7 +107,7 @@ execution::MtpRun RankProgramImpl::mtp_run(std::uint32_t step, const execution::
 }
 
 execution::MlaSelection RankProgramImpl::mtp_selection(std::uint32_t step, int c) {
-    auto selected          = resources.plan.frame.mtp->selection.bind(resources.fixed());
+    auto selected          = frame.mtp->selection.bind(resources.fixed());
     selected.pool_ids      = selected.pool_ids.slice(1, 0, c);
     selected.pool_counts   = selected.pool_counts.slice(0, 0, c);
     selected.selection_end = selected.selection_end.slice(0, 0, c);
@@ -118,7 +116,7 @@ execution::MlaSelection RankProgramImpl::mtp_selection(std::uint32_t step, int c
 
 void RankProgramImpl::mtp_forward(std::uint32_t step, const execution::BatchView& call,
                                   const execution::MlaSubmit& submit) {
-    const auto& io = resources.plan.frame;
+    const auto& io = frame;
     const auto& m  = *io.mtp;
     const int b = call.rows, c = call.attention.rows, h = parameters.profile->config.text.hidden;
     auto recursive      = resources.packed(m.recursive_hidden, {h, b, 2});
@@ -144,19 +142,19 @@ void RankProgramImpl::mtp_forward(std::uint32_t step, const execution::BatchView
             static_cast<const ops::SamplingConfig*>(resources.tensor(m.proposal_sampling).data);
         ops::vocabulary_candidates(logits.view({logits.ne[0], 1, b}),
                                    parameters.profile->local.vocabulary.begin,
-                                   parameters.profile->public_tokens, configs,
-                                   row(m.proposal_columns, b), {}, keys, resources.workspace, cuda);
+                                   parameters.profile->public_tokens, configs, call.valid_columns,
+                                   {}, keys, resources.workspace, cuda);
         parallel->maximum(keys, cuda);
         ops::sample_vocabulary_candidates(keys.view({1, 1, b, 1}), configs,
                                           row(io.rows.sampling_positions, b),
-                                          ops::kSamplePurposeDecode, ids, cuda);
+                                          ops::kSamplePurposeDecode, ids, call.valid_columns, cuda);
     } else {
         ops::argmax(logits, ids, parameters.profile->public_tokens, cuda);
     }
 }
 
 void RankProgramImpl::accept_mtp(int b) {
-    const auto& io    = resources.plan.frame;
+    const auto& io    = frame;
     const auto& m     = *io.mtp;
     const auto& local = parameters.profile->local;
     const int w       = shape.draft_tokens + 1;
@@ -174,16 +172,16 @@ void RankProgramImpl::accept_mtp(int b) {
                     cuda);
         ops::speculative_accept_greedy_drafts(target, logits, drafts, extents, positions, licensed,
                                               counts, parameters.profile->public_tokens, configs,
-                                              resources.workspace, cuda);
+                                              row(io.rows.live_rows, b), resources.workspace, cuda);
         return;
     }
-    vocabulary().accept(logits, configs, row(io.decode.valid_columns, b), drafts, extents,
-                        positions, licensed, counts);
+    vocabulary().accept(logits, configs, row(io.decode.valid_columns, b), row(io.rows.live_rows, b),
+                        drafts, extents, positions, licensed, counts);
 }
 
 void RankProgramImpl::repair_mtp_history(const execution::BatchView& call, bool repair,
                                          DecodeGraphSection* captured_repair) {
-    const auto& io = resources.plan.frame;
+    const auto& io = frame;
     const auto& m  = *io.mtp;
     const int b = call.rows, w = call.tokens, c = call.attention.rows,
               h       = parameters.profile->config.text.hidden;

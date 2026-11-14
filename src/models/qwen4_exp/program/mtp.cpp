@@ -16,7 +16,7 @@ execution::BatchView RankProgramImpl::mtp_inputs(const MtpBatchLayout& layout,
                                                  std::uint32_t tokens,
                                                  std::span<const MtpInputRow> inputs,
                                                  bool history) {
-    const auto batch = static_cast<std::int32_t>(rows.size());
+    const auto batch = static_cast<std::int32_t>(compute->sequence ? 1 : compute->physical.rows);
     const auto t     = static_cast<std::int32_t>(tokens);
     const auto host  = [&](const TensorRegion& region) {
         return static_cast<std::int32_t*>(host_tensor(region).data);
@@ -24,11 +24,28 @@ execution::BatchView RankProgramImpl::mtp_inputs(const MtpBatchLayout& layout,
     const auto offsets = [&](const TensorRegion& region) {
         return static_cast<std::int64_t*>(host_tensor(region).data);
     };
+    for (int b = 0; b < batch; ++b)
+        for (int j = 0; j < t; ++j) {
+            if (history) host(layout.ids)[j + t * b] = 0;
+            host(layout.positions)[j + t * b] = 0;
+            for (int axis = 0; axis < 3; ++axis)
+                host(layout.rope_positions)[j + t * (axis + 3 * b)] = 0;
+        }
     std::uint32_t maximum = 1;
     for (int b = 0; b < batch; ++b) {
-        const auto& row   = rows[b];
-        const auto& input = inputs[b];
-        const auto n      = input.ids.size();
+        host(layout.live_rows)[b]              = 0;
+        host(layout.valid_columns)[b]          = 0;
+        offsets(layout.source_offsets)[b]      = -1;
+        offsets(layout.destination_offsets)[b] = -1;
+        host(layout.table_rows)[b]             = -1;
+        host(layout.base_positions)[b]         = 0;
+        host(layout.record_offsets)[b]         = 0;
+    }
+    for (std::size_t b = 0; b < rows.size(); ++b) {
+        host(layout.live_rows)[b] = 1;
+        const auto& row           = rows[b];
+        const auto& input         = inputs[b];
+        const auto n              = input.ids.size();
         if (n > tokens) throw std::logic_error("MTP input exceeds its window");
         host(layout.valid_columns)[b]     = n;
         offsets(layout.source_offsets)[b] = row.states.at(parameters.profile->local.rank).source;
@@ -58,10 +75,10 @@ execution::BatchView RankProgramImpl::mtp_inputs(const MtpBatchLayout& layout,
     }
     const auto offset = layout.ingress.offset, bytes = layout.ingress.bytes;
     if (history)
-        copy_bytes_async(resources.persistent().subspan(offset, bytes),
-                         resources.ingress().subspan(
-                             offset - resources.plan.persistent.buffers.host_region.offset, bytes),
-                         cuda);
+        copy_bytes_async(
+            resources.persistent().subspan(offset, bytes),
+            resources.ingress().subspan(offset - resources.buffers().host_region.offset, bytes),
+            cuda);
     return resources.mtp_batch(layout, t, batch, maximum);
 }
 
@@ -71,7 +88,7 @@ ops::QsaTailStateView RankProgramImpl::mtp_working_tail(std::uint32_t slot, std:
 
 execution::MtpRun RankProgramImpl::draft_run(std::uint32_t step, std::int32_t batch,
                                              std::uint32_t visible) {
-    const auto& buffers = resources.plan.persistent.buffers;
+    const auto& buffers = resources.buffers();
     const auto& frame   = *buffers.mtp;
     const auto channels = dimension(parameters.profile->config.text.residual_width());
     const auto call     = resources.mtp_batch(frame.draft_steps[step], 1, batch, visible);
@@ -89,7 +106,7 @@ execution::MtpRun RankProgramImpl::draft_run(std::uint32_t step, std::int32_t ba
 
 void RankProgramImpl::draft_forward(std::uint32_t step, std::int32_t batch, std::uint32_t visible,
                                     const DecodeGraphDefinition* mixer, DecodeGraphChild* child) {
-    const auto& buffers = resources.plan.persistent.buffers;
+    const auto& buffers = resources.buffers();
     const auto& frame   = *buffers.mtp;
     const auto channels = dimension(parameters.profile->config.text.residual_width());
     const auto hidden   = dimension(parameters.profile->config.text.hidden);
@@ -112,26 +129,24 @@ void RankProgramImpl::draft_forward(std::uint32_t step, std::int32_t batch, std:
     execution::project_head(sample, parameters.mtp->head, logits, resources.workspace, cuda);
     auto ids = draft_output_ids(step, batch);
     if (parallel)
-        vocabulary_draft(logits, ids);
+        vocabulary_draft(logits, device_tensor(frame.draft_steps[step].valid_columns), ids);
     else
         ops::argmax(logits, ids, parameters.profile->public_tokens, cuda);
 }
 
 Tensor RankProgramImpl::draft_proposals(std::int32_t batch) {
-    return device_tensor(resources.plan.persistent.buffers.mtp->drafts)
-        .slice(0, 0, batch)
-        .permute({1, 0, 2, 3});
+    return device_tensor(resources.buffers().mtp->drafts).slice(0, 0, batch).permute({1, 0, 2, 3});
 }
 
 Tensor RankProgramImpl::draft_output_ids(std::uint32_t step, std::int32_t batch) {
-    return device_tensor(resources.plan.persistent.buffers.mtp->drafts)
+    return device_tensor(resources.buffers().mtp->drafts)
         .slice(1, step, 1)
         .slice(0, 0, batch)
         .view({batch});
 }
 
 void RankProgramImpl::install_decode(std::int32_t batch) {
-    const auto& io = resources.plan.persistent.buffers;
+    const auto& io = resources.buffers();
     copy_bytes_async(io.ingress.bind(resources.persistent()),
                      resources.ingress().subspan(0, io.ingress.bytes), cuda);
     if (!io.mtp) return;
@@ -147,29 +162,28 @@ void RankProgramImpl::install_decode(std::int32_t batch) {
 void RankProgramImpl::align_mtp(std::span<const WorkRow> rows, std::uint32_t tokens,
                                 const Tensor& previous, const Tensor& conditioning,
                                 std::optional<models::vision::EmbeddingView> visual) {
-    const auto& frame   = *resources.plan.persistent.buffers.mtp;
-    const auto batch    = static_cast<std::int32_t>(rows.size());
+    const auto& frame   = *resources.buffers().mtp;
+    const auto batch    = static_cast<std::int32_t>(compute->sequence ? 1 : compute->physical.rows);
     const auto channels = dimension(parameters.profile->config.text.residual_width());
     const auto first    = rows.front().main_frontier;
     const auto skip     = batch == 1 && first == 0 ? 1U : 0U;
     const auto width    = std::max(1U, tokens - skip);
-    std::array<MtpInputRow, kMaximumConcurrency> inputs;
-    for (int b = 0; b < batch; ++b) {
+    auto& inputs        = mtp_rows;
+    for (std::size_t b = 0; b < rows.size(); ++b) {
         inputs[b] = {rows[b].mtp_frontier,
                      std::span<const TokenId>(rows[b].ids).subspan(skip, tokens - skip)};
     }
     const auto aligned = previous.view({channels, static_cast<std::int32_t>(tokens), batch})
                              .slice(1, skip < tokens ? skip : 0, width);
     if (tokens == skip) visual.reset();
-    const auto metadata =
-        mtp_inputs(frame.history, rows, width, {inputs.data(), rows.size()}, true);
+    const auto metadata = mtp_inputs(history_control_view(frame.history, width, batch), rows, width,
+                                     {inputs.data(), rows.size()}, true);
     if (visual && skip) {
         const auto& forward = std::get<ForwardWork>(compute->request.work.operation);
         if (!forward.visual) throw std::logic_error("MTP visual history has no window mapping");
         const auto& region = *frame.history.visual_indices;
         auto host          = resources.ingress().subspan(
-            region.region.offset - resources.plan.persistent.buffers.host_region.offset,
-            region.region.bytes);
+            region.region.offset - resources.buffers().host_region.offset, region.region.bytes);
         visual =
             visual_view(*forward.visual->window.plan, first + skip, tokens - skip, region, host);
     }
@@ -181,7 +195,8 @@ void RankProgramImpl::align_mtp(std::span<const WorkRow> rows, std::uint32_t tok
     const auto next = conditioning.view({channels, static_cast<std::int32_t>(tokens), batch})
                           .slice(1, tokens - 1, 1)
                           .view({channels, batch});
-    ops::scatter(next, resources.states->conditioning(compute->batch.destination_offsets), cuda);
+    ops::scatter(next, resources.states->conditioning(compute->batch.destination_offsets),
+                 compute->batch.live_rows, cuda);
 }
 
 void RankProgramImpl::accept_forward(std::int32_t batch) {
@@ -189,7 +204,7 @@ void RankProgramImpl::accept_forward(std::int32_t batch) {
         vocabulary_accept(batch);
         return;
     }
-    const auto& buffers   = resources.plan.persistent.buffers;
+    const auto& buffers   = resources.buffers();
     const auto& frame     = *buffers.mtp;
     const auto width      = shape.draft_tokens + 1;
     const auto vocabulary = parameters.profile->public_tokens;
@@ -211,27 +226,28 @@ void RankProgramImpl::accept_forward(std::int32_t batch) {
         auto scope = resources.workspace.scope();
         ops::speculative_accept_greedy_drafts(
             target, logits, drafts, extents, lengths, licensed, counts, vocabulary,
-            static_cast<const ops::SamplingConfig*>(device_configs.data), resources.workspace,
-            cuda);
+            static_cast<const ops::SamplingConfig*>(device_configs.data),
+            row(buffers.batch.live_rows), resources.workspace, cuda);
     }
 }
 
 void RankProgramImpl::prepare_mtp() {
     auto& f             = *compute;
     const auto& work    = std::get<MtpWork>(f.request.work.operation);
-    const auto& buffers = resources.plan.persistent.buffers;
+    const auto& buffers = resources.buffers();
     const auto& frame   = *buffers.mtp;
-    const auto batch    = static_cast<std::int32_t>(f.rows.size());
+    const auto batch    = static_cast<std::int32_t>(f.physical.rows);
     const auto k = shape.draft_tokens, width = k + 1;
-    std::array<ple::InputRow, kMaximumConcurrency> inputs;
-    for (int b = 0; b < batch; ++b) {
+    auto& inputs = input_rows;
+    for (std::size_t b = 0; b < f.rows.size(); ++b) {
         const auto& row = f.rows[b];
         inputs[b] = {{row.member.sequence.value, row.member.sequence.generation, row.main_frontier,
                       row.ple_raw_tail},
                      row.ids};
     }
     if (host_ple) {
-        f.ple = host_ple->try_begin(f.request.ticket, width, {inputs.data(), f.rows.size()});
+        f.ple = host_ple->try_begin(f.request.ticket, width, f.physical.rows,
+                                    {inputs.data(), f.rows.size()});
         if (!f.ple) return;
     }
     f.verify.emplace();
@@ -249,8 +265,8 @@ void RankProgramImpl::prepare_mtp() {
     std::vector<execution::BatchView> calls;
     calls.reserve(steps);
     for (std::uint32_t step = 0; step < steps; ++step) {
-        std::array<MtpInputRow, kMaximumConcurrency> step_inputs;
-        for (int b = 0; b < batch; ++b)
+        auto& step_inputs = mtp_rows;
+        for (std::size_t b = 0; b < f.rows.size(); ++b)
             step_inputs[b] = {f.rows[b].main_frontier - 1 + std::min(step, round.extents[b]),
                               step == 0 || step < round.extents[b]
                                   ? std::span<const TokenId>(f.rows[b].ids)
@@ -280,9 +296,9 @@ void RankProgramImpl::prepare_mtp() {
             }
         }
     }
-    std::array<std::uint32_t, kMaximumConcurrency> valid;
+    auto& valid = valid_rows;
     gpu_timer.end_draft();
-    for (int b = 0; b < batch; ++b) valid[b] = round.extents[b] + 1;
+    for (std::size_t b = 0; b < f.rows.size(); ++b) valid[b] = round.extents[b] + 1;
     if (host_ple) host_ple->seal(*f.ple, {valid.data(), f.rows.size()});
     ops::prepare_verify_ids(row_tensor(buffers.anchors), drafts, row_tensor(frame.extents),
                             f.batch.ids, cuda);

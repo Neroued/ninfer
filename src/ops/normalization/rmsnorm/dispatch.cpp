@@ -46,21 +46,26 @@ Instance select_instance(Epilogue kind, Operands operands, std::int32_t sms) {
 } // namespace
 
 void dispatch(const Tensor& x, const Tensor& weight, const Tensor* gate, float eps, Epilogue kind,
-              Tensor& out, Operands operands, CudaExecutionView execution) {
+              Tensor& out, Tensor* inverse, Operands operands, CudaExecutionView execution) {
     // Each launch respects grid.x capacity; the semantic row extent remains unrestricted.
     constexpr std::int64_t kMaxRows = std::numeric_limits<int>::max();
     for (std::int64_t first = 0; first < operands.rows;) {
         const auto count  = std::min(operands.rows - first, kMaxRows);
         const auto offset = std::size_t(first) * operands.dimension * sizeof(std::uint16_t);
-        Tensor x_chunk = x, out_chunk = out, gate_chunk;
+        Tensor x_chunk = x, out_chunk = out, gate_chunk, inverse_chunk;
         x_chunk.data   = static_cast<std::byte*>(x.data) + offset;
         out_chunk.data = static_cast<std::byte*>(out.data) + offset;
         if (gate) {
             gate_chunk      = *gate;
             gate_chunk.data = static_cast<std::byte*>(gate->data) + offset;
         }
+        if (inverse) {
+            inverse_chunk      = *inverse;
+            inverse_chunk.data = static_cast<float*>(inverse->data) + first;
+        }
         const Operands chunk{operands.dimension, count, operands.alignment_bytes};
-        launch(x_chunk, weight, gate ? &gate_chunk : nullptr, eps, kind, out_chunk, chunk,
+        launch(x_chunk, weight, gate ? &gate_chunk : nullptr, eps, kind, out_chunk,
+               inverse ? &inverse_chunk : nullptr, chunk,
                select_instance(kind, chunk, execution.multiprocessor_count()), execution.stream());
         first += count;
     }

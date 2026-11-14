@@ -47,6 +47,23 @@ struct RecordAccess {
     std::int32_t width;
     float scale;
 
+    void advance_rows(std::int32_t rows) {
+        const auto columns = std::int64_t(rows) * width;
+        const auto qk      = columns * heads.H_qk * kStateDim;
+        const auto values  = columns * heads.H_v * kStateDim;
+        q += qk;
+        k += qk;
+        v += values;
+        g += columns * heads.H_v;
+        beta += columns * heads.H_v;
+        initial_offsets += rows;
+        if constexpr (Masked) valid_columns += rows;
+        key_record += qk;
+        value_record += values;
+        gate_record += columns * heads.H_v;
+        out += values;
+    }
+
     __device__ __forceinline__ RecurrentCoordinates coordinates() const {
         return make_coordinates(static_cast<std::int32_t>(blockIdx.y), 0,
                                 static_cast<std::int32_t>(blockIdx.z), heads);
@@ -137,6 +154,12 @@ __global__ void __launch_bounds__(common::kWarpSize* kNumWarps, 2)
     recurrent_record_kernel(RecordAccess<Masked> access) {
     const RecurrentCoordinates coord = access.coordinates();
     const std::int32_t valid         = access.active_columns(coord);
+    if constexpr (Masked) {
+        if (!valid) {
+            zero_output_suffix(access, coord, 0, access.width);
+            return;
+        }
+    }
     __align__(16) float state[kDvPerWarp][kQkPerLane];
     load_state_tile(state, access.state_read_base(coord), coord);
     run_recurrent_sequence<true, RecordEffects, PrefetchKey>(state, access, coord, valid);

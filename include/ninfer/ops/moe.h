@@ -89,8 +89,19 @@ struct ScaledSwiGLUTerm {
 };
 
 struct ExpertRoutes {
-    Tensor ids;          // Contiguous I32 [K,T]; distinct logical IDs within each token.
+    Tensor ids;          // Contiguous I32 [K,T]; nonnegative IDs are distinct within each token.
     Tensor coefficients; // Contiguous FP32 [K,T]; consumed without renormalization.
+};
+
+// Valid token prefixes in flattened [W,P] order. Empty lengths means all T tokens are live.
+// Otherwise valid_columns is contiguous Device I32[P], T=P*tokens_per_row, W>0 and
+// 0<=valid_columns[p]<=W. Inactive tokens publish IDs=-1 and coefficients=0 (including shared
+// gates). Complete MoE writes zero or preserves AddResidual bits for inactive tokens. No expert
+// assignment, mask entry or expert payload is accessed for a -1 route. Dense intermediate
+// projections may compute inactive columns; their values never affect the observable result.
+struct MoeTokenValidity {
+    Tensor valid_columns;
+    std::int32_t tokens_per_row = 1;
 };
 
 enum class ExpertSubsetKind : std::uint8_t { All, None, MaskOnes, MaskZeros };
@@ -139,7 +150,8 @@ routed_swiglu_profile(const WeightBankView& gate_up, const WeightBankView& down,
                                                                       std::int32_t min_tokens,
                                                                       std::int32_t max_tokens);
 void topk_softmax_route(const Tensor& x, const RouteProfile& profile, const Weight& control,
-                        ExpertRoutes& routes, Tensor& shared_coefficients, MemoryArena& workspace,
+                        ExpertRoutes& routes, Tensor& shared_coefficients,
+                        MoeTokenValidity validity, MemoryArena& workspace,
                         CudaExecutionView execution);
 
 // Corrected sigmoid routing over all global experts; no shared logit.
@@ -160,8 +172,8 @@ struct SigmoidRouteProfile {
                                                                       std::int32_t min_tokens,
                                                                       std::int32_t max_tokens);
 void topk_sigmoid_route(const Tensor& x, const SigmoidRouteProfile&, const Weight& control,
-                        const Tensor& correction_bias, ExpertRoutes& routes, MemoryArena&,
-                        CudaExecutionView);
+                        const Tensor& correction_bias, ExpertRoutes& routes, MoeTokenValidity,
+                        MemoryArena&, CudaExecutionView);
 
 struct SigmoidMoeProfile {
     SigmoidRouteProfile routing;
@@ -189,7 +201,8 @@ struct SigmoidMoeWeights {
                                                                            std::int32_t min_tokens,
                                                                            std::int32_t max_tokens);
 void topk_sigmoid_swiglu_moe(const Tensor&, const SigmoidMoeProfile&, const SigmoidMoeWeights&,
-                             ExpertSubset, Tensor& destination, MemoryArena&, CudaExecutionView);
+                             ExpertSubset, Tensor& destination, MoeTokenValidity, MemoryArena&,
+                             CudaExecutionView);
 
 // F_e(x)=down_e*(activation(gate_e*x,up_e*x)), with the explicit profile clamp when present.
 // Sum coefficient[j,t]*F_ids[j,t](x[:,t]) over subset. Registered clamped block-scaled
@@ -200,7 +213,8 @@ void topk_sigmoid_swiglu_moe(const Tensor&, const SigmoidMoeProfile&, const Sigm
 // mask/shared coefficients are 4-byte aligned.
 // Write reads no old destination; AddResidual requires BF16 and adds its old value before
 // final rounding. None writes zero without accessing routed weights/routes (or computes shared).
-// Route IDs are in [0,E); unselected weights and index entries are never read. Callers publish
+// Route IDs are in {-1} union [0,E); -1 has coefficient zero and no assignment. Unselected
+// weights and index entries are never read. Callers publish
 // and retain every selected weight through execution. All views belong to the execution GPU.
 // Destination and live scratch are mutually disjoint and overlap no input. Intermediate precision
 // is private; there is no semantic staging cast. No hidden allocation, transfer or host readback
@@ -256,7 +270,7 @@ topk_softmax_swiglu_moe_workspace_capacity_bytes(const MoeProfile& profile, Expe
                                                  std::int32_t max_tokens);
 void topk_softmax_swiglu_moe(const Tensor& x, const MoeProfile& profile, const MoeWeights& weights,
                              ExpertSubset subset, MoeEpilogue epilogue, Tensor& destination,
-                             MemoryArena& workspace, CudaExecutionView execution,
-                             const MoeExecutionHints& hints = {});
+                             MoeTokenValidity validity, MemoryArena& workspace,
+                             CudaExecutionView execution, const MoeExecutionHints& hints = {});
 
 } // namespace ninfer::ops

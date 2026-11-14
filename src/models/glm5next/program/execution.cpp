@@ -14,7 +14,7 @@ void RankProgramImpl::execute_round(const execution::BatchView& main,
                                     bool read_drafts, const execution::MlaSubmit& submit,
                                     RoundSections* sections,
                                     const execution::DraftSubmit& draft_submit) {
-    const auto& io = resources.plan.frame;
+    const auto& io = frame;
     const int g = main.rows, c = main.attention.rows, h = parameters.profile->config.text.hidden;
     const bool verify = !draft_bounds.empty();
     auto hidden       = resources.packed(io.pending_hidden, {h, main.tokens, g});
@@ -69,7 +69,8 @@ void RankProgramImpl::execute_round(const execution::BatchView& main,
         main_forward(main, execution::StepUpdate{}, hidden, {}, submit);
         if (parameters.mtp) align_history(main, hidden, 1);
         if (parameters.draft) append_dflash_context(main, main.valid_columns, {0, 1});
-        ops::scatter(hidden.view({h, g}), resources.states.hidden(main.destination_offsets), cuda);
+        ops::scatter(hidden.view({h, g}), resources.states.hidden(main.destination_offsets),
+                     main.live_rows, cuda);
     }
     const auto project = [&] { project_head(hidden.view({h, main.tokens * g})); };
     if (sections)
@@ -101,22 +102,26 @@ void RankProgramImpl::forward() {
         if (f.control_offset)
             for (auto& [rank, s] : w.states) s.source = s.destination;
         rows       = {&w, 1};
-        f.physical = plan_batch(rows, parameters.profile->local.size);
+        f.physical = {{1, 1}, {0}, {}};
+        f.physical.owners.resize(parameters.profile->local.size);
+        for (std::uint32_t rank = 0; rank < f.physical.owners.size(); ++rank)
+            f.physical.owners[rank] = {rank > w.attention_rank ? 1U : 0U,
+                                       rank == w.attention_rank ? 1U : 0U};
     } else
-        f.physical = work.batch;
+        f.physical = work_batch(work);
     f.tokens = rows.front().ids.size();
     prepare_inputs(rows, f.physical, std::max(1U, f.tokens));
     if (parameters.mtp && f.tokens) { prepare_history_metadata(rows); }
-    const auto& io = resources.plan.frame;
-    const int h = dimension(parameters.profile->config.text.hidden), b = rows.size();
+    const auto& io = frame;
+    const int h = dimension(parameters.profile->config.text.hidden), b = f.batch.rows;
     f.hidden = f.sequence ? resources.tensor(io.prefill_hidden).slice(1, 0, std::max(1U, f.tokens))
                           : resources.packed(io.pending_hidden, {h, 1, b}).view({h, b});
     for (std::size_t i = 0; i < rows.size(); ++i)
         f.result.rows[control ? f.control_row : i].processed += rows[i].ids.size();
     if (!f.sequence && f.tokens == 1) {
         const bool sample = forward && forward->sample != SampleKind::None;
-        f.graph_round     = graphs != nullptr;
-        if (graphs)
+        f.graph_round     = graphs && forward && forward->kind == ForwardKind::Ordinary;
+        if (f.graph_round)
             graphs->replay(f.batch, {}, sample, false);
         else
             execute_round(f.batch, {}, sample, false);
@@ -132,7 +137,7 @@ void RankProgramImpl::forward() {
         return;
     }
     if (!f.sequence) upload_region(io.ingress, io.ingress.bytes);
-    if (parameters.mtp && f.tokens) stage_conditioning(rows.size());
+    if (parameters.mtp && f.tokens) stage_conditioning(f.batch.rows);
     if (!f.tokens) {
         const auto offset = rows[0].states.at(parameters.profile->local.rank).source;
         const auto source =
@@ -166,7 +171,8 @@ void RankProgramImpl::forward() {
             copy_bytes_async({destination.data, destination.bytes(), cuda.device()},
                              {last.data, last.bytes(), cuda.device()}, cuda);
         } else
-            ops::scatter(f.hidden, resources.states.hidden(f.batch.destination_offsets), cuda);
+            ops::scatter(f.hidden, resources.states.hidden(f.batch.destination_offsets),
+                         f.batch.live_rows, cuda);
         if (f.timed_prefill) prefill_timer->record_stop();
     }
     if (forward && forward->sample != SampleKind::None) {
@@ -181,7 +187,7 @@ void RankProgramImpl::forward() {
 
 execution::TextRun RankProgramImpl::text_run(const execution::BatchView& call,
                                              execution::StateUpdate update) {
-    const auto& io = resources.plan.frame;
+    const auto& io = frame;
     return execution::TextRun(
         parameters,
         {resources.workspace, resources.states, resources.main,
@@ -210,9 +216,8 @@ void RankProgramImpl::main_forward(const execution::BatchView& call, execution::
 }
 
 void RankProgramImpl::project_head(Tensor hidden) {
-    auto logits =
-        resources.packed(*resources.plan.frame.logits,
-                         {dimension(parameters.profile->local.vocabulary.size), hidden.ne[1]});
+    auto logits = resources.packed(
+        *frame.logits, {dimension(parameters.profile->local.vocabulary.size), hidden.ne[1]});
     ops::linear(hidden, parameters.text.head.weight, logits, parameters.text.head.policy,
                 resources.workspace, cuda);
 }
@@ -264,8 +269,7 @@ void RankProgramImpl::decide() {
     if (verify && !f.decision) request_decision();
     if (!f.decision) return;
     upload_sampling();
-    const auto rows = work_rows(f.request.work);
-    const int b     = rows.size();
+    const int b = f.batch.rows;
     if (f.graph_round) {
         graphs->decide(b, verify);
     } else if (verify) {
@@ -299,7 +303,7 @@ void RankProgramImpl::result() {
             f.result.rows[f.physical.members[b]].tokens = {ids[b]};
     }
     if (const auto* speculative = std::get_if<SpeculativeWork>(&f.request.work.operation)) {
-        const auto& io     = resources.plan.frame;
+        const auto& io     = frame;
         const auto* ids    = static_cast<const TokenId*>(output(*io.sampled_ids).data);
         const auto* counts = static_cast<const std::int32_t*>(output(*io.output_counts).data);
         for (std::size_t b = 0; b < f.physical.members.size(); ++b) {

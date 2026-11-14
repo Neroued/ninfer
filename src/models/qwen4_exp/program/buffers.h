@@ -12,7 +12,7 @@ struct QsaRecordLayout {
 struct BatchLayout {
     TensorRegion ids, positions, rope_positions;
     std::optional<TensorRegion> visual_indices;
-    TensorRegion valid_columns, source_offsets, destination_offsets, main_tables;
+    TensorRegion live_rows, valid_columns, source_offsets, destination_offsets, main_tables;
     TensorRegion base_positions, record_offsets, accepted_columns, count_columns;
     TensorRegion raw_tail, raw_tail_offsets, count_slots, sampling_positions;
     std::uint32_t max_positions;
@@ -20,7 +20,7 @@ struct BatchLayout {
 
 struct MtpBatchLayout {
     TensorRegion ids, positions, rope_positions;
-    TensorRegion valid_columns, source_offsets, destination_offsets, table_rows;
+    TensorRegion live_rows, valid_columns, source_offsets, destination_offsets, table_rows;
     TensorRegion base_positions, record_offsets;
     std::optional<TensorRegion> visual_indices;
     LayoutRegion ingress;
@@ -50,10 +50,15 @@ struct BufferLayout {
     std::optional<MtpBufferLayout> mtp;
     std::optional<TensorRegion> logits;
     std::optional<TensorRegion> ple_embedding, vocabulary_local, vocabulary_gathered;
-    std::optional<TensorRegion> proposal_sampling, proposal_columns;
+    std::optional<TensorRegion> proposal_sampling;
     std::optional<TensorRegion> sampled_ids, output_counts;
     std::optional<TensorRegion> token_counts, sampling, grammar_masks;
 };
+
+[[nodiscard]] MtpBatchLayout history_control_view(const MtpBatchLayout&, std::uint32_t tokens,
+                                                  std::uint32_t rows);
+
+void select_buffer_rows(BufferLayout&, const BufferLayout& backing, std::uint32_t rows);
 
 [[nodiscard]] BufferLayout plan_buffers(LayoutBuilder&, const Config&, const EngineOptions&,
                                         std::uint32_t chunk, std::uint32_t public_tokens,

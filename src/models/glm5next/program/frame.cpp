@@ -8,6 +8,128 @@
 
 namespace ninfer::models::glm5next {
 
+namespace {
+void control_layout(LayoutBuilder& b, FrameLayout& out, PhysicalBatchShape shape, int width) {
+    const int global_rows = dimension(shape.rows), local_rows = dimension(shape.attention_rows);
+    const auto tensor = [&](DType type, std::initializer_list<int> dims, const char* label) {
+        return b.add_tensor(type, dims, 256, label);
+    };
+    const auto rows   = [&] { return tensor(DType::I32, {global_rows}, "global row metadata"); };
+    const auto locals = [&] { return tensor(DType::I32, {local_rows}, "attention row metadata"); };
+    const auto metadata = [&](int n) {
+        BatchLayout result{{}, tensor(DType::I32, {n}, "token ordinals"), rows()};
+        const auto begin = result.positions.region.offset;
+        result.ingress   = {
+            begin, result.valid_columns.region.offset + result.valid_columns.region.bytes - begin,
+            256};
+        return result;
+    };
+    auto& global               = out.rows;
+    global.anchors             = rows();
+    global.live_rows           = rows();
+    out.decode                 = metadata(width * global_rows);
+    out.decode.ids             = global.anchors;
+    global.source_offsets      = tensor(DType::I64, {global_rows}, "source State offsets");
+    global.destination_offsets = tensor(DType::I64, {global_rows}, "destination State offsets");
+    global.base_positions      = rows();
+    global.count_slots         = rows();
+    global.sampling_positions  = rows();
+    global.sampling_columns    = rows();
+    global.ingress             = {global.live_rows.region.offset,
+                                  global.sampling_columns.region.offset + global.sampling_columns.region.bytes -
+                                      global.live_rows.region.offset,
+                                  256};
+    if (out.speculative) out.speculative->extents = rows();
+    if (out.dflash) out.dflash->valid_columns = rows();
+    if (out.mtp) {
+        auto& m = *out.mtp;
+        m.draft_steps.resize(width - 1);
+        for (auto& step : m.draft_steps) step = metadata(global_rows);
+        m.skip_first = rows();
+    }
+    if (out.sampling)
+        out.sampling =
+            tensor(DType::I32, {sizeof(ops::SamplingConfig) / sizeof(std::int32_t), global_rows},
+                   "sampling configuration");
+    auto& local               = out.attention;
+    local.to_global           = locals();
+    local.from_gather         = rows();
+    local.live_rows           = locals();
+    local.live_columns        = locals();
+    local.source_offsets      = tensor(DType::I64, {local_rows}, "local source State offsets");
+    local.destination_offsets = tensor(DType::I64, {local_rows}, "local destination State offsets");
+    local.main_tables         = locals();
+    local.mtp_tables          = locals();
+    local.base_positions      = locals();
+    local.record_offsets      = locals();
+    local.ingress             = {local.to_global.region.offset,
+                                 local.record_offsets.region.offset + local.record_offsets.region.bytes -
+                                     local.to_global.region.offset,
+                                 256};
+    const auto local_batch    = [&](BatchLayout& io, int n, TensorRegion tables) {
+        io.attention = {tensor(DType::I32, {n}, "local positions"), locals(), tables};
+    };
+    local_batch(out.decode, width * local_rows, local.main_tables);
+    if (out.mtp)
+        for (auto& step : out.mtp->draft_steps) local_batch(step, local_rows, local.mtp_tables);
+    const auto ingress_end = b.finish(256);
+    out.ingress = {global.anchors.region.offset, ingress_end - global.anchors.region.offset, 256};
+    global.accepted_columns = rows();
+    global.count_columns    = rows();
+    local.accepted_columns  = locals();
+    local.active_columns    = locals();
+    if (out.speculative) out.speculative->last_columns = rows();
+    const auto commit_end = b.finish(256);
+    out.commit_ingress    = {global.accepted_columns.region.offset,
+                             commit_end - global.accepted_columns.region.offset, 256};
+}
+
+void draft_ids(FrameLayout& out, int rows) {
+    if (!out.mtp || !out.speculative) return;
+    for (std::size_t step = 0; step < out.mtp->draft_steps.size(); ++step) {
+        auto& ids = out.mtp->draft_steps[step].ids;
+        ids       = step ? out.speculative->drafts : out.rows.anchors;
+        if (step) ids.region.offset += (step - 1) * rows * sizeof(TokenId);
+        ids.shape            = {rows, 1, 1, 1};
+        ids.region.bytes     = rows * sizeof(TokenId);
+        ids.region.alignment = alignof(TokenId);
+    }
+}
+} // namespace
+
+void reshape_frame_controls(FrameLayout& out, PhysicalBatchShape shape, std::uint32_t width) {
+    const auto capacity = std::uint32_t(out.pending_hidden.shape[2]);
+    if (!shape.rows || !shape.attention_rows || shape.rows > capacity ||
+        shape.attention_rows > capacity || width != std::uint32_t(out.pending_hidden.shape[1]))
+        throw std::invalid_argument("GLM frame controls exceed their physical capacity");
+    LayoutBuilder b;
+    if (out.ingress.offset) (void)b.add(out.ingress.offset, 1, "frame prefix");
+    const auto capacity_end = out.main.ids.region.offset;
+    control_layout(b, out, shape, dimension(width));
+    if (b.finish(256) > capacity_end)
+        throw std::invalid_argument("GLM frame controls exceed allocation capacity");
+    if (out.sampled_ids) {
+        LayoutBuilder output;
+        const auto begin = out.egress.offset;
+        (void)output.add(begin, 1, "output prefix");
+        out.sampled_ids = output.add_tensor(DType::I32, {dimension(width), dimension(shape.rows)},
+                                            256, "generated tokens");
+        out.output_counts =
+            output.add_tensor(DType::I32, {dimension(shape.rows)}, 256, "generated token counts");
+        out.result_egress = {begin, output.finish() - begin, 256};
+        if (out.speculative)
+            out.speculative->drafts = output.add_tensor(
+                DType::I32,
+                out.mtp ? std::initializer_list<int>{dimension(shape.rows), dimension(width - 1)}
+                        : std::initializer_list<int>{dimension(width - 1), dimension(shape.rows)},
+                256, "draft tokens");
+        out.egress = {begin, output.finish() - begin, 256};
+    }
+    out.main.attention.table_rows = out.attention.main_tables;
+    if (out.mtp) out.mtp->history.attention.table_rows = out.attention.mtp_tables;
+    draft_ids(out, dimension(shape.rows));
+}
+
 FrameLayout plan_frame(LayoutBuilder& b, const execution::ModelProfile& p,
                        const ExecutionShape& s) {
     const auto& c   = p.config.text;
@@ -30,65 +152,16 @@ FrameLayout plan_frame(LayoutBuilder& b, const execution::ModelProfile& p,
         return result;
     };
     FrameLayout out;
-    out.rows.anchors           = rows();
-    out.decode                 = metadata(width * batch, false);
-    out.decode.ids             = out.rows.anchors;
-    auto& global               = out.rows;
-    global.source_offsets      = tensor(DType::I64, {batch}, "source State offsets");
-    global.destination_offsets = tensor(DType::I64, {batch}, "destination State offsets");
-    global.base_positions      = rows();
-    global.count_slots         = rows();
-    global.sampling_positions  = rows();
-    global.sampling_columns    = rows();
-    global.ingress             = {global.source_offsets.region.offset,
-                                  global.sampling_columns.region.offset + global.sampling_columns.region.bytes -
-                                      global.source_offsets.region.offset,
-                                  256};
-    auto& local                = out.attention;
-    local.to_global            = rows();
-    local.from_gather          = rows();
-    local.live_rows            = rows();
-    local.live_columns         = rows();
-    local.source_offsets       = tensor(DType::I64, {batch}, "local source State offsets");
-    local.destination_offsets  = tensor(DType::I64, {batch}, "local destination State offsets");
-    local.main_tables          = rows();
-    local.mtp_tables           = rows();
-    local.base_positions       = rows();
-    local.record_offsets       = rows();
-    local.ingress              = {local.to_global.region.offset,
-                                  local.record_offsets.region.offset + local.record_offsets.region.bytes -
-                                      local.to_global.region.offset,
-                                  256};
-    if (p.mtp || p.draft) out.speculative.emplace().extents = rows();
-    if (p.draft) out.dflash.emplace().valid_columns = rows();
-    if (p.mtp) {
-        auto& m = out.mtp.emplace();
-        for (std::uint32_t i = 0; i < s.draft_tokens; ++i)
-            m.draft_steps.push_back(metadata(batch, false));
-        m.skip_first = rows();
-    }
+    if (p.mtp || p.draft) out.speculative.emplace();
+    if (p.draft) out.dflash.emplace();
+    if (p.mtp) out.mtp.emplace();
+    if (s.purpose == EnginePurpose::Generation) out.sampling.emplace();
+    control_layout(b, out, {s.max_concurrency, s.max_concurrency}, width);
+    auto& local            = out.attention;
     const auto local_batch = [&](BatchLayout& io, int n, TensorRegion tables) {
         io.attention = {tensor(DType::I32, {n}, "local positions"), rows(), tables};
     };
-    local_batch(out.decode, width * batch, local.main_tables);
-    if (out.mtp)
-        for (auto& step : out.mtp->draft_steps) local_batch(step, batch, local.mtp_tables);
-    if (s.purpose == EnginePurpose::Generation)
-        out.sampling =
-            tensor(DType::I32, {sizeof(ops::SamplingConfig) / sizeof(std::int32_t), batch},
-                   "sampling configuration");
-    const auto ingress_end = b.finish(256);
-    out.ingress = {out.rows.anchors.region.offset, ingress_end - out.rows.anchors.region.offset,
-                   256};
-    global.accepted_columns = rows();
-    global.count_columns    = rows();
-    local.accepted_columns  = rows();
-    local.active_columns    = rows();
-    if (out.speculative) out.speculative->last_columns = rows();
-    const auto commit_end = b.finish(256);
-    out.commit_ingress    = {global.accepted_columns.region.offset,
-                             commit_end - global.accepted_columns.region.offset, 256};
-    out.main              = metadata(columns, true);
+    out.main = metadata(columns, true);
     local_batch(out.main, columns, local.main_tables);
     if (p.vision) out.visual_indices = tensor(DType::I32, {columns}, "visual embedding indices");
     const auto host_end = b.finish(256);
@@ -125,8 +198,7 @@ FrameLayout plan_frame(LayoutBuilder& b, const execution::ModelProfile& p,
                                         dimension(3ULL * heads * d), heads, heads, d, d});
     }
     if (out.mtp) {
-        auto& m            = *out.mtp;
-        m.proposal_columns = rows();
+        auto& m = *out.mtp;
         m.proposal_sampling =
             tensor(DType::I32, {sizeof(ops::SamplingConfig) / sizeof(std::int32_t), batch},
                    "proposal sampling");
@@ -170,16 +242,7 @@ FrameLayout plan_frame(LayoutBuilder& b, const execution::ModelProfile& p,
                                           : tensor(DType::I32, {width - 1, batch}, "draft tokens");
             last                    = out.speculative->drafts.region;
         }
-        if (out.mtp) {
-            for (int step = 0; step < width - 1; ++step) {
-                auto& ids = out.mtp->draft_steps[step].ids;
-                ids       = step ? out.speculative->drafts : out.rows.anchors;
-                if (step) ids.region.offset += (step - 1) * batch * sizeof(TokenId);
-                ids.shape            = {batch, 1, 1, 1};
-                ids.region.bytes     = batch * sizeof(TokenId);
-                ids.region.alignment = alignof(TokenId);
-            }
-        }
+        draft_ids(out, batch);
         out.egress = {first, last.offset + last.bytes - first, 256};
     }
     return out;

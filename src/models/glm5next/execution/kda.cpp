@@ -69,9 +69,9 @@ void kda(const Tensor& input, const ModelProfile& profile, const KdaParameters& 
              records->beta.view({heads, t, rows})},
             recurrent, cuda);
     } else {
-        ops::kimi_delta_attention_batch_update(q, key, value, forget, beta, p.a_log, p.dt_bias,
-                                               c.gate_lower_bound, scale, before.recurrent,
-                                               after.recurrent, recurrent, cuda);
+        ops::kimi_delta_attention_batch_update(
+            q, key, value, forget, beta, p.a_log, p.dt_bias, c.gate_lower_bound, scale,
+            before.recurrent, after.recurrent, batch.valid_columns, recurrent, cuda);
     }
     auto normalized = b.normalized.view({d, heads, m});
     ops::sigmoid_gated_rmsnorm(recurrent.view({d, heads, m}), p.norm, b.gate.view({d, heads, m}),

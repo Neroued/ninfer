@@ -193,7 +193,8 @@ struct ExtractFixture {
             {history_view(history.span(), indices)},
             {Tensor(records.span(), DType::BF16, {D, tokens, b}),
              Tensor(valid.span(), DType::I32, {b})},
-            a, {history_view(options.inplace ? history.span() : after.span(), indices)}, execution);
+            a, {history_view(options.inplace ? history.span() : after.span(), indices)}, {},
+            execution);
     }
 };
 

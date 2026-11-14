@@ -52,7 +52,8 @@ __global__ void shared_vector(const __nv_bfloat16* x, const __nv_bfloat16* weigh
         if (!lane) {
             if (route) {
                 if (shared_only) {
-                    shared_gate[token] = 1.0F / (1.0F + __expf(-sum));
+                    shared_gate[token] =
+                        storage.token_validity.contains(token) ? 1.0F / (1.0F + __expf(-sum)) : 0;
                 } else {
                     scores[token * kScoreRows + row] = sum;
                 }
@@ -67,9 +68,12 @@ __global__ void shared_vector(const __nv_bfloat16* x, const __nv_bfloat16* weigh
         }
         sum = warp_reduce_sum(sum);
         if (!lane) {
-            const int i = token * kHidden + row;
-            output.store(i, output.initial(i) + routed_value(token, row, storage, coefficients) +
-                                beta[token] * sum);
+            const int i     = token * kHidden + row;
+            const bool live = output.is_live(token);
+            output.store(i,
+                         output.initial(i, live) + routed_value(token, row, storage, coefficients) +
+                             beta[token] * sum,
+                         live);
         }
     }
 }
@@ -175,7 +179,9 @@ __global__ __launch_bounds__(128) void shared_mma(
                             const int row = row0 + wm * 16 + m * 32 + (lane >> 2) + (v / 2) * 8;
                             if (row < kExperts + 1) {
                                 if (shared_only) {
-                                    shared_gate[token] = 1.0F / (1.0F + __expf(-acc[m][n][v]));
+                                    shared_gate[token] = storage.token_validity.contains(token)
+                                                             ? 1.0F / (1.0F + __expf(-acc[m][n][v]))
+                                                             : 0;
                                 } else {
                                     scores[token * kScoreRows + row] = acc[m][n][v];
                                 }
@@ -192,13 +198,16 @@ __global__ __launch_bounds__(128) void shared_mma(
                         h[tokens * Intermediate + index] =
                             __float2bfloat16_rn(value - __bfloat162float(hi));
                 } else {
+                    const bool live = output.is_live(token);
 #pragma unroll
                     for (int m = 0; m < 2; ++m) {
                         const int row = row0 + wm * 32 + m * 16 + (lane >> 2) + (v / 2) * 8;
                         const int i   = token * kHidden + row;
-                        output.store(i, output.initial(i) +
-                                            routed_value(token, row, storage, coefficients) +
-                                            beta[token] * acc[m][n][v]);
+                        output.store(i,
+                                     output.initial(i, live) +
+                                         routed_value(token, row, storage, coefficients) +
+                                         beta[token] * acc[m][n][v],
+                                     live);
                     }
                 }
             }
@@ -208,7 +217,8 @@ __global__ __launch_bounds__(128) void shared_mma(
 
 template <bool Count, bool FixedIndices = false>
 __global__ void route_selection(const float* scores, int* ids, float* alpha, float* beta,
-                                int* counts, int tokens, ExpertSubsetKind subset, const int* mask) {
+                                int* counts, int tokens, ExpertSubsetKind subset, const int* mask,
+                                TokenValidity validity) {
     constexpr int Warps = Count ? 8 : 1;
     __shared__ float logits[Warps][kTopK];
     __shared__ int local[Count ? kExperts : 1];
@@ -221,15 +231,12 @@ __global__ void route_selection(const float* scores, int* ids, float* alpha, flo
     if (token < tokens) {
         routing::select_experts<SwiGLUH2560I640E512K10, FixedIndices>(
             scores + token * kScoreRows, ids + token * kTopK, alpha + token * kTopK, beta + token,
-            logits[warp]);
+            logits[warp], validity.contains(token));
         if constexpr (Count) {
             __syncwarp();
             if (lane < kTopK) {
                 const int expert = ids[token * kTopK + lane];
-                if (subset == ExpertSubsetKind::All ||
-                    mask[expert] == (subset == ExpertSubsetKind::MaskOnes)) {
-                    atomicAdd(local + expert, 1);
-                }
+                if (expert_in_subset(subset, mask, expert)) { atomicAdd(local + expert, 1); }
             }
         }
     }
@@ -252,45 +259,49 @@ void launch_shared_impl(const Tensor& x, const ScaledSwiGLUTerm& shared, const E
     const auto* coefficients = static_cast<const float*>(routes.coefficients.data);
     const auto* beta         = static_cast<const float*>(shared.coefficients.data);
     const int tokens         = x.ne[1];
-    with_output(destination, mode, [&](auto output) {
-        // Complete already produced the shared activation alongside control.
-        // The final shared down still combines routed and shared terms once.
-        if (plan.shared_algorithm == SharedAlgorithm::Vector) {
-            if (!prepared) {
-                shared_vector<true, Intermediate>
-                    <<<dim3(Intermediate / 4, tokens), 128, 0, stream>>>(
-                        input, gu, storage, coefficients, beta, output);
-            }
-            CUDA_CHECK(cudaGetLastError());
-            shared_vector<false, Intermediate><<<dim3(kHidden / 4, tokens), 128, 0, stream>>>(
-                input, down, storage, coefficients, beta, output);
-        } else {
-            const auto launch = [&]<int Columns>() {
+    with_output(
+        destination, mode,
+        [&](auto output) {
+            // Complete already produced the shared activation alongside control.
+            // The final shared down still combines routed and shared terms once.
+            if (plan.shared_algorithm == SharedAlgorithm::Vector) {
                 if (!prepared) {
-                    shared_mma<true, Columns, Intermediate, SplitActivation>
-                        <<<dim3(Intermediate / 32, (tokens + Columns - 1) / Columns), 128, 0,
-                           stream>>>(input, gu, storage, coefficients, beta, output, tokens);
+                    shared_vector<true, Intermediate>
+                        <<<dim3(Intermediate / 4, tokens), 128, 0, stream>>>(
+                            input, gu, storage, coefficients, beta, output);
                 }
                 CUDA_CHECK(cudaGetLastError());
-                shared_mma<false, Columns, Intermediate, SplitActivation>
-                    <<<dim3(kHidden / 64, (tokens + Columns - 1) / Columns), 128, 0, stream>>>(
-                        input, down, storage, coefficients, beta, output, tokens);
-            };
-            if (plan.shared_columns == 64) {
-                launch.template operator()<64>();
+                shared_vector<false, Intermediate><<<dim3(kHidden / 4, tokens), 128, 0, stream>>>(
+                    input, down, storage, coefficients, beta, output);
             } else {
-                launch.template operator()<32>();
+                const auto launch = [&]<int Columns>() {
+                    if (!prepared) {
+                        shared_mma<true, Columns, Intermediate, SplitActivation>
+                            <<<dim3(Intermediate / 32, (tokens + Columns - 1) / Columns), 128, 0,
+                               stream>>>(input, gu, storage, coefficients, beta, output, tokens);
+                    }
+                    CUDA_CHECK(cudaGetLastError());
+                    shared_mma<false, Columns, Intermediate, SplitActivation>
+                        <<<dim3(kHidden / 64, (tokens + Columns - 1) / Columns), 128, 0, stream>>>(
+                            input, down, storage, coefficients, beta, output, tokens);
+                };
+                if (plan.shared_columns == 64) {
+                    launch.template operator()<64>();
+                } else {
+                    launch.template operator()<32>();
+                }
             }
-        }
-        CUDA_CHECK(cudaGetLastError());
-    });
+            CUDA_CHECK(cudaGetLastError());
+        },
+        storage.token_validity);
 }
 
 template <int Intermediate, bool SplitActivation>
 void launch_control_shared_impl(const Tensor& x, const MoeWeights& weights,
                                 const ExpertRoutes& routes, ExpertSubset subset,
                                 const Tensor& shared, float* scores, const Storage& storage,
-                                const Plan& plan, CudaExecutionView execution) {
+                                const Plan& plan, TokenValidity validity,
+                                CudaExecutionView execution) {
     const auto stream   = execution.stream();
     const auto* input   = static_cast<const __nv_bfloat16*>(x.data);
     const auto* gu      = static_cast<const __nv_bfloat16*>(weights.shared.gate_up.weight.qdata);
@@ -324,12 +335,12 @@ void launch_control_shared_impl(const Tensor& x, const MoeWeights& weights,
             route_selection<true, FixedIndices><<<(x.ne[1] + 7) / 8, 256, 0, stream>>>(
                 scores, static_cast<int*>(routes.ids.data),
                 static_cast<float*>(routes.coefficients.data), static_cast<float*>(shared.data),
-                storage.groups.counts, x.ne[1], subset.kind, mask);
+                storage.groups.counts, x.ne[1], subset.kind, mask, validity);
         } else {
             route_selection<false, FixedIndices><<<x.ne[1], 32, 0, stream>>>(
                 scores, static_cast<int*>(routes.ids.data),
                 static_cast<float*>(routes.coefficients.data), static_cast<float*>(shared.data),
-                nullptr, x.ne[1], subset.kind, mask);
+                nullptr, x.ne[1], subset.kind, mask, validity);
         }
     };
     if (plan.network_topk)
@@ -359,14 +370,15 @@ void launch_shared(const Tensor& x, const ScaledSwiGLUTerm& shared, const Expert
 
 void launch_control_shared(const Tensor& x, const MoeWeights& weights, const ExpertRoutes& routes,
                            ExpertSubset subset, const Tensor& shared, float* scores,
-                           const Storage& storage, const Plan& plan, CudaExecutionView execution) {
+                           const Storage& storage, const Plan& plan, TokenValidity validity,
+                           CudaExecutionView execution) {
     const auto launch = [&]<int Intermediate>() {
         if (plan.shared_split_activation)
-            launch_control_shared_impl<Intermediate, true>(x, weights, routes, subset, shared,
-                                                           scores, storage, plan, execution);
+            launch_control_shared_impl<Intermediate, true>(
+                x, weights, routes, subset, shared, scores, storage, plan, validity, execution);
         else
-            launch_control_shared_impl<Intermediate, false>(x, weights, routes, subset, shared,
-                                                            scores, storage, plan, execution);
+            launch_control_shared_impl<Intermediate, false>(
+                x, weights, routes, subset, shared, scores, storage, plan, validity, execution);
     };
     if (weights.shared.down.weight.k == 320)
         launch.template operator()<320>();

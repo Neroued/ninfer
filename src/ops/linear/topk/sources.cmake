@@ -19,3 +19,11 @@ if(NINFER_TARGET STREQUAL "dgx_spark")
     "${CMAKE_CURRENT_LIST_DIR}/keys/dgx_spark/mxfp8.cu"
     "${CMAKE_CURRENT_LIST_DIR}/keys/dgx_spark/q4.cu")
 endif()
+
+target_sources(ninfer_ops_non_rdc PRIVATE
+  "${CMAKE_CURRENT_LIST_DIR}/q8/shapes/n248320_k5120/large.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/q4/shapes/n131072_k5120/large.cu")
+if(NOT NINFER_TARGET STREQUAL "dgx_spark")
+  target_sources(ninfer_ops_non_rdc PRIVATE
+    "${CMAKE_CURRENT_LIST_DIR}/fp8/shapes/n248320_k5120/large.cu")
+endif()

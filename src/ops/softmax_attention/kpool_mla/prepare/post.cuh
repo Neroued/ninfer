@@ -27,7 +27,7 @@ __device__ __forceinline__ __nv_bfloat16* record_at(const PrepareArguments& a, i
 
 __device__ __forceinline__ __nv_bfloat16* carry_at(const PrepareArguments& a, int kind, int b,
                                                    int r) {
-    return a.carry + ((b * 2 + kind) * 3 + r) * 128;
+    return a.carry + ((std::int64_t(b) * 2 + kind) * 3 + r) * 128;
 }
 
 __device__ __forceinline__ __nv_bfloat16 old_word(const PrepareArguments& a, int kind, int b,
@@ -287,16 +287,8 @@ __global__ __launch_bounds__(ParallelTail ? 256 : 128) void prepare_post_kernel(
         }
         job -= columns;
     }
-    const int first_b = a.first_row, last_b = a.last_row;
-    int b = first_b, t0 = 0, t1 = 0;
-    for (; b <= last_b; ++b) {
-        t0                 = b == first_b ? a.first_column : 0;
-        t1                 = b == last_b ? a.last_stop : a.tokens;
-        const int capacity = (t1 - t0 + 6) / 4;
-        if (job < capacity) break;
-        job -= capacity;
-    }
-    if (b > last_b) return;
+    int b, t0, t1;
+    pool_coordinate(a, job, b, t0, t1);
     const int n = a.valid[b], stop = min(t1, n);
     if (stop <= t0) return;
     const int initial  = a.positions[std::int64_t(b) * a.tokens];

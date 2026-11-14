@@ -15,7 +15,7 @@ void sparse_mla_geometry(const KpoolSparseMlaProfile& p, KpoolMlaStorage storage
     require(storage == KpoolMlaStorage::BFloat16 ||
                 storage == KpoolMlaStorage::Fp8E4m3fnGroup128Ue8m0,
             "unsupported Sparse MLA latent format");
-    require(lo > 0 && hi >= lo && batch >= 1 && batch <= 8 && sms > 0, "Sparse MLA T/B/device");
+    require(lo > 0 && hi >= lo && batch >= 1 && sms > 0, "Sparse MLA T/B/device");
     require(envelope.max_visible_tokens <= kKpoolMaxVisibleTokens, "Sparse MLA context limit");
 }
 

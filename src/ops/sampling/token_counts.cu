@@ -66,7 +66,7 @@ void increment_token_counts_batch(const Tensor& token_ids, const Tensor& valid_c
     constexpr const char* op = "increment_token_counts_batch";
     const int t = token_ids.ne[0], b = token_ids.ne[1], v = token_counts.ne[0],
               s = token_counts.ne[1];
-    if (t <= 0 || b < 1 || b > 8 || v <= 0 || s <= 0)
+    if (t <= 0 || b < 1 || v <= 0 || s <= 0)
         throw std::invalid_argument("increment_token_counts_batch: invalid shape");
     operand::tensor(token_ids, DType::I32, {t, b}, 4, op, "IDs", execution.device());
     operand::tensor(valid_columns, DType::I32, {b}, 4, op, "valid columns", execution.device());

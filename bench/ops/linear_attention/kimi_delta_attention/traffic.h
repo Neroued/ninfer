@@ -44,7 +44,9 @@ struct Traffic {
 
 inline Traffic traffic(Fixture& f, const std::string& op) {
     const auto n = std::accumulate(f.valid_counts.begin(), f.valid_counts.end(), std::uint64_t(0));
-    const std::uint64_t state         = 4ULL * 128 * 128 * f.h * f.b;
+    const auto active =
+        std::count_if(f.valid_counts.begin(), f.valid_counts.end(), [](int n) { return n != 0; });
+    const std::uint64_t state         = 4ULL * 128 * 128 * f.h * active;
     const std::uint64_t record_column = 2ULL * 128 * f.qh + 6ULL * 128 * f.h + 4ULL * f.h;
     Traffic out;
     const std::uint64_t m = std::uint64_t(f.t) * f.b;
@@ -99,7 +101,7 @@ inline Traffic traffic(Fixture& f, const std::string& op) {
         return out;
     }
     if (op == "input-update" || op == "input-record") {
-        out.state_read   = 6ULL * f.channels * f.b;
+        out.state_read   = 6ULL * f.channels * active;
         out.state_write  = op == "input-update" ? out.state_read : 0;
         out.record_write = op == "input-record" ? 2ULL * f.channels * n : 0;
         out.read =
@@ -139,8 +141,8 @@ inline Traffic traffic(Fixture& f, const std::string& op) {
         out.state_write   = op == "record" ? 0 : state;
         const auto copied = f.aliases_kv_records() ? 0 : 2ULL * 128 * (f.qh + f.h);
         out.record_write  = op == "record" ? (copied + 4ULL * 129 * f.h) * n : 0;
-        out.read = (4ULL * 128 * f.qh + 4ULL * 128 * f.h + 2ULL * f.h) * n + 4ULL * 129 * f.h +
-                   out.state_read;
+        out.read          = (4ULL * 128 * f.qh + 4ULL * 128 * f.h + 2ULL * f.h) * n +
+                   (active ? 4ULL * 129 * f.h : 0) + out.state_read;
         out.write      = 2ULL * 128 * f.h * f.t * f.b + out.state_write + out.record_write;
         namespace core = ops::detail::kimi_delta_attention;
         if (op == "core" && core::select_recurrence_route(f.t) == core::RecurrenceRoute::Chunked) {

@@ -3,7 +3,7 @@
 namespace ninfer::models::qwen4_exp::detail {
 
 Tensor RankProgramImpl::device_embedding(std::int32_t tokens, std::int32_t batch) {
-    return packed_tensor(*resources.plan.persistent.buffers.ple_embedding,
+    return packed_tensor(*resources.buffers().ple_embedding,
                          {dimension(parameters.profile->config.text.ple.embedding), tokens, batch});
 }
 
@@ -17,7 +17,7 @@ void RankProgramImpl::prepare_device_ple(const execution::BatchView& batch) {
         hash.vocab_sizes[i] = controls.vocab_sizes[i];
         hash.offsets[i]     = controls.offsets[i];
     }
-    const auto& io     = resources.plan.persistent.buffers.batch;
+    const auto& io     = resources.buffers().batch;
     const auto tail    = packed_tensor(io.raw_tail, {2, batch.batch});
     const auto offsets = device_tensor(io.raw_tail_offsets).slice(0, 0, batch.batch);
     const StateFieldView tail_field{

@@ -13,7 +13,7 @@ void launch_recurrent_inout(const Tensor& q, const Tensor& k, const Tensor& v, c
 void launch_recurrent_batch_update(const Tensor& q, const Tensor& k, const Tensor& v,
                                    const Tensor& g, const Tensor& beta, float scale,
                                    bool normalize_qk, ConstStateFieldView source_state,
-                                   StateFieldView destination_state, Tensor& out,
-                                   cudaStream_t stream);
+                                   StateFieldView destination_state, const Tensor& valid_columns,
+                                   Tensor& out, cudaStream_t stream);
 
 } // namespace ninfer::ops::detail::gated_delta_net

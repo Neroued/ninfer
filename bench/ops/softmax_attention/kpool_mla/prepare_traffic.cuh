@@ -23,8 +23,7 @@ inline KpoolPrepareTraffic kpool_prepare_traffic(const tool::kpool::Fixture& f,
         std::none_of(f.valid.host.begin(), f.valid.host.end(), [](int n) { return n > 0; });
     const auto simt = [](impl::ProjectionRoute r) {
         return r == impl::ProjectionRoute::Gemv || r == impl::ProjectionRoute::Simt2 ||
-               r == impl::ProjectionRoute::Simt4 || r == impl::ProjectionRoute::Fp8Simt1 ||
-               r == impl::ProjectionRoute::Fp8Simt4;
+               r == impl::ProjectionRoute::Fp8Simt1 || r == impl::ProjectionRoute::Fp8Simt4;
     };
     for (int begin = 0; begin < total; begin += layout.columns) {
         const int columns = std::min(layout.columns, total - begin);

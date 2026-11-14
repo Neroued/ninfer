@@ -11,6 +11,19 @@ std::vector<int> ragged(int width, int batch) {
     return valid;
 }
 
+void append_batch_cases(std::vector<RecordCase>& result, Profile profile) {
+    using Policy      = ops::LinearPolicy;
+    const auto policy = profile.format == QType::NVFP4                 ? Policy::AllowA4
+                        : profile.format == QType::FP8_E4M3FN_ROW_BF16 ? Policy::AllowA8
+                                                                       : Policy::A16Only;
+    for (const int batch : {9, 17}) {
+        auto valid = ragged(4, batch);
+        for (int row = 1; row < batch; row += 3) valid[row] = 0;
+        result.push_back({4, batch, std::move(valid), 1913U, policy});
+    }
+    result.push_back({3, 1, {0}, 1919U});
+}
+
 std::vector<RecordCase> cases(Profile p) {
     using Policy = ops::LinearPolicy;
     std::vector<RecordCase> result;
@@ -22,6 +35,7 @@ std::vector<RecordCase> cases(Profile p) {
                 if (b == 1) valid[0] = t - 1;
                 result.push_back({t, b, std::move(valid), 1901U + t + b});
             }
+        append_batch_cases(result, p);
         return result;
     }
     if (p.format == QType::Q4_G64_FP16) {
@@ -55,6 +69,7 @@ std::vector<RecordCase> cases(Profile p) {
                 for (int b : {2, 3, 4}) result.push_back({4, b, ragged(4, b), 1810U + b, policy});
         }
     }
+    append_batch_cases(result, p);
     return result;
 }
 } // namespace
@@ -102,6 +117,8 @@ int main(int argc, char** argv) {
                                  {{"format", profile.name},
                                   {"policy", policy_name(c.policy)},
                                   {"execution", graph ? "graph" : "eager"}}});
+            if (c.batch > 8 || std::find(c.valid.begin(), c.valid.end(), 0) != c.valid.end())
+                catalogue.back().tags.emplace_back("suite", "concurrency");
         }
         suite.add(std::move(catalogue), [=](auto selected) {
             Weights weights(profile, true);

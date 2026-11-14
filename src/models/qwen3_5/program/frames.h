@@ -5,9 +5,9 @@
 #include "ninfer/ops/sampling.h"
 #include "ninfer/types.h"
 
-#include <array>
 #include <cstdint>
 #include <optional>
+#include <span>
 
 namespace ninfer::models::qwen3_5 {
 
@@ -24,42 +24,95 @@ struct FrameSpec {
     std::uint32_t control_token_limit = 0;
 };
 
-// Arrays are compact-row indexed. Tensor views bind only the current exact-B prefix.
-struct FrameIngress {
-    std::array<TokenId, kMaximumConcurrency> anchors{};
-    std::array<std::int32_t, kMaximumConcurrency> frontiers{};
-    std::array<std::int32_t, kMaximumConcurrency> backend_frontiers{};
-    std::array<std::int32_t, kMaximumConcurrency> extents{};
-    std::array<std::int32_t, kMaximumConcurrency> valid_columns{};
-    std::array<std::int32_t, kMaximumConcurrency> proposal_valid_columns{};
-    std::array<std::int32_t, kMaximumConcurrency> budgets{};
-    std::array<std::int32_t, kMaximumConcurrency> main_table_rows{};
-    std::array<std::int32_t, kMaximumConcurrency> backend_table_rows{};
-    std::array<std::int64_t, kMaximumConcurrency> state_source_offsets{};
-    std::array<std::int64_t, kMaximumConcurrency> state_destination_offsets{};
-    std::array<std::int32_t, kMaximumConcurrency> residency_slots{};
-    std::array<std::int32_t, kMaximumConcurrency> rope_deltas{};
-    std::array<ops::SamplingConfig, kMaximumConcurrency> sampling{};
-    std::array<std::int32_t, kMaximumConcurrency> sampling_positions{}, history_skip{};
-    std::array<std::int32_t, 3 * kMaximumConcurrency> previous_rope{};
-    std::array<std::int32_t, 16 * kMaximumConcurrency> decode_positions{};
-    std::array<std::int32_t, 48 * kMaximumConcurrency> decode_rope{};
-    std::array<std::int32_t, 5 * kMaximumConcurrency> step_positions{}, step_valid{};
-    std::array<std::int32_t, 15 * kMaximumConcurrency> step_rope{};
+struct FrameIngressLayout {
+    TensorRegion live_rows;
+    TensorRegion anchors;
+    TensorRegion frontiers;
+    TensorRegion backend_frontiers;
+    TensorRegion extents;
+    TensorRegion valid_columns;
+    TensorRegion proposal_valid_columns;
+    TensorRegion budgets;
+    TensorRegion main_table_rows;
+    TensorRegion backend_table_rows;
+    TensorRegion residency_slots;
+    TensorRegion rope_deltas;
+    TensorRegion sampling_positions;
+    TensorRegion history_skip;
+    TensorRegion previous_rope;
+    TensorRegion decode_positions;
+    TensorRegion decode_rope;
+    TensorRegion step_positions;
+    TensorRegion step_valid;
+    TensorRegion step_rope;
+    TensorRegion state_source_offsets;
+    TensorRegion state_destination_offsets;
+    LayoutRegion sampling;
+    std::size_t bytes = 0;
 };
 
-struct FrameCommit {
-    std::array<std::int64_t, kMaximumConcurrency> state_destination_offsets{};
-    std::array<std::int32_t, kMaximumConcurrency> last_columns{}, accepted_columns{};
-    std::array<std::int32_t, kMaximumConcurrency> count_columns{};
-    std::array<std::int32_t, kMaximumConcurrency> draft_append_starts{};
-    std::array<std::int32_t, kMaximumConcurrency> draft_append_ends{};
+struct FrameCommitLayout {
+    TensorRegion state_destination_offsets;
+    TensorRegion last_columns;
+    TensorRegion accepted_columns;
+    TensorRegion count_columns;
+    TensorRegion draft_append_starts;
+    TensorRegion draft_append_ends;
+    std::size_t bytes = 0;
 };
 
-struct FrameEgress {
-    std::array<TokenId, kMaximumConcurrency * 16> tokens{};
-    std::array<std::int32_t, kMaximumConcurrency> counts{};
+struct FrameEgressLayout {
+    TensorRegion tokens, counts;
+    std::size_t bytes = 0;
 };
+
+struct FrameControlLayout {
+    FrameIngressLayout ingress;
+    FrameCommitLayout commit;
+    FrameEgressLayout egress;
+};
+
+struct FrameIngressView {
+    std::span<std::int32_t> live_rows;
+    std::span<std::int32_t> anchors;
+    std::span<std::int32_t> frontiers;
+    std::span<std::int32_t> backend_frontiers;
+    std::span<std::int32_t> extents;
+    std::span<std::int32_t> valid_columns;
+    std::span<std::int32_t> proposal_valid_columns;
+    std::span<std::int32_t> budgets;
+    std::span<std::int32_t> main_table_rows;
+    std::span<std::int32_t> backend_table_rows;
+    std::span<std::int32_t> residency_slots;
+    std::span<std::int32_t> rope_deltas;
+    std::span<std::int32_t> sampling_positions;
+    std::span<std::int32_t> history_skip;
+    std::span<std::int32_t> previous_rope;
+    std::span<std::int32_t> decode_positions;
+    std::span<std::int32_t> decode_rope;
+    std::span<std::int32_t> step_positions;
+    std::span<std::int32_t> step_valid;
+    std::span<std::int32_t> step_rope;
+    std::span<std::int64_t> state_source_offsets;
+    std::span<std::int64_t> state_destination_offsets;
+    std::span<ops::SamplingConfig> sampling;
+};
+
+struct FrameCommitView {
+    std::span<std::int64_t> state_destination_offsets;
+    std::span<std::int32_t> last_columns;
+    std::span<std::int32_t> accepted_columns;
+    std::span<std::int32_t> count_columns;
+    std::span<std::int32_t> draft_append_starts;
+    std::span<std::int32_t> draft_append_ends;
+};
+
+struct FrameEgressView {
+    std::span<TokenId> tokens;
+    std::span<std::int32_t> counts;
+};
+
+[[nodiscard]] FrameControlLayout plan_frame_controls(const FrameSpec&, std::uint32_t rows);
 
 struct MtpFrameLayout {
     TensorRegion base_conditioning;
@@ -100,6 +153,7 @@ struct FrameHostLayout {
 
 struct FrameLayout {
     FrameSpec spec;
+    FrameControlLayout controls;
     std::int32_t input_capacity = 0;
     LayoutRegion ingress;
     LayoutRegion commit;
@@ -162,12 +216,20 @@ public:
     [[nodiscard]] FrameInputView decode_view(std::int32_t width, std::int32_t batch) const;
     [[nodiscard]] FrameInputView host_decode_view(std::int32_t width, std::int32_t batch) const;
 
+    void bind_rows(std::uint32_t rows);
+    void clear_ingress();
+    void clear_commit();
+    void clear_egress();
+
+    [[nodiscard]] std::uint32_t rows() const noexcept { return rows_; }
+
     const FrameSpec spec;
     const std::int32_t input_capacity;
     PinnedHostBuffer host_storage;
-    FrameIngress* host_ingress = nullptr;
-    FrameCommit* host_commit   = nullptr;
-    FrameEgress* host_egress   = nullptr;
+    FrameIngressView host_ingress;
+    FrameCommitView host_commit;
+    FrameEgressView host_egress;
+    MemorySpan host_ingress_bytes, host_commit_bytes, host_egress_bytes;
     Tensor host_input_ids, host_cache_positions, host_rope_positions;
     Tensor host_visual_indices;
     Tensor host_control_tokens;
@@ -175,7 +237,7 @@ public:
     Tensor host_masks, host_drafts, host_score_logprobs;
     Tensor host_step_positions, host_step_rope_positions, host_step_valid_columns;
     MemorySpan ingress, commit, egress;
-    Tensor anchors, frontiers, backend_frontiers, extents, valid_columns;
+    Tensor live_rows, anchors, frontiers, backend_frontiers, extents, valid_columns;
     Tensor proposal_valid_columns, budgets, main_table_rows, backend_table_rows;
     Tensor state_source_offsets, state_destination_offsets, residency_slots, rope_deltas;
     const ops::SamplingConfig* sampling = nullptr;
@@ -192,6 +254,9 @@ public:
     std::optional<DFlashFrame> dflash;
 
 private:
+    MemorySpan ingress_storage_, commit_storage_, egress_storage_;
+    MemorySpan host_ingress_storage_, host_commit_storage_, host_egress_storage_;
+    std::uint32_t rows_ = 0;
     void validate_input_shape(std::int32_t width, std::int32_t batch) const;
 };
 

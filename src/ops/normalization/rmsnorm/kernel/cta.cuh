@@ -8,11 +8,13 @@
 namespace ninfer::ops::detail::rmsnorm {
 
 // One CTA owns a wide row. Vector routes require a width divisible by the CTA pair span.
-template <Epilogue Kind, int Block, int MaxPairsPerThread, bool Prefetch, int FixedD = 0>
+template <Epilogue Kind, int Block, int MaxPairsPerThread, bool Prefetch, int FixedD = 0,
+          bool SaveInverse = false>
 __launch_bounds__(Block) __global__
     void rmsnorm_cta_bf16x2_kernel(const __nv_bfloat162* x, const __nv_bfloat162* weight,
                                    const __nv_bfloat162* z, __nv_bfloat162* out,
-                                   std::int32_t input_d, std::int64_t rows, float eps) {
+                                   std::int32_t input_d, std::int64_t rows, float eps,
+                                   float* inverse_output) {
     const int d = FixedD ? FixedD : input_d;
     static_assert(Block % common::kWarpSize == 0);
     const std::int64_t row = static_cast<std::int64_t>(blockIdx.x);
@@ -50,6 +52,9 @@ __launch_bounds__(Block) __global__
     if (threadIdx.x == 0) { inv_shared = rsqrtf(block_sum / static_cast<float>(d) + eps); }
     __syncthreads();
     const float inv = inv_shared;
+    if constexpr (SaveInverse) {
+        if (threadIdx.x == 0) inverse_output[row] = inv;
+    }
 
 #pragma unroll
     for (int k = 0; k < MaxPairsPerThread; ++k) {
@@ -78,11 +83,11 @@ __launch_bounds__(Block) __global__
 // Implements: include/ninfer/ops/rmsnorm.h
 // Match: aligned contiguous BF16, plain epilogue, D=2048, sm_120a.
 // Algorithm assumptions: exactly two BF16x2 values per thread; one 512-thread CTA owns one row.
-template <Epilogue Kind>
+template <Epilogue Kind, bool SaveInverse = false>
 __launch_bounds__(512) __global__
     void rmsnorm_d2048_bf16x2_kernel(const __nv_bfloat162* x, const __nv_bfloat162* weight,
                                      const __nv_bfloat162* z, __nv_bfloat162* out,
-                                     std::int64_t rows, float eps) {
+                                     std::int64_t rows, float eps, float* inverse_output) {
     constexpr int kBlock       = 512;
     constexpr int kPairsPerRow = 1024;
     const std::int64_t row     = static_cast<std::int64_t>(blockIdx.x);
@@ -103,6 +108,9 @@ __launch_bounds__(512) __global__
     if (threadIdx.x == 0) { inv_shared = rsqrtf(sum * (1.0f / 2048.0f) + eps); }
     __syncthreads();
     const float inv = inv_shared;
+    if constexpr (SaveInverse) {
+        if (threadIdx.x == 0) inverse_output[row] = inv;
+    }
 
     const float2 w0 = __bfloat1622float2(weight[pair0]);
     const float2 w1 = __bfloat1622float2(weight[pair1]);

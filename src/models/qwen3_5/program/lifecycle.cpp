@@ -12,14 +12,13 @@ namespace ninfer::models::qwen3_5::detail {
 RankProgramImpl::RankProgramImpl(const execution::Parameters& values, const SequencePlanImpl& plan,
                                  DeviceContext& context, const StartupObserver& observer)
     : parameters(values), device(context), capacity(plan.capacity),
-      max_concurrency(plan.max_concurrency), prefill_chunk(plan.prefill_chunk),
-      draft_window(plan.draft_window), backend(plan.speculative_backend),
-      proposal_head(plan.proposal_head), use_cuda_graph(plan.use_cuda_graph),
-      kv_storage(plan.kv_storage), workspace_plan(plan.workspace),
-      resources(context, plan.persistent, plan.workspace, observer),
-      context_counts(plan.causal_scoring ? 0
-                                         : std::size_t(values.profile->public_tokens) *
-                                               plan.max_concurrency * sizeof(std::int32_t)),
+      max_concurrency(plan.max_concurrency), batch_execution(plan.batch_execution),
+      prefill_chunk(plan.prefill_chunk), draft_window(plan.draft_window),
+      backend(plan.speculative_backend), proposal_head(plan.proposal_head),
+      use_cuda_graph(plan.use_cuda_graph), kv_storage(plan.kv_storage),
+      workspace_plan(plan.workspace), resources(context, plan.persistent, plan.workspace, observer),
+      context_counts(plan.persistent.pinned_context_counts_bytes()),
+      residencies(plan.max_concurrency), validation_marks(plan.max_concurrency),
       result_ready(context), drafts_ready(context), compute_retired(context),
       context_ready(context), prefill_timer(context), gpu_timer(context, plan.gpu_timing) {
     if (parameters.profile != plan.profile || parameters.profile->options != plan.features)
@@ -86,9 +85,8 @@ void RankProgramImpl::install_residencies(const ContextWork& work) {
                                        device.transfer_stream()));
             continue;
         }
-        auto* row_counts = counts + lane * vocabulary;
-        binding.counts.restore({row_counts, vocabulary});
-        CUDA_CHECK(cudaMemcpyAsync(destination.data, row_counts, vocabulary * sizeof(std::int32_t),
+        binding.counts.restore({counts, vocabulary});
+        CUDA_CHECK(cudaMemcpyAsync(destination.data, counts, vocabulary * sizeof(std::int32_t),
                                    cudaMemcpyHostToDevice, device.transfer_stream()));
     }
 }

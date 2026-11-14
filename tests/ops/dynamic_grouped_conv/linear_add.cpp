@@ -282,6 +282,12 @@ int run_profile(std::int32_t input_rows, std::span<const std::pair<int, int>> ca
 } // namespace
 
 void add_linear_conv_add_cases(ninfer::test::OpSuite& suite) {
+    suite.add("linear_conv_add/k4096/w2/b17",
+              [] {
+                  const std::array cases{std::pair{2, 17}};
+                  return run_profile(4096, cases);
+              },
+              {{"suite", "concurrency"}});
     for (int input_rows : {4096, 17408}) {
         std::vector<std::pair<int, int>> shapes;
         std::vector<OpCase> cases;

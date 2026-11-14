@@ -137,7 +137,7 @@ void run(const Options& o, Fixture& gate_up, Fixture& down) {
             std::vector<int> selected(std::size_t(ep::K) * t);
             if (subset.kind != ops::ExpertSubsetKind::None) {
                 ops::topk_sigmoid_route(x, profile.routing, router.weight, correction_tensor,
-                                        routes, workspace, cuda);
+                                        routes, {}, workspace, cuda);
                 CUDA_CHECK(cudaStreamSynchronize(cuda.stream()));
                 ids.copy_to_host(selected.data(), selected.size() * 4);
             }
@@ -215,8 +215,8 @@ void run(const Options& o, Fixture& gate_up, Fixture& down) {
                     workspace.reset_peak();
                     const auto result = measurement::measure(
                         [&](auto view) {
-                            ops::topk_sigmoid_swiglu_moe(x, profile, weights, subset, y, workspace,
-                                                         view);
+                            ops::topk_sigmoid_swiglu_moe(x, profile, weights, subset, y, {},
+                                                         workspace, view);
                         },
                         [](auto) {}, flush, cuda, o.timing, execution, cache);
                     row.workspace_peak = workspace.peak_used();

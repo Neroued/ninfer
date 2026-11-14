@@ -23,12 +23,13 @@ public:
     using Commit = typename Types::Commit;
 
     DistributedExecutor(std::unique_ptr<distributed::ExecutionGroup> group,
-                        ExecutionCapacity capacity, Codec codec,
+                        ExecutionCapacity capacity, Codec codec, std::uint32_t max_decode_rows,
                         std::vector<RankSnapshot> initial_observations = {})
-        : group_(std::move(group)), pool_(capacity), codec_(std::move(codec)),
-          budget_(codec_.control_budget()), compute_(capacity.compute_frames),
-          context_(capacity.context_frames), progress_(group_->topology().ranks.size()),
-          measurement_reports_(progress_.size()), measurement_errors_(progress_.size()) {
+        : Executor<Types>(max_decode_rows), group_(std::move(group)), pool_(capacity),
+          codec_(std::move(codec)), budget_(codec_.control_budget()),
+          compute_(capacity.compute_frames), context_(capacity.context_frames),
+          progress_(group_->topology().ranks.size()), measurement_reports_(progress_.size()),
+          measurement_errors_(progress_.size()) {
         this->observations_.resize(progress_.size());
         if (!initial_observations.empty()) this->observations_ = std::move(initial_observations);
         const auto model_budget = budget_;
@@ -50,7 +51,8 @@ public:
                     backend.graph = {};
                 }
         }
-        validate_control_capacity();
+        group_->reserve_control_capacity(
+            protocol::control_transport_limits(budget_, pool_.capacity(), progress_.size(), true));
     }
 
     ~DistributedExecutor() override {
@@ -416,11 +418,6 @@ private:
                 inputs_.release(release.id);
             }
         }
-    }
-
-    void validate_control_capacity() const {
-        protocol::validate_control_capacity(budget_, pool_.capacity(), group_->limits(),
-                                            group_->topology().ranks.size());
     }
 
     void measurement_boundary(MeasurementCommand command) {

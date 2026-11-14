@@ -28,7 +28,8 @@ RankPreparation::RankPreparation(const artifact::Reader& reader, std::span<const
         throw std::invalid_argument("Qwen4Exp rank plan differs from worker identity");
     if (request.artifact != reader.artifact_id())
         throw artifact::ArtifactError("Qwen4Exp worker artifact differs from coordinator");
-    options_                  = std::move(request.options);
+    batches_ = std::make_shared<const BatchExecutionPlan>(std::move(request.batches));
+    options_ = std::move(request.options);
     options_.startup_observer = observer;
     host_reservation_bytes_   = request.host_reservation_bytes;
     control_owner_            = request.control_owner;
@@ -37,13 +38,14 @@ RankPreparation::RankPreparation(const artifact::Reader& reader, std::span<const
                                     device_.device()));
     profile_       = execution::describe_model(load_->definition(), load_->weight_data(),
                                                load_->expert_data(), load_->rank_plan());
-    capacity_plan_ = describe_execution_capacity(profile_, options_, device_);
+    capacity_plan_ = describe_execution_capacity(profile_, options_, batches_, device_);
     const WorkContract contract{describe_execution_shape(*profile_, options_),
                                 profile_->config.text.vocabulary,
                                 profile_->public_tokens,
                                 bool(profile_->mtp),
                                 bool(profile_->vision),
-                                profile_->control_token_limit};
+                                profile_->control_token_limit,
+                                batches_};
     host_reservation_bytes_ +=
         runtime::protocol::work_payload_memory(contract.payload_capacity(topology.ranks.size()),
                                                {1, 1}, topology.ranks.size(), control_owner_);
@@ -64,7 +66,7 @@ void RankPreparation::materialize() {
 std::vector<distributed::GroupRequirements> RankPreparation::communication_requirements() const {
     using distributed::Collective;
     using distributed::Reduction;
-    const auto plan   = plan_graph_probe(profile_, {}, options_, device_, {});
+    const auto plan   = plan_graph_probe(profile_, {}, options_, batches_, device_, {});
     const auto& shape = plan.shape;
     const auto hidden = std::size_t(profile_->config.text.hidden);
     const auto batch  = std::size_t(shape.max_concurrency);
@@ -124,7 +126,7 @@ void RankPreparation::prepare_rebuild_probe() {
 }
 
 void RankPreparation::create_probe(GraphProbeBacking backing) {
-    auto plan = plan_graph_probe(profile_, {}, options_, device_, {}, backing);
+    auto plan = plan_graph_probe(profile_, {}, options_, batches_, device_, {}, backing);
     probe_    = std::make_unique<RankProgram>(instance_->parameters, std::move(plan), device_,
                                               options_.startup_observer, binding_);
 }
@@ -158,7 +160,7 @@ void RankPreparation::prepare(runtime::ContextCapacity capacity, std::size_t ava
     auto options             = options_;
     options.context_capacity = ContextCapacityPolicy::explicit_capacity(capacity.device_bytes);
     const auto reserve       = graph_memory_.rebuild_estimate_bytes;
-    auto plan                = plan_execution(profile_, {}, options, device_,
+    auto plan                = plan_execution(profile_, {}, options, batches_, device_,
                                available > reserve ? available - reserve : 0, {}, control_owner_,
                                               available_host_bytes);
     if (!plan) {

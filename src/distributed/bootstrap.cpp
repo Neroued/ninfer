@@ -337,7 +337,15 @@ ExecutionGroup::ExecutionGroup(DeploymentOptions options, ExecutionTopology topo
 
 ExecutionGroup::~ExecutionGroup() = default;
 
-const TransportLimits& ExecutionGroup::limits() const noexcept { return impl_->transport.limits(); }
+void ExecutionGroup::reserve_control_capacity(const TransportLimits& limits) {
+    impl_->transport.reserve_capacity(limits);
+}
+
+TransportLimits ExecutionGroup::limits() const { return impl_->transport.limits(); }
+
+void WorkerConnection::reserve_control_capacity(const TransportLimits& limits) {
+    transport_->reserve_capacity(limits);
+}
 
 bool ExecutionGroup::try_send(std::span<const OutgoingMessage> messages, Traffic traffic) {
     return impl_->try_send(messages, traffic);

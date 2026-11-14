@@ -82,7 +82,7 @@ KpoolTailFields append_kpool_tail_fields(StateImageBuilder& builder, int index_d
 
 KpoolRawRecordLayout plan_kpool_raw_records(LayoutBuilder& builder, int dim, int width, int rows,
                                             int layers) {
-    if (dim <= 0 || width <= 0 || rows < 1 || rows > 8 || layers <= 0)
+    if (dim <= 0 || width <= 0 || rows < 1 || layers <= 0)
         throw std::invalid_argument("Kpool records: invalid geometry");
     return {builder.add_tensor(DType::BF16, {dim, width, rows, layers}, 256, "Kpool raw keys"),
             builder.add_tensor(DType::BF16, {dim, width, rows, layers}, 256, "Kpool raw gates")};

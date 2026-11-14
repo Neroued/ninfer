@@ -75,7 +75,7 @@ __launch_bounds__(256) __global__
     const int kv_head       = unit % Geometry::KVHeads;
     const int lane          = threadIdx.x & 31;
     const auto input_offset = static_cast<std::int64_t>(batch) * width * 256 * Geometry::KVHeads;
-    const int position      = positions[batch * width] + token;
+    const int position      = positions[static_cast<std::int64_t>(batch) * width] + token;
     const auto* table       = metadata.block_table();
     std::int64_t page       = lane == 0 ? lookup_page(table, position) : 0;
     page                    = __shfl_sync(0xffffffffU, page, 0);

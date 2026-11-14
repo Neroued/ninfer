@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <stdexcept>
 #include <string>
 
@@ -63,9 +64,7 @@ void require_parameters(float epsilon, float theta) {
         throw std::invalid_argument("rmsnorm_rope: epsilon and theta must be positive and finite");
 }
 
-constexpr std::int32_t kHeadDim       = 128;
-constexpr std::int32_t kMaximumBatch  = 8;
-constexpr std::int32_t kMaximumSingle = 2048;
+constexpr std::int32_t kHeadDim = 128;
 
 void require_tensor(const Tensor& tensor, DType dtype, const std::array<std::int32_t, 4>& shape,
                     const char* label, Device device) {
@@ -112,8 +111,8 @@ void rmsnorm_rope(const Tensor& positions, const Tensor& q_norm_weight, const Te
     const std::int32_t batch = q.ne[3];
     const std::int32_t width = q.ne[2];
     if (width < 2 || width > 16) throw std::invalid_argument("rmsnorm_rope: pair W must be 2..16");
-    if (batch < 1 || batch > kMaximumBatch) {
-        throw std::invalid_argument("rmsnorm_rope: pair B must be 1..8");
+    if (batch < 1 || std::int64_t(width) * batch > std::numeric_limits<int>::max()) {
+        throw std::invalid_argument("rmsnorm_rope: pair batch or flattened extent is invalid");
     }
     const int query_heads = q.ne[1], key_heads = k.ne[1];
     if (!((query_heads == 32 && key_heads == 8) || (query_heads == 16 && key_heads == 4)))
@@ -140,9 +139,7 @@ void rmsnorm_rope(const Tensor& positions, const Tensor& norm_weight, float epsi
     require_parameters(epsilon, theta);
     const auto stream         = execution.stream();
     const std::int32_t tokens = x.ne[2];
-    if (tokens < 1 || tokens > kMaximumSingle) {
-        throw std::invalid_argument("rmsnorm_rope: single T must be 1..2048");
-    }
+    if (tokens < 1) { throw std::invalid_argument("rmsnorm_rope: single T must be positive"); }
     const int heads = x.ne[1];
     if (heads != 4 && heads != 8)
         throw std::invalid_argument("rmsnorm_rope: single Hkv must be 4 or 8");

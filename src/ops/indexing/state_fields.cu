@@ -57,7 +57,7 @@ __global__ void assign_fields(const __grid_constant__ Fields fields) {
 template <class View>
 void check_state(const View& state, DType dtype, int features, int batch, const Tensor& selector,
                  const char* op, CudaExecutionView cuda) {
-    if (features <= 0 || batch < 1 || batch > 8 || state.field.layers != 1 ||
+    if (features <= 0 || batch < 1 || state.field.layers != 1 ||
         (dtype != DType::BF16 && dtype != DType::I32))
         throw std::invalid_argument(std::string(op) + ": invalid field geometry or type");
     operand::state_field(state, dtype, {features}, dtype_size(dtype), op, "state", cuda.device());

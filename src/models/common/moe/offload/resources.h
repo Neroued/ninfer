@@ -82,7 +82,8 @@ public:
     Resources& operator=(const Resources&) = delete;
 
     // Retain the activity through the traversal; GPU-only streaming does not wake the team.
-    [[nodiscard]] std::optional<CpuExecutionView::ActiveScope> begin(std::int32_t tokens);
+    [[nodiscard]] std::optional<CpuExecutionView::ActiveScope> begin(std::int32_t physical_tokens,
+                                                                     std::int32_t active_tokens);
     [[nodiscard]] bool try_before_layer(ExpertBankId bank);
     [[nodiscard]] bool settled() const noexcept;
     // Immutable bindings for capture. No cache acquisition or submission is performed.
@@ -99,7 +100,8 @@ public:
     void restore_cache_after_preparation();
     // The plan fixes each layer's Write/AddResidual semantics.
     [[nodiscard]] bool start(ExpertBankId bank, const Tensor& hidden, Tensor& output,
-                             MemoryArena& workspace, const ops::MoeExecutionHints& hints);
+                             ops::MoeTokenValidity validity, MemoryArena& workspace,
+                             const ops::MoeExecutionHints& hints);
     [[nodiscard]] bool poll();
     void synchronize() const;
     [[nodiscard]] std::uint64_t uploaded_bytes() const noexcept;

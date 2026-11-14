@@ -10,7 +10,7 @@ namespace ninfer::ops {
  *
  * q is BF16 [128,Hq,W,B], k is BF16 [128,Hkv,W,B], q_norm_weight and k_norm_weight
  * are BF16 [128], and positions is I32 [W,B]. Supported (Hq,Hkv) are (32,8) and (16,4),
- * with W=2..16 and B=1..8. Epsilon and theta are positive and finite. For each head and
+ * with W=2..16 and B>=1. Epsilon and theta are positive and finite. For each head and
  * physical token, the complete mathematical operation is
  *
  *   inv       = 1 / sqrt(sum_d x[d]^2 / 128 + epsilon)
@@ -31,7 +31,7 @@ void rmsnorm_rope(const Tensor& positions, const Tensor& q_norm_weight, const Te
 
 /**
  * Single-K form of the same formula and effects. x is BF16 [128,Hkv,T], Hkv=4 or 8,
- * norm_weight is BF16 [128], and positions is I32 [T], with T=1..2048. x is completely
+ * norm_weight is BF16 [128], and positions is I32 [T], with T>=1. x is completely
  * overwritten in place and must not overlap either read-only input.
  */
 void rmsnorm_rope(const Tensor& positions, const Tensor& norm_weight, float epsilon, float theta,

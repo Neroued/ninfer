@@ -4,21 +4,22 @@
 
 namespace ninfer::models::glm5next::detail {
 Tensor RankProgramImpl::draft_proposals(int batch) {
-    const auto& region = resources.plan.frame.speculative->drafts;
-    return parameters.mtp ? resources.tensor(region).slice(0, 0, batch).permute({1, 0, 2, 3})
+    const auto& region = frame.speculative->drafts;
+    return parameters.mtp ? resources.packed(region, {batch, dimension(shape.draft_tokens)})
+                                .permute({1, 0, 2, 3})
                           : resources.packed(region, {dimension(shape.draft_tokens), batch});
 }
 
 void RankProgramImpl::prepare_speculative() {
     auto& f          = *compute;
     const auto& work = std::get<SpeculativeWork>(f.request.work.operation);
-    const auto& io   = resources.plan.frame;
+    const auto& io   = frame;
     const auto rank  = parameters.profile->local.rank;
     const int b = work.rows.size(), k = shape.draft_tokens, width = k + 1;
-    f.physical = f.request.work.batch;
+    f.physical = work.batch;
     f.tokens   = width;
     f.sequence = false;
-    std::array<std::uint32_t, kMaximumConcurrency> valid{}, skip_first{};
+    std::vector<std::uint32_t> valid(b), skip_first(b);
     for (int i = 0; i < b; ++i) {
         valid[i]      = work.draft_extents[i] + 1;
         skip_first[i] = work.draft_extents[i] != 0;
@@ -28,6 +29,13 @@ void RankProgramImpl::prepare_speculative() {
     const auto i32 = [&](const TensorRegion& r) {
         return static_cast<std::int32_t*>(host(r).data);
     };
+    const auto physical_rows = f.batch.rows;
+    std::fill_n(i32(io.speculative->extents), physical_rows, 0);
+    if (parameters.mtp)
+        for (auto& step : io.mtp->draft_steps) {
+            std::fill_n(i32(step.positions), physical_rows, 0);
+            std::fill_n(i32(step.valid_columns), physical_rows, 0);
+        }
     f.draft_visible.assign(parameters.mtp ? k : 1, 0);
     for (int i = 0; i < b; ++i) {
         const auto logical              = f.physical.members[i];
@@ -48,8 +56,9 @@ void RankProgramImpl::prepare_speculative() {
     if (parameters.mtp)
         for (int s = 0; s < k; ++s)
             fill_local_metadata(io.mtp->draft_steps[s], 1, f.batch.attention.rows);
-    f.hidden               = resources.packed(io.pending_hidden,
-                                              {dimension(parameters.profile->config.text.hidden), width, b});
+    f.hidden =
+        resources.packed(io.pending_hidden,
+                         {dimension(parameters.profile->config.text.hidden), width, physical_rows});
     const bool read_drafts = !f.decision;
     f.graph_round          = graphs != nullptr;
     if (graphs)

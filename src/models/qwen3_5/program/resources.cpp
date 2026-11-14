@@ -87,10 +87,11 @@ std::size_t ResourceLayout::pinned_bytes() const {
     auto mapping = mapping_bytes(decoder.text_kv);
     if (decoder.mtp_kv) mapping += mapping_bytes(*decoder.mtp_kv);
     if (dflash && dflash->full) mapping += mapping_bytes(*dflash->full);
-    const auto counts = token_counts ? std::size_t(frame.spec.public_tokens) *
-                                           frame.spec.batch_capacity * sizeof(std::int32_t)
-                                     : 0;
-    return frame.host.bytes + 2 * mapping + counts;
+    return frame.host.bytes + 2 * mapping + pinned_context_counts_bytes();
+}
+
+std::size_t ResourceLayout::pinned_context_counts_bytes() const {
+    return token_counts ? std::size_t(frame.spec.public_tokens) * sizeof(std::int32_t) : 0;
 }
 
 DFlashPersistentState::DFlashPersistentState(MemorySpan arena, MemorySpan backing,

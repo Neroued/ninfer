@@ -65,15 +65,18 @@ void kimi_delta_attention(const Tensor& q, const Tensor& k, const Tensor& v, con
  * q/k BF16 [128,Hqk,1,B], v/g/out BF16 [128,Hv,1,B], beta BF16 [Hv,1,B],
  * A_log FP32 [Hv], dt_bias FP32 [128,Hv], and source/destination select FP32 [128,128,Hv] fields
  * using device I64 [B] arena-relative byte offsets. Each field is 16-byte aligned and in bounds;
- * other operands are contiguous. B is in [1,8]. Source/destination may exactly alias or be
- * disjoint. Destinations are distinct and cannot overwrite another row's source. Read-only
+ * other operands are contiguous. B is positive. valid_columns is empty for all active rows,
+ * or Device I32 [B] with values in {0,1}. An inactive row writes exact BF16 +0 to output and
+ * accesses neither its State offsets nor selected fields. Source/destination may exactly alias or
+ * be disjoint. Destinations are distinct and cannot overwrite another row's source. Read-only
  * sources may be shared. Inputs, output and metadata do not overlap selected state fields.
  */
 void kimi_delta_attention_batch_update(const Tensor& q, const Tensor& k, const Tensor& v,
                                        const Tensor& g, const Tensor& beta, const Tensor& A_log,
                                        const Tensor& dt_bias, float lower_bound, float scale,
                                        ConstStateFieldView source, StateFieldView destination,
-                                       Tensor& out, CudaExecutionView execution);
+                                       const Tensor& valid_columns, Tensor& out,
+                                       CudaExecutionView execution);
 
 struct KdaRecurrenceRecords {
     Tensor key;       // BF16 [128,Hq,T,B], before normalization.
@@ -85,7 +88,8 @@ struct KdaRecurrenceRecords {
 /**
  * Evaluate n[b] KDA steps from each read-only source field, publishing BF16 readouts and
  * transition records, without writing persistent state. Inputs are the batch-update shapes
- * with positive T; valid_columns is empty (n=T) or Device I32 [B], 1<=n<=T, B=1..8.
+ * with positive T and B; valid_columns is empty (n=T) or Device I32 [B], 0<=n<=T.
+ * Zero-length rows read neither State selectors nor fields and write no records.
  * Records preserve represented K/V and the actual FP32 log-decay/beta words. Outputs match
  * ordinary one-token updates of the same inputs bit for bit. Invalid output tails are +0;
  * record tails and source fields are unchanged. K/key-record and V/value-record may exactly

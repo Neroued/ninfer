@@ -37,12 +37,12 @@ std::vector<float> values(std::size_t n, unsigned seed, float amplitude = 1) {
 }
 
 int replay_case(int layers, int heads, int width, int batch, bool alias_records, bool in_place,
-                bool graph, int qheads = 0, bool projected = false) {
+                bool graph, int qheads = 0, bool projected = false, bool inactive = false) {
     auto& context = cuda_environment().context;
     CudaStream stream(context);
     const auto cuda = context.execution_view(stream.stream());
     if (!qheads) qheads = heads;
-    const int channels = (2 * qheads + heads) * 128, capacity = 8;
+    const int channels = (2 * qheads + heads) * 128, capacity = batch > 8 ? batch + 3 : 8;
     StateImageBuilder sb;
     const auto guard        = sb.add(DType::I32, {64}, 1, "unrelated field");
     const auto state_layout = plan_linear_attention_state(
@@ -65,9 +65,14 @@ int replay_case(int layers, int heads, int width, int batch, bool alias_records,
     Tensor destination_table(destination_buffer.span(), DType::I64, {batch});
     std::vector<int> valid(batch), accepted(batch);
     for (int b = 0; b < batch; ++b) {
-        valid[b]    = projected ? width : std::max(1, width - b % width);
+        valid[b] = projected ? width : std::max(1, width - b % width);
+        if (inactive && b % 3 == 0) valid[b] = 0;
         accepted[b] = batch == 1 ? valid[b] : (b == batch - 1 ? valid[b] : std::min(b, valid[b]));
     }
+    auto record_sources = sources;
+    for (int b = 0; b < batch; ++b)
+        if (!valid[b]) record_sources[b] = -1;
+    source_buffer.copy_from_host(record_sources.data(), source_buffer.size());
     auto valid_buffer = to_device(valid), accepted_buffer = to_device(accepted);
     Tensor valid_table(valid_buffer.span(), DType::I32, {batch});
     Tensor accepted_table(accepted_buffer.span(), DType::I32, {batch});
@@ -180,7 +185,8 @@ int replay_case(int layers, int heads, int width, int batch, bool alias_records,
             launch();
             CUDA_CHECK(cudaStreamEndCapture(cuda.stream(), &gr));
             CUDA_CHECK(cudaGraphInstantiate(&ex, gr, 0));
-            std::vector<int> one(batch, 1);
+            auto one = valid;
+            for (auto& n : one) n = std::min(n, 1);
             valid_buffer.copy_from_host(one.data(), valid_buffer.size());
             CUDA_CHECK(cudaGraphLaunch(ex, cuda.stream()));
             CUDA_CHECK(cudaStreamSynchronize(cuda.stream()));
@@ -195,7 +201,7 @@ int replay_case(int layers, int heads, int width, int batch, bool alias_records,
             valid_buffer.copy_from_host(valid.data(), valid_buffer.size());
             CUDA_CHECK(cudaGraphLaunch(ex, cuda.stream()));
             CUDA_CHECK(cudaStreamSynchronize(cuda.stream()));
-            source_buffer.copy_from_host(sources.data(), source_buffer.size());
+            source_buffer.copy_from_host(record_sources.data(), source_buffer.size());
             CUDA_CHECK(cudaGraphExecDestroy(ex));
             CUDA_CHECK(cudaGraphDestroy(gr));
         }
@@ -428,5 +434,17 @@ int main(int argc, char** argv) {
               [] { return replay_case(2, 32, 8, 4, true, false, true); });
     suite.add("kda/replay/inplace_multilayer_t16",
               [] { return replay_case(2, 32, 16, 8, false, true, true); });
+    suite.add("kda/replay/expanded_host",
+              [] { return replay_case(2, 1, 4, 17, false, false, false, 1, false, true); },
+              {{"suite", "concurrency"}});
+    suite.add("kda/replay/expanded_device",
+              [] { return replay_case(2, 1, 3, 64, false, false, true, 1, false, true); },
+              {{"suite", "concurrency"}});
+    suite.add("kda/replay/grouped_state_tiles",
+              [] { return replay_case(1, 32, 4, 17, false, false, true, 32, false, true); },
+              {{"suite", "concurrency"}});
+    suite.add("kda/replay/grouped_long_window",
+              [] { return replay_case(1, 32, 16, 64, false, false, true, 32, false, true); },
+              {{"suite", "concurrency"}});
     return suite.main(argc, argv);
 }

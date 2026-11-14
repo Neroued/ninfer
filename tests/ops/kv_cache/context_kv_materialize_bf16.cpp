@@ -137,12 +137,16 @@ int run(F& f, int width, int batch, bool graph, bool narrow = false,
         for (int b = 0; b < batch; ++b) {
             counts[b] = replay == 2 ? 0 : replay == 1 ? (b + width / 2) % (width + 1) : width;
             if (narrow) counts[b] = std::min(counts[b], 3);
+            if (batch > F::Records && b % ((batch + F::Records - 1) / F::Records) != 0)
+                counts[b] = 0;
             for (int i = 0; i < counts[b]; ++i)
                 positions[b * width + i] = 1'048'570 + b * 4096 + i + replay * 137;
         }
         for (int l = 0; l < 5; ++l) {
             slots[l].resize(batch);
-            for (int b = 0; b < batch; ++b) slots[l][b] = counts[b] ? (b * 3 + l + replay) % 8 : -1;
+            const int stride = (batch + F::Records - 1) / F::Records;
+            for (int b = 0; b < batch; ++b)
+                slots[l][b] = counts[b] ? (b / stride * 3 + l + replay) % F::Records : -1;
             const auto values = f.records->record_offsets(slots[l]);
             offsets[l].copy_from_host(values.data(), batch * 8);
         }
@@ -196,12 +200,15 @@ int reject_invalid_prefix(F& f) {
 
 void add_bf16_context_materialize_cases(OpSuite& suite) {
     std::vector<OpCase> cases;
-    const std::vector<std::pair<int, int>> shapes{{1, 1},   {3, 8},   {8, 2},   {8, 8},   {16, 8},
-                                                  {129, 1}, {257, 1}, {512, 1}, {2048, 1}};
-    for (auto [c, b] : shapes)
+    const std::vector<std::pair<int, int>> shapes{{1, 1},    {3, 8},   {8, 2},   {8, 8},
+                                                  {16, 8},   {129, 1}, {257, 1}, {512, 1},
+                                                  {2048, 1}, {8, 17},  {1, 129}};
+    for (auto [c, b] : shapes) {
         cases.push_back(
             {"context_materialize_bf16/c" + std::to_string(c) + "/b" + std::to_string(b),
              {{"format", "bf16"}, {"execution", c == 8 || c == 2048 ? "graph" : "eager"}}});
+        if (b > 8) cases.back().tags.emplace_back("suite", "concurrency");
+    }
     cases.push_back(
         {"context_materialize_bf16/narrow", {{"format", "bf16"}, {"execution", "graph"}}});
     cases.push_back({"context_materialize_bf16/parameters", {{"format", "bf16"}}});
@@ -241,7 +248,7 @@ void add_bf16_context_materialize_cases(OpSuite& suite) {
         "context_materialize_bf16/capacity",
         [] {
             int failures = 0;
-            for (int b = 1; b <= 8; ++b) {
+            for (int b : {1, 2, 4, 8, 9, 17, 129, 65536}) {
                 const int last      = b == 1 ? 2048 : 16;
                 std::size_t maximum = 0;
                 for (int c = 1; c <= last; ++c)
@@ -271,5 +278,5 @@ void add_bf16_context_materialize_cases(OpSuite& suite) {
             }
             return failures;
         },
-        {{"format", "bf16"}});
+        {{"format", "bf16"}, {"suite", "concurrency"}});
 }

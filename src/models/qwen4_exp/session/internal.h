@@ -9,6 +9,7 @@
 #include "models/common/qwen/vision/control.h"
 
 #include <deque>
+#include <unordered_map>
 
 namespace ninfer::models::qwen4_exp::detail {
 using Image        = context::StateId;
@@ -111,7 +112,9 @@ struct Sequence {
     std::uint32_t last_saved = 0, last_intermediate_attempt = 0;
     std::optional<std::uint32_t> retry_frontier;
     std::unique_ptr<CaptureReservation> capture;
-    bool capture_pending = false;
+    bool capture_pending          = false;
+    std::uint64_t membership_mark = 0;
+    bool computing                = false;
     SpeculativeStats speculative;
 };
 
@@ -355,8 +358,20 @@ public:
     Checkpoints checkpoints;
     context::MetadataAccount count_storage{directory.metadata_budget()};
     TokenCountBuilder count_builder;
-    std::array<std::unique_ptr<Sequence>, kMaximumConcurrency> sequences;
-    std::array<std::uint64_t, kMaximumConcurrency> epochs{};
+    std::vector<std::unique_ptr<Sequence>> sequences;
+    std::unordered_map<std::uint64_t, Sequence*> resident_sequences;
+    std::uint64_t membership_clock = 0;
+
+    std::uint64_t next_membership_mark() {
+        if (!++membership_clock) {
+            for (auto& s : sequences)
+                if (s) s->membership_mark = 0;
+            ++membership_clock;
+        }
+        return membership_clock;
+    }
+
+    std::vector<std::uint64_t> epochs;
     std::vector<runtime::KvPoolDescriptor> pools;
     std::unique_ptr<ContextOperation> operation;
     std::optional<ContextAssessment> pending_maintenance;

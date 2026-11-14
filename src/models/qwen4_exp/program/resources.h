@@ -46,6 +46,10 @@ public:
     [[nodiscard]] QsaCache& pool(std::uint32_t index);
     [[nodiscard]] const QsaCache& pool(std::uint32_t index) const;
 
+    void select_batch(std::uint32_t rows);
+
+    [[nodiscard]] const BufferLayout& buffers() const { return buffers_; }
+
     [[nodiscard]] Tensor tensor(const TensorRegion&);
     [[nodiscard]] Tensor packed(const TensorRegion&, std::initializer_list<std::int32_t>);
     [[nodiscard]] execution::BatchView main_batch(std::int32_t tokens, std::int32_t batch,
@@ -57,6 +61,8 @@ public:
     const ExecutionPlan plan;
 private:
     DeviceContext& device_;
+    BufferLayout buffers_;
+    std::uint32_t selected_rows_ = 0;
     DeviceBuffer context_, persistent_, workspace_;
     PinnedHostBuffer ingress_, egress_, sampling_, ple_handoff_, compute_aux_, context_counts_;
     PinnedHostBuffer host_context_;

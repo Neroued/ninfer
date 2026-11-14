@@ -46,6 +46,14 @@ __device__ __forceinline__ GdnReplayFoldKernelRow fold_row(const GdnReplayFoldDe
     return {rows.sources[b], rows.destinations[b], rows.columns[b], 0};
 }
 
+__device__ __forceinline__ int fold_columns(const GdnReplayFoldKernelRows& rows, int b) {
+    return rows.row[b].commit_columns;
+}
+
+__device__ __forceinline__ int fold_columns(const GdnReplayFoldDeviceRows& rows, int b) {
+    return rows.columns[b];
+}
+
 template <class Geometry, class Rows = GdnReplayFoldKernelRows>
 struct FoldAccess {
     const __nv_bfloat16* key_record;
@@ -59,6 +67,7 @@ struct FoldAccess {
     std::int32_t record_capacity;
     std::int32_t width;
     Rows rows;
+    std::int32_t record_begin;
 
     __device__ __forceinline__ RecurrentCoordinates coordinates() const {
         const std::int32_t batch       = static_cast<std::int32_t>(blockIdx.y);
@@ -84,11 +93,12 @@ struct FoldAccess {
 
     __device__ __forceinline__ std::int32_t
     active_columns(const RecurrentCoordinates& coord) const {
-        return fold_row(rows, coord.batch).commit_columns;
+        return fold_columns(rows, coord.batch);
     }
 
     __device__ __forceinline__ std::int64_t record_outer(const RecurrentCoordinates& coord) const {
-        return static_cast<std::int64_t>(coord.layer) * record_capacity + coord.batch;
+        return static_cast<std::int64_t>(coord.layer) * record_capacity + record_begin +
+               coord.batch;
     }
 
     __device__ __forceinline__ const float*

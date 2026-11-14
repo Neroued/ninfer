@@ -59,8 +59,8 @@ struct ViewValidation {
                 label);
     }
 
-    // Features are contiguous. Outer axes may have layer gaps or be interleaved; the smaller
-    // axis is at most eight for QSA state/records, keeping the overlap check bounded.
+    // Features are contiguous. Outer axes may have layer gaps or be interleaved.
+    // Check intersections by the smaller outer extent, typically the record window.
     void columns(const Tensor& t, DType dtype, int features, int count, int outer,
                  const char* label) const {
         require(device.type() == DeviceType::CUDA && t.device == device, "operand device");

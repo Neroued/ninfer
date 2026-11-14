@@ -1,4 +1,5 @@
 #include "ops/linear/topk/keys/dispatch.h"
+#include "ops/linear/topk/dispatch.h"
 #include "ops/linear/common/operands.h"
 #include "ops/common/host/operands.h"
 #include <algorithm>
@@ -17,8 +18,7 @@ void validate(const Tensor& hidden, const Weight& head, int begin, int domain, L
         throw std::invalid_argument("linear_topk keys: invalid token range");
     namespace operand = common::operand;
     operand::device(arena.device(), execution.device(), op, "workspace");
-    if (keys.ne[1] <= 0 || keys.ne[2] < 1 || keys.ne[2] > 8 ||
-        std::int64_t(keys.ne[1]) * keys.ne[2] != hidden.ne[1])
+    if (keys.ne[1] <= 0 || keys.ne[2] < 1 || std::int64_t(keys.ne[1]) * keys.ne[2] != hidden.ne[1])
         throw std::invalid_argument("linear_topk keys: expected [16,D,B] for [K,D*B]");
     operand::tensor(keys, DType::I64, {16, keys.ne[1], keys.ne[2]}, 16, op, "keys",
                     execution.device());
@@ -58,11 +58,10 @@ std::size_t linear_topk_workspace_capacity_bytes(QType type, int rows, int k, Li
         throw std::invalid_argument("linear_topk keys: invalid interval");
     (void)tk::select(type, rows, k, policy, 1);
     WorkspaceLayoutBuilder layout;
-    for (int columns = 1; columns <= detail::kLinearTopKMaxChunkColumns; ++columns) {
-        if (!detail::linear_topk_chunk_reachable(columns, first, last)) continue;
+    detail::for_each_linear_topk_extent(first, last, tk::large_threshold(type), [&](int columns) {
         auto scope = layout.scope();
         (void)tk::allocate(layout, tk::select(type, rows, k, policy, columns), rows, k, columns);
-    }
+    });
     return layout.peak_bytes();
 }
 
@@ -78,25 +77,39 @@ void linear_topk(const Tensor& hidden, const Weight& head, int begin, int domain
     }
     auto flat_keys = keys.view({16, hidden.ne[1]});
     for (int first = 0; first < hidden.ne[1];) {
-        const int columns = std::min(detail::kLinearTopKMaxChunkColumns, hidden.ne[1] - first);
+        const int columns = detail::linear_topk_chunk_columns(hidden.ne[1] - first,
+                                                              tk::large_threshold(head.qtype));
         const auto x      = hidden.slice(1, first, columns);
         auto out          = flat_keys.slice(1, first, columns);
         const auto plan   = tk::select(head.qtype, head.n, head.k, policy, columns);
         auto scope        = arena.scope();
-        const auto work   = tk::allocate(arena, plan, head.n, head.k, columns);
-        const auto check  = [&](const void* p, std::size_t bytes) {
-            const auto range = common::operand::range(p, bytes, op);
-            for (auto operand : live) common::operand::disjoint(range, operand, op);
+        const auto check  = [&](const void* pointer, std::size_t bytes) {
+            const auto range = common::operand::range(pointer, bytes, op);
+            for (const auto operand : live) common::operand::disjoint(range, operand, op);
         };
-        for (const Tensor* t : {&work.candidates.partial_keys, &work.candidates.group_keys,
-                                &work.candidates.secondary_keys, &work.candidates.group_done})
-            check(t->data, t->bytes());
+        const auto activation = tk::allocate_activation(arena, plan, columns, head.k);
         if (plan.a8) {
-            check(work.activation.codes, std::size_t(columns) * head.k);
-            check(work.activation.scales, std::size_t(columns) * head.k / 32);
+            check(activation.codes, std::size_t(columns) * head.k);
+            check(activation.scales, std::size_t(columns) * head.k / 32);
+            plan.prepare(x, head, activation, execution.stream());
         }
-        plan.producer(x, head, begin, domain, work.candidates, work.activation, execution.stream());
-        tk::merge(work.candidates, out, execution.stream());
+        const int window = plan.row_window ? plan.row_window : head.n;
+        for (int row = 0; row < head.n; row += window) {
+            const auto weight = detail::linear_topk_rows(head, row, std::min(window, head.n - row));
+            auto row_scope    = arena.scope();
+            const auto work   = tk::allocate_window(arena, plan, weight.n, columns, activation);
+            const auto& candidates = work.candidates;
+            for (const Tensor* tensor :
+                 {&candidates.partial_keys, &candidates.group_keys, &candidates.secondary_keys,
+                  &candidates.group_done, &work.scores})
+                check(tensor->data, tensor->bytes());
+            plan.producer(x, weight, begin + row, domain, work, execution.stream());
+            if (row)
+                detail::launch_linear_topk_merge_keys_accumulate(candidates, out,
+                                                                 execution.stream());
+            else
+                detail::launch_linear_topk_merge_keys(candidates, out, execution.stream());
+        }
         first += columns;
     }
 }

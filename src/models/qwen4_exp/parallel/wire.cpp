@@ -30,6 +30,7 @@ void encode_rank_load(Encoder& out, const RankLoadRequest& request) {
     encode_assemblies(out, p.assemblies);
     encode_expert_partitions(out, p.experts);
     encode_rank_options(out, request.options);
+    encode_batch_execution_spec(out, request.batches);
     out.u64(request.host_reservation_bytes);
     out.boolean(request.control_owner);
 }
@@ -53,6 +54,7 @@ RankLoadRequest decode_rank_load(Decoder& in) {
     p.assemblies                   = decode_assemblies(in);
     p.experts                      = decode_expert_partitions(in);
     request.options                = decode_rank_options(in);
+    request.batches                = decode_batch_execution_spec(in);
     request.host_reservation_bytes = in.u64();
     request.control_owner          = in.boolean();
     return request;
@@ -67,6 +69,7 @@ void encode(Encoder& out, const RankExecutionDescription& r) {
     out.boolean(s.context_cache);
     out.boolean(s.cuda_graph);
     out.boolean(s.gpu_timing);
+    encode_batch_execution_spec(out, p.batches->spec());
     context::encode_directory(out, p.context);
     out.u32(p.vision_max_features);
     out.u32(p.checkpoint_interval);
@@ -78,17 +81,18 @@ void encode(Encoder& out, const RankExecutionDescription& r) {
 
 RankExecutionDescription decode_rank_execution(Decoder& in) {
     RankExecutionDescription r;
-    auto& p               = r.session;
-    p.shape               = {in.u32(),
-                             in.u32(),
-                             in.u32(),
-                             in.u32(),
-                             static_cast<KvCacheStorage>(in.u8()),
-                             static_cast<EnginePurpose>(in.u8()),
-                             in.boolean(),
-                             in.boolean(),
-                             in.boolean()};
-    p.context             = context::decode_directory(in);
+    auto& p   = r.session;
+    p.shape   = {in.u32(),
+                 in.u32(),
+                 in.u32(),
+                 in.u32(),
+                 static_cast<KvCacheStorage>(in.u8()),
+                 static_cast<EnginePurpose>(in.u8()),
+                 in.boolean(),
+                 in.boolean(),
+                 in.boolean()};
+    p.batches = std::make_shared<const BatchExecutionPlan>(decode_batch_execution_spec(in));
+    p.context = context::decode_directory(in);
     p.vision_max_features = in.u32();
     p.checkpoint_interval = in.u32();
     r.capacity            = {in.u32(), in.u32()};

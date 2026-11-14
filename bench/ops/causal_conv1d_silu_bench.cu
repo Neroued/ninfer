@@ -18,6 +18,8 @@
 #include <cstring>
 #include <string>
 #include <optional>
+#include <limits>
+#include <stdexcept>
 #include <vector>
 
 using namespace ninfer;
@@ -247,8 +249,12 @@ void run_decode(const Options& options) {
 void run_snapshot(const Options& options) {
     const std::size_t n =
         static_cast<std::size_t>(options.channels) * options.tokens * options.batch;
-    const std::int32_t required_slots =
-        options.batch == 1 ? options.slots : options.batch * options.tokens + options.batch;
+    const auto required = options.batch == 1
+                              ? std::int64_t(options.slots)
+                              : std::int64_t(options.batch) * (std::int64_t(options.tokens) + 1);
+    if (required > std::numeric_limits<std::int32_t>::max())
+        throw std::invalid_argument("snapshot slot extent exceeds I32");
+    const auto required_slots = static_cast<std::int32_t>(required);
     const std::int32_t slots  = std::max(options.slots, required_slots);
     const std::size_t state_n = static_cast<std::size_t>(options.channels) * 3u * slots;
 
@@ -302,10 +308,18 @@ void run_snapshot(const Options& options) {
     Tensor tsnapshot_base(snapshot_base_slot.span(), DType::I32, {options.batch});
     Tensor tout(out.span(), DType::BF16, {options.channels, options.tokens, options.batch});
 
-    // The selected history and four weights are reusable across T; each token reads x, writes out,
-    // and publishes three BF16 state columns.
-    const double bytes = 8.0 * options.channels + 6.0 * options.channels * options.batch +
-                         10.0 * static_cast<double>(n);
+    std::uint64_t live_rows = 0, live_tokens = 0;
+    for (int row = 0; row < options.batch; ++row) {
+        const int count =
+            options.valid_columns.empty() ? options.tokens : options.valid_columns[row];
+        live_rows += count != 0;
+        live_tokens += count;
+    }
+    // Weights/history and input/snapshots are read or written only for active prefixes;
+    // every physical output column is written, including zero padding.
+    const double bytes =
+        options.channels * ((live_rows ? 8.0 : 0.0) + 6.0 * live_rows + 8.0 * live_tokens) +
+        2.0 * static_cast<double>(n);
     const Result r = time_stage(
         options,
         [&](CudaExecutionView cuda) {
@@ -361,7 +375,7 @@ bool parse_options(int argc, char** argv, Options& options) try {
                 return false;
             }
         } else if (!std::strcmp(argv[i], "--valid-columns") && i + 1 < argc) {
-            options.valid_columns = measurement::integers(argv[++i]);
+            options.valid_columns = measurement::integers(argv[++i], 0);
         } else if ((!std::strcmp(argv[i], "--channels") || !std::strcmp(argv[i], "--tokens") ||
                     !std::strcmp(argv[i], "--slots") || !std::strcmp(argv[i], "--initial-slot") ||
                     !std::strcmp(argv[i], "--batch")) &&
@@ -385,7 +399,7 @@ bool parse_options(int argc, char** argv, Options& options) try {
         !options.split) {
         options.decode = options.prefill = true;
     }
-    if (options.batch > 8 || (options.in_place && !options.split) ||
+    if ((options.in_place && !options.split) ||
         (!options.snapshot && !options.split && options.batch != 1) ||
         (!options.snapshot && !options.valid_columns.empty()) ||
         (!options.valid_columns.empty() &&

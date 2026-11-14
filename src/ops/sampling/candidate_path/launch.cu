@@ -29,7 +29,17 @@ struct DeviceArgs {
     int batch;
     const unsigned long long* keys;
     std::int32_t* merged_ids;
+    const std::int32_t* live_rows;
 };
+
+__device__ void clear_row(const DeviceArgs& a, int batch) {
+    const auto first = std::int64_t(batch) * a.steps;
+    for (int i = threadIdx.x; i < a.steps * kCandidates; i += blockDim.x) {
+        a.q[first * kCandidates + i] = 0.0F;
+        if (a.merged_ids) a.merged_ids[first * kCandidates + i] = 0;
+        if (i < a.steps) a.drafts[first + i] = 0;
+    }
+}
 
 struct alignas(16) SelectorShared {
     __nv_bfloat16 successors[kCandidates * kRank];
@@ -44,7 +54,7 @@ struct alignas(16) SelectorShared {
 
 // Each local list is descending. Reverse the second half to form a bitonic
 // sequence, then merge in five warp exchanges without decoding or narrowing keys.
-__device__ unsigned long long merged_key(const DeviceArgs& a, int column) {
+__device__ unsigned long long merged_key(const DeviceArgs& a, std::int64_t column) {
     const int lane = threadIdx.x & 31;
     const int rank = lane / 16, local = rank ? 31 - lane : lane;
     auto key = a.keys[(std::int64_t(rank) * a.steps * a.batch + column) * 16 + local];
@@ -56,7 +66,7 @@ __device__ unsigned long long merged_key(const DeviceArgs& a, int column) {
     return key;
 }
 
-__device__ void merge_current(const DeviceArgs& a, int column, SelectorShared& shared,
+__device__ void merge_current(const DeviceArgs& a, std::int64_t column, SelectorShared& shared,
                               bool publish) {
     const int lane = threadIdx.x & 31;
     const auto key = merged_key(a, column);
@@ -98,8 +108,8 @@ __device__ int draw_rank(float edge, float temperature, unsigned long long seed,
 }
 
 template <bool Gathered, int Warps, bool WaitForPredecessor = true>
-__device__ void score_row(const DeviceArgs& a, int column, SelectorShared& shared, const int* ids,
-                          const float* unary) {
+__device__ void score_row(const DeviceArgs& a, std::int64_t column, SelectorShared& shared,
+                          const int* ids, const float* unary) {
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
 #pragma unroll
     for (int c = warp; c < kCandidates; c += Warps) {
@@ -146,8 +156,8 @@ __device__ void walk_path(const DeviceArgs& a, SelectorShared& shared, const int
     }
 #pragma unroll 1
     for (int step = 0; step < a.steps; ++step) {
-        const int column = batch * a.steps + step;
-        const int* ids   = Gathered ? all_ids + step * kCandidates : a.ids + column * kCandidates;
+        const auto column = std::int64_t(batch) * a.steps + step;
+        const int* ids    = Gathered ? all_ids + step * kCandidates : a.ids + column * kCandidates;
         const float* unary =
             Gathered ? all_unary + step * kCandidates : a.unary + column * kCandidates;
         score_row<Gathered, Warps>(a, column, shared, ids, unary);
@@ -166,16 +176,19 @@ __device__ void walk_path(const DeviceArgs& a, SelectorShared& shared, const int
 template <bool Gathered, int Warps = 16>
 __global__ __launch_bounds__(Warps * 32,
                              1) void selector_walk_kernel(const __grid_constant__ DeviceArgs a) {
+    if (a.live_rows && !a.live_rows[blockIdx.x]) {
+        clear_row(a, blockIdx.x);
+        return;
+    }
     __shared__ SelectorShared shared;
     if constexpr (Gathered) {
-        // All columns are independent until path sampling. Merge them in parallel,
-        // allowing successor prefetch for the next step to overlap the prior draw.
+        // Merge independent columns before the sequential path walk.
         __shared__ int ids[15 * kCandidates];
         __shared__ float unary[15 * kCandidates];
         const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
         for (int step = warp; step < a.steps; step += Warps) {
-            const int column = blockIdx.x * a.steps + step;
-            const auto key   = merged_key(a, column);
+            const auto column = std::int64_t(blockIdx.x) * a.steps + step;
+            const auto key    = merged_key(a, column);
             if (lane < kCandidates) {
                 ids[step * kCandidates + lane]   = id_from_order_key(key);
                 unary[step * kCandidates + lane] = key ? score_from_order_key(key) : -CUDART_INF_F;
@@ -193,8 +206,10 @@ template <bool Gathered, int Warps = 16>
 __global__ __launch_bounds__(Warps * 32,
                              2) void selector_lattice_kernel(const __grid_constant__ DeviceArgs a,
                                                              float* edges) {
-    const int column = blockIdx.x, p = blockIdx.y;
+    const std::int64_t column = blockIdx.x;
+    const int p               = blockIdx.y;
     const int step = column % a.steps, batch = column / a.steps;
+    if (a.live_rows && !a.live_rows[batch]) return;
     if (step == 0 && p != 0) return;
     __shared__ SelectorShared shared;
     if constexpr (Gathered) {
@@ -221,13 +236,17 @@ __global__
 __launch_bounds__(32) void selector_lattice_walk_kernel(const __grid_constant__ DeviceArgs a,
                                                         const float* edges) {
     const int lane = threadIdx.x, batch = blockIdx.x;
+    if (a.live_rows && !a.live_rows[batch]) {
+        clear_row(a, batch);
+        return;
+    }
     const auto seed         = a.configs[batch].seed;
     const float temperature = a.configs[batch].temperature;
     const int position      = a.positions[batch];
     int predecessor_rank    = 0;
 #pragma unroll 1
     for (int step = 0; step < a.steps; ++step) {
-        const int column = batch * a.steps + step;
+        const auto column = std::int64_t(batch) * a.steps + step;
         const float edge =
             lane < kCandidates
                 ? edges[(static_cast<std::int64_t>(column) * kCandidates + predecessor_rank) *
@@ -249,7 +268,8 @@ void launch_candidate_path(SelectorPlan plan, CandidateSelectorInput input,
                            const Tensor& anchors, const Tensor& predecessor_codebook,
                            const Tensor& successor_codebook, const Tensor& base_positions,
                            const SamplingConfig* configs, Tensor& drafts, Tensor& proposal_q,
-                           const SelectorWorkspace& workspace, cudaStream_t stream) {
+                           const Tensor& live_rows, const SelectorWorkspace& workspace,
+                           cudaStream_t stream) {
     const DeviceArgs args{static_cast<const std::int32_t*>(candidate_ids.data),
                           static_cast<const float*>(unary_scores.data),
                           static_cast<const __nv_bfloat16*>(projected_hidden.data),
@@ -265,7 +285,8 @@ void launch_candidate_path(SelectorPlan plan, CandidateSelectorInput input,
                           static_cast<const unsigned long long*>(keys.data),
                           input == CandidateSelectorInput::GatheredKeys
                               ? static_cast<int*>(candidate_ids.data)
-                              : nullptr};
+                              : nullptr,
+                          static_cast<const std::int32_t*>(live_rows.data)};
     const auto launch = [&]<bool Gathered, int Warps>() {
         if (plan.route == SelectorRoute::Direct) {
             selector_walk_kernel<Gathered, Warps>
@@ -279,13 +300,16 @@ void launch_candidate_path(SelectorPlan plan, CandidateSelectorInput input,
             selector_lattice_walk_kernel<<<candidate_ids.ne[2], 32, 0, stream>>>(args, edges);
         }
     };
-    if (input == CandidateSelectorInput::GatheredKeys) {
+    const auto submit = [&]<bool Gathered>() {
         if (plan.warps == 8)
-            launch.template operator()<true, 8>();
+            launch.template operator()<Gathered, 8>();
         else
-            launch.template operator()<true, 16>();
-    } else
-        launch.template operator()<false, 16>();
+            launch.template operator()<Gathered, 16>();
+    };
+    if (input == CandidateSelectorInput::GatheredKeys)
+        submit.template operator()<true>();
+    else
+        submit.template operator()<false>();
     CUDA_CHECK(cudaGetLastError());
 }
 } // namespace ninfer::ops::candidate_path_detail

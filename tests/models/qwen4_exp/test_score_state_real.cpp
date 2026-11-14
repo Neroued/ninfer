@@ -206,9 +206,12 @@ int main() {
         auto load       = q4::resolve_load(reader, definition, device->device(), device->device());
         const auto geometry = load.ple_table().geometry();
         auto model          = q4::materialize_model(std::move(load), *device);
-        auto execution =
-            q4::plan_execution(profile, geometry, options, *device,
-                               device_memory_snapshot(device->device()).available_bytes());
+        auto execution      = q4::plan_execution(
+            profile, geometry, options,
+            std::make_shared<const models::BatchExecutionPlan>(models::make_batch_execution_spec(
+                options.max_concurrency, 1,
+                options.use_cuda_graph && options.purpose == EnginePurpose::Generation)),
+            *device, device_memory_snapshot(device->device()).available_bytes());
         require(execution.has_value(), "fresh scoring execution resources do not fit");
         auto plan = q4::plan_session(*execution);
         auto instance =
@@ -218,7 +221,8 @@ int main() {
         auto& rank  = *instance->program;
         auto worker = std::make_unique<runtime::RankWorker<ObservedTypes>>(std::move(device),
                                                                            std::move(instance));
-        runtime::LocalExecutor<ObservedTypes> executor(std::move(worker), {1});
+        runtime::LocalExecutor<ObservedTypes> executor(std::move(worker), {1},
+                                                       options.max_concurrency);
         q4::Session session(q4::prepare_session(definition, std::move(plan)), executor);
         const auto empty = session.physical_usage();
         ninfer::models::frontend::FrontendOptions frontend_options;

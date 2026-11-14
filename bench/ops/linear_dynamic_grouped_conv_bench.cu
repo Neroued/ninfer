@@ -1,3 +1,4 @@
+#include <climits>
 #include "ninfer/ops/dynamic_grouped_conv.h"
 #include "direct_bf16_weight.cuh"
 #include "op_measurement.cuh"
@@ -31,7 +32,7 @@ Options parse(int argc, char** argv) {
         else if (!measurement::parse(o.timing, flag, value))
             throw std::invalid_argument("unknown option");
     }
-    if (o.width < 0 || o.width == 1 || o.width > 16 || o.batch < 0 || o.batch > 8)
+    if (o.width < 0 || o.width == 1 || o.width > 16 || o.batch < 0)
         throw std::invalid_argument("invalid W/B");
     return o;
 }
@@ -39,10 +40,16 @@ Options parse(int argc, char** argv) {
 
 int main(int argc, char** argv) {
     try {
-        const auto o    = parse(argc, argv);
+        const auto o        = parse(argc, argv);
+        const int min_width = o.width ? o.width : 2, max_width = o.width ? o.width : 16;
+        const int min_batch = o.batch ? o.batch : 1, max_batch = o.batch ? o.batch : 8;
+        if (std::int64_t(max_width) * max_batch > INT_MAX)
+            throw std::invalid_argument("too many columns");
+        const int max_columns = max_width * max_batch;
         constexpr int H = 4096, G = H / 16;
-        auto input = make_bf16(std::size_t(o.k) * 128, 101), base = make_bf16(H * 4, 103),
-             delta = make_bf16(G * 2 * 128, 105), output = make_buffer(H * 128 * 2);
+        auto input = make_bf16(std::size_t(o.k) * max_columns, 101), base = make_bf16(H * 4, 103),
+             delta  = make_bf16(std::size_t(G) * 2 * max_columns, 105),
+             output = make_buffer(std::size_t(H) * max_columns * 2);
         auto weight = make_direct_bf16_weight(H, o.k, 107);
         Tensor b(base.span(), DType::BF16, {H, 2, 2});
         L2FlushBuffer flush(o.timing.flush_bytes);
@@ -50,10 +57,8 @@ int main(int argc, char** argv) {
         measurement::Csv csv(
             o.timing.csv_out,
             "width,columns,necessary_bytes,useful_flops,effective_gbs,roofline_us");
-        for (int w = 2; w <= 16; ++w) {
-            if (o.width && w != o.width) continue;
-            for (int batch = 1; batch <= 8; ++batch) {
-                if (o.batch && batch != o.batch) continue;
+        for (int w = min_width; w <= max_width; ++w) {
+            for (int batch = min_batch; batch <= max_batch; ++batch) {
                 const int m = w * batch;
                 Tensor x(input.span(), DType::BF16, {o.k, w, batch}),
                     d(delta.span(), DType::BF16, {G, 2, w, batch}),

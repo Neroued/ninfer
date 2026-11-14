@@ -76,14 +76,18 @@ __launch_bounds__(WarpsPerCta * 32, 2) __global__ void context_attention_split_p
     int split_capacity, float scale, __nv_bfloat16* __restrict__ partial_acc,
     float* __restrict__ partial_m, float* __restrict__ partial_l, __nv_bfloat16* __restrict__ out) {
     const int batch = static_cast<int>(blockIdx.z);
+    const bool live = valid_columns[batch] > 0;
     ContextAttentionPolicy policy{
-        .block_table = block_tables + static_cast<std::int64_t>(logical_pages) * table_rows[batch],
+        .block_table =
+            live ? block_tables + static_cast<std::int64_t>(logical_pages) * table_rows[batch]
+                 : nullptr,
         .logical_pages = logical_pages,
     };
     context_query_split_partial_body<ContextAttentionPolicy, Tokens, WarpsPerCta, KeyBlock,
                                      DirectOutput>(
-        q, query_k, query_v, valid_columns, context_k, context_v, policy, context_length[batch],
-        max_context, split_capacity, scale, partial_acc, partial_m, partial_l, out);
+        q, query_k, query_v, valid_columns, context_k, context_v, policy,
+        live ? context_length[batch] : 0, max_context, split_capacity, scale, partial_acc,
+        partial_m, partial_l, out);
 }
 
 template <int Tokens, int KeyBlock>
@@ -95,9 +99,11 @@ __launch_bounds__(128, 2) __global__
                                          const std::int32_t* __restrict__ valid_columns,
                                          int max_context, int split_capacity,
                                          __nv_bfloat16* __restrict__ out) {
-    const int length = context_length[static_cast<int>(blockIdx.z)];
-    context_query_reduce_body<Tokens, KeyBlock>(partial_acc, partial_m, partial_l, length, length,
-                                                valid_columns, max_context, split_capacity, out);
+    const int batch  = static_cast<int>(blockIdx.z);
+    const int length = valid_columns[batch] > 0 ? context_length[batch] : 0;
+    context_query_reduce_body<Tokens, KeyBlock, 4, kContextQueryKVHeads, 64>(
+        partial_acc, partial_m, partial_l, length, length, valid_columns, max_context,
+        split_capacity, out);
 }
 
 } // namespace ninfer::ops::detail

@@ -59,7 +59,7 @@ void require_weight(const Weight& w, const ContextKVMaterializeProfile& p, const
 }
 
 void require_profile(std::int32_t width, std::int32_t batch) {
-    if (batch < 1 || batch > 8 || width < 1) {
+    if (batch < 1 || width < 1) {
         throw std::invalid_argument("context_kv_materialize: invalid W/B");
     }
     if (width <= kBlockWidth) return;
@@ -68,7 +68,7 @@ void require_profile(std::int32_t width, std::int32_t batch) {
 }
 
 void require_interval(std::int32_t batch, std::int32_t min_width, std::int32_t max_width) {
-    if (batch < 1 || batch > 8 || min_width < 1 || max_width < min_width) {
+    if (batch < 1 || min_width < 1 || max_width < min_width) {
         throw std::invalid_argument("context_kv_materialize workspace: invalid interval");
     }
     if (batch == 1) {
@@ -80,6 +80,13 @@ void require_interval(std::int32_t batch, std::int32_t min_width, std::int32_t m
     if (max_width > kBlockWidth) {
         throw std::invalid_argument("context_kv_materialize workspace: batched W exceeds 16");
     }
+}
+
+// The smallest projection tile covers 16 columns on CUDA's grid-y axis.
+// Preserve each row's complete prefix when partitioning larger launches.
+std::int32_t launch_rows(std::int32_t batch, std::int32_t count) {
+    constexpr int MaxLaunchColumns = 65535 * 16;
+    return std::min(batch, MaxLaunchColumns / count);
 }
 
 template <class Allocator>
@@ -128,10 +135,16 @@ context_kv_materialize_workspace_capacity_bytes(const ContextKVMaterializeProfil
     // Every W admits max_count=0..W. Thus max_width includes the envelopes of all smaller W,
     // including scratch-requiring routes below the fully fused interval.
     for (int count = 1; count <= max_width; ++count) {
-        const int columns = count * batch_size;
-        if (detail::select_context_kv_materialize(profile, columns).key_scratch)
-            capacity = std::max(capacity,
-                                key_scratch_capacity(profile.head_dim * profile.kv_heads, columns));
+        const int rows     = launch_rows(batch_size, count);
+        const auto include = [&](int batch) {
+            if (batch == 0) return;
+            const int columns = count * batch;
+            if (detail::select_context_kv_materialize(profile, columns).key_scratch)
+                capacity = std::max(
+                    capacity, key_scratch_capacity(profile.head_dim * profile.kv_heads, columns));
+        };
+        include(rows);
+        include(batch_size % rows);
     }
     return capacity;
 }
@@ -176,13 +189,34 @@ void context_kv_materialize(
     }
 
     if (envelope.max_count == 0) return;
-    const int columns   = envelope.max_count * batch;
-    const auto selected = detail::select_context_kv_materialize(profile, columns);
-    auto scope          = workspace.scope();
-    Tensor key_scratch;
-    if (selected.key_scratch)
-        key_scratch = allocate_key_scratch(workspace, profile.head_dim * profile.kv_heads, columns);
-    selected.launch(context, positions, counts, layers, profile, envelope, key_scratch, stream);
+    const auto launch = [&](const Tensor& x, const Tensor& p, const Tensor& c,
+                            const auto& selected_layers) {
+        const int columns   = envelope.max_count * x.ne[2];
+        const auto selected = detail::select_context_kv_materialize(profile, columns);
+        auto scope          = workspace.scope();
+        Tensor key_scratch;
+        if (selected.key_scratch)
+            key_scratch =
+                allocate_key_scratch(workspace, profile.head_dim * profile.kv_heads, columns);
+        selected.launch(x, p, c, selected_layers, profile, envelope, key_scratch, stream);
+    };
+    const int rows = launch_rows(batch, envelope.max_count);
+    if (rows == batch) {
+        launch(context, positions, counts, layers);
+        return;
+    }
+    for (std::int64_t begin = 0; begin < batch; begin += rows) {
+        const int size       = std::min<std::int64_t>(rows, batch - begin);
+        auto selected_layers = layers;
+        for (auto& layer : selected_layers) {
+            layer.cache.k.records.byte_offsets =
+                layer.cache.k.records.byte_offsets.slice(0, begin, size);
+            layer.cache.v.records.byte_offsets =
+                layer.cache.v.records.byte_offsets.slice(0, begin, size);
+        }
+        launch(context.slice(2, begin, size), positions.slice(1, begin, size),
+               counts.slice(0, begin, size), selected_layers);
+    }
 }
 
 } // namespace ninfer::ops

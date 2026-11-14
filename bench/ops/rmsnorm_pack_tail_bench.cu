@@ -1,6 +1,7 @@
 // Complete fused normalization and packing, with one public Op per sample.
 #include "ninfer/ops/rmsnorm_pack_tail.h"
 #include "op_measurement.cuh"
+#include <climits>
 #include <iomanip>
 #include <sstream>
 using namespace ninfer;
@@ -22,7 +23,7 @@ Options parse(int argc, char** argv) {
         if (flag == "--help") {
             std::cout
                 << "usage: ninfer_rmsnorm_pack_tail_bench [--hidden 4096|5120] [--epsilon E]\n"
-                   "  --widths W,... (2..16) --batches B,... (1..8)\n"
+                   "  --widths W,... (2..16) --batches B,... (B>=1)\n"
                    "  --calls N (1..64): repeated read-only inputs, warm cache only\n";
             m::help();
             std::exit(0);
@@ -40,7 +41,7 @@ Options parse(int argc, char** argv) {
         } else if (flag == "--widths")
             o.widths = m::integers(value, 2, 16);
         else if (flag == "--batches")
-            o.batches = m::integers(value, 1, 8);
+            o.batches = m::integers(value, 1);
         else if (!m::parse(o.timing, flag, value))
             throw std::invalid_argument("unknown flag: " + std::string(flag));
     }
@@ -54,7 +55,10 @@ Options parse(int argc, char** argv) {
 
 void run(const Options& o, int width, int batch, bench::L2FlushBuffer& flush, m::Csv& csv,
          CudaExecutionView e) {
-    const int columns = (width - 1) * batch;
+    const auto extent = std::int64_t(width - 1) * batch;
+    if (extent > INT_MAX)
+        throw std::invalid_argument("flattened output extent is not representable");
+    const int columns = static_cast<int>(extent);
     auto input        = bench::make_bf16(std::size_t(o.hidden) * width * batch, 101U);
     auto weight       = bench::make_bf16(o.hidden, 103U, .8F, 1.2F);
     auto output       = bench::make_buffer(std::size_t(o.hidden) * columns * 2);
@@ -64,7 +68,7 @@ void run(const Options& o, int width, int batch, bench::L2FlushBuffer& flush, m:
     const auto launch = [&](CudaExecutionView cuda) {
         for (int i = 0; i < o.calls; ++i) ops::rmsnorm_pack_tail(x, w, o.epsilon, y, cuda);
     };
-    const std::size_t bytes = std::size_t(o.hidden) * (4 * columns + 2);
+    const std::size_t bytes = std::size_t(o.hidden) * (4ULL * columns + 2);
     m::Row row{.op     = "rmsnorm_pack_tail",
                .format = "bf16",
                .n      = o.hidden,

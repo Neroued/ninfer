@@ -42,7 +42,7 @@ struct Nf4EmbeddingShard {
  * zero. Exclusive row ownership permits combining partial outputs as packed I32/U32 words;
  * the Op itself performs no communication.
  *
- * T>0, B=1..8. token_ids is Device I32 [T,B] with contiguous dimension zero and a
+ * T>0, B>=1. token_ids is Device I32 [T,B] with contiguous dimension zero and a
  * non-overlapping, naturally aligned outer stride. before.token_ids selects dense I32 [2]
  * records with contiguous Device I64 [B] byte offsets. valid_columns is Device I32 [B].
  * For n=valid_columns[b], 0<=n<=T; live rows select valid, naturally aligned records. Output is
@@ -63,7 +63,7 @@ void ngram_embedding_lookup(const Tensor& token_ids, const Tensor& valid_columns
  * Shared PLE domain and view conventions:
  *
  * H=2560 features per stream, C=4 streams, D=H*C=10240 channels. Channel c=d+H*s
- * identifies feature d of stream s. B is in [1,8]; T (physical columns per batch row), R
+ * identifies feature d of stream s. B is positive; T (physical columns per batch row), R
  * (record columns) are positive. Every positive T representable by the views and available
  * storage is supported. Matching axes agree across operands.
  *
@@ -225,7 +225,9 @@ void ple_conv_add_norm(const Tensor& residual, const Tensor& gated_value, const 
  *
  * Shared view rules apply. before/after may use different backing arenas.
  * accepted_columns is contiguous Device I32 [B]. For each b, 0<=a<=records.valid_columns[b]<=R.
- * Every source/destination byte offset selects a valid field, including for a=0.
+ * live_rows is empty for dense rows or contiguous Device I32 [B] with values 0/1. Inactive
+ * rows read no accepted count, offset, State or record data and preserve destination.
+ * Every live source/destination byte offset selects a valid field, including for a=0.
  *
  * This is exact BF16 word copying, preserving every bit including zero signs. No numerical
  * evaluation or finite-value requirement is imposed on the copied words. Only the nine columns
@@ -240,6 +242,6 @@ void ple_conv_add_norm(const Tensor& residual, const Tensor& gated_value, const 
  */
 void ple_state_extract(const ConstPleConvStateView& before, const PleConvRecordReadView& records,
                        const Tensor& accepted_columns, PleConvStateView after,
-                       CudaExecutionView execution);
+                       const Tensor& live_rows, CudaExecutionView execution);
 
 } // namespace ninfer::ops

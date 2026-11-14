@@ -301,7 +301,7 @@ int run_batch_case(CudaExecutionView execution, const Geometry& geometry, KvCach
                    std::span<const std::uint32_t> graph_limits) {
     const int batch = test_case.contexts.size(), width = test_case.width;
     const int pool_rows = std::max(
-        batch, *std::max_element(test_case.table_rows.begin(), test_case.table_rows.end()) + 1);
+        1, *std::max_element(test_case.table_rows.begin(), test_case.table_rows.end()) + 1);
     int maximum_visible = 1;
     for (int b = 0; b < batch; ++b)
         maximum_visible = std::max(
@@ -376,14 +376,17 @@ int run_batch_case(CudaExecutionView execution, const Geometry& geometry, KvCach
         for (int b = 0; b < batch; ++b)
             for (int j = 0; j < width; ++j)
                 positions[b * width + j] =
-                    valid[b] == 0 ? 0 : contexts[b] + std::min(j, valid[b] - 1);
+                    valid[b] == 0 ? -1 : contexts[b] + std::min(j, valid[b] - 1);
         const auto q_bits = to_bf16_bits(q), k_bits = to_bf16_bits(k), v_bits = to_bf16_bits(v);
         dq.copy_from_host(q_bits.data(), q_bits.size() * 2);
         dk.copy_from_host(k_bits.data(), k_bits.size() * 2);
         dv.copy_from_host(v_bits.data(), v_bits.size() * 2);
         dp.copy_from_host(positions.data(), positions.size() * 4);
         dvalid.copy_from_host(valid.data(), batch * 4);
-        dlanes.copy_from_host(lanes.data(), batch * 4);
+        auto selected_lanes = lanes;
+        for (int b = 0; b < batch; ++b)
+            if (valid[b] == 0) selected_lanes[b] = -1;
+        dlanes.copy_from_host(selected_lanes.data(), batch * 4);
         dout.fill(0xff);
         scratch.fill(phase ? 0xa5 : 0x5a);
         cuda_synchronize();
@@ -448,7 +451,7 @@ int run_batch_case(CudaExecutionView execution, const Geometry& geometry, KvCach
                     verify_input(label + " v unchanged", dv, v_bits);
         failures += verify_positions(label + " positions unchanged", dp, positions) +
                     verify_positions(label + " counts unchanged", dvalid, valid) +
-                    verify_positions(label + " lanes unchanged", dlanes, lanes);
+                    verify_positions(label + " lanes unchanged", dlanes, selected_lanes);
         failures += dout.verify_guards(label) + scratch.verify_guards(label);
         if (workspace.used() != 0 || workspace.peak_used() > capacity) {
             std::cerr << label << ": workspace mismatch\n";
@@ -500,7 +503,7 @@ int verify_workspace_capacity_contract(CudaExecutionView execution, KvCacheStora
     for (const int sm_count : {96, 160, 170, 192}) {
         constexpr ops::AttentionHeadGeometry capacity_geometry{kHeadDim, 24, 4};
         constexpr ops::CausalAttentionExecutionEnvelope capacity_envelope{1, 131072};
-        for (const int batch : {1, 3}) {
+        for (const int batch : {1, 3, 17, 65537}) {
             const int max_width = batch == 1 ? 257 : 16;
             std::size_t largest = 0;
             for (int width = 1; width <= max_width; ++width)

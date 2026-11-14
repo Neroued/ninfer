@@ -21,7 +21,7 @@ Int8KvCausalPlan select_int8_kv_causal_plan(int heads, int width, int batch,
                                             CausalAttentionExecutionEnvelope envelope,
                                             int multiprocessor_count) {
     if (multiprocessor_count <= 0 || (heads != 24 && heads != 16) || width < 1 || batch < 1 ||
-        batch > 8 || (batch > 1 && width > 16) || envelope.min_visible_keys == 0 ||
+        (batch > 1 && width > 16) || envelope.min_visible_keys == 0 ||
         envelope.min_visible_keys > envelope.max_visible_keys ||
         envelope.max_visible_keys > kCausalAttentionMaximumVisibleKeys)
         throw std::invalid_argument("INT8 attention: invalid plan inputs");
@@ -54,6 +54,7 @@ std::size_t int8_kv_workspace_bytes(int heads, int batch, int min_width, int max
             select_int8_kv_causal_plan(heads, width, batch, envelope, multiprocessor_count);
         if (plan.family == Int8KvFamily::Tiled) continue;
         const int splits = plan.partition.capacity;
+        if (splits == 1) continue;
         WorkspaceLayoutBuilder layout;
         (void)allocate_causal_partials(layout, heads, width, splits, batch);
         maximum = std::max(maximum, layout.peak_bytes(1));

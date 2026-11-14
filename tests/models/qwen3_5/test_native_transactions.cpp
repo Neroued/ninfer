@@ -210,11 +210,12 @@ public:
             const std::array<runtime::CommitDecision, 1> decision{
                 {{.accepted_tokens = 1, .terminal = terminal}}};
             auto result = driver_.commit(std::move(*step.pending), decision);
-            require(result.row_count == 1 && result.rows[0].disposition ==
-                                                 (terminal ? runtime::CommitDisposition::Finishable
+            require(result.rows.size() == 1 &&
+                        result.rows[0].disposition == (terminal
+                                                           ? runtime::CommitDisposition::Finishable
                                                            : runtime::CommitDisposition::Active),
                     "prefill commit returned the wrong request phase");
-            if (result.capture_ready[0]) { program_.skip_capture(sequence); }
+            if (result.rows[0].capture_ready) { program_.skip_capture(sequence); }
             return step.summary;
         }
         throw std::runtime_error("prefill exceeded its bounded chunk count");
@@ -488,7 +489,7 @@ public:
                 "input replay fixture did not reach its full input boundary");
         const std::array<runtime::CommitDecision, 1> accepted{{{.accepted_tokens = 1}}};
         const auto committed = driver_.commit(std::move(*begin.pending), accepted);
-        require(committed.capture_ready[0], "full raw input did not offer its replay point");
+        require(committed.rows[0].capture_ready, "full raw input did not offer its replay point");
         const auto input = capture(active, prompt_tokens, runtime::CheckpointRole::InputReplay);
 
         reserve(active, q35::ExecutionUnitKind::Decode, 1);
@@ -539,7 +540,7 @@ public:
                     "active input fixture did not reach its full input boundary");
             const std::array<runtime::CommitDecision, 1> accepted{{{.accepted_tokens = 1}}};
             const auto committed = driver_.commit(std::move(*begin.pending), accepted);
-            require(committed.capture_ready[0], "active input fixture did not offer P");
+            require(committed.rows[0].capture_ready, "active input fixture did not offer P");
             const auto input =
                 capture(original, prompt_tokens, runtime::CheckpointRole::InputReplay);
 
@@ -600,7 +601,7 @@ public:
         require(begin.complete && begin.pending, "independent-history fixture did not begin A");
         const std::array<runtime::CommitDecision, 1> accepted{{{.accepted_tokens = 1}}};
         const auto committed = driver_.commit(std::move(*begin.pending), accepted);
-        require(committed.capture_ready[0], "independent-history fixture did not offer P_A");
+        require(committed.rows[0].capture_ready, "independent-history fixture did not offer P_A");
         const auto input_a = capture(active_a, prompt_tokens, runtime::CheckpointRole::InputReplay);
         const std::array<q35::CheckpointHandle, 1> points_a{input_a};
         const auto identity = [&](q35::CheckpointHandle point) {
@@ -702,7 +703,7 @@ public:
         endpoint_input.push_back(begin.pending->tokens().front());
         const std::array<runtime::CommitDecision, 1> accepted{{{.accepted_tokens = 1}}};
         const auto committed = driver_.commit(std::move(*begin.pending), accepted);
-        require(committed.capture_ready[0], "Host suffix fixture did not offer P");
+        require(committed.rows[0].capture_ready, "Host suffix fixture did not offer P");
         const auto input = capture(active, prompt_tokens, runtime::CheckpointRole::InputReplay);
 
         // Extend the same history across complete KV pages, retaining the earlier input point.
@@ -805,7 +806,7 @@ public:
         require(step.complete && step.pending && !step.capture_ready,
                 "skipped input changed the normal prefill unit");
         const std::array<runtime::CommitDecision, 1> accepted{{{.accepted_tokens = 1}}};
-        require(!driver_.commit(std::move(*step.pending), accepted).capture_ready[0],
+        require(!driver_.commit(std::move(*step.pending), accepted).rows[0].capture_ready,
                 "skipped input unexpectedly remained reserved");
         require(program_.retry_capture(active) && program_.prepare_capture(active)->reserved,
                 "committed input could not retry without a compute permit");
@@ -1125,7 +1126,7 @@ public:
         auto begin = driver_.prefill(active);
         require(begin.pending.has_value(), "Host retirement fixture did not begin");
         const std::array<runtime::CommitDecision, 1> accepted{{{.accepted_tokens = 1}}};
-        require(driver_.commit(std::move(*begin.pending), accepted).capture_ready[0],
+        require(driver_.commit(std::move(*begin.pending), accepted).rows[0].capture_ready,
                 "Host retirement fixture did not offer its input point");
         const auto input = capture(active, 65, runtime::CheckpointRole::InputReplay);
         reserve(active, q35::ExecutionUnitKind::Decode, 1);
@@ -1173,7 +1174,7 @@ public:
             auto begin = driver_.prefill(active);
             require(begin.pending.has_value(), "rewind fixture did not complete input");
             const std::array<runtime::CommitDecision, 1> accepted{{{.accepted_tokens = 1}}};
-            require(driver_.commit(std::move(*begin.pending), accepted).capture_ready[0],
+            require(driver_.commit(std::move(*begin.pending), accepted).rows[0].capture_ready,
                     "rewind fixture did not offer input recovery");
             const auto input = capture(active, prefix, runtime::CheckpointRole::InputReplay);
             const std::array<q35::SequenceHandle, 1> members{active};
@@ -1693,7 +1694,7 @@ public:
              {second, q35::ExecutionUnitKind::Decode, 1}}};
         require(static_cast<bool>(program_.reserve_units(units)), "grammar mixed unit reservation");
         const std::array<runtime::RoundBudget, 2> budgets{{{1}, {1}}};
-        const std::array constrained{true, false};
+        const std::array<std::uint8_t, 2> constrained{1, 0};
         auto pending = driver_.decode(
             members, budgets, constrained, [](const runtime::DecisionRequest& request) {
                 runtime::DecisionInput input{.stage = request.stage};
@@ -1754,7 +1755,7 @@ void shared_capture_alignment(std::shared_ptr<const q35::ModelDefinition> defini
         if (step.pending) {
             const std::array<runtime::CommitDecision, 1> accepted{{{.accepted_tokens = 1}}};
             const auto committed = driver.commit(std::move(*step.pending), accepted);
-            step.capture_ready   = committed.capture_ready[0];
+            step.capture_ready   = committed.rows[0].capture_ready;
         }
         return step;
     };

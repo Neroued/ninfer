@@ -76,7 +76,8 @@ void run(const Options& options) {
                 arena.reset_peak();
                 const auto result = measurement::measure(
                     [&](auto cuda) {
-                        ops::topk_sigmoid_route(x, profile, control.weight, b, routes, arena, cuda);
+                        ops::topk_sigmoid_route(x, profile, control.weight, b, routes, {}, arena,
+                                                cuda);
                     },
                     [](auto) {}, flush, device_context().execution_view(), options.timing,
                     execution, cache);

@@ -19,21 +19,28 @@ void launch_nvfp4_kv_grouped_mma(const CausalAttentionOperands& p, Nvfp4KvCacheV
         Masked != (cache.valid_columns != nullptr) || partition.capacity < 1 ||
         partition.target > CausalKvPartition::kMaxSplits || partition.target < 1 ||
         partition.key_shift < 6 || partition.key_shift > 12 ||
-        partition.capacity != partition.active(p.visible_capacity) || !partial.acc ||
-        !partial.maximum || !partial.sum)
+        partition.capacity != partition.active(p.visible_capacity) ||
+        (partition.capacity != 1 && (!partial.acc || !partial.maximum || !partial.sum)))
         throw std::invalid_argument("NVFP4 grouped attention: invalid schedule/partials");
     if constexpr (Input::writes_cache)
         if (!input.k || !input.v) throw std::invalid_argument("NVFP4 append requires K/V");
-    constexpr auto kernel =
-        nvfp4_kv_grouped_mma_kernel<G, S, MultiBatch, Masked, Input, ParallelQueries>;
-    constexpr int bytes = S::kDynamicArena ? S::kArenaBytes : 0;
-    (void)common::prepare_shared<bytes, kernel, true>();
-    const dim3 grid(G::KVHeads * (ParallelQueries ? common::div_up(p.width, S::kTokenTile) : 1),
-                    partition.capacity, p.batch);
-    kernel<<<grid, S::kThreads, bytes, stream>>>(
-        p.q, input, p.positions, cache.keys, cache.values, cache.key_scales, cache.value_scales,
-        cache.tables, cache.valid_columns, cache.table_rows, cache.table_stride, p.width,
-        p.visible_capacity, partition, p.scale, partial.acc, partial.maximum, partial.sum);
+    const auto launch = [&]<bool Direct>() {
+        constexpr auto kernel =
+            nvfp4_kv_grouped_mma_kernel<G, S, MultiBatch, Masked, Input, ParallelQueries, Direct>;
+        constexpr int bytes = S::kDynamicArena ? S::kArenaBytes : 0;
+        (void)common::prepare_shared<bytes, kernel, true>();
+        const dim3 grid(G::KVHeads * (ParallelQueries ? common::div_up(p.width, S::kTokenTile) : 1),
+                        partition.capacity, p.batch);
+        kernel<<<grid, S::kThreads, bytes, stream>>>(
+            p.q, input, p.positions, cache.keys, cache.values, cache.key_scales, cache.value_scales,
+            cache.tables, cache.valid_columns, cache.table_rows, cache.table_stride, p.width,
+            p.visible_capacity, partition, p.scale, partial.acc, partial.maximum, partial.sum,
+            p.out);
+    };
+    if (partition.capacity == 1)
+        launch.template operator()<true>();
+    else
+        launch.template operator()<false>();
     CUDA_CHECK(cudaGetLastError());
 }
 

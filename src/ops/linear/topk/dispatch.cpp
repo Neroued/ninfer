@@ -1,6 +1,7 @@
 #include "ops/linear/topk/dispatch.h"
 
 #include <stdexcept>
+#include "core/platform.h"
 
 namespace ninfer::ops::detail {
 LinearTopKProfile select_linear_topk_profile(QType qtype, std::int32_t head_rows,
@@ -20,9 +21,28 @@ LinearTopKProfile select_linear_topk_profile(QType qtype, std::int32_t head_rows
     throw std::invalid_argument("linear_topk: unsupported head profile");
 }
 
+int linear_topk_large_threshold(LinearTopKProfile profile) {
+#if NINFER_TARGET_SPARK
+    return profile == LinearTopKProfile::Q4Mapped ? 256 : 128;
+#else
+    return 256;
+#endif
+}
+
 LinearTopKPlan select_linear_topk(LinearTopKProfile profile, int columns) {
     if (columns < 1 || columns > kLinearTopKMaxChunkColumns)
         throw std::invalid_argument("linear_topk: invalid internal chunk size");
+    if (columns > 128) {
+        if (profile == LinearTopKProfile::Q8Full) return select_topk_q8_n248320_k5120_large();
+        if (profile == LinearTopKProfile::Q4Mapped) return select_topk_q4_n131072_k5120_large();
+#if !NINFER_TARGET_SPARK
+        return select_topk_fp8_n248320_k5120_large();
+#else
+        auto plan       = select_topk_fp8_n248320_k5120_mma(columns);
+        plan.row_window = 8192;
+        return plan;
+#endif
+    }
     switch (profile) {
     case LinearTopKProfile::Q8Full:
         if (columns <= 24) return {select_topk_q8_n248320_k5120_sliced(columns), 128};
@@ -42,13 +62,16 @@ std::size_t linear_topk_capacity(LinearTopKProfile profile, int head_rows, int m
     if (min_columns < 1 || max_columns < min_columns)
         throw std::invalid_argument("linear_topk workspace: invalid column interval");
     WorkspaceLayoutBuilder layout;
-    for (int columns = 1; columns <= kLinearTopKMaxChunkColumns; ++columns) {
-        const bool reachable = linear_topk_chunk_reachable(columns, min_columns, max_columns);
-        if (!reachable) continue;
-        const auto plan = select_linear_topk(profile, columns);
-        auto scope      = layout.scope();
-        (void)allocate_linear_topk_workspace(layout, head_rows, columns, plan.rows_per_producer);
-    }
+    for_each_linear_topk_extent(
+        min_columns, max_columns, linear_topk_large_threshold(profile), [&](int columns) {
+            const auto plan = select_linear_topk(profile, columns);
+            auto scope      = layout.scope();
+            if (plan.row_window && plan.row_window < head_rows)
+                (void)layout.alloc(DType::I64, {16, columns}, 256);
+            (void)allocate_linear_topk_workspace(
+                layout, plan.row_window ? std::min(head_rows, plan.row_window) : head_rows, columns,
+                plan.rows_per_producer);
+        });
     return layout.peak_bytes();
 }
 } // namespace ninfer::ops::detail

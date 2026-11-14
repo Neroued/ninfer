@@ -60,7 +60,7 @@ struct Request {
 
 using Scheduler  = ninfer::runtime::Scheduler<Request>;
 using RequestPtr = std::shared_ptr<Request>;
-using Slots      = std::array<RequestPtr, ninfer::kMaximumConcurrency>;
+using Slots      = std::vector<RequestPtr>;
 
 void require(bool condition, const char* message) {
     if (!condition) { throw std::runtime_error(message); }
@@ -86,7 +86,8 @@ void test_fifo_bypass_survives_pressure() {
         for (const auto& candidate : candidates) {
             scheduler.admission_candidate_checked(candidate->id);
         }
-        require(!candidates.empty() && candidates.front() == head && candidates.size() <= 3,
+        require(!candidates.empty() && candidates.front() == head &&
+                    candidates.size() <= 1 + Scheduler::admission_scan_batch,
                 "fresh scan did not preserve the head and bounded work");
     }
     require(head->admission_bypasses == 0 && fresh[1]->admission_bypasses == 0,
@@ -122,19 +123,20 @@ void test_fifo_bypass_survives_pressure() {
     fresh.pop_front();
     scheduler.begin_admission_scan();
     const auto after_cancel = scheduler.fresh_candidates(fresh, 2);
-    require(after_cancel.size() > 1 && after_cancel.size() <= 3 && after_cancel.front()->id == 13 &&
-                after_cancel.front()->admission_bypasses == 0,
+    require(after_cancel.size() > 1 && after_cancel.size() <= 1 + Scheduler::admission_scan_batch &&
+                after_cancel.front()->id == 13 && after_cancel.front()->admission_bypasses == 0,
             "head removal transferred its exhausted credit to the next request");
 }
 
 void test_scan_progress_and_waiter_barrier() {
     Scheduler scheduler;
-    std::deque<RequestPtr> fresh{request(1), request(2), request(3),
-                                 request(4), request(5), request(6)};
+    std::deque<RequestPtr> fresh;
+    for (std::uint64_t id = 1; id <= 3 * Scheduler::admission_scan_batch + 2; ++id)
+        fresh.push_back(request(id));
     std::vector<std::uint64_t> seen;
     const auto observe = [&](const std::vector<RequestPtr>& candidates) {
         require(!candidates.empty() && candidates.front() == fresh.front() &&
-                    candidates.size() <= 3,
+                    candidates.size() <= 1 + Scheduler::admission_scan_batch,
                 "candidate scan exceeded the head plus bounded younger requests");
         for (const auto& candidate : candidates) {
             require(std::find(fresh.begin(), fresh.end(), candidate) != fresh.end(),
@@ -152,17 +154,19 @@ void test_scan_progress_and_waiter_barrier() {
             "failed bounded batch abandoned later requests that could fit");
     const auto next = scheduler.fresh_candidates(fresh, 2);
     require(
-        next.size() == 3 && next[1]->id == 4 && next[2]->id == 5,
+        next.size() == 1 + Scheduler::admission_scan_batch &&
+            next[1]->id == 2 + Scheduler::admission_scan_batch,
         "a later fitting request required another arrival or resident completion to be checked");
     observe(next);
 
     // Remove the last examined ticket and add an arrival. The next event must preserve
     // cursor progress rather than restart indefinitely at the first failed requests.
     std::erase(fresh, next.back());
-    fresh.push_back(request(7));
+    fresh.push_back(request(3 * Scheduler::admission_scan_batch + 3));
     scheduler.begin_admission_scan();
     const auto after_change = scheduler.fresh_candidates(fresh, 2);
-    require(after_change.size() == 3 && after_change[1]->id == 6 && after_change[2]->id == 7,
+    require(after_change.size() == 1 + Scheduler::admission_scan_batch &&
+                after_change[1]->id == 2 + 2 * Scheduler::admission_scan_batch,
             "queue changes reset the stable-ticket admission cursor");
     observe(after_change);
     for (std::size_t attempt = 0; scheduler.admission_scan_pending() && attempt < fresh.size();
@@ -196,7 +200,8 @@ void test_scan_keeps_unexamined_candidates() {
     std::deque<RequestPtr> fresh{request(1), request(2), request(3), request(4)};
     scheduler.begin_admission_scan();
     const auto first = scheduler.fresh_candidates(fresh, 2);
-    require(first.size() == 3, "admission did not expose a bounded candidate batch");
+    require(first.size() > 2 && first.size() <= 1 + Scheduler::admission_scan_batch,
+            "admission did not expose a bounded candidate batch");
     scheduler.admission_candidate_checked(first[0]->id);
     scheduler.admission_candidate_checked(first[1]->id);
     scheduler.admitted(fresh, *first[1], 2);
@@ -219,19 +224,27 @@ void admit(Scheduler& scheduler, const RequestPtr& value) {
     scheduler.admitted(std::deque<RequestPtr>{value}, *value, 4);
 }
 
+template <class Slots>
+std::optional<std::uint32_t> victim(const Scheduler& scheduler, const Slots& slots,
+                                    std::span<const std::uint32_t> excluded = {}) {
+    const auto candidates = scheduler.preemption_candidates(slots);
+    for (auto lane : candidates)
+        if (std::find(excluded.begin(), excluded.end(), lane) == excluded.end()) return lane;
+    return {};
+}
+
 void test_pressure_handoff_and_fair_service() {
     Scheduler scheduler;
-    Slots slots{};
+    Slots slots(4);
     auto a = slots[0] = request(10, Request::Phase::Decode);
     auto b = slots[1] = request(20, Request::Phase::Decode);
     auto c = slots[2] = request(30, Request::Phase::Decode);
     for (const auto& value : {a, b, c}) admit(scheduler, value);
 
     scheduler.require_progress(a->id);
-    require(scheduler.preemption_victim(slots, 4) == 2,
-            "capacity handoff did not exclude its beneficiary");
+    require(victim(scheduler, slots) == 2, "capacity handoff did not exclude its beneficiary");
     const std::array excluded{2U};
-    require(scheduler.preemption_victim(slots, 4, excluded) == 1,
+    require(victim(scheduler, slots, excluded) == 1,
             "noncontributing victim prevented another release candidate");
     slots[2].reset(); // c paused; the same capacity is still owed to a.
     scheduler.require_progress(c->id);
@@ -247,11 +260,10 @@ void test_pressure_handoff_and_fair_service() {
     scheduler.served(b->id, Scheduler::service_quantum_ns);
     require(scheduler.advance_service(true, false) && scheduler.progress_owner() == c->id,
             "suspended request was skipped by service rotation");
-    require(scheduler.preemption_victim(slots, 4) == 1,
+    require(victim(scheduler, slots) == 1,
             "a waiting request could not preempt an older served resident");
     b->recovery_pending = true;
-    require(scheduler.preemption_victim(slots, 4) == 0,
-            "protected Native recovery was selected as a victim");
+    require(victim(scheduler, slots) == 0, "protected Native recovery was selected as a victim");
     b->recovery_pending = false;
     // Arbitrarily many resource polls/replay boundaries cannot consume c's service turn.
     for (int i = 0; i < 100; ++i)
@@ -269,6 +281,19 @@ void test_pressure_handoff_and_fair_service() {
     require(scheduler.advance_service(false, false) && !scheduler.progress_owner(),
             "resolved pressure did not reopen fresh admission");
     scheduler.finished(c->id);
+}
+
+void test_batch_completion_preserves_service_order() {
+    Scheduler scheduler;
+    for (std::uint64_t id = 1; id <= 128; ++id) admit(scheduler, request(id));
+    scheduler.require_progress(1);
+    std::vector<std::uint64_t> ended;
+    for (std::uint64_t id = 1; id <= 128; id += 2) ended.push_back(id);
+    scheduler.finished(ended);
+    require(scheduler.progress_owner() == 2, "batch completion lost the next service owner");
+    scheduler.served(2, Scheduler::service_quantum_ns);
+    require(scheduler.advance_service(true, false) && scheduler.progress_owner() == 4,
+            "batch completion reordered surviving requests");
 }
 
 void test_recovery_cost_has_a_bounded_service_allowance() {
@@ -308,7 +333,7 @@ void test_bounded_service_under_continuous_contention() {
 
 void test_prefill_replay_round_robin() {
     Scheduler scheduler;
-    Slots slots{};
+    Slots slots(4);
     slots[0] = request(1, Request::Phase::Decode);
     slots[1] = request(2, Request::Phase::Prefill);
     slots[2] = request(3, Request::Phase::Replay);
@@ -332,7 +357,7 @@ void test_prefill_replay_round_robin() {
 
 void test_decode_and_control_membership() {
     Scheduler scheduler;
-    Slots slots{};
+    Slots slots(4);
     slots[0]                      = request(1, Request::Phase::Decode);
     slots[0]->budget->tokens      = 11;
     slots[0]->output.model_tokens = 3;
@@ -340,8 +365,9 @@ void test_decode_and_control_membership() {
     slots[2]->recovery_pending    = true;
     slots[3]                      = request(3, Request::Phase::Decode);
     slots[3]->capture_pending     = true;
-    const auto round              = scheduler.build_round_membership(slots, 4);
-    require(round.size == 2 && round.lanes[0] == 0 && round.lanes[1] == 2 &&
+    Scheduler::RoundMembership round(4);
+    scheduler.build_round_membership(slots, [](auto) { return true; }, round);
+    require(round.size() == 2 && round.lanes[0] == 0 && round.lanes[1] == 2 &&
                 round.sequences[0] == 1 && round.sequences[1] == 2 &&
                 round.budgets[0].generated_tokens_remaining == 3 &&
                 round.budgets[1].generated_tokens_remaining == 1,
@@ -351,11 +377,69 @@ void test_decode_and_control_membership() {
     slots[0]->output.control = {7, 8, 9};
     slots[2]->phase          = Request::Phase::Control;
     slots[2]->output.control = {10, 11, 12};
-    const auto control       = scheduler.build_control_membership(slots, 4);
-    require(control.size == 2 && control.row_stride == 3 &&
+    Scheduler::ControlMembership control(4);
+    scheduler.build_control_membership(slots, [](auto) { return true; }, control);
+    require(control.size() == 2 && control.row_stride == 3 &&
                 control.tokens == std::vector<ninfer::TokenId>({7, 8, 9, 10, 11, 12}) &&
                 control.sequences[0] == 1 && control.sequences[1] == 2,
             "compact control membership changed committed control spans or request order");
+}
+
+void test_large_sparse_membership_and_reuse() {
+    constexpr std::uint32_t capacity = 128;
+    Scheduler scheduler;
+    Slots slots(capacity);
+    Scheduler::RoundMembership round(capacity);
+    for (std::uint32_t lane = 0; lane < capacity; ++lane) {
+        if (lane % 3 == 0) continue;
+        slots[lane]                  = request(lane + 1, Request::Phase::Decode);
+        slots[lane]->capture_pending = lane % 5 == 0;
+    }
+    scheduler.build_round_membership(slots, [](auto lane) { return lane % 7 != 0; }, round);
+    std::vector<std::uint32_t> expected;
+    for (std::uint32_t lane = 0; lane < capacity; ++lane)
+        if (lane % 3 && lane % 5 && lane % 7) expected.push_back(lane);
+    require(round.lanes == expected && round.size() > 8,
+            "large decode membership lost sparse or eligible lanes");
+    for (std::size_t row = 0; row < round.size(); ++row)
+        require(round.sequences[row] == expected[row] + 1 &&
+                    round.budgets[row].generated_tokens_remaining == 8,
+                "compact decode membership lost sequence or budget alignment");
+
+    slots.assign(capacity, nullptr);
+    slots[127]                   = request(1000, Request::Phase::Decode);
+    slots[127]->recovery_pending = true;
+    scheduler.build_round_membership(slots, [](auto) { return true; }, round);
+    require(round.size() == 1 && round.lanes[0] == 127 && round.sequences[0] == 1000 &&
+                round.budgets[0].generated_tokens_remaining == 1,
+            "reused membership retained old rows or confused a reused lane");
+    scheduler.build_round_membership(slots, [](auto) { return false; }, round);
+    require(round.empty() && round.sequence_span().empty() && round.budget_span().empty(),
+            "empty membership retained stale row payloads");
+}
+
+void test_control_membership_groups_eligible_widths() {
+    Scheduler scheduler;
+    Slots slots(128);
+    for (const auto lane : {0U, 9U, 100U, 127U})
+        slots[lane] = request(lane + 1, Request::Phase::Control);
+    slots[0]->output.control   = {1};
+    slots[9]->output.control   = {2, 3};
+    slots[100]->output.control = {4};
+    slots[127]->output.control = {5, 6};
+    Scheduler::ControlMembership control(128);
+    scheduler.build_control_membership(slots, [](auto lane) { return lane != 0; }, control);
+    require(control.lanes == std::vector<std::uint32_t>({9, 127}) && control.row_stride == 2 &&
+                control.sequences == std::vector<std::uint64_t>({10, 128}) &&
+                control.tokens == std::vector<ninfer::TokenId>({2, 3, 5, 6}),
+            "ineligible control row set the width or mismatched widths shared a batch");
+    scheduler.build_control_membership(slots, [](auto) { return true; }, control);
+    require(control.lanes == std::vector<std::uint32_t>({0, 100}) && control.row_stride == 1 &&
+                control.tokens == std::vector<ninfer::TokenId>({1, 4}),
+            "reused control membership retained a previous width or token payload");
+    scheduler.build_control_membership(slots, [](auto) { return false; }, control);
+    require(control.empty() && control.tokens.empty() && control.row_stride == 0,
+            "empty control membership retained an old width or tokens");
 }
 
 } // namespace
@@ -366,10 +450,13 @@ int main() {
         test_scan_progress_and_waiter_barrier();
         test_scan_keeps_unexamined_candidates();
         test_pressure_handoff_and_fair_service();
+        test_batch_completion_preserves_service_order();
         test_bounded_service_under_continuous_contention();
         test_recovery_cost_has_a_bounded_service_allowance();
         test_prefill_replay_round_robin();
         test_decode_and_control_membership();
+        test_large_sparse_membership_and_reuse();
+        test_control_membership_groups_eligible_widths();
         std::cout << "ok\n";
         return 0;
     } catch (const std::exception& error) {

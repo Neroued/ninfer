@@ -92,7 +92,7 @@ void packed_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
  * [B], and the cache is BF16, INT8-G64, FP8-E4M3FN-G128/UE8M0, NVFP4-G16, or K8V4. valid_columns is
  * either contiguous device I32 [B] or an empty Tensor meaning every row has W live columns. This
  * dense/masked topology is chosen by the caller and never inferred by copying device metadata to
- * the host. B=1 accepts every positive W in the current prompt/decode domain; B=2..8 accepts
+ * the host. B=1 accepts every positive W in the current prompt/decode domain; B>1 accepts
  * W=1..16.
  *
  * Let Vb be W for dense input or valid_columns[b] otherwise. For live column j<Vb with absolute
@@ -100,8 +100,8 @@ void packed_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
  * kv_table_rows[b]. The current k/v row is appended before it is observed, so the formula above
  * uses J=[0,p]. Each masked row has a live prefix [0,Vb); its live positions are sequential and
  * address populated histories. A nonempty row repeats its last live position through the inert
- * tail; an empty row uses zero positions. Other tail values are safe dummies.
- * Tail columns do not mutate cache and produce exact BF16 zero.
+ * tail; an empty row does not access positions or the page-table selector. Other tail values are
+ * safe dummies. Tail columns do not mutate cache and produce exact BF16 zero.
  *
  * Cache planes share packed page records selected by an I64 byte-offset table. Row and head
  * strides describe fields inside one record. Attention consumes this cache directly.
@@ -156,7 +156,7 @@ void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,
  * Non-causal grouped-query attention over persistent context plus one live query block.
  *
  * The registered profile is D=128, Hq=32, Hkv=8 (group 4), scale=1/sqrt(128), T=1..16, and
- * B=1..8. q/out are contiguous BF16 [128,32,T,B], query_k/query_v are contiguous BF16
+ * B>0. q/out are contiguous BF16 [128,32,T,B], query_k/query_v are contiguous BF16
  * [128,8,T,B], and context_lengths, valid_columns, and table_rows are contiguous device I32 [B].
  * The read-only BFloat16 context stores BF16 K and FP16 V fields [128,64,8] within each
  * packed page record. Its I64 [logical_pages,table_rows] table contains arena-relative byte
@@ -165,6 +165,7 @@ void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,
  * For row b, let L=context_lengths[b] and V=valid_columns[b]. Every live query i<V attends the
  * complete logical set consisting of context rows [0,L) followed by every temporary query K/V row
  * [0,V). There is no causal triangle. Columns i>=V are inert and produce exact BF16 zero. The
+ * V=0 skips context lengths, page-table selectors, and all input/cache data. The
  * context and temporary query K/V remain separate physical segments; every input and cache byte is
  * unchanged, and out is the only observable mutation and is completely overwritten.
  *

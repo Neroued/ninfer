@@ -30,6 +30,7 @@ struct DraftInputs {
     Tensor valid_columns;
     Tensor state_offsets;
     Tensor full_kv_rows;
+    Tensor live_rows;
     const ops::SamplingConfig* sampling = nullptr;
 };
 

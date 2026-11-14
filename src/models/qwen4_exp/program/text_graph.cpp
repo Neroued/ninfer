@@ -9,13 +9,13 @@ namespace ninfer::models::qwen4_exp {
 void TextGraph::prepare(execution::TextRun& run, const execution::Parameters& parameters,
                         moe::Schedule* experts, std::span<const std::uint32_t> bounds,
                         std::array<ple::DeviceEmbedding, 2> ple, execution::TextOutputs output,
-                        Tensor logits, std::int32_t columns, MemoryArena& workspace,
+                        Tensor logits, moe::TokenGeometry geometry, MemoryArena& workspace,
                         DeviceContext& device, const std::function<void()>& install_inputs) {
     bounds_.assign(bounds.begin(), bounds.end());
     workspace_bytes_.resize(bounds.size());
     const auto cuda = device.execution_view();
     if (experts)
-        prepare_offloaded(run, parameters, *experts, ple, output, logits, columns, workspace, cuda,
+        prepare_offloaded(run, parameters, *experts, ple, output, logits, geometry, workspace, cuda,
                           install_inputs);
     else
         prepare_resident(run, parameters, ple, output, logits, workspace, cuda, install_inputs);
@@ -82,7 +82,7 @@ void TextGraph::prepare_offloaded(execution::TextRun& run, const execution::Para
                                   moe::Schedule& experts,
                                   std::array<ple::DeviceEmbedding, 2> inputs,
                                   execution::TextOutputs output, Tensor logits,
-                                  std::int32_t columns, MemoryArena& workspace,
+                                  moe::TokenGeometry geometry, MemoryArena& workspace,
                                   CudaExecutionView cuda,
                                   const std::function<void()>& install_inputs) {
     auto& graph        = implementation_.emplace<Offloaded>();
@@ -113,7 +113,7 @@ void TextGraph::prepare_offloaded(execution::TextRun& run, const execution::Para
                 profile.push_back(*shared);
             } else {
                 profile.push_back(experts.capture_layer(
-                    p.text.layers[i].moe.bank, cuda, columns, [&] { run.mixer(i); },
+                    p.text.layers[i].moe.bank, cuda, geometry, [&] { run.mixer(i); },
                     [&](const moe::GpuCall& call) { run.gpu_moe(call); }, [&] { run.combine(i); },
                     shared ? *shared : nullptr));
             }

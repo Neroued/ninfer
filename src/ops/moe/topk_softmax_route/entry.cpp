@@ -29,11 +29,13 @@ std::size_t topk_softmax_route_workspace_capacity_bytes(const RouteProfile& prof
 }
 
 void topk_softmax_route(const Tensor& x, const RouteProfile& profile, const Weight& control,
-                        ExpertRoutes& routes, Tensor& shared_coefficients, MemoryArena& workspace,
+                        ExpertRoutes& routes, Tensor& shared_coefficients,
+                        MoeTokenValidity validity, MemoryArena& workspace,
                         CudaExecutionView execution) {
     detail::validate_route_profile(profile);
     detail::MoeOperands operands("topk_softmax_route", execution);
     const int tokens = operands.input(x, profile.hidden);
+    operands.validity(validity, tokens);
     operands.control(control, profile);
     operands.routes(routes, profile.top_k, tokens, true);
     operands.coefficient(shared_coefficients, tokens, true);
@@ -53,9 +55,9 @@ void topk_softmax_route(const Tensor& x, const RouteProfile& profile, const Weig
             detail::moe_cuda::routing::allocate_route(scratch, plan, count, profile.experts);
         const ExpertRoutes result{routes.ids.slice(1, offset, count),
                                   routes.coefficients.slice(1, offset, count)};
-        detail::moe_cuda::routing::launch_route(x.slice(1, offset, count), control, result,
-                                                shared_coefficients.slice(0, offset, count), plan,
-                                                storage, {}, execution);
+        detail::moe_cuda::routing::launch_route(
+            x.slice(1, offset, count), control, result, shared_coefficients.slice(0, offset, count),
+            plan, storage, {}, detail::moe_cuda::token_validity(validity, offset), execution);
     }
 }
 } // namespace ninfer::ops

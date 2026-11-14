@@ -1,5 +1,6 @@
 #pragma once
 
+#include "models/common/batch.h"
 #include "core/kda_replay_records.h"
 #include "models/glm5next/execution_shape.h"
 #include "models/glm5next/state/context.h"
@@ -17,6 +18,7 @@ struct BatchLayout {
 };
 
 struct RowLayout {
+    TensorRegion live_rows;
     TensorRegion source_offsets, destination_offsets, base_positions, accepted_columns,
         count_columns;
     TensorRegion anchors, count_slots, sampling_positions, sampling_columns;
@@ -45,7 +47,7 @@ struct MtpFrameLayout {
     BatchLayout history;
     std::vector<BatchLayout> draft_steps;
     TensorRegion conditioning, previous_hidden, recursive_hidden;
-    TensorRegion proposal_sampling, proposal_columns;
+    TensorRegion proposal_sampling;
     std::optional<TensorRegion> target_tokens;
     TensorRegion skip_first;
     ops::KpoolBlockSelectionLayout selection;
@@ -68,6 +70,8 @@ struct FrameLayout {
     std::optional<TensorRegion> candidates, gathered_candidates, sampled_ids, output_counts;
     std::optional<TensorRegion> visual_indices;
 };
+
+void reshape_frame_controls(FrameLayout&, PhysicalBatchShape, std::uint32_t width);
 
 [[nodiscard]] FrameLayout plan_frame(LayoutBuilder&, const execution::ModelProfile&,
                                      const ExecutionShape&);

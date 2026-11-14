@@ -1,6 +1,7 @@
 #pragma once
 
 #include "models/common/token_input.h"
+#include "models/common/batch.h"
 
 #include "models/common/context/contract.h"
 #include "models/common/context/directory/history.h"
@@ -33,12 +34,14 @@ struct WorkRow {
 
 // Physical rows are owner-contiguous; all public results and decisions retain logical order.
 struct BatchPlan {
+    PhysicalBatchShape shape;
     std::vector<std::uint32_t> members;
     std::vector<IndexRange> owners;
     bool operator==(const BatchPlan&) const = default;
 };
 
-[[nodiscard]] BatchPlan plan_batch(std::span<const WorkRow>, std::uint32_t ranks);
+[[nodiscard]] BatchPlan plan_batch(std::span<const WorkRow>, const BatchExecutionPlan&,
+                                   bool decode);
 
 enum class ForwardKind : std::uint8_t { Prefill, Replay, Ordinary, Control };
 enum class SampleKind : std::uint8_t { None, FirstToken, NextToken };
@@ -48,11 +51,13 @@ struct ForwardWork {
     SampleKind sample = SampleKind::None;
     std::vector<WorkRow> rows;
     std::optional<vision::Work> visual;
+    BatchPlan batch;
 };
 
 struct SpeculativeWork {
     std::vector<WorkRow> rows;
     std::vector<std::uint32_t> draft_extents;
+    BatchPlan batch;
 };
 
 struct ResidencyBinding {
@@ -69,12 +74,12 @@ struct ScoreWork {
     WorkRow row;
     std::vector<TokenId> targets;
     std::uint32_t first_target_column = 0;
+    BatchPlan batch;
 };
 
 struct Work {
     ContextActions actions;
     std::variant<ForwardWork, SpeculativeWork, ContextWork, ScoreWork> operation;
-    BatchPlan batch;
 };
 
 struct RowResult {
@@ -119,6 +124,7 @@ struct ExecutionTypes {
 
 struct WorkContract {
     ExecutionShape shape;
+    std::shared_ptr<const BatchExecutionPlan> batches;
     std::uint32_t vocabulary, public_tokens, ranks;
     std::uint32_t vision_max_features = 0;
     std::uint32_t control_token_limit = 0;
@@ -131,6 +137,8 @@ struct WorkContract {
 };
 
 [[nodiscard]] std::span<const WorkRow> work_rows(const Work&);
+[[nodiscard]] const BatchPlan& work_batch(const Work&);
+void prepare_batch(Work&, const BatchExecutionPlan&);
 [[nodiscard]] const context::ContextActions& local_actions(const ContextActions&,
                                                            std::uint32_t rank);
 

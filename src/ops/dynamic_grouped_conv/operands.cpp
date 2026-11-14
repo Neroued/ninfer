@@ -3,6 +3,7 @@
 
 #include <array>
 #include <cmath>
+#include <limits>
 #include <stdexcept>
 #include <string>
 
@@ -102,7 +103,8 @@ void require_prepare_nonoverlap(const Tensor& residual, const Tensor& norm_weigh
 
 void validate_interval(int min_width, int max_width, int min_batch, int max_batch, const char* op) {
     if (min_width < 2 || max_width > 16 || min_width > max_width || min_batch < 1 ||
-        max_batch > 8 || min_batch > max_batch)
+        min_batch > max_batch ||
+        std::int64_t(max_width) * max_batch > std::numeric_limits<int>::max())
         throw std::invalid_argument(std::string(op) + ": invalid W/B interval");
 }
 

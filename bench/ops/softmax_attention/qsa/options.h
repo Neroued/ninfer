@@ -102,7 +102,7 @@ inline Options parse_options(int argc, char** argv) {
                    "  --capacity R[,R...] --batch B --base-positions F0[,F0...]\n"
                    "  --valid dense|N[,N...] --accepted dense|mixed|N[,N...]\n"
                    "  --layout contiguous|layered|unaligned --inplace\n"
-                   "A single F0/count broadcasts to all B rows. B=1..8.\n";
+                   "A single F0/count broadcasts to all B rows. B>=1.\n";
             measurement::help();
             std::exit(0);
         }
@@ -228,7 +228,7 @@ inline Options parse_options(int argc, char** argv) {
     if (o.selected_blocks > 512 ||
         (o.selection != "random" && o.selection != "shared" && o.selection != "contiguous"))
         throw std::invalid_argument("invalid sparse selection/count");
-    if (o.batch > 8 || (o.axes != 1 && o.axes != 3) ||
+    if (o.batch < 1 || (o.axes != 1 && o.axes != 3) ||
         (o.layout != "contiguous" && o.layout != "layered" && o.layout != "unaligned"))
         throw std::invalid_argument("invalid QSA batch/axes/layout");
     if (o.graph_calls > 1 &&

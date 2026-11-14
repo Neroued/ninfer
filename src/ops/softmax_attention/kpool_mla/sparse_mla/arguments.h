@@ -25,6 +25,7 @@ struct SparseMlaArguments {
     __nv_bfloat16 *mapped, *out;
     float *numerator, *maximum, *denominator;
     int tokens, batch, width, splits, tile;
+    int first_row = 0, last_row = 0;
     int preferred_splits = 0, split_wave_size = 0;
     float scale;
     bool direct              = false;
@@ -43,7 +44,7 @@ struct SparseMlaArguments {
     __device__ int execution_splits() const {
         if (!preferred_splits) return splits;
         int live = 0;
-        for (int b = 0; b < batch; ++b) {
+        for (int b = first_row; b <= last_row; ++b) {
             const auto row_begin = std::int64_t(b) * tokens;
             const auto row_end   = row_begin + valid[b];
             const auto first     = begin > row_begin ? begin : row_begin;

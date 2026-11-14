@@ -24,7 +24,7 @@ using namespace ninfer::test;
 
 namespace {
 
-template <int Hidden, bool EpsilonProbe = false>
+template <int Hidden, bool EpsilonProbe = false, int MaximumTokens = 128>
 struct PrepareFixture {
     static constexpr std::int32_t kHidden          = Hidden;
     static constexpr std::int32_t kMaximumWidth    = 16;
@@ -32,8 +32,7 @@ struct PrepareFixture {
     static constexpr std::int32_t kTaps            = 2;
     static constexpr std::int32_t kSides           = 2;
     static constexpr std::int32_t kCoefficientRows = 4 * kGroups;
-    static constexpr std::int32_t kMaximumBatch    = 8;
-    static constexpr std::int32_t kMaximumTokens   = kMaximumWidth * kMaximumBatch;
+    static constexpr std::int32_t kMaximumTokens   = MaximumTokens;
     static constexpr float kEps = EpsilonProbe ? .25F : Hidden == 4096 ? 1.0e-5F : 1.0e-6F;
 
     static constexpr ReductionCriterion kFinishDeltaCriterion{/*relative_l2=*/3.2e-3,
@@ -239,8 +238,10 @@ struct PrepareFixture {
         DeviceBuffer residual_device = to_device(residual_host);
         DeviceBuffer norm_device     = to_device(norm_host);
         DeviceBuffer base_device     = to_device(base_host);
+        int max_batch                = 1;
+        for (auto [width, batch] : cases) max_batch = std::max(max_batch, batch);
         const auto capacity = ops::rmsnorm_dynamic_grouped_conv_prepare_workspace_capacity_bytes(
-            kHidden, 2, 16, 1, 8);
+            kHidden, 2, 16, 1, max_batch);
         ninfer::DeviceBuffer workspace_storage(ninfer::test::cuda_environment().context.device(),
                                                capacity);
         MemoryArena workspace(workspace_storage.span());
@@ -261,7 +262,8 @@ struct PrepareFixture {
             Tensor prepared(pd.span(), DType::BF16, {kHidden, width, batch});
             Tensor finish(fd.span(), DType::BF16, {kGroups, kTaps, width, batch});
             const bool graph_case = (width == 3 && batch == 3) || (width == 7 && batch == 7) ||
-                                    (width == 14 && batch == 7) || (width == 16 && batch == 8);
+                                    (width == 14 && batch == 7) || (width == 16 && batch >= 8) ||
+                                    width * batch >= 256;
             for (int replay = 0; replay < (graph_case ? 2 : 1); ++replay) {
                 pd.fill(0xff);
                 fd.fill(0xff);
@@ -330,7 +332,8 @@ void add_prepare_profile(ninfer::test::OpSuite& suite) {
     std::vector<OpCase> cases;
     for (auto [width, batch] : shapes) {
         const bool graph = (width == 3 && batch == 3) || (width == 7 && batch == 7) ||
-                           (width == 14 && batch == 7) || (width == 16 && batch == 8);
+                           (width == 14 && batch == 7) || (width == 16 && batch >= 8) ||
+                           width * batch >= 256;
         cases.push_back({"conv_prepare/k" + std::to_string(Hidden) + "/w" + std::to_string(width) +
                              "/b" + std::to_string(batch),
                          {{"execution", graph ? "graph" : "eager"}, {"format", "bf16"}}});
@@ -345,35 +348,67 @@ void add_prepare_profile(ninfer::test::OpSuite& suite) {
 void add_conv_prepare_cases(ninfer::test::OpSuite& suite) {
     add_prepare_profile<5120>(suite);
     add_prepare_profile<4096>(suite);
+    suite.add({"conv_prepare/k4096/w7/b19", {{"format", "bf16"}, {"suite", "concurrency"}}}, [] {
+        const std::array cases{std::pair{7, 19}};
+        return PrepareFixture<4096, false, 144>{}.run(cases);
+    });
+    suite.add({"conv_prepare/k4096/w4/b128", {{"format", "bf16"}, {"suite", "concurrency"}}}, [] {
+        const std::array cases{std::pair{4, 128}};
+        return PrepareFixture<4096, false, 512>{}.run(cases);
+    });
+    suite.add({"conv_prepare/k5120/w4/b128", {{"format", "bf16"}, {"suite", "concurrency"}}}, [] {
+        const std::array cases{std::pair{4, 128}};
+        return PrepareFixture<5120, false, 512>{}.run(cases);
+    });
+    suite.add({"conv_prepare/k4096/w7/b37", {{"format", "bf16"}, {"suite", "concurrency"}}}, [] {
+        const std::array cases{std::pair{7, 37}};
+        return PrepareFixture<4096, false, 259>{}.run(cases);
+    });
+    suite.add({"conv_prepare/k4096/w7/b147", {{"format", "bf16"}, {"suite", "concurrency"}}}, [] {
+        const std::array cases{std::pair{7, 147}};
+        return PrepareFixture<4096, false, 1029>{}.run(cases);
+    });
     suite.add({"conv_prepare/k4096/epsilon", {{"format", "bf16"}}}, [] {
         const std::array cases{std::pair{2, 1}};
         return PrepareFixture<4096, true>{}.run(cases);
     });
-    suite.add({"conv_prepare/workspace-profile", {{"format", "bf16"}}}, [] {
-        int failures = 0;
-        for (int hidden : {4096, 5120}) {
-            const auto capacity =
-                ops::rmsnorm_dynamic_grouped_conv_prepare_workspace_capacity_bytes(hidden, 2, 16, 1,
-                                                                                   8);
-            for (int width = 2; width <= 16; ++width)
-                for (int batch = 1; batch <= 8; ++batch)
-                    if (ops::rmsnorm_dynamic_grouped_conv_prepare_workspace_capacity_bytes(
-                            hidden, width, width, batch, batch) > capacity)
-                        ++failures;
-        }
-        for (auto args : std::array<std::array<int, 5>, 6>{{{0, 2, 16, 1, 8},
-                                                            {4095, 2, 16, 1, 8},
-                                                            {4096, 1, 16, 1, 8},
-                                                            {4096, 3, 2, 1, 8},
-                                                            {4096, 2, 17, 1, 8},
-                                                            {4096, 2, 16, 0, 8}}}) {
-            try {
-                (void)ops::rmsnorm_dynamic_grouped_conv_prepare_workspace_capacity_bytes(
-                    args[0], args[1], args[2], args[3], args[4]);
-                ++failures;
-            } catch (const std::invalid_argument&) {}
-        }
-        if (failures) std::cerr << "dynamic prepare workspace/profile contract failed\n";
-        return failures;
-    });
+    suite.add(
+        {"conv_prepare/workspace-profile", {{"format", "bf16"}, {"suite", "concurrency"}}}, [] {
+            int failures = 0;
+            for (int hidden : {4096, 5120}) {
+                const auto capacity =
+                    ops::rmsnorm_dynamic_grouped_conv_prepare_workspace_capacity_bytes(hidden, 2,
+                                                                                       16, 1, 64);
+                for (int width = 2; width <= 16; ++width)
+                    for (int batch : {1, 8, 9, 17, 24, 25, 64})
+                        if (ops::rmsnorm_dynamic_grouped_conv_prepare_workspace_capacity_bytes(
+                                hidden, width, width, batch, batch) > capacity)
+                            ++failures;
+            }
+            for (int hidden : {4096, 5120})
+                for (int width : {4, 7}) {
+                    const int last = (256 + width - 1) / width;
+                    const auto capacity =
+                        ops::rmsnorm_dynamic_grouped_conv_prepare_workspace_capacity_bytes(
+                            hidden, width, width, 1, last);
+                    for (int batch = 1; batch <= last; ++batch)
+                        if (ops::rmsnorm_dynamic_grouped_conv_prepare_workspace_capacity_bytes(
+                                hidden, width, width, batch, batch) > capacity)
+                            ++failures;
+                }
+            for (auto args : std::array<std::array<int, 5>, 6>{{{0, 2, 16, 1, 8},
+                                                                {4095, 2, 16, 1, 8},
+                                                                {4096, 1, 16, 1, 8},
+                                                                {4096, 3, 2, 1, 8},
+                                                                {4096, 2, 17, 1, 8},
+                                                                {4096, 2, 16, 0, 8}}}) {
+                try {
+                    (void)ops::rmsnorm_dynamic_grouped_conv_prepare_workspace_capacity_bytes(
+                        args[0], args[1], args[2], args[3], args[4]);
+                    ++failures;
+                } catch (const std::invalid_argument&) {}
+            }
+            if (failures) std::cerr << "dynamic prepare workspace/profile contract failed\n";
+            return failures;
+        });
 }

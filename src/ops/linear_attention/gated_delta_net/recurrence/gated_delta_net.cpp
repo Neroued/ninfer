@@ -75,13 +75,11 @@ RecurrenceGeometry validate_recurrent(const Tensor& q, const Tensor& k, const Te
     return geometry;
 }
 
-RecurrenceGeometry validate_recurrent_batch_update(const Tensor& q, const Tensor& k,
-                                                   const Tensor& v, const Tensor& g,
-                                                   const Tensor& beta, float scale,
-                                                   ConstStateFieldView source_state,
-                                                   StateFieldView destination_state,
-                                                   const Tensor& out, Device device) {
-    constexpr std::int32_t kMaximumBatch = 8;
+RecurrenceGeometry
+validate_recurrent_batch_update(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
+                                const Tensor& beta, float scale, ConstStateFieldView source_state,
+                                StateFieldView destination_state, const Tensor& valid_columns,
+                                const Tensor& out, Device device) {
     common::operand::dtype(q, DType::BF16, "gated_delta_net", "q must be BF16");
     common::operand::dtype(k, DType::BF16, "gated_delta_net", "k must be BF16");
     common::operand::dtype(v, DType::BF16, "gated_delta_net", "v must be BF16");
@@ -91,8 +89,8 @@ RecurrenceGeometry validate_recurrent_batch_update(const Tensor& q, const Tensor
 
     const RecurrenceGeometry geometry = require_geometry(q, v);
     const std::int32_t batch          = q.ne[3];
-    if (batch <= 0 || batch > kMaximumBatch || geometry.tokens != 1) {
-        throw std::invalid_argument("gated_delta_net: batch update requires B=1..8 and W=1");
+    if (batch <= 0 || geometry.tokens != 1) {
+        throw std::invalid_argument("gated_delta_net: batch update requires positive B and W=1");
     }
     common::operand::shape(
         q, {detail::gated_delta_net::kStateDim, geometry.qk_heads, geometry.tokens, batch},
@@ -125,6 +123,9 @@ RecurrenceGeometry validate_recurrent_batch_update(const Tensor& q, const Tensor
     common::operand::contiguous_nonnull(g, "gated_delta_net", "g", device);
     common::operand::contiguous_nonnull(beta, "gated_delta_net", "beta", device);
     common::operand::contiguous_nonnull(out, "gated_delta_net", "out", device);
+    if (valid_columns.data)
+        common::operand::tensor(valid_columns, DType::I32, {batch}, 4, "gated_delta_net",
+                                "valid columns", device);
 
     detail::gated_delta_net::require_scale(scale, "gated_delta_net");
 
@@ -171,14 +172,15 @@ void gated_delta_net(const Tensor& q, const Tensor& k, const Tensor& v, const Te
 void gated_delta_net_batch_update(const Tensor& q, const Tensor& k, const Tensor& v,
                                   const Tensor& g, const Tensor& beta, float scale,
                                   bool normalize_qk, ConstStateFieldView source_state,
-                                  StateFieldView destination_state, Tensor& out,
-                                  CudaExecutionView execution) {
+                                  StateFieldView destination_state, const Tensor& valid_columns,
+                                  Tensor& out, CudaExecutionView execution) {
     const auto stream = execution.stream();
-    validate_recurrent_batch_update(q, k, v, g, beta, scale, source_state, destination_state, out,
-                                    execution.device());
+    validate_recurrent_batch_update(q, k, v, g, beta, scale, source_state, destination_state,
+                                    valid_columns, out, execution.device());
 
-    detail::gated_delta_net::launch_recurrent_batch_update(
-        q, k, v, g, beta, scale, normalize_qk, source_state, destination_state, out, stream);
+    detail::gated_delta_net::launch_recurrent_batch_update(q, k, v, g, beta, scale, normalize_qk,
+                                                           source_state, destination_state,
+                                                           valid_columns, out, stream);
 }
 
 void gated_delta_net(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,

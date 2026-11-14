@@ -16,8 +16,7 @@ ExecutionShape shape(const execution::ModelProfile& p, const EngineOptions& o,
                      KvCacheVectorFormat index_format) {
     if (load_options(o) != p.options)
         throw std::invalid_argument("GLM5Next execution components differ from selected weights");
-    if (!o.max_context || o.max_context > p.config.text.max_context || !o.max_concurrency ||
-        o.max_concurrency > kMaximumConcurrency)
+    if (!o.max_context || o.max_context > p.config.text.max_context || !o.max_concurrency)
         throw std::invalid_argument(
             "GLM5Next execution bounds differ from its model or batch contract");
     if (bool(p.mtp || p.draft) != bool(o.speculative.draft_tokens))
@@ -78,8 +77,11 @@ context::ContextDirectorySpec schema(const ExecutionPlan& p, std::size_t capacit
 std::size_t ExecutionPlan::pinned_bytes() const {
     return (workspace.vision ? workspace.vision->encoder.host_staging_bytes : 0) +
            frame.host_ingress.bytes + frame.sampling_ingress.bytes + pinned_output_bytes +
-           2 * mapping_elements * sizeof(std::int64_t) +
-           (frame.token_counts ? frame.token_counts->region.bytes : 0);
+           2 * mapping_elements * sizeof(std::int64_t) + pinned_context_counts_bytes();
+}
+
+std::size_t ExecutionPlan::pinned_context_counts_bytes() const {
+    return frame.token_counts ? std::size_t(profile->public_tokens) * sizeof(std::int32_t) : 0;
 }
 
 std::size_t ExecutionPlan::device_bytes() const {
@@ -92,14 +94,18 @@ std::size_t ExecutionPlan::reservation_bytes() const {
 }
 
 ExecutionPlan plan_execution(std::shared_ptr<const execution::ModelProfile> profile,
-                             const EngineOptions& o, KvCacheVectorFormat index_format,
-                             int sm_count) {
+                             const EngineOptions& o, KvCacheVectorFormat index_format, int sm_count,
+                             BatchExecutionSpec batches) {
     if (!profile)
         throw std::invalid_argument("GLM5Next execution planning requires its weight profile");
     ExecutionPlan out;
-    out.profile        = std::move(profile);
-    out.shape          = shape(*out.profile, o, index_format);
-    out.use_cuda_graph = o.use_cuda_graph && o.purpose == EnginePurpose::Generation;
+    out.profile = std::move(profile);
+    out.shape   = shape(*out.profile, o, index_format);
+    out.batches = std::make_shared<const BatchExecutionPlan>(std::move(batches));
+    if (out.batches->resident_capacity() != out.shape.max_concurrency ||
+        out.batches->attention_owners() != out.profile->local.size)
+        throw std::invalid_argument("GLM batch plan differs from its execution resources");
+    out.use_cuda_graph = !out.batches->graph_rows().empty();
     out.state          = plan_state(*out.profile);
     out.workspace =
         execution::plan_workspace(*out.profile, out.shape, sm_count, o.vision_memory_budget_bytes);

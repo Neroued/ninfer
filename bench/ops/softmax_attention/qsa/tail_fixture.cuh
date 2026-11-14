@@ -90,7 +90,7 @@ struct TailFixture {
     }
 
     void launch(CudaExecutionView execution) {
-        ops::qsa_tail_extract(before, records, count, after, execution);
+        ops::qsa_tail_extract(before, records, count, after, {}, execution);
     }
 };
 

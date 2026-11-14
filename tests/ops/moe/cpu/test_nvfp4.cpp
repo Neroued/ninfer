@@ -185,7 +185,7 @@ void compare(const float* actual, const std::vector<double>& expected) {
 }
 
 void qualify(Fixture& f, CpuExecutor& executor, int tokens, int active, bool same,
-             ops::ExpertSubsetKind kind, int inactive_prefix = 0) {
+             ops::ExpertSubsetKind kind, int inactive_prefix = 0, bool absent_routes = false) {
     std::vector<std::uint16_t> input(std::size_t(H) * tokens);
     std::vector<int> ids(std::size_t(K) * tokens);
     std::vector<float> coefficients(ids.size());
@@ -202,13 +202,17 @@ void qualify(Fixture& f, CpuExecutor& executor, int tokens, int active, bool sam
         std::copy(f.inputs[pattern].begin(), f.inputs[pattern].end(),
                   input.begin() + std::size_t(t) * H);
         for (int j = 0; j < K; ++j) {
-            const int e        = inactive_prefix
-                                     ? (t < inactive_prefix || j > 0 ? j : 511)
-                                     : expert_ids[(j + (same ? 0 : t * 7)) % expert_ids.size()];
+            int e              = inactive_prefix ? (t < inactive_prefix || j > 0 ? j : 511)
+                                                 : expert_ids[(j + (same ? 0 : t * 7)) % expert_ids.size()];
             const auto slot    = std::size_t(t) * K + j;
             ids[slot]          = e;
             coefficients[slot] = j < active ? (j & 1 ? -0.07F : 0.113F) : 0;
-            if (kind == ops::ExpertSubsetKind::None ||
+            if (absent_routes && (t + 1 < tokens || j >= 2)) {
+                e                  = -1;
+                ids[slot]          = -1;
+                coefficients[slot] = 0;
+            }
+            if (e < 0 || kind == ops::ExpertSubsetKind::None ||
                 (kind == ops::ExpertSubsetKind::MaskOnes && !mask[e]) ||
                 (kind == ops::ExpertSubsetKind::MaskZeros && mask[e]))
                 continue;
@@ -337,6 +341,22 @@ void validation(Fixture& f, CpuExecutor& executor) {
     check(std::all_of(static_cast<float*>(out.data), static_cast<float*>(out.data) + H,
                       [](float v) { return v == 0; }),
           "empty subset is not zero");
+    ids[0] = -2;
+    rejects(call);
+    ids[0] = -1;
+    rejects(call);
+    ids.fill(-1);
+    coefficients.fill(0);
+    weights = {};
+    std::fill_n(static_cast<float*>(out.data), H, -123.5F);
+    call();
+    check(std::all_of(static_cast<float*>(out.data), static_cast<float*>(out.data) + H,
+                      [](float v) { return v == 0; }),
+          "absent routes are not zero");
+    ops::routed_swiglu(
+        x, f.profile, {}, routes,
+        {ops::ExpertSubsetKind::MaskZeros, Tensor(zeros.data(), Device::cpu(), DType::I32, {E})},
+        out, arena, executor.execution_view());
 }
 } // namespace
 
@@ -378,37 +398,45 @@ int main(int argc, char** argv) {
         }
         return 0;
     });
-    enum class Recipe { InactiveDivisors, Policies, InactivePrefix, Contract, Tiny };
+    enum class Recipe { InactiveDivisors, Policies, InactivePrefix, AbsentRoutes, Contract, Tiny };
     for (auto [recipe, name] : {std::pair{Recipe::InactiveDivisors, "inactive_divisors"},
                                 {Recipe::Policies, "policies"},
                                 {Recipe::InactivePrefix, "inactive_prefix"},
+                                {Recipe::AbsentRoutes, "absent_routes"},
                                 {Recipe::Contract, "contract"},
-                                {Recipe::Tiny, "tiny"}})
-        suite.add(std::string("cpu_moe/nvfp4/") + name,
-                  [=] {
-                      CpuTopology topology;
-                      CpuExecutor executor(
-                          topology,
-                          plan_cpu_team(
-                              topology.info(),
-                              std::min<std::size_t>(8, cpu_worker_order(topology.info()).size())));
-                      Fixture f;
-                      if (recipe == Recipe::InactiveDivisors) {
-                          for (int e = 1; e < E; e += 2)
-                              f.gu.divisors[e] = std::numeric_limits<float>::quiet_NaN();
-                          qualify(f, executor, 3, K, false, ExpertSubsetKind::MaskOnes);
-                      } else if (recipe == Recipe::Policies) {
-                          f.profile.ffn.gate_up_policy = ops::LinearPolicy::A16Only;
-                          f.profile.ffn.down_policy    = ops::LinearPolicy::AllowA8;
-                          qualify(f, executor, 4, K, true, ExpertSubsetKind::All);
-                      } else if (recipe == Recipe::InactivePrefix)
-                          qualify(f, executor, 257, K, false, ExpertSubsetKind::MaskOnes, 256);
-                      else if (recipe == Recipe::Contract)
-                          validation(f, executor);
-                      else
-                          tiny_inputs(f, executor);
-                      return 0;
-                  },
-                  {{"format", "nvfp4"}});
+                                {Recipe::Tiny, "tiny"}}) {
+        std::vector<std::pair<std::string, std::string>> tags{{"format", "nvfp4"}};
+        if (recipe == Recipe::AbsentRoutes || recipe == Recipe::Contract)
+            tags.emplace_back("suite", "concurrency");
+        suite.add(
+            std::string("cpu_moe/nvfp4/") + name,
+            [=] {
+                CpuTopology topology;
+                CpuExecutor executor(
+                    topology, plan_cpu_team(topology.info(),
+                                            std::min<std::size_t>(
+                                                8, cpu_worker_order(topology.info()).size())));
+                Fixture f;
+                if (recipe == Recipe::InactiveDivisors) {
+                    for (int e = 1; e < E; e += 2)
+                        f.gu.divisors[e] = std::numeric_limits<float>::quiet_NaN();
+                    qualify(f, executor, 3, K, false, ExpertSubsetKind::MaskOnes);
+                } else if (recipe == Recipe::Policies) {
+                    f.profile.ffn.gate_up_policy = ops::LinearPolicy::A16Only;
+                    f.profile.ffn.down_policy    = ops::LinearPolicy::AllowA8;
+                    qualify(f, executor, 4, K, true, ExpertSubsetKind::All);
+                } else if (recipe == Recipe::InactivePrefix)
+                    qualify(f, executor, 257, K, false, ExpertSubsetKind::MaskOnes, 256);
+                else if (recipe == Recipe::AbsentRoutes) {
+                    qualify(f, executor, 257, K, false, ExpertSubsetKind::All, 0, true);
+                    qualify(f, executor, 9, K, false, ExpertSubsetKind::MaskOnes, 0, true);
+                } else if (recipe == Recipe::Contract)
+                    validation(f, executor);
+                else
+                    tiny_inputs(f, executor);
+                return 0;
+            },
+            std::move(tags));
+    }
     return suite.main(argc, argv);
 }

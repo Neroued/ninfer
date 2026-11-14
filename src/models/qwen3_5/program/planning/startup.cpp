@@ -64,7 +64,7 @@ ResourceLayout persistent_layout(const SequencePlanImpl& plan) {
         .attention_head_dim    = dimension(config.attention->head_dim),
         .kv_storage            = plan.kv_storage,
         .enable_mtp            = plan.features.mtp(),
-        .kv_table_rows         = static_cast<std::int32_t>(plan.max_concurrency),
+        .kv_table_rows         = dimension(plan.max_concurrency),
     };
     spec.state_images = {
         .linear =
@@ -82,7 +82,7 @@ ResourceLayout persistent_layout(const SequencePlanImpl& plan) {
     if (plan.speculative_backend != SpeculativeBackend::None) {
         spec.replay_records = GdnReplayRecordSpec{
             .layers          = dimension(config.linear_attention_layers),
-            .record_capacity = static_cast<std::int32_t>(plan.max_concurrency),
+            .record_capacity = dimension(plan.max_concurrency),
             .width           = static_cast<std::int32_t>(plan.draft_window + 1),
             .conv_channels   = config.gdn ? dimension(config.gdn->conv_channels()) : 0,
             .qk_heads        = config.gdn ? dimension(config.gdn->linear_num_key_heads) : 0,
@@ -221,7 +221,9 @@ WorkspaceSpec build_workspace_plan(const SequencePlanImpl& plan) {
                 auto bytes =
                     moe::workspace_bytes(p.math, ops::MoeEpilogue::AddResidual, first, last);
                 if (plan.moe) {
-                    bytes = std::max(bytes, plan.moe->workspace_bytes(p.bank, first, last));
+                    bytes = std::max(bytes,
+                                     plan.moe->workspace_bytes(p.bank, first, last,
+                                                               path != GdnWorkspacePath::Prefill));
                 }
                 scratch(layout, bytes);
             }
@@ -270,8 +272,7 @@ WorkspaceSpec build_workspace_plan(const SequencePlanImpl& plan) {
     }
 
     if (!plan.causal_scoring) {
-        for (std::int32_t batch = 1; batch <= static_cast<std::int32_t>(plan.max_concurrency);
-             ++batch) {
+        for (std::int32_t batch = 1; batch <= dimension(plan.max_concurrency); ++batch) {
             WorkspaceLayoutBuilder ordinary;
             matrix(ordinary, DType::BF16, dimension(config.hidden_size), batch);
             target_body(ordinary, batch, batch, qwen3_5::TextPhase::Verify,
@@ -320,8 +321,7 @@ WorkspaceSpec build_workspace_plan(const SequencePlanImpl& plan) {
         // Main, history writes, and draft steps reuse the workspace in sequence. Their inputs,
         // conditioning, and outputs live in the execution frame.
         out.mtp_prefill = std::max(out.text_prefill, mtp_history(1, chunk));
-        for (std::int32_t batch = 1; batch <= static_cast<std::int32_t>(plan.max_concurrency);
-             ++batch) {
+        for (std::int32_t batch = 1; batch <= dimension(plan.max_concurrency); ++batch) {
             const std::int32_t aggregate = batch * verify;
             WorkspaceLayoutBuilder target;
             matrix(target, DType::BF16, dimension(config.hidden_size), aggregate);
@@ -487,8 +487,7 @@ WorkspaceSpec build_workspace_plan(const SequencePlanImpl& plan) {
             };
 
             out.dflash_context = dflash_context_capacity(chunk, 1, false);
-            for (std::int32_t batch = 1; batch <= static_cast<std::int32_t>(plan.max_concurrency);
-                 ++batch) {
+            for (std::int32_t batch = 1; batch <= dimension(plan.max_concurrency); ++batch) {
                 const std::int32_t aggregate = verify * batch;
                 WorkspaceLayoutBuilder target;
                 matrix(target, DType::BF16, dimension(config.hidden_size), aggregate);
@@ -543,8 +542,8 @@ void validate_target_options(const execution::ModelProfile& profile, DeviceConte
     if (options.prefill_chunk % kPrefillChunkAlignment != 0) {
         throw std::invalid_argument("prefill_chunk must be a nonzero multiple of 128");
     }
-    if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
-        throw std::invalid_argument("max_concurrency must be in [1,8]");
+    if (options.max_concurrency == 0) {
+        throw std::invalid_argument("max_concurrency must be positive");
     }
     switch (options.speculative.backend) {
     case SpeculativeBackend::None:
@@ -583,6 +582,7 @@ void validate_target_options(const execution::ModelProfile& profile, DeviceConte
 std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlanningInputs& inputs,
                                                            std::size_t context_bytes) {
     auto impl                               = std::make_unique<SequencePlanImpl>();
+    impl->batch_execution                   = inputs.batch_execution;
     impl->profile                           = inputs.profile;
     impl->moe                               = inputs.moe;
     impl->capacity                          = inputs.capacity;
@@ -633,6 +633,9 @@ make_sequence_planner_impl(std::shared_ptr<const execution::ModelProfile> profil
                            std::shared_ptr<const moe::Plan> moe) {
     validate_target_options(*profile, device, options);
     SequencePlanningInputs inputs{
+        .batch_execution = std::make_shared<const BatchExecutionPlan>(make_batch_execution_spec(
+            options.max_concurrency, 1,
+            options.use_cuda_graph && options.purpose == EnginePurpose::Generation)),
         .profile         = std::move(profile),
         .moe             = std::move(moe),
         .capacity        = options.max_context,

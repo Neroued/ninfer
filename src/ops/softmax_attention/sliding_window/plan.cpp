@@ -12,9 +12,9 @@ select_sliding_window_attention_plan(AttentionHeadGeometry geometry, std::uint32
     if (window != 2048 && window != 4096) {
         throw std::invalid_argument("sliding_window_attention plan: unsupported window");
     }
-    if (tokens < 1 || tokens > 16 || batch < 1 || batch > 8) {
+    if (tokens < 1 || tokens > 16 || batch < 1) {
         throw std::invalid_argument(
-            "sliding_window_attention plan: T must be 1..16 and B must be 1..8");
+            "sliding_window_attention plan: T must be 1..16 and B must be positive");
     }
     if (envelope.min_context > envelope.max_context || envelope.max_context > INT32_MAX) {
         throw std::invalid_argument("sliding_window_attention plan: invalid envelope");
@@ -61,16 +61,21 @@ select_sliding_window_attention_plan(AttentionHeadGeometry geometry, std::uint32
             }
         }
     }
+    if (batch > 8) {
+        split_limit =
+            static_cast<int>((static_cast<std::int64_t>(split_limit) * 8 + batch - 1) / batch);
+    }
     const bool direct = envelope.max_context <= static_cast<std::uint32_t>(direct_context_limit);
+    const int splits  = direct ? 1 : std::min(split_limit, std::max(1, context_tiles));
     return {
-        .geometry = geometry,
-        .route =
-            direct ? SlidingWindowAttentionRoute::Direct : SlidingWindowAttentionRoute::SplitKv,
+        .geometry       = geometry,
+        .route          = splits == 1 ? SlidingWindowAttentionRoute::Direct
+                                      : SlidingWindowAttentionRoute::SplitKv,
         .tokens         = tokens,
         .warps          = (tokens + 3) / 4,
         .key_block      = key_block,
         .reduce_warps   = reduce_warps,
-        .split_capacity = direct ? 1 : std::min(split_limit, std::max(1, context_tiles)),
+        .split_capacity = splits,
         .max_context    = envelope.max_context >= window
                               ? INT32_MAX
                               : static_cast<std::int32_t>((envelope.max_context + 31U) / 32U * 32U),

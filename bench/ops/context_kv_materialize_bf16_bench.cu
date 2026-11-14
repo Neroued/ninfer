@@ -32,7 +32,7 @@ Options parse(int argc, char** argv) {
         if (flag == "--widths")
             o.widths = m::integers(value, 1, 2048);
         else if (flag == "--batches")
-            o.batches = m::integers(value, 1, 8);
+            o.batches = m::integers(value, 1, INT32_MAX);
         else if (flag == "--counts") {
             if (value != "full" && value != "one" && value != "half" && value != "ragged" &&
                 value != "zero")
@@ -54,20 +54,20 @@ void run(const Options& o, Fixture& fixture, int c, int b, m::Csv& csv,
          bench::L2FlushBuffer& flush) {
     const auto e = bench::device_context().execution_view();
     auto input   = bench::make_bf16(4096ULL * c * b, 51501U);
-    DeviceBuffer positions(e.device(), c * b * 4), counts(e.device(), b * 4),
-        offsets(e.device(), b * 8);
-    std::vector<int> cp(b), pp(c * b, -1), slots(b);
+    DeviceBuffer positions(e.device(), std::size_t(c) * std::size_t(b) * 4),
+        counts(e.device(), std::size_t(b) * 4), offsets(e.device(), std::size_t(b) * 8);
+    std::vector<int> cp(b), pp(std::size_t(c) * b, -1), slots(b);
     for (int j = 0; j < b; ++j) {
         cp[j]    = o.counts == "zero"     ? 0
                    : o.counts == "one"    ? 1
                    : o.counts == "half"   ? (c + 1) / 2
-                   : o.counts == "ragged" ? (j * 7 + c) % (c + 1)
+                   : o.counts == "ragged" ? (std::int64_t(j) * 7 + c) % (c + 1)
                                           : c;
-        slots[j] = cp[j] ? 7 - j : -1;
-        for (int i = 0; i < cp[j]; ++i) pp[j * c + i] = o.position + j * 4096 + i;
+        slots[j] = cp[j] ? b - 1 - j : -1;
+        for (int i = 0; i < cp[j]; ++i) pp[std::size_t(j) * c + i] = o.position + i;
     }
-    const int actual = std::accumulate(cp.begin(), cp.end(), 0);
-    const auto off   = fixture.records->record_offsets(slots);
+    const auto actual = std::accumulate(cp.begin(), cp.end(), std::int64_t{0});
+    const auto off    = fixture.records->record_offsets(slots);
     positions.copy_from_host(pp.data(), pp.size() * 4);
     counts.copy_from_host(cp.data(), cp.size() * 4);
     offsets.copy_from_host(off.data(), off.size() * 8);
@@ -129,7 +129,8 @@ void run(const Options& o, Fixture& fixture, int c, int b, m::Csv& csv,
 int main(int argc, char** argv) {
     try {
         const auto o = parse(argc, argv);
-        Fixture f(bench::device_context().device());
+        Fixture f(bench::device_context().device(),
+                  *std::max_element(o.batches.begin(), o.batches.end()));
         bench::L2FlushBuffer flush(o.timing.flush_bytes);
         m::Csv csv(o.timing.csv_out,
                    "actual_columns,envelope_max_count,logical_bytes,useful_flops,necessary_weight_"

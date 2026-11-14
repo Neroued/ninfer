@@ -85,8 +85,10 @@ struct GatheredSelectorFixture {
         hidden_bits.resize(256 * columns);
         std::set<int> rows;
         for (int b = 0; b < batch; ++b) {
-            anchors[b]   = b % 2 ? Domain - 1 - b * 101 : 17 + b * 97;
-            positions[b] = 1'048'560 + b * 97 + salt * 137;
+            anchors[b]   = b % 2 ? Domain - 1 - (std::uint64_t(b) * 101) % Domain
+                                 : (17 + std::uint64_t(b) * 97) % Domain;
+            positions[b] = (1'048'560ULL + std::uint64_t(b) * 97 + std::uint64_t(salt) * 137) %
+                           (std::uint64_t(INT_MAX) - steps);
             rows.insert(anchors[b]);
         }
         for (int column = 0; column < columns; ++column) {

@@ -218,7 +218,7 @@ int run_case(Cache& cache, int width, int batch, int base_context, int envelope_
                      : b % 4 == 1             ? std::max(1, width - 1)
                      : b % 4 == 2             ? 1
                                               : 0;
-        lanes[b]   = LaneOrder[b];
+        lanes[b]   = LaneOrder[b % LaneOrder.size()];
     }
     ops::SlidingWindowAttentionExecutionEnvelope envelope{0,
                                                           static_cast<std::uint32_t>(envelope_max)};
@@ -442,6 +442,11 @@ int main(int argc, char** argv) {
                 add(glm, width, batch, length, length, Prefix::Mixed, false);
     for (int width : {2, 8, 16})
         add({2048, true, 4}, width, width == 8 ? 8 : 1, 1'048'576, 1'048'640, Prefix::Full, true);
+    for (const auto recipe : {cache, glm}) {
+        add(recipe, 4, 17, 128, 2048, Prefix::Mixed, true);
+        add(recipe, 1, 129, 2048, 2048, Prefix::Zero, false);
+    }
+
     for (const auto& [recipe, cases] : groups) {
         const auto [window, boundary, heads] = recipe;
         std::vector<OpCase> catalogue;
@@ -452,7 +457,8 @@ int main(int argc, char** argv) {
                      std::to_string(c.batch) + "/context" + std::to_string(c.context) + "/bound" +
                      std::to_string(c.envelope) + "/prefix" + std::to_string(int(c.prefix)) +
                      (c.graph ? "/graph" : "/eager"),
-                 {{"execution", c.graph ? "graph" : "eager"}}});
+                 {{"suite", c.batch > 8 ? "concurrency" : "swa"},
+                  {"execution", c.graph ? "graph" : "eager"}}});
         suite.add(std::move(catalogue), [=](auto selected) {
             Cache cache(window, boundary, heads);
             int failures = 0;

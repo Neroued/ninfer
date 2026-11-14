@@ -40,6 +40,7 @@ public:
 private:
     void create_probe(GraphProbeBacking);
     EngineOptions options_;
+    std::shared_ptr<const BatchExecutionPlan> batches_;
     DeviceContext& device_;
     ParallelBinding binding_;
     std::size_t host_reservation_bytes_ = 0;

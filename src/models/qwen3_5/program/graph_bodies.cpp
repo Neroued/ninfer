@@ -14,7 +14,7 @@ GraphPreparationSample RankProgramImpl::initialize_graphs(GraphPreparationMode m
         return initialize_graphs(GraphPreparationMode::Capture);
     }
     GraphPreparation observation(device, mode);
-    graphs.emplace(GraphSpec{capacity, max_concurrency, draft_window, backend});
+    graphs.emplace(GraphSpec{capacity, batch_execution, draft_window, backend});
     GraphBodies bodies;
     bodies.prologue = [this, capture = observation.capturing()](const GraphInvocation& call) {
         gpu_timer.begin_target(capture);
@@ -32,6 +32,8 @@ GraphPreparationSample RankProgramImpl::initialize_graphs(GraphPreparationMode m
                                      frame.state_source_offsets.slice(0, 0, batch),
                                      frame.state_destination_offsets.slice(0, 0, batch),
                                      {}};
+        for (int row = 0; row < batch; ++row)
+            inputs.active_tokens += frame.host_ingress.valid_columns[row];
         execution::TextStateUpdate update = execution::StepUpdate{};
         if (call.width > 1) update.emplace<execution::ReplayRecords>(*resources.replay_records);
         std::optional<execution::DFlashFeatureSink> feature;

@@ -4,6 +4,8 @@
 
 #include <unordered_set>
 
+#include <climits>
+
 using namespace ninfer;
 using namespace ninfer::bench;
 namespace kp = ninfer::tool::kpool;
@@ -22,7 +24,7 @@ int main(int argc, char** argv) {
             if (flag == "--help") {
                 std::cout
                     << "Complete latent Sparse MLA: U_K, attention, U_V.\n"
-                       "  --tokens N,... --batch 1..8 --end E --layers 1|11\n"
+                       "  --tokens N,... --batch B --end E --layers 1|11\n"
                        "  --reserve-tokens N,...  preserve the cache layout of a wider sweep\n"
                        "  --selected 0..512 --ragged 0|1 --frozen 0|1\n"
                        "  --active-rows 0..B  leading active request rows (default B)\n"
@@ -45,9 +47,9 @@ int main(int argc, char** argv) {
             else if (flag == "--factor-format" && (value == "bf16" || value == "mxfp8"))
                 mxfp8 = value == "mxfp8";
             else if (flag == "--batch")
-                batch = measurement::integer(value, 1, 8);
+                batch = measurement::integer(value, 1, INT_MAX);
             else if (flag == "--active-rows")
-                active_rows = measurement::integer(value, 0, 8);
+                active_rows = measurement::integer(value, 0, INT_MAX);
             else if (flag == "--end")
                 end = measurement::integer(value, 1, 1048576);
             else if (flag == "--selected")

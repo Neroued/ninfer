@@ -18,7 +18,7 @@ void RankProgramImpl::commit(runtime::ExecutionTicket ticket, runtime::CommandSe
     if (std::holds_alternative<SpeculativeWork>(f.request.work.operation))
         commit_speculative(commit);
     if (forward && forward->sample != SampleKind::None) {
-        const auto& io = resources.plan.frame;
+        const auto& io = frame;
         const int b    = commit.rows.size();
         auto* values   = static_cast<std::int32_t*>(host(io.rows.count_columns).data);
         bool any       = false;
@@ -49,14 +49,17 @@ void RankProgramImpl::commit(runtime::ExecutionTicket ticket, runtime::CommandSe
 
 void RankProgramImpl::commit_speculative(const Commit& commit) {
     auto& f             = *compute;
-    const auto& io      = resources.plan.frame;
+    const auto& io      = frame;
     const int b         = f.batch.rows;
     auto* values        = static_cast<std::int32_t*>(host(io.rows.accepted_columns).data);
     auto* count_lengths = static_cast<std::int32_t*>(host(io.rows.count_columns).data);
     auto* last          = static_cast<std::int32_t*>(host(io.speculative->last_columns).data);
     bool any = false, repair = false, count_tokens = false;
     const auto& work = std::get<SpeculativeWork>(f.request.work.operation);
-    for (int i = 0; i < b; ++i) {
+    std::fill_n(values, b, 0);
+    std::fill_n(count_lengths, b, 0);
+    std::fill_n(last, b, -1);
+    for (std::size_t i = 0; i < f.physical.members.size(); ++i) {
         const auto logical   = f.physical.members[i];
         const auto n         = commit.rows[logical].accepted;
         values[i]            = n;
@@ -89,7 +92,7 @@ void RankProgramImpl::execute_speculative_commit(const execution::BatchView& cal
                                                  bool count_tokens,
                                                  DecodeGraphSection* captured_repair,
                                                  DecodeGraphSection* captured_counts) {
-    const auto& io = resources.plan.frame;
+    const auto& io = frame;
     const int b = call.rows, w = call.tokens, c = call.attention.rows;
     const int h   = dimension(parameters.profile->config.text.hidden);
     auto accepted = row(io.rows.accepted_columns, b);
@@ -125,7 +128,7 @@ void RankProgramImpl::execute_speculative_commit(const execution::BatchView& cal
 void RankProgramImpl::control_counts() {
     auto& f            = *compute;
     const auto& rows   = std::get<ForwardWork>(f.request.work.operation).rows;
-    const auto& io     = resources.plan.frame;
+    const auto& io     = frame;
     const auto cap     = resources.tensor(io.main.ids).numel();
     auto* ids          = static_cast<TokenId*>(host(io.main.ids).data);
     std::uint32_t used = 0;

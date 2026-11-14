@@ -14,29 +14,31 @@ Tensor DistributedVocabulary::collect(const Tensor& logits, const ops::SamplingC
 }
 
 void DistributedVocabulary::sample(const Tensor& logits, const ops::SamplingConfig* configs,
-                                   const Tensor& valid, const Tensor& positions, int purpose,
-                                   Tensor& ids) const {
+                                   const Tensor& valid, const Tensor& live_rows,
+                                   const Tensor& positions, int purpose, Tensor& ids) const {
     const auto combined = collect(logits, configs, valid, {});
-    ops::sample_vocabulary_candidates(combined, configs, positions, purpose, ids, cuda);
+    ops::sample_vocabulary_candidates(combined, configs, positions, purpose, ids, live_rows, cuda);
 }
 
 void DistributedVocabulary::accept(const Tensor& logits, const ops::SamplingConfig* configs,
-                                   const Tensor& valid, const Tensor& drafts, const Tensor& extents,
+                                   const Tensor& valid, const Tensor& live_rows,
+                                   const Tensor& drafts, const Tensor& extents,
                                    const Tensor& positions, Tensor& licensed,
                                    Tensor& counts) const {
     const auto combined = collect(logits, configs, valid, drafts);
     ops::accept_vocabulary_candidates(combined, configs, drafts, extents, positions, licensed,
-                                      counts, cuda);
+                                      counts, live_rows, cuda);
 }
 
 void DistributedVocabulary::accept_sparse(const Tensor& logits, const ops::SamplingConfig* configs,
-                                          const Tensor& valid, const Tensor& drafts,
-                                          const Tensor& candidate_ids, const Tensor& q,
-                                          const Tensor& extents, const Tensor& positions,
-                                          Tensor& licensed, Tensor& counts) const {
+                                          const Tensor& valid, const Tensor& live_rows,
+                                          const Tensor& drafts, const Tensor& candidate_ids,
+                                          const Tensor& q, const Tensor& extents,
+                                          const Tensor& positions, Tensor& licensed,
+                                          Tensor& counts) const {
     const auto combined = collect(logits, configs, valid, drafts);
     ops::accept_vocabulary_candidates_sparse(combined, configs, drafts, candidate_ids, q, extents,
-                                             positions, licensed, counts, cuda);
+                                             positions, licensed, counts, live_rows, cuda);
 }
 
 } // namespace ninfer::models

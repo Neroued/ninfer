@@ -12,6 +12,9 @@ Startup::Startup(const artifact::Reader& definition_source, const artifact::Read
         if (parallel.ranks.size() != 1)
             throw std::invalid_argument("Qwen4Exp distributed generation is not implemented");
     }
+    batches_      = std::make_shared<const BatchExecutionPlan>(make_batch_execution_spec(
+        options.max_concurrency, 1,
+        options.use_cuda_graph && options.purpose == EnginePurpose::Generation));
     profile       = execution::describe_model(*definition_);
     auto resident = resolve_load(reader_, definition_, device);
     table_        = resident.ple_table_owner();
@@ -32,7 +35,7 @@ Startup::plan(DeviceContext& device, const EngineOptions& options, WeightPlaceme
               std::size_t available, std::size_t available_host_bytes) const {
     const bool host = placement == WeightPlacement::HostExperts;
     if (host && !offload_) return {};
-    auto planned = plan_execution(profile, table_->geometry(), options, device, available,
+    auto planned = plan_execution(profile, table_->geometry(), options, batches_, device, available,
                                   host ? offload_ : nullptr, true, available_host_bytes);
     if (!planned) return {};
     const auto capacity = planned->capacity;
@@ -84,13 +87,13 @@ std::unique_ptr<RankProgram> create_rank_program(const execution::Parameters& p,
 
 GraphPreparationPlan Startup::graph_plan(const EngineOptions& options,
                                          const ExecutionPreparation& preparation) const {
-    return describe_graph_preparation(options, preparation.experts.get());
+    return describe_graph_preparation(options, *batches_, preparation.experts.get());
 }
 
 Startup::Calibration Startup::calibrate(const execution::Parameters& parameters,
                                         DeviceContext& device, const EngineOptions& options,
                                         const ExecutionPreparation& preparation) const {
-    return calibrate_graphs(parameters, device, options, preparation.experts);
+    return calibrate_graphs(parameters, device, options, batches_, preparation.experts);
 }
 
 std::string prefill_signature(const ModelDefinition& model, const moe::Plan* moe,

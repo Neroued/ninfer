@@ -24,7 +24,7 @@ Options parse(int argc, char** argv) {
         const std::string_view flag = argv[i];
         if (flag == "--help") {
             std::cout << "Vocabulary partition benchmark\n"
-                         "  --op candidates|sample|accept|counts --tokens T[,T...] --batch 1..8\n"
+                         "  --op candidates|sample|accept|counts --tokens T[,T...] --batch B\n"
                          "  --rows V --domain D --ranks 1..16 --rank R\n"
                          "  --candidates 1|20 (defaults to the sampling requirement)\n"
                          "  --stochastic --penalties --mask --accept-all\n";
@@ -53,7 +53,7 @@ Options parse(int argc, char** argv) {
         else if (flag == "--tokens")
             o.tokens = measurement::integers(value);
         else if (flag == "--batch")
-            o.batch = measurement::integer(value, 1, 8);
+            o.batch = measurement::integer(value);
         else if (flag == "--rows")
             o.rows = measurement::integer(value);
         else if (flag == "--domain")
@@ -133,15 +133,18 @@ struct Fixture {
                              std::vector<int>(std::size_t((o.domain + 31) / 32) * t * o.batch, -1))
                        : DeviceBuffer{}),
           valid(measurement::make_i32(std::vector<int>(o.batch, t))),
-          drafts(measurement::make_i32(std::vector<int>(std::max(1, t - 1) * o.batch, 17))),
+          drafts(measurement::make_i32(
+              std::vector<int>(std::size_t(std::max(1, t - 1)) * o.batch, 17))),
           keys(make_buffer(std::size_t(k) * t * o.batch * o.ranks * 8)),
-          work(make_buffer(std::max<std::size_t>(
-              256, ops::vocabulary_candidates_workspace_capacity_bytes(o.rows, t * o.batch, k)))),
+          work(make_buffer(
+              std::max<std::size_t>(256, ops::vocabulary_candidates_workspace_capacity_bytes(
+                                             o.rows, std::int64_t(t) * o.batch, k)))),
           positions(measurement::make_i32(std::vector<int>(o.batch, 1024))),
-          output(make_buffer(o.batch * 4)),
+          output(make_buffer(std::size_t(o.batch) * 4)),
           extents(measurement::make_i32(std::vector<int>(o.batch, t - 1))),
           lengths(measurement::make_i32(std::vector<int>(o.batch, 1024))),
-          licensed(make_buffer(t * o.batch * 4)), licensed_counts(make_buffer(o.batch * 4)),
+          licensed(make_buffer(std::size_t(t) * o.batch * 4)),
+          licensed_counts(make_buffer(std::size_t(o.batch) * 4)),
           input(logits.span(), DType::BF16, {o.rows, t, o.batch}),
           key_view(keys.span(), DType::I64, {k, t, o.batch, o.ranks}),
           valid_view(valid.span(), DType::I32, {o.batch}), workspace(work.span()) {
@@ -206,12 +209,12 @@ struct Fixture {
         else if (options.op == "sample") {
             Tensor pos(positions.span(), DType::I32, {b}), out(output.span(), DType::I32, {b});
             ops::sample_vocabulary_candidates(key_view, cfg, pos, ops::kSamplePurposeDecode, out,
-                                              cuda);
+                                              {}, cuda);
         } else {
             Tensor e(extents.span(), DType::I32, {b}), l(lengths.span(), DType::I32, {b}),
                 tokens(licensed.span(), DType::I32, {t, b}),
                 n(licensed_counts.span(), DType::I32, {b});
-            ops::accept_vocabulary_candidates(key_view, cfg, draft_view, e, l, tokens, n, cuda);
+            ops::accept_vocabulary_candidates(key_view, cfg, draft_view, e, l, tokens, n, {}, cuda);
         }
     }
 

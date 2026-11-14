@@ -262,9 +262,6 @@ void launch_bf16_projection(const PrepareArguments& a, int parent, std::int64_t 
     case ProjectionRoute::Simt2:
         launch_bf16_a16_simt<Simt<2>>(p, output, LinearIdentityEpilogue{}, stream);
         break;
-    case ProjectionRoute::Simt4:
-        launch_bf16_a16_simt<Simt<4>>(p, output, LinearIdentityEpilogue{}, stream);
-        break;
     case ProjectionRoute::Sliced8:
         launch_bf16_a16_sliced_k_mma<Short>(p, output, LinearIdentityEpilogue{}, stream);
         break;
@@ -336,12 +333,7 @@ void launch_prepare(const PrepareArguments& inputs, const PrepareGeometry& geome
                                               parent ? plan.second : plan.first, stream);
             }
         }
-        int jobs = columns * (1 + (a.query_rank != 0));
-        for (int b = a.first_row; b <= a.last_row; ++b) {
-            const int start = b == a.first_row ? a.first_column : 0;
-            const int end   = b == a.last_row ? a.last_stop : a.tokens;
-            jobs += (end - start + 6) / 4;
-        }
+        const int jobs  = columns * (1 + (a.query_rank != 0)) + a.pool_jobs;
         const auto post = [&]<bool Fp8Latent>() {
             const auto submit = [&]<bool Fp8Index>() {
                 if (a.update && columns <= 64)

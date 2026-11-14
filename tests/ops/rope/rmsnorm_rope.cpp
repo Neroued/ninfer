@@ -350,23 +350,32 @@ int contract() {
 
 void add_rmsnorm_rope_cases(ninfer::test::OpSuite& suite) {
     const auto pair = [&](int width, int batch, int position, unsigned seed, bool graph = false) {
-        suite.add("rmsnorm_rope/pair/w" + std::to_string(width) + "/b" + std::to_string(batch) +
-                      (graph ? "/graph" : "/eager"),
-                  [=] { return run_pair_case(width, batch, position, seed, graph); },
-                  {{"execution", graph ? "graph" : "eager"}});
+        std::vector<std::pair<std::string, std::string>> tags{
+            {"execution", graph ? "graph" : "eager"}};
+        if (batch > 8) tags.emplace_back("suite", "concurrency");
+        suite.add(
+            "rmsnorm_rope/pair/w" + std::to_string(width) + "/b" + std::to_string(batch) +
+                (graph ? "/graph" : "/eager"),
+            [=] { return run_pair_case(width, batch, position, seed, graph); }, std::move(tags));
     };
     const auto single = [&](int tokens, int position, unsigned seed, bool graph = false) {
-        suite.add("rmsnorm_rope/single/t" + std::to_string(tokens) + (graph ? "/graph" : "/eager"),
-                  [=] { return run_single_case(tokens, position, seed, graph); },
-                  {{"execution", graph ? "graph" : "eager"}});
+        std::vector<std::pair<std::string, std::string>> tags{
+            {"execution", graph ? "graph" : "eager"}};
+        if (tokens > 2048) tags.emplace_back("suite", "concurrency");
+        suite.add(
+            "rmsnorm_rope/single/t" + std::to_string(tokens) + (graph ? "/graph" : "/eager"),
+            [=] { return run_single_case(tokens, position, seed, graph); }, std::move(tags));
     };
     for (int width = 2; width <= 16; ++width)
         for (int batch = 1; batch <= 8; ++batch)
             pair(width, batch, width == 2 && batch == 1 ? 0 : 262000, 0x1000U + width * 8 + batch);
     pair(3, 3, 0, 0x1001U, true);
     pair(16, 8, 262000, 0x1002U, true);
+    pair(16, 17, 262000, 0x1003U, true);
+    pair(2, 64, 262000, 0x1004U, true);
     single(1, 0, 0x2001U, true);
     single(2048, 260000, 0x2002U, true);
+    single(2049, 260000, 0x2003U, true);
     single(1, 0, 0x2001U);
     single(8, 131'069, 0x2002U);
     single(64, 262'080, 0x2003U);

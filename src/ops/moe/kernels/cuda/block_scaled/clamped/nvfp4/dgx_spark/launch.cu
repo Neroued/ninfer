@@ -26,7 +26,7 @@ __global__ void quantize_input(const __nv_bfloat16* x, std::uint8_t* codes, std:
     if (threadIdx.x < 32) {
         bool hit = false;
         if (threadIdx.x < kTopK)
-            hit = includes(kind, mask, ids[std::int64_t(token) * kTopK + threadIdx.x]);
+            hit = expert_in_subset(kind, mask, ids[std::int64_t(token) * kTopK + threadIdx.x]);
         const unsigned votes = __ballot_sync(0xffffffff, hit);
         if (threadIdx.x == 0) {
             live                 = votes != 0;
@@ -211,7 +211,7 @@ void launch_experts_impl(const Tensor& x, const CudaSwiGLUExperts& experts,
                     ActivationScale{nullptr, experts.activation_calibration.down.scalar_divisor()},
                     s.groups, static_cast<const int*>(routes.ids.data),
                     static_cast<const float*>(routes.coefficients.data), s.routed_sum, x.ne[1],
-        plan.pool_expert_limit, plan.pool_min_experts);
+                    plan.pool_expert_limit, plan.pool_min_experts);
                 CUDA_CHECK(cudaGetLastError());
             };
             switch (plan.dense_down_columns) {

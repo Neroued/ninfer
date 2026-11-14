@@ -5,10 +5,11 @@
 
 namespace ninfer::ops::detail {
 
-ContextAttentionPlan select_context_attention_plan(std::int32_t tokens,
+ContextAttentionPlan select_context_attention_plan(std::int32_t tokens, std::int32_t batch,
                                                    ContextAttentionExecutionEnvelope envelope) {
-    if (tokens < 1 || tokens > 16) {
-        throw std::invalid_argument("context_softmax_attention plan: T must be 1..16");
+    if (tokens < 1 || tokens > 16 || batch < 1) {
+        throw std::invalid_argument(
+            "context_softmax_attention plan: T must be 1..16 and B must be positive");
     }
     if (envelope.min_context > envelope.max_context) {
         throw std::invalid_argument("context_softmax_attention plan: invalid envelope");
@@ -25,17 +26,22 @@ ContextAttentionPlan select_context_attention_plan(std::int32_t tokens,
         split_limit =
             envelope.max_context <= 131072u ? 32 : (envelope.max_context <= 196608u ? 38 : 40);
     }
+    if (batch > 8) {
+        split_limit =
+            static_cast<int>((static_cast<std::int64_t>(split_limit) * 8 + batch - 1) / batch);
+    }
     const std::uint32_t envelope_tiles =
         (envelope.max_context + static_cast<std::uint32_t>(key_block) - 1u) /
         static_cast<std::uint32_t>(key_block);
     const std::int32_t splits =
         direct ? 1 : std::min(split_limit, std::max(1, static_cast<std::int32_t>(envelope_tiles)));
     return {
-        .route          = direct ? ContextAttentionRoute::Direct : ContextAttentionRoute::SplitKv,
-        .tokens         = tokens,
-        .warps          = warps,
-        .key_block      = key_block,
-        .split_capacity = splits,
+        .route     = splits == 1 ? ContextAttentionRoute::Direct : ContextAttentionRoute::SplitKv,
+        .tokens    = tokens,
+        .warps     = warps,
+        .key_block = splits == 1 ? 32 : key_block,
+        .split_capacity   = splits,
+        .keep_reduce_slot = envelope.max_context != 0,
     };
 }
 

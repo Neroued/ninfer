@@ -5,6 +5,7 @@
 
 #include <cmath>
 #include <iostream>
+#include <tuple>
 
 using namespace ninfer;
 using namespace ninfer::test;
@@ -41,6 +42,7 @@ int verify(kp::Fixture& f) {
     parallel_rows(count * w.rows, std::uint64_t(count) * w.rows * 4096, [&](int lo, int hi) {
         for (int i = lo; i < hi; ++i) {
             const int row = i % w.rows, m = i / w.rows, b = m / patterns, t = m % patterns;
+            if (t >= f.valid.at(b)) continue;
             double value = 0;
             for (int k = 0; k < 4096; ++k)
                 value += weight_value(row, k) * kp::decode(f.x.at(k, t, b));
@@ -232,16 +234,28 @@ int verify(kp::Fixture& f) {
 
 int run(kp::Projection mode, int T, int B, bool update, bool graph, int phase, bool fp8 = false,
         bool fp8_latent = false, kp::ProjectionFormat format = kp::ProjectionFormat::BFloat16,
-        bool a16_only = false) {
+        bool a16_only = false, bool padded = false) {
     auto& device = cuda_environment().context;
     kp::Weights weights(device.device(), mode, format);
     if (a16_only)
         std::get<ops::PairedProjectionWeights>(weights.params.weights).first.policy =
             ops::LinearPolicy::A16Only;
-    kp::Fixture f(weights, device.execution_view(), T, B, update, true, true, update, phase,
+    kp::Fixture f(weights, device.execution_view(), T, B, update, !padded, true, update, phase,
                   fp8 ? KvCacheVectorFormat::Fp8E4m3fnGroup128Ue8m0 : KvCacheVectorFormat::BFloat16,
                   fp8_latent ? ops::KpoolMlaStorage::Fp8E4m3fnGroup128Ue8m0
                              : ops::KpoolMlaStorage::BFloat16);
+    if (padded) {
+        for (int b = 0; b < B; ++b) {
+            if (b == 0 || b == B / 2 || b == B - 1) continue;
+            f.valid.at(b)     = 0;
+            f.selectors.at(b) = f.offsets.at(b) = -1;
+            f.before_offsets.at(b) = f.after_offsets.at(b) = -1;
+            for (int t = 0; t < T; ++t) f.positions.at(t, b) = -1;
+        }
+        for (auto* v : {&f.valid, &f.selectors, &f.offsets, &f.positions}) v->upload();
+        f.before_offsets.upload();
+        f.after_offsets.upload();
+    }
     // Seven independent activation vectors keep long-window oracle cost bounded. Every output
     // column is still checked, including page placements, padding, and tail/record write sets.
     for (int b = 0; b < B; ++b)
@@ -280,10 +294,11 @@ int run(kp::Projection mode, int T, int B, bool update, bool graph, int phase, b
 }
 
 int inert(bool update, bool fp8 = false, bool fp8_latent = false,
-          kp::ProjectionFormat format = kp::ProjectionFormat::BFloat16, int tokens = 9) {
+          kp::ProjectionFormat format = kp::ProjectionFormat::BFloat16, int tokens = 9,
+          int batch = 3) {
     auto& device = cuda_environment().context;
     kp::Weights weights(device.device(), kp::Projection::Full, format);
-    kp::Fixture f(weights, device.execution_view(), tokens, 3, update, false, true, update, 0,
+    kp::Fixture f(weights, device.execution_view(), tokens, batch, update, false, true, update, 0,
                   fp8 ? KvCacheVectorFormat::Fp8E4m3fnGroup128Ue8m0 : KvCacheVectorFormat::BFloat16,
                   fp8_latent ? ops::KpoolMlaStorage::Fp8E4m3fnGroup128Ue8m0
                              : ops::KpoolMlaStorage::BFloat16);
@@ -308,6 +323,26 @@ int inert(bool update, bool fp8 = false, bool fp8_latent = false,
         f.launch(device.execution_view());
     device.synchronize();
     return verify(f);
+}
+
+int workspace_interval() {
+    int failures = 0;
+    for (bool update : {false, true}) {
+        const auto capacity = update ? ops::kpool_mla_prepare_update_workspace_capacity_bytes
+                                     : ops::kpool_mla_prepare_record_workspace_capacity_bytes;
+        for (auto [B, lo, hi] :
+             {std::tuple{65, 1, 129}, {129, 1, 31}, {1025, 1023, 1025}, {65537, 1, 17}}) {
+            const auto bytes = [&](int first, int last) {
+                return capacity(kp::bf16_prepare_profile(kp::Projection::Full),
+                                ops::KpoolMlaStorage::BFloat16, KvCacheVectorFormat::BFloat16, B,
+                                first, last, 48);
+            };
+            std::size_t maximum = 0;
+            for (int T = lo; T <= hi; ++T) maximum = std::max(maximum, bytes(T, T));
+            failures += bytes(lo, hi) != maximum;
+        }
+    }
+    return failures;
 }
 
 int admission() {
@@ -353,6 +388,29 @@ int admission() {
 int main(int argc, char** argv) {
     OpSuite suite;
     suite.add("kpool_prepare/admission", admission);
+    suite.add("kpool_prepare/large_batch/workspace_interval", workspace_interval,
+              {{"suite", "concurrency"}});
+    suite.add("kpool_prepare/large_batch/bf16_record",
+              [] {
+                  return run(kp::Projection::Full, 1, 9, false, true, 3, false, false,
+                             kp::ProjectionFormat::BFloat16, false, true);
+              },
+              {{"suite", "concurrency"}, {"execution", "graph"}});
+    suite.add("kpool_prepare/large_batch/fp8_update",
+              [] {
+                  return run(kp::Projection::Full, 4, 17, true, true, 3, true, true,
+                             kp::ProjectionFormat::BlockFp8, false, true);
+              },
+              {{"suite", "concurrency"}, {"execution", "graph"}});
+    suite.add("kpool_prepare/large_batch/mxfp8_window",
+              [] {
+                  return run(kp::Projection::Full, 9, 129, true, true, 3, true, true,
+                             kp::ProjectionFormat::Mxfp8, false, true);
+              },
+              {{"suite", "concurrency"}, {"execution", "graph"}});
+    suite.add("kpool_prepare/large_batch/inert",
+              [] { return inert(false, true, true, kp::ProjectionFormat::Mxfp8, 1, 65); },
+              {{"suite", "concurrency"}, {"execution", "graph"}});
     for (bool update : {false, true})
         suite.add(std::string("kpool_prepare/inert/") + (update ? "update" : "record"),
                   [=] { return inert(update); });

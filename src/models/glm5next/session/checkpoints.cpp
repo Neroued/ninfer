@@ -297,6 +297,10 @@ namespace ninfer::models::glm5next {
 
 std::size_t Session::checkpoint_extent() const noexcept { return impl_->checkpoints.size(); }
 
+std::uint64_t Session::checkpoint_catalog_revision() const noexcept {
+    return impl_->checkpoints.revision();
+}
+
 std::vector<runtime::ContextTransferRequirement>
 Session::checkpoint_restore_requirements(CheckpointHandle h) const {
     return impl_->checkpoints.at(h).snapshot.restore_requirements(impl_->directory);

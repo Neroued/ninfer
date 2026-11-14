@@ -28,16 +28,16 @@ constexpr ops::ContextKVMaterializeProfile kProfile{5120,   128,  8, 2048, QType
                                                     1.e-6F, 1.e7F};
 
 
-constexpr int kLayers       = static_cast<int>(ops::kContextKVMaterializeLayers);
-constexpr int kParentRows   = 6144;
-constexpr int kKeyRow       = 4096;
-constexpr int kValueRow     = 5120;
-constexpr int kHidden       = 5120;
-constexpr int kRows         = 1024;
-constexpr int kHeadDim      = 128;
-constexpr int kHeads        = 8;
-constexpr int kCapacity     = 2048;
-constexpr int kLaneCapacity = 8;
+constexpr int kLayers     = static_cast<int>(ops::kContextKVMaterializeLayers);
+constexpr int kParentRows = 6144;
+constexpr int kKeyRow     = 4096;
+constexpr int kValueRow   = 5120;
+constexpr int kHidden     = 5120;
+constexpr int kRows       = 1024;
+constexpr int kHeadDim    = 128;
+constexpr int kHeads      = 8;
+constexpr int kCapacity   = 2048;
+
 
 enum class Execution : std::uint8_t { Eager, Graph };
 
@@ -94,7 +94,7 @@ Options parse_options(int argc, char** argv) {
             return argv[index];
         };
         if (argument == "--batches") {
-            options.batches = parse_list(next(), 8);
+            options.batches = parse_list(next(), INT32_MAX);
         } else if (argument == "--widths") {
             options.widths = parse_list(next(), 2048);
         } else if (argument == "--counts") {
@@ -134,7 +134,8 @@ struct Fixture {
     DeviceBuffer state;
     std::optional<StateImageStorage> images;
     std::array<ops::ContextKVMaterializeLayerView, kLayers> layers;
-    DeviceBuffer context = bench::make_bf16(static_cast<std::size_t>(kHidden) * 2048, 101U);
+    DeviceBuffer context;
+    int lane_capacity;
     DeviceBuffer positions;
     DeviceBuffer counts;
     DeviceBuffer offsets;
@@ -142,19 +143,40 @@ struct Fixture {
     MemoryArena direct_arena;
     ops::ContextKVMaterializeExecutionEnvelope envelope{};
 
-    Fixture()
-        : positions(ninfer::bench::device_context().device(), sizeof(std::int32_t) * 2048),
-          counts(ninfer::bench::device_context().device(), sizeof(std::int32_t) * 8),
-          offsets(ninfer::bench::device_context().device(), sizeof(std::int64_t) * 8),
-          direct_workspace(
-              ninfer::bench::device_context().device(),
-              ops::context_kv_materialize_workspace_capacity_bytes(kProfile, 1, 1, 2048)),
+    static std::size_t maximum_columns(const Options& options) {
+        std::size_t maximum = 0;
+        for (int width : options.widths)
+            for (int batch : options.batches)
+                if (width <= 16 || batch == 1)
+                    maximum = std::max(maximum, std::size_t(width) * batch);
+        return maximum;
+    }
+
+    static std::size_t workspace_capacity(const Options& options) {
+        std::size_t maximum = 0;
+        for (int width : options.widths)
+            for (int batch : options.batches)
+                if (width <= 16 || batch == 1)
+                    maximum =
+                        std::max(maximum, ops::context_kv_materialize_workspace_capacity_bytes(
+                                              kProfile, batch, width, width));
+        return maximum;
+    }
+
+    explicit Fixture(const Options& options)
+        : context(bench::make_bf16(std::size_t(kHidden) * maximum_columns(options), 101U)),
+          lane_capacity(*std::max_element(options.batches.begin(), options.batches.end())),
+          positions(ninfer::bench::device_context().device(),
+                    sizeof(std::int32_t) * maximum_columns(options)),
+          counts(ninfer::bench::device_context().device(), sizeof(std::int32_t) * lane_capacity),
+          offsets(ninfer::bench::device_context().device(), sizeof(std::int64_t) * lane_capacity),
+          direct_workspace(ninfer::bench::device_context().device(), workspace_capacity(options)),
           direct_arena(direct_workspace.span()) {
         StateImageBuilder builder;
         cache_layout = plan_cyclic_kv_cache(builder, kLayers, kCapacity, kHeads, kHeadDim);
         state_layout = builder.finish();
         state        = DeviceBuffer(ninfer::bench::device_context().device(),
-                                    state_layout.image_bytes * kLaneCapacity);
+                                    state_layout.image_bytes * lane_capacity);
         images.emplace(state.span(), state_layout);
         for (int layer = 0; layer < kLayers; ++layer) {
             parents[static_cast<std::size_t>(layer)] = bench::make_row_split_weight(
@@ -172,15 +194,16 @@ struct Fixture {
 
     void prepare(int width, int batch, const std::string& mode) {
         direct_arena.reset_peak();
-        std::vector<int> host_positions(width * batch), host_counts(batch);
+        std::vector<int> host_positions(std::size_t(width) * batch), host_counts(batch);
         std::vector<std::int64_t> host_offsets(batch);
         for (int b = 0; b < batch; ++b) {
-            host_counts[b]  = mode == "zero"     ? 0
-                              : mode == "one"    ? 1
-                              : mode == "ragged" ? (b * 7 + width) % (width + 1)
-                                                 : width;
-            host_offsets[b] = static_cast<std::int64_t>((7 - b) * state_layout.image_bytes);
-            for (int i = 0; i < width; ++i) host_positions[b * width + i] = 262140 + 8192 * b + i;
+            host_counts[b] = mode == "zero"     ? 0
+                             : mode == "one"    ? 1
+                             : mode == "ragged" ? (std::int64_t(b) * 7 + width) % (width + 1)
+                                                : width;
+            host_offsets[b] =
+                static_cast<std::int64_t>((lane_capacity - 1 - b) * state_layout.image_bytes);
+            for (int i = 0; i < width; ++i) host_positions[std::size_t(b) * width + i] = 262140 + i;
         }
         envelope = {
             static_cast<std::uint32_t>(*std::min_element(host_counts.begin(), host_counts.end())),
@@ -232,7 +255,7 @@ int main(int argc, char** argv) {
         CUDA_CHECK(cudaGetDevice(&device));
         cudaDeviceProp properties{};
         CUDA_CHECK(cudaGetDeviceProperties(&properties, device));
-        Fixture fixture;
+        Fixture fixture(options);
         bench::L2FlushBuffer flush(options.flush_bytes);
         std::printf("# gpu=%s public=context_kv_materialize geometry=L5_K5120_N1024 cache=cold "
                     "flush_mib=%zu execution=%s\n",
@@ -256,8 +279,8 @@ int main(int argc, char** argv) {
                     CUDA_CHECK(cudaGraphDestroy(empty));
                     if (nodes != 0 || fixture.direct_arena.peak_used() != 0)
                         throw std::runtime_error("zero-count materialization is not empty");
-                    std::printf("%d,%d,%d,%s,0,0,nan,nan,nan,0,%zu,0\n", width, batch,
-                                width * batch, options.counts.c_str(),
+                    std::printf("%d,%d,%zu,%s,0,0,nan,nan,nan,0,%zu,0\n", width, batch,
+                                std::size_t(width) * batch, options.counts.c_str(),
                                 ops::context_kv_materialize_workspace_capacity_bytes(
                                     kProfile, batch, width, width));
                     continue;
@@ -265,10 +288,10 @@ int main(int argc, char** argv) {
                 const auto timing = measure(
                     options, [&](CudaExecutionView cuda) { fixture.launch(width, batch, cuda); },
                     flush, cuda, &nodes);
-                std::printf("%d,%d,%d,%s,%u,%u,%.3f,%.3f,%.3f,%zu,%zu,%zu\n", width, batch,
-                            width * batch, options.counts.c_str(), fixture.envelope.min_count,
-                            fixture.envelope.max_count, timing.median_us, timing.min_us,
-                            timing.p95_us, nodes,
+                std::printf("%d,%d,%zu,%s,%u,%u,%.3f,%.3f,%.3f,%zu,%zu,%zu\n", width, batch,
+                            std::size_t(width) * batch, options.counts.c_str(),
+                            fixture.envelope.min_count, fixture.envelope.max_count,
+                            timing.median_us, timing.min_us, timing.p95_us, nodes,
                             ops::context_kv_materialize_workspace_capacity_bytes(kProfile, batch,
                                                                                  width, width),
                             fixture.direct_arena.peak_used());

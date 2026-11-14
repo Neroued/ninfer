@@ -78,7 +78,7 @@ struct Input {
 Ticket prepare(disk::PrepareService& service, const Input& input) {
     std::optional<Ticket> ticket;
     until([&] {
-        ticket = service.prepare(input.tokens, input.inputs());
+        ticket = service.prepare(input.tokens, input.batch, input.inputs());
         return ticket.has_value();
     });
     return *ticket;
@@ -179,15 +179,19 @@ void hashes(const disk::Table& source, const Input& input) {
 void host(const disk::Table& source, const Input& input, bool failure) {
     HostBuffer first(input.bytes()), second(input.bytes());
     const std::array outputs{first.span(), second.span()};
-    disk::PrepareService service(
-        source, input.eos,
-        {.max_positions = input.tokens * input.batch, .io_depth = 4, .cache_bytes = 512}, outputs);
+    disk::PrepareService service(source, input.eos,
+                                 {.max_positions = input.tokens * input.batch,
+                                  .max_rows      = input.batch,
+                                  .io_depth      = 4,
+                                  .cache_bytes   = 512},
+                                 outputs);
     if (!failure) {
         const std::array empty{InputRow{input.rows[0].identity, {}}};
-        const auto cancelled = service.prepare(1, empty);
+        const auto cancelled = service.prepare(1, empty.size(), empty);
         require(cancelled.has_value(), "initial window admission failed");
         service.cancel(*cancelled);
-        require(!service.prepare(1, empty, false), "prefetch consumed the last required slot");
+        require(!service.prepare(1, empty.size(), empty, false),
+                "prefetch consumed the last required slot");
         rejects([&] { service.prioritize(*cancelled); });
         until([&] { return service.poll(*cancelled).drained; });
         service.release(*cancelled);
@@ -209,10 +213,12 @@ void host(const disk::Table& source, const Input& input, bool failure) {
         incremental[b].ids = incremental[b].ids.first(1);
     std::optional<Ticket> next;
     until([&] {
-        next = service.prepare(input.tokens, std::span(incremental).first(input.batch), false);
+        next = service.prepare(input.tokens, input.batch, std::span(incremental).first(input.batch),
+                               false);
         return next.has_value();
     });
-    require(!service.prepare(input.tokens, input.inputs()), "unbounded PLE window admission");
+    require(!service.prepare(input.tokens, input.batch, input.inputs()),
+            "unbounded PLE window admission");
     rejects([&] { service.release(full); });
     rejects([&] { (void)service.embedding(full); });
     service.prioritize(*next);
@@ -255,7 +261,7 @@ void host(const disk::Table& source, const Input& input, bool failure) {
     const std::array empty{InputRow{input.rows[0].identity, {}}};
     std::optional<Ticket> zero;
     until([&] {
-        zero = service.prepare(1, empty);
+        zero = service.prepare(1, empty.size(), empty);
         return zero.has_value();
     });
     service.seal(*zero, std::array<std::uint32_t, 1>{0});
@@ -267,6 +273,58 @@ void host(const disk::Table& source, const Input& input, bool failure) {
             "empty reshaped window retained old E");
     require(service.stats().reads == reads, "empty window read the table");
     service.release(*zero);
+}
+
+void padded_host(const disk::Table& source, const Input& input) {
+    constexpr std::uint32_t capacity = 17, logical_rows = 9, physical_rows = 10;
+    HostBuffer output(std::size_t(input.tokens) * capacity * kEmbeddingBytes);
+    const std::array outputs{output.span()};
+    const disk::PrepareOptions options{.max_positions = input.tokens * capacity,
+                                       .max_rows      = capacity,
+                                       .io_depth      = 4,
+                                       .cache_bytes   = 512};
+    disk::PrepareService service(source, input.eos, options, outputs);
+    require(service.memory_bytes() ==
+                disk::PrepareService::memory_bytes(source.geometry(), options, 1),
+            "PLE metadata capacity is missing from its resource plan");
+    std::vector<InputRow> rows(logical_rows, input.rows[0]);
+    for (std::uint32_t row = 0; row < logical_rows; ++row) rows[row].identity.sequence += row;
+    std::optional<Ticket> ticket;
+    until([&] {
+        ticket = service.prepare(input.tokens, physical_rows, rows);
+        return ticket.has_value();
+    });
+    service.seal(*ticket, std::vector<std::uint32_t>(logical_rows, input.tokens));
+    ready(service, *ticket);
+    const auto view = service.embedding(*ticket);
+    require(
+        view.window.batch == physical_rows && view.window.valid_columns.size() == physical_rows &&
+            view.window.identities.size() == logical_rows && view.window.valid_columns.back() == 0,
+        "PLE padding invented a logical identity or active row");
+    const auto row_words = std::size_t(input.tokens) * kEmbeddingElements;
+    const auto* words    = static_cast<const std::uint16_t*>(view.values.data);
+    for (std::uint32_t row = 1; row < logical_rows; ++row)
+        require(std::equal(words, words + row_words, words + row * row_words),
+                "PLE enlarged logical batch changed embedding values");
+    require(std::all_of(words + logical_rows * row_words, words + physical_rows * row_words,
+                        [](auto value) { return value == 0; }),
+            "PLE padding contains nonzero embeddings");
+    service.release(*ticket);
+    until([&] {
+        rows[0].ids = rows[0].ids.first(1);
+        ticket      = service.prepare(1, 12, std::span(rows).first(1));
+        return ticket.has_value();
+    });
+    service.seal(*ticket, std::array<std::uint32_t, 1>{1});
+    ready(service, *ticket);
+    const auto reshaped = service.embedding(*ticket);
+    require(reshaped.window.identities.size() == 1 && reshaped.window.valid_columns.size() == 12,
+            "PLE reshaped window retained old identities");
+    const auto* padded = static_cast<const std::uint16_t*>(reshaped.values.data);
+    require(std::all_of(padded + kEmbeddingElements, padded + 12 * kEmbeddingElements,
+                        [](auto value) { return value == 0; }),
+            "PLE reused padding retained previous embeddings");
+    service.release(*ticket);
 }
 
 class StreamGate {
@@ -295,10 +353,12 @@ private:
 void gpu(const disk::Table& source, const Input& input) {
     DeviceContext context;
     UploadSlots uploads(context, input.tokens * input.batch, 2);
-    disk::PrepareService service(
-        source, input.eos,
-        {.max_positions = input.tokens * input.batch, .io_depth = 4, .cache_bytes = 512},
-        uploads.host_slots());
+    disk::PrepareService service(source, input.eos,
+                                 {.max_positions = input.tokens * input.batch,
+                                  .max_rows      = input.batch,
+                                  .io_depth      = 4,
+                                  .cache_bytes   = 512},
+                                 uploads.host_slots());
     const auto try_release = [&](Ticket ticket) {
         const auto state = service.poll(ticket);
         if (state.status == disk::PrepareStatus::Preparing || !state.drained ||
@@ -441,6 +501,7 @@ int main(int argc, char** argv) {
             row_reads(source);
             hashes(source, input);
             host(source, input, false);
+            padded_host(source, input);
         } else if (mode == "--gpu")
             gpu(source, input);
         else

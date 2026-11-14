@@ -24,6 +24,7 @@ namespace ninfer::models::qwen3_5::detail {
 inline constexpr std::uint32_t kCausalScoreTile = 1024;
 
 struct SequencePlanningInputs {
+    std::shared_ptr<const BatchExecutionPlan> batch_execution;
     std::shared_ptr<const execution::ModelProfile> profile;
     std::shared_ptr<const moe::Plan> moe;
     std::uint32_t capacity                 = 0;
@@ -43,6 +44,7 @@ struct SequencePlanningInputs {
 };
 
 struct SequencePlanImpl {
+    std::shared_ptr<const BatchExecutionPlan> batch_execution;
     std::shared_ptr<const execution::ModelProfile> profile;
     std::shared_ptr<const moe::Plan> moe;
     std::uint32_t capacity                 = 0;

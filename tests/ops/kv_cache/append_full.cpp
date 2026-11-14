@@ -875,6 +875,9 @@ void add_full_append_cases(ninfer::test::OpSuite& suite) {
         if (storage != KvCacheStorage::BFloat16)
             suite.add("append/full/" + format + "/h2/t129",
                       [=] { return full_append_case(2, storage, 129); }, {{"format", format}});
+        suite.add("append/prefix/d256/" + format + "/h2/ragged-b17",
+                  [=] { return full_prefix_case(2, storage, 3, 17, false); },
+                  {{"format", format}, {"execution", "eager"}, {"suite", "concurrency"}});
         for (int heads : {2, 4}) {
             const auto base = "append/prefix/d256/" + format + "/h" + std::to_string(heads);
             suite.add(base + "/ragged-b8-graph",

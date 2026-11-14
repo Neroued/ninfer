@@ -60,8 +60,8 @@ template <KvCacheStorage Storage, bool BoundedPhase, bool VectorWeights, bool To
           int KvHeads, bool Queries, bool VectorKv = KvHeads == 4>
 __global__ __launch_bounds__(128) void prepare_kernel(const __grid_constant__ PrepareArguments a) {
     using Geometry = PrepareGeometry<KvHeads, Queries>;
-    const int t    = TokenMajor ? blockIdx.x / Geometry::groups : blockIdx.x;
-    const int b = blockIdx.y, lane = threadIdx.x % 32;
+    const int t    = a.token_begin + (TokenMajor ? blockIdx.x / Geometry::groups : blockIdx.x);
+    const int b = a.row_begin + blockIdx.y, lane = threadIdx.x % 32;
     const int group = TokenMajor ? blockIdx.x % Geometry::groups : blockIdx.z;
     const int task  = group * Geometry::warps + threadIdx.x / 32;
     const auto m    = t + std::int64_t(b) * a.tokens;

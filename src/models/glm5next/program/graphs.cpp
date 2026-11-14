@@ -9,7 +9,7 @@
 namespace ninfer::models::glm5next::detail {
 void Graphs::bind_sites(Round& round, int g, int c, int depth) {
     auto& p        = owner_;
-    const auto& io = p.resources.plan.frame;
+    const auto& io = p.frame;
     const auto add = [&](execution::MlaReadout call, int step) {
         Site site{.call = call, .draft_step = step};
         const auto visible = call.visible;
@@ -88,59 +88,61 @@ void Graphs::prepare_round(int g, int c, bool verify) {
 
 void Graphs::prepare(GraphInputs& inputs, GraphPreparation& preparation) {
     auto& p           = owner_;
-    const int ranks   = p.parameters.profile->local.size;
     const int maximum = p.shape.draft_tokens;
-    for (int g = 1; g <= int(p.shape.max_concurrency); ++g) {
-        for (int c = (g + ranks - 1) / ranks; c <= g; ++c) {
-            for (bool verify : {false, true}) {
-                if (verify && !maximum) continue;
-                const int depth = verify ? maximum : 0;
-                inputs.set(g, c, depth);
-                const auto main =
-                    p.decode_batch(verify ? maximum + 1 : 1, g, c, p.shape.max_context);
-                const std::vector<std::uint32_t> draft(depth && p.parameters.draft ? 1 : depth,
-                                                       p.shape.max_context);
-                const auto decide = [&] {
-                    if (verify)
-                        p.accept_speculative(g);
-                    else
-                        p.sample(g, SampleKind::NextToken);
-                };
-                if (preparation.capturing()) {
-                    prepare_round(g, c, verify);
-                    replay(main, draft, true, false);
-                } else {
-                    p.execute_round(main, draft, true, false);
-                }
-                decide();
-                preparation.checkpoint();
+    for (const auto shape : p.resources.plan.batches->graph_shapes()) {
+        const int g = dimension(shape.rows), c = dimension(shape.attention_rows);
+        for (bool verify : {false, true}) {
+            if (verify && !maximum) continue;
+            const int depth = verify ? maximum : 0;
+            inputs.set(g, c, depth);
+            const auto main = p.decode_batch(verify ? maximum + 1 : 1, g, c, p.shape.max_context);
+            const std::vector<std::uint32_t> draft(depth && p.parameters.draft ? 1 : depth,
+                                                   p.shape.max_context);
+            const auto decide = [&] {
+                if (verify)
+                    p.accept_speculative(g);
+                else
+                    p.sample(g, SampleKind::NextToken);
+            };
+            if (preparation.capturing()) {
+                prepare_round(g, c, verify);
+                replay(main, draft, true, false);
+            } else {
+                p.execute_round(main, draft, true, false);
             }
-            if (maximum) {
-                inputs.set(g, c, maximum);
-                const auto main = p.decode_batch(maximum + 1, g, c, p.shape.max_context);
-                if (!preparation.capturing()) {
-                    p.execute_speculative_commit(main, true, true);
-                    preparation.checkpoint();
-                    continue;
-                }
-                auto& commit = commits_[{g, c}];
-                p.resources.workspace.reset_peak();
-                commit.graph.prepare(
-                    p.cuda,
-                    [&] {
-                        p.execute_speculative_commit(main, true, true, &commit.repair,
-                                                     &commit.counts);
-                    },
-                    p.parallel ? &*p.parallel : nullptr);
-                commit.workspace_bytes = p.resources.workspace.peak_used();
-                workspace_peak_        = std::max(workspace_peak_, commit.workspace_bytes);
-                commit.graph.launch(p.cuda, p.parallel ? &*p.parallel : nullptr);
-                preparation.checkpoint();
-            }
+            decide();
+            preparation.checkpoint();
         }
+        if (maximum) {
+            inputs.set(g, c, maximum);
+            const auto main = p.decode_batch(maximum + 1, g, c, p.shape.max_context);
+            if (!preparation.capturing()) {
+                p.execute_speculative_commit(main, true, true);
+                preparation.checkpoint();
+                continue;
+            }
+            auto& commit = commits_[{g, c}];
+            p.resources.workspace.reset_peak();
+            commit.graph.prepare(
+                p.cuda,
+                [&] {
+                    p.execute_speculative_commit(main, true, true, &commit.repair, &commit.counts);
+                },
+                p.parallel ? &*p.parallel : nullptr);
+            commit.workspace_bytes = p.resources.workspace.peak_used();
+            workspace_peak_        = std::max(workspace_peak_, commit.workspace_bytes);
+            commit.graph.launch(p.cuda, p.parallel ? &*p.parallel : nullptr);
+            preparation.checkpoint();
+        }
+    }
+    for (const auto g : p.resources.plan.batches->graph_rows()) {
+        const auto representative = std::find_if(p.resources.plan.batches->graph_shapes().begin(),
+                                                 p.resources.plan.batches->graph_shapes().end(),
+                                                 [&](auto shape) { return shape.rows == g; });
         for (bool verify : {false, true}) {
             if (verify && !maximum) continue;
             if (!preparation.capturing()) continue;
+            inputs.set(g, representative->attention_rows, verify ? maximum : 0);
             auto& decision = decisions_[{g, verify}];
             p.resources.workspace.reset_peak();
             decision.graph.prepare(

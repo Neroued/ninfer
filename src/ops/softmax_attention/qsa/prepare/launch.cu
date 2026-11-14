@@ -4,7 +4,9 @@
 #include "ops/common/host/operands.h"
 #include "core/platform.h"
 
+#include <algorithm>
 #include <array>
+#include <climits>
 #include <cmath>
 #include <stdexcept>
 
@@ -104,11 +106,21 @@ template <KvCacheStorage Storage, bool BoundedPhase, bool VectorWeights, int KvH
 void submit(const PrepareArguments& args, PreparePlan plan, cudaStream_t stream) {
     constexpr int groups = PrepareGeometry<KvHeads, Queries>::groups;
     const auto launch    = [&]<bool TokenMajor>() {
-        const dim3 grid          = TokenMajor ? dim3(args.tokens * groups, args.batch)
-                                                 : dim3(args.tokens, args.batch, groups);
-        constexpr bool vector_kv = KvHeads == 4 || (NINFER_TARGET_RTX5090 && KvHeads == 2);
-        prepare_kernel<Storage, BoundedPhase, VectorWeights, TokenMajor, KvHeads, Queries,
-                          vector_kv><<<grid, 128, 0, stream>>>(args);
+        constexpr bool vector_kv  = KvHeads == 4 || (NINFER_TARGET_RTX5090 && KvHeads == 2);
+        constexpr int token_limit = TokenMajor ? INT_MAX / groups : INT_MAX;
+        for (std::int64_t row = 0; row < args.batch; row += 65535) {
+            for (std::int64_t token = 0; token < args.tokens; token += token_limit) {
+                auto window        = args;
+                window.row_begin   = static_cast<int>(row);
+                window.token_begin = static_cast<int>(token);
+                const auto rows    = std::min(65535, args.batch - window.row_begin);
+                const auto tokens  = std::min(token_limit, args.tokens - window.token_begin);
+                const dim3 grid =
+                    TokenMajor ? dim3(tokens * groups, rows) : dim3(tokens, rows, groups);
+                prepare_kernel<Storage, BoundedPhase, VectorWeights, TokenMajor, KvHeads, Queries,
+                                  vector_kv><<<grid, 128, 0, stream>>>(window);
+            }
+        }
     };
     if constexpr (!Queries && KvHeads != 4)
         launch.template operator()<true>();

@@ -5,6 +5,7 @@
 #include "ninfer/ops/indexing.h"
 
 #include <algorithm>
+#include <cstring>
 
 namespace ninfer::models::qwen4_exp::detail {
 
@@ -17,7 +18,7 @@ Tensor RankProgramImpl::packed_tensor(const TensorRegion& r,
 
 Tensor RankProgramImpl::host_tensor(const TensorRegion& region) {
     auto r = region;
-    r.region.offset -= resources.plan.persistent.buffers.host_region.offset;
+    r.region.offset -= resources.buffers().host_region.offset;
     return r.bind(resources.ingress());
 }
 
@@ -34,7 +35,7 @@ ops::SamplingConfig sampling_config(const ResolvedSamplingParameters& p) {
 
 void RankProgramImpl::prepare_main_inputs(std::span<const WorkRow> rows, std::uint32_t tokens) {
     auto& frame         = *compute;
-    const auto& buffers = resources.plan.persistent.buffers;
+    const auto& buffers = resources.buffers();
     const auto& io      = frame.sequence ? buffers.batch : buffers.decode;
     const auto host     = [&](const TensorRegion& r) {
         return static_cast<std::int32_t*>(host_tensor(r).data);
@@ -42,12 +43,23 @@ void RankProgramImpl::prepare_main_inputs(std::span<const WorkRow> rows, std::ui
     const auto offsets = [&](const TensorRegion& r) {
         return static_cast<std::int64_t*>(host_tensor(r).data);
     };
-    const auto batch = rows.size();
-    frame.visible    = 1;
+    const auto batch = frame.sequence ? 1U : frame.physical.rows;
+    std::memset(resources.ingress().data, 0, buffers.ingress.bytes);
     for (std::size_t b = 0; b < batch; ++b) {
+        offsets(io.source_offsets)[b]      = -1;
+        offsets(io.destination_offsets)[b] = -1;
+        offsets(io.raw_tail_offsets)[b]    = -1;
+        host(io.main_tables)[b]            = -1;
+        host(io.count_slots)[b]            = -1;
+    }
+    frame.visible               = 1;
+    std::uint32_t active_tokens = 0;
+    for (std::size_t b = 0; b < rows.size(); ++b) {
+        host(io.live_rows)[b]     = 1;
         const auto& row           = rows[b];
         const auto valid          = frame.verify ? frame.verify->extents[b] + 1 : row.ids.size();
         host(io.valid_columns)[b] = valid;
+        active_tokens += valid;
         offsets(io.source_offsets)[b] = row.states.at(parameters.profile->local.rank).source;
         offsets(io.destination_offsets)[b] =
             row.states.at(parameters.profile->local.rank).destination;
@@ -85,13 +97,13 @@ void RankProgramImpl::prepare_main_inputs(std::span<const WorkRow> rows, std::ui
         upload(io.ids, tokens * batch * sizeof(TokenId));
         upload(io.positions, tokens * batch * sizeof(std::int32_t));
         upload(io.rope_positions, tokens * batch * 3 * sizeof(std::int32_t));
-        upload(io.valid_columns, io.sampling_positions.region.offset +
-                                     io.sampling_positions.region.bytes -
-                                     io.valid_columns.region.offset);
+        upload(io.live_rows, io.sampling_positions.region.offset +
+                                 io.sampling_positions.region.bytes - io.live_rows.region.offset);
     }
     if (buffers.sampling) {
         auto* configs = static_cast<ops::SamplingConfig*>(host_tensor(*buffers.sampling).data);
-        for (std::size_t b = 0; b < batch; ++b) {
+        for (std::size_t b = 0; b < batch; ++b) configs[b] = {};
+        for (std::size_t b = 0; b < rows.size(); ++b) {
             configs[b] = sampling_config(rows[b].sampling);
             if (configs[b].presence_penalty || configs[b].frequency_penalty)
                 configs[b].token_counts =
@@ -104,7 +116,8 @@ void RankProgramImpl::prepare_main_inputs(std::span<const WorkRow> rows, std::ui
                                    static_cast<int>((parameters.profile->public_tokens + 31) / 32)};
         }
     }
-    frame.batch = resources.main_batch(tokens, batch, frame.visible, frame.sequence);
+    frame.batch               = resources.main_batch(tokens, batch, frame.visible, frame.sequence);
+    frame.batch.active_tokens = active_tokens;
 }
 
 void RankProgramImpl::prepare_forward() {
@@ -117,6 +130,7 @@ void RankProgramImpl::prepare_forward() {
         prepare_control_window();
     f.tokens       = f.rows.front().ids.size();
     f.first_sample = forward && forward->sample == SampleKind::FirstToken;
+    resources.select_batch(f.sequence ? 1 : f.physical.rows);
     if (!f.tokens) {
         f.sample = resources.states->sample_hidden(
             f.rows.front().states.at(parameters.profile->local.rank).source);
@@ -124,7 +138,7 @@ void RankProgramImpl::prepare_forward() {
         request_decision();
         return;
     }
-    std::array<ple::InputRow, kMaximumConcurrency> inputs;
+    auto& inputs = input_rows;
     for (std::size_t b = 0; b < f.rows.size(); ++b) {
         const auto& row = f.rows[b];
         inputs[b] = {{row.member.sequence.value, row.member.sequence.generation, row.main_frontier,
@@ -132,20 +146,21 @@ void RankProgramImpl::prepare_forward() {
                      row.ids};
     }
     if (host_ple) {
-        f.ple = host_ple->try_require(f.request.ticket, f.tokens, {inputs.data(), f.rows.size()});
+        f.ple = host_ple->try_require(f.request.ticket, f.tokens, f.sequence ? 1 : f.physical.rows,
+                                      {inputs.data(), f.rows.size()});
         if (!f.ple) return;
     }
     prepare_main_inputs(f.rows, f.tokens);
-    if (!f.sequence && !device_graphs && !graphs) install_decode(f.rows.size());
-    if (!host_ple && (!device_graphs || f.sequence)) prepare_device_ple(f.batch);
+    if (!f.sequence && !(f.graphable && (device_graphs || graphs))) install_decode(f.physical.rows);
+    if (!host_ple && (!device_graphs || !f.graphable || f.sequence)) prepare_device_ple(f.batch);
     prepare_main();
     request_decision();
 }
 
 void RankProgramImpl::prepare_main() {
     auto& f            = *compute;
-    const auto& layout = resources.plan.persistent.buffers;
-    const auto batch   = static_cast<std::int32_t>(f.rows.size());
+    const auto& layout = resources.buffers();
+    const auto batch   = static_cast<std::int32_t>(f.sequence ? 1 : f.physical.rows);
     const auto t       = static_cast<std::int32_t>(f.tokens);
     const auto hidden  = dimension(parameters.profile->config.text.hidden);
     if (f.verify) {
@@ -182,13 +197,13 @@ void RankProgramImpl::prepare_main() {
         f.timer_started = true;
     }
     ++f.attention.forwards;
-    f.attention.rows += batch;
+    f.attention.rows += f.rows.size();
     f.attention.scheduled_positions += std::uint64_t(f.tokens) * batch;
     if (f.verify)
         for (auto extent : f.verify->extents) f.attention.valid_positions += extent + 1;
     else
         for (const auto& row : f.rows) f.attention.valid_positions += row.ids.size();
-    if (device_graphs && !f.sequence) {
+    if (device_graphs && f.graphable && !f.sequence) {
         const auto* forward    = std::get_if<ForwardWork>(&f.request.work.operation);
         const bool control     = forward && forward->sample == SampleKind::None;
         const bool constrained = std::any_of(f.rows.begin(), f.rows.end(),
@@ -217,7 +232,7 @@ void RankProgramImpl::prepare_main() {
             f.rows[0].states.at(parameters.profile->local.rank).source,
             f.rows[0].states.at(parameters.profile->local.rank).destination};
     f.run = std::make_unique<execution::TextRun>(parameters, execution, f.batch, update, cuda);
-    if (graphs && host_ple && !f.sequence) {
+    if (graphs && host_ple && f.graphable && !f.sequence) {
         const auto* forward = std::get_if<ForwardWork>(&f.request.work.operation);
         f.graph             = &graphs->main(batch, f.verify.has_value(), f.visible,
                                             f.verify || forward->sample != SampleKind::None);
@@ -255,10 +270,11 @@ void RankProgramImpl::after_main() {
             copy_bytes_async({destination.data, destination.bytes(), cuda.device()},
                              {last.data, last.bytes(), cuda.device()}, cuda);
         } else {
-            auto sample = f.sample.view({dimension(parameters.profile->config.text.hidden),
-                                         static_cast<std::int32_t>(f.rows.size())});
+            auto sample =
+                f.sample.view({dimension(parameters.profile->config.text.hidden),
+                               static_cast<std::int32_t>(f.sequence ? 1 : f.physical.rows)});
             ops::scatter(sample, resources.states->sample_hidden(f.batch.destination_offsets),
-                         cuda);
+                         f.batch.live_rows, cuda);
         }
     }
     if (f.timer_started) prefill_timer.record_stop();
@@ -283,7 +299,7 @@ void RankProgramImpl::sample_forward(std::int32_t batch, bool first_token) {
         vocabulary_sample(batch, first_token);
         return;
     }
-    const auto& io = resources.plan.persistent.buffers;
+    const auto& io = resources.buffers();
     auto logits    = device_tensor(*io.logits).slice(1, 0, batch);
     auto configs   = device_tensor(*io.sampling);
     auto positions = device_tensor(io.batch.sampling_positions).slice(0, 0, batch);
@@ -294,7 +310,7 @@ void RankProgramImpl::sample_forward(std::int32_t batch, bool first_token) {
     ops::sample(logits, sampled, parameters.profile->public_tokens,
                 static_cast<const ops::SamplingConfig*>(configs.data), positions,
                 first_token ? ops::kSamplePurposePrefill : ops::kSamplePurposeDecode,
-                resources.workspace, cuda);
+                device_tensor(io.batch.live_rows).slice(0, 0, batch), resources.workspace, cuda);
 }
 
 void RankProgramImpl::request_decision() {
@@ -337,7 +353,7 @@ void RankProgramImpl::request_decision() {
 
 void RankProgramImpl::install_sampling(bool speculative) {
     auto& f             = *compute;
-    const auto& buffers = resources.plan.persistent.buffers;
+    const auto& buffers = resources.buffers();
     const auto batch    = f.rows.size();
     const auto words    = (parameters.profile->public_tokens + 31) / 32;
     const auto width    = speculative ? f.verify->width : 1;
@@ -361,6 +377,10 @@ void RankProgramImpl::install_sampling(bool speculative) {
     }
     if (!consumed.rows.empty()) events.emplace_back(std::move(consumed));
     if (f.sequence || f.first_sample) {
+        const auto physical = f.sequence ? 1U : f.physical.rows;
+        auto* live          = static_cast<std::int32_t*>(host_tensor(buffers.batch.live_rows).data);
+        std::fill_n(live, physical, 0);
+        std::fill_n(live, batch, 1);
         auto* configs = static_cast<ops::SamplingConfig*>(host_tensor(*buffers.sampling).data);
         auto* positions =
             static_cast<std::int32_t*>(host_tensor(buffers.batch.sampling_positions).data);
@@ -384,6 +404,7 @@ void RankProgramImpl::install_sampling(bool speculative) {
                              {host_tensor(region).data, bytes, Device::cpu(), true}, cuda);
         };
         upload(*buffers.sampling, batch * sizeof(*configs));
+        upload(buffers.batch.live_rows, physical * sizeof(*live));
         upload(buffers.batch.count_slots, buffers.batch.sampling_positions.region.offset +
                                               buffers.batch.sampling_positions.region.bytes -
                                               buffers.batch.count_slots.region.offset);
@@ -395,8 +416,8 @@ void RankProgramImpl::prepare_decision() {
     request_decision();
     if (!f.decision) return;
     install_sampling(f.verify.has_value());
-    const auto& buffers = resources.plan.persistent.buffers;
-    const auto batch    = f.rows.size();
+    const auto& buffers = resources.buffers();
+    const auto batch    = f.sequence ? 1U : f.physical.rows;
     if (device_graphs && f.graph_main) {
         device_graphs->decide(batch, f.verify.has_value());
         gpu_timer.record_result();
@@ -421,7 +442,7 @@ void RankProgramImpl::prepare_decision() {
             execution::project_head(sample, parameters.text.head, logits, resources.workspace,
                                     cuda);
         }
-        if (graphs && host_ple && !f.first_sample)
+        if (graphs && host_ple && f.graphable && !f.first_sample)
             graphs->sample(batch);
         else
             sample_forward(batch, f.first_sample);
@@ -435,7 +456,7 @@ void RankProgramImpl::prepare_decision() {
 }
 
 void RankProgramImpl::copy_sample_result(std::int32_t batch, bool verify) {
-    const auto& io   = resources.plan.persistent.buffers;
+    const auto& io   = resources.buffers();
     const auto begin = io.sampled_ids->region.offset;
     const auto bytes =
         verify ? io.output_counts->region.offset + io.output_counts->region.bytes - begin

@@ -16,6 +16,7 @@ struct Invocation {
 };
 
 inline bool participates(ExpertSubsetKind kind, const std::int32_t* mask, int expert) noexcept {
+    if (expert < 0) { return false; }
     switch (kind) {
     case ExpertSubsetKind::All:
         return true;

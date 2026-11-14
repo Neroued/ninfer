@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/layout.h"
+#include "models/common/batch.h"
 #include "models/common/graph_preparation.h"
 
 #include "models/common/context/directory.h"
@@ -61,6 +62,7 @@ class RankProgram;
 enum class TextPhase { Prefill, Verify };
 
 struct SessionPlan {
+    std::shared_ptr<const BatchExecutionPlan> batch_execution;
     std::shared_ptr<const execution::ModelProfile> profile;
     context::ContextDirectorySpec context;
     std::vector<runtime::KvPoolDescriptor> kv_pools;
@@ -91,6 +93,7 @@ public:
     [[nodiscard]] std::uint32_t capacity() const noexcept;
     [[nodiscard]] std::size_t context_capacity_bytes() const noexcept;
     [[nodiscard]] std::uint32_t max_concurrency() const noexcept;
+    [[nodiscard]] const BatchExecutionPlan& batch_execution() const;
     [[nodiscard]] std::size_t device_reservation_bytes() const noexcept;
     [[nodiscard]] std::size_t workspace_capacity_bytes() const noexcept;
     [[nodiscard]] std::size_t host_capacity_bytes() const noexcept;

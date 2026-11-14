@@ -55,7 +55,7 @@ void linear_topk(const Tensor& hidden, const Weight& head, const Tensor& row_to_
 
 /**
  * Local vocabulary top-16 as lossless FP32 score/global-ID keys, following vocabulary.h.
- * hidden is contiguous BF16 [K,D*B]; keys is contiguous I64 [16,D,B], D>0, B=1..8,
+ * hidden is contiguous BF16 [K,D*B]; keys is contiguous I64 [16,D,B], D>0, B>=1,
  * with candidate rank fastest. Both bases are 16-byte aligned.
  * Row v of native W [N,K] has global ID token_begin+v; only IDs below token_domain
  * participate. token_begin>=0, token_domain>0, token_begin+N<=INT_MAX. Empty support

@@ -988,7 +988,7 @@ int coordinator(int argc, char** argv) {
         }
         return group;
     };
-    Executor executor(prepare(), {1, 1}, {});
+    Executor executor(prepare(), {1, 1}, {}, 1);
     executor.bind_to_current_thread();
     std::uint64_t state = 0;
     for (auto work : std::vector<Work>{{},
@@ -1058,7 +1058,7 @@ int coordinator(int argc, char** argv) {
     }
     executor.drain();
     for (const auto operation : {Operation::Sum, Operation::ContextScatter}) {
-        Executor failing(prepare(), {1, 1}, {});
+        Executor failing(prepare(), {1, 1}, {}, 1);
         failing.bind_to_current_thread();
         auto reservation = failing.try_reserve(
             context_operation(operation) ? rt::FrameKind::Context : rt::FrameKind::Compute);

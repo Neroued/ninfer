@@ -12,12 +12,15 @@ GraphPreparationPlan describe_graph_preparation(const EngineOptions& options,
     GraphPreparationPlan out;
     if (!options.use_cuda_graph || !moe) return out;
     out.segmented = true;
-    for (std::uint32_t batch = 1; batch <= options.max_concurrency; ++batch) {
+    const BatchExecutionPlan batches(make_batch_execution_spec(options.max_concurrency, 1, true));
+    for (const auto batch : batches.graph_rows()) {
         for (const auto& layer : moe->description().layers) {
-            out.layers_by_batch.push_back(moe->graph_plan(layer.bank, batch));
+            out.layers_by_batch.push_back(
+                moe->graph_plan(layer.bank, moe::decode_geometry(batches, batch, 1)));
             if (options.speculative.backend != SpeculativeBackend::None) {
                 const auto width = options.speculative.draft_tokens + 1;
-                out.layers_by_batch.push_back(moe->graph_plan(layer.bank, batch * width));
+                out.layers_by_batch.push_back(
+                    moe->graph_plan(layer.bank, moe::decode_geometry(batches, batch, width)));
             }
         }
     }

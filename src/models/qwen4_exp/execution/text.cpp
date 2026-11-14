@@ -15,10 +15,10 @@ TextRun::TextRun(const Parameters& p, TextExecution execution, BatchView batch, 
       scope_(execution.workspace.scope()),
       roots_(workspace::roots(execution.workspace, p.profile->config.text,
                               batch.tokens * batch.batch)),
-      expert_activity_(execution.experts ? execution.experts->begin(batch.tokens * batch.batch)
+      expert_activity_(execution.experts ? execution.experts->begin(batch.tokens * batch.batch,
+                                                                    batch.active_tokens)
                                          : std::nullopt) {
     if (batch.tokens <= 0 || batch.batch < 1 ||
-        batch.batch > static_cast<std::int32_t>(kMaximumConcurrency) ||
         (std::holds_alternative<SequenceState>(update) && batch.batch != 1) ||
         (std::holds_alternative<StepUpdate>(update) && batch.tokens != 1) ||
         (std::holds_alternative<VerifyRecords>(update) && batch.tokens < 2))
@@ -48,6 +48,7 @@ bool TextRun::advance_layer(std::uint32_t i) {
         mixer(i);
         if (execution_.experts) {
             if (!execution_.experts->start(p.moe.bank, roots_.input, roots_.output,
+                                           {batch_.valid_columns, batch_.tokens},
                                            execution_.workspace, {})) {
                 waiting_moe_ = true;
                 return false;
@@ -114,12 +115,13 @@ void TextRun::finish_mixer(std::uint32_t i) {
 void TextRun::resident_moe(std::uint32_t i) {
     const auto& p = parameters_.text.layers[i].moe;
     moe::execute(roots_.input, p, p.resident, ops::MoeEpilogue::Write, roots_.output,
-                 execution_.workspace, cuda_);
+                 {batch_.valid_columns, batch_.tokens}, execution_.workspace, cuda_);
 }
 
 void TextRun::gpu_moe(const moe::GpuCall& call) {
     auto scratch = execution_.workspace.scope();
-    call(roots_.input, roots_.output, execution_.workspace, {});
+    call(roots_.input, roots_.output, {batch_.valid_columns, batch_.tokens}, execution_.workspace,
+         {});
 }
 
 void TextRun::combine(std::uint32_t i) {

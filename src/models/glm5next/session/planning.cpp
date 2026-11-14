@@ -53,6 +53,7 @@ PreparedSession prepare_session(std::shared_ptr<const ModelDefinition> definitio
                                 PreparedContext prepared, std::uint32_t interval) {
     SessionPlan plan;
     plan.shape               = prepared.shape;
+    plan.batches             = std::move(prepared.batches);
     plan.context             = std::move(prepared.spec);
     plan.states              = std::move(prepared.states);
     plan.checkpoint_interval = interval;

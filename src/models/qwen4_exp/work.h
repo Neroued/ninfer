@@ -1,6 +1,7 @@
 #pragma once
 
 #include "models/common/token_input.h"
+#include "models/common/batch.h"
 
 #include "models/common/context/contract.h"
 #include "models/common/context/directory/state.h"
@@ -64,11 +65,13 @@ struct ForwardWork {
     std::vector<WorkRow> rows;
     std::optional<PlePrefetch> prefetch;
     std::optional<qwen::VisionWork> visual;
+    PhysicalBatchShape shape;
 };
 
 struct MtpWork {
     std::vector<WorkRow> rows;
     std::vector<std::uint32_t> draft_extents;
+    PhysicalBatchShape shape;
 };
 
 struct ResidencyBinding {
@@ -86,6 +89,7 @@ struct ScoreWork {
     WorkRow row;
     std::vector<TokenId> targets;
     std::uint32_t first_target_column = 0;
+    PhysicalBatchShape shape;
 };
 
 struct Work {
@@ -144,6 +148,7 @@ struct WorkContract {
     std::uint32_t vocabulary, public_tokens;
     bool mtp, vision;
     std::uint32_t control_token_limit = 0;
+    std::shared_ptr<const BatchExecutionPlan> batches;
 
     [[nodiscard]] runtime::WorkPayloadCapacity payload_capacity(std::uint32_t rank_count) const;
     void validate(const Work&, runtime::FrameKind) const;
@@ -154,6 +159,8 @@ struct WorkContract {
 };
 
 [[nodiscard]] std::span<const WorkRow> work_rows(const Work&);
+[[nodiscard]] const PhysicalBatchShape& work_shape(const Work&);
+void plan_work_batch(Work&, const BatchExecutionPlan&);
 void validate_decision_rows(const runtime::DecisionInput&, std::uint32_t stage,
                             std::uint32_t vocabulary, std::span<const std::uint32_t> positions);
 

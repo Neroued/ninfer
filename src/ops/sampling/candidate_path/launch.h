@@ -8,5 +8,6 @@ void launch_candidate_path(SelectorPlan plan, CandidateSelectorInput input,
                            const Tensor& anchors, const Tensor& predecessor_codebook,
                            const Tensor& successor_codebook, const Tensor& base_positions,
                            const SamplingConfig* configs, Tensor& drafts, Tensor& proposal_q,
-                           const SelectorWorkspace& workspace, cudaStream_t stream);
+                           const Tensor& live_rows, const SelectorWorkspace& workspace,
+                           cudaStream_t stream);
 }

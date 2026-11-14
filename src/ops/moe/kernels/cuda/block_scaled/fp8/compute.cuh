@@ -165,7 +165,7 @@ __global__ __launch_bounds__(Schedule<Columns, Gate>::threads) void grouped_mma(
 __global__ void vector_gate(const __nv_bfloat16* x, ExpertMatrixDeviceView bank, const int* ids,
                             ExpertSubsetKind kind, const int* mask, float* activation) {
     const int assignment = blockIdx.y, expert = ids[assignment];
-    if (!includes(kind, mask, expert)) { return; }
+    if (!expert_in_subset(kind, mask, expert)) { return; }
     const auto weight = resolve(bank, expert);
     const int row = blockIdx.x * 4 + (threadIdx.x >> 5), lane = threadIdx.x & 31;
     float gate = 0, up = 0;
@@ -197,7 +197,7 @@ __global__ void vector_down(const float* activation, ExpertMatrixDeviceView bank
     const int token = blockIdx.y, route = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int assignment = token * kTopK + route, expert = ids[assignment];
     float sum[Rows] = {};
-    if (includes(kind, mask, expert)) {
+    if (expert_in_subset(kind, mask, expert)) {
         const auto weight = resolve(bank, expert);
         for (int block = 0; block < kIntermediate / 128; ++block) {
             const int k = block * 128 + lane * 4;
@@ -228,8 +228,9 @@ __global__ void vector_down(const float* activation, ExpertMatrixDeviceView bank
         float result = 0;
 #pragma unroll
         for (int j = 0; j < kTopK; ++j) { result += values[j][threadIdx.x]; }
-        const int i = token * kHidden + blockIdx.x * Rows + threadIdx.x;
-        output.store(i, output.initial(i) + result);
+        const int i     = token * kHidden + blockIdx.x * Rows + threadIdx.x;
+        const bool live = output.is_live(token);
+        output.store(i, output.initial(i, live) + result, live);
     }
 }
 } // namespace ninfer::ops::detail::moe_cuda::block_scaled::fp8

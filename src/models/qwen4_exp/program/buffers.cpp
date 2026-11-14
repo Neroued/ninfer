@@ -6,14 +6,33 @@
 #include <algorithm>
 
 namespace ninfer::models::qwen4_exp {
+namespace {
+class ControlLayout {
+public:
+    explicit ControlLayout(std::size_t begin) {
+        if (begin) (void)builder_.add(begin, 1, "control prefix");
+    }
+
+    TensorRegion plane(DType dtype, std::initializer_list<std::int32_t> shape) {
+        return builder_.add_tensor(dtype, shape,
+                                   std::max<std::size_t>(dtype_size(dtype), alignof(void*)),
+                                   "control metadata");
+    }
+
+    std::size_t end() const { return builder_.finish(); }
+private:
+    LayoutBuilder builder_;
+};
+} // namespace
+
 BufferLayout plan_buffers(LayoutBuilder& b, const Config& c, const EngineOptions& o,
                           std::uint32_t chunk, std::uint32_t public_tokens, const GdnConfig& gdn,
                           std::uint32_t local_vocabulary, std::uint32_t ranks, bool device_ple) {
     const auto hidden = dimension(c.text.hidden), channels = dimension(c.text.residual_width());
     const auto index_key = dimension(c.text.qsa.index_key_width());
-    const auto batch     = static_cast<std::int32_t>(o.max_concurrency);
-    const auto width     = static_cast<std::int32_t>(c.mtp ? o.speculative.draft_tokens + 1 : 1);
-    const auto positions = std::max(static_cast<std::int32_t>(chunk), batch * width);
+    const auto batch     = dimension(o.max_concurrency);
+    const auto width     = dimension(c.mtp ? std::uint64_t(o.speculative.draft_tokens) + 1 : 1);
+    const auto positions = dimension(std::max<std::uint64_t>(chunk, std::uint64_t(batch) * width));
     const auto tensor    = [&](DType dtype, std::initializer_list<std::int32_t> shape,
                             const char* label) { return b.add_tensor(dtype, shape, 256, label); };
     const auto rows      = [&] { return tensor(DType::I32, {batch}, "batch metadata"); };
@@ -21,6 +40,7 @@ BufferLayout plan_buffers(LayoutBuilder& b, const Config& c, const EngineOptions
     out.anchors                   = rows();
     const auto decode_positions   = tensor(DType::I32, {width * batch}, "decode ordinals");
     const auto decode_rope        = tensor(DType::I32, {width * batch, 3}, "decode coordinates");
+    out.batch.live_rows           = rows();
     out.batch.valid_columns       = rows();
     out.batch.source_offsets      = tensor(DType::I64, {batch}, "source State offsets");
     out.batch.destination_offsets = tensor(DType::I64, {batch}, "destination State offsets");
@@ -42,6 +62,7 @@ BufferLayout plan_buffers(LayoutBuilder& b, const Config& c, const EngineOptions
         out.ids                 = ids;
         out.positions           = tensor(DType::I32, {n}, "MTP positions");
         out.rope_positions      = tensor(DType::I32, {n, 3}, "MTP RoPE");
+        out.live_rows           = rows();
         out.valid_columns       = rows();
         out.source_offsets      = tensor(DType::I64, {batch}, "source State offsets");
         out.destination_offsets = tensor(DType::I64, {batch}, "destination State offsets");
@@ -61,7 +82,8 @@ BufferLayout plan_buffers(LayoutBuilder& b, const Config& c, const EngineOptions
         mtp.skip_first = rows();
         for (int step = 0; step < width - 1; ++step)
             mtp.draft_steps.push_back(metadata(batch, {}, false));
-        last_ingress = mtp.draft_steps.back().record_offsets;
+        last_ingress =
+            mtp.draft_steps.empty() ? mtp.skip_first : mtp.draft_steps.back().record_offsets;
     }
     out.ingress = {
         out.anchors.region.offset,
@@ -158,7 +180,6 @@ BufferLayout plan_buffers(LayoutBuilder& b, const Config& c, const EngineOptions
         out.proposal_sampling =
             tensor(DType::I32, {static_cast<std::int32_t>(sizeof(ops::SamplingConfig) / 4), batch},
                    "draft greedy config");
-        out.proposal_columns = rows();
     }
     if (!scoring) {
         out.logits =
@@ -173,5 +194,104 @@ BufferLayout plan_buffers(LayoutBuilder& b, const Config& c, const EngineOptions
                    "grammar masks");
     }
     return out;
+}
+
+MtpBatchLayout history_control_view(const MtpBatchLayout& backing, std::uint32_t tokens,
+                                    std::uint32_t rows) {
+    MtpBatchLayout out   = backing;
+    const auto positions = dimension(std::uint64_t(tokens) * rows);
+    if (!tokens || !rows || std::uint64_t(positions) * sizeof(TokenId) > backing.ids.region.bytes ||
+        rows > static_cast<std::uint32_t>(backing.live_rows.shape[0]))
+        throw std::invalid_argument("Qwen4Exp history control exceeds frame capacity");
+    ControlLayout layout(backing.ingress.offset);
+    const auto plane = [&](DType type, std::initializer_list<std::int32_t> shape) {
+        return layout.plane(type, shape);
+    };
+    const auto n            = dimension(rows);
+    out.ids                 = plane(DType::I32, {positions});
+    out.positions           = plane(DType::I32, {positions});
+    out.rope_positions      = plane(DType::I32, {positions, 3});
+    out.live_rows           = plane(DType::I32, {n});
+    out.valid_columns       = plane(DType::I32, {n});
+    out.source_offsets      = plane(DType::I64, {n});
+    out.destination_offsets = plane(DType::I64, {n});
+    out.table_rows          = plane(DType::I32, {n});
+    out.base_positions      = plane(DType::I32, {n});
+    out.record_offsets      = plane(DType::I32, {n});
+    out.ingress = {backing.ingress.offset, layout.end() - backing.ingress.offset, alignof(void*)};
+    if (layout.end() > backing.ingress.offset + backing.ingress.bytes)
+        throw std::logic_error("Qwen4Exp history view exceeds its backing");
+    return out;
+}
+
+void select_buffer_rows(BufferLayout& out, const BufferLayout& backing, std::uint32_t rows) {
+    if (!rows || rows > static_cast<std::uint32_t>(backing.batch.live_rows.shape[0]))
+        throw std::invalid_argument("Qwen4Exp control rows exceed frame capacity");
+    const auto n     = dimension(rows);
+    const auto width = backing.decode.max_positions / backing.batch.live_rows.shape[0];
+    ControlLayout layout(backing.ingress.offset);
+    const auto plane = [&](DType dtype, std::initializer_list<std::int32_t> shape) {
+        return layout.plane(dtype, shape);
+    };
+    const auto row                = [&] { return plane(DType::I32, {n}); };
+    out.anchors                   = row();
+    out.decode.positions          = plane(DType::I32, {dimension(std::uint64_t(width) * rows)});
+    out.decode.rope_positions     = plane(DType::I32, {dimension(std::uint64_t(width) * rows), 3});
+    out.batch.live_rows           = row();
+    out.batch.valid_columns       = row();
+    out.batch.source_offsets      = plane(DType::I64, {n});
+    out.batch.destination_offsets = plane(DType::I64, {n});
+    out.batch.main_tables         = row();
+    out.batch.base_positions      = row();
+    out.batch.record_offsets      = row();
+    out.batch.raw_tail            = plane(DType::I32, {2, n});
+    out.batch.raw_tail_offsets    = plane(DType::I64, {n});
+    out.batch.count_slots         = row();
+    out.batch.sampling_positions  = row();
+    if (out.sampling)
+        out.sampling = plane(DType::I32, {static_cast<int>(sizeof(ops::SamplingConfig) / 4), n});
+    if (out.mtp) {
+        out.mtp->extents    = row();
+        out.mtp->skip_first = row();
+        for (std::size_t step = 0; step < out.mtp->draft_steps.size(); ++step) {
+            auto& draft               = out.mtp->draft_steps[step];
+            draft.positions           = row();
+            const auto begin          = draft.positions.region.offset;
+            draft.rope_positions      = plane(DType::I32, {n, 3});
+            draft.live_rows           = row();
+            draft.valid_columns       = row();
+            draft.source_offsets      = plane(DType::I64, {n});
+            draft.destination_offsets = plane(DType::I64, {n});
+            draft.table_rows          = row();
+            draft.base_positions      = row();
+            draft.record_offsets      = row();
+            draft.ingress             = {begin, layout.end() - begin, alignof(void*)};
+            if (!step) draft.ids = out.anchors;
+        }
+    }
+    out.ingress = {backing.ingress.offset, layout.end() - backing.ingress.offset, 256};
+    out.commit_destination_offsets = plane(DType::I64, {n});
+    const auto commit_begin        = out.commit_destination_offsets.region.offset;
+    out.batch.accepted_columns     = row();
+    out.batch.count_columns        = row();
+    if (out.mtp) {
+        out.mtp->last_columns   = row();
+        out.mtp->active_columns = row();
+    }
+    out.commit_ingress = {commit_begin, layout.end() - commit_begin, alignof(void*)};
+    if (layout.end() > backing.commit_ingress.offset + backing.commit_ingress.bytes)
+        throw std::logic_error("Qwen4Exp control view exceeds its backing");
+    if (out.sampled_ids) {
+        ControlLayout result(backing.sampled_ids->region.offset);
+        out.sampled_ids   = result.plane(DType::I32, {dimension(width), n});
+        out.output_counts = result.plane(DType::I32, {n});
+    }
+    const auto positions = out.decode.positions, rope = out.decode.rope_positions;
+    out.decode                = out.batch;
+    out.decode.ids            = out.anchors;
+    out.decode.positions      = positions;
+    out.decode.rope_positions = rope;
+    out.decode.visual_indices.reset();
+    out.decode.max_positions = width * rows;
 }
 } // namespace ninfer::models::qwen4_exp

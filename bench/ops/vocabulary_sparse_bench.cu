@@ -28,7 +28,7 @@ Options parse(int argc, char** argv) {
         if (f == "--steps")
             o.steps = m::integers(v, 1, 15);
         else if (f == "--batches")
-            o.batches = m::integers(v, 1, 8);
+            o.batches = m::integers(v);
         else if (f == "--mode") {
             if (v == "greedy")
                 o.modes = {0};
@@ -78,8 +78,8 @@ int main(int argc, char** argv) {
                             std::fill(f.extents.begin(), f.extents.end(), 0);
                             f.extent_buffer.copy_from_host(f.extents.data(), b * 4);
                         }
-                        auto ob = bench::make_buffer((d + 1) * b * 4),
-                             cb = bench::make_buffer(b * 4);
+                        auto ob = bench::make_buffer(std::size_t(d + 1) * b * 4),
+                             cb = bench::make_buffer(std::size_t(b) * 4);
                         Tensor out(ob.span(), DType::I32, {d + 1, b}),
                             counts(cb.span(), DType::I32, {b});
                         auto launch = [&](CudaExecutionView cuda) {
@@ -87,7 +87,7 @@ int main(int argc, char** argv) {
                                 f.keys(),
                                 static_cast<const ops::SamplingConfig*>(f.config_buffer.data()),
                                 f.draft_view(), f.id_view(), f.q_view(), f.extent_view(),
-                                f.position_view(), out, counts, cuda);
+                                f.position_view(), out, counts, {}, cuda);
                         };
                         m::Row row;
                         row.op      = "accept_vocabulary_candidates_sparse";

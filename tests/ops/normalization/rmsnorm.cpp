@@ -9,6 +9,7 @@
 #include <cmath>
 #include <cstdint>
 #include <iostream>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -25,11 +26,18 @@ constexpr ReductionCriterion rmsnorm_bf16_criterion() {
             /*gross_relative_to_max_reference*/ 3.95e-3};
 }
 
+constexpr ReductionCriterion rmsnorm_inverse_criterion() {
+    return {/*relative_l2*/ 2.0e-6, /*gross_absolute*/ 1.0e-7,
+            /*gross_relative_to_max_reference*/ 4.0e-6};
+}
+
 std::vector<double> rmsnorm_oracle(const std::vector<float>& input,
                                    const std::vector<float>& weight, const Shape& shape,
-                                   bool unit_offset, float eps) {
+                                   bool unit_offset, float eps,
+                                   std::vector<double>* inverse_output = nullptr) {
     std::vector<double> output(input.size());
     const auto row_count = static_cast<std::int64_t>(shape.rows) * shape.tokens;
+    if (inverse_output) inverse_output->resize(row_count);
     for (std::int64_t row = 0; row < row_count; ++row) {
         const std::size_t base = static_cast<std::size_t>(row) * shape.d;
         double sum_squares     = 0.0;
@@ -38,6 +46,7 @@ std::vector<double> rmsnorm_oracle(const std::vector<float>& input,
             sum_squares += value * value;
         }
         const double inverse = 1.0 / std::sqrt(sum_squares / static_cast<double>(shape.d) + eps);
+        if (inverse_output) (*inverse_output)[row] = inverse;
         for (std::int32_t column = 0; column < shape.d; ++column) {
             const double gain     = static_cast<double>(weight[column]) + (unit_offset ? 1.0 : 0.0);
             output[base + column] = static_cast<double>(input[base + column]) * inverse * gain;
@@ -48,7 +57,8 @@ std::vector<double> rmsnorm_oracle(const std::vector<float>& input,
 
 int run_case(const char* label, const Shape& shape, bool unit_offset, std::uint32_t seed,
              float input_scale = 4.0F, std::size_t leading_words = 0, bool replay = false,
-             int width = 0, bool heterogeneous_quarters = false, float eps = kEps) {
+             int width = 0, bool heterogeneous_quarters = false, float eps = kEps,
+             bool with_inverse = false) {
     const std::size_t count = shape.elements();
     std::vector<float> input(count), weight(shape.d);
     fill_uniform(input, seed, -input_scale, input_scale);
@@ -80,17 +90,30 @@ int run_case(const char* label, const Shape& shape, bool unit_offset, std::uint3
         output_tensor = Tensor(output.span().subspan(leading), DType::BF16,
                                {shape.d, shape.rows, width, shape.tokens / width});
     }
+    const auto rows = static_cast<std::size_t>(shape.rows) * shape.tokens;
+    std::optional<GuardedDeviceBuffer> inverse;
+    Tensor inverse_tensor;
+    if (with_inverse) {
+        // Only natural FP32 alignment is required, including on vectorized BF16 routes.
+        inverse.emplace((rows + 1) * sizeof(float));
+        inverse_tensor = Tensor(inverse->span().subspan(sizeof(float)), DType::FP32,
+                                {input_tensor.ne[1], input_tensor.ne[2], input_tensor.ne[3]});
+    }
     DeviceContext device;
     DecodeGraphDefinition definition;
     DecodeGraphExecutable graph;
     const auto launch = [&] {
-        ops::rmsnorm(input_tensor, weight_tensor, eps, unit_offset, output_tensor,
-                     device.execution_view());
+        if (with_inverse)
+            ops::rmsnorm(input_tensor, weight_tensor, eps, unit_offset, output_tensor,
+                         inverse_tensor, device.execution_view());
+        else
+            ops::rmsnorm(input_tensor, weight_tensor, eps, unit_offset, output_tensor,
+                         device.execution_view());
     };
     int failures = 0;
     for (int phase = 0; phase < (replay ? 2 : 1); ++phase) {
         if (phase) {
-            for (auto& value : input) value = -value;
+            for (auto& value : input) value *= with_inverse ? -0.5F : -1.0F;
             for (auto& value : weight) value *= 0.5F;
             const std::size_t offset = leading_words;
             for (std::size_t i = 0; i < input.size(); ++i)
@@ -103,6 +126,7 @@ int run_case(const char* label, const Shape& shape, bool unit_offset, std::uint3
                                   device_weight.expected.size() * 2, cudaMemcpyHostToDevice));
         }
         output.fill(0xff);
+        if (inverse) inverse->fill(0xff);
         cuda_synchronize();
         if (replay && phase == 0) {
             definition.capture(device.stream(), launch);
@@ -113,10 +137,22 @@ int run_case(const char* label, const Shape& shape, bool unit_offset, std::uint3
         else
             launch();
         cuda_synchronize(device.stream());
-        const auto reference = rmsnorm_oracle(input, weight, shape, unit_offset, eps);
+        std::vector<double> inverse_reference;
+        const auto reference = rmsnorm_oracle(input, weight, shape, unit_offset, eps,
+                                              with_inverse ? &inverse_reference : nullptr);
         failures += verify_reduction(label, from_device_bf16(output_data, count), reference,
                                      rmsnorm_bf16_criterion());
         failures += verify_output_storage(std::string(label) + " output", output, leading_words);
+        if (inverse) {
+            const auto values = from_device<float>(inverse_tensor.data, rows);
+            failures += verify_reduction(std::string(label) + " inverse",
+                                         std::vector<double>(values.begin(), values.end()),
+                                         inverse_reference, rmsnorm_inverse_criterion());
+            failures += verify_exact((std::string(label) + " inverse prefix").c_str(),
+                                     from_device<std::uint32_t>(inverse->data(), 1),
+                                     std::vector<std::uint32_t>{0xffffffffU});
+            failures += inverse->verify_guards(std::string(label) + " inverse");
+        }
         failures += verify_preserved(std::string(label) + " preserves input", device_input);
         failures += verify_preserved(std::string(label) + " preserves weight", device_weight);
     }
@@ -158,8 +194,122 @@ int validate_contract() {
     return failed;
 }
 
+int validate_inverse_contract() {
+    DeviceContext device;
+    const auto execution = device.execution_view();
+    DeviceBuffer input(execution.device(), 128 * 4), weight(execution.device(), 128 * 2),
+        output(execution.device(), 128 * 4);
+    GuardedDeviceBuffer inverse_storage(6 * sizeof(float));
+    Tensor x(input.span(), DType::BF16, {128, 2}), w(weight.span(), DType::BF16, {128}),
+        y(output.span(), DType::BF16, {128, 2}), inverse(inverse_storage.span(), DType::FP32, {2});
+    const auto reject = [&](Tensor out, Tensor inv, const char* label) {
+        try {
+            ops::rmsnorm(x, w, kEps, false, out, inv, execution);
+        } catch (const std::invalid_argument&) { return 0; }
+        std::cerr << "rmsnorm inverse accepted " << label << '\n';
+        return 1;
+    };
+    int failed = 0;
+    for (void* pointer :
+         {x.data, w.data, y.data, static_cast<void*>(static_cast<std::byte*>(x.data) + 4)}) {
+        auto alias = inverse;
+        alias.data = pointer;
+        failed += reject(y, alias, "overlapping inverse");
+    }
+    failed += reject(x, inverse, "overlapping output");
+    auto invalid  = inverse;
+    invalid.dtype = DType::BF16;
+    failed += reject(y, invalid, "BF16 inverse");
+    invalid       = inverse;
+    invalid.ne[0] = 1;
+    invalid.ne[1] = 2;
+    failed += reject(y, invalid, "reshaped inverse");
+    invalid = inverse;
+    invalid.nb[0] *= 2;
+    failed += reject(y, invalid, "strided inverse");
+    invalid      = inverse;
+    invalid.data = static_cast<std::byte*>(inverse.data) + 2;
+    failed += reject(y, invalid, "unaligned inverse");
+    invalid      = inverse;
+    invalid.data = nullptr;
+    failed += reject(y, invalid, "null inverse");
+    invalid        = inverse;
+    invalid.device = Device::cpu();
+    failed += reject(y, invalid, "inverse on another device");
+
+    auto empty          = Tensor::metadata(DType::BF16, {128, 2, 1});
+    empty.ne[2]         = 0;
+    auto empty_inverse  = Tensor::metadata(DType::FP32, {2, 1});
+    empty_inverse.ne[1] = 0;
+    ops::rmsnorm(empty, w, kEps, false, empty, empty_inverse, execution);
+    auto wrong_empty_inverse  = empty_inverse;
+    wrong_empty_inverse.ne[0] = 1;
+    try {
+        ops::rmsnorm(empty, w, kEps, false, empty, wrong_empty_inverse, execution);
+        std::cerr << "rmsnorm inverse accepted incorrect empty shape\n";
+        ++failed;
+    } catch (const std::invalid_argument&) {}
+    wrong_empty_inverse       = empty_inverse;
+    wrong_empty_inverse.dtype = DType::BF16;
+    try {
+        ops::rmsnorm(empty, w, kEps, false, empty, wrong_empty_inverse, execution);
+        std::cerr << "rmsnorm inverse accepted incorrect empty dtype\n";
+        ++failed;
+    } catch (const std::invalid_argument&) {}
+
+    auto no_features  = Tensor::metadata(DType::BF16, {1, 2, 3});
+    no_features.ne[0] = 0;
+    no_features.nb[1] = no_features.nb[2] = no_features.nb[3] = 0;
+    auto no_weight                                            = Tensor::metadata(DType::BF16, {1});
+    no_weight.ne[0]                                           = 0;
+    no_weight.nb[1] = no_weight.nb[2] = no_weight.nb[3] = 0;
+    Tensor untouched_inverse(inverse_storage.span(), DType::FP32, {2, 3});
+    inverse_storage.fill(0x5a);
+    ops::rmsnorm(no_features, no_weight, kEps, true, no_features, untouched_inverse, execution);
+    cuda_synchronize();
+    cudaGraph_t empty_graph = nullptr;
+    CUDA_CHECK(cudaStreamBeginCapture(device.stream(), cudaStreamCaptureModeThreadLocal));
+    ops::rmsnorm(empty, w, kEps, false, empty, empty_inverse, execution);
+    ops::rmsnorm(no_features, no_weight, kEps, true, no_features, untouched_inverse, execution);
+    CUDA_CHECK(cudaStreamEndCapture(device.stream(), &empty_graph));
+    std::size_t nodes = 0;
+    CUDA_CHECK(cudaGraphGetNodes(empty_graph, nullptr, &nodes));
+    CUDA_CHECK(cudaGraphDestroy(empty_graph));
+    if (nodes != 0) {
+        std::cerr << "rmsnorm empty inverse call submitted device work\n";
+        ++failed;
+    }
+    failed += verify_exact("rmsnorm D=0 preserves inverse",
+                           from_device<std::uint32_t>(inverse_storage.data(), 6),
+                           std::vector<std::uint32_t>(6, 0x5a5a5a5aU));
+    failed += inverse_storage.verify_guards("rmsnorm inverse empty");
+    return failed;
+}
+
 void add_rmsnorm_cases(ninfer::test::OpSuite& suite) {
     suite.add("rmsnorm/contract", validate_contract);
+    suite.add("rmsnorm/inverse/contract", validate_inverse_contract, {{"suite", "concurrency"}});
+    const auto add_inverse = [&](const Shape& shape, bool offset, bool graph = false, int width = 0,
+                                 float scale = 4.F) {
+        const auto id = "rmsnorm/inverse/d" + std::to_string(shape.d) + "/r" +
+                        std::to_string(shape.rows) + "/t" + std::to_string(shape.tokens) +
+                        "/scale" + std::to_string(scale);
+        suite.add(id,
+                  [=] {
+                      return run_case("RMSNorm with inverse", shape, offset, 2501U, scale, 0, graph,
+                                      width, false, kEps, true);
+                  },
+                  {{"execution", graph ? "graph" : "eager"}, {"suite", "concurrency"}});
+    };
+    add_inverse({131, 3, 2}, false);
+    add_inverse({128, 1, 7}, false);
+    add_inverse({128, 3, 6}, true, true, 3);
+    add_inverse({2048, 1, 3}, false);
+    add_inverse({5120, 1, 7}, false);
+    add_inverse({4096, 1, 289}, false, true);
+    add_inverse({20480, 1, 3}, true);
+    add_inverse({20480, 1, 171}, false);
+    add_inverse({131, 1, 2}, true, false, 0, 0.F);
     for (int d : {1024, 4096}) {
         for (int rows : {1, 17, 128, 288, 289, 4097})
             suite.add("rmsnorm/glm/d" + std::to_string(d) + "/m" + std::to_string(rows), [=] {

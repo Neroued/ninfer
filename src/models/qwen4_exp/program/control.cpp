@@ -12,9 +12,9 @@ void RankProgramImpl::prepare_control_window() {
     const auto& original = work.rows.at(f.control_row);
     const auto begin     = f.control_offset;
     auto end             = std::min<std::size_t>(begin + shape.prefill_chunk, original.ids.size());
-    const auto count = end - begin;
-    f.control_window = original;
-    auto& row        = *f.control_window;
+    const auto count     = end - begin;
+    f.control_window     = original;
+    auto& row            = *f.control_window;
     row.ids.assign(original.ids.begin() + begin, original.ids.begin() + begin + count);
     row.control_last_token.reset();
     row.main_frontier += begin;
@@ -75,7 +75,7 @@ void RankProgramImpl::finish_control_window() {
 void RankProgramImpl::enqueue_control_counts() {
     auto& f             = *compute;
     const auto& work    = std::get<ForwardWork>(f.request.work.operation);
-    const auto& buffers = resources.plan.persistent.buffers;
+    const auto& buffers = resources.buffers();
     auto* host          = static_cast<TokenId*>(resources.compute_aux().data);
     const auto capacity = buffers.batch.max_positions;
     auto device_ids     = packed_tensor(buffers.batch.ids, {static_cast<int>(capacity)});

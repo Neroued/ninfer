@@ -57,9 +57,11 @@ void execute_grouped(const Tensor& q, const Tensor& positions, float scale, Cach
                      cudaStream_t stream) {
     const auto view =
         make_quantized_causal_cache_view<Int8KvCacheView<Input::writes_cache>>(cache, valid, rows);
-    auto scope         = workspace.scope();
-    const auto partial = allocate_causal_partials(workspace, plan.query_heads, plan.width,
-                                                  plan.partition.capacity, plan.batch);
+    auto scope = workspace.scope();
+    CausalPartialStorage partial;
+    if (plan.partition.capacity != 1)
+        partial = allocate_causal_partials(workspace, plan.query_heads, plan.width,
+                                           plan.partition.capacity, plan.batch);
     const auto p = make_causal_operands(q, positions, out, scale, plan.envelope.max_visible_keys);
     if (plan.query_heads == 24)
         grouped_instance<CausalD256H24Kv4>(p, view, input, plan.partition, partial.view(), stream);
@@ -93,9 +95,11 @@ void parallel_grouped(const CausalAttentionOperands& p, Int8KvReadView cache,
 
 void execute_parallel(const CausalAttentionOperands& p, Int8KvReadView cache,
                       const Int8KvCausalPlan& plan, MemoryArena& workspace, cudaStream_t stream) {
-    auto scope         = workspace.scope();
-    const auto partial = allocate_causal_partials(workspace, plan.query_heads, plan.width,
-                                                  plan.partition.capacity, plan.batch);
+    auto scope = workspace.scope();
+    CausalPartialStorage partial;
+    if (plan.partition.capacity != 1)
+        partial = allocate_causal_partials(workspace, plan.query_heads, plan.width,
+                                           plan.partition.capacity, plan.batch);
     if (plan.query_heads == 24)
         parallel_grouped<CausalD256H24Kv4, Int8KvCausalPlan::kTokenTile>(p, cache, plan.partition,
                                                                          partial.view(), stream);

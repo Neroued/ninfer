@@ -124,10 +124,12 @@ std::size_t topk_sigmoid_swiglu_moe_workspace_capacity_bytes(const SigmoidMoePro
 
 void topk_sigmoid_swiglu_moe(const Tensor& x, const SigmoidMoeProfile& p,
                              const SigmoidMoeWeights& w, ExpertSubset subset, Tensor& out,
-                             MemoryArena& ws, CudaExecutionView execution) {
+                             MoeTokenValidity validity, MemoryArena& ws,
+                             CudaExecutionView execution) {
     validate(p, subset.kind, 1, 1);
     detail::MoeOperands operands("topk_sigmoid_swiglu_moe", execution);
     const int tokens = operands.input(x, p.routed.ffn.hidden);
+    operands.validity(validity, tokens);
     if (out.dtype != DType::BF16)
         throw std::invalid_argument("whole local MoE requires BF16 Write");
     operands.output(out, p.routed.ffn.hidden, tokens, MoeEpilogue::Write);
@@ -144,15 +146,20 @@ void topk_sigmoid_swiglu_moe(const Tensor& x, const SigmoidMoeProfile& p,
     operands.workspace(scratch.storage());
     operands.finish();
     if (subset.kind == ExpertSubsetKind::None) {
-        swiglu(x, p.shared, w.shared, out, scratch, execution);
+#if NINFER_TARGET_SPARK
+        detail::swiglu_ffn::launch_ffn_join(
+            x, w.shared, out, {nullptr, nullptr, detail::moe_cuda::token_validity(validity)},
+            *p.shared.clamp_limit, scratch, execution.stream());
+#endif
         return;
     }
 #if NINFER_TARGET_SPARK
     auto storage = allocate_whole(scratch, tokens);
-    topk_sigmoid_route(x, p.routing, w.control, w.correction_bias, storage.routes, scratch,
-                       execution);
-    const auto routed = routed_contribution(x, p.routed, w.routed, storage.routes, subset, storage,
-                                            scratch, execution);
+    topk_sigmoid_route(x, p.routing, w.control, w.correction_bias, storage.routes, validity,
+                       scratch, execution);
+    auto routed = routed_contribution(x, p.routed, w.routed, storage.routes, subset, storage,
+                                      scratch, execution);
+    routed.token_validity = detail::moe_cuda::token_validity(validity);
     detail::swiglu_ffn::launch_ffn_join(x, w.shared, out, routed, *p.shared.clamp_limit, scratch,
                                         execution.stream());
 #endif

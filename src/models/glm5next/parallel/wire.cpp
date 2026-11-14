@@ -28,6 +28,7 @@ void encode_rank_load(Encoder& out, const RankLoadRequest& request) {
     encode_assemblies(out, p.assemblies);
     encode_expert_partitions(out, p.experts);
     encode_rank_options(out, request.options);
+    encode_batch_execution_spec(out, request.batches);
     out.u8(static_cast<std::uint8_t>(request.index_format));
     out.u64(request.host_reservation_bytes);
     out.boolean(request.control_owner);
@@ -52,6 +53,7 @@ RankLoadRequest decode_rank_load(Decoder& in) {
     p.assemblies                   = decode_assemblies(in);
     p.experts                      = decode_expert_partitions(in);
     request.options                = decode_rank_options(in);
+    request.batches                = decode_batch_execution_spec(in);
     request.index_format           = static_cast<KvCacheVectorFormat>(in.u8());
     request.host_reservation_bytes = in.u64();
     request.control_owner          = in.boolean();
@@ -68,6 +70,7 @@ void encode(Encoder& out, const RankResourceDescription& r) {
     out.boolean(s.context_cache);
     out.boolean(s.gpu_timing);
     out.u8(static_cast<std::uint8_t>(s.speculative));
+    encode_batch_execution_spec(out, r.batches);
     for (auto record : {r.state.common, r.state.owner}) {
         out.u64(record.bytes);
         out.u64(record.alignment);
@@ -111,6 +114,7 @@ RankResourceDescription decode_rank_resources(Decoder& in) {
                             in.boolean(),
                             in.boolean(),
                             static_cast<SpeculativeBackend>(in.u8())};
+    r.batches            = decode_batch_execution_spec(in);
     r.state.common       = {in.u64(), in.u64()};
     r.state.owner        = {in.u64(), in.u64()};
     r.state.owner_fields = {in.u64(), in.u64(), in.u64()};

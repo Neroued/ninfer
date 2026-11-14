@@ -27,10 +27,14 @@ __device__ __forceinline__ float dot_eight(const __nv_bfloat16* a, const __nv_bf
 }
 
 __global__ void shared_gate(const __nv_bfloat16* x, const __nv_bfloat16* weight, float* beta,
-                            int hidden, int tokens) {
+                            int hidden, int tokens, TokenValidity validity) {
     const int token = blockIdx.x * 4 + threadIdx.x / 32;
     const int lane  = threadIdx.x % 32;
     if (token >= tokens) { return; }
+    if (!validity.contains(token)) {
+        if (!lane) beta[token] = 0;
+        return;
+    }
     float sum = 0;
     for (int k = lane * 8; k < hidden; k += 32 * 8) {
         sum += dot_eight(x + std::int64_t(token) * hidden + k, weight + k);
@@ -101,10 +105,16 @@ __global__ void router_token_tile(const __nv_bfloat16* x, const __nv_bfloat16* w
 
 template <class Shape, bool Partial, bool FixedIndices = false>
 __global__ void select_routes(const float* scores, int* ids, float* alpha, float* beta,
-                              bool programmatic) {
+                              bool programmatic, TokenValidity validity) {
     __shared__ float reduced[Shape::control_rows], selected[Shape::top_k];
     const int token = blockIdx.x, tid = threadIdx.x;
     if (!tid && programmatic) { pdl::trigger_dependents(); }
+    if (!validity.contains(token)) {
+        if (tid < 32)
+            select_experts<Shape>(nullptr, ids + token * Shape::top_k, alpha + token * Shape::top_k,
+                                  beta + token, selected, false);
+        return;
+    }
     if constexpr (Partial) {
         if (programmatic) { pdl::wait_for_dependencies(); }
         for (int row = tid; row < Shape::control_rows; row += blockDim.x) {
@@ -120,13 +130,14 @@ __global__ void select_routes(const float* scores, int* ids, float* alpha, float
     if (tid < 32) {
         select_experts<Shape, FixedIndices>(
             Partial ? reduced : scores + std::int64_t(token) * Shape::score_rows,
-            ids + token * Shape::top_k, alpha + token * Shape::top_k, beta + token, selected);
+            ids + token * Shape::top_k, alpha + token * Shape::top_k, beta + token, selected, true);
     }
 }
 
 template <class Shape>
 __global__ void select_count_routes(const float* scores, int* ids, float* alpha, float* beta,
-                                    int* local, int* tile_counts, int tokens) {
+                                    int* local, int* tile_counts, int tokens,
+                                    TokenValidity validity) {
     constexpr int TileTokens = 8;
     __shared__ int counts[Shape::experts];
     __shared__ float selected[TileTokens][Shape::top_k];
@@ -137,13 +148,13 @@ __global__ void select_count_routes(const float* scores, int* ids, float* alpha,
     if (token < tokens) {
         select_experts<Shape>(scores + std::int64_t(token) * Shape::score_rows,
                               ids + token * Shape::top_k, alpha + token * Shape::top_k,
-                              beta + token, selected[warp]);
+                              beta + token, selected[warp], validity.contains(token));
         __syncwarp();
         if (!lane) {
 #pragma unroll
             for (int j = 0; j < Shape::top_k; ++j) {
                 const int a = token * Shape::top_k + j;
-                local[a]    = atomicAdd(counts + ids[a], 1);
+                local[a]    = ids[a] >= 0 ? atomicAdd(counts + ids[a], 1) : -1;
             }
         }
     }
@@ -170,7 +181,8 @@ void token_extent(int tokens, Function&& launch) {
 template <class S>
 void launch_route_shape(const Tensor& x, const Weight& control, const ExpertRoutes& routes,
                         const Tensor& shared, const RouterPlan& plan, const RouteStorage& storage,
-                        const MoeExecutionHints& hints, CudaExecutionView execution) {
+                        const MoeExecutionHints& hints, TokenValidity validity,
+                        CudaExecutionView execution) {
     const auto* input   = static_cast<const __nv_bfloat16*>(x.data);
     const auto* weights = static_cast<const __nv_bfloat16*>(control.qdata);
     const auto stream   = execution.stream();
@@ -210,25 +222,26 @@ void launch_route_shape(const Tensor& x, const Weight& control, const ExpertRout
     auto* beta  = static_cast<float*>(shared.data);
     if (plan.count_assignments) {
         select_count_routes<S><<<(tokens + 7) / 8, 256, 0, stream>>>(
-            storage.scores, ids, alpha, beta, storage.local_ranks, storage.tile_counts, tokens);
+            storage.scores, ids, alpha, beta, storage.local_ranks, storage.tile_counts, tokens,
+            validity);
         CUDA_CHECK(cudaGetLastError());
     } else if (plan.algorithm == RouterAlgorithm::TokenTile) {
         if (plan.programmatic) {
             CUDA_CHECK(pdl::launch_dependent({dim3(tokens), dim3(128), 0, stream},
                                              select_routes<S, true>, storage.scores, ids, alpha,
-                                             beta, true));
+                                             beta, true, validity));
         } else {
             select_routes<S, true>
-                <<<tokens, 128, 0, stream>>>(storage.scores, ids, alpha, beta, false);
+                <<<tokens, 128, 0, stream>>>(storage.scores, ids, alpha, beta, false, validity);
             CUDA_CHECK(cudaGetLastError());
         }
     } else {
         if (plan.network_topk) {
-            select_routes<S, false, true>
-                <<<tokens, 32, 0, stream>>>(storage.scores, ids, alpha, beta, plan.programmatic);
+            select_routes<S, false, true><<<tokens, 32, 0, stream>>>(
+                storage.scores, ids, alpha, beta, plan.programmatic, validity);
         } else {
-            select_routes<S, false>
-                <<<tokens, 32, 0, stream>>>(storage.scores, ids, alpha, beta, plan.programmatic);
+            select_routes<S, false><<<tokens, 32, 0, stream>>>(storage.scores, ids, alpha, beta,
+                                                               plan.programmatic, validity);
         }
         CUDA_CHECK(cudaGetLastError());
     }
@@ -236,22 +249,23 @@ void launch_route_shape(const Tensor& x, const Weight& control, const ExpertRout
 
 void launch_route(const Tensor& x, const Weight& control, const ExpertRoutes& routes,
                   const Tensor& shared, const RouterPlan& plan, const RouteStorage& storage,
-                  const MoeExecutionHints& hints, CudaExecutionView execution) {
+                  const MoeExecutionHints& hints, TokenValidity validity,
+                  CudaExecutionView execution) {
     if (control.k == 2560) {
         launch_route_shape<SwiGLUH2560I640E512K10>(x, control, routes, shared, plan, storage, hints,
-                                                   execution);
+                                                   validity, execution);
     } else {
         launch_route_shape<SwiGLUH2048I512E256K8>(x, control, routes, shared, plan, storage, hints,
-                                                  execution);
+                                                  validity, execution);
     }
 }
 
 void launch_shared_gate(const Tensor& x, const Weight& control, const Tensor& shared,
-                        CudaExecutionView execution) {
+                        TokenValidity validity, CudaExecutionView execution) {
     const auto* weights = static_cast<const __nv_bfloat16*>(control.qdata);
     shared_gate<<<(x.ne[1] + 3) / 4, 128, 0, execution.stream()>>>(
         static_cast<const __nv_bfloat16*>(x.data), weights + (control.n - 1) * control.k,
-        static_cast<float*>(shared.data), control.k, x.ne[1]);
+        static_cast<float*>(shared.data), control.k, x.ne[1], validity);
     CUDA_CHECK(cudaGetLastError());
 }
 } // namespace ninfer::ops::detail::moe_cuda::routing

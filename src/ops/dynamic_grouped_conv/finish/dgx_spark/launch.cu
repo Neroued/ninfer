@@ -1,9 +1,9 @@
 #include "ops/dynamic_grouped_conv/finish/launch.h"
+#include "ops/dynamic_grouped_conv/finish/dgx_spark/tma.cuh"
 #include "ops/linear/kernels/bf16/bf16_template_launch.cuh"
 
 namespace ninfer::ops::detail::dynamic_grouped_conv::finish {
 namespace {
-constexpr int kOutputRows = 4096, kOutputGroups = 256;
 
 struct Outputs {
     const __nv_bfloat16* base;
@@ -73,6 +73,12 @@ template <int K>
 void launch_profile(const Tensor& x, const Weight& w, const Tensor& base, const Tensor& delta,
                     Tensor& y, cudaStream_t stream) {
     const int m = x.ne[1] * x.ne[2];
+    if (m >= 256) {
+        if constexpr (K == 6144) {
+            if (m <= 512) return run_tma<K, 64, 128, 32, 32>(x, w, base, delta, y, stream);
+        }
+        return run_tma<K, 128, 64, 32, 32>(x, w, base, delta, y, stream);
+    }
     if (m <= 32) {
         if constexpr (K == 2048)
             return run<K, 16, 32, 16, 32, 7, false, true>(x, w, base, delta, y, stream);

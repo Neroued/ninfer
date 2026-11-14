@@ -8,6 +8,10 @@ namespace ninfer::models::qwen4_exp {
 
 std::size_t Session::checkpoint_extent() const noexcept { return impl_->checkpoints.size(); }
 
+std::uint64_t Session::checkpoint_catalog_revision() const noexcept {
+    return impl_->checkpoints.revision();
+}
+
 std::vector<runtime::ContextTransferRequirement>
 Session::checkpoint_restore_requirements(CheckpointHandle h) const {
     return impl_->checkpoints.at(h).snapshot.restore_requirements(impl_->directory);
@@ -424,6 +428,7 @@ ContextProgress detail::SessionImpl::complete_context() {
             result.private_points                    = std::move(tx->carried);
             result.retired_checkpoints               = std::move(tx->retired);
             p.sequences[tx->lane]                    = std::move(tx->binding);
+            p.resident_sequences.emplace(s.id, &s);
             tx->clones.clear();
         } else if (auto* tx = std::get_if<detail::CaptureOperation>(&operation.action)) {
             auto& s = *p.sequences[tx->lane];
@@ -473,6 +478,7 @@ ResourceReservation detail::SessionImpl::reserve_units(std::span<const Execution
 
     std::vector<Need> needed;
     ContextDemand demand;
+    const auto mark = p.next_membership_mark();
     for (const auto& unit : units) {
         auto& sequence = p.sequence(unit.sequence);
         if ((unit.kind == ExecutionUnitKind::Prefill || unit.kind == ExecutionUnitKind::Replay) &&
@@ -480,9 +486,9 @@ ResourceReservation detail::SessionImpl::reserve_units(std::span<const Execution
                 sequence.continuation.metadata.main_frontier &&
             sequence.continuation.metadata.main_frontier < sequence.request->summary.prompt_tokens)
             return {.status = runtime::UnitReservationStatus::ExecutionUnavailable};
-        if (std::any_of(needed.begin(), needed.end(),
-                        [&](const auto& n) { return n.sequence == &sequence; }))
+        if (sequence.membership_mark == mark)
             throw std::logic_error("execution reservation repeats a sequence");
+        sequence.membership_mark = mark;
         Need need{&sequence,
                   std::max(sequence.recovery_peak, p.unit_end(sequence, unit.kind, unit.tokens))};
         if (need.end > p.shape.max_context) throw std::out_of_range("execution exceeds context");

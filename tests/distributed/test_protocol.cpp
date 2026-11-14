@@ -28,6 +28,22 @@ void require(bool value, const char* message) {
     if (!value) throw std::runtime_error(message);
 }
 
+void batch_plans() {
+    for (const bool graph : {false, true}) {
+        const auto source = models::make_batch_execution_spec(128, 3, graph);
+        wire::Encoder out;
+        models::encode_batch_execution_spec(out, source);
+        const auto payload = std::move(out).take();
+        wire::Decoder in(payload);
+        const auto decoded = models::decode_batch_execution_spec(in);
+        in.finish();
+        require(decoded == source, "rank preparation changed the batch execution specification");
+        const models::BatchExecutionPlan plan(decoded);
+        require(plan.decode(17, 6) == models::PhysicalBatchShape{graph ? 20U : 17U, 6},
+                "worker interpreted different physical batch geometry");
+    }
+}
+
 void communication_preparation() {
     dist::ExecutionTopology topology;
     topology.ranks.resize(2);
@@ -191,6 +207,8 @@ void cache_profiles_roundtrip() {
                          KvCacheStorage::Fp8KeyNvfp4Value}) {
         q::RankLoadRequest request{};
         request.options.kv_cache = storage;
+        request.batches = models::make_batch_execution_spec(request.options.max_concurrency, 1,
+                                                            request.options.use_cuda_graph);
         wire::Encoder load_out;
         q::encode_rank_load(load_out, request);
         const auto load_bytes = std::move(load_out).take();
@@ -200,15 +218,20 @@ void cache_profiles_roundtrip() {
         require(loaded.options.kv_cache == storage, "rank load changed the KV profile");
 
         q::RankExecutionDescription execution{};
-        execution.session.shape.kv_storage = storage;
+        execution.session.shape.kv_storage      = storage;
+        execution.session.shape.max_concurrency = request.options.max_concurrency;
+        execution.session.shape.cuda_graph      = request.options.use_cuda_graph;
+        execution.session.batches =
+            std::make_shared<const models::BatchExecutionPlan>(request.batches);
         wire::Encoder execution_out;
         q::encode(execution_out, execution);
         const auto execution_bytes = std::move(execution_out).take();
         wire::Decoder execution_in(execution_bytes);
         const auto decoded = q::decode_rank_execution(execution_in);
         execution_in.finish();
-        require(decoded.session.shape.kv_storage == storage,
-                "rank execution changed the KV profile");
+        require(decoded.session.shape.kv_storage == storage &&
+                    decoded.session.batches->spec() == request.batches,
+                "rank execution changed the KV profile or batch plan");
     }
 }
 
@@ -291,6 +314,7 @@ void model_preparation() {
     request.host_reservation_bytes      = 2ULL << 30;
     request.control_owner               = false;
     request.index_format                = KvCacheVectorFormat::BFloat16;
+    request.batches = models::make_batch_execution_spec(o.max_concurrency, 2, o.use_cuda_graph);
     wire::Encoder out;
     glm::encode_rank_load(out, request);
     const auto bytes = std::move(out).take();
@@ -314,6 +338,7 @@ void model_preparation() {
     require(std::move(roundtrip).take() == bytes && decoded.rank.kda_heads.begin == 32 &&
                 decoded.options.speculative.proposal_head == ProposalHead::Optimized &&
                 decoded.index_format == request.index_format &&
+                decoded.batches == request.batches &&
                 decoded.host_reservation_bytes == request.host_reservation_bytes,
             "GLM preparation lost partition, assembly, execution policy or Host reservation");
 
@@ -338,6 +363,7 @@ void model_preparation() {
     qwen.rank.rank       = 1;
     qwen.rank.size       = 2;
     qwen.rank.experts    = {{{0, 1, 2}, {320, 320}}};
+    qwen.batches = models::make_batch_execution_spec(o.max_concurrency, 1, o.use_cuda_graph);
     wire::Encoder qw;
     q::encode_rank_load(qw, qwen);
     const auto qb = std::move(qw).take();
@@ -360,6 +386,7 @@ void model_preparation() {
                                        true,
                                        false};
     r.state                         = {{1024, 256}, {1536, 256}, {1024, 512, 256}};
+    r.batches                       = request.batches;
     r.context.ranks                 = {{1, 2ULL << 30, 0}};
     r.context.state                 = {100, {{0, {{1, 1024, 256}}}, {1, {{1, 1536, 256}}}}};
     r.context.pools                 = {{0, 4096, 100, 16384, 8, {{1, {8192, 256}}}},
@@ -375,7 +402,8 @@ void model_preparation() {
     wire::Decoder ri(rb);
     const auto rd = glm::decode_rank_resources(ri);
     ri.finish();
-    require(rd.shape == r.shape && rd.state == r.state && rd.context == r.context &&
+    require(rd.shape == r.shape && rd.batches == r.batches && rd.state == r.state &&
+                rd.context == r.context &&
                 rd.budget.context_capacity_bytes == r.budget.context_capacity_bytes &&
                 rd.observation.memory.allocations.device_weights_bytes == 91ULL << 30 &&
                 rd.vision_max_features == r.vision_max_features,
@@ -405,8 +433,11 @@ void native_work() {
     q::VisionInputBindings bindings;
     q::WorkContract contract{
         {128, 2, 32, 3, KvCacheStorage::BFloat16, EnginePurpose::Generation}, 256, 250, true, true};
+    contract.batches = std::make_shared<const models::BatchExecutionPlan>(
+        models::make_batch_execution_spec(2, 1, false));
     const auto original = row();
     q::Work work{{}, q::MtpWork{{original}, {3}}};
+    q::plan_work_batch(work, *contract.batches);
     work.actions[0].operations = {ctx::RecordClear{{ctx::ContextMemory::Device, 16384, 1024}},
                                   ctx::RecordCopy{{ctx::ContextMemory::Device, 2176, 256},
                                                   {ctx::ContextMemory::Device, 4224, 256},
@@ -473,6 +504,7 @@ void native_work() {
     producer.rows   = {original};
     producer.visual = models::qwen::VisionWork{use, input_owner};
     q::Work producing{{}, producer};
+    q::plan_work_batch(producing, *contract.batches);
     wire::Encoder encoded_producer;
     q::encode_work(encoded_producer, producing, bindings, 0);
     const auto producer_bytes = std::move(encoded_producer).take();
@@ -495,6 +527,7 @@ void native_work() {
                                    q::SampleKind::FirstToken,
                                    {prefill_row},
                                    q::PlePrefetch{original.member, 23, {23, 24}, {31, 32}}}};
+    q::plan_work_batch(forward, *contract.batches);
     wire::Encoder forward_out;
     q::encode_work(forward_out, forward, bindings, 0);
     const auto forward_bytes = std::move(forward_out).take();
@@ -509,6 +542,7 @@ void native_work() {
     scoring_contract.shape.purpose = EnginePurpose::CausalScoring;
     prefill_row.constrained        = false;
     q::Work score{{}, q::ScoreWork{prefill_row, {24}, 1}};
+    q::plan_work_batch(score, *contract.batches);
     wire::Encoder score_out;
     q::encode_work(score_out, score, bindings, 0);
     const auto score_bytes = std::move(score_out).take();
@@ -658,11 +692,14 @@ void compact_payloads() {
         true,
         true,
         64};
+    contract.batches = std::make_shared<const models::BatchExecutionPlan>(
+        models::make_batch_execution_spec(8, 1, false));
     auto control               = row();
     control.ids                = {23, 5};
     control.control_last_token = 8;
     control.rope_positions.clear();
     q::Work work{{}, q::ForwardWork{q::ForwardKind::Control, q::SampleKind::None, {control}}};
+    q::plan_work_batch(work, *contract.batches);
     contract.validate(work, runtime::FrameKind::Compute);
     q::VisionInputBindings bindings;
     wire::Encoder encoded;
@@ -676,9 +713,11 @@ void compact_payloads() {
     std::array<TokenId, 2> forced{};
     models::ControlTokens{r.ids, *r.control_last_token}.copy(forced);
     require(forced == std::array<TokenId, 2>{5, 8}, "Control lost its committed token sequence");
-    const auto p = contract.payload_capacity(2);
-    runtime::protocol::validate_control_capacity(
-        {p.compute_work, p.context_work, p.decision, p.commit, 4096, 4096}, {1, 1}, {}, 2);
+    const auto p      = contract.payload_capacity(2);
+    const auto limits = runtime::protocol::control_transport_limits(
+        {p.compute_work, p.context_work, p.decision, p.commit, 4096, 4096}, {1, 1}, 2, true);
+    require(limits.message_bytes >= p.decision && limits.continuation_bytes >= 2 * p.decision,
+            "prepared control capacity cannot carry a full decision");
     contract.vocabulary += 8;
     auto& control_row  = std::get<q::ForwardWork>(work.operation).rows[0];
     control_row.ids[1] = contract.public_tokens;
@@ -686,6 +725,39 @@ void compact_payloads() {
     control_row.ids[1] = 5;
     std::get<q::ForwardWork>(work.operation).rows[0].ids.resize(65, 5);
     rejects([&] { contract.validate(work, runtime::FrameKind::Compute); });
+}
+
+void prepared_control_capacity() {
+    const runtime::protocol::ControlBudget budget{1024, 1024, 72ULL << 20, 2048, 4096, 4096};
+    int sockets[2];
+    require(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0, sockets) == 0,
+            "control capacity socketpair failed");
+    dist::Transport source, target;
+    source.add(1, dist::Socket(sockets[0]));
+    target.add(0, dist::Socket(sockets[1]));
+    source.start();
+    target.start();
+    source.reserve_capacity(runtime::protocol::control_transport_limits(budget, {1, 1}, 2, true));
+    target.reserve_capacity(runtime::protocol::control_transport_limits(budget, {1, 1}, 2, false));
+    const auto message = std::make_shared<wire::Message>(
+        wire::Message{wire::Kind::Supply, 1, wire::Bytes(budget.decision, std::byte{37})});
+    const std::array messages{dist::OutgoingMessage{1, message}};
+    require(source.try_send(messages, dist::Traffic::Continuation),
+            "prepared continuation did not fit its queue");
+    const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    for (;;) {
+        if (auto received = poll_message(target)) {
+            const auto& payload = received->message.payload;
+            require(payload.size() == budget.decision && payload.data()[0] == std::byte{37} &&
+                        payload.back() == std::byte{37},
+                    "large continuation was truncated");
+            break;
+        }
+        require(std::chrono::steady_clock::now() < until, "large continuation stalled");
+        std::this_thread::yield();
+    }
+    source.close();
+    target.close();
 }
 
 void retained_payload() {
@@ -912,6 +984,7 @@ void diagnostic_backpressure() {
 
 int main() {
     try {
+        batch_plans();
         topology_identity();
         communication_preparation();
         communication_selection();
@@ -924,6 +997,7 @@ int main() {
         terminal_messages();
         diagnostic_backpressure();
         retained_payload();
+        prepared_control_capacity();
         compact_payloads();
         inputs();
         RankSnapshot memory;

@@ -363,7 +363,7 @@ struct SparseAcceptSuite {
                 target_tensor, logits_tensor, drafts_tensor, candidate_tensor, q_tensor,
                 extent_tensor, lengths_tensor, licensed_tensor, licensed_counts_tensor,
                 kSparseTokenDomain, static_cast<const ops::SamplingConfig*>(d_configs.data()),
-                envelope, workspace, cuda);
+                envelope, {}, workspace, cuda);
         };
         launch(ninfer::test::cuda_environment().default_execution);
         cuda_synchronize();
@@ -777,6 +777,102 @@ struct SparseAcceptSuite {
     }
 };
 
+int padded_sparse_contract(bool raw) {
+    const int batch = raw ? 17 : 33, k = raw ? 7 : 1, width = k + 1;
+    const auto cuda = cuda_environment().context.execution_view();
+    std::vector<int> targets(width * batch), drafts(k * batch), ids(16 * k * batch), extents(batch),
+        live(batch), expected(width * batch), expected_counts(batch), positions(batch, 123);
+    std::vector<float> probabilities(ids.size(), 0);
+    std::vector<std::uint16_t> logits(std::size_t(kSparsePhysicalRows) * width * batch,
+                                      f32_to_bf16(-20.F));
+    std::vector<ops::SamplingConfig> configs(batch);
+    for (int b = 0; b < batch; ++b)
+        for (int t = 0; t < width; ++t) {
+            const int token                                                    = 4 + t;
+            targets[b * width + t]                                             = token;
+            logits[(std::size_t(b) * width + t) * kSparsePhysicalRows + token] = f32_to_bf16(12.F);
+            if (t < k) {
+                drafts[b * k + t] = token;
+                const int offset  = (b * k + t) * 16;
+                for (int c = 0; c < 16; ++c) ids[offset + c] = token + c;
+                probabilities[offset] = 1;
+            }
+        }
+    auto target = to_device(targets), proposed = to_device(drafts), input = to_device(logits),
+         candidates = to_device(ids), q = to_device(probabilities), valid = to_device(live),
+         extent = to_device(extents), pos = to_device(positions), parameters = to_device(configs);
+    GuardedDeviceBuffer output(std::size_t(width) * batch * sizeof(int)),
+        count(batch * sizeof(int));
+    Tensor tt(target.span(), DType::I32, {width, batch}),
+        x(input.span(), DType::BF16, {kSparsePhysicalRows, width, batch}),
+        d(proposed.span(), DType::I32, {k, batch}),
+        choices(candidates.span(), DType::I32, {16, k, batch}),
+        probability(q.span(), DType::FP32, {16, k, batch}), n(extent.span(), DType::I32, {batch}),
+        p(pos.span(), DType::I32, {batch}), a(valid.span(), DType::I32, {batch}),
+        y(output.span(), DType::I32, {width, batch}), counts(count.span(), DType::I32, {batch});
+    const ops::SpeculativeAcceptExecutionEnvelope envelope{raw};
+    DeviceBuffer storage(
+        cuda.device(),
+        std::max<std::size_t>(256, ops::speculative_accept_sparse_drafts_workspace_capacity_bytes(
+                                       kSparseTokenDomain, envelope, k, k, batch, batch)));
+    MemoryArena workspace(storage.span());
+    DecodeGraphDefinition definition;
+    definition.capture(cuda.stream(), [&] {
+        ops::speculative_accept_sparse_drafts(
+            tt, x, d, choices, probability, n, p, y, counts, kSparseTokenDomain,
+            static_cast<const ops::SamplingConfig*>(parameters.data()), envelope, a, workspace,
+            cuda);
+    });
+    DecodeGraphExecutable graph;
+    graph.instantiate(definition);
+    int failures = 0;
+    for (int replay = 0; replay < 3; ++replay) {
+        std::fill(expected.begin(), expected.end(), 0);
+        for (int b = 0; b < batch; ++b) {
+            live[b]    = replay != 1 && (b + replay) % 3 != 1;
+            extents[b] = live[b] ? b % (k + 1) : std::numeric_limits<int>::min();
+            configs[b] = {.temperature = !raw && b % 2 ? 1.F : 0.F, .top_k = raw ? 1 : 20};
+            if (!live[b]) {
+                configs[b].presence_penalty = 1;
+                configs[b].token_counts     = reinterpret_cast<const int*>(std::uintptr_t{1});
+                configs[b].mask = {reinterpret_cast<const std::uint32_t*>(std::uintptr_t{1}), 1};
+            }
+            expected_counts[b] = live[b] ? extents[b] + 1 : 0;
+            for (int t = 0; t < expected_counts[b]; ++t) expected[b * width + t] = 4 + t;
+        }
+        valid.copy_from_host(live.data(), live.size() * sizeof(int));
+        extent.copy_from_host(extents.data(), extents.size() * sizeof(int));
+        parameters.copy_from_host(configs.data(), configs.size() * sizeof(configs.front()));
+        output.fill(0x5a);
+        count.fill(0x5a);
+        graph.launch(cuda.stream());
+        cuda_synchronize(cuda.stream());
+        failures += verify_exact("sparse accept padded tokens",
+                                 from_device<int>(output.data(), expected.size()), expected);
+        failures += verify_exact("sparse accept padded counts",
+                                 from_device<int>(count.data(), batch), expected_counts);
+        failures += output.verify_guards("sparse accept padded output");
+        failures += count.verify_guards("sparse accept padded counts");
+    }
+    std::fill(live.begin(), live.end(), 0);
+    valid.copy_from_host(live.data(), live.size() * sizeof(int));
+    for (auto* tensor : {&tt, &x, &d, &choices, &probability, &n, &p})
+        tensor->data = reinterpret_cast<void*>(std::uintptr_t{256});
+    output.fill(0x5a);
+    count.fill(0x5a);
+    ops::speculative_accept_sparse_drafts(
+        tt, x, d, choices, probability, n, p, y, counts, kSparseTokenDomain,
+        reinterpret_cast<const ops::SamplingConfig*>(std::uintptr_t{256}), envelope, a, workspace,
+        cuda);
+    cuda_synchronize(cuda.stream());
+    failures += verify_exact("sparse accept inactive input isolation",
+                             from_device<int>(output.data(), expected.size()),
+                             std::vector<int>(expected.size()));
+    failures += verify_exact("sparse accept inactive count isolation",
+                             from_device<int>(count.data(), batch), std::vector<int>(batch));
+    return failures;
+}
+
 int capacity_contract() {
     std::size_t peak = 0;
     for (int k = 1; k <= 15; ++k)
@@ -800,6 +896,10 @@ int capacity_contract() {
 
 void add_sparse_accept_cases(ninfer::test::OpSuite& suite) {
     suite.add("accept_sparse/capacity", capacity_contract);
+    suite.add("accept_sparse/padded_batch17/raw", [] { return padded_sparse_contract(true); },
+              {{"suite", "concurrency"}});
+    suite.add("accept_sparse/padded_batch33/general", [] { return padded_sparse_contract(false); },
+              {{"suite", "concurrency"}});
     for (int k = 1; k <= 15; ++k)
         for (int batch = 1; batch <= 8; ++batch) {
             const auto id = "accept_sparse/k" + std::to_string(k) + "/b" + std::to_string(batch);

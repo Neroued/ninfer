@@ -29,6 +29,7 @@ Published artifact downloads are listed in the [project README](../README.md).
 | Document | Responsibility |
 |---|---|
 | [Engine architecture](maintainer/engine-architecture.md) | 所有权、启动预算、请求与执行事务、提交和退役 |
+| [Concurrency execution](designs/concurrency-contract.md) | 驻留容量、逻辑成员、Graph 桶、ADP 行映射与 padding |
 | [Distributed execution](maintainer/distributed-execution.md) | 集中调度、rank 准备、控制与数据通信、完整完成与失败 |
 | [Context management](maintainer/context-management.md) | KV/State 统一容量、身份、预留、前缀策略、ADP 与恢复 |
 | [Frontend](maintainer/frontend.md) | 模型策略与共享文本/媒体基础、输入身份、输出与 grammar 事务 |

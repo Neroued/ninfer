@@ -3,6 +3,7 @@
 #include "ops/sampling/candidate_path/plan.h"
 
 #include <array>
+#include <climits>
 #include <stdexcept>
 
 namespace ninfer::ops {
@@ -12,25 +13,29 @@ constexpr const char* kOp = "candidate_selector_path";
 void validate_common(int steps, int batch, const Tensor& hidden, const Tensor& anchors,
                      const Tensor& predecessor, const Tensor& successor, int token_domain,
                      const Tensor& positions, const SamplingConfig* configs, const Tensor& drafts,
-                     const Tensor& q, MemoryArena& workspace, CudaExecutionView execution) {
-    if (steps < 1 || steps > 15 || batch < 1 || batch > 8)
-        throw std::invalid_argument("candidate_selector_path: K must be 1..15, B must be 1..8");
+                     const Tensor& q, const Tensor& live_rows, MemoryArena& workspace,
+                     CudaExecutionView execution) {
+    if (steps < 1 || steps > 15 || batch < 1 || std::int64_t(steps) * batch > INT_MAX)
+        throw std::invalid_argument("candidate_selector_path: invalid K/B geometry");
     if (workspace.device() != execution.device())
         throw std::invalid_argument("candidate_selector_path: workspace belongs to another device");
     const int rows = predecessor.ne[1];
     if (token_domain < 1 || token_domain > rows)
         throw std::invalid_argument("candidate_selector_path: invalid token domain");
     const auto tensor = [&](const Tensor& t, DType type, std::initializer_list<int> shape,
-                            const char* name) {
-        common::operand::tensor(t, type, shape, 16, kOp, name, execution.device());
+                            const char* name, std::size_t alignment = 16) {
+        common::operand::tensor(t, type, shape, alignment, kOp, name, execution.device());
     };
     tensor(hidden, DType::BF16, {256, steps, batch}, "projected hidden");
-    tensor(anchors, DType::I32, {batch}, "anchors");
+    tensor(anchors, DType::I32, {batch}, "anchors", alignof(std::int32_t));
     tensor(predecessor, DType::BF16, {256, rows}, "predecessor codebook");
     tensor(successor, DType::BF16, {256, rows}, "successor codebook");
-    tensor(positions, DType::I32, {batch}, "positions");
-    tensor(drafts, DType::I32, {steps, batch}, "drafts");
+    tensor(positions, DType::I32, {batch}, "positions", alignof(std::int32_t));
+    tensor(drafts, DType::I32, {steps, batch}, "drafts", alignof(std::int32_t));
     tensor(q, DType::FP32, {16, steps, batch}, "proposal q");
+    if (live_rows.data)
+        common::operand::tensor(live_rows, DType::I32, {batch}, 4, kOp, "live rows",
+                                execution.device());
     if (!common::operand::aligned(configs, alignof(SamplingConfig)))
         throw std::invalid_argument("candidate_selector_path: invalid configs");
 }
@@ -39,10 +44,10 @@ void execute(CandidateSelectorInput input, const Tensor& ids, const Tensor& unar
              const Tensor& keys, const Tensor& hidden, const Tensor& anchors,
              const Tensor& predecessor, const Tensor& successor, int token_domain,
              const Tensor& positions, const SamplingConfig* configs, Tensor& drafts, Tensor& q,
-             MemoryArena& workspace, CudaExecutionView execution) {
+             const Tensor& live_rows, MemoryArena& workspace, CudaExecutionView execution) {
     const int steps = ids.ne[1], batch = ids.ne[2];
     validate_common(steps, batch, hidden, anchors, predecessor, successor, token_domain, positions,
-                    configs, drafts, q, workspace, execution);
+                    configs, drafts, q, live_rows, workspace, execution);
     common::operand::tensor(ids, DType::I32, {16, steps, batch}, 16, kOp, "candidate IDs",
                             execution.device());
     if (input == CandidateSelectorInput::Candidates)
@@ -63,9 +68,12 @@ void execute(CandidateSelectorInput input, const Tensor& ids, const Tensor& unar
         common::operand::range(q, kOp),
         common::operand::range(configs, batch * sizeof(SamplingConfig), kOp)};
     common::operand::disjoint(ranges, kOp);
-    candidate_path_detail::execute_candidate_path(input, ids, unary, keys, hidden, anchors,
-                                                  predecessor, successor, positions, configs,
-                                                  drafts, q, workspace, execution.stream());
+    if (live_rows.data)
+        for (const auto range : ranges)
+            common::operand::disjoint(range, common::operand::range(live_rows, kOp), kOp);
+    candidate_path_detail::execute_candidate_path(
+        input, ids, unary, keys, hidden, anchors, predecessor, successor, positions, configs,
+        drafts, q, live_rows, workspace, execution.stream());
 }
 } // namespace
 
@@ -73,11 +81,15 @@ std::size_t candidate_selector_path_workspace_capacity_bytes(CandidateSelectorIn
                                                              int min_steps, int max_steps,
                                                              int min_batch, int max_batch) {
     if (min_steps < 1 || max_steps > 15 || max_steps < min_steps || min_batch < 1 ||
-        max_batch > 8 || max_batch < min_batch)
+        max_batch < min_batch || std::int64_t(max_steps) * max_batch > INT_MAX)
         throw std::invalid_argument("selector workspace: invalid K/B interval");
     WorkspaceLayoutBuilder layout;
+    // The Lattice allocation grows with B, then disappears at the Direct route boundary.
     for (int k = min_steps; k <= max_steps; ++k)
-        for (int b = min_batch; b <= max_batch; ++b) {
+        for (int b :
+             {max_batch,
+              std::min(max_batch, candidate_path_detail::maximum_lattice_batch(input, k))}) {
+            if (b < min_batch || b > max_batch) continue;
             auto scope = layout.scope();
             (void)candidate_path_detail::allocate_selector_workspace(
                 layout, candidate_path_detail::select_candidate_path(input, k, b), k, b);
@@ -89,17 +101,20 @@ void candidate_selector_path(const Tensor& ids, const Tensor& unary, const Tenso
                              const Tensor& anchors, const Tensor& predecessor,
                              const Tensor& successor, int token_domain, const Tensor& positions,
                              const SamplingConfig* configs, Tensor& drafts, Tensor& q,
-                             MemoryArena& workspace, CudaExecutionView execution) {
+                             const Tensor& live_rows, MemoryArena& workspace,
+                             CudaExecutionView execution) {
     execute(CandidateSelectorInput::Candidates, ids, unary, {}, hidden, anchors, predecessor,
-            successor, token_domain, positions, configs, drafts, q, workspace, execution);
+            successor, token_domain, positions, configs, drafts, q, live_rows, workspace,
+            execution);
 }
 
 void candidate_selector_path(const Tensor& keys, const Tensor& hidden, const Tensor& anchors,
                              const Tensor& predecessor, const Tensor& successor, int token_domain,
                              const Tensor& positions, const SamplingConfig* configs, Tensor& ids,
-                             Tensor& drafts, Tensor& q, MemoryArena& workspace,
-                             CudaExecutionView execution) {
+                             Tensor& drafts, Tensor& q, const Tensor& live_rows,
+                             MemoryArena& workspace, CudaExecutionView execution) {
     execute(CandidateSelectorInput::GatheredKeys, ids, {}, keys, hidden, anchors, predecessor,
-            successor, token_domain, positions, configs, drafts, q, workspace, execution);
+            successor, token_domain, positions, configs, drafts, q, live_rows, workspace,
+            execution);
 }
 } // namespace ninfer::ops

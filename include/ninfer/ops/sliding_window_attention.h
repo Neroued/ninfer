@@ -40,7 +40,7 @@ sliding_window_attention_graph_profile(AttentionHeadGeometry, std::uint32_t wind
  * Symmetric non-causal sliding-window grouped-query attention.
  *
  * Registered profiles are D=128, (Hq,Hkv)=(32,8) with window/cyclic capacity 2048 or 4096,
- * and (16,4) with capacity 2048; both use group 4, scale=1/sqrt(128), T=1..16, B=1..8.
+ * and (16,4) with capacity 2048; both use group 4, scale=1/sqrt(128), T=1..16, B>0.
  * q/out are contiguous BF16 [128,Hq,T,B], query_k/query_v are contiguous BF16 [128,Hkv,T,B],
  * positions is contiguous Device I32 [T,B], and Context K/V select dense
  * [128,padded_capacity,Hkv] fields with contiguous Device I64 [B]

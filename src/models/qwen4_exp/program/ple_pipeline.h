@@ -15,10 +15,14 @@ public:
     ~PlePipeline();
     // A missing ticket means the required slot is still retiring. Successful calls claim
     // matching prefetch work for this execution and copy all input identities and IDs.
-    [[nodiscard]] std::optional<ple::Ticket>
-    try_require(runtime::ExecutionTicket, std::uint32_t tokens, std::span<const ple::InputRow>);
-    [[nodiscard]] std::optional<ple::Ticket>
-    try_begin(runtime::ExecutionTicket, std::uint32_t tokens, std::span<const ple::InputRow>);
+    [[nodiscard]] std::optional<ple::Ticket> try_require(runtime::ExecutionTicket,
+                                                         std::uint32_t tokens,
+                                                         std::uint32_t physical_rows,
+                                                         std::span<const ple::InputRow>);
+    [[nodiscard]] std::optional<ple::Ticket> try_begin(runtime::ExecutionTicket,
+                                                       std::uint32_t tokens,
+                                                       std::uint32_t physical_rows,
+                                                       std::span<const ple::InputRow>);
     void append_device(ple::Ticket, const Tensor& ids, std::span<const std::uint32_t> extents,
                        std::uint32_t step);
     // Capture only the CUDA handoff. Host bookkeeping follows the submitted chain replay.
@@ -48,10 +52,12 @@ private:
     struct Window {
         ple::Ticket ticket;
         std::optional<runtime::ExecutionTicket> owner;
-        std::uint32_t tokens;
+        std::uint32_t tokens = 0, physical_rows = 0;
+        bool allocated = false;
         std::vector<ple::SequenceIdentity> rows;
         std::vector<std::int32_t> ids;
-        std::array<std::uint32_t, kMaximumConcurrency> known{}, valid{};
+        std::vector<std::uint32_t> known, valid;
+        void reset();
         bool seal_requested = false, sealed = false;
         std::uint32_t append_count = 0, next_append = 0;
         bool uploaded = false, acquired = false, consumed = false, cancelled = false;
@@ -61,15 +67,18 @@ private:
     struct DeviceAppend {
         CudaCompletionEvent produced, copied;
         ple::Ticket ticket{};
-        std::array<bool, kMaximumConcurrency> active{};
+        std::vector<std::uint8_t> active;
         std::uint32_t batch = 0;
         bool pending        = false;
 
-        explicit DeviceAppend(const DeviceContext& device) : produced(device), copied(device) {}
+        DeviceAppend(const DeviceContext& device, std::uint32_t capacity)
+            : produced(device), copied(device), active(capacity) {}
     };
 
-    [[nodiscard]] bool matches(const Window&, std::uint32_t, std::span<const ple::InputRow>) const;
-    [[nodiscard]] std::optional<ple::Ticket> prepare(std::uint32_t, std::span<const ple::InputRow>,
+    [[nodiscard]] bool matches(const Window&, std::uint32_t, std::uint32_t,
+                               std::span<const ple::InputRow>) const;
+    [[nodiscard]] std::optional<ple::Ticket> prepare(std::uint32_t, std::uint32_t,
+                                                     std::span<const ple::InputRow>,
                                                      std::optional<runtime::ExecutionTicket> owner);
     Window& window(ple::Ticket);
     [[nodiscard]] MemorySpan append_destination(std::uint32_t slot, std::uint32_t step,
@@ -78,7 +87,8 @@ private:
     void cancel(Window&);
     Resources& resources_;
     CudaExecutionView cuda_;
-    std::array<std::optional<Window>, 2> windows_;
+    std::array<Window, 2> windows_;
+    std::vector<ple::Append> additions_;
     std::vector<DeviceAppend> appends_;
     bool drained_ = false;
 };

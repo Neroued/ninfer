@@ -43,6 +43,7 @@ void SessionImpl::finish_result(ComputeResult result) {
             batch.stride_ = std::max<std::uint32_t>(batch.stride_, row.tokens.size());
         batch.tokens_.resize(batch.stride_ * tx.members.size());
         batch.counts_.resize(tx.members.size());
+        batch.failed_.resize(tx.members.size());
         for (std::size_t b = 0; b < tx.members.size(); ++b) {
             const auto& row = tx.result->rows[b];
             if (row.tokens.empty()) throw std::logic_error("sampled batch has an empty row");
@@ -70,7 +71,7 @@ void SessionImpl::finish_result(ComputeResult result) {
 
     tx.completion = std::make_unique<context::ContextTransaction>(directory);
     Commit commit;
-    std::array<ContinuationMetadata, kMaximumConcurrency> completed{};
+    std::vector<ContinuationMetadata> completed(tx.members.size());
     commit.rows.reserve(tx.members.size());
     const bool retain_recovery = tx.kind == Kind::Replay;
     for (std::size_t b = 0; b < tx.members.size(); ++b) {
@@ -131,6 +132,7 @@ void SessionImpl::finish_result(ComputeResult result) {
 
 void SessionImpl::retire_compute(const runtime::DeviceRetired& event) {
     auto& tx = *compute;
+    for (auto h : tx.members) sequence(h).computing = false;
     if (tx.vision_id) {
         const auto* window = vision_window.current();
         bool complete      = tx.discarded;
@@ -189,8 +191,8 @@ CommitResult Session::commit(PendingBatch&& batch,
             throw std::logic_error("invalid generated-prefix decision");
     }
     CommitResult result;
-    result.row_count = decisions.size();
-    std::array<ContinuationMetadata, kMaximumConcurrency> completed{};
+    result.rows.resize(decisions.size());
+    std::vector<ContinuationMetadata> completed(decisions.size());
     try {
         tx.decisions.assign(decisions.begin(), decisions.end());
         tx.completion = std::make_unique<context::ContextTransaction>(p.directory);
@@ -257,7 +259,7 @@ CommitResult Session::commit(PendingBatch&& batch,
             s.phase         = decision.terminal ? detail::Phase::Finished : detail::Phase::Active;
             row.disposition = decision.terminal ? runtime::CommitDisposition::Finishable
                                                 : runtime::CommitDisposition::Active;
-            result.capture_ready[b] = s.capture_pending;
+            result.rows[b].capture_ready = s.capture_pending;
         }
     }
     batch.ticket_ = {};

@@ -28,42 +28,39 @@ void scratch(WorkspaceLayoutBuilder& a, std::size_t bytes) {
 }
 
 void mla(WorkspaceLayoutBuilder& a, const ModelProfile& p, const MlaProfile& m,
-         const ExecutionShape& s, int first, int last, int batch, int sm_count, bool record,
+         const ExecutionShape& s, int first, int last, int local, int sm_count, bool record,
          bool frozen) {
     const auto storage = latent_storage(s.kv_storage);
-    for (int local = 1; local <= batch; ++local) {
-        for (int mode = 0; mode < (frozen ? 2 : 1); ++mode) {
-            auto scope        = a.scope();
-            const bool reuse  = mode != 0;
-            const int minimum = dimension(std::uint64_t(first) * local);
-            const int columns = dimension(std::uint64_t(last) * local);
-            (void)workspace::mla(a, p.config.text, columns, reuse, !frozen);
-            const auto& profile = m.prepare.at(
-                static_cast<std::size_t>(reuse ? ops::KpoolMlaPrepareProjection::QueryAndHistory
-                                               : ops::KpoolMlaPrepareProjection::Full));
-            scratch(a, record
-                           ? ops::kpool_mla_prepare_record_workspace_capacity_bytes(
-                                 profile, storage, s.index_format, local, first, last, sm_count)
-                           : ops::kpool_mla_prepare_update_workspace_capacity_bytes(
-                                 profile, storage, s.index_format, local, first, last, sm_count));
-            if (reuse)
-                scratch(a, linear(m.query, minimum, columns));
-            else {
-                scratch(a, ops::linear_split_workspace_capacity_bytes(m.query_index, m.query_rows,
-                                                                      minimum, columns));
-                scratch(a, ops::kpool_indexer_workspace_capacity_bytes(m.indexer, s.index_format,
-                                                                       {s.max_context}, local,
-                                                                       first, last, sm_count));
-            }
-            scratch(a, ops::kpool_sparse_mla_workspace_capacity_bytes(
-                           m.attention, storage, {s.max_context}, local, first, last, sm_count));
-            scratch(a, linear(m.output, minimum, columns));
+    for (int mode = 0; mode < (frozen ? 2 : 1); ++mode) {
+        auto scope        = a.scope();
+        const bool reuse  = mode != 0;
+        const int minimum = dimension(std::uint64_t(first) * local);
+        const int columns = dimension(std::uint64_t(last) * local);
+        (void)workspace::mla(a, p.config.text, columns, reuse, !frozen);
+        const auto& profile = m.prepare.at(
+            static_cast<std::size_t>(reuse ? ops::KpoolMlaPrepareProjection::QueryAndHistory
+                                           : ops::KpoolMlaPrepareProjection::Full));
+        scratch(a, record ? ops::kpool_mla_prepare_record_workspace_capacity_bytes(
+                                profile, storage, s.index_format, local, first, last, sm_count)
+                          : ops::kpool_mla_prepare_update_workspace_capacity_bytes(
+                                profile, storage, s.index_format, local, first, last, sm_count));
+        if (reuse)
+            scratch(a, linear(m.query, minimum, columns));
+        else {
+            scratch(a, ops::linear_split_workspace_capacity_bytes(m.query_index, m.query_rows,
+                                                                  minimum, columns));
+            scratch(a, ops::kpool_indexer_workspace_capacity_bytes(m.indexer, s.index_format,
+                                                                   {s.max_context}, local, first,
+                                                                   last, sm_count));
         }
+        scratch(a, ops::kpool_sparse_mla_workspace_capacity_bytes(
+                       m.attention, storage, {s.max_context}, local, first, last, sm_count));
+        scratch(a, linear(m.output, minimum, columns));
     }
 }
 
 std::size_t body(const ModelProfile& p, const ExecutionShape& s, int first, int last, int batch,
-                 int sm_count, bool prefill, bool mtp) {
+                 int sm_count, bool prefill, bool mtp, std::size_t attention_bytes) {
     WorkspaceLayoutBuilder a;
     const int minimum = dimension(std::uint64_t(first) * batch);
     const int columns = dimension(std::uint64_t(last) * batch);
@@ -76,7 +73,7 @@ std::size_t body(const ModelProfile& p, const ExecutionShape& s, int first, int 
             (void)workspace::mtp_stem(a, p.config.text, columns);
             scratch(a, linear(p.mtp->stem, minimum, columns));
         }
-        mla(a, p, p.mtp->attention, s, first, last, batch, sm_count, false, true);
+        scratch(a, attention_bytes);
         scratch(a, ops::topk_sigmoid_swiglu_moe_workspace_capacity_bytes(
                        p.mtp->moe.math, p.mtp->moe.subset, minimum, columns));
         return a.peak_bytes();
@@ -112,9 +109,6 @@ std::size_t body(const ModelProfile& p, const ExecutionShape& s, int first, int 
                                dimension(p.local.kda_heads.size), dimension(p.local.kda_heads.size),
                                first, last));
             scratch(a, linear(k->output, minimum, columns));
-        } else {
-            mla(a, p, std::get<MlaProfile>(layer.mixer), s, first, last, batch, sm_count,
-                !prefill && last > 1, false);
         }
         if (const auto* d = std::get_if<DenseProfile>(&layer.ffn))
             scratch(a, ops::swiglu_workspace_capacity_bytes(d->math, minimum, columns));
@@ -123,11 +117,12 @@ std::size_t body(const ModelProfile& p, const ExecutionShape& s, int first, int 
                            std::get<MoeProfile>(layer.ffn).math,
                            std::get<MoeProfile>(layer.ffn).subset, minimum, columns));
     }
+    scratch(a, attention_bytes);
     return a.peak_bytes();
 }
 
 std::size_t history(const ModelProfile& p, const ExecutionShape& s, int first, int last, int batch,
-                    int sm_count, bool sequence = false) {
+                    std::size_t attention_bytes, bool sequence = false) {
     WorkspaceLayoutBuilder a;
     const int columns = dimension(std::uint64_t(last) * batch);
     const int minimum = dimension(std::uint64_t(first) * batch);
@@ -140,15 +135,29 @@ std::size_t history(const ModelProfile& p, const ExecutionShape& s, int first, i
         (void)workspace::mtp_stem(a, p.config.text, columns);
         scratch(a, linear(p.mtp->stem, minimum, columns));
     }
-    for (int local = 1; local <= batch; ++local) {
-        auto scope          = a.scope();
-        const auto& profile = p.mtp->attention.prepare.at(
-            static_cast<std::size_t>(ops::KpoolMlaPrepareProjection::History));
-        scratch(a, ops::kpool_mla_prepare_update_workspace_capacity_bytes(
-                       profile, latent_storage(s.kv_storage), s.index_format, local, first, last,
-                       sm_count));
+    scratch(a, attention_bytes);
+    return a.peak_bytes();
+}
+
+std::size_t attention_workspace(const ModelProfile& p, const ExecutionShape& s, int first, int last,
+                                int batch, int sm_count, bool record, bool mtp) {
+    WorkspaceLayoutBuilder a;
+    if (mtp) {
+        mla(a, p, p.mtp->attention, s, first, last, batch, sm_count, false, true);
+    } else {
+        for (const auto& layer : p.text.layers)
+            if (const auto* m = std::get_if<MlaProfile>(&layer.mixer))
+                mla(a, p, *m, s, first, last, batch, sm_count, record, false);
     }
     return a.peak_bytes();
+}
+
+std::size_t history_attention_workspace(const ModelProfile& p, const ExecutionShape& s, int first,
+                                        int last, int batch, int sm_count) {
+    const auto& profile = p.mtp->attention.prepare.at(
+        static_cast<std::size_t>(ops::KpoolMlaPrepareProjection::History));
+    return ops::kpool_mla_prepare_update_workspace_capacity_bytes(
+        profile, latent_storage(s.kv_storage), s.index_format, batch, first, last, sm_count);
 }
 
 } // namespace
@@ -156,23 +165,44 @@ std::size_t history(const ModelProfile& p, const ExecutionShape& s, int first, i
 WorkspacePlan plan_workspace(const ModelProfile& p, const ExecutionShape& s, int sm_count,
                              std::size_t vision_budget) {
     WorkspacePlan out;
-    out.prefill = body(p, s, 1, dimension(s.prefill_chunk), 1, sm_count, true, false);
+    const int chunk                = dimension(s.prefill_chunk);
+    out.prefill                    = body(p, s, 1, chunk, 1, sm_count, true, false,
+                                          attention_workspace(p, s, 1, chunk, 1, sm_count, false, false));
+    std::size_t ordinary_attention = 0, verify_attention = 0, draft_attention = 0,
+                history_attention = 0;
+    // Local attention geometry is independent of the global roots. Accumulate its
+    // high-water mark once; every local row count <= the current global count is covered.
     for (std::uint32_t b = 1; b <= s.max_concurrency; ++b) {
-        const int batch = dimension(b);
-        out.ordinary    = std::max(out.ordinary, body(p, s, 1, 1, batch, sm_count, false, false));
-        if (p.mtp || p.draft)
+        const int batch    = dimension(b);
+        ordinary_attention = std::max(
+            ordinary_attention, attention_workspace(p, s, 1, 1, batch, sm_count, false, false));
+        out.ordinary = std::max(
+            out.ordinary, body(p, s, 1, 1, batch, sm_count, false, false, ordinary_attention));
+        if (p.mtp || p.draft) {
+            verify_attention =
+                std::max(verify_attention,
+                         attention_workspace(p, s, 2, dimension(std::uint64_t(s.draft_tokens) + 1),
+                                             batch, sm_count, true, false));
             out.verify =
                 std::max(out.verify, body(p, s, 2, dimension(std::uint64_t(s.draft_tokens) + 1),
-                                          batch, sm_count, false, false));
+                                          batch, sm_count, false, false, verify_attention));
+        }
         if (p.mtp) {
-            out.draft = std::max(out.draft, body(p, s, 1, 1, batch, sm_count, false, true));
-            out.history =
-                std::max(out.history, history(p, s, 1, dimension(s.draft_tokens), batch, sm_count));
+            draft_attention = std::max(
+                draft_attention, attention_workspace(p, s, 1, 1, batch, sm_count, false, true));
+            out.draft         = std::max(out.draft,
+                                         body(p, s, 1, 1, batch, sm_count, false, true, draft_attention));
+            history_attention = std::max(
+                history_attention,
+                history_attention_workspace(p, s, 1, dimension(s.draft_tokens), batch, sm_count));
+            out.history = std::max(
+                out.history, history(p, s, 1, dimension(s.draft_tokens), batch, history_attention));
         }
     }
     if (p.mtp)
-        out.history =
-            std::max(out.history, history(p, s, 1, dimension(s.prefill_chunk), 1, sm_count, true));
+        out.history = std::max(
+            out.history, history(p, s, 1, chunk, 1,
+                                 history_attention_workspace(p, s, 1, chunk, 1, sm_count), true));
     const int columns = s.purpose == EnginePurpose::CausalScoring
                             ? dimension(std::min(s.prefill_chunk, 1024U))
                             : dimension(std::uint64_t(s.max_concurrency) * (s.draft_tokens + 1ULL));

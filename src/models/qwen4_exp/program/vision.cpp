@@ -47,7 +47,7 @@ RankProgramImpl::prepare_vision(const std::optional<qwen::VisionWork>& work, std
         }
         window.produced(bytes);
     }
-    const auto& region = *resources.plan.persistent.buffers.batch.visual_indices;
+    const auto& region = *resources.buffers().batch.visual_indices;
     const auto host    = host_tensor(region);
     return visual_view(*work->window.plan, begin, tokens, region,
                        {host.data, host.bytes(), host.device, true});

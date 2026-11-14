@@ -9,4 +9,6 @@ target_sources(ninfer_ops PRIVATE
 if(NINFER_TARGET STREQUAL "dgx_spark")
   target_sources(ninfer_ops PRIVATE "${CMAKE_CURRENT_LIST_DIR}/prepare/dgx_spark/launch.cu")
   target_sources(ninfer_ops PRIVATE "${CMAKE_CURRENT_LIST_DIR}/finish/dgx_spark/launch.cu")
+else()
+  target_sources(ninfer_ops PRIVATE "${CMAKE_CURRENT_LIST_DIR}/prepare/rtx5090/launch.cu")
 endif()

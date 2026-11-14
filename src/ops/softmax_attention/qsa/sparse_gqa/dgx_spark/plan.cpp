@@ -40,8 +40,19 @@ SparseGqaPlan select_sparse_gqa_plan(KvCacheStorage storage, int tokens, int bat
                                      QsaSparseGqaExecutionEnvelope envelope, int sms) {
     const auto queries = std::int64_t(tokens) * batch;
     const auto visible = envelope.max_visible_tokens;
-    if (queries >= sparse_gqa_direct_queries(kv_heads, sms))
+    if (queries >= sparse_gqa_direct_queries(kv_heads, sms)) {
+        if (tokens < 8) {
+            // An eight-query prefix tile cannot fit inside one physical request.
+            // Keep the same two graph nodes, with one direct attention pass.
+            const bool rotated_value = storage == KvCacheStorage::Nvfp4Group16 ||
+                                       storage == KvCacheStorage::Fp8KeyNvfp4Value;
+            const int key_rows = rotated_value ? 16 : 32;
+            auto plan          = SparseGqaPlan{key_rows, 1, SparseGqaInstance::Mma, false, visible};
+            plan.merge_node    = true;
+            return plan;
+        }
         return {16, 1, SparseGqaInstance::Grouped, false, visible};
+    }
     const int partition_heads = partition_head_groups(storage, kv_heads, queries);
     const auto target         = std::max<std::int64_t>(
         1, (std::int64_t(sms) * 3 / (2 * partition_heads) + queries - 1) / queries);
@@ -57,11 +68,15 @@ SparseGqaPlan select_sparse_gqa_plan(KvCacheStorage storage, int tokens, int bat
     const int key_rows = expand ? 16 : 32;
     if (expand) splits = std::min(partition_heads == 1 ? 64 : 32, splits * 2);
     const int tiles = std::max(1, (int(std::min(visible, 2051u)) + key_rows - 1) / key_rows);
-    return {key_rows, std::min(splits, tiles),
-            simt ? SparseGqaInstance::Simt : SparseGqaInstance::Mma,
-            simt || kv_heads != 1 || storage != KvCacheStorage::BFloat16 ||
-                std::min(splits, tiles) != 1,
-            visible};
+    splits          = std::min(splits, tiles);
+    auto plan =
+        SparseGqaPlan{key_rows, splits, simt ? SparseGqaInstance::Simt : SparseGqaInstance::Mma,
+                      simt || splits > 1, visible};
+    // The MMA epilogue can normalize any cache format directly when unsplit.
+    // Fixed geometry retains attention + merge across every visible-token bound.
+    // An unsplit MMA writes output directly and leaves the merge node idle.
+    plan.merge_node = true;
+    return plan;
 }
 
 SparseGqaLaunchPlan select_sparse_gqa_launch(const ConstPagedKVBatchLayerView& cache,
@@ -78,6 +93,14 @@ SparseGqaLaunchPlan select_sparse_gqa_launch(const ConstPagedKVBatchLayerView& c
     if (plan.instance == SparseGqaInstance::Simt)
         return {SparseGqaLoad::Direct, vector, plan.splits,
                 queries > 8 ? SparseGqaKernel::Simt4 : SparseGqaKernel::Simt8};
+    if (plan.instance == SparseGqaInstance::Mma &&
+        queries >= sparse_gqa_direct_queries(cache.num_kv_heads, sms)) {
+        const auto load = plan.key_rows == 16   ? staged
+                          : quantized && vector ? SparseGqaLoad::InPlace
+                                                : SparseGqaLoad::Direct;
+        return {load, vector, 1,
+                plan.key_rows == 16 ? SparseGqaKernel::Columns16 : SparseGqaKernel::Columns32};
+    }
     if (!vector) return {SparseGqaLoad::Direct, false, plan.splits};
     if (plan.visible_tokens <= 64)
         return {staged, true, plan.splits, SparseGqaKernel::Columns32Wide};

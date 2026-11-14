@@ -15,15 +15,26 @@ std::int32_t hybrid_token_limit(HybridPolicy policy, std::uint32_t workers) {
         std::clamp(maximum * workers / policy.reference_workers, std::uint64_t{1}, maximum));
 }
 
-void size_resources(Plan& plan, std::int32_t max_tokens) {
+void size_resources(Plan& plan, std::int32_t max_tokens,
+                    std::span<const TokenGeometry> geometries) {
     plan.bridge       = {};
     std::size_t masks = 0;
     for (std::size_t i = 0; i < plan.layers.size(); ++i) {
-        const auto& layer = plan.layers[i];
+        auto& layer = plan.layers[i];
         if (!layer.spec.profile.routed.experts) continue;
+        layer.hybrid_physical_tokens = std::min(max_tokens, layer.hybrid_max_tokens);
+        for (const auto geometry : geometries) {
+            if (geometry.minimum_active_tokens <= 0 ||
+                geometry.minimum_active_tokens > geometry.physical_tokens ||
+                geometry.physical_tokens > max_tokens)
+                throw std::invalid_argument("invalid MoE physical/active token geometry");
+            if (!layer.requires_full_bank(geometry.minimum_active_tokens))
+                layer.hybrid_physical_tokens =
+                    std::max(layer.hybrid_physical_tokens, geometry.physical_tokens);
+        }
         plan.bridge.include(describe_execution(layer.spec.profile, ops::ExpertSubsetKind::MaskOnes,
                                                layer.spec.epilogue, 1,
-                                               std::min(max_tokens, layer.hybrid_max_tokens)));
+                                               layer.hybrid_physical_tokens));
         masks += std::size_t(layer.spec.profile.routed.experts) * sizeof(std::int32_t);
     }
     plan.device_bytes = masks + plan.bridge.device_frame_bytes + plan.cache.config.capacity_bytes +
@@ -248,6 +259,7 @@ const LayerPlan& Plan::layer(ExpertBankId bank) const { return layers[layer_inde
 
 std::optional<Plan> resolve_plan(Plan out, std::span<const ExpertBankCacheSpec> specs,
                                  std::size_t available, std::int32_t max_tokens,
+                                 std::span<const TokenGeometry> geometries,
                                  const CpuTopology& topology, std::uint32_t requested_workers) {
     const auto order = cpu_worker_order(topology.info());
     if (order.empty()) throw std::runtime_error("no CPU available for MoE execution");
@@ -261,7 +273,7 @@ std::optional<Plan> resolve_plan(Plan out, std::span<const ExpertBankCacheSpec> 
         largest_bank = std::max(largest_bank, out.cache.banks[layer.spec.bank.index].entry_bytes *
                                                   std::size_t(layer.spec.profile.routed.experts));
     }
-    size_resources(out, max_tokens);
+    size_resources(out, max_tokens, geometries);
     if (!largest_bank || out.device_bytes > available ||
         available - out.device_bytes < largest_bank)
         return std::nullopt;
@@ -274,7 +286,7 @@ std::optional<Plan> resolve_plan(Plan out, std::span<const ExpertBankCacheSpec> 
     config.max_in_flight_uses = static_cast<std::uint32_t>(out.layers.size() + 8);
     out.cache                 = describe_expert_cache(specs, config);
     if (!plan_cache(out)) return std::nullopt;
-    size_resources(out, max_tokens);
+    size_resources(out, max_tokens, geometries);
     out.team = plan_cpu_team(topology.info(), workers);
     if (workers < order.size()) out.caller_cpus = {order[workers]};
     return out;

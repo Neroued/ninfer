@@ -22,8 +22,11 @@ void scatter(const Tensor& source, const Tensor& indices, Tensor& destination,
 
 // destination.record[b].field[:] = source[:,b]. Source is BF16 [D,B]; the field is
 // BF16 [D] with contiguous features and I64 record offsets [B]. Copies bits exactly.
-// Selected fields are distinct and disjoint from the inputs. Unselected storage is preserved.
-void scatter(const Tensor& source, const StateFieldView& destination, CudaExecutionView execution);
+// live_rows is empty for dense rows or contiguous Device I32 [B] with values 0/1. An inactive
+// row reads no source or offset and preserves State. Selected live fields are distinct and
+// disjoint from inputs. Unselected storage is preserved.
+void scatter(const Tensor& source, const StateFieldView& destination, const Tensor& live_rows,
+             CudaExecutionView execution);
 
 /**
  * destination[:,j,lanes[b]] = source[:,j,b], for j < valid_columns[b].
@@ -33,9 +36,10 @@ void scatter(const Tensor& source, const StateFieldView& destination, CudaExecut
  * A feature slice retains its parent's strides. D is divisible by eight and every BF16 column
  * starts at a 16-byte-aligned address. Inputs and destination do not overlap.
  *
- * The caller supplies distinct lanes in [0,C), counts in [0,W], and disjoint destination
- * columns/lanes. Copies BF16 bits exactly; invalid tails, unselected lanes and features outside
- * the destination slice are preserved. Zero counts read no source values. No workspace is used.
+ * The caller supplies counts in [0,W] and distinct lanes in [0,C) for rows with nonzero
+ * counts. Copies BF16 bits exactly; invalid tails, unselected lanes and features outside
+ * the destination slice are preserved. Zero counts read neither lanes nor source values. No
+ * workspace is used.
  */
 void scatter_bf16_batch(const Tensor& source, const Tensor& lanes, const Tensor& valid_columns,
                         Tensor& destination, CudaExecutionView execution);
@@ -75,7 +79,7 @@ void gather(const ConstStateFieldView& source, const Tensor& active, Tensor& out
 
 // For columns[b]>=0, destination.record[b].field[:]=source[:,columns[b],b]; -1 preserves the
 // destination and reads no source or record offset. Source is contiguous BF16 or I32 [D,T,B],
-// columns is contiguous I32 [B], B=1..8, and destination has same-dtype contiguous [D] fields
+// columns is contiguous I32 [B], B>=1, and destination has same-dtype contiguous [D] fields
 // with I64 record offsets [B]. Live columns are in range and destination fields are distinct.
 // Inputs and selected destination fields are
 // disjoint. Copies represented bits exactly, preserves all unselected storage, owns no
@@ -95,7 +99,7 @@ struct StateColumnScatter {
 };
 
 // Apply independent field assignments in one submission. Each of up to eight entries has its
-// own D>0, B=1..8 and BF16/I32 dtype. State fields are single-layer dense [D], selected by
+// own D>0, B>=1 and BF16/I32 dtype. State fields are single-layer dense [D], selected by
 // contiguous Device I64 [B] byte offsets. Dense operands have contiguous features and explicit
 // non-overlapping, naturally aligned outer strides. Entries may use different backing arenas.
 //

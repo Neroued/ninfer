@@ -5,17 +5,16 @@
 #include <algorithm>
 #include <array>
 #include <limits>
+#include <vector>
 
 namespace ninfer::ops {
 namespace {
 using detail::kimi_delta_attention::kStateDim;
-constexpr int kMaximumReplayRows = 8;
 
 void validate_fold_records(const KdaReplayRecords& records) {
     constexpr const char* kOp       = "kda_replay_fold";
     const KdaReplayRecordSpec& spec = records.spec;
-    if (spec.record_capacity <= 0 || spec.record_capacity > kMaximumReplayRows || spec.width < 1 ||
-        spec.layers < 1 ||
+    if (spec.record_capacity <= 0 || spec.width < 1 || spec.layers < 1 ||
         !detail::kimi_delta_attention::valid_heads(spec.qk_heads, spec.value_heads) ||
         spec.conv_channels != (2LL * spec.qk_heads + spec.value_heads) * kStateDim ||
         spec.key_dim != kStateDim || spec.value_dim != kStateDim) {
@@ -80,20 +79,16 @@ common::operand::Blocks selected_field(StateFieldView field, std::int64_t offset
     return {common::operand::range(first, op), field.field.layer_stride, field.field.layers};
 }
 
-detail::kimi_delta_attention::KdaReplayFoldKernelRows
-validate_fold_rows(const KdaReplayRecords& records, LinearAttentionStateAllLayersView states,
-                   std::span<const KdaReplayFoldRow> rows) {
+void validate_fold_rows(const KdaReplayRecords& records, LinearAttentionStateAllLayersView states,
+                        std::span<const KdaReplayFoldRow> rows) {
     if (rows.empty() || rows.size() > static_cast<std::size_t>(records.spec.record_capacity))
         throw std::invalid_argument("kda_replay_fold: active row count is out of range");
-    detail::kimi_delta_attention::KdaReplayFoldKernelRows packed{};
     using Fields = std::array<common::operand::Blocks, 2>;
-    std::array<Fields, kMaximumReplayRows> sources{}, destinations{};
+    std::vector<Fields> sources(rows.size()), destinations(rows.size());
     for (std::size_t row = 0; row < rows.size(); ++row) {
         const auto& selected = rows[row];
         if (selected.commit_columns < 0 || selected.commit_columns > records.spec.width)
             throw std::invalid_argument("kda_replay_fold: commit extent is out of range");
-        packed.row[row] = {selected.source_offset, selected.destination_offset,
-                           selected.commit_columns};
         if (selected.commit_columns == 0) continue;
         sources[row]      = {selected_field(states.conv, selected.source_offset),
                              selected_field(states.recurrent, selected.source_offset)};
@@ -128,7 +123,6 @@ validate_fold_rows(const KdaReplayRecords& records, LinearAttentionStateAllLayer
             }
         }
     }
-    return packed;
 }
 
 } // namespace
@@ -144,16 +138,23 @@ void KdaReplayFoldPlan::execute(std::span<const KdaReplayFoldRow> rows,
                                 CudaExecutionView execution) const {
     common::operand::device(records_.conv.device, execution.device(), "kda_replay_fold",
                             "state/records");
-    const detail::kimi_delta_attention::KdaReplayFoldKernelRows packed =
-        validate_fold_rows(records_, states_, rows);
-    // Row descriptors are host values, including under Graph capture. Preserve full validation
-    // above; an all-zero commit has no device work or state/record reads.
-    if (std::none_of(rows.begin(), rows.end(),
-                     [](const KdaReplayFoldRow& row) { return row.commit_columns != 0; }))
-        return;
-    detail::kimi_delta_attention::launch_replay_fold(
-        records_, states_, packed, static_cast<std::int32_t>(rows.size()),
-        execution.multiprocessor_count(), execution.stream());
+    validate_fold_rows(records_, states_, rows);
+    // Validate the complete request before publishing any State. Each launch captures its
+    // bounded Host descriptors by value and keeps the original physical record row numbers.
+    for (std::size_t begin = 0; begin < rows.size();
+         begin += detail::kimi_delta_attention::kHostFoldRows) {
+        const auto count =
+            std::min<std::size_t>(detail::kimi_delta_attention::kHostFoldRows, rows.size() - begin);
+        const auto group = rows.subspan(begin, count);
+        if (std::none_of(group.begin(), group.end(),
+                         [](const KdaReplayFoldRow& row) { return row.commit_columns != 0; }))
+            continue;
+        detail::kimi_delta_attention::KdaReplayFoldKernelRows packed{};
+        std::copy(group.begin(), group.end(), packed.row);
+        detail::kimi_delta_attention::launch_replay_fold(
+            records_, states_, packed, static_cast<int>(begin), static_cast<int>(count),
+            execution.multiprocessor_count(), execution.stream());
+    }
 }
 
 void KdaReplayFoldPlan::execute(const Tensor& source_offsets, const Tensor& destination_offsets,

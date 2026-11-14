@@ -480,9 +480,9 @@ int graph_mapping_replay_case() {
     return failures;
 }
 
-int batch_table_case() {
+int batch_table_case(int batch, bool empty = false) {
     constexpr int tokens            = 2;
-    constexpr int batch             = 2;
+    constexpr int cache_rows        = 2;
     constexpr int logical_pages     = 2;
     constexpr int logical_capacity  = logical_pages * kPage;
     constexpr int physical_pages    = 6;
@@ -495,8 +495,8 @@ int batch_table_case() {
     std::vector<float> q(row_q_count * batch);
     std::vector<float> query_k(row_kv_count * batch);
     std::vector<float> query_v(row_kv_count * batch);
-    std::vector<float> logical_k(logical_count * batch);
-    std::vector<float> logical_v(logical_count * batch);
+    std::vector<float> logical_k(logical_count * cache_rows);
+    std::vector<float> logical_v(logical_count * cache_rows);
     std::vector<float> physical_k(physical_count);
     std::vector<float> physical_v(physical_count);
     fill_uniform(q, 16001u, -0.35f, 0.35f);
@@ -515,7 +515,7 @@ int batch_table_case() {
     round_to_bf16(physical_v);
 
     const std::vector<std::int32_t> block_tables{0, 2, 5, 3};
-    for (int row = 0; row < batch; ++row) {
+    for (int row = 0; row < cache_rows; ++row) {
         const std::vector<float> row_k(
             logical_k.begin() + static_cast<std::ptrdiff_t>(row * logical_count),
             logical_k.begin() + static_cast<std::ptrdiff_t>((row + 1) * logical_count));
@@ -531,9 +531,12 @@ int batch_table_case() {
                                 physical_pages);
     }
 
-    const std::vector<std::int32_t> lengths{65, 1};
-    const std::vector<std::int32_t> valid{2, 1};
-    const std::vector<std::int32_t> table_rows{1, 0};
+    std::vector<std::int32_t> lengths(batch), valid(batch), table_rows(batch);
+    for (int b = 0; b < batch; ++b) {
+        valid[b]      = empty ? 0 : (2 - b % 3);
+        lengths[b]    = valid[b] == 0 ? -1 : b % 2 == 0 ? 65 : 1;
+        table_rows[b] = valid[b] == 0 ? -1 : 1 - b % 2;
+    }
     DeviceBuffer d_q       = to_device(bf16_bits(q));
     DeviceBuffer d_query_k = to_device(bf16_bits(query_k));
     DeviceBuffer d_query_v = to_device(bf16_bits(query_v));
@@ -555,11 +558,12 @@ int batch_table_case() {
     Tensor valid_tensor(d_valid.span(), DType::I32, {batch});
     Tensor table_row_tensor(d_table_rows.span(), DType::I32, {batch});
     Tensor out_tensor(d_out.span(), DType::BF16, {kD, kQHeads, tokens, batch});
-    auto context = make_context_view(packed, d_tables, logical_pages, batch);
+    auto context = make_context_view(packed, d_tables, logical_pages, cache_rows);
     constexpr ops::ContextAttentionExecutionEnvelope envelope{0, 65};
 
     std::vector<double> expected(row_q_count * batch);
     for (int b = 0; b < batch; ++b) {
+        if (valid[b] == 0) continue;
         const auto q_begin     = q.begin() + static_cast<std::ptrdiff_t>(b * row_q_count);
         const auto kv_begin    = query_k.begin() + static_cast<std::ptrdiff_t>(b * row_kv_count);
         const int selected_row = table_rows[static_cast<std::size_t>(b)];
@@ -593,10 +597,10 @@ int batch_table_case() {
                                    ninfer::test::cuda_environment().default_execution);
     cuda_synchronize();
 
-    int failures = verify_reduction("context_softmax_attention B=2 mixed lengths and table rows",
+    int failures = verify_reduction("context_softmax_attention mixed lengths and table rows",
                                     from_device_bf16(d_out.data(), row_q_count * batch), expected,
                                     kContextQueryBf16Criterion);
-    failures += d_out.verify_guards("context-attention B=2 output guards");
+    failures += d_out.verify_guards("context-attention batch output guards");
     return failures;
 }
 
@@ -656,5 +660,11 @@ void add_context_attention_cases(ninfer::test::OpSuite& suite) {
     add(8, 65, InputProfile::Random, 65, MappingPattern::Fragmented, 0);
     suite.add("context_attention/graph_mapping", graph_mapping_replay_case,
               {{"format", "bf16"}, {"execution", "graph"}});
-    suite.add("context_attention/batch_table", batch_table_case, {{"format", "bf16"}});
+    for (const int batch : {2, 17})
+        suite.add("context_attention/batch_table/b" + std::to_string(batch),
+                  [=] { return batch_table_case(batch); },
+                  {{"suite", batch > 8 ? "concurrency" : "context_attention"}, {"format", "bf16"}});
+    suite.add("context_attention/batch_table/b129_empty",
+              [] { return batch_table_case(129, true); },
+              {{"suite", "concurrency"}, {"format", "bf16"}});
 }

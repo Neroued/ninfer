@@ -5,6 +5,8 @@
 #include "models/glm5next/state/continuation.h"
 
 #include <algorithm>
+#include <set>
+#include <unordered_set>
 
 namespace ninfer::models::glm5next {
 namespace {
@@ -35,17 +37,55 @@ std::span<const WorkRow> work_rows(const Work& work) {
     return {};
 }
 
-BatchPlan plan_batch(std::span<const WorkRow> rows, std::uint32_t ranks) {
-    require(ranks > 0, "empty rank group");
+BatchPlan plan_batch(std::span<const WorkRow> rows, const BatchExecutionPlan& plan, bool decode) {
+    require(!rows.empty() && rows.size() <= plan.resident_capacity(), "invalid batch membership");
     BatchPlan result;
-    for (std::uint32_t rank = 0; rank < ranks; ++rank) {
-        const auto begin = static_cast<std::uint32_t>(result.members.size());
-        for (std::uint32_t row = 0; row < rows.size(); ++row)
-            if (rows[row].attention_rank == rank) result.members.push_back(row);
-        result.owners.push_back({begin, static_cast<std::uint32_t>(result.members.size()) - begin});
+    result.owners.resize(plan.attention_owners());
+    for (const auto& row : rows) {
+        require(row.attention_rank < result.owners.size(), "attention owner outside rank group");
+        ++result.owners[row.attention_rank].size;
     }
-    require(result.members.size() == rows.size(), "attention owner outside rank group");
+    std::uint32_t begin = 0, maximum = 0;
+    for (auto& owner : result.owners) {
+        owner.begin = begin;
+        begin += owner.size;
+        maximum = std::max(maximum, owner.size);
+    }
+    result.shape = decode ? plan.decode(rows.size(), maximum) : plan.exact(rows.size(), maximum);
+    result.members.resize(rows.size());
+    std::vector<std::uint32_t> offsets(result.owners.size());
+    for (std::uint32_t row = 0; row < rows.size(); ++row) {
+        const auto owner                                              = rows[row].attention_rank;
+        result.members[result.owners[owner].begin + offsets[owner]++] = row;
+    }
     return result;
+}
+
+const BatchPlan& work_batch(const Work& work) {
+    return std::visit(
+        [](const auto& operation) -> const BatchPlan& {
+            if constexpr (std::is_same_v<std::decay_t<decltype(operation)>, ContextWork>)
+                throw std::logic_error("Context work has no compute batch");
+            else
+                return operation.batch;
+        },
+        work.operation);
+}
+
+void prepare_batch(Work& work, const BatchExecutionPlan& plan) {
+    std::visit(
+        [&](auto& operation) {
+            using T = std::decay_t<decltype(operation)>;
+            if constexpr (!std::is_same_v<T, ContextWork>) {
+                const bool decode = [&] {
+                    if constexpr (std::is_same_v<T, ForwardWork>)
+                        return operation.kind == ForwardKind::Ordinary;
+                    return std::is_same_v<T, SpeculativeWork>;
+                }();
+                operation.batch = plan_batch(work_rows(work), plan, decode);
+            }
+        },
+        work.operation);
 }
 
 const context::ContextActions& local_actions(const ContextActions& actions, std::uint32_t rank) {
@@ -90,13 +130,12 @@ runtime::WorkPayloadCapacity WorkContract::payload_capacity(std::uint32_t rank_c
             ? payload(1, chunk, 8 * chunk)
             : std::max({payload(1, chunk, 4 * chunk), payload(batch, width, 4),
                         payload(batch, control_token_limit, 8ULL * control_token_limit)});
-    const auto context = header + context::action_batch_capacity() + 128 +
-                         batch * (88 + TokenCounts::encoded_capacity(public_tokens));
+    const auto context = header + context::action_batch_capacity() + 128 + 88 +
+                         TokenCounts::encoded_capacity(public_tokens) + 16 * batch;
     const auto decision = header + 12 + batch * (20 + 4 * width * ((public_tokens + 31ULL) / 32));
     const auto commit   = header + 64 + batch * (64 + 20 * rank_count) + actions(batch, width);
-    const auto context_rows =
-        sizeof(Work) + sizeof(ContextWork) +
-        batch * (sizeof(ResidencyBinding) + sizeof(runtime::ResidencyId) + 4ULL * public_tokens);
+    const auto context_rows = sizeof(Work) + sizeof(ContextWork) + sizeof(ResidencyBinding) +
+                              4ULL * public_tokens + batch * sizeof(runtime::ResidencyId);
     const auto actions_storage = context::action_batch_storage_capacity() + 128;
     return {work,
             context,
@@ -108,26 +147,29 @@ runtime::WorkPayloadCapacity WorkContract::payload_capacity(std::uint32_t rank_c
 
 void WorkContract::validate(const Work& work, runtime::FrameKind kind) const {
     if (const auto* c = std::get_if<ContextWork>(&work.operation)) {
-        require(kind == runtime::FrameKind::Context &&
-                    c->bindings.size() <= shape.max_concurrency &&
+        require(kind == runtime::FrameKind::Context && c->bindings.size() <= 1 &&
                     c->releases.size() <= shape.max_concurrency,
                 "invalid context frame");
-        std::array<bool, kMaximumConcurrency> bound{}, released{};
+        std::vector<std::uint32_t> bound, released;
+        bound.reserve(c->bindings.size());
+        released.reserve(c->releases.size());
         for (const auto& r : c->releases) {
-            require(r.lane.value < shape.max_concurrency && r.generation && !released[r.lane.value],
+            require(r.lane.value < shape.max_concurrency && r.generation,
                     "invalid residency release");
-            released[r.lane.value] = true;
+            released.push_back(r.lane.value);
         }
         for (const auto& b : c->bindings) {
             member(b.member, shape.max_concurrency);
-            require(!bound[b.member.residency.lane.value], "duplicate residency binding");
-            bound[b.member.residency.lane.value] = true;
+            bound.push_back(b.member.residency.lane.value);
             b.counts.validate(public_tokens, shape.max_context);
             require(shape.purpose == EnginePurpose::Generation || b.counts.empty(),
                     "scoring residency has generation counts");
         }
-        require(work.batch.members.empty() && work.batch.owners.empty(),
-                "context has compute rows");
+        for (auto* lanes : {&bound, &released}) {
+            std::sort(lanes->begin(), lanes->end());
+            require(std::adjacent_find(lanes->begin(), lanes->end()) == lanes->end(),
+                    "duplicate context residency");
+        }
         return;
     }
     const auto* forward = std::get_if<ForwardWork>(&work.operation);
@@ -136,7 +178,16 @@ void WorkContract::validate(const Work& work, runtime::FrameKind kind) const {
     require(kind == runtime::FrameKind::Compute && !rows.empty() &&
                 rows.size() <= shape.max_concurrency,
             "compute frame extent");
-    require(work.batch == plan_batch(rows, ranks), "physical row plan differs from membership");
+    require(batches && batches->resident_capacity() == shape.max_concurrency &&
+                batches->attention_owners() == ranks,
+            "batch plan differs from prepared execution");
+    const bool decode = std::holds_alternative<SpeculativeWork>(work.operation) ||
+                        (forward && forward->kind == ForwardKind::Ordinary);
+    require(work_batch(work) == plan_batch(rows, *batches, decode),
+            "physical row plan differs from membership");
+    std::set<std::pair<std::uint64_t, std::uint64_t>> sequences;
+    std::unordered_set<std::uint32_t> lanes, main_tables, mtp_tables;
+    std::vector<std::unordered_set<std::int64_t>> state_reads(ranks), state_writes(ranks);
     for (std::size_t i = 0; i < rows.size(); ++i) {
         const auto& r = rows[i];
         require(r.control_last_token.has_value() == control, "control fields outside control work");
@@ -161,20 +212,20 @@ void WorkContract::validate(const Work& work, runtime::FrameKind kind) const {
         if (control && !r.ids.empty())
             tokens(std::span<const TokenId>(r.ids).subspan(1), public_tokens);
         if (r.control_last_token) tokens({&*r.control_last_token, 1}, public_tokens);
-        for (std::size_t j = 0; j < i; ++j) {
-            require(r.member.sequence != rows[j].member.sequence &&
-                        r.member.residency.lane != rows[j].member.residency.lane &&
-                        r.main_table.index != rows[j].main_table.index &&
-                        (shape.speculative != SpeculativeBackend::Mtp ||
-                         r.mtp_table.index != rows[j].mtp_table.index),
-                    "overlapping batch owners");
-            for (const auto& [rank, offsets] : r.states) {
-                const auto other = rows[j].states.at(rank);
-                require(offsets.destination != other.destination &&
-                            offsets.destination != other.source &&
-                            other.destination != offsets.source,
-                        "overlapping State writes");
-            }
+        require(sequences.emplace(r.member.sequence.value, r.member.sequence.generation).second &&
+                    lanes.insert(r.member.residency.lane.value).second &&
+                    main_tables.insert(r.main_table.index).second &&
+                    (shape.speculative != SpeculativeBackend::Mtp ||
+                     mtp_tables.insert(r.mtp_table.index).second),
+                "overlapping batch owners");
+        for (const auto& [rank, offsets] : r.states) {
+            auto& reads  = state_reads[rank];
+            auto& writes = state_writes[rank];
+            require(!writes.contains(offsets.destination) && !writes.contains(offsets.source) &&
+                        !reads.contains(offsets.destination),
+                    "overlapping State writes");
+            reads.insert(offsets.source);
+            writes.insert(offsets.destination);
         }
     }
     if (const auto* f = std::get_if<ForwardWork>(&work.operation)) {
@@ -243,7 +294,7 @@ void WorkContract::validate(const Work& work, const runtime::DecisionRequest& re
     const auto rows = work_rows(work);
     require(request.vocabulary == public_tokens && request.stage == input.stage,
             "decision identity");
-    std::array<bool, kMaximumConcurrency> requested{}, seen{};
+    std::vector<std::uint8_t> requested(rows.size()), seen(rows.size());
     for (const auto& r : request.rows) {
         require(r.member < rows.size() && rows[r.member].constrained && !requested[r.member] &&
                     r.drafts.size() ==

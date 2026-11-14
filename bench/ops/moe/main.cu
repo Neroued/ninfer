@@ -215,6 +215,25 @@ double unique_weight_bytes(const Result& result) {
                                              : double(result.unique_experts) * double(per_expert));
 }
 
+double operand_bytes(const Result& result) {
+    const double tokens = result.tokens;
+    if (result.operation == Operation::Route)
+        return unique_weight_bytes(result) + tokens * (2 * kHidden + 8 * kTopK + 4);
+    if (result.operation == Operation::Routed && result.subset == ops::ExpertSubsetKind::None)
+        return tokens * 4 * kHidden;
+    const bool complete = result.operation == Operation::Complete;
+    const double routes =
+        complete || result.subset == ops::ExpertSubsetKind::None ? 0 : tokens * 8 * kTopK;
+    const double shared_scale = result.operation == Operation::RoutedShared ? tokens * 4 : 0;
+    const double mask         = result.subset == ops::ExpertSubsetKind::MaskOnes ||
+                                result.subset == ops::ExpertSubsetKind::MaskZeros
+                                    ? kExperts * sizeof(std::int32_t)
+                                    : 0;
+    // Complete reads BF16 residual and writes BF16; routed writes FP32.
+    // These are necessary public operands, excluding private workspace traffic.
+    return unique_weight_bytes(result) + tokens * 6 * kHidden + routes + shared_scale + mask;
+}
+
 double logical_flops(const Result& result) {
     const double ffn = 2.0 * 1024 * kHidden + 2.0 * kHidden * kIntermediate;
     const bool router =
@@ -695,7 +714,7 @@ public:
                     {kHidden, kExperts, kTopK}, tokens, tokens));
             MemoryArena arena(scratch.span());
             ops::topk_softmax_route(x_, {kHidden, kExperts, kTopK}, fixture.weights().control,
-                                    routes_, beta_tensor_, arena, bench::default_execution());
+                                    routes_, beta_tensor_, {}, arena, bench::default_execution());
             CUDA_CHECK(cudaDeviceSynchronize());
         }
         CUDA_CHECK(cudaDeviceSynchronize());
@@ -722,12 +741,12 @@ public:
         switch (operation_) {
         case Operation::Complete:
             ops::topk_softmax_swiglu_moe(x_, profile, weights, subset_,
-                                         ops::MoeEpilogue::AddResidual, destination_tensor_,
+                                         ops::MoeEpilogue::AddResidual, destination_tensor_, {},
                                          workspace_, cuda);
             break;
         case Operation::Route:
             ops::topk_softmax_route(x_, {kHidden, kExperts, kTopK}, weights.control, routes_,
-                                    beta_tensor_, workspace_, cuda);
+                                    beta_tensor_, {}, workspace_, cuda);
             break;
         case Operation::Routed:
             ops::routed_swiglu(x_, profile.routed, weights.routed, routes_, subset_,
@@ -864,20 +883,30 @@ std::vector<Result> run_point(BenchmarkWeights& fixture, CodecProfile profile, s
     return results;
 }
 
-void print_result(const Result& result, double peak_memory_gbps) {
+void print_result(const Result& result) {
     const double seconds            = result.stats.median_us * 1.0e-6;
     const double useful_weight_gbps = unique_weight_bytes(result) / seconds / 1.0e9;
-    const double memory_lower_bound = unique_weight_bytes(result) / (peak_memory_gbps * 1000.0);
-    const double tflops             = logical_flops(result) / seconds / 1.0e12;
-    std::printf("%-6s T=%-5d %-11s U=%-3d ov=%4.1f %-12s %-4s "
-                "median=%8.3f us min=%8.3f us p95=%8.3f us "
-                "unique_weight=%7.1f GB/s memory_lower_bound=%7.3f us logical=%6.2f TFLOP/s "
-                "workspace=%zu\n",
-                codec_name(result.codec), result.tokens, distribution_name(result.distribution),
-                result.unique_experts, result.adjacent_overlap, execution_name(result.execution),
-                cache_name(result.cache), result.stats.median_us, result.stats.min_us,
-                result.stats.p95_us, useful_weight_gbps, memory_lower_bound, tflops,
-                result.workspace_bytes);
+    const double memory_lower_bound =
+        operand_bytes(result) / (bench::kRoofline.sustained_read_gbs * 1000.0);
+    const double compute_lower_bound =
+        logical_flops(result) / (bench::kRoofline.bf16_f32_tflops * 1.0e6);
+    const double roofline_bound =
+        std::isfinite(memory_lower_bound) && std::isfinite(compute_lower_bound)
+            ? std::max(memory_lower_bound, compute_lower_bound)
+            : std::numeric_limits<double>::quiet_NaN();
+    const double tflops = logical_flops(result) / seconds / 1.0e12;
+    std::printf(
+        "%-6s T=%-5d %-11s U=%-3d ov=%4.1f %-12s %-4s "
+        "median=%8.3f us min=%8.3f us p95=%8.3f us "
+        "unique_weight=%7.1f GB/s memory_lower_bound=%s us allowed_bf16_compute_bound=%s us "
+        "aggregate_allowed_roofline_bound=%s us logical=%6.2f TFLOP/s "
+        "workspace=%zu\n",
+        codec_name(result.codec), result.tokens, distribution_name(result.distribution),
+        result.unique_experts, result.adjacent_overlap, execution_name(result.execution),
+        cache_name(result.cache), result.stats.median_us, result.stats.min_us, result.stats.p95_us,
+        useful_weight_gbps, bench::format_metric(memory_lower_bound, 3).c_str(),
+        bench::format_metric(compute_lower_bound, 3).c_str(),
+        bench::format_metric(roofline_bound, 3).c_str(), tflops, result.workspace_bytes);
 }
 
 void write_csv(const std::string& path, const std::vector<Result>& results, const Options& options,
@@ -891,21 +920,29 @@ void write_csv(const std::string& path, const std::vector<Result>& results, cons
     if (!stream) { throw std::runtime_error("failed to open CSV output"); }
     int runtime = 0;
     CUDA_CHECK(cudaRuntimeGetVersion(&runtime));
-    const double peak_memory_gbps = bench::kRoofline.memory_gbs;
+    const double read_gbps = bench::kRoofline.sustained_read_gbs;
     stream << "codec,tokens,distribution,seed,unique_experts,adjacent_overlap,execution,"
               "timed_scope,cache,median_us,min_us,p95_us,unique_weight_gbps,"
               "memory_lower_bound_us,logical_tflops,workspace_bytes,warmup,repeat,"
-              "flush_bytes,build_type,gpu,cuda_runtime,op,subset,selected_assignments\n";
+              "flush_bytes,build_type,gpu,cuda_runtime,op,subset,selected_assignments,"
+              "operand_bytes,effective_gbps,allowed_bf16_compute_bound_us,aggregate_allowed_"
+              "roofline_bound_us\n";
     for (const Result& result : results) {
         const double seconds            = result.stats.median_us * 1.0e-6;
         const double useful_weight_gbps = unique_weight_bytes(result) / seconds / 1.0e9;
+        const double memory_bound       = operand_bytes(result) / (read_gbps * 1000);
+        const double compute_bound =
+            logical_flops(result) / (bench::kRoofline.bf16_f32_tflops * 1.0e6);
+        const double roofline_bound = std::isfinite(memory_bound) && std::isfinite(compute_bound)
+                                          ? std::max(memory_bound, compute_bound)
+                                          : std::numeric_limits<double>::quiet_NaN();
         stream << codec_name(result.codec) << ',' << result.tokens << ','
                << distribution_name(result.distribution) << ',' << result.seed << ','
                << result.unique_experts << ',' << result.adjacent_overlap << ','
                << execution_name(result.execution) << ",public_op_device_body,"
                << cache_name(result.cache) << ',' << result.stats.median_us << ','
                << result.stats.min_us << ',' << result.stats.p95_us << ',' << useful_weight_gbps
-               << ',' << unique_weight_bytes(result) / (peak_memory_gbps * 1000.0) << ','
+               << ',' << bench::format_metric(memory_bound, 6, "") << ','
                << logical_flops(result) / seconds / 1.0e12 << ',' << result.workspace_bytes << ','
                << options.warmup << ',' << options.repeat << ',' << options.flush_bytes << ','
 #ifdef NDEBUG
@@ -915,7 +952,10 @@ void write_csv(const std::string& path, const std::vector<Result>& results, cons
 #endif
                << ',' << context.properties().name << ',' << runtime << ','
                << operation_name(result.operation) << ',' << int(result.subset) << ','
-               << result.selected_assignments << '\n';
+               << result.selected_assignments << ',' << operand_bytes(result) << ','
+               << operand_bytes(result) / (result.stats.median_us * 1000) << ','
+               << bench::format_metric(compute_bound, 6, "") << ','
+               << bench::format_metric(roofline_bound, 6, "") << '\n';
     }
 }
 
@@ -923,21 +963,21 @@ void write_csv(const std::string& path, const std::vector<Result>& results, cons
 
 int main(int argc, char** argv) {
     try {
-        const Options options         = parse_options(argc, argv);
-        auto& context                 = ninfer::bench::device_context();
-        const double peak_memory_gbps = bench::kRoofline.memory_gbs;
+        const Options options  = parse_options(argc, argv);
+        auto& context          = ninfer::bench::device_context();
+        const double read_gbps = bench::kRoofline.sustained_read_gbs;
         std::printf("# gpu=%s compute_capability=%d execution=%s "
                     "timed_scope=public_op_device_body cold_flush_mib=%llu "
-                    "reference_target=%s theoretical_memory=%.1f GB/s\n",
+                    "reference_target=%s sustained_read=%.2f GB/s\n",
                     context.properties().name, context.compute_capability(),
                     options.execution == Execution::Both ? "both"
                                                          : execution_name(options.execution),
                     static_cast<unsigned long long>(options.flush_bytes >> 20),
-                    bench::kRoofline.target, peak_memory_gbps);
+                    bench::kRoofline.target, read_gbps);
 
-        std::printf(
-            "# op=%s subset=%d; memory bound uses unique weights and theoretical bandwidth\n",
-            operation_name(options.operation), int(options.subset));
+        std::printf("# op=%s subset=%d; memory bound uses unique encoded weights and public "
+                    "operands; allowed compute bound uses BF16\n",
+                    operation_name(options.operation), int(options.subset));
         std::vector<Result> results;
         for (CodecProfile profile : selected_profiles(options.codec)) {
             BenchmarkWeights fixture(profile, options.seed,
@@ -945,7 +985,7 @@ int main(int argc, char** argv) {
             for (std::int32_t tokens : selected_tokens(options.tokens)) {
                 std::vector<Result> point =
                     run_point(fixture, profile, tokens, options, context.execution_view());
-                for (const Result& result : point) { print_result(result, peak_memory_gbps); }
+                for (const Result& result : point) { print_result(result); }
                 results.insert(results.end(), std::make_move_iterator(point.begin()),
                                std::make_move_iterator(point.end()));
             }

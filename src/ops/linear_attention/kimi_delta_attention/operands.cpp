@@ -9,7 +9,7 @@ Geometry validate_inputs(const Tensor& q, const Tensor& k, const Tensor& v, cons
                          float lower_bound, float scale, const Tensor& out, Device device) {
     constexpr const char* op = "kimi_delta_attention";
     const Geometry p{q.ne[1], v.ne[1], q.ne[2], q.ne[3]};
-    if (!valid_heads(p.qk_heads, p.value_heads) || p.tokens < 1 || p.batch < 1 || p.batch > 8)
+    if (!valid_heads(p.qk_heads, p.value_heads) || p.tokens < 1 || p.batch < 1)
         throw std::invalid_argument("kimi_delta_attention: invalid head/token/batch geometry");
     if (!std::isfinite(lower_bound) || lower_bound < -5 || lower_bound > 0 ||
         !std::isfinite(scale) || std::abs(scale - 1.0F / std::sqrt(128.0F)) > 1.0e-6F)

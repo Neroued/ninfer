@@ -79,7 +79,7 @@ int run_batch_case(int width, int batch, bool dense) {
     for (int b = 0; b < batch; ++b) {
         anchors[b] = 9173 + 111 * b;
         lengths[b] = 37 + 1009 * b;
-        valid[b]   = dense ? width : 1 + (3 * b) % width;
+        valid[b]   = dense ? width : (3 * b) % (width + 1);
     }
     DeviceBuffer device_anchors = to_device(anchors);
     DeviceBuffer device_lengths = to_device(lengths);
@@ -102,7 +102,7 @@ int run_batch_case(int width, int batch, bool dense) {
     };
     launch();
     CUDA_CHECK(cudaStreamSynchronize(stream));
-    if (width == 16 && batch == 8) {
+    if (width == 16 && (batch == 8 || batch == 17)) {
         cudaGraph_t graph;
         cudaGraphExec_t executable;
         CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
@@ -114,7 +114,7 @@ int run_batch_case(int width, int batch, bool dense) {
         for (int b = 0; b < batch; ++b) {
             anchors[b] += 11;
             lengths[b] += 7;
-            valid[b] = 1 + valid[b] % width;
+            valid[b] = (valid[b] + 1) % (width + 1);
         }
         CUDA_CHECK(cudaMemcpyAsync(device_anchors.data(), anchors.data(), device_anchors.size(),
                                    cudaMemcpyHostToDevice, stream));
@@ -131,8 +131,9 @@ int run_batch_case(int width, int batch, bool dense) {
     std::vector<std::int32_t> expected_ids(width * batch), expected_positions(width * batch);
     for (int b = 0; b < batch; ++b)
         for (int j = 0; j < width; ++j) {
-            expected_ids[b * width + j]       = j == 0 ? anchors[b] : mask;
-            expected_positions[b * width + j] = lengths[b] + std::min(j, valid[b] - 1);
+            expected_ids[b * width + j] = !valid[b] ? 0 : j == 0 ? anchors[b] : mask;
+            expected_positions[b * width + j] =
+                !valid[b] ? 0 : lengths[b] + std::min(j, valid[b] - 1);
         }
     int failures =
         verify_exact("DFlash2 masked ids",
@@ -169,6 +170,10 @@ void add_masked_block_cases(ninfer::test::OpSuite& suite) {
                               std::to_string(batch) + (dense ? "/dense" : "/ragged"),
                           [=] { return run_batch_case(width, batch, dense); },
                           {{"execution", width == 16 && batch == 8 ? "graph" : "eager"}});
+    suite.add("masked_block/batched/w16/b17/ragged", [] { return run_batch_case(16, 17, false); },
+              {{"execution", "graph"}, {"suite", "concurrency"}});
+    suite.add("masked_block/batched/w7/b64/ragged", [] { return run_batch_case(7, 64, false); },
+              {{"suite", "concurrency"}});
     suite.add("masked_block/batched/w7/b3/ragged", [] { return run_batch_case(7, 3, false); },
               {{"execution", "eager"}});
 }

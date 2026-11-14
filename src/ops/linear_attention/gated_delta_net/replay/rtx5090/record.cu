@@ -5,6 +5,7 @@
 #include "core/device.h"
 #include "ops/common/host/operands.h"
 #include <cuda_bf16.h>
+#include <algorithm>
 #include <cstdint>
 
 namespace ninfer::ops::detail::gated_delta_net {
@@ -46,7 +47,13 @@ __global__ __launch_bounds__(128, 2) void record_window_kernel(RecordAccess<Mask
     __shared__ __align__(16) RecordWindow<Capacity> window;
     const auto coord = access.coordinates();
     const int valid = access.active_columns(coord), tid = coord.warp * 32 + coord.lane;
-    for (int i = tid; i < max(valid, 1) * (kStateDim / 8); i += 128) {
+    if constexpr (Masked) {
+        if (!valid) {
+            zero_output_suffix(access, coord, 0, access.width);
+            return;
+        }
+    }
+    for (int i = tid; i < valid * (kStateDim / 8); i += 128) {
         const int token = i / (kStateDim / 8), column = i % (kStateDim / 8) * 8;
         common::cp_async<16, Cache::ca>(&window.key[token][column],
                                         access.key_ptr(coord, token) + column);
@@ -79,10 +86,9 @@ void launch_recurrent_record_fixed(const Tensor& q, const Tensor& k, const Tenso
                                    Tensor& key_record, Tensor& value_record, Tensor& gate_record,
                                    Tensor& out, cudaStream_t stream) {
     const auto heads = HeadMap::of(q.ne[1], v.ne[1]);
-    const dim3 grid(static_cast<unsigned>(v.ne[1]), static_cast<unsigned>(q.ne[3]),
-                    static_cast<unsigned>(kStateDim / kBlockDv));
+    dim3 grid(static_cast<unsigned>(v.ne[1]), 1, static_cast<unsigned>(kStateDim / kBlockDv));
     const dim3 block(common::kWarpSize, kNumWarps, 1);
-    const RecordAccess<Masked> access{
+    RecordAccess<Masked> access{
         static_cast<const __nv_bfloat16*>(q.data),
         static_cast<const __nv_bfloat16*>(k.data),
         static_cast<const __nv_bfloat16*>(v.data),
@@ -102,14 +108,18 @@ void launch_recurrent_record_fixed(const Tensor& q, const Tensor& k, const Tenso
     const auto alignment = reinterpret_cast<std::uintptr_t>(q.data) |
                            reinterpret_cast<std::uintptr_t>(k.data) |
                            reinterpret_cast<std::uintptr_t>(v.data);
-    if (alignment % 16 != 0)
-        recurrent_record_kernel<Masked, false><<<grid, block, 0, stream>>>(access);
-    else if (q.ne[2] <= 4)
-        record_window_kernel<Masked, 4><<<grid, block, 0, stream>>>(access);
-    else if (q.ne[2] <= 8)
-        record_window_kernel<Masked, 8><<<grid, block, 0, stream>>>(access);
-    else
-        record_window_kernel<Masked, 16><<<grid, block, 0, stream>>>(access);
+    for (std::int64_t begin = 0; begin < q.ne[3]; begin += 65535) {
+        grid.y = static_cast<unsigned>(std::min<std::int64_t>(65535, q.ne[3] - begin));
+        if (alignment % 16 != 0)
+            recurrent_record_kernel<Masked, false><<<grid, block, 0, stream>>>(access);
+        else if (q.ne[2] <= 4)
+            record_window_kernel<Masked, 4><<<grid, block, 0, stream>>>(access);
+        else if (q.ne[2] <= 8)
+            record_window_kernel<Masked, 8><<<grid, block, 0, stream>>>(access);
+        else
+            record_window_kernel<Masked, 16><<<grid, block, 0, stream>>>(access);
+        if (begin + grid.y < q.ne[3]) access.advance_rows(grid.y);
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 

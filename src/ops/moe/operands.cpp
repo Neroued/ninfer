@@ -150,6 +150,15 @@ int MoeOperands::input(const Tensor& x, int hidden) {
     return x.ne[1];
 }
 
+void MoeOperands::validity(const MoeTokenValidity& validity, int tokens) {
+    if (!validity.valid_columns.data) return;
+    require(validity.tokens_per_row > 0 && tokens % validity.tokens_per_row == 0,
+            "MoE: token validity differs from flattened input");
+    operand::tensor(validity.valid_columns, DType::I32, {tokens / validity.tokens_per_row}, 4, op_,
+                    "valid columns", device_);
+    read(validity.valid_columns.data, validity.valid_columns.bytes());
+}
+
 void MoeOperands::output(const Tensor& y, int hidden, int tokens, MoeEpilogue mode) {
     validate_output(y.dtype, mode);
     operand::tensor(y, y.dtype, {hidden, tokens}, 16, op_, "destination", device_);

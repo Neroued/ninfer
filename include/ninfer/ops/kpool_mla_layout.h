@@ -65,7 +65,7 @@ struct KpoolRawRecordLayout {
                                                    const Tensor& valid_columns) const;
 };
 
-// Positive Di/W/L and 1<=R<=8; checked Tensor extents and size arithmetic. Each plane starts
+// Positive Di/W/R/L; checked Tensor extents and size arithmetic. Each plane starts
 // at 256-byte alignment, feature contiguous. Metadata and final frame padding are excluded.
 [[nodiscard]] KpoolRawRecordLayout
 plan_kpool_raw_records(LayoutBuilder& builder, std::int32_t index_dim, std::int32_t width,

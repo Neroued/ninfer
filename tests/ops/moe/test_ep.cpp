@@ -82,7 +82,7 @@ int run(Weights& w, CudaExecutionView execution, const Case& c,
     auto invoke = [&] {
         if (c.complete) {
             ops::topk_softmax_swiglu_moe(x, profile, weights, w.subset(), ops::MoeEpilogue::Write,
-                                         y, arena, execution);
+                                         y, {}, arena, execution);
         } else {
             ops::routed_swiglu(x, w.profile(), w.experts(), selected, w.subset(),
                                ops::MoeEpilogue::Write, y, arena, execution);

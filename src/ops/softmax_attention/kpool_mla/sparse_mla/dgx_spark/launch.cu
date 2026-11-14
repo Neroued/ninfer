@@ -117,6 +117,8 @@ void launch_sparse_mla(SparseMlaArguments a, MemorySpan scratch,
     const auto total = std::int64_t(a.tokens) * a.batch;
     for (a.begin = 0; a.begin < total; a.begin += kMlaWindow) {
         a.width            = std::min<std::int64_t>(kMlaWindow, total - a.begin);
+        a.first_row        = a.begin / a.tokens;
+        a.last_row         = (a.begin + a.width - 1) / a.tokens;
         const auto plan    = sparse_mla_plan(profile, storage, a.width, a.batch, envelope, sms);
         a.splits           = plan.splits;
         a.preferred_splits = plan.preferred_splits;

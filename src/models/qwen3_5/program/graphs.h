@@ -2,11 +2,13 @@
 
 #include "core/decode_graph.h"
 #include "models/common/graph_preparation.h"
+#include "models/common/batch.h"
 #include "models/qwen3_5/program/resources.h"
 #include "models/qwen3_5/program/text_graph.h"
 
 #include <functional>
 #include <memory>
+#include <map>
 #include <optional>
 #include <vector>
 
@@ -30,10 +32,10 @@ struct GraphInvocation {
 };
 
 struct GraphSpec {
-    std::uint32_t capacity       = 0;
-    std::uint32_t batch_capacity = 1;
-    std::uint32_t draft_window   = 0;
-    SpeculativeBackend backend   = SpeculativeBackend::None;
+    std::uint32_t capacity = 0;
+    std::shared_ptr<const BatchExecutionPlan> batch_execution;
+    std::uint32_t draft_window = 0;
+    SpeculativeBackend backend = SpeculativeBackend::None;
 };
 
 // Borrowed only during preparation. Bodies operate on the fixed execution frame;
@@ -54,7 +56,7 @@ public:
     void prepare(Resources&, const execution::Parameters&, DeviceContext&, const GraphBodies&,
                  GraphPreparation&);
     [[nodiscard]] bool start(GraphPhase, std::uint32_t batch, std::uint32_t frontier,
-                             CudaExecutionView);
+                             std::uint32_t target_tokens, CudaExecutionView);
     [[nodiscard]] bool poll();
     void cancel();
     void clear();
@@ -95,7 +97,7 @@ private:
     };
 
     GraphSpec spec_;
-    std::vector<Batch> batches_;
+    std::map<std::uint32_t, Batch> batches_;
     execution::TextGraph* pending_ = nullptr;
     std::size_t workspace_peak_    = 0;
 };

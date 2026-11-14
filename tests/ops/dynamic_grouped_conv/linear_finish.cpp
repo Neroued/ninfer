@@ -13,13 +13,13 @@ using namespace ninfer;
 using namespace ninfer::test;
 
 namespace {
-constexpr int H = 4096, G = H / 16, MaxM = 128;
+constexpr int H = 4096, G = H / 16;
 constexpr ReductionCriterion local_criterion{1. / 256, 1. / 256, 2. / 256};
 constexpr ReductionCriterion sum_criterion{1. / 256, 1., 2. / 256};
 
-std::vector<std::uint16_t> input(int k, int seed) {
-    std::vector<std::uint16_t> x(std::size_t(k) * MaxM);
-    for (int c = 0; c < MaxM; ++c)
+std::vector<std::uint16_t> input(int k, int seed, int columns) {
+    std::vector<std::uint16_t> x(std::size_t(k) * columns);
+    for (int c = 0; c < columns; ++c)
         for (int h = 0; h < k; ++h) {
             std::uint32_t z =
                 std::uint32_t(h) * 0x9e3779b9U + std::uint32_t(c + seed) * 0x85ebca6bU;
@@ -33,10 +33,11 @@ std::vector<std::uint16_t> input(int k, int seed) {
 
 std::vector<double> project(const direct_bf16_weight::HostWeight& w,
                             const std::vector<std::uint16_t>& x) {
-    std::vector<double> z(std::size_t(H) * MaxM);
-    parallel_rows(H, std::uint64_t(H) * w.k * MaxM, [&](int a, int b) {
+    const int columns = x.size() / w.k;
+    std::vector<double> z(std::size_t(H) * columns);
+    parallel_rows(H, std::uint64_t(H) * w.k * columns, [&](int a, int b) {
         for (int h = a; h < b; ++h)
-            for (int c = 0; c < MaxM; ++c) {
+            for (int c = 0; c < columns; ++c) {
                 double sum = 0;
                 for (int k = 0; k < w.k; ++k)
                     sum += double(bf16_to_f32(w.bits[std::size_t(h) * w.k + k])) *
@@ -65,7 +66,9 @@ std::vector<double> finish(const std::vector<double>& z, const std::vector<std::
 }
 
 int run(int k, std::span<const std::pair<int, int>> cases) {
-    const auto x0 = input(k, 101), x1 = input(k, 307);
+    int columns = 0;
+    for (const auto [width, batch] : cases) columns = std::max(columns, width * batch);
+    const auto x0 = input(k, 101, columns), x1 = input(k, 307, columns);
     auto neg = x0;
     for (auto& v : neg) v ^= 0x8000;
     std::vector<std::uint16_t> base(4 * H);
@@ -75,7 +78,7 @@ int run(int k, std::span<const std::pair<int, int>> cases) {
         base[2 * H + h] = f32_to_bf16(.375f + (h % 13) / 4096.f);
         base[3 * H + h] = f32_to_bf16(-.15625f + (h % 17) / 8192.f);
     }
-    auto delta = input(G * 2, 701);
+    auto delta = input(G * 2, 701, columns);
     for (auto& v : delta) v = f32_to_bf16(bf16_to_f32(v) / 16.f);
     direct_bf16_weight::DeviceWeight w0(direct_bf16_weight::make_patterned(H, k, 809)),
         w1(direct_bf16_weight::make_patterned(H, k, 811));
@@ -129,7 +132,7 @@ int run(int k, std::span<const std::pair<int, int>> cases) {
         launch();
         verify(1);
         if ((width == 3 && batch == 3) || (width == 7 && batch == 7) ||
-            (width == 16 && batch == 8)) {
+            (width == 16 && batch == 8) || width * batch >= 256) {
             DecodeGraphDefinition definition;
             DecodeGraphExecutable executable;
             definition.capture(cuda.stream(), launch);
@@ -187,13 +190,16 @@ void add_linear_conv_finish_cases(OpSuite& suite) {
     });
     for (int k : {2048, 6144}) {
         const std::vector<std::pair<int, int>> shapes{
-            {2, 1}, {2, 8},  {3, 3},  {4, 1},  {4, 8},  {7, 7},  {8, 1},  {8, 2},  {8, 4}, {8, 8},
-            {9, 8}, {11, 6}, {12, 8}, {13, 5}, {14, 7}, {15, 8}, {16, 1}, {16, 4}, {16, 8}};
+            {2, 1},  {2, 8},  {3, 3},  {4, 1},  {4, 8},   {7, 7},  {8, 1},  {8, 2},
+            {8, 4},  {8, 8},  {9, 8},  {11, 6}, {12, 8},  {13, 5}, {14, 7}, {15, 8},
+            {16, 1}, {16, 4}, {16, 8}, {7, 19}, {4, 128}, {7, 37}, {16, 33}};
         std::vector<OpCase> cases;
-        for (auto [w, b] : shapes)
+        for (auto [w, b] : shapes) {
             cases.push_back({"conv_finish/k" + std::to_string(k) + "/w" + std::to_string(w) + "/b" +
                                  std::to_string(b),
                              {{"format", "bf16"}}});
+            if (b > 8) cases.back().tags.emplace_back("suite", "concurrency");
+        }
         suite.add(std::move(cases), [k, shapes](auto selected) {
             std::vector<std::pair<int, int>> cases;
             for (auto i : selected) cases.push_back(shapes[i]);

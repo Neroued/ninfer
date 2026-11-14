@@ -1,3 +1,4 @@
+#include "ops/common/host/launch.h"
 #include "ninfer/ops/sequence.h"
 #include <cstdint>
 #include <stdexcept>
@@ -17,13 +18,15 @@ __global__ void prepare_ragged_prefix_kernel(
     uint4* __restrict__ destination, std::int32_t* __restrict__ positions,
     std::int32_t* __restrict__ counts, std::int32_t vectors_per_column, std::int32_t width,
     std::int64_t source_column_stride, std::int64_t source_lane_stride) {
-    const int feature_tile         = blockIdx.z;
-    const std::int32_t column      = blockIdx.x;
-    const std::int32_t batch       = static_cast<std::int32_t>(blockIdx.y);
-    const std::int32_t count       = ends[batch] - starts[batch];
-    const bool live                = column < count;
-    const std::int64_t source_base = static_cast<std::int64_t>(lanes[batch]) * source_lane_stride +
-                                     static_cast<std::int64_t>(column) * source_column_stride;
+    const int feature_tile    = blockIdx.z;
+    const std::int32_t column = blockIdx.x;
+    const std::int32_t batch  = static_cast<std::int32_t>(blockIdx.y);
+    const std::int32_t count  = ends[batch] - starts[batch];
+    const bool live           = column < count;
+    const std::int64_t source_base =
+        live ? static_cast<std::int64_t>(lanes[batch]) * source_lane_stride +
+                   static_cast<std::int64_t>(column) * source_column_stride
+             : 0;
     const std::int64_t destination_base =
         (static_cast<std::int64_t>(batch) * width + column) * vectors_per_column;
     const uint4 zero{};
@@ -31,7 +34,8 @@ __global__ void prepare_ragged_prefix_kernel(
          vector < vectors_per_column; vector += gridDim.z * kRaggedPrefixVectorsPerBlock)
         destination[destination_base + vector] = live ? source[source_base + vector] : zero;
     if (feature_tile == 0 && threadIdx.x == 0) {
-        positions[column + width * batch] = starts[batch] + (live ? column : max(count - 1, 0));
+        positions[column + std::int64_t(width) * batch] =
+            starts[batch] + (live ? column : max(count - 1, 0));
         if (column == 0) { counts[batch] = count; }
     }
 }
@@ -43,14 +47,19 @@ void prepare_ragged_prefix_launch(const Tensor& source, const Tensor& lanes, con
     const int tiles   = (vectors + kRaggedPrefixVectorsPerBlock - 1) / kRaggedPrefixVectorsPerBlock;
     // Separate axes avoid per-CTA integer division. Grid stride preserves generic D when
     // feature tiles exceed CUDA's Z limit. Real feature widths use one vector per thread.
-    const dim3 grid(source.ne[1], destination.ne[2], std::min(tiles, 65535));
-    prepare_ragged_prefix_kernel<<<grid, kRaggedPrefixVectorsPerBlock, 0, stream>>>(
-        static_cast<const uint4*>(source.data), static_cast<const std::int32_t*>(lanes.data),
-        static_cast<const std::int32_t*>(starts.data), static_cast<const std::int32_t*>(ends.data),
-        static_cast<uint4*>(destination.data), static_cast<std::int32_t*>(positions.data),
-        static_cast<std::int32_t*>(counts.data), source.ne[0] / 8, source.ne[1],
-        source.nb[1] / static_cast<std::int64_t>(sizeof(uint4)),
-        source.nb[2] / static_cast<std::int64_t>(sizeof(uint4)));
+    common::for_each_token_slice(destination.ne[2], 1, [&](int offset, int count) {
+        const dim3 grid(source.ne[1], count, std::min(tiles, 65535));
+        prepare_ragged_prefix_kernel<<<grid, kRaggedPrefixVectorsPerBlock, 0, stream>>>(
+            static_cast<const uint4*>(source.data),
+            static_cast<const std::int32_t*>(lanes.data) + offset,
+            static_cast<const std::int32_t*>(starts.data) + offset,
+            static_cast<const std::int32_t*>(ends.data) + offset,
+            static_cast<uint4*>(destination.data) + std::int64_t(offset) * source.ne[1] * vectors,
+            static_cast<std::int32_t*>(positions.data) + std::int64_t(offset) * source.ne[1],
+            static_cast<std::int32_t*>(counts.data) + offset, source.ne[0] / 8, source.ne[1],
+            source.nb[1] / static_cast<std::int64_t>(sizeof(uint4)),
+            source.nb[2] / static_cast<std::int64_t>(sizeof(uint4)));
+    });
     CUDA_CHECK(cudaGetLastError());
 }
 

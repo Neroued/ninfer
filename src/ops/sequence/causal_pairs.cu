@@ -1,3 +1,4 @@
+#include "ops/common/host/launch.h"
 #include "ninfer/ops/sequence.h"
 #include "ops/common/host/operands.h"
 
@@ -66,8 +67,7 @@ void prepare_causal_pairs(const CausalPairInputs& in, const CausalPairOutputs& o
     constexpr const char* op = "prepare_causal_pairs";
     const int d = in.hidden.ne[0], w = in.hidden.ne[1], b = in.hidden.ne[2];
     const int p = out.hidden.ne[1], c = out.hidden.ne[2];
-    if (d <= 0 || d % 8 || w < 1 || p < 1 || b < 1 || b > 8 || c < 1 || c > 8 ||
-        (!in.rows.data && c != b))
+    if (d <= 0 || d % 8 || w < 1 || p < 1 || b < 1 || c < 1 || (!in.rows.data && c != b))
         throw std::invalid_argument("prepare_causal_pairs: invalid shape");
     check_hidden(in.hidden, {d, w, b}, "hidden", cuda);
     check_hidden(in.previous_hidden, {d, b}, "previous hidden", cuda);
@@ -122,7 +122,29 @@ void prepare_causal_pairs(const CausalPairInputs& in, const CausalPairOutputs& o
                      static_cast<int*>(out.lengths.data),
                      d / 8,
                      axes};
-    pair_kernel<<<dim3(p, c), 128, 0, cuda.stream()>>>(args);
+    common::for_each_token_slice(c, 1, [&](int offset, int count) {
+        auto slice = args;
+        slice.paired.data += std::int64_t(offset) * slice.paired.z;
+        slice.paired_ids.data += std::int64_t(offset) * slice.paired_ids.y;
+        slice.paired_positions.data += std::int64_t(offset) * slice.paired_positions.y;
+        if (slice.paired_rope.data)
+            slice.paired_rope.data += std::int64_t(offset) * slice.paired_rope.z;
+        slice.lengths += offset;
+        if (slice.rows) {
+            slice.rows += offset;
+        } else {
+            slice.hidden.data += std::int64_t(offset) * slice.hidden.z;
+            slice.previous.data += std::int64_t(offset) * slice.previous.y;
+            slice.ids.data += std::int64_t(offset) * slice.ids.y;
+            slice.positions.data += std::int64_t(offset) * slice.positions.y;
+            if (slice.rope.data) slice.rope.data += std::int64_t(offset) * slice.rope.z;
+            if (slice.previous_rope.data)
+                slice.previous_rope.data += std::int64_t(offset) * slice.previous_rope.y;
+            slice.prefix += offset;
+            slice.skip += offset;
+        }
+        pair_kernel<<<dim3(p, count), 128, 0, cuda.stream()>>>(slice);
+    });
     CUDA_CHECK(cudaGetLastError());
 }
 } // namespace ninfer::ops

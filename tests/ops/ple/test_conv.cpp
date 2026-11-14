@@ -93,7 +93,7 @@ int split_window(DeviceContext& device, bool norm) {
     };
     segment(0, 5, first, f.state_view(), f.record_view().offsets);
     ops::ple_state_extract(f.state_view(), {f.records.tensor, f.batch_view().valid_columns}, first,
-                           middle, device.execution_view());
+                           middle, {}, device.execution_view());
     segment(5, 12, second, middle, Tensor(second_offset.span(), DType::I32, {1}));
     device.synchronize();
     int failures = f.verify(norm, "PLE split windows at t=5");
@@ -102,7 +102,7 @@ int split_window(DeviceContext& device, bool norm) {
         upload_i32(first_count, {a});
         cuda_synchronize();
         ops::ple_state_extract(f.state_view(), {f.records.tensor, f.batch_view().valid_columns},
-                               first, middle, device.execution_view());
+                               first, middle, {}, device.execution_view());
         device.synchronize();
         auto expected = intermediate.host;
         for (int c = 0; c < D; ++c) {
@@ -162,15 +162,18 @@ void add_ple_conv_cases(ninfer::test::OpSuite& suite) {
               [] { return output_in_history_gap(cuda_environment().context); });
     const auto add = [&](int t, int b, int layout, bool inplace, bool norm, bool graph = false,
                          float scale = 1.f) {
-        suite.add("ple_conv/t" + std::to_string(t) + "/b" + std::to_string(b) + "/layout" +
-                      std::to_string(layout) + (inplace ? "/alias" : "/disjoint") +
-                      (norm ? "/norm" : "/plain") + "/scale" + std::to_string(scale) +
-                      (graph ? "/graph" : "/eager"),
-                  [=] {
-                      return run(cuda_environment().context, t, b, layout, inplace, norm, graph,
-                                 scale);
-                  },
-                  {{"execution", graph ? "graph" : "eager"}});
+        std::vector<std::pair<std::string, std::string>> tags{
+            {"execution", graph ? "graph" : "eager"}};
+        if (b > 8) tags.emplace_back("suite", "concurrency");
+        suite.add(
+            "ple_conv/t" + std::to_string(t) + "/b" + std::to_string(b) + "/layout" +
+                std::to_string(layout) + (inplace ? "/alias" : "/disjoint") +
+                (norm ? "/norm" : "/plain") + "/scale" + std::to_string(scale) +
+                (graph ? "/graph" : "/eager"),
+            [=] {
+                return run(cuda_environment().context, t, b, layout, inplace, norm, graph, scale);
+            },
+            std::move(tags));
     };
     for (bool norm : {false, true}) {
         suite.add(std::string("ple_conv/short_record/") + (norm ? "norm" : "plain"),
@@ -181,6 +184,7 @@ void add_ple_conv_cases(ninfer::test::OpSuite& suite) {
             add(t, t % 2 ? 1 : 8, 0, t % 3 == 0, norm, t == 1 || t == 9 || t == 16);
         for (int layout : {1, 2}) add(13, 3, layout, true, norm, true);
         for (float scale : {0.f, 1e-5f}) add(4, 2, 0, false, norm, true, scale);
+        add(3, 17, 0, true, norm, true);
         add(1024, 1, 0, false, norm);
         add(4097, 1, 0, true, norm);
         if (norm) {

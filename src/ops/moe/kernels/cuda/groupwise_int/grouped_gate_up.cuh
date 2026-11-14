@@ -17,19 +17,18 @@ using common::mma_bf16;
 using common::ldmatrix_x2;
 using common::ldmatrix_x4;
 
-enum class GateUpDensity { Any, Spread, Packed };
-
 template <class Shape, class Access, int ExpertWarps, int ExpertBN, int Stages,
-          GateUpDensity Density>
+          GroupDensity Density, int BlockK = 64>
 __global__ __launch_bounds__(ExpertWarps * 32, 3) void grouped_q4_gate_up(
     const __nv_bfloat16* __restrict__ x, const int* __restrict__ packed_token,
     const int* __restrict__ expert_offsets, const int* __restrict__ route_job_experts,
     const int* __restrict__ route_job_columns, const GroupedInfo* __restrict__ info, Access weights,
     __nv_bfloat16* __restrict__ activation) {
-    constexpr int BM = 64, BK = 64;
+    constexpr int BM = 64, BK = BlockK, GroupsPerTile = BK / 64;
+    static_assert(BK == 64 || BK == 128);
     if (info->direct) { return; }
-    if constexpr (Density != GateUpDensity::Any) {
-        if (bool(info->spread) != (Density == GateUpDensity::Spread)) { return; }
+    if constexpr (Density != GroupDensity::Any) {
+        if (bool(info->spread) != (Density == GroupDensity::Spread)) { return; }
     }
     constexpr int ExpertThreads = ExpertWarps * 32;
     constexpr int GroupsPerRow  = Shape::hidden / 64;
@@ -42,7 +41,7 @@ __global__ __launch_bounds__(ExpertWarps * 32, 3) void grouped_q4_gate_up(
                   "the staging loop is unrolled, so every thread must take the same column count");
     __shared__ __align__(16) __nv_bfloat16 As[BM * BK];
     __shared__ __align__(16) __nv_bfloat16 Bs[Stages][ExpertBN * BK];
-    __shared__ __align__(16) std::uint8_t Cr[Stages][BM * 32];
+    __shared__ __align__(16) std::uint8_t Cr[Stages][BM * (BK / 2)];
     __shared__ __align__(16) std::uint8_t Sr[BM * GroupsPerRow * 2];
 
     const int tid  = static_cast<int>(threadIdx.x);
@@ -112,19 +111,20 @@ __global__ __launch_bounds__(ExpertWarps * 32, 3) void grouped_q4_gate_up(
                 cp_async_zfill<16, Cache::cg>(dst, src_row[i] + k0 + k8 * 8, col < cols ? 16 : 0);
             }
 
-            const int group = kt;
-            for (int item = tid; item < BM * 2; item += ExpertThreads) {
-                const int row  = item >> 1;
-                const int half = item & 1;
+            constexpr int ChunksPerRow = (BK / 2) / 16;
+            for (int item = tid; item < BM * ChunksPerRow; item += ExpertThreads) {
+                const int row   = item / ChunksPerRow;
+                const int chunk = item % ChunksPerRow;
                 const std::int64_t gi =
-                    static_cast<std::int64_t>(global_row(row)) * GroupsPerRow + group;
-                cp_async<16, Cache::cg>(&Cr[stage][row * 32 + half * 16],
-                                        &codes[gi * 32 + half * 16]);
+                    static_cast<std::int64_t>(global_row(row)) * GroupsPerRow + kt * GroupsPerTile;
+                cp_async<16, Cache::cg>(&Cr[stage][row * (BK / 2) + chunk * 16],
+                                        &codes[gi * 32 + chunk * 16]);
             }
         };
 
         auto decode_weight = [&](int stage) {
-            constexpr int CodeChunksPerRow = common::Q4RowSplitStorage::kCodeBytesPerGroup / 4;
+            constexpr int CodeChunksPerRow =
+                GroupsPerTile * common::Q4RowSplitStorage::kCodeBytesPerGroup / 4;
             static_assert(CodeChunksPerRow * 8 == BK,
                           "a row of codes must decode to exactly the tile's k width");
             for (int item = tid; item < BM * CodeChunksPerRow; item += ExpertThreads) {
@@ -132,7 +132,8 @@ __global__ __launch_bounds__(ExpertWarps * 32, 3) void grouped_q4_gate_up(
                 const int chunk = item - row * CodeChunksPerRow;
                 unsigned decoded[4];
                 Q4MmaDecodeAtom::decode_eight(
-                    *reinterpret_cast<const unsigned*>(&Cr[stage][row * 32 + chunk * 4]), decoded);
+                    *reinterpret_cast<const unsigned*>(&Cr[stage][row * (BK / 2) + chunk * 4]),
+                    decoded);
                 store_vec(&As[row * BK + common::swizzle_xor_64(row, chunk * 8)],
                           make_int4(static_cast<int>(decoded[0]), static_cast<int>(decoded[1]),
                                     static_cast<int>(decoded[2]), static_cast<int>(decoded[3])));
@@ -156,55 +157,64 @@ __global__ __launch_bounds__(ExpertWarps * 32, 3) void grouped_q4_gate_up(
             __syncthreads();
 
             if (warp * WarpCols < cols) {
-                float partial[4][WarpNT][4] = {};
 #pragma unroll
-                for (int ki = 0; ki < BK / 16; ++ki) {
-                    unsigned af[4][4];
-                    unsigned bf[WarpNT][2];
+                for (int group = 0; group < GroupsPerTile; ++group) {
+                    float partial[4][WarpNT][4] = {};
 #pragma unroll
-                    for (int mi = 0; mi < 4; ++mi) {
-                        const int row = mi * 16 + a_rowoff;
-                        const int col = ki * 16 + a_coloff;
-                        ldmatrix_x4(af[mi][0], af[mi][1], af[mi][2], af[mi][3],
-                                    smem_addr(&As[row * BK + common::swizzle_xor_64(row, col)]));
-                    }
-#pragma unroll
-                    for (int ni = 0; ni < WarpNT; ++ni) {
-                        const int brow = warp * WarpCols + ni * 8 + b_rin;
-                        const int bcol = ki * 16 + b_koff;
-                        ldmatrix_x2(
-                            bf[ni][0], bf[ni][1],
-                            smem_addr(&Bs[stage][brow * BK + common::swizzle_xor_64(brow, bcol)]));
+                    for (int ki = 0; ki < 64 / 16; ++ki) {
+                        unsigned af[4][4];
+                        unsigned bf[WarpNT][2];
 #pragma unroll
                         for (int mi = 0; mi < 4; ++mi) {
-                            mma_bf16(partial[mi][ni][0], partial[mi][ni][1], partial[mi][ni][2],
-                                     partial[mi][ni][3], af[mi][0], af[mi][1], af[mi][2], af[mi][3],
-                                     bf[ni][0], bf[ni][1]);
+                            const int row = mi * 16 + a_rowoff;
+                            const int col = group * 64 + ki * 16 + a_coloff;
+                            ldmatrix_x4(
+                                af[mi][0], af[mi][1], af[mi][2], af[mi][3],
+                                smem_addr(&As[row * BK + common::swizzle_xor_64(row, col)]));
+                        }
+#pragma unroll
+                        for (int ni = 0; ni < WarpNT; ++ni) {
+                            const int brow = warp * WarpCols + ni * 8 + b_rin;
+                            const int bcol = group * 64 + ki * 16 + b_koff;
+                            ldmatrix_x2(
+                                bf[ni][0], bf[ni][1],
+                                smem_addr(
+                                    &Bs[stage][brow * BK + common::swizzle_xor_64(brow, bcol)]));
+#pragma unroll
+                            for (int mi = 0; mi < 4; ++mi) {
+                                mma_bf16(partial[mi][ni][0], partial[mi][ni][1], partial[mi][ni][2],
+                                         partial[mi][ni][3], af[mi][0], af[mi][1], af[mi][2],
+                                         af[mi][3], bf[ni][0], bf[ni][1]);
+                            }
                         }
                     }
-                }
 #pragma unroll
-                for (int mi = 0; mi < 4; ++mi) {
-                    const int row0 = mi * 16 + gid;
-                    const int row1 = row0 + 8;
-                    float scale0 =
-                        lid == 0
-                            ? __half2float(__ushort_as_half(*reinterpret_cast<const std::uint16_t*>(
-                                  &Sr[(row0 * GroupsPerRow + kt) * 2])))
-                            : 0.0f;
-                    float scale1 =
-                        lid == 0
-                            ? __half2float(__ushort_as_half(*reinterpret_cast<const std::uint16_t*>(
-                                  &Sr[(row1 * GroupsPerRow + kt) * 2])))
-                            : 0.0f;
-                    scale0 = __shfl_sync(0xffffffffu, scale0, gid * 4);
-                    scale1 = __shfl_sync(0xffffffffu, scale1, gid * 4);
+                    for (int mi = 0; mi < 4; ++mi) {
+                        const int row0 = mi * 16 + gid;
+                        const int row1 = row0 + 8;
+                        float scale0 =
+                            lid == 0
+                                ? __half2float(
+                                      __ushort_as_half(*reinterpret_cast<const std::uint16_t*>(
+                                          &Sr[(row0 * GroupsPerRow + kt * GroupsPerTile + group) *
+                                              2])))
+                                : 0.0f;
+                        float scale1 =
+                            lid == 0
+                                ? __half2float(
+                                      __ushort_as_half(*reinterpret_cast<const std::uint16_t*>(
+                                          &Sr[(row1 * GroupsPerRow + kt * GroupsPerTile + group) *
+                                              2])))
+                                : 0.0f;
+                        scale0 = __shfl_sync(0xffffffffu, scale0, gid * 4);
+                        scale1 = __shfl_sync(0xffffffffu, scale1, gid * 4);
 #pragma unroll
-                    for (int ni = 0; ni < WarpNT; ++ni) {
-                        acc[mi][ni][0] = fmaf(partial[mi][ni][0], scale0, acc[mi][ni][0]);
-                        acc[mi][ni][1] = fmaf(partial[mi][ni][1], scale0, acc[mi][ni][1]);
-                        acc[mi][ni][2] = fmaf(partial[mi][ni][2], scale1, acc[mi][ni][2]);
-                        acc[mi][ni][3] = fmaf(partial[mi][ni][3], scale1, acc[mi][ni][3]);
+                        for (int ni = 0; ni < WarpNT; ++ni) {
+                            acc[mi][ni][0] = fmaf(partial[mi][ni][0], scale0, acc[mi][ni][0]);
+                            acc[mi][ni][1] = fmaf(partial[mi][ni][1], scale0, acc[mi][ni][1]);
+                            acc[mi][ni][2] = fmaf(partial[mi][ni][2], scale1, acc[mi][ni][2]);
+                            acc[mi][ni][3] = fmaf(partial[mi][ni][3], scale1, acc[mi][ni][3]);
+                        }
                     }
                 }
             }

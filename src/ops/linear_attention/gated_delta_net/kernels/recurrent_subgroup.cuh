@@ -8,6 +8,24 @@ namespace subgroup {
 
 inline constexpr int kWindowSize = 16;
 
+template <bool GroupStateTiles>
+__device__ __forceinline__ RecurrentCoordinates coordinates(HeadMap heads, int batch) {
+    if constexpr (!GroupStateTiles)
+        return make_coordinates(batch, 0, static_cast<int>(blockIdx.z), heads);
+    constexpr int tiles = kStateDim / kBlockDv;
+    const int head = blockIdx.x / tiles, tile = blockIdx.x % tiles;
+    return {static_cast<int>(threadIdx.x),
+            static_cast<int>(threadIdx.y),
+            batch,
+            0,
+            tile,
+            static_cast<unsigned>(head),
+            static_cast<unsigned>(heads.qk_head(head)),
+            static_cast<unsigned>(tile * kBlockDv + threadIdx.y * kDvPerWarp),
+            static_cast<unsigned>(threadIdx.x * kQkPerLane)};
+}
+
+
 enum class Mode { Update, Record, Fold };
 
 template <int Capacity>

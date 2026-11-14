@@ -2,7 +2,9 @@
 #include "op_measurement.cuh"
 
 namespace ninfer::bench::rmsnorm {
-enum class Op { Plain, Offset, Silu, Sigmoid };
+enum class Op { Plain, Offset, PlainInverse, OffsetInverse, Silu, Sigmoid };
+
+inline bool writes_inverse(Op op) { return op == Op::PlainInverse || op == Op::OffsetInverse; }
 
 struct Options {
     measurement::Options timing;
@@ -19,6 +21,10 @@ inline const char* name(Op op) {
         return "rmsnorm";
     case Op::Offset:
         return "offset";
+    case Op::PlainInverse:
+        return "rmsnorm-inverse";
+    case Op::OffsetInverse:
+        return "offset-inverse";
     case Op::Silu:
         return "silu-gated";
     case Op::Sigmoid:
@@ -34,7 +40,8 @@ inline Options parse(int argc, char** argv) {
         const std::string_view flag = argv[i];
         if (flag == "--help" || flag == "-h") {
             std::cout
-                << "RMSNorm Op benchmark\n  --op rmsnorm|offset|silu-gated|sigmoid-gated\n"
+                << "RMSNorm Op benchmark\n"
+                   "  --op rmsnorm|offset|rmsnorm-inverse|offset-inverse|silu-gated|sigmoid-gated\n"
                    "  --dim D --heads H --batch B --tokens M[,M...] or --sweep START:END[:STEP]\n"
                    "  --reserve-tokens M --condition-us N --epsilon E\n";
             measurement::help();
@@ -46,6 +53,10 @@ inline Options parse(int argc, char** argv) {
                 o.op = Op::Plain;
             else if (value == "offset")
                 o.op = Op::Offset;
+            else if (value == "rmsnorm-inverse")
+                o.op = Op::PlainInverse;
+            else if (value == "offset-inverse")
+                o.op = Op::OffsetInverse;
             else if (value == "silu-gated")
                 o.op = Op::Silu;
             else if (value == "sigmoid-gated")

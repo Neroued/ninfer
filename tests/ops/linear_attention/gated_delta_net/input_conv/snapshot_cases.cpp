@@ -14,6 +14,29 @@ Weight capacity_weight(QType format, std::int32_t rows, std::int32_t columns) {
     return weight;
 }
 
+void append_batch_cases(std::vector<SnapshotCase>& result, Profile profile) {
+    using Policy      = ops::LinearPolicy;
+    const auto policy = profile.format == QType::NVFP4                 ? Policy::AllowA4
+                        : profile.format == QType::FP8_E4M3FN_ROW_BF16 ? Policy::AllowA8
+                                                                       : Policy::A16Only;
+    for (const auto [width, batch] : {std::pair{1, 9}, std::pair{4, 17}}) {
+        std::vector<int> valid(batch);
+        for (int row = 0; row < batch; ++row) valid[row] = row % 3 == 1 ? 0 : width - row % width;
+        result.push_back({.width     = width,
+                          .policy    = policy,
+                          .graph     = true,
+                          .batch     = batch,
+                          .valid     = std::move(valid),
+                          .conv_seed = 987});
+    }
+    result.push_back({.width = 3, .batch = 1, .valid = {0}, .conv_seed = 991});
+    if (profile.qk_rows == 1024)
+        for (const int batch : {17, 32})
+            result.push_back({.width = 1, .graph = true, .batch = batch, .conv_seed = 997});
+    if (profile.format == QType::Q8_G32_FP16 && profile.hidden == 2560)
+        result.push_back({.width = 1, .batch = 64, .conv_seed = 997});
+}
+
 std::vector<SnapshotCase> cases(Profile p) {
     using Policy = ops::LinearPolicy;
     std::vector<SnapshotCase> result;
@@ -41,6 +64,7 @@ std::vector<SnapshotCase> cases(Profile p) {
                 batch(t, b, std::move(valid), 739);
                 result.back().graph = (b == 2 && t == 6) || (b == 8 && t == 16);
             }
+        append_batch_cases(result, p);
         return result;
     }
     if (p.format == QType::Q4_G64_FP16) {
@@ -108,8 +132,9 @@ std::vector<SnapshotCase> cases(Profile p) {
     }
     // The persistent single-token publication has its own public entry and offset mapping.
     batch(1, 1, {}, 977U);
-    result.back().graph = true;
+    result.back().graph          = true;
     result.back().full_reference = p.format == QType::NVFP4;
+    append_batch_cases(result, p);
     return result;
 }
 } // namespace
@@ -226,7 +251,7 @@ int snapshot_capacity_contract() {
             batch, min_width, max_width);
     };
     for (auto policy : {ops::LinearPolicy::A16Only, ops::LinearPolicy::AllowA8}) {
-        for (int batch : {1, 2, 8}) {
+        for (int batch : {1, 2, 8, 9, 17, 64}) {
             std::size_t peak = 0;
             for (int width = 1; width <= 16; ++width) {
                 peak = std::max(peak, fp8_snapshot_capacity(policy, batch, width, width));
@@ -237,6 +262,11 @@ int snapshot_capacity_contract() {
             }
         }
     }
+    try {
+        (void)ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(q8_capacity_weights,
+                                                                         INT32_MAX, 2, 2);
+        ++failures;
+    } catch (const std::invalid_argument&) {}
     return failures;
 }
 
@@ -257,10 +287,13 @@ int main(int argc, char** argv) {
                              std::to_string(profile.hidden) + "/t" + std::to_string(c.width) +
                              (c.batch ? "/batch" + std::to_string(c.batch) : "/single") + "/" +
                              policy_name(c.policy) + (c.graph ? "/graph" : "/eager");
+            if (std::find(c.valid.begin(), c.valid.end(), 0) != c.valid.end()) id += "/inactive";
             catalogue.push_back({id,
                                  {{"format", profile.name},
                                   {"policy", policy_name(c.policy)},
                                   {"execution", c.graph ? "graph" : "eager"}}});
+            if (c.batch > 8 || std::find(c.valid.begin(), c.valid.end(), 0) != c.valid.end())
+                catalogue.back().tags.emplace_back("suite", "concurrency");
         }
         suite.add(std::move(catalogue), [=](auto selected) {
             Weights weights(profile, false);

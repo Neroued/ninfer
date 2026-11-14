@@ -17,7 +17,8 @@ void require(bool value, const char* message) {
 // Storage geometry without model weights or arithmetic admission. Workspace is a separate
 // contract qualified by Op tests and the real startup check.
 glm::ExecutionPlan storage_plan(unsigned rank, bool mtp, KvCacheStorage storage,
-                                KvCacheVectorFormat index_format, bool dflash = false) {
+                                KvCacheVectorFormat index_format, bool dflash = false,
+                                unsigned concurrency = 3) {
     auto profile           = std::make_shared<glm::execution::ModelProfile>();
     auto& c                = profile->config.text;
     c.hidden               = 4096;
@@ -42,18 +43,23 @@ glm::ExecutionPlan storage_plan(unsigned rank, bool mtp, KvCacheStorage storage,
     }
     glm::ExecutionPlan p;
     p.profile = std::move(profile);
-    p.shape   = {129,  3,    128, mtp ? 3U : 0U, storage, index_format, EnginePurpose::Generation,
-                 true, false};
+    p.shape   = {
+        129,  concurrency, 128, mtp ? 3U : 0U, storage, index_format, EnginePurpose::Generation,
+        true, false};
     p.shape.speculative = mtp ? SpeculativeBackend::Mtp : SpeculativeBackend::None;
     if (dflash) {
         p.shape.speculative  = SpeculativeBackend::DFlash2;
         p.shape.draft_tokens = 7;
     }
+    p.batches = std::make_shared<const models::BatchExecutionPlan>(
+        models::make_batch_execution_spec(concurrency, 2, true));
     p.state = glm::plan_state(*p.profile);
     LayoutBuilder b;
-    p.main = glm::plan_cache(b, c.mla, 11, 129, 3, glm::latent_storage(storage), index_format);
+    p.main =
+        glm::plan_cache(b, c.mla, 11, 129, concurrency, glm::latent_storage(storage), index_format);
     if (mtp)
-        p.mtp = glm::plan_cache(b, c.mla, 1, 129, 3, glm::latent_storage(storage), index_format);
+        p.mtp = glm::plan_cache(b, c.mla, 1, 129, concurrency, glm::latent_storage(storage),
+                                index_format);
     p.frame            = glm::plan_frame(b, *p.profile, p.shape);
     p.fixed_bytes      = b.finish(256);
     p.mapping_elements = p.main.tables.page_offsets.region.bytes / 8;
@@ -87,6 +93,7 @@ struct Fixture {
             p.capacity = capacities[rank];
             descriptions.push_back({rank,
                                     p.shape,
+                                    p.batches->spec(),
                                     glm::describe_state(p.state),
                                     glm::describe_context(p),
                                     {},
@@ -207,6 +214,41 @@ void dflash_storage() {
             "owner-tail migration included TP-local cyclic history");
 }
 
+void capacity_views() {
+    const auto p =
+        storage_plan(0, true, KvCacheStorage::BFloat16, KvCacheVectorFormat::BFloat16, false, 256);
+    auto view                  = p.frame;
+    const auto records         = view.main_records;
+    const auto backing         = view.host_ingress;
+    const auto initial_ingress = view.ingress.bytes;
+    glm::reshape_frame_controls(view, {20, 6}, p.shape.draft_tokens + 1);
+    require(view.rows.live_rows.shape[0] == 20 && view.decode.valid_columns.shape[0] == 20 &&
+                view.attention.live_rows.shape[0] == 6 && view.attention.from_gather.shape[0] == 20,
+            "physical frame confused global and attention capacities");
+    require(view.ingress.bytes < initial_ingress && view.host_ingress == backing &&
+                view.main_records.raw_keys.region == records.raw_keys.region,
+            "frame view changed its backing or retained maximum-capacity ingress");
+    const auto sampling = view.sampling->region;
+    const auto extents  = view.speculative->extents.region;
+    const auto output   = view.result_egress;
+    glm::reshape_frame_controls(view, {20, 20}, p.shape.draft_tokens + 1);
+    require(view.sampling->region == sampling && view.speculative->extents.region == extents &&
+                view.result_egress == output,
+            "attention geometry changed global decision addresses");
+    const auto draft_step =
+        view.mtp->draft_steps[2].ids.region.offset - view.speculative->drafts.region.offset;
+    require(draft_step == 20 * sizeof(TokenId),
+            "draft history retained allocation-capacity stride");
+    auto keys          = records.raw_keys;
+    keys.region.offset = 0;
+    HostBuffer memory(keys.region.bytes);
+    const auto raw   = keys.bind(memory.span());
+    const auto small = raw.slice(2, 0, 6);
+    require(small.ne[2] == 6 && small.nb[3] == raw.nb[3] &&
+                small.nb[3] == 128ULL * 4 * 256 * sizeof(std::uint16_t),
+            "small local Kpool record view changed allocated layer stride");
+}
+
 void gpu() {
     DeviceContext device;
     Fixture f(true);
@@ -255,6 +297,7 @@ int main(int argc, char** argv) {
         if (std::string_view(argv[1]) == "--host") {
             host();
             dflash_storage();
+            capacity_views();
         } else {
             require(std::string_view(argv[1]) == "--gpu", "invalid resource test mode");
             int count = 0;

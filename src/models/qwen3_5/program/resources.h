@@ -54,6 +54,7 @@ struct ResourceLayout {
     std::size_t bytes              = 0;
 
     [[nodiscard]] std::size_t pinned_bytes() const;
+    [[nodiscard]] std::size_t pinned_context_counts_bytes() const;
     [[nodiscard]] std::vector<RecordSpec> context_records() const;
 };
 

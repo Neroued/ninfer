@@ -386,11 +386,11 @@ std::vector<int> Fixture::check_routes(int tokens, MemoryArena& workspace, CudaE
     auto selected = routes(tokens);
     if (shape.clamped)
         ops::topk_sigmoid_route(x(tokens), sigmoid_profile().routing, sigmoid_weights().control,
-                                sigmoid_weights().correction_bias, selected, workspace, cuda);
+                                sigmoid_weights().correction_bias, selected, {}, workspace, cuda);
     else {
         Tensor shared(impl_->shared_coefficients.span(), DType::FP32, {tokens});
         ops::topk_softmax_route(x(tokens), {shape.hidden, shape.experts, shape.top_k},
-                                softmax_weights().control, selected, shared, workspace, cuda);
+                                softmax_weights().control, selected, shared, {}, workspace, cuda);
     }
     CUDA_CHECK(cudaStreamSynchronize(cuda.stream()));
     std::vector<int> got(std::size_t(shape.top_k) * tokens), histogram(shape.experts);

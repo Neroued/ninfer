@@ -169,6 +169,12 @@ void add_rmsnorm_pack_tail_cases(ninfer::test::OpSuite& suite) {
         suite.add("rmsnorm_pack_tail/glm/w" + std::to_string(width) + "/b" + std::to_string(batch),
                   [=] { return run_case(width, batch, 1800U, false, 4096, 1.e-5F); });
     }
+    suite.add("rmsnorm_pack_tail/glm/w16/b17",
+              [] { return run_case(16, 17, 1811U, true, 4096, 1.e-5F); },
+              {{"execution", "graph"}, {"suite", "concurrency"}});
+    suite.add("rmsnorm_pack_tail/glm/w2/b64",
+              [] { return run_case(2, 64, 1813U, true, 4096, 1.e-5F); },
+              {{"execution", "graph"}, {"suite", "concurrency"}});
     suite.add("rmsnorm_pack_tail/glm/graph",
               [] { return run_case(8, 8, 1801U, true, 4096, 1.e-5F); }, {{"execution", "graph"}});
     suite.add("rmsnorm_pack_tail/glm/epsilon",

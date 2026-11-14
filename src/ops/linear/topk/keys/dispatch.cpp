@@ -2,6 +2,8 @@
 #include "core/platform.h"
 
 namespace ninfer::ops::detail::topk_keys {
+int large_threshold(QType type) { return type == QType::Q4_G64_FP16 ? 256 : 128; }
+
 Plan select(QType type, int rows, int k, LinearPolicy policy, int columns) {
     if (!valid_linear_policy(policy) || columns < 1 || columns > kLinearTopKMaxChunkColumns)
         throw std::invalid_argument("linear_topk keys: invalid policy or internal extent");

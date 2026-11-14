@@ -11,7 +11,8 @@ struct SwiGluRoutedOutput {
     RoutedSwiGLUContribution routed;
 
     __device__ __forceinline__ float combine(int row, int token, float value) const {
-        if (!routed.valid_tokens || routed.valid_tokens[token])
+        if (!routed.token_validity.contains(token)) return 0;
+        if (routed.values && (!routed.valid_tokens || routed.valid_tokens[token]))
             value += routed.values[std::int64_t(token) * Rows + row];
         return value;
     }

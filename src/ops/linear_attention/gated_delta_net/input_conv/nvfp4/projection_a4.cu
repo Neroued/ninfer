@@ -47,6 +47,11 @@ struct Plan {
 Plan select_projection(int tokens) {
     if (NINFER_TARGET_RTX5090 && tokens <= 16)
         return {Nvfp4ScaleLayout::RowMajor, launch_gemm<M32N64, true>, true};
+    if (NINFER_TARGET_SPARK) {
+        if (tokens > 128) return {Nvfp4ScaleLayout::Tiled256, launch_tma};
+        if (tokens > 64) return {Nvfp4ScaleLayout::RowMajor, launch_gemm<M128N128Pipelined>};
+        if (tokens > 32) return {Nvfp4ScaleLayout::RowMajor, launch_gemm<M64N128>};
+    }
     if (tokens >= 512) return {Nvfp4ScaleLayout::Tiled256, launch_tma};
     if (tokens <= 64) return {Nvfp4ScaleLayout::RowMajor, launch_gemm<M32N64>};
     if (tokens <= 96) return {Nvfp4ScaleLayout::RowMajor, launch_gemm<M32N128>};

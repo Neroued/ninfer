@@ -101,6 +101,7 @@ ContextProgress detail::SessionImpl::complete_context() {
             result.private_points                    = std::move(tx->carried);
             result.retired_checkpoints               = std::move(tx->retired);
             p.sequences[tx->lane]                    = std::move(tx->binding);
+            p.resident_sequences.emplace(s.id, &s);
             tx->clones.clear();
         } else if (auto* tx = std::get_if<detail::CaptureOperation>(&operation.action)) {
             auto& s = *p.sequences[tx->lane];

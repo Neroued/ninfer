@@ -166,7 +166,7 @@ void DFlashRun::finish() {
     ops::candidate_selector_path(v.gathered, v.projected, inputs_.anchors, p.predecessor_codebook,
                                  p.successor_codebook, profile.public_tokens, inputs_.frontiers,
                                  inputs_.sampling, outputs_.candidate_ids, outputs_.drafts,
-                                 outputs_.proposal_q, arena, cuda_);
+                                 outputs_.proposal_q, inputs_.live_rows, arena, cuda_);
 }
 
 void draft_append_context(const Parameters& p, DraftExecution e, const Tensor& features,

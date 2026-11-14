@@ -24,7 +24,7 @@ void validate_kv(const detail::qsa::ViewValidation& v, const QsaKvProjectionView
     const int tokens = p.key.ne[2], rows = p.key.ne[3], axes = rope_positions.ne[1];
     const int kv_heads = p.key.ne[1];
     v.require(detail::qsa::registered_query_heads(kv_heads) != 0, "unsupported head geometry");
-    v.require(tokens > 0 && rows >= 1 && rows <= 8 && (axes == 1 || axes == 3), "T/B/A");
+    v.require(tokens > 0 && rows >= 1 && (axes == 1 || axes == 3), "T/B/A");
     v.require(parameters.rms_epsilon > 0 && std::isfinite(parameters.rms_epsilon) &&
                   parameters.rope_theta > 0 && std::isfinite(parameters.rope_theta),
               "epsilon/theta");

@@ -143,9 +143,14 @@ void routed_swiglu(const Tensor& x, const RoutedSwiGLUProfile& profile,
         const auto offset = std::size_t(t) * profile.top_k;
         for (int j = 0; j < profile.top_k; ++j) {
             const int expert = ids[offset + j];
-            require(expert >= 0 && expert < profile.experts &&
+            require(expert >= -1 && expert < profile.experts &&
                         std::isfinite(coefficients[offset + j]),
                     "routed_swiglu CPU: invalid route ID or coefficient");
+            if (expert == -1) {
+                require(coefficients[offset + j] == 0,
+                        "routed_swiglu CPU: absent route must have zero coefficient");
+                continue;
+            }
             for (int previous = 0; previous < j; ++previous) {
                 require(expert != ids[offset + previous], "routed_swiglu CPU: duplicate route ID");
             }

@@ -187,6 +187,10 @@ Session::evaluate_recovery(std::span<const CheckpointHandle> advertised) const {
 
 std::size_t Session::checkpoint_extent() const noexcept { return impl_->checkpoints.size(); }
 
+std::uint64_t Session::checkpoint_catalog_revision() const noexcept {
+    return impl_->checkpoints.revision();
+}
+
 std::vector<runtime::ContextTransferRequirement>
 Session::checkpoint_restore_requirements(CheckpointHandle h) const {
     return impl_->checkpoints.at(h).snapshot.restore_requirements(impl_->directory);
@@ -350,7 +354,7 @@ std::optional<runtime::ExecutionTicket> Session::start_replay(SequenceHandle h) 
 
 std::optional<runtime::ExecutionTicket>
 Session::start_decode(std::span<const SequenceHandle> h, std::span<const runtime::RoundBudget> b,
-                      std::span<const bool> c) {
+                      std::span<const std::uint8_t> c) {
     return impl_->start_decode(h, b, c);
 }
 
@@ -418,12 +422,13 @@ SessionImpl::SessionImpl(std::shared_ptr<const ModelDefinition> definition_in, S
       max_concurrency(plan.max_concurrency), prefill_chunk(plan.prefill_chunk),
       draft_window(plan.draft_window), speculative_backend(plan.speculative_backend),
       context_cache(plan.context_cache), vision_enabled(plan.profile->options.vision),
-      causal_scoring(plan.causal_scoring),
+      causal_scoring(plan.causal_scoring), sequences(max_concurrency), requests(max_concurrency),
+      lane_epochs(max_concurrency), lane_marks(max_concurrency),
       recovery_metadata(directory.metadata_budget(), plan.causal_scoring ? 0 : plan.max_concurrency,
                         1, 1,
                         PreparedCaptureBacking::cache_bytes(
                             plan.capacity, plan.causal_scoring ? 0 : plan.max_concurrency)) {
-    if (!definition || !plan.profile || plan.context.pools.empty())
+    if (!definition || !plan.profile || !plan.batch_execution || plan.context.pools.empty())
         throw std::invalid_argument("Session preparation is incomplete");
     checkpoints.configure(Checkpoints::capacity_for_metadata(directory.metadata_budget().limit()),
                           directory.metadata_budget(), &recovery_index);
@@ -432,7 +437,16 @@ SessionImpl::SessionImpl(std::shared_ptr<const ModelDefinition> definition_in, S
         count_builder.prepare(plan.profile->public_tokens);
     }
     releases.reserve(max_concurrency);
+    resident_sequences.reserve(max_concurrency);
     for (std::uint32_t i = 0; i < max_concurrency; ++i) sequences[i].lane = i;
+}
+
+std::uint64_t SessionImpl::next_lane_mark() {
+    if (++lane_mark_generation == 0) {
+        std::fill(lane_marks.begin(), lane_marks.end(), 0);
+        ++lane_mark_generation;
+    }
+    return lane_mark_generation;
 }
 
 SessionImpl::~SessionImpl() {

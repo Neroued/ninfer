@@ -5,6 +5,7 @@
 #include "core/buffer.h"
 #include "core/decode_graph.h"
 
+#include <initializer_list>
 #include <numeric>
 #include <string>
 
@@ -193,8 +194,37 @@ int graph_update(DeviceContext& device) {
     return failures;
 }
 
+int batched_graph_update(DeviceContext& device, int tokens, int batch, int history_limit,
+                         Pattern pattern, std::initializer_list<std::uint32_t> bounds) {
+    Fixture f(tokens, batch, history_limit, 0, pattern);
+    const auto capacity = *std::max_element(bounds.begin(), bounds.end());
+    const auto bytes    = ops::qsa_indexer_workspace_capacity_bytes(f.T, f.T, f.B, {capacity});
+    GuardedDeviceBuffer scratch(bytes);
+    MemoryArena workspace(scratch.span());
+    DecodeGraphExecutable graph;
+    int failures = 0;
+    for (const auto bound : bounds) {
+        f.history                     = std::max(1U, std::min(bound, std::uint32_t(history_limit)));
+        f.envelope.max_visible_tokens = bound;
+        f.reset(1, bound == 0);
+        DecodeGraphDefinition definition;
+        definition.capture(device.stream(), [&] { f.launch(workspace, device.execution_view()); });
+        if (graph.ready())
+            graph.update(definition);
+        else
+            graph.instantiate(definition);
+        graph.launch(device.stream());
+        device.synchronize();
+        failures += verify(f, "batched indexer graph update bound=" + std::to_string(bound));
+        failures += scratch.verify_guards("batched indexer graph workspace");
+        if (workspace.used() || workspace.peak_used() > bytes) ++failures;
+        if (failures) return failures;
+    }
+    return failures;
+}
+
 int read_footprint(DeviceContext& device) {
-    Fixture f(8, 4, 32772, 0, Pattern::Dyadic);
+    Fixture f(4, 17, 16388, 0, Pattern::Dyadic);
     f.reset(0);
     DeviceBuffer query(ninfer::test::cuda_environment().context.device(), f.q_host.size() * 2);
     DeviceBuffer keys(ninfer::test::cuda_environment().context.device(), f.packed->storage().bytes);
@@ -237,7 +267,7 @@ int read_footprint(DeviceContext& device) {
     }
     ninfer::DeviceBuffer workspace_storage(
         ninfer::test::cuda_environment().context.device(),
-        ops::qsa_indexer_workspace_capacity_bytes(8, 8, 4, f.envelope));
+        ops::qsa_indexer_workspace_capacity_bytes(f.T, f.T, f.B, f.envelope));
     MemoryArena workspace(workspace_storage.span());
     f.launch(workspace, device.execution_view());
     device.synchronize();
@@ -289,19 +319,35 @@ int main(int argc, char** argv) {
     OpSuite suite;
     suite.add("qsa_indexer/graph_update", [] { return graph_update(cuda_environment().context); },
               {{"execution", "graph"}});
+    suite.add("qsa_indexer/batched_graph_update/t1/b129",
+              [] {
+                  return batched_graph_update(cuda_environment().context, 1, 129, 4096,
+                                              Pattern::Dyadic, {0, 2051, 65536, 2052, 0, 4096});
+              },
+              {{"execution", "graph"}, {"suite", "concurrency"}});
+    suite.add("qsa_indexer/batched_graph_update/t4/b17",
+              [] {
+                  return batched_graph_update(cuda_environment().context, 4, 17, 16388,
+                                              Pattern::Dense, {0, 2051, 65536, 16384, 0, 4096});
+              },
+              {{"execution", "graph"}, {"suite", "concurrency"}});
     suite.add("qsa_indexer/contract", [] { return validation(cuda_environment().context); });
     suite.add("qsa_indexer/read_footprint",
               [] { return read_footprint(cuda_environment().context); });
     const auto add = [&](int t, int b, int history, int layout, Pattern pattern, bool graph = false,
                          std::uint32_t capacity = 262144) {
-        suite.add("qsa_indexer/t" + std::to_string(t) + "/b" + std::to_string(b) + "/l" +
-                      std::to_string(history) + "/layout" + std::to_string(layout) + "/pattern" +
-                      std::to_string(int(pattern)) + "/capacity" + std::to_string(capacity),
-                  [=] {
-                      return run(cuda_environment().context, t, b, history, layout, pattern, graph,
-                                 capacity);
-                  },
-                  {{"execution", graph ? "graph" : "eager"}});
+        std::vector<std::pair<std::string, std::string>> tags{
+            {"execution", graph ? "graph" : "eager"}};
+        if (b > 8) tags.emplace_back("suite", "concurrency");
+        suite.add(
+            "qsa_indexer/t" + std::to_string(t) + "/b" + std::to_string(b) + "/l" +
+                std::to_string(history) + "/layout" + std::to_string(layout) + "/pattern" +
+                std::to_string(int(pattern)) + "/capacity" + std::to_string(capacity),
+            [=] {
+                return run(cuda_environment().context, t, b, history, layout, pattern, graph,
+                           capacity);
+            },
+            std::move(tags));
     };
     for (int history :
          {1, 3, 4, 5, 2047, 2048, 2049, 2050, 2051, 2052, 2053, 32764, 32768, 32772, 262144})
@@ -311,6 +357,8 @@ int main(int argc, char** argv) {
     for (int t : {2, 3, 4, 5, 8, 9, 16, 17, 31, 32, 33, 63, 64, 65})
         add(t, 1, 32772, t % 2, Pattern::Dyadic, t == 4 || t == 65);
     for (int b = 2; b <= 8; ++b) add(64 / b + 1, b, 32772, b % 2, Pattern::Dyadic, true);
+    add(16, 17, 4096, 1, Pattern::Dyadic, true, 4096);
+    add(1, 65, 2055, 0, Pattern::Dyadic, false, 2055);
     for (int t : {128, 1024, 2048, 4096}) add(t, 1, 262144, 0, Pattern::Dyadic);
     add(129, 1, 131076, 0, Pattern::Dense, true, 131076);
     add(65, 4, 65540, 0, Pattern::NearBoundary, true, 65540);

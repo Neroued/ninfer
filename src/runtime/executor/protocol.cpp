@@ -27,21 +27,17 @@ std::size_t work_payload_memory(const WorkPayloadCapacity& p, ExecutionCapacity 
     return worker + control;
 }
 
-void validate_control_capacity(const ControlBudget& b, ExecutionCapacity frames,
-                               const distributed::TransportLimits& limits, std::size_t ranks) {
+distributed::TransportLimits control_transport_limits(const ControlBudget& b,
+                                                      ExecutionCapacity frames, std::size_t ranks,
+                                                      bool coordinator) {
     if (!ranks) throw std::invalid_argument("control capacity requires a rank");
-    const auto report                                    = measurement_report_capacity(b.report);
-    const std::pair<const char*, std::size_t> messages[] = {{"compute Submit", b.compute_work},
-                                                            {"context Submit", b.context_work},
-                                                            {"Supply", b.decision},
-                                                            {"Commit", b.commit},
-                                                            {"Event", b.event},
-                                                            {"MeasurementComplete", report}};
-    for (auto [name, bytes] : messages)
-        if (!bytes || bytes > limits.message_bytes)
-            throw std::invalid_argument(std::string(name) + " capacity " + std::to_string(bytes) +
-                                        " exceeds transport message limit " +
-                                        std::to_string(limits.message_bytes));
+    const auto report = measurement_report_capacity(b.report);
+    distributed::TransportLimits limits;
+    for (const auto bytes :
+         {b.compute_work, b.context_work, b.decision, b.commit, b.event, report}) {
+        if (!bytes) throw std::invalid_argument("empty control payload capacity");
+        limits.message_bytes = std::max(limits.message_bytes, bytes);
+    }
 
     struct Queue {
         std::size_t bytes = 0, messages = 0;
@@ -55,42 +51,51 @@ void validate_control_capacity(const ControlBudget& b, ExecutionCapacity frames,
             messages += count;
         }
 
-        void check(std::size_t max_bytes, std::size_t max_messages, const char* name) const {
-            if (bytes > max_bytes || messages > max_messages)
-                throw std::invalid_argument(
-                    std::string(name) + " requires " + std::to_string(bytes) + " bytes / " +
-                    std::to_string(messages) + " messages; capacity is " +
-                    std::to_string(max_bytes) + " / " + std::to_string(max_messages));
+        void multiply(std::size_t count) {
+            if (count && (bytes > SIZE_MAX / count || messages > SIZE_MAX / count))
+                throw std::overflow_error("control queue capacity overflow");
+            bytes *= count;
+            messages *= count;
+        }
+
+        void append(const Queue& other) {
+            if (other.bytes > SIZE_MAX - bytes || other.messages > SIZE_MAX - messages)
+                throw std::overflow_error("control queue capacity overflow");
+            bytes += other.bytes;
+            messages += other.messages;
         }
     };
 
     const std::size_t compute = frames.compute_frames, context = frames.context_frames;
     Queue submits, commands, responses;
-    submits.add(b.compute_work, ranks * compute);
-    submits.add(b.context_work, ranks * context);
-    submits.check(limits.queued_bytes, limits.queued_messages, "coordinator Submit queue");
-
-    commands.add(b.decision, ranks * compute);
-    commands.add(b.commit, ranks * compute);
-    // Discard, InputRelease and a measurement/shutdown command have bounded scalar envelopes.
-    commands.add(128, ranks * (2 * compute + 1));
-    commands.check(limits.continuation_bytes, limits.continuation_messages,
-                   "coordinator continuation queue");
-
+    submits.add(b.compute_work, compute);
+    submits.add(b.context_work, context);
+    commands.add(b.decision, compute);
+    commands.add(b.commit, compute);
+    commands.add(128, 2 * compute + 1); // Discard, InputRelease, measurement/shutdown.
     responses.add(b.event, 6 * compute + 3 * context);
-    responses.add(16, 8 * compute + 3 * context); // applied/retired progress
+    responses.add(16, 8 * compute + 3 * context); // Applied/retired progress.
     responses.add(report, 1);
-    responses.add(128, 2); // input readiness and terminal acknowledgement
-    responses.check(limits.continuation_bytes, limits.continuation_messages,
-                    "worker continuation queue");
+    responses.add(128, 2); // Input readiness and terminal acknowledgement.
     Queue incoming;
-    if (responses.bytes > SIZE_MAX / ranks || responses.messages > SIZE_MAX / ranks)
-        throw std::overflow_error("control receive capacity overflow");
-    incoming.bytes    = responses.bytes * ranks;
-    incoming.messages = responses.messages * ranks;
-    incoming.check(limits.queued_bytes + limits.continuation_bytes + limits.input_bytes,
-                   limits.queued_messages + limits.continuation_messages + limits.input_messages,
-                   "coordinator receive queue");
+    if (coordinator) {
+        submits.multiply(ranks);
+        commands.multiply(ranks);
+        incoming = responses;
+        incoming.multiply(ranks);
+    } else {
+        incoming.append(submits);
+        incoming.append(commands);
+        commands = responses;
+    }
+    limits.queued_bytes          = std::max(limits.queued_bytes, submits.bytes);
+    limits.queued_messages       = std::max(limits.queued_messages, submits.messages);
+    limits.continuation_bytes    = std::max(limits.continuation_bytes, commands.bytes);
+    limits.continuation_messages = std::max(limits.continuation_messages, commands.messages);
+    incoming.append({limits.input_bytes, limits.input_messages});
+    limits.received_bytes    = std::max(limits.received_bytes, incoming.bytes);
+    limits.received_messages = std::max(limits.received_messages, incoming.messages);
+    return limits;
 }
 
 std::size_t measurement_report_capacity(std::size_t snapshot_bytes) {

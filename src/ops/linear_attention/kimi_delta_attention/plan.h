@@ -16,7 +16,14 @@ RecurrenceRoute select_recurrence_route(int tokens);
 int select_value_tile(int value_heads, int multiprocessor_count);
 int recurrence_window_tokens(int value_heads, int tokens);
 int recurrence_window_peak(int value_heads, int first, int last);
-int select_record_rows(int value_heads, int tokens, int batch);
+
+struct RecordSchedule {
+    int rows;
+    bool group_state_tiles = false;
+    int steps              = 4;
+};
+
+RecordSchedule select_record_schedule(int value_heads, int tokens, int batch);
 
 struct FoldSchedule {
     int warps, values;

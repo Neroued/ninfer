@@ -254,9 +254,9 @@ struct Workload {
     void launch(Fixture& f, const std::string& operation, CudaExecutionView cuda) {
         if (operation == "complete") {
             ops::topk_softmax_swiglu_moe(x, f.profile, f.weights, {}, ops::MoeEpilogue::Write, y,
-                                         arena, cuda);
+                                         {}, arena, cuda);
         } else if (operation == "route") {
-            ops::topk_softmax_route(x, {H, E, TopK}, f.weights.control, routes, shared, arena,
+            ops::topk_softmax_route(x, {H, E, TopK}, f.weights.control, routes, shared, {}, arena,
                                     cuda);
         } else if (operation == "routed-shared") {
             ops::routed_swiglu(x, f.profile.routed, f.weights.routed, routes, {},

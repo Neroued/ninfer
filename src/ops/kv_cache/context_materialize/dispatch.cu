@@ -2,6 +2,7 @@
 #include "ops/common/host/launch.h"
 #include "ops/common/host/operands.h"
 #include "ops/kv_cache/context_materialize/projection.cuh"
+#include "core/platform.h"
 
 namespace ninfer::ops::detail::context_kv {
 namespace {
@@ -75,8 +76,12 @@ select_context_kv_materialize(const ContextKVMaterializeProfile& profile, std::i
     if (columns <= 64) return implementation<launch_mma<64, 32, 128, 2>, true>();
     if (columns <= 80) return implementation<launch_mma<64, 80, 128, 5>, true>();
     if (columns <= 96) return implementation<launch_mma<64, 96, 128, 6>, true>();
+#if NINFER_TARGET_SPARK
+    return implementation<launch_mma<128, 64, 128, 2>, false>();
+#else
     if (columns <= 256) return implementation<launch_mma<128, 64, 128, 2>, false>();
     return implementation<launch_mma<64, 64, 64, 2>, true>();
+#endif
 }
 
 } // namespace ninfer::ops::detail

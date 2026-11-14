@@ -52,6 +52,7 @@ struct ComputeFrame {
     runtime::ExecutionRequest<ExecutionTypes> request;
     ComputePhase phase = ComputePhase::Prepare;
     std::span<const WorkRow> rows;
+    PhysicalBatchShape physical;
     std::optional<ple::Ticket> ple;
     std::optional<VerifyRound> verify;
     std::unique_ptr<execution::TextRun> run;
@@ -63,7 +64,7 @@ struct ComputeFrame {
     bool decision_requested = false, sequence = false;
     bool release_vision = false;
     bool first_sample = false, timer_started = false;
-    bool graph_main = false;
+    bool graph_main = false, graphable = false;
     std::vector<std::uint32_t> draft_visible;
     std::uint32_t tokens = 0, visible = 0, layer = 0;
     std::uint32_t score_at = 0, score_count = 0;
@@ -137,7 +138,7 @@ public:
     void accept_forward(std::int32_t batch);
     [[nodiscard]] DistributedVocabulary vocabulary();
     void vocabulary_sample(std::int32_t batch, bool first_token);
-    void vocabulary_draft(const Tensor& logits, Tensor& ids);
+    void vocabulary_draft(const Tensor& logits, const Tensor& valid_columns, Tensor& ids);
     void vocabulary_accept(std::int32_t batch);
     void copy_sample_result(std::int32_t batch, bool verify);
     void copy_verify_inputs(std::int32_t batch, DecodeGraphSection* = nullptr);
@@ -179,7 +180,10 @@ public:
     CudaEventTimer prefill_timer;
     runtime::ExecutionGpuTimer gpu_timer;
     CudaCompletionEvent compute_done, context_done;
-    std::array<std::optional<ResidentBinding>, kMaximumConcurrency> bindings;
+    std::vector<std::optional<ResidentBinding>> bindings;
+    std::vector<ple::InputRow> input_rows;
+    std::vector<MtpInputRow> mtp_rows;
+    std::vector<std::uint32_t> valid_rows;
     std::optional<ComputeFrame> compute;
     std::optional<ContextFrame> context;
     std::deque<runtime::ExecutionEvent<ExecutionTypes>> events;

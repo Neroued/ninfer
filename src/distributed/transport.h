@@ -53,8 +53,11 @@ struct TransportLimits {
     std::size_t continuation_messages = 64;
     std::size_t input_bytes           = 8ULL << 20;
     std::size_t input_messages        = 16;
-    std::size_t diagnostic_bytes      = 64ULL << 10;
-    std::size_t diagnostic_messages   = 16;
+    // Zero derives receive capacity from the three lossless outgoing queues.
+    std::size_t received_bytes      = 0;
+    std::size_t received_messages   = 0;
+    std::size_t diagnostic_bytes    = 64ULL << 10;
+    std::size_t diagnostic_messages = 16;
 };
 
 enum class Traffic { Work, Continuation, Input, Diagnostic };
@@ -95,7 +98,8 @@ public:
     [[nodiscard]] bool receiving() const noexcept;
     [[nodiscard]] std::string failure() const;
     [[nodiscard]] bool sending() const;
-    [[nodiscard]] const TransportLimits& limits() const noexcept;
+    void reserve_capacity(const TransportLimits&);
+    [[nodiscard]] TransportLimits limits() const;
     [[nodiscard]] std::shared_ptr<std::atomic<bool>> failure_signal() const;
     void close() noexcept;
 private:

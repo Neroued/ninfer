@@ -15,7 +15,8 @@ public:
     ~ExecutionGroup();
     ExecutionGroup(const ExecutionGroup&)            = delete;
     ExecutionGroup& operator=(const ExecutionGroup&) = delete;
-    [[nodiscard]] const TransportLimits& limits() const noexcept;
+    void reserve_control_capacity(const TransportLimits&);
+    [[nodiscard]] TransportLimits limits() const;
     [[nodiscard]] bool try_send(std::span<const OutgoingMessage>, Traffic = Traffic::Work);
     [[nodiscard]] std::optional<IncomingMessage> poll();
     [[nodiscard]] std::vector<IncomingMessage> receive_all(wire::Kind,
@@ -52,6 +53,7 @@ public:
 
     void startup_attempt(std::uint32_t attempt) noexcept { startup_.attempt(attempt); }
 
+    void reserve_control_capacity(const TransportLimits&);
     void send(wire::Kind, wire::Bytes = {}, bool continuation = true);
     [[nodiscard]] bool try_send(wire::Kind, wire::Bytes, bool continuation);
     [[nodiscard]] std::optional<wire::Message> poll();

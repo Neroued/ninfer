@@ -19,6 +19,7 @@ struct SelectorWorkspace {
 };
 
 SelectorPlan select_candidate_path(CandidateSelectorInput input, int steps, int batch);
+int maximum_lattice_batch(CandidateSelectorInput input, int steps);
 
 template <class Allocator>
 SelectorWorkspace allocate_selector_workspace(Allocator& allocator, SelectorPlan plan, int steps,
@@ -34,6 +35,6 @@ void execute_candidate_path(CandidateSelectorInput input, const Tensor& candidat
                             const Tensor& projected_hidden, const Tensor& anchors,
                             const Tensor& predecessor_codebook, const Tensor& successor_codebook,
                             const Tensor& base_positions, const SamplingConfig* configs,
-                            Tensor& drafts, Tensor& proposal_q, MemoryArena& workspace,
-                            cudaStream_t stream);
+                            Tensor& drafts, Tensor& proposal_q, const Tensor& live_rows,
+                            MemoryArena& workspace, cudaStream_t stream);
 } // namespace ninfer::ops::candidate_path_detail

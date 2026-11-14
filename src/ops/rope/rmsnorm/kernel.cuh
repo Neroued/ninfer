@@ -26,7 +26,7 @@ __global__ __launch_bounds__(HeadsPerBlock* LanesPerHead) void rmsnorm_rope_d128
     const int local_head = query ? head : head - QueryHeads;
     auto* data           = query ? q : k;
     const auto* weight   = query ? q_weight : k_weight;
-    const int base       = (token * (query ? QueryHeads : KeyHeads) + local_head) * 64;
+    const auto base = (std::int64_t(token) * (query ? QueryHeads : KeyHeads) + local_head) * 64;
     __shared__ float sine[64], cosine[64];
     __shared__ __nv_bfloat162 weight_cache[CacheWeights ? 64 : 1];
     if constexpr (CacheWeights)

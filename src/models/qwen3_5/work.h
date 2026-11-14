@@ -1,6 +1,7 @@
 #pragma once
 
 #include "models/common/token_input.h"
+#include "models/common/batch.h"
 
 #include "models/common/context/contract.h"
 #include "models/common/context/directory/state.h"
@@ -59,6 +60,7 @@ struct ForwardWork {
     std::vector<TokenId> control_last_tokens;
     SamplePurpose sample = SamplePurpose::None;
     std::vector<SamplingInput> sampling;
+    PhysicalBatchShape shape;
 };
 
 struct DecodeRow {
@@ -71,11 +73,13 @@ struct DecodeRow {
 
 struct DecodeWork {
     std::vector<DecodeRow> rows;
+    PhysicalBatchShape shape;
 };
 
 // DFlash target features occupy a residency's persistent plane until this range is appended.
 struct NormalizeWork {
     std::vector<ExecutionRow> rows;
+    PhysicalBatchShape shape;
 };
 
 struct ResidencyBinding {
@@ -94,6 +98,7 @@ struct ScoreWork {
     InputWindow input;
     std::vector<TokenId> targets;
     std::uint32_t first_column = 0;
+    PhysicalBatchShape shape;
 };
 
 struct Work {
@@ -141,6 +146,9 @@ struct Commit {
     std::vector<CommitRow> rows;
     context::ContextActions context;
 };
+
+// Freezes physical geometry while preserving the logical member order.
+void plan_work_batch(Work&, const BatchExecutionPlan&);
 
 struct ExecutionTypes {
     [[nodiscard]] static ExecutionWork describe_work(const qwen3_5::Work&);

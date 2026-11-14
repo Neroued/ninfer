@@ -83,6 +83,14 @@ ComputeOperation::ComputeOperation(runtime::ExecutionRequest<ExecutionTypes>&& v
 
 ComputeOperation::~ComputeOperation() = default;
 
+std::uint64_t RankProgramImpl::next_validation_mark() const {
+    if (++validation_generation == 0) {
+        std::fill(validation_marks.begin(), validation_marks.end(), 0);
+        ++validation_generation;
+    }
+    return validation_generation;
+}
+
 void RankProgramImpl::validate_row(const ExecutionRow& row) const {
     const auto lane = row.member.residency.lane.value;
     if (lane >= max_concurrency || !row.member.sequence.generation ||
@@ -133,19 +141,39 @@ void RankProgramImpl::validate_work(const Work& work, runtime::FrameKind kind) c
     auto validate_members = [&](const auto& rows, auto binding) {
         if (rows.empty() || rows.size() > max_concurrency)
             throw std::invalid_argument("Qwen3.5 work has invalid batch membership");
-        std::array<bool, kMaximumConcurrency> seen{};
+        const auto mark = next_validation_mark();
         for (const auto& value : rows) {
             const auto& row = binding(value);
             validate_row(row);
-            auto& present = seen[row.member.residency.lane.value];
-            if (present) throw std::invalid_argument("Qwen3.5 work repeats a residency");
-            present = true;
+            auto& present = validation_marks[row.member.residency.lane.value];
+            if (present == mark) throw std::invalid_argument("Qwen3.5 work repeats a residency");
+            present = mark;
         }
     };
     std::visit(
         [&](const auto& op) {
             using T = std::decay_t<decltype(op)>;
+            if constexpr (!std::is_same_v<T, ContextWork>) {
+                const auto members = [&] {
+                    if constexpr (std::is_same_v<T, ScoreWork>)
+                        return std::size_t{1};
+                    else
+                        return op.rows.size();
+                }();
+                const bool bucketed =
+                    std::is_same_v<T, DecodeWork> && !batch_execution->graph_rows().empty();
+                if (!members || members > op.shape.rows || op.shape.rows > max_concurrency ||
+                    op.shape.attention_rows != op.shape.rows ||
+                    (!bucketed && op.shape.rows != members) ||
+                    (bucketed &&
+                     !std::binary_search(batch_execution->graph_rows().begin(),
+                                         batch_execution->graph_rows().end(), op.shape.rows)))
+                    throw std::invalid_argument(
+                        "Qwen3.5 work is outside its prepared batch geometry");
+            }
             if constexpr (std::is_same_v<T, ContextWork>) {
+                if (op.bindings.size() > 1 || op.releases.size() > max_concurrency)
+                    throw std::invalid_argument("Qwen3.5 context work exceeds its frame capacity");
                 for (const auto& binding : op.bindings) {
                     if (binding.member.residency.lane.value >= max_concurrency ||
                         !binding.member.residency.generation || !binding.member.sequence.generation)
@@ -235,18 +263,19 @@ void RankProgramImpl::validate_decision(runtime::ExecutionTicket ticket,
     const auto& op = require_compute(ticket);
     if (!op.decision_requested || op.decision_supplied || input.stage != op.decision_stage)
         throw std::logic_error("Qwen3.5 decision input does not match the pending stage");
-    std::array<bool, kMaximumConcurrency> seen{};
+    const auto mark  = next_validation_mark();
     const auto words = (parameters.profile->public_tokens + 31) / 32;
     for (const auto& row : input.rows) {
-        if (row.member >= op.batch || seen[row.member] || !op.sampling[row.member].constrained ||
+        if (row.member >= op.batch || validation_marks[row.member] == mark ||
+            !op.sampling[row.member].constrained ||
             row.positions !=
-                static_cast<std::uint32_t>(resources.frame.host_ingress->extents[row.member] + 1) ||
+                static_cast<std::uint32_t>(resources.frame.host_ingress.extents[row.member] + 1) ||
             row.words.size() != words * row.positions || (row.dead_positions >> row.positions) != 0)
             throw std::invalid_argument("Qwen3.5 decision mask has invalid shape or membership");
-        seen[row.member] = true;
+        validation_marks[row.member] = mark;
     }
     for (std::uint32_t row = 0; row < op.batch; ++row) {
-        if (seen[row] != op.sampling[row].constrained)
+        if ((validation_marks[row] == mark) != op.sampling[row].constrained)
             throw std::invalid_argument("Qwen3.5 decision omitted a constrained row");
     }
 }
@@ -264,7 +293,7 @@ void RankProgramImpl::prepare_commit(runtime::ExecutionTicket ticket, Commit& va
         compute_actions->validate(value.context);
         return;
     }
-    const auto& output = *resources.frame.host_egress;
+    const auto& output = resources.frame.host_egress;
     if (value.rows.size() != op.batch)
         throw std::invalid_argument("Qwen3.5 generating commit has invalid membership");
     compute_actions->validate(value.context);

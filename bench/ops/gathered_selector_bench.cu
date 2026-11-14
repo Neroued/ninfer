@@ -28,7 +28,7 @@ Options parse(int argc, char** argv) {
         if (flag == "--steps")
             o.steps = m::integers(v, 1, 15);
         else if (flag == "--batches")
-            o.batches = m::integers(v, 1, 8);
+            o.batches = m::integers(v);
         else if (flag == "--mode") {
             if (v == "greedy")
                 o.modes = {0};
@@ -45,6 +45,10 @@ Options parse(int argc, char** argv) {
     }
     if (o.timing.profile && (o.steps.size() != 1 || o.batches.size() != 1 || o.modes.size() != 1))
         throw std::invalid_argument("profile one geometry/mode");
+    if (std::int64_t(*std::max_element(o.steps.begin(), o.steps.end())) *
+            *std::max_element(o.batches.begin(), o.batches.end()) >
+        INT_MAX)
+        throw std::invalid_argument("selector columns are not representable");
     return o;
 }
 
@@ -66,10 +70,11 @@ void run(const Options& o, F& f, int mode, m::Csv& csv, bench::L2FlushBuffer& fl
     auto wb = bench::make_buffer(std::max<std::size_t>(capacity, 1));
     MemoryArena work(wb.span());
     auto launch = [&](CudaExecutionView cuda) {
-        ops::candidate_selector_path(
-            f.key_tensor(), f.hidden_tensor(), f.anchor_tensor(), f.predecessor_tensor(),
-            f.successor_tensor(), F::Domain, f.position_tensor(),
-            static_cast<const ops::SamplingConfig*>(f.configs.data()), ids, drafts, q, work, cuda);
+        ops::candidate_selector_path(f.key_tensor(), f.hidden_tensor(), f.anchor_tensor(),
+                                     f.predecessor_tensor(), f.successor_tensor(), F::Domain,
+                                     f.position_tensor(),
+                                     static_cast<const ops::SamplingConfig*>(f.configs.data()), ids,
+                                     drafts, q, {}, work, cuda);
     };
     m::Row row;
     row.op              = "candidate_selector_path";

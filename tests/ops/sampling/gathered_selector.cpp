@@ -5,6 +5,9 @@
 
 #include <numeric>
 #include <array>
+#include <limits>
+#include <span>
+#include <tuple>
 
 using namespace ninfer;
 using namespace ninfer::test;
@@ -26,10 +29,15 @@ double uniform(std::uint64_t seed, int position) {
     return double(std::uint32_t(k >> 40)) / 16777216.;
 }
 
-int verify_math(const F& f, const std::vector<int>& drafts, const std::vector<float>& q) {
+int verify_math(const F& f, const std::vector<int>& drafts, const std::vector<float>& q,
+                std::span<const int> live_rows = {}) {
     std::vector<double> reference(q.size());
     int failures = 0;
     for (int b = 0; b < f.batch; ++b) {
+        if (!live_rows.empty() && !live_rows[b]) {
+            for (int step = 0; step < f.steps; ++step) failures += drafts[b * f.steps + step] != 0;
+            continue;
+        }
         int predecessor = f.anchors[b];
         for (int step = 0; step < f.steps; ++step) {
             const int col = b * f.steps + step;
@@ -92,6 +100,103 @@ int verify_math(const F& f, const std::vector<int>& drafts, const std::vector<fl
                                        kQCriterion);
 }
 
+int masked_rows(ops::CandidateSelectorInput input, int steps, int batch) {
+    const auto e = cuda_environment().context.execution_view();
+    F f(e.device(), steps, batch);
+    auto candidate_input = to_device(f.ids), unary = to_device(f.unary);
+    GuardedDeviceBuffer ids_buffer(f.ids.size() * sizeof(int)),
+        drafts_buffer(std::size_t(steps) * batch * sizeof(int)),
+        q_buffer(f.ids.size() * sizeof(float));
+    Tensor ids(ids_buffer.span(), DType::I32, {16, steps, batch}),
+        drafts(drafts_buffer.span(), DType::I32, {steps, batch}),
+        q(q_buffer.span(), DType::FP32, {16, steps, batch});
+    std::vector<int> live(batch, 1);
+    auto device_live = to_device(live);
+    Tensor validity(device_live.span(), DType::I32, {batch});
+    const auto capacity =
+        ops::candidate_selector_path_workspace_capacity_bytes(input, steps, steps, batch, batch);
+    GuardedDeviceBuffer scratch(std::max<std::size_t>(1, capacity));
+    MemoryArena arena(scratch.span());
+    const auto launch = [&] {
+        const auto* configs = static_cast<const ops::SamplingConfig*>(f.configs.data());
+        if (input == ops::CandidateSelectorInput::Candidates) {
+            const Tensor candidates(candidate_input.span(), DType::I32, {16, steps, batch}),
+                scores(unary.span(), DType::FP32, {16, steps, batch});
+            ops::candidate_selector_path(candidates, scores, f.hidden_tensor(), f.anchor_tensor(),
+                                         f.predecessor_tensor(), f.successor_tensor(), F::Domain,
+                                         f.position_tensor(), configs, drafts, q, validity, arena,
+                                         e);
+        } else {
+            ops::candidate_selector_path(f.key_tensor(), f.hidden_tensor(), f.anchor_tensor(),
+                                         f.predecessor_tensor(), f.successor_tensor(), F::Domain,
+                                         f.position_tensor(), configs, ids, drafts, q, validity,
+                                         arena, e);
+        }
+    };
+    DecodeGraphDefinition definition;
+    DecodeGraphExecutable executable;
+    cuda_synchronize();
+    definition.capture(e.stream(), launch);
+    executable.instantiate(definition);
+    int failures = 0;
+    for (int replay = 0; replay < 3; ++replay) {
+        auto anchors = f.anchors, positions = f.positions, candidates = f.ids;
+        auto hidden       = f.hidden_bits;
+        auto keys         = f.key_words;
+        auto configs      = f.sampling;
+        auto scores       = f.unary;
+        auto expected_ids = f.ids;
+        for (int b = 0; b < batch; ++b) {
+            live[b] = replay < 2 && b % 2 == replay;
+            if (live[b]) continue;
+            anchors[b] = positions[b] = INT_MIN;
+            configs[b].temperature    = std::numeric_limits<float>::quiet_NaN();
+            for (int step = 0; step < steps; ++step) {
+                const auto column = std::size_t(b) * steps + step;
+                std::fill_n(hidden.begin() + column * 256, 256, std::uint16_t{0x7fc0});
+                for (int c = 0; c < 16; ++c) {
+                    candidates[column * 16 + c]   = INT_MIN;
+                    scores[column * 16 + c]       = std::numeric_limits<float>::quiet_NaN();
+                    expected_ids[column * 16 + c] = 0;
+                    for (int rank = 0; rank < 2; ++rank)
+                        keys[(rank * std::size_t(steps) * batch + column) * 16 + c] = ULLONG_MAX;
+                }
+            }
+        }
+        device_live.copy_from_host(live.data(), device_live.size());
+        f.anchor.copy_from_host(anchors.data(), f.anchor.size());
+        f.position.copy_from_host(positions.data(), f.position.size());
+        f.hidden.copy_from_host(hidden.data(), f.hidden.size());
+        f.keys.copy_from_host(keys.data(), f.keys.size());
+        f.configs.copy_from_host(configs.data(), f.configs.size());
+        candidate_input.copy_from_host(candidates.data(), candidate_input.size());
+        unary.copy_from_host(scores.data(), unary.size());
+        ids_buffer.fill(0xff);
+        drafts_buffer.fill(0xff);
+        q_buffer.fill(0xff);
+        cuda_synchronize();
+        executable.launch(e.stream());
+        cuda_synchronize(e.stream());
+        failures += verify_math(f, from_device<int>(drafts_buffer.data(), steps * batch),
+                                from_device<float>(q_buffer.data(), f.ids.size()), live);
+        if (input == ops::CandidateSelectorInput::GatheredKeys)
+            failures +=
+                verify_exact("masked merged IDs", from_device<int>(ids_buffer.data(), f.ids.size()),
+                             expected_ids);
+        else
+            failures +=
+                verify_exact("masked candidate input preserved",
+                             from_device<int>(candidate_input, candidates.size()), candidates);
+        failures += verify_exact("selector validity preserved",
+                                 from_device<int>(device_live, live.size()), live);
+        failures +=
+            ids_buffer.verify_guards("masked IDs") + drafts_buffer.verify_guards("masked drafts") +
+            q_buffer.verify_guards("masked q") + scratch.verify_guards("masked selector workspace");
+        failures += arena.used() != 0 || arena.peak_used() > capacity;
+    }
+    return failures;
+}
+
 int run(int steps, int batch, F::Pattern pattern, bool graph) {
     const auto e = cuda_environment().context.execution_view();
     F f(e.device(), steps, batch, pattern);
@@ -105,10 +210,11 @@ int run(int steps, int batch, F::Pattern pattern, bool graph) {
     GuardedDeviceBuffer scratch(std::max<std::size_t>(capacity, 1));
     MemoryArena arena(scratch.span());
     const auto launch = [&] {
-        ops::candidate_selector_path(
-            f.key_tensor(), f.hidden_tensor(), f.anchor_tensor(), f.predecessor_tensor(),
-            f.successor_tensor(), F::Domain, f.position_tensor(),
-            static_cast<const ops::SamplingConfig*>(f.configs.data()), ids, drafts, q, arena, e);
+        ops::candidate_selector_path(f.key_tensor(), f.hidden_tensor(), f.anchor_tensor(),
+                                     f.predecessor_tensor(), f.successor_tensor(), F::Domain,
+                                     f.position_tensor(),
+                                     static_cast<const ops::SamplingConfig*>(f.configs.data()), ids,
+                                     drafts, q, {}, arena, e);
     };
     DecodeGraphDefinition definition;
     DecodeGraphExecutable executable;
@@ -186,6 +292,18 @@ int run(int steps, int batch, F::Pattern pattern, bool graph) {
 } // namespace
 
 void add_gathered_selector_cases(OpSuite& suite) {
+    for (auto [input, steps, batch] :
+         {std::tuple{ops::CandidateSelectorInput::Candidates, 3, 9},
+          std::tuple{ops::CandidateSelectorInput::Candidates, 7, 17},
+          std::tuple{ops::CandidateSelectorInput::GatheredKeys, 7, 2},
+          std::tuple{ops::CandidateSelectorInput::GatheredKeys, 7, 17}}) {
+        const auto form =
+            input == ops::CandidateSelectorInput::Candidates ? "candidates" : "gathered";
+        suite.add("selector/masked/" + std::string(form) + "/k" + std::to_string(steps) + "/b" +
+                      std::to_string(batch),
+                  [=] { return masked_rows(input, steps, batch); },
+                  {{"suite", "selector"}, {"suite", "concurrency"}, {"execution", "graph"}});
+    }
     suite.add("gathered_selector/contracts",
               [] {
                   const auto e = cuda_environment().context.execution_view();
@@ -204,7 +322,7 @@ void add_gathered_selector_cases(OpSuite& suite) {
                               keys, f.hidden_tensor(), f.anchor_tensor(), f.predecessor_tensor(),
                               successor, domain, f.position_tensor(),
                               static_cast<const ops::SamplingConfig*>(f.configs.data()), ids,
-                              drafts, out, arena, e);
+                              drafts, out, {}, arena, e);
                           ++failures;
                       } catch (const std::invalid_argument&) {}
                   };
@@ -222,12 +340,12 @@ void add_gathered_selector_cases(OpSuite& suite) {
                                      ops::CandidateSelectorInput::GatheredKeys}) {
                       std::size_t peak = 0;
                       for (int d = 1; d <= 15; ++d)
-                          for (int b = 1; b <= 8; ++b)
+                          for (int b : {1, 2, 3, 7, 8, 9, 17, 128})
                               peak = std::max(peak,
                                               ops::candidate_selector_path_workspace_capacity_bytes(
                                                   input, d, d, b, b));
                       failures += peak != ops::candidate_selector_path_workspace_capacity_bytes(
-                                              input, 1, 15, 1, 8);
+                                              input, 1, 15, 1, 128);
                   }
                   return failures;
               },

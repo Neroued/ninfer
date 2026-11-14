@@ -52,10 +52,10 @@ void kv_cache_append(const Tensor& k, const Tensor& v, const Tensor& positions,
  * uses BF16 K and FP16 V record-local planes [128,64,8]. D256/Hkv2|4 uses
  * record-local planes and any storage format defined by kv_cache_append, with the same exact codec.
  * No byte belonging only to the rejected physical tail [counts[b],T) is written. A zero count
- * reads no positions or K/V for that batch row. Inputs are unchanged, and the Op
+ * reads no positions, table selectors or K/V for that batch row. Inputs are unchanged, and the Op
  * neither decides nor publishes a committed frontier.
  *
- * The caller guarantees T>0, B=1..8, envelope.min_count <= counts[b] <= envelope.max_count <= T,
+ * The caller guarantees T>0, B>0, envelope.min_count <= counts[b] <= envelope.max_count <= T,
  * sequential nonnegative live positions, materialized table entries for every position allowed by
  * the envelope, and pairwise non-aliasing of inputs and cache storage.
  */
@@ -73,9 +73,9 @@ void kv_cache_append_prefix(const Tensor& k, const Tensor& v, const Tensor& posi
  * Hkv=8 and capacity 2048 or 4096. Absolute position p maps to slot p mod capacity. For a nonempty
  * prefix, the caller guarantees that the row's existing live interval ends immediately before
  * positions[0,b]. Advancing it by counts[b] makes every overwritten old slot dead, and one row
- * commits at most the ring capacity. A zero count reads no positions or K/V and changes no cache
- * bytes. Physical T is independent of the committed prefix length. Consequently, no two live writes
- * race for one physical slot. The Op does not own or publish the state frontier.
+ * commits at most the ring capacity. A zero count reads no positions, record offsets or K/V and
+ * changes no cache bytes. Physical T is independent of the committed prefix length. Consequently,
+ * no two live writes race for one physical slot. The Op does not own or publish the state frontier.
  */
 void kv_cache_append_prefix(const Tensor& k, const Tensor& v, const Tensor& positions,
                             const Tensor& counts, KVCacheAppendPrefixExecutionEnvelope envelope,

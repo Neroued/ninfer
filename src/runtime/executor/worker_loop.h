@@ -20,6 +20,8 @@ public:
           budget_(protocol::with_communication_capacity(codec_.control_budget(),
                                                         connection.communication().statistics())),
           compute_(program.capacity().compute_frames), context_(program.capacity().context_frames) {
+        connection_.reserve_control_capacity(protocol::control_transport_limits(
+            budget_, program.capacity(), connection.topology().ranks.size(), false));
         if constexpr (requires { codec_.bind_input_storage(program_.input_storage()); })
             codec_.bind_input_storage(program_.input_storage());
         connection_.communication().reset_statistics();
@@ -46,7 +48,8 @@ private:
         connection_.communication().check();
         while (auto event = observe_host_call(host_.progress_ns, [&] { return program_.poll(); }))
             consume(std::move(*event));
-        while (commands_.size() < 64) {
+        const auto command_capacity = 3 * compute_.size() + context_.size();
+        while (commands_.size() < command_capacity) {
             auto message = connection_.poll();
             if (!message) break;
             if (message->epoch != connection_.bootstrap().epoch)

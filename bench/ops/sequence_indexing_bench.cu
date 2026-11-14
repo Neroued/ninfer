@@ -9,8 +9,18 @@ namespace m = bench::measurement;
 namespace {
 struct Options {
     m::Options timing;
-    std::vector<std::string> ops{"masked",  "verify", "verify-ids",   "ragged",
-                                 "scatter", "gather", "state-gather", "state-scatter"};
+    std::vector<std::string> ops{"masked",
+                                 "verify",
+                                 "verify-ids",
+                                 "ragged",
+                                 "scatter",
+                                 "gather",
+                                 "state-gather",
+                                 "state-scatter",
+                                 "state-scatter-direct",
+                                 "batch-gather",
+                                 "state-gather-direct",
+                                 "causal-pairs"};
     std::vector<int> widths = m::sweep("2:16"), batches = m::sweep("1:8");
     int features = 4096, column_features = 0;
     std::string counts = "all";
@@ -23,7 +33,9 @@ Options parse(int argc, char** argv) {
         if (flag == "--help") {
             std::cout << "Sequence/indexing public Op benchmark\n --op "
                          "masked|verify|verify-ids|ragged|scatter|gather|state-gather|state-"
-                         "scatter|all\n --widths W,... --batches B,... --features D\n"
+                         "scatter|state-scatter-direct|batch-gather|state-gather-direct|causal-"
+                         "pairs|all\n --widths W,... --batches B,... "
+                         "--features D\n"
                          " --column-features P (default D) --counts "
                          "all|half|mixed|zero\n";
             m::help();
@@ -43,7 +55,7 @@ Options parse(int argc, char** argv) {
         else if (flag == "--widths")
             o.widths = m::integers(value, 2, 4096);
         else if (flag == "--batches")
-            o.batches = m::integers(value, 1, 8);
+            o.batches = m::integers(value, 1);
         else if (flag == "--counts")
             o.counts = value;
         else if (!m::parse(o.timing, flag, value))
@@ -62,7 +74,7 @@ void run(const Options& o, const std::string& op, int w, int b, m::Csv& csv,
          bench::L2FlushBuffer& flush) {
     if ((op == "masked" || op == "verify" || op == "verify-ids") && w > 16)
         throw std::invalid_argument("query width must be <=16");
-    if (op == "masked" && o.counts == "zero") return;
+    const int slots = std::max(8, b);
     const int d     = o.features;
     const int pitch = o.column_features ? o.column_features : d;
     const auto e    = bench::device_context().execution_view();
@@ -73,18 +85,22 @@ void run(const Options& o, const std::string& op, int w, int b, m::Csv& csv,
     for (int r = 0; r < b; ++r) {
         anchors[r]   = 17 + r * 7919;
         positions[r] = 1'048'560 + r * 97;
-        lanes[r]     = (r * 3 + 1) % 8;
+        lanes[r]     = (r + 1) % slots;
         valid[r]     = o.counts == "all"    ? w
                        : o.counts == "half" ? w / 2
                        : o.counts == "zero" ? 0
                                             : r % (w + 1);
-        if (op == "masked") valid[r] = std::max(1, valid[r]);
-        extents[r] = std::min(w - 1, valid[r]);
-        starts[r]  = positions[r];
-        ends[r]    = starts[r] + valid[r];
-        columns[r] = valid[r] ? std::min(w - 1, valid[r] - 1) : -1;
-        offsets[r] = valid[r] ? std::int64_t(lanes[r]) * record_stride : -1;
+        extents[r]   = std::min(w - 1, valid[r]);
+        starts[r]    = positions[r];
+        ends[r]      = starts[r] + valid[r];
+        columns[r]   = valid[r] ? std::min(w - 1, valid[r] - 1) : -1;
+        offsets[r]   = valid[r] ? std::int64_t(lanes[r]) * record_stride : -1;
+        if (op == "batch-gather" && !valid[r]) lanes[r] = -1;
     }
+    std::vector<int> active_rows(b);
+    for (int row = 0; row < b; ++row) active_rows[row] = valid[row] > 0;
+    auto live_buffer = m::make_i32(active_rows);
+    Tensor live_mask(live_buffer.span(), DType::I32, {b});
     auto ab = m::make_i32(anchors), pb = m::make_i32(positions), vb = m::make_i32(valid),
          eb = m::make_i32(extents), lb = m::make_i32(lanes), sb = m::make_i32(starts),
          endb = m::make_i32(ends), cb = m::make_i32(columns);
@@ -102,22 +118,23 @@ void run(const Options& o, const std::string& op, int w, int b, m::Csv& csv,
         output_positions(pos.span(), DType::I32, {w, b}), output_counts(nb.span(), DType::I32, {b}),
         draft(drafts.span(), DType::I32, {w - 1, b});
     const bool feature_op = op != "masked" && op != "verify" && op != "verify-ids";
-    auto source = feature_op ? bench::make_bf16(std::size_t(pitch) * w * 8, 6101) : DeviceBuffer{};
-    auto dense  = feature_op ? bench::make_bf16(std::size_t(d) * w * b, 6103) : DeviceBuffer{};
+    auto source =
+        feature_op ? bench::make_bf16(std::size_t(pitch) * w * slots, 6101) : DeviceBuffer{};
+    auto dense = feature_op ? bench::make_bf16(std::size_t(d) * w * b, 6103) : DeviceBuffer{};
     auto destination =
-        feature_op ? bench::make_zeros(std::size_t(pitch) * w * 8 * 2) : DeviceBuffer{};
+        feature_op ? bench::make_zeros(std::size_t(pitch) * w * slots * 2) : DeviceBuffer{};
     auto gathered = feature_op ? bench::make_zeros(std::size_t(d) * b * 2) : DeviceBuffer{};
-    auto records =
-        feature_op ? bench::make_bf16(std::size_t(record_stride / 2) * 8, 6109) : DeviceBuffer{};
+    auto records  = feature_op ? bench::make_bf16(std::size_t(record_stride / 2) * slots, 6109)
+                               : DeviceBuffer{};
     Tensor x, y, z, g;
     StateFieldView state;
     if (feature_op) {
-        x       = Tensor(source.span(), DType::BF16, {d, w, 8});
+        x       = Tensor(source.span(), DType::BF16, {d, w, slots});
         x.nb[1] = pitch * 2;
         x.nb[2] = x.nb[1] * w;
-        x.nb[3] = x.nb[2] * 8;
+        x.nb[3] = x.nb[2] * slots;
         y       = Tensor(dense.span(), DType::BF16, {d, w, b});
-        z       = Tensor(destination.span(), DType::BF16, {d, w, 8});
+        z       = Tensor(destination.span(), DType::BF16, {d, w, slots});
         z.nb[1] = x.nb[1];
         z.nb[2] = x.nb[2];
         z.nb[3] = x.nb[3];
@@ -129,9 +146,17 @@ void run(const Options& o, const std::string& op, int w, int b, m::Csv& csv,
     for (auto& v : choose) v = std::max(0, v);
     auto chooser = m::make_i32(choose);
     Tensor selection(chooser.span(), DType::I32, {b});
+    DeviceBuffer pair_ids, pair_positions, pair_skip;
+    if (op == "causal-pairs") {
+        std::vector<int> pair_values(std::size_t(w) * b);
+        for (int row = 0; row < b; ++row)
+            for (int col = 0; col < w; ++col) pair_values[row * w + col] = positions[row] + col;
+        pair_ids       = m::make_i32(std::vector<int>(std::size_t(w) * b, 12345));
+        pair_positions = m::make_i32(pair_values);
+        pair_skip      = m::make_i32(std::vector<int>(b));
+    }
     const auto launch = [&](CudaExecutionView cuda) {
         if (op == "masked") {
-            // This Op's nonempty query contract excludes zero valid columns.
             ops::prepare_masked_block(a, p, n, 154856, output_ids, output_positions, cuda);
         } else if (op == "verify")
             ops::prepare_verify_inputs(a, draft, p, extent, output_ids, output_positions, cuda);
@@ -142,11 +167,33 @@ void run(const Options& o, const std::string& op, int w, int b, m::Csv& csv,
                                        cuda);
         else if (op == "scatter")
             ops::scatter_bf16_batch(y, lane, n, z, cuda);
-        else if (op == "gather")
+        else if (op == "batch-gather") {
+            if (pitch != d) throw std::invalid_argument("batch-gather requires contiguous columns");
+            ops::gather_batch_rows(x, lane, y, cuda);
+        } else if (op == "gather")
             ops::gather_bf16_batch_columns(y, selection, g, cuda);
+        else if (op == "causal-pairs") {
+            const Tensor previous(source.span(), DType::BF16, {d, b});
+            Tensor paired(destination.span(), DType::BF16, {d, w, b});
+            ops::prepare_causal_pairs({y,
+                                       previous,
+                                       Tensor(pair_ids.span(), DType::I32, {w, b}),
+                                       Tensor(pair_positions.span(), DType::I32, {w, b}),
+                                       {},
+                                       {},
+                                       n,
+                                       Tensor(pair_skip.span(), DType::I32, {b}),
+                                       {}},
+                                      {paired, output_ids, output_positions, output_counts, {}},
+                                      cuda);
+        } else if (op == "state-gather-direct")
+            ops::gather(state, n, g, cuda);
         else if (op == "state-gather") {
             const ops::StateGather field{state, n, g};
             ops::gather_state_fields(std::span(&field, 1), cuda);
+        } else if (op == "state-scatter-direct") {
+            const Tensor rows(dense.span(), DType::BF16, {d, b});
+            ops::scatter(rows, state, live_mask, cuda);
         } else {
             const ops::StateColumnScatter field{y, selected, state};
             ops::scatter_state_fields(std::span(&field, 1), cuda);
@@ -165,9 +212,13 @@ void run(const Options& o, const std::string& op, int w, int b, m::Csv& csv,
         bytes = std::size_t(d) * 2 * (live + std::int64_t(w) * b) + 4 * w * b + 16 * b;
     else if (op == "scatter")
         bytes = std::size_t(d) * 4 * live + 8 * b;
+    else if (op == "batch-gather")
+        bytes = std::size_t(d) * w * 2 * (active + b) + 4 * b;
     else if (op == "gather")
         bytes = std::size_t(d) * 4 * b + 4 * b;
-    else if (op == "state-gather")
+    else if (op == "causal-pairs")
+        bytes = (std::size_t(d) * 2 + 8) * (live + std::int64_t(w) * b) + 12 * b;
+    else if (op == "state-gather" || op == "state-gather-direct")
         bytes = std::size_t(d) * 2 * (active + b) + 4 * b + 8 * active;
     else
         bytes = std::size_t(d) * 4 * active + 4 * b + 8 * active;

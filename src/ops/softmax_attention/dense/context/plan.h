@@ -15,9 +15,11 @@ struct ContextAttentionPlan {
     std::int32_t warps          = 0;
     std::int32_t key_block      = 0;
     std::int32_t split_capacity = 0;
+    bool keep_reduce_slot       = false;
 };
 
 [[nodiscard]] ContextAttentionPlan
-select_context_attention_plan(std::int32_t tokens, ContextAttentionExecutionEnvelope envelope);
+select_context_attention_plan(std::int32_t tokens, std::int32_t batch,
+                              ContextAttentionExecutionEnvelope envelope);
 
 } // namespace ninfer::ops::detail

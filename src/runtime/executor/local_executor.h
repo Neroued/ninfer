@@ -15,9 +15,11 @@ public:
     using Protocol = typename Types::ExecutionTypes;
     using Event    = ExecutionEvent<Protocol>;
 
-    LocalExecutor(std::unique_ptr<RankWorker<Types>> worker, SessionEpoch epoch)
-        : worker_(std::move(worker)), epoch_(epoch), pool_(worker_->program().capacity()),
-          compute_(pool_.capacity().compute_frames), context_(pool_.capacity().context_frames) {
+    LocalExecutor(std::unique_ptr<RankWorker<Types>> worker, SessionEpoch epoch,
+                  std::uint32_t max_decode_rows)
+        : Executor<Protocol>(max_decode_rows), worker_(std::move(worker)), epoch_(epoch),
+          pool_(worker_->program().capacity()), compute_(pool_.capacity().compute_frames),
+          context_(pool_.capacity().context_frames) {
         this->observations_.resize(1);
         this->observations_[0].hardware = worker_->device_name();
         sample_resources(true);

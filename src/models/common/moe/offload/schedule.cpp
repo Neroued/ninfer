@@ -79,9 +79,10 @@ public:
 
     bool try_before_layer(ExpertBankId bank) override { return resources_.try_before_layer(bank); }
 
-    bool start(ExpertBankId bank, const Tensor& hidden, Tensor& output, MemoryArena& workspace,
+    bool start(ExpertBankId bank, const Tensor& hidden, Tensor& output,
+               ops::MoeTokenValidity validity, MemoryArena& workspace,
                const ops::MoeExecutionHints& hints) override {
-        return resources_.start(bank, hidden, output, workspace, hints);
+        return resources_.start(bank, hidden, output, validity, workspace, hints);
     }
 
     bool poll() override { return resources_.poll(); }
@@ -89,7 +90,7 @@ public:
     void cancel() override { resources_.cancel(); }
 
     std::shared_ptr<const moe::LayerGraphDefinition>
-    capture_layer(ExpertBankId bank, CudaExecutionView cuda, std::int32_t tokens,
+    capture_layer(ExpertBankId bank, CudaExecutionView cuda, TokenGeometry geometry,
                   const std::function<void()>& mixer, const GpuBody& body,
                   const std::function<void()>& feature,
                   const std::shared_ptr<const moe::LayerGraphDefinition>& shared) override {
@@ -98,16 +99,19 @@ public:
             const auto& existing = dynamic_cast<const Definition&>(*shared);
             if (&existing.resources != &resources_ || existing.bank != bank)
                 throw std::logic_error("MoE graph sharing changed its execution owner");
-            out->definition.moe = existing.definition.moe;
+            out->definition.moe      = existing.definition.moe;
+            out->definition.validity = existing.definition.validity;
         } else {
             out->definition.moe = std::make_shared<SubsetGraphDefinitions>();
         }
         offload::capture_layer(
-            out->definition, resources_, bank, cuda, tokens, mixer,
+            out->definition, resources_, bank, cuda, geometry, mixer,
             [&](const PreparedExecution& call) {
-                body([&](const Tensor& hidden, Tensor& output, MemoryArena& workspace,
-                         const ops::MoeExecutionHints& hints) {
-                    enqueue_gpu(hidden, call, output, workspace, GpuSubmission::Capture, hints);
+                body([&](const Tensor& hidden, Tensor& output, ops::MoeTokenValidity validity,
+                         MemoryArena& workspace, const ops::MoeExecutionHints& hints) {
+                    out->definition.validity = validity;
+                    enqueue_gpu(hidden, call, output, validity, workspace, GpuSubmission::Capture,
+                                hints);
                 });
             },
             feature);
@@ -127,9 +131,10 @@ public:
     const ScheduleDescription& description() const noexcept override { return description_; }
 
 private:
-    void begin_activity(std::int32_t tokens) override {
+    void begin_activity(std::int32_t physical_tokens, std::int32_t active_tokens) override {
         if (active_) throw std::logic_error("MoE traversal is already active");
-        if (auto activity = resources_.begin(tokens)) activity_.emplace(std::move(*activity));
+        if (auto activity = resources_.begin(physical_tokens, active_tokens))
+            activity_.emplace(std::move(*activity));
         active_ = true;
     }
 
@@ -158,24 +163,29 @@ public:
     const ScheduleDescription& description() const noexcept override { return description_; }
 
     std::shared_ptr<const moe::Plan> resolve(std::size_t available, std::int32_t max_tokens,
+                                             std::span<const TokenGeometry> geometries,
                                              std::uint32_t workers) const override {
         CpuTopology topology;
-        auto resolved = resolve_plan(*plan_, banks_, available, max_tokens, topology, workers);
+        auto resolved =
+            resolve_plan(*plan_, banks_, available, max_tokens, geometries, topology, workers);
         return resolved ? std::make_shared<Planned>(std::move(*resolved), banks_) : nullptr;
     }
 
-    std::size_t workspace_bytes(ExpertBankId bank, std::int32_t first,
-                                std::int32_t last) const override {
+    std::size_t workspace_bytes(ExpertBankId bank, std::int32_t first, std::int32_t last,
+                                bool masked_tokens) const override {
         const auto& layer = plan_->layer(bank);
-        const auto end    = std::min(last, layer.hybrid_max_tokens);
+        const auto limit =
+            masked_tokens ? (plan_->team.worker_cpus.empty() ? last : layer.hybrid_physical_tokens)
+                          : layer.hybrid_max_tokens;
+        const auto end = std::min(last, limit);
         if (first > end) return 0;
         return describe_execution(layer.spec.profile, ops::ExpertSubsetKind::MaskOnes,
                                   layer.spec.epilogue, first, end)
             .gpu_workspace_bytes;
     }
 
-    GraphPlan graph_plan(ExpertBankId bank, std::int32_t tokens) const override {
-        return offload::graph_plan(*plan_, bank, tokens);
+    GraphPlan graph_plan(ExpertBankId bank, TokenGeometry geometry) const override {
+        return offload::graph_plan(*plan_, bank, geometry);
     }
 
     std::unique_ptr<moe::Schedule> create(std::span<const Parameters* const> layers,

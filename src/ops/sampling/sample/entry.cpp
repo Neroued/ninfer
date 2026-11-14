@@ -1,6 +1,7 @@
 #include "ninfer/ops/sampling.h"
 
 #include "ops/sampling/sample/plan.h"
+#include "ops/common/host/operands.h"
 
 #include <algorithm>
 #include <stdexcept>
@@ -17,7 +18,7 @@ std::size_t sampling_workspace_capacity_bytes(std::int32_t token_domain, std::in
 
 void sample(const Tensor& logits, Tensor& out, std::int32_t token_domain,
             const SamplingConfig* configs, const Tensor& logical_positions, std::int32_t purpose,
-            MemoryArena& workspace, CudaExecutionView execution) {
+            const Tensor& live_rows, MemoryArena& workspace, CudaExecutionView execution) {
     if (workspace.device() != execution.device()) {
         throw std::invalid_argument("sample: workspace belongs to another device");
     }
@@ -54,13 +55,23 @@ void sample(const Tensor& logits, Tensor& out, std::int32_t token_domain,
         throw std::invalid_argument("sample: tensor data must be non-null");
     }
     if (configs == nullptr) { throw std::invalid_argument("sample: configs must be non-null"); }
+    if (live_rows.data) {
+        common::operand::tensor(live_rows, DType::I32, {logits.ne[1]}, 4, "sample", "live rows",
+                                execution.device());
+        common::operand::disjoint(common::operand::range(live_rows, "sample"),
+                                  common::operand::range(out, "sample"), "sample");
+    }
 
     auto scratch_scope       = workspace.scope();
     const auto plan          = sample_detail::select_plan(token_domain, logits.ne[1]);
     const std::size_t bytes  = plan.workspace.bytes;
     const MemorySpan scratch = bytes == 0 ? MemorySpan{} : workspace.alloc_bytes(bytes);
-    sample_detail::launch(logits, out, token_domain, configs, logical_positions, purpose, plan,
-                          scratch, stream);
+    if (live_rows.data && scratch.data)
+        common::operand::disjoint(common::operand::range(live_rows, "sample"),
+                                  common::operand::range(scratch.data, scratch.bytes, "sample"),
+                                  "sample");
+    sample_detail::launch(logits, out, token_domain, configs, logical_positions, purpose, live_rows,
+                          plan, scratch, stream);
 }
 
 } // namespace ninfer::ops

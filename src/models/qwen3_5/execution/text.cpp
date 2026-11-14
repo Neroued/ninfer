@@ -265,7 +265,7 @@ void TextRun::gdn(const BlockParameters& block, std::uint32_t compact_layer) {
             ops::gated_delta_net_batch_update(
                 qb, kb, vb, gb, bb, scale, true, source,
                 view_.states.layer_view(compact_layer, inputs_.state_destination_offsets).recurrent,
-                ob, cuda);
+                inputs_.valid_columns, ob, cuda);
         }
     }
 
@@ -313,11 +313,13 @@ void TextRun::post_mixer(std::uint32_t layer, const moe::GpuCall* call) {
         if (call) throw std::invalid_argument("GPU MoE body supplied for a dense layer");
         dense_mlp(h, *dense, residual_, DenseMlpUse::Text, view_.workspace, view_.execution);
     } else if (call) {
-        (*call)(h, residual_, view_.workspace, next_projection_hints(layer));
+        (*call)(h, residual_, {inputs_.valid_columns, inputs_.ids.ne[0]}, view_.workspace,
+                next_projection_hints(layer));
     } else {
         const auto& parameters = std::get<moe::Parameters>(block.ffn);
         moe::execute(h, parameters, parameters.resident, ops::MoeEpilogue::AddResidual, residual_,
-                     view_.workspace, view_.execution, next_projection_hints(layer));
+                     {inputs_.valid_columns, inputs_.ids.ne[0]}, view_.workspace, view_.execution,
+                     next_projection_hints(layer));
     }
 }
 
@@ -356,7 +358,7 @@ void TextRun::finish() {
 bool TextRun::start() {
     if (stage_ != Stage::Idle) throw std::logic_error("Main traversal has already started");
     if (view_.moe) {
-        auto activity = view_.moe->begin(residual_.ne[1]);
+        auto activity = view_.moe->begin(residual_.ne[1], inputs_.active_tokens);
         if (activity) activity_.emplace(std::move(*activity));
     }
     stage_ = Stage::Layer;
@@ -393,7 +395,8 @@ bool TextRun::poll() {
             ops::rmsnorm(residual_, block.post_attention_norm, config.rms_norm_eps, true,
                          post_mixer_hidden_, view_.execution);
             stage_ = Stage::PostMixer;
-            if (!view_.moe->start(routed->bank, post_mixer_hidden_, residual_, view_.workspace,
+            if (!view_.moe->start(routed->bank, post_mixer_hidden_, residual_,
+                                  {inputs_.valid_columns, inputs_.ids.ne[0]}, view_.workspace,
                                   next_projection_hints(layer_)))
                 return false;
         } else {

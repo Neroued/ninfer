@@ -114,7 +114,7 @@ void kpool_indexer(const Tensor& query, const Tensor& coefficients,
         }
         launch_fp8_indexer(f, execution.multiprocessor_count(), execution.stream());
     } else {
-        launch_indexer(a, plan.windows, execution.multiprocessor_count(), execution.stream());
+        launch_indexer(a, execution.multiprocessor_count(), execution.stream());
     }
 }
 } // namespace ninfer::ops

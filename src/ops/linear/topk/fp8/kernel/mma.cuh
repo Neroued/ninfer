@@ -57,7 +57,7 @@ template <int TileColumns, int kBlockK = 128>
 __global__
 __launch_bounds__(MmaSchedule<TileColumns, kBlockK>::kThreads, 2) void fp8_mma_linear_topk_kernel(
     const __nv_bfloat16* __restrict__ hidden, const std::uint8_t* __restrict__ weight_codes,
-    const __nv_bfloat16* __restrict__ row_scales, std::int32_t valid_rows,
+    const __nv_bfloat16* __restrict__ row_scales, std::int32_t valid_rows, std::int32_t first_row,
     std::uint64_t* __restrict__ partial_keys, std::int32_t producer_groups, std::int32_t columns) {
     constexpr int kKTiles       = kLinearTopKHidden / kBlockK;
     constexpr int kBlockRows    = 64;
@@ -71,7 +71,9 @@ __launch_bounds__(MmaSchedule<TileColumns, kBlockK>::kThreads, 2) void fp8_mma_l
     static_assert(TileColumns % 8 == 0 && TileColumns <= 128);
     extern __shared__ __align__(16) unsigned char shared_bytes[];
     auto& reusable = *reinterpret_cast<Fp8MmaReusableStorage<TileColumns, kBlockK>*>(shared_bytes);
-    const int column_begin = static_cast<int>(blockIdx.y) * TileColumns;
+    const int producer     = columns > 128 ? int(blockIdx.y) : int(blockIdx.x);
+    const int column_tile  = columns > 128 ? int(blockIdx.x) : int(blockIdx.y);
+    const int column_begin = column_tile * TileColumns;
     const int live_columns = min(TileColumns, columns - column_begin);
     hidden += static_cast<std::int64_t>(column_begin) * kLinearTopKHidden;
 
@@ -92,7 +94,7 @@ __launch_bounds__(MmaSchedule<TileColumns, kBlockK>::kThreads, 2) void fp8_mma_l
 
     __syncthreads();
 
-    const int row_begin = static_cast<int>(blockIdx.x) * kRowsPerProducer;
+    const int row_begin = producer * kRowsPerProducer;
     {
         float accumulators[kTokenMmas][4] = {};
 
@@ -241,8 +243,8 @@ __launch_bounds__(MmaSchedule<TileColumns, kBlockK>::kThreads, 2) void fp8_mma_l
             const int local_row = reducer_lane * 2 + item;
             const int row       = row_begin + local_row;
             if (row < valid_rows) {
-                keys[item] =
-                    common::score_id_order_key(reusable.reduction.scores[column][local_row], row);
+                keys[item] = common::score_id_order_key(
+                    reusable.reduction.scores[column][local_row], first_row + row);
             }
         }
         MmaWarpSort(reusable.reduction.sort[reducer_warp])
@@ -254,7 +256,7 @@ __launch_bounds__(MmaSchedule<TileColumns, kBlockK>::kThreads, 2) void fp8_mma_l
                 if (column < live_columns) {
                     const auto dst =
                         (static_cast<std::int64_t>(column_begin + column) * producer_groups +
-                         blockIdx.x) *
+                         producer) *
                             kLinearTopK +
                         rank;
                     partial_keys[dst] = keys[item];

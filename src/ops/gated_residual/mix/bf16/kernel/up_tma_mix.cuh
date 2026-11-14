@@ -3,6 +3,8 @@
 #include "ops/gated_residual/mix/bf16/kernel/output.cuh"
 #include "ops/linear/kernels/bf16/bf16_a16_tma_mma.cuh"
 
+#include <type_traits>
+
 namespace ninfer::ops::detail::hc::mix::bf16 {
 struct StripedTmaWeightAccess {
     template <class Schedule>
@@ -115,11 +117,18 @@ struct TmaPrefetchedMixEpilogue {
     static constexpr int kSharedBytes =
         Schedule::kBlockRows * Schedule::kBlockTokens * (sizeof(float) + sizeof(__nv_bfloat16));
 
-    template <class S, bool FullTokens, class Output>
+    template <class S>
+    struct PreparedInputs {
+        static constexpr int kLoads =
+            (S::kBlockTokens * (S::kBlockRows / 8) + S::kThreads - 1) / S::kThreads;
+        uint4 words[kLoads];
+    };
+
+    template <class S, bool FullTokens, class Output, class Prepared = std::nullptr_t>
     __device__ __forceinline__ void finish_tile(const Output& output, unsigned char* storage,
                                                 float (&accum)[S::kMmaRows][S::kMmaTokens][4],
-                                                int row_begin, int token_begin, int,
-                                                int tokens) const {
+                                                int row_begin, int token_begin, int, int tokens,
+                                                const Prepared& saved = nullptr) const {
         constexpr int Features = S::kBlockRows / kStreams, Tokens = S::kBlockTokens,
                       Rows = S::kBlockRows;
         const int tid = threadIdx.x - S::kProducerThreads, warp = tid / 32, lane = tid % 32;
@@ -132,16 +141,27 @@ struct TmaPrefetchedMixEpilogue {
         // Staging has retired before the collective callback. Keep BF16 Z separate from
         // the FP32 contribution prefix so no producer overwrites an unread input.
         auto* z_tile = reinterpret_cast<__nv_bfloat16*>(storage + Rows * Tokens * sizeof(float));
-        for (int v = int(threadIdx.x); v < Tokens * (Rows / 8); v += S::kThreads) {
-            const int t = v / (Rows / 8), r = (v % (Rows / 8)) * 8;
-            uint4 words{};
-            if (FullTokens || token_begin + t < tokens) {
-                const int stream = r / Features, feature = feature_begin + r % Features;
-                words = common::load_vec<uint4>(normalized +
-                                                std::int64_t(token_begin + t) * kResidualWidth +
-                                                stream * kWidth + feature);
+        if constexpr (std::is_same_v<Prepared, std::nullptr_t>) {
+            for (int v = int(threadIdx.x); v < Tokens * (Rows / 8); v += S::kThreads) {
+                const int t = v / (Rows / 8), r = (v % (Rows / 8)) * 8;
+                uint4 words{};
+                if (FullTokens || token_begin + t < tokens) {
+                    const int stream = r / Features, feature = feature_begin + r % Features;
+                    words = common::load_vec<uint4>(normalized +
+                                                    std::int64_t(token_begin + t) * kResidualWidth +
+                                                    stream * kWidth + feature);
+                }
+                common::store_vec(z_tile + z_at(r, t), words);
             }
-            common::store_vec(z_tile + z_at(r, t), words);
+        } else {
+#pragma unroll
+            for (int i = 0; i < PreparedInputs<S>::kLoads; ++i) {
+                const int v = threadIdx.x + i * S::kThreads;
+                if (v < Tokens * (Rows / 8)) {
+                    const int t = v / (Rows / 8), r = (v % (Rows / 8)) * 8;
+                    common::store_vec(z_tile + z_at(r, t), saved.words[i]);
+                }
+            }
         }
         __syncthreads();
         const auto store = [&](int r, int t, float value) {
@@ -191,6 +211,30 @@ struct TmaPrefetchedMixEpilogue {
                 }
             }
         }
+    }
+};
+
+struct TmaEarlyMixEpilogue : TmaPrefetchedMixEpilogue {
+    template <class S, bool FullTokens>
+    __device__ __forceinline__ PreparedInputs<S> prepare_tile(int row_begin, int token_begin, int,
+                                                              int tokens) const {
+        constexpr int Features = S::kBlockRows / kStreams, Rows = S::kBlockRows,
+                      Tokens = S::kBlockTokens;
+        PreparedInputs<S> result{};
+#pragma unroll
+        for (int i = 0; i < PreparedInputs<S>::kLoads; ++i) {
+            const int v = threadIdx.x + i * S::kThreads;
+            if (v < Tokens * (Rows / 8)) {
+                const int t = v / (Rows / 8), r = (v % (Rows / 8)) * 8;
+                if (FullTokens || token_begin + t < tokens) {
+                    const int stream = r / Features, feature = row_begin / kStreams + r % Features;
+                    result.words[i] = common::load_vec<uint4>(
+                        normalized + std::int64_t(token_begin + t) * kResidualWidth +
+                        stream * kWidth + feature);
+                }
+            }
+        }
+        return result;
     }
 };
 

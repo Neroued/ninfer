@@ -155,6 +155,42 @@ int decode_padding_graph(bool mx, int tokens = 4) {
     return failures;
 }
 
+int large_batch_graph(int B, int T, bool fp8, bool mx) {
+    auto& d = cuda_environment().context;
+    kp::SparseMlaFixture f(d.execution_view(), T, B, 65, 1, 1, false, false, 1, 1,
+                           fp8 ? ops::KpoolMlaStorage::Fp8E4m3fnGroup128Ue8m0
+                               : ops::KpoolMlaStorage::BFloat16);
+    if (mx) f.encode_factors(d.execution_view());
+    const auto positions = f.positions.host, valid = f.valid.host, selectors = f.selectors.host,
+               rows = f.selection_rows.host;
+    DecodeGraphDefinition definition;
+    definition.capture(d.stream(), [&] { f.launch(d.execution_view()); });
+    DecodeGraphExecutable graph;
+    graph.instantiate(definition);
+    int failures = 0;
+    for (bool active : {true, false}) {
+        f.positions.host      = positions;
+        f.valid.host          = valid;
+        f.selectors.host      = selectors;
+        f.selection_rows.host = rows;
+        for (int b = 0; b < B; ++b) {
+            if (active && (b == 0 || b == B / 2 || b == B - 1)) continue;
+            f.valid.at(b)     = 0;
+            f.selectors.at(b) = -1;
+            for (int t = 0; t < T; ++t) {
+                f.positions.at(t, b)      = -1;
+                f.selection_rows.at(t, b) = -1;
+            }
+        }
+        f.upload_metadata();
+        f.scratch.fill(0xa5);
+        graph.launch(d.stream());
+        d.synchronize();
+        failures += verify(f);
+    }
+    return failures;
+}
+
 int empty(bool fp8 = false) {
     auto& d = cuda_environment().context;
     kp::SparseMlaFixture f(d.execution_view(), 4, 2, 8196, 0, 1, false, true, 1, 1,
@@ -361,6 +397,11 @@ int workspace_interval(bool fp8 = false, bool mx = false) {
                 for (int t = lo; t <= hi; ++t) maximum = std::max(maximum, capacity(B, t, t, E));
                 failures += capacity(B, lo, hi, E) != maximum;
             }
+    for (auto [B, lo, hi] : {std::tuple{17, 1, 65}, {65, 9, 31}, {1025, 1, 17}}) {
+        std::size_t maximum = 0;
+        for (int t = lo; t <= hi; ++t) maximum = std::max(maximum, capacity(B, t, t, 8192));
+        failures += capacity(B, lo, hi, 8192) != maximum;
+    }
     return failures;
 }
 
@@ -456,6 +497,12 @@ int main(int argc, char** argv) {
     add("kpool_sparse_mla/read_footprint", [] { return read_footprint(); });
     suite.add("kpool_sparse_mla/workspace_interval", [] { return workspace_interval(); });
     suite.add("kpool_sparse_mla/admission", admission);
+    suite.add("kpool_sparse_mla/large_batch/bf16",
+              [] { return large_batch_graph(17, 1, false, false); },
+              {{"suite", "concurrency"}, {"execution", "graph"}});
+    suite.add("kpool_sparse_mla/large_batch/mxfp8_fp8_window",
+              [] { return large_batch_graph(129, 9, true, true); },
+              {{"suite", "concurrency"}, {"execution", "graph"}});
     for (auto [T, B, E, cap] :
          {std::tuple{1, 1, 1, 512}, {1, 1, 2, 512},        {1, 1, 3, 512},     {1, 1, 65, 512},
           {1, 1, 2051, 512},        {1, 1, 1048576, 512},  {4, 2, 8194, 512},  {9, 1, 2051, 512},

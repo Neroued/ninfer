@@ -20,7 +20,7 @@ void RankProgramImpl::commit_draft_history(ComputeOperation& operation) {
     auto& draft       = *frame.dflash;
     auto& state       = *resources.dflash;
     const auto width  = static_cast<std::int32_t>(draft_window + 1);
-    const auto batch  = static_cast<std::int32_t>(operation.batch);
+    const auto batch  = static_cast<std::int32_t>(operation.shape.rows);
     const auto cuda   = device.execution_view();
     const auto prefix = [](const Tensor& storage, std::initializer_list<std::int32_t> shape) {
         return Tensor({storage.data, storage.bytes(), storage.device}, storage.dtype, shape);

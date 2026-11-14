@@ -346,6 +346,7 @@ bool SessionImpl::begin_pause(SequenceHandle handle, runtime::PauseAction action
         release_sequence_kv(state);
         release_sequence_state(state);
     }
+    resident_sequences.erase(state.id.value);
     saved->sequence    = std::move(state);
     saved->control     = std::move(control);
     state              = {};

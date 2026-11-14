@@ -115,6 +115,11 @@ public:
     explicit ResourceManager(bool enabled, ContextMachineCostModel costs)
         : enabled_(enabled), costs_(std::move(costs)) {}
 
+    ResourceManager(const ResourceManager&)            = delete;
+    ResourceManager& operator=(const ResourceManager&) = delete;
+    ResourceManager(ResourceManager&&)                 = default;
+    ResourceManager& operator=(ResourceManager&&)      = default;
+
     [[nodiscard]] const PrefixCacheStatistics& statistics() const noexcept {
         return index_.statistics();
     }
@@ -128,11 +133,10 @@ public:
         if (enabled_) {
             for (const auto handle : index_.matches(session, base)) {
                 if (session.checkpoint_metadata(handle).frontier > maximum_frontier) { continue; }
-                for (const auto& owner : owners_) {
-                    const auto point =
-                        std::find_if(owner.points.begin(), owner.points.end(),
-                                     [&](const auto& p) { return p.handle == handle; });
-                    if (point == owner.points.end()) { continue; }
+                const auto found = references_.find(handle);
+                if (found == references_.end()) continue;
+                for (const auto token : found->second.owners) {
+                    const auto& owner  = *find_owner(token);
                     const auto& advice = base.context_cache();
                     const bool take =
                         own_resume
@@ -149,13 +153,11 @@ public:
                          .publication_order = owner.publication_order,
                          .ordinal           = owner.token});
                 }
-                for (const auto& shared : shared_) {
-                    if (shared.handle != handle) { continue; }
+                for (const auto ordinal : found->second.shared)
                     result.push_back({.source       = Source{.checkpoint = handle},
-                                      .shared_entry = shared.ordinal,
+                                      .shared_entry = ordinal,
                                       .resume_owner = own_resume,
-                                      .ordinal      = shared.ordinal});
-                }
+                                      .ordinal      = ordinal});
             }
         }
         if (own_resume) {
@@ -333,11 +335,15 @@ public:
         if (!waiting) {
             if (held.empty()) { return; }
             waiting_.push_back({.request = request, .choice = choice, .held = std::move(held)});
+            waiting_lookup_.emplace(request, std::prev(waiting_.end()));
+            for (auto h : waiting_.back().held) add_reference(h, &References::waiting, request);
             return;
         }
         auto old        = std::move(waiting->held);
         waiting->choice = choice;
         waiting->held   = std::move(held);
+        for (auto h : old) remove_reference(h, &References::waiting, request);
+        for (auto h : waiting->held) add_reference(h, &References::waiting, request);
         for (const auto point : old) { release_unreferenced(session, point); }
     }
 
@@ -370,22 +376,27 @@ public:
         if (auto* waiting = find_waiting(request)) { waiting->binding = true; }
         for (const auto handle : retired) { forget(handle); }
         if (consumed) {
-            for (auto& waiting : waiting_) {
-                if (waiting.request != request && std::erase(waiting.held, *consumed)) {
-                    ++waiting.revocations;
-                }
+            const auto found = references_.find(*consumed);
+            if (found == references_.end()) return;
+            const auto waiters = found->second.waiting;
+            for (auto id : waiters) {
+                if (id == request) continue;
+                auto& waiting = *find_waiting(id);
+                std::erase(waiting.held, *consumed);
+                remove_reference(*consumed, &References::waiting, id);
+                ++waiting.revocations;
             }
         }
     }
 
     void release_source(Session& session, std::uint64_t request) {
-        const auto found = std::find_if(waiting_.begin(), waiting_.end(), [=](const auto& entry) {
-            return entry.request == request;
-        });
-        if (found == waiting_.end()) { return; }
-        auto held = std::move(found->held);
-        waiting_.erase(found);
-        for (const auto handle : held) { release_unreferenced(session, handle); }
+        const auto found = waiting_lookup_.find(request);
+        if (found == waiting_lookup_.end()) return;
+        auto held = std::move(found->second->held);
+        for (auto h : held) remove_reference(h, &References::waiting, request);
+        waiting_.erase(found->second);
+        waiting_lookup_.erase(found);
+        for (const auto handle : held) release_unreferenced(session, handle);
     }
 
     // Called exactly once after Native's irreversible bind commit. The choice preserves logical
@@ -437,6 +448,7 @@ public:
                                    .priority        = priority,
                                    .proven_frontier = proven_frontier,
                                    .retained_at     = ++retention_clock_});
+                owner_lookup_.emplace(token, std::prev(owners_.end()));
             }
         }
         auto* owner   = find_owner(token);
@@ -478,6 +490,8 @@ public:
                 }
                 const auto old = entry.handle;
                 entry.handle   = handle;
+                remove_reference(old, &References::shared, entry.ordinal);
+                add_reference(handle, &References::shared, entry.ordinal);
                 index_.insert(session, handle, summary.frontier, summary.role);
                 release_unreferenced(session, old);
                 return;
@@ -488,6 +502,8 @@ public:
                  .priority    = demand_priority(session.checkpoint_key(handle, summary.frontier)),
                  .retained_at = ++retention_clock_,
                  .evidence    = summary.evidence});
+            shared_lookup_.emplace(shared_.back().ordinal, std::prev(shared_.end()));
+            add_reference(handle, &References::shared, shared_.back().ordinal);
             index_.insert(session, handle, summary.frontier, summary.role);
         } else {
             auto* owner = find_owner(token);
@@ -524,6 +540,7 @@ public:
                     return;
                 }
                 owner->points.push_back({handle, summary.role});
+                add_reference(handle, &References::owners, owner->token);
                 index_.insert(session, handle, summary.frontier, summary.role);
             }
         }
@@ -577,6 +594,7 @@ public:
         auto* owner = find_owner(token);
         if (!owner) { return; }
         owner->active            = false;
+        references_dirty_        = true;
         owner->publication_order = publication_order;
         const auto& advice       = base.context_cache();
         if (advice.update_session_index && advice.session_key) {
@@ -598,7 +616,9 @@ public:
         auto* owner = find_owner(token);
         if (!owner) { return; }
         const auto old = points(token);
-        std::erase_if(owners_, [&](const auto& entry) { return entry.token == token; });
+        for (auto h : old) remove_reference(h, &References::owners, token);
+        owners_.erase(owner_lookup_.at(token));
+        owner_lookup_.erase(token);
         for (const auto handle : old) { release_unreferenced(session, handle); }
     }
 
@@ -1209,6 +1229,10 @@ public:
         owners_.clear();
         shared_.clear();
         waiting_.clear();
+        owner_lookup_.clear();
+        shared_lookup_.clear();
+        waiting_lookup_.clear();
+        references_.clear();
         demand_lookup_.clear();
         demand_frontiers_.clear();
         demand_.clear();
@@ -1228,15 +1252,13 @@ private:
     };
 
     WaitingSource* find_waiting(std::uint64_t request) {
-        const auto found = std::find_if(waiting_.begin(), waiting_.end(),
-                                        [=](const auto& item) { return item.request == request; });
-        return found == waiting_.end() ? nullptr : &*found;
+        const auto found = waiting_lookup_.find(request);
+        return found == waiting_lookup_.end() ? nullptr : &*found->second;
     }
 
     const WaitingSource* find_waiting(std::uint64_t request) const {
-        const auto found = std::find_if(waiting_.begin(), waiting_.end(),
-                                        [=](const auto& item) { return item.request == request; });
-        return found == waiting_.end() ? nullptr : &*found;
+        const auto found = waiting_lookup_.find(request);
+        return found == waiting_lookup_.end() ? nullptr : &*found->second;
     }
 
     bool consumable(Handle handle, OwnerToken owner, std::uint64_t request,
@@ -1247,8 +1269,10 @@ private:
                                     [&](const auto& point) { return point.handle == handle; });
         }
         if (catalog_reference_count(handle) != allowed) { return false; }
-        for (const auto& waiting : waiting_) {
-            if (!contains(waiting.held, handle)) { continue; }
+        const auto refs = references_.find(handle);
+        if (refs == references_.end()) return false;
+        for (auto id : refs->second.waiting) {
+            const auto& waiting = *find_waiting(id);
             if (waiting.binding) { return false; }
             if (waiting.request != request &&
                 (!revocation || revocation->purpose == ReclaimPurpose::OptionalWrite ||
@@ -1263,25 +1287,23 @@ private:
 
     [[nodiscard]] std::uint64_t waiting_ticket(std::span<const Handle> handles) const {
         std::uint64_t oldest = 0;
-        for (const auto& waiting : waiting_) {
-            if (std::any_of(handles.begin(), handles.end(),
-                            [&](auto handle) { return contains(waiting.held, handle); })) {
-                oldest = oldest ? std::min(oldest, waiting.request) : waiting.request;
-            }
+        for (auto h : handles) {
+            const auto found = references_.find(h);
+            if (found == references_.end()) continue;
+            for (auto id : found->second.waiting) oldest = oldest ? std::min(oldest, id) : id;
         }
         return oldest;
     }
 
     bool may_revoke(std::span<const Handle> handles, ReclaimRights rights) const {
-        for (const auto& waiting : waiting_) {
-            if (!std::any_of(handles.begin(), handles.end(),
-                             [&](auto handle) { return contains(waiting.held, handle); })) {
-                continue;
-            }
-            if (waiting.binding || rights.purpose == ReclaimPurpose::OptionalWrite ||
-                (rights.purpose == ReclaimPurpose::FreshAdmission &&
-                 waiting.request <= rights.request)) {
-                return false;
+        for (auto h : handles) {
+            const auto found = references_.find(h);
+            if (found == references_.end()) continue;
+            for (auto id : found->second.waiting) {
+                const auto& waiting = *find_waiting(id);
+                if (waiting.binding || rights.purpose == ReclaimPurpose::OptionalWrite ||
+                    (rights.purpose == ReclaimPurpose::FreshAdmission && id <= rights.request))
+                    return false;
             }
         }
         return true;
@@ -1359,39 +1381,60 @@ private:
         return std::find(handles.begin(), handles.end(), handle) != handles.end();
     }
 
+    struct HandleHash {
+        std::size_t operator()(Handle h) const noexcept { return h.index; }
+    };
+
+    struct References {
+        std::vector<std::uint64_t> owners, shared, waiting;
+
+        bool empty() const { return owners.empty() && shared.empty() && waiting.empty(); }
+    };
+
+    using ReferenceList = std::vector<std::uint64_t> References::*;
+
+    void add_reference(Handle h, ReferenceList kind, std::uint64_t id) {
+        references_dirty_ = true;
+        auto& entries     = references_[h].*kind;
+        if (std::find(entries.begin(), entries.end(), id) == entries.end()) entries.push_back(id);
+    }
+
+    void remove_reference(Handle h, ReferenceList kind, std::uint64_t id) {
+        references_dirty_ = true;
+        const auto found  = references_.find(h);
+        if (found == references_.end()) return;
+        std::erase(found->second.*kind, id);
+        if (found->second.empty()) references_.erase(found);
+    }
+
     Owner* find_owner(OwnerToken token) {
-        const auto it = std::find_if(owners_.begin(), owners_.end(),
-                                     [&](const auto& owner) { return owner.token == token; });
-        return it == owners_.end() ? nullptr : &*it;
+        const auto found = owner_lookup_.find(token);
+        return found == owner_lookup_.end() ? nullptr : &*found->second;
     }
 
     const Owner* find_owner(OwnerToken token) const {
-        const auto it = std::find_if(owners_.begin(), owners_.end(),
-                                     [&](const auto& owner) { return owner.token == token; });
-        return it == owners_.end() ? nullptr : &*it;
+        const auto found = owner_lookup_.find(token);
+        return found == owner_lookup_.end() ? nullptr : &*found->second;
     }
 
     Shared* find_shared(std::uint64_t ordinal) {
-        const auto it = std::find_if(shared_.begin(), shared_.end(),
-                                     [&](const auto& entry) { return entry.ordinal == ordinal; });
-        return it == shared_.end() ? nullptr : &*it;
+        const auto found = shared_lookup_.find(ordinal);
+        return found == shared_lookup_.end() ? nullptr : &*found->second;
     }
 
     std::size_t catalog_reference_count(Handle handle) const {
-        std::size_t count = 0;
-        for (const auto& owner : owners_) {
-            count += std::count_if(owner.points.begin(), owner.points.end(),
-                                   [&](const auto& point) { return point.handle == handle; });
-        }
-        count += std::count_if(shared_.begin(), shared_.end(),
-                               [&](const auto& entry) { return entry.handle == handle; });
-        return count;
+        const auto found = references_.find(handle);
+        return found == references_.end()
+                   ? 0
+                   : found->second.owners.size() + found->second.shared.size();
     }
 
     std::size_t reference_count(Handle handle) const {
-        auto count = catalog_reference_count(handle);
-        for (const auto& waiting : waiting_) { count += contains(waiting.held, handle); }
-        return count;
+        const auto found = references_.find(handle);
+        return found == references_.end()
+                   ? 0
+                   : found->second.owners.size() + found->second.shared.size() +
+                         found->second.waiting.size();
     }
 
     bool references(Handle handle) const { return reference_count(handle) != 0; }
@@ -1402,19 +1445,30 @@ private:
             return false;
         }
         std::erase_if(owner.points, [&](const auto& point) { return point.handle == handle; });
+        remove_reference(handle, &References::owners, owner.token);
         if (!catalog_reference_count(handle)) { index_.erase(handle); }
         return true;
     }
 
     void forget(Handle handle, bool reclaimed = false) {
+        references_dirty_ = true;
         index_.erase(handle, reclaimed);
-        for (auto& owner : owners_) {
+        const auto found = references_.find(handle);
+        if (found == references_.end()) return;
+        for (auto token : found->second.owners) {
+            auto& owner = *find_owner(token);
             std::erase_if(owner.points, [&](const auto& point) { return point.handle == handle; });
         }
-        std::erase_if(shared_, [&](const auto& entry) { return entry.handle == handle; });
-        for (auto& waiting : waiting_) {
-            if (std::erase(waiting.held, handle) && !waiting.binding) { ++waiting.revocations; }
+        for (auto id : found->second.shared) {
+            shared_.erase(shared_lookup_.at(id));
+            shared_lookup_.erase(id);
         }
+        for (auto id : found->second.waiting) {
+            auto& waiting = *find_waiting(id);
+            std::erase(waiting.held, handle);
+            if (!waiting.binding) ++waiting.revocations;
+        }
+        references_.erase(found);
     }
 
     void release_unreferenced(Session& session, Handle handle) {
@@ -1429,6 +1483,7 @@ private:
         std::vector<Handle> old;
         for (const auto& point : owner.points) { old.push_back(point.handle); }
         owner.points.clear();
+        for (auto h : old) remove_reference(h, &References::owners, owner.token);
         for (const auto handle : carried) {
             if (!session.valid_checkpoint(handle)) { continue; }
             const auto summary = session.checkpoint_metadata(handle);
@@ -1436,29 +1491,30 @@ private:
                 throw std::logic_error("Native carried a public point as a private continuation");
             }
             owner.points.push_back({handle, summary.role});
+            add_reference(handle, &References::owners, owner.token);
             index_.insert(session, handle, summary.frontier, summary.role);
         }
         for (const auto handle : old) { release_unreferenced(session, handle); }
     }
 
     void prune(Session& session) {
+        const auto revision = session.checkpoint_catalog_revision();
+        if (!references_dirty_ && revision == pruned_revision_) return;
         demand_capacity_ = std::max<std::size_t>(256, session.checkpoint_extent() * 2);
         std::vector<Handle> stale;
-        const auto inspect = [&](Handle handle) {
-            if (!session.valid_checkpoint(handle) && !contains(stale, handle)) {
-                stale.push_back(handle);
+        for (const auto& [handle, refs] : references_)
+            if (!session.valid_checkpoint(handle)) stale.push_back(handle);
+        for (const auto handle : stale) forget(handle);
+        for (auto it = owners_.begin(); it != owners_.end();) {
+            if (!it->active && it->points.empty()) {
+                owner_lookup_.erase(it->token);
+                it = owners_.erase(it);
+            } else {
+                ++it;
             }
-        };
-        for (const auto& owner : owners_) {
-            for (const auto& point : owner.points) { inspect(point.handle); }
         }
-        for (const auto& shared : shared_) { inspect(shared.handle); }
-        for (const auto& waiting : waiting_) {
-            for (const auto handle : waiting.held) { inspect(handle); }
-        }
-        for (const auto handle : stale) { forget(handle); }
-        std::erase_if(owners_,
-                      [](const auto& owner) { return !owner.active && owner.points.empty(); });
+        references_dirty_ = false;
+        pruned_revision_  = revision;
     }
 
     struct RankedVictim {
@@ -2027,9 +2083,13 @@ private:
     bool enabled_;
     ContextMachineCostModel costs_;
     PrefixIndex<Model> index_;
-    std::vector<Owner> owners_;
-    std::vector<Shared> shared_;
-    std::vector<WaitingSource> waiting_;
+    std::list<Owner> owners_;
+    std::list<Shared> shared_;
+    std::list<WaitingSource> waiting_;
+    std::unordered_map<OwnerToken, typename std::list<Owner>::iterator> owner_lookup_;
+    std::unordered_map<std::uint64_t, typename std::list<Shared>::iterator> shared_lookup_;
+    std::unordered_map<std::uint64_t, typename std::list<WaitingSource>::iterator> waiting_lookup_;
+    std::unordered_map<Handle, References, HandleHash> references_;
     std::size_t demand_capacity_ = 256;
     std::list<Demand> demand_;
     std::map<DemandKey, typename std::list<Demand>::iterator> demand_lookup_;
@@ -2038,5 +2098,7 @@ private:
     std::uint64_t retention_clock_ = 0;
     std::uint64_t ordinal_         = 0;
     std::uint64_t decision_clock_  = 0;
+    std::uint64_t pruned_revision_ = 0;
+    bool references_dirty_         = false;
 };
 } // namespace ninfer::runtime

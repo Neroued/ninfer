@@ -8,10 +8,11 @@
 #include <iostream>
 #include <regex>
 #include <stdexcept>
+#include <string_view>
 
 namespace {
-void require(bool condition, const char* message) {
-    if (!condition) { throw std::runtime_error(message); }
+void require(bool condition, std::string_view message) {
+    if (!condition) { throw std::runtime_error(std::string(message)); }
 }
 
 ninfer::PromptInput prompt(bool thinking = false) {
@@ -85,7 +86,9 @@ void choice_and_regex(ninfer::Engine& engine, unsigned concurrency, bool specula
     const auto thought                 = engine.generate(engine.prepare(prompt(true)), thinking);
     require(valid_choice(thought.content) &&
                 thought.finish_reason == ninfer::FinishReason::StopToken,
-            "choice constrained the thinking channel or lost the content boundary");
+            "choice constrained the thinking channel or lost the content boundary: content=" +
+                thought.content +
+                ", finish=" + std::to_string(static_cast<int>(thought.finish_reason)));
     for (const auto& constraint : {ninfer::OutputConstraint::choice({"TASK-12", "TASK-123"}),
                                    ninfer::OutputConstraint::regex("(BUG|TASK)-[0-9]{4}")}) {
         auto input                 = prompt();

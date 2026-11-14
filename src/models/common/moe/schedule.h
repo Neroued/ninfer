@@ -1,6 +1,7 @@
 #pragma once
 
 #include "models/common/moe/execution.h"
+#include "models/common/batch.h"
 #include "core/expert_cache.h"
 
 #include <array>
@@ -12,6 +13,16 @@
 #include <vector>
 
 namespace ninfer::models::moe {
+
+// A fixed physical Main window and the smallest real workload that can select it.
+struct TokenGeometry {
+    std::int32_t physical_tokens, minimum_active_tokens;
+};
+
+[[nodiscard]] TokenGeometry decode_geometry(const BatchExecutionPlan&, std::uint32_t rows,
+                                            std::uint32_t width);
+[[nodiscard]] std::vector<TokenGeometry> decode_geometries(const BatchExecutionPlan&,
+                                                           std::uint32_t maximum_width);
 
 struct HybridPolicy {
     std::int32_t max_tokens         = 0;
@@ -48,8 +59,8 @@ struct GraphPlan {
 
 // Borrowed synchronous capture call. The model supplies its normalization/input preparation;
 // the schedule supplies the GPU body without exposing CPU or cache handoff resources.
-using GpuCall =
-    std::function<void(const Tensor&, Tensor&, MemoryArena&, const ops::MoeExecutionHints&)>;
+using GpuCall = std::function<void(const Tensor&, Tensor&, ops::MoeTokenValidity, MemoryArena&,
+                                   const ops::MoeExecutionHints&)>;
 using GpuBody = std::function<void(const GpuCall&)>;
 
 class LayerGraphDefinition;
@@ -82,15 +93,18 @@ class Plan {
 public:
     virtual ~Plan()                                                               = default;
     [[nodiscard]] virtual const ScheduleDescription& description() const noexcept = 0;
-    [[nodiscard]] virtual std::shared_ptr<const Plan>
-    resolve(std::size_t available, std::int32_t max_tokens, std::uint32_t cpu_workers) const = 0;
+    [[nodiscard]] virtual std::shared_ptr<const Plan> resolve(std::size_t available,
+                                                              std::int32_t max_tokens,
+                                                              std::span<const TokenGeometry>,
+                                                              std::uint32_t cpu_workers) const = 0;
     [[nodiscard]] virtual std::size_t workspace_bytes(ExpertBankId, std::int32_t first,
-                                                      std::int32_t last) const               = 0;
-    [[nodiscard]] virtual GraphPlan graph_plan(ExpertBankId, std::int32_t tokens) const      = 0;
+                                                      std::int32_t last,
+                                                      bool masked_tokens) const                = 0;
+    [[nodiscard]] virtual GraphPlan graph_plan(ExpertBankId, TokenGeometry) const              = 0;
     [[nodiscard]] virtual std::unique_ptr<Schedule> create(std::span<const Parameters* const>,
                                                            std::span<const ExpertBankSource>,
                                                            const DeviceContext&,
-                                                           ResourcePurpose) const            = 0;
+                                                           ResourcePurpose) const              = 0;
 };
 
 [[nodiscard]] std::shared_ptr<const Plan> describe_plan(std::span<const ExpertBankCacheSpec>,
@@ -132,21 +146,22 @@ public:
 
     virtual ~Schedule() = default;
 
-    [[nodiscard]] std::optional<Activity> begin(std::int32_t tokens) {
-        begin_activity(tokens);
+    [[nodiscard]] std::optional<Activity> begin(std::int32_t physical_tokens,
+                                                std::int32_t active_tokens) {
+        begin_activity(physical_tokens, active_tokens);
         return Activity(*this);
     }
 
     [[nodiscard]] virtual bool try_before_layer(ExpertBankId) = 0;
     // start accepts one layer, borrowing its operands and arena through poll/cancel.
     // Completion means submission, not Device retirement. Keep Activity across yields.
-    [[nodiscard]] virtual bool start(ExpertBankId, const Tensor&, Tensor&, MemoryArena&,
-                                     const ops::MoeExecutionHints&) = 0;
-    [[nodiscard]] virtual bool poll()                               = 0;
+    [[nodiscard]] virtual bool start(ExpertBankId, const Tensor&, Tensor&, ops::MoeTokenValidity,
+                                     MemoryArena&, const ops::MoeExecutionHints&) = 0;
+    [[nodiscard]] virtual bool poll()                                             = 0;
     // Discard work not yet submitted; already queued consumers retain their backing.
     virtual void cancel() = 0;
     [[nodiscard]] virtual std::shared_ptr<const LayerGraphDefinition>
-    capture_layer(ExpertBankId, CudaExecutionView, std::int32_t tokens,
+    capture_layer(ExpertBankId, CudaExecutionView, TokenGeometry,
                   const std::function<void()>& mixer, const GpuBody&,
                   const std::function<void()>& feature,
                   const std::shared_ptr<const LayerGraphDefinition>& shared)      = 0;
@@ -157,10 +172,10 @@ public:
     [[nodiscard]] virtual const ScheduleDescription& description() const noexcept = 0;
 
 private:
-    virtual void begin_activity(std::int32_t) = 0;
-    virtual void end_activity() noexcept      = 0;
-    virtual void begin_preparation()          = 0;
-    virtual void end_preparation() noexcept   = 0;
+    virtual void begin_activity(std::int32_t physical_tokens, std::int32_t active_tokens) = 0;
+    virtual void end_activity() noexcept                                                  = 0;
+    virtual void begin_preparation()                                                      = 0;
+    virtual void end_preparation() noexcept                                               = 0;
 };
 
 } // namespace ninfer::models::moe

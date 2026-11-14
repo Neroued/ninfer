@@ -33,6 +33,15 @@ __global__ __launch_bounds__(WarpsPerCta * 32) void gdn_projected_conv_parallel_
     const int row      = static_cast<int>(blockIdx.x) * 32 + lane;
     std::int32_t valid = valid_columns == nullptr ? tokens : *valid_columns;
     valid              = valid < 0 ? 0 : (valid > tokens ? tokens : valid);
+    if (!valid) {
+        const auto destination =
+            CausalConvSplitOutput3<__nv_bfloat16, ConvGeometry::query_rows, ConvGeometry::key_rows,
+                                   ConvGeometry::value_rows>{query, key, value}
+                .column(row);
+        for (int token = warp; token < tokens; token += WarpsPerCta)
+            *destination.at(token) = __float2bfloat16_rn(0.0F);
+        return;
+    }
     if (warp == 0) {
         const std::int64_t initial_base = *source_offsets / 2;
 #pragma unroll

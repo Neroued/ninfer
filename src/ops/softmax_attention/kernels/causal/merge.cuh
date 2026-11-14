@@ -8,6 +8,8 @@
 
 namespace ninfer::ops::detail {
 
+static __global__ void causal_merge_idle_kernel() {}
+
 template <class Geometry>
 __device__ __forceinline__ float
 causal_merge_natural_statistics(const float* partial_m, const float* partial_l, int q_head,
@@ -62,8 +64,6 @@ __launch_bounds__(256) __global__
     if constexpr (MultiBatch) {
         if (batch >= batch_size) return;
     }
-    if constexpr (MultiBatch) positions += static_cast<std::int64_t>(batch) * tokens;
-    const int window  = positions[tokens - 1] + 1;
     int output_column = token;
     if constexpr (MultiBatch) output_column += batch * tokens;
     if constexpr (Masked) {
@@ -82,6 +82,8 @@ __launch_bounds__(256) __global__
         partial_m += static_cast<std::int64_t>(batch) * Geometry::QHeads * tokens * split_count;
         partial_l += static_cast<std::int64_t>(batch) * Geometry::QHeads * tokens * split_count;
     }
+    if constexpr (MultiBatch) positions += static_cast<std::int64_t>(batch) * tokens;
+    const int window        = positions[tokens - 1] + 1;
     const int active_splits = partition.active(window);
     __shared__ float weights[256], warp_sums[8], scalars[2];
     const float head_l = causal_merge_natural_statistics<Geometry>(
@@ -113,6 +115,11 @@ void launch_causal_natural_merge(const CausalAttentionOperands& p,
                                  const std::int32_t* valid_columns, CausalKvPartition partition,
                                  CausalPartialView partial, cudaStream_t stream) {
     static_assert(S::kThreads == 256);
+    if (partition.capacity == 1) {
+        causal_merge_idle_kernel<<<1, 1, 0, stream>>>();
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
     const dim3 grid(G::QHeads, common::div_up(G::kHeadDim, S::kDChunk), p.width * p.batch);
     causal_natural_merge_kernel<G, S::kDChunk, MultiBatch, Masked, InverseRotation>
         <<<grid, S::kThreads, 0, stream>>>(partial.acc, partial.maximum, partial.sum, p.positions,

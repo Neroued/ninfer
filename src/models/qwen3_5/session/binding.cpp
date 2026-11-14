@@ -59,9 +59,9 @@ BindingPlan SessionImpl::plan_binding(const RequestBasePlan& base, runtime::Lane
     // Root at frontier zero already covers a request paused before its first chunk.
     // Only missing committed history requires replay; a snapshot is not required.
     transaction.resume_without_replay = resume && actual->reused_tokens == resume->frontier();
-    transaction.take_private    = candidate.take_private;
-    transaction.carried_points  = actual->private_points;
-    transaction.state_action    = actual->state_action;
+    transaction.take_private          = candidate.take_private;
+    transaction.carried_points        = actual->private_points;
+    transaction.state_action          = actual->state_action;
     if (source) {
         if (actual->state_action == StateBindingAction::Move)
             std::erase(transaction.carried_points, *source);
@@ -225,6 +225,7 @@ BindingReservation SessionImpl::start_binding(const RequestBasePlan& base, runti
                                   : SequenceHandle{next_sequence++, executor().epoch().value};
     if (++lane_epochs[lane] == 0) ++lane_epochs[lane];
     sequences[lane].residency = {{lane}, lane_epochs[lane]};
+    resident_sequences.emplace(sequences[lane].id.value, lane);
     context_operation_->reservation.emplace(std::move(*execution_reservation));
     auto& tx        = std::get<BindOperation>(context_operation_->action);
     auto& migration = context_operation_->transaction;

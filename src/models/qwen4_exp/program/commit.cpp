@@ -8,8 +8,8 @@ namespace ninfer::models::qwen4_exp::detail {
 
 void RankProgramImpl::commit_verify(const Commit& commit) {
     const auto rows     = compute->rows;
-    const auto& buffers = resources.plan.persistent.buffers;
-    const auto batch    = static_cast<std::int32_t>(rows.size());
+    const auto& buffers = resources.buffers();
+    const auto batch    = static_cast<std::int32_t>(compute->physical.rows);
     auto* accepted = static_cast<std::int32_t*>(host_tensor(buffers.batch.accepted_columns).data);
     auto* count_columns = static_cast<std::int32_t*>(host_tensor(buffers.batch.count_columns).data);
     auto* destinations =
@@ -18,6 +18,11 @@ void RankProgramImpl::commit_verify(const Commit& commit) {
     auto* active = static_cast<std::int32_t*>(host_tensor(buffers.mtp->active_columns).data);
     bool any = false, rebuild_history = false, count_tokens = false;
     for (int b = 0; b < batch; ++b) {
+        accepted[b] = count_columns[b] = 0;
+        last[b] = active[b] = -1;
+        destinations[b]     = -1;
+    }
+    for (std::size_t b = 0; b < rows.size(); ++b) {
         const auto& decision = commit.rows[b];
         accepted[b]          = static_cast<std::int32_t>(decision.accepted);
         count_columns[b] = rows[b].sampling.presence_penalty || rows[b].sampling.frequency_penalty
@@ -45,19 +50,21 @@ void RankProgramImpl::commit_verify(const Commit& commit) {
 void RankProgramImpl::execute_mtp_commit(std::int32_t batch, bool rebuild_history,
                                          bool count_tokens, DecodeGraphSection* captured_repair,
                                          DecodeGraphSection* captured_counts) {
-    const auto& io   = resources.plan.persistent.buffers;
+    const auto& io   = resources.buffers();
     const auto& mtp  = *io.mtp;
     const auto width = static_cast<int>(shape.draft_tokens + 1), k = width - 1;
     const auto channels = dimension(parameters.profile->config.text.residual_width());
     const auto hidden   = dimension(parameters.profile->config.text.hidden);
-    const auto row     = [&](const TensorRegion& r) { return device_tensor(r).slice(0, 0, batch); };
-    auto accepted      = row(io.batch.accepted_columns);
-    auto main           = resources.main_batch(width, batch, shape.max_context);
+    const auto row = [&](const TensorRegion& r) { return device_tensor(r).slice(0, 0, batch); };
+    auto accepted  = row(io.batch.accepted_columns);
+    auto main      = resources.main_batch(width, batch, shape.max_context);
     main.destination_offsets = row(io.commit_destination_offsets);
-    auto history       = resources.mtp_batch(mtp.history, k, batch, shape.max_context);
+    auto history       = resources.mtp_batch(history_control_view(mtp.history, k, batch), k, batch,
+                                             shape.max_context);
     history.table_rows = row(mtp.draft_steps[0].table_rows);
     history.base_positions = main.base_positions;
     history.record_offsets = main.record_offsets;
+    history.live_rows      = main.live_rows;
     auto last = row(mtp.last_columns), active = row(mtp.active_columns);
     const auto sample       = packed_tensor(io.pending_sample, {hidden, width, batch});
     const auto conditioning = packed_tensor(*io.pending_conditioning, {channels, width, batch});
@@ -80,10 +87,12 @@ void RankProgramImpl::execute_mtp_commit(std::int32_t batch, bool rebuild_histor
                           {device_tensor(io.main_qsa.keys).slice(2, 0, batch),
                            device_tensor(io.main_qsa.coordinates).slice(2, 0, batch),
                            main.base_positions, main.valid_columns},
-                          accepted, resources.states->main_tail(main.destination_offsets), cuda);
+                          accepted, resources.states->main_tail(main.destination_offsets),
+                          main.live_rows, cuda);
     ops::ple_state_extract(resources.states->ple(main.source_offsets),
                            {device_tensor(io.ple_records).slice(2, 0, batch), main.valid_columns},
-                           accepted, resources.states->ple(main.destination_offsets), cuda);
+                           accepted, resources.states->ple(main.destination_offsets),
+                           main.live_rows, cuda);
     const auto tail       = mtp_working_tail(0, batch);
     const auto key_width  = dimension(parameters.profile->config.text.qsa.index_key_width());
     const auto tail_width = dimension(parameters.profile->config.text.qsa.compression - 1);
@@ -103,7 +112,7 @@ void RankProgramImpl::execute_mtp_commit(std::int32_t batch, bool rebuild_histor
                            .view({key_width * tail_width, 1, batch});
     auto key_store               = destination.raw_keys;
     key_store.field.tensor.shape = {key_width * tail_width, 1, 1, 1};
-    const auto coordinates = packed_tensor(mtp.tail_coordinates, {3, batch, 3})
+    const auto coordinates       = packed_tensor(mtp.tail_coordinates, {3, batch, 3})
                                  .slice(2, tail_slot, 1)
                                  .view({3, 1, batch});
     const std::array fields{

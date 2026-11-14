@@ -41,7 +41,8 @@ struct Bf16ContextFixture {
         return x ^ (x >> 16);
     }
 
-    explicit Bf16ContextFixture(Device device) {
+    explicit Bf16ContextFixture(Device device, int record_count = Records) {
+        const auto cache_elements = std::size_t(128) * Padded * Heads * record_count;
         std::vector<Tensor> fields;
         for (int l = 0; l < Layers; ++l) {
             auto& host = parent_bits[l];
@@ -62,8 +63,8 @@ struct Bf16ContextFixture {
                 norm_bits[l][d] = bf16(.75F + l * .03125F + ((d * 7 + l) % 19) / 128.F);
             norms[l] = DeviceBuffer(device, 256);
             norms[l].copy_from_host(norm_bits[l].data(), 256);
-            keys[l]   = DeviceBuffer(device, CacheElements * 2);
-            values[l] = DeviceBuffer(device, CacheElements * 2);
+            keys[l]   = DeviceBuffer(device, cache_elements * 2);
+            values[l] = DeviceBuffer(device, cache_elements * 2);
             keys[l].fill(0xa5);
             values[l].fill(0xa5);
             auto weight = [&](int first) {
@@ -82,9 +83,9 @@ struct Bf16ContextFixture {
             };
             layers[l] = {weight(0), weight(Rows), Tensor(norms[l].span(), DType::BF16, {128}), {}};
             fields.emplace_back(keys[l].span(), DType::BF16,
-                                std::initializer_list<int>{128, Padded, Heads, Records});
+                                std::initializer_list<int>{128, Padded, Heads, record_count});
             fields.emplace_back(values[l].span(), DType::FP16,
-                                std::initializer_list<int>{128, Padded, Heads, Records});
+                                std::initializer_list<int>{128, Padded, Heads, record_count});
         }
         records = std::make_unique<StateRecordFixture>(fields, 3);
     }

@@ -35,16 +35,18 @@ int main(int argc, char** argv) {
                     }
             };
             if (options.op == "fold") {
-                gdn_replay::FoldFixture f(options.profile, t);
+                gdn_replay::FoldFixture f(options.profile, t, options.batch);
                 const auto counts = gdn_replay::extents(options.commits, t, options.batch, true);
-                constexpr int records[] = {10, 2, 8, 0, 6, 4, 9, 1};
+                constexpr int small_records[] = {10, 2, 8, 0, 6, 4, 9, 1};
+                const auto record             = [&](int b) {
+                    return options.batch <= 8 ? small_records[b] : b + 3;
+                };
                 std::vector<ops::GdnReplayFoldRow> rows;
                 for (int b = 0; b < options.batch; ++b)
-                    rows.push_back(
-                        {f.byte_offset(records[b]), f.byte_offset(records[b]), counts[b]});
+                    rows.push_back({f.byte_offset(record(b)), f.byte_offset(record(b)), counts[b]});
                 const bool on_device = options.row_metadata == "device";
                 std::vector<std::int64_t> offsets(options.batch);
-                for (int b = 0; b < options.batch; ++b) offsets[b] = f.byte_offset(records[b]);
+                for (int b = 0; b < options.batch; ++b) offsets[b] = f.byte_offset(record(b));
                 auto selected = on_device ? gdn_replay::make_offsets(offsets) : DeviceBuffer{};
                 auto prefixes = on_device ? measurement::make_i32(counts) : DeviceBuffer{};
                 Tensor selectors, commits;

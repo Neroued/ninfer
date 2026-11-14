@@ -138,7 +138,9 @@ int run_case(std::int32_t value_heads, std::int32_t width, std::int32_t batch,
     Tensor selected_reference_slot(reference_slot.span(), DType::I64, {1});
     Tensor valid;
     if (!dense) { valid = Tensor(device_valid.span(), DType::I32, {batch}); }
-    auto initial_offsets        = history.record_offsets(initial_slots);
+    auto initial_offsets = history.record_offsets(initial_slots);
+    for (int row = 0; row < batch; ++row)
+        if (!valid_columns[row]) initial_offsets[row] = -1;
     DeviceBuffer device_initial = to_device(initial_offsets);
     Tensor initial(device_initial.span(), DType::I64, {batch});
     Tensor reference_output(reference_out.span(), DType::BF16,
@@ -159,7 +161,8 @@ int run_case(std::int32_t value_heads, std::int32_t width, std::int32_t batch,
         CUDA_CHECK(cudaMemsetAsync(reference_out.data(), 0, reference_out.size(), stream));
         for (std::int32_t row = 0; row < batch; ++row) {
             const std::int32_t valid_extent = valid_columns[static_cast<std::size_t>(row)];
-            Tensor q_row                    = q.slice(3, row, 1)
+            if (!valid_extent) continue;
+            Tensor q_row = q.slice(3, row, 1)
                                .slice(2, 0, valid_extent)
                                .view({kStateDim, kQkHeads, valid_extent});
             Tensor k_row = k.slice(3, row, 1)
@@ -194,7 +197,7 @@ int run_case(std::int32_t value_heads, std::int32_t width, std::int32_t batch,
                 ops::gated_delta_net_batch_update(
                     qt, kt, vt, gt, bt, kScale, true,
                     dense_record_field(final_row, 3, selected_reference_slot),
-                    dense_record_field(final_row, 3, selected_reference_slot), ot,
+                    dense_record_field(final_row, 3, selected_reference_slot), {}, ot,
                     stream_execution);
             }
         }
@@ -221,14 +224,16 @@ int run_case(std::int32_t value_heads, std::int32_t width, std::int32_t batch,
         CUDA_CHECK(
             cudaMemcpyAsync(q.data, q_bits.data(), q.bytes(), cudaMemcpyHostToDevice, stream));
         for (auto& slot : initial_slots) slot = (slot + 3) % slots;
-        initial_offsets = history.record_offsets(initial_slots);
-        CUDA_CHECK(cudaMemcpyAsync(device_initial.data(), initial_offsets.data(),
-                                   device_initial.size(), cudaMemcpyHostToDevice, stream));
         if (!dense) {
-            for (auto& count : valid_columns) count = 1 + count % width;
+            for (auto& count : valid_columns) count = (count + 1) % (width + 1);
             CUDA_CHECK(cudaMemcpyAsync(device_valid.data(), valid_columns.data(),
                                        device_valid.size(), cudaMemcpyHostToDevice, stream));
         }
+        initial_offsets = history.record_offsets(initial_slots);
+        for (int row = 0; row < batch; ++row)
+            if (!valid_columns[row]) initial_offsets[row] = -1;
+        CUDA_CHECK(cudaMemcpyAsync(device_initial.data(), initial_offsets.data(),
+                                   device_initial.size(), cudaMemcpyHostToDevice, stream));
         CUDA_CHECK(cudaMemsetAsync(key_record.data(), 0xff, key_record.size(), stream));
         CUDA_CHECK(cudaMemsetAsync(value_record.data(), 0xff, value_record.size(), stream));
         CUDA_CHECK(cudaMemsetAsync(gate_record.data(), 0xff, gate_record.size(), stream));
@@ -336,6 +341,13 @@ int main(int argc, char** argv) {
                   [=] { return run_case(heads, width, batch, valid, seed); },
                   {{"execution", width == 2 || width == 9 || width == 16 ? "graph" : "eager"}});
     };
+    for (const auto [batch, width] : {std::pair{9, 4}, std::pair{17, 9}, std::pair{64, 2}}) {
+        std::vector<int> valid(batch);
+        for (int row = 0; row < batch; ++row) valid[row] = row % (width + 1);
+        suite.add("gdn_record/expanded/b" + std::to_string(batch),
+                  [=] { return run_case(24, width, batch, valid, 1900U + batch); },
+                  {{"suite", "concurrency"}});
+    }
     add(32, 2, 1, {}, 1701U);
     add(32, 16, 1, {7}, 1711U);
     add(32, 6, 8, {6, 5, 4, 3, 2, 1, 6, 2}, 1721U);

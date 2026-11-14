@@ -515,74 +515,65 @@ __device__ __forceinline__ void context_query_split_partial_body(
     }
 }
 
-template <int Tokens, int KeyBlock>
+template <int Tokens, int KeyBlock, int WarpsPerBlock, int KVHeads, int MaxSplits, class Partial>
 __device__ __forceinline__ void
-context_query_reduce_body(const __nv_bfloat16* __restrict__ partial_acc,
+context_query_reduce_body(const Partial* __restrict__ partial_acc,
                           const float* __restrict__ partial_m, const float* __restrict__ partial_l,
                           int length, int context_count,
                           const std::int32_t* __restrict__ valid_columns, int max_context,
                           int split_capacity, __nv_bfloat16* __restrict__ out) {
-    const int q_head = static_cast<int>(blockIdx.x);
-    const int token  = static_cast<int>(blockIdx.y);
-    const int batch  = static_cast<int>(blockIdx.z);
-    const int tid    = static_cast<int>(threadIdx.x);
-    constexpr std::int64_t QueryElements =
-        static_cast<std::int64_t>(kContextQueryHeadDim) * kContextQueryQHeads * Tokens;
-    constexpr std::int64_t StatElements = static_cast<std::int64_t>(kContextQueryQHeads) * Tokens;
+    constexpr int QHeads    = KVHeads * kContextQueryGroup;
+    constexpr unsigned Mask = 0xffffffffu;
+    __shared__ float weights[WarpsPerBlock][MaxSplits];
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int batch = blockIdx.z;
+    const int row   = blockIdx.x * WarpsPerBlock + warp;
+    const int token = row / QHeads, head = row % QHeads;
+    if (token >= Tokens) return;
+    constexpr std::int64_t QueryElements = std::int64_t(kContextQueryHeadDim) * QHeads * Tokens;
+    constexpr std::int64_t StatElements  = std::int64_t(QHeads) * Tokens;
     partial_acc += QueryElements * split_capacity * batch;
     partial_m += StatElements * split_capacity * batch;
     partial_l += StatElements * split_capacity * batch;
     out += QueryElements * batch;
-    if (q_head >= kContextQueryQHeads || token >= Tokens) { return; }
-    if (length < 0 || length > max_context || token >= valid_columns[batch]) {
-        if (tid < kContextQueryHeadDim) {
-            out[context_query_q_index(q_head, tid, token)] = __float2bfloat16(0.0f);
-        }
+    if (token >= valid_columns[batch] || length < 0 || length > max_context) {
+#pragma unroll
+        for (int item = 0; item < 4; ++item)
+            out[context_query_q_index<QHeads>(head, lane + item * 32, token)] =
+                __float2bfloat16(0.F);
         return;
     }
-
     const int context_tiles = (context_count + KeyBlock - 1) / KeyBlock;
-    const int active_splits = context_tiles > 0 ? min(context_tiles, split_capacity) : 1;
-    __shared__ float reduce[128];
-
-    float local_m = -CUDART_INF_F;
-    for (int split = tid; split < active_splits; split += blockDim.x) {
-        local_m = fmaxf(local_m, partial_m[context_query_stat_index<Tokens>(q_head, token, split)]);
+    const int active        = context_tiles > 0 ? min(context_tiles, split_capacity) : 1;
+    float local_m           = -CUDART_INF_F;
+    for (int split = lane; split < active; split += 32)
+        local_m =
+            fmaxf(local_m, partial_m[context_query_stat_index<Tokens, QHeads>(head, token, split)]);
+    const float maximum = common::warp_max<32>(local_m, Mask);
+    float local_l       = 0.F;
+    for (int split = lane; split < active; split += 32) {
+        const auto index     = context_query_stat_index<Tokens, QHeads>(head, token, split);
+        const float weight   = expf(partial_m[index] - maximum);
+        weights[warp][split] = weight;
+        local_l += partial_l[index] * weight;
     }
-    reduce[tid] = local_m;
-    __syncthreads();
-    for (int stride = 64; stride > 0; stride >>= 1) {
-        if (tid < stride) { reduce[tid] = fmaxf(reduce[tid], reduce[tid + stride]); }
-        __syncthreads();
-    }
-    const float global_m = reduce[0];
-    __syncthreads();
-
-    float local_l = 0.0f;
-    for (int split = tid; split < active_splits; split += blockDim.x) {
-        const auto idx = context_query_stat_index<Tokens>(q_head, token, split);
-        local_l += partial_l[idx] * expf(partial_m[idx] - global_m);
-    }
-    reduce[tid] = local_l;
-    __syncthreads();
-    for (int stride = 64; stride > 0; stride >>= 1) {
-        if (tid < stride) { reduce[tid] += reduce[tid + stride]; }
-        __syncthreads();
-    }
-    const float global_l = reduce[0];
-
-    if (tid < kContextQueryHeadDim) {
-        float numerator = 0.0f;
-        for (int split = 0; split < active_splits; ++split) {
-            const auto stat    = context_query_stat_index<Tokens>(q_head, token, split);
-            const float weight = expf(partial_m[stat] - global_m);
-            numerator +=
-                __bfloat162float(
-                    partial_acc[context_query_partial_index<Tokens>(q_head, tid, token, split)]) *
-                weight;
+    const float denominator = common::warp_sum<32>(local_l, Mask);
+    __syncwarp(Mask);
+#pragma unroll
+    for (int item = 0; item < 4; ++item) {
+        const int d     = lane + item * 32;
+        float numerator = 0.F;
+        for (int split = 0; split < active; ++split) {
+            const auto index = context_query_partial_index<Tokens, QHeads>(head, d, token, split);
+            float value;
+            if constexpr (std::is_same_v<Partial, float>)
+                value = partial_acc[index];
+            else
+                value = __bfloat162float(partial_acc[index]);
+            numerator += value * weights[warp][split];
         }
-        const float value = global_l > 0.0f ? numerator / global_l : 0.0f;
-        out[context_query_q_index(q_head, tid, token)] = __float2bfloat16(value);
+        out[context_query_q_index<QHeads>(head, d, token)] =
+            __float2bfloat16(denominator > 0.F ? numerator / denominator : 0.F);
     }
 }
 

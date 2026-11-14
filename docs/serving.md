@@ -1144,8 +1144,8 @@ raw counters and seconds over rounded stderr rates.
 
 ## Execution behavior
 
-The server owns one Engine with `1..8` execution lanes fixed at startup, locally or across its
-configured ranks. Decode-ready requests are batched at execution boundaries. A request becomes
+The server owns one Engine with `max_concurrency` resident request lanes fixed at startup, locally
+or across its configured ranks. Decode-ready requests are batched at execution boundaries. A request becomes
 decode-ready after prefill; completed or cancelled requests leave subsequent work. CUDA Graph
 execution follows the model's compute and commit boundaries, including owner-local attention for
 GLM attention DP.

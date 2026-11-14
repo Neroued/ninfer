@@ -78,7 +78,7 @@ struct Result {
     std::fprintf(stderr,
                  "error: %s\n"
                  "usage: ninfer_sliding_window_attention_bench "
-                 "[--kv-heads 4|8] [--window 2048|4096] [--tokens 1,...,16] [--batches 1,...,8] "
+                 "[--kv-heads 4|8] [--window 2048|4096] [--tokens 1,...,16] [--batches B,...] "
                  "[--context 0,...,1048576] [--envelope-max N] [--valid full|half|mixed|zero] "
                  "[--lengths uniform|mixed] "
                  "[--execution eager|graph|both] [--cache cold|warm|both] "
@@ -99,7 +99,7 @@ Options parse_options(int argc, char** argv) {
             options.tokens = bench::measurement::integers(next("--tokens requires a value"), 1, 16);
         } else if (argument == "--batches") {
             options.batches =
-                bench::measurement::integers(next("--batches requires a value"), 1, 8);
+                bench::measurement::integers(next("--batches requires a value"), 1, INT32_MAX);
         } else if (argument == "--kv-heads") {
             options.kv_heads =
                 bench::measurement::integer(next("--kv-heads requires a value"), 4, 8);

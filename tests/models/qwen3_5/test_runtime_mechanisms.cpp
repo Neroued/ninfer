@@ -1,5 +1,6 @@
 #include "models/common/vision/window.h"
 #include "core/layout.h"
+#include "models/qwen3_5/program/frames.h"
 #include "models/qwen3_5/state/decoder_state.h"
 #include "models/common/qwen/vision/control.h"
 
@@ -142,6 +143,122 @@ void test_decoder_layout() {
             k8v4.mtp_kv &&
             k8v4.mtp_kv->pages.payload_bytes() == (k8_vector_bytes + v4_vector_bytes) * mtp_vectors,
         "K8V4 Text/MTP asymmetric page record payload bytes");
+}
+
+void test_frame_layout() {
+    constexpr std::uint32_t capacity = 128;
+    constexpr std::array rows{1U, 9U, 10U, 64U, capacity};
+    constexpr std::array backends{ninfer::SpeculativeBackend::None, ninfer::SpeculativeBackend::Mtp,
+                                  ninfer::SpeculativeBackend::DFlash2};
+    const auto check_regions = [](std::vector<ninfer::LayoutRegion> regions, std::size_t bytes,
+                                  std::size_t maximum) {
+        expect(bytes <= maximum, "compact controls exceed their maximum backing");
+        std::sort(regions.begin(), regions.end(),
+                  [](const auto& a, const auto& b) { return a.offset < b.offset; });
+        std::size_t end = 0;
+        for (const auto& region : regions) {
+            expect(region.bytes && region.offset >= end && region.offset % region.alignment == 0 &&
+                       region.offset + region.bytes <= bytes,
+                   "control fields overlap or exceed their aligned slab");
+            end = region.offset + region.bytes;
+        }
+    };
+    for (const auto backend : backends) {
+        const auto drafts = backend == ninfer::SpeculativeBackend::Mtp       ? 3U
+                            : backend == ninfer::SpeculativeBackend::DFlash2 ? 15U
+                                                                             : 0U;
+        const q35::FrameSpec spec{.hidden         = 16,
+                                  .output_rows    = 32,
+                                  .public_tokens  = 32,
+                                  .prefill_chunk  = 128,
+                                  .batch_capacity = capacity,
+                                  .draft_window   = drafts,
+                                  .backend        = backend};
+        ninfer::LayoutBuilder builder;
+        const auto frame = q35::plan_frames(builder, spec);
+        std::array<std::size_t, 3> previous{};
+        for (const auto count : rows) {
+            const auto control = q35::plan_frame_controls(spec, count);
+            const auto& in     = control.ingress;
+            const auto& commit = control.commit;
+            const auto& out    = control.egress;
+            const auto width   = drafts + 1;
+            std::vector<ninfer::LayoutRegion> input_regions, commit_regions, output_regions;
+            const auto tensor = [&](auto& regions, const ninfer::TensorRegion& value,
+                                    ninfer::DType dtype, std::int32_t x, std::int32_t y = 1) {
+                expect(value.dtype == dtype &&
+                           value.shape == std::array<std::int32_t, 4>{x, y, 1, 1} &&
+                           value.region.bytes == std::size_t(x) * y * ninfer::dtype_size(dtype),
+                       "control field does not match its physical row geometry");
+                regions.push_back(value.region);
+            };
+            for (const auto* field :
+                 {&in.live_rows, &in.anchors, &in.frontiers, &in.backend_frontiers, &in.extents,
+                  &in.valid_columns, &in.proposal_valid_columns, &in.budgets, &in.main_table_rows,
+                  &in.backend_table_rows, &in.residency_slots, &in.rope_deltas,
+                  &in.sampling_positions, &in.history_skip})
+                tensor(input_regions, *field, ninfer::DType::I32, count);
+            for (const auto* field : {&in.state_source_offsets, &in.state_destination_offsets})
+                tensor(input_regions, *field, ninfer::DType::I64, count);
+            tensor(input_regions, in.previous_rope, ninfer::DType::I32, count, 3);
+            tensor(input_regions, in.decode_positions, ninfer::DType::I32, count * width);
+            tensor(input_regions, in.decode_rope, ninfer::DType::I32, count * width, 3);
+            expect(in.sampling.bytes == count * sizeof(ninfer::ops::SamplingConfig),
+                   "sampling controls retain unused resident rows");
+            input_regions.push_back(in.sampling);
+            if (backend == ninfer::SpeculativeBackend::Mtp) {
+                tensor(input_regions, in.step_positions, ninfer::DType::I32, count, drafts);
+                tensor(input_regions, in.step_valid, ninfer::DType::I32, count, drafts);
+                tensor(input_regions, in.step_rope, ninfer::DType::I32, 3 * count, drafts);
+            }
+            tensor(commit_regions, commit.state_destination_offsets, ninfer::DType::I64, count);
+            for (const auto* field :
+                 {&commit.last_columns, &commit.accepted_columns, &commit.count_columns,
+                  &commit.draft_append_starts, &commit.draft_append_ends})
+                tensor(commit_regions, *field, ninfer::DType::I32, count);
+            tensor(output_regions, out.tokens, ninfer::DType::I32, width, count);
+            tensor(output_regions, out.counts, ninfer::DType::I32, count);
+            check_regions(std::move(input_regions), in.bytes, frame.ingress.bytes);
+            check_regions(std::move(commit_regions), commit.bytes, frame.commit.bytes);
+            check_regions(std::move(output_regions), out.bytes, frame.egress.bytes);
+            const std::array sizes{in.bytes, commit.bytes, out.bytes};
+            const std::array maximum{frame.host.ingress.bytes, frame.host.commit.bytes,
+                                     frame.host.egress.bytes};
+            for (std::size_t i = 0; i < sizes.size(); ++i) {
+                expect(sizes[i] >= previous[i] && sizes[i] <= maximum[i],
+                       "control transfer size is not monotone or exceeds Host backing");
+                if (count == 1)
+                    expect(sizes[i] < maximum[i], "one-row transfer includes resident capacity");
+            }
+            previous = sizes;
+        }
+        if (frame.mtp) {
+            ninfer::HostBuffer backing(builder.finish(256));
+            ninfer::HostBuffer ingress(frame.ingress.bytes);
+            q35::MtpFrame mtp(backing.span(), *frame.mtp);
+            for (const auto count : rows) {
+                const auto controls     = q35::plan_frame_controls(spec, count);
+                mtp.step_positions      = controls.ingress.step_positions.bind(ingress.span());
+                mtp.step_valid_columns  = controls.ingress.step_valid.bind(ingress.span());
+                mtp.step_rope_positions = controls.ingress.step_rope.bind(ingress.span());
+                const auto step         = mtp.step_view(1, count);
+                const auto proposals    = mtp.proposals(count);
+                expect(proposals.ne[0] == static_cast<int>(drafts) &&
+                           proposals.ne[1] == static_cast<int>(count) &&
+                           proposals.nb[0] == capacity * sizeof(ninfer::TokenId) &&
+                           proposals.nb[1] == sizeof(ninfer::TokenId),
+                       "MTP proposal view lost its allocated draft-step stride");
+                expect(static_cast<const std::byte*>(step.ids.data) -
+                                   static_cast<const std::byte*>(mtp.drafts.data) ==
+                               capacity * sizeof(ninfer::TokenId) &&
+                           static_cast<const std::byte*>(step.positions.data) -
+                                   static_cast<const std::byte*>(mtp.step_positions.data) ==
+                               count * sizeof(std::int32_t) &&
+                           step.rope_positions.nb[1] == count * sizeof(std::int32_t),
+                       "MTP step confuses resident proposal and physical control strides");
+            }
+        }
+    }
 }
 
 void test_visual_embedding_windows() {
@@ -401,6 +518,7 @@ void test_regular_prefix_identity() {
 
 int main() {
     test_decoder_layout();
+    test_frame_layout();
     test_visual_embedding_windows();
     test_vision_control();
     test_prefix_identity();

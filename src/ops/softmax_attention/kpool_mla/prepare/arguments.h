@@ -45,7 +45,9 @@ struct PrepareArguments {
     int tokens, batch, rows, query_rank, heads, norm_dim;
     int splits = 1, stage_columns = 0;
     int first_row = 0, first_column = 0, first_span = 0, last_row = 0, last_stop = 0;
+    int first_pool_jobs = 0, pool_jobs_per_row = 0, middle_pool_jobs = 0, pool_jobs = 0;
     std::uint32_t token_multiplier = 0, token_shift = 0;
+    std::uint32_t pool_multiplier = 0, pool_shift = 0;
     float rms_epsilon, key_epsilon;
     bool update, fp8_index, fp8_latent;
 };

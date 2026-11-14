@@ -398,6 +398,16 @@ public:
     // Exact Host bytes freed by deleting this fixed set, with physical sharing counted once.
     [[nodiscard]] std::size_t
     host_bytes_released(std::span<const CheckpointHandle> checkpoints) const;
+    // Evictable resources of one checkpoint under the session's own accounting; zero for a
+    // checkpoint that cannot currently be released.
+    [[nodiscard]] runtime::CheckpointEvictableResources
+    checkpoint_evictable_resources(CheckpointHandle checkpoint) const;
+    // One StateImage stride in bytes; a checkpoint's state_slots x this is its state footprint.
+    [[nodiscard]] std::size_t state_image_bytes() const noexcept;
+    // Device bytes of one KV page group in the named pool.
+    [[nodiscard]] std::size_t kv_page_bytes(std::uint32_t pool) const noexcept;
+    // Logical StateImage slot capacity of the resident state directory.
+    [[nodiscard]] std::uint32_t state_slots_capacity() const noexcept;
     using HostRequirement = context::HostWriteRequirements;
     [[nodiscard]] runtime::PauseCostQuote
     pause_cost(SequenceHandle, const PauseOption&, std::span<const CheckpointHandle> sources,

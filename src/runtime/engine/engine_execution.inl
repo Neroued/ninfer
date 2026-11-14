@@ -680,11 +680,13 @@ template <class Instance>
 void EngineCore<Instance>::fail_all(std::exception_ptr error) noexcept {
     std::deque<std::shared_ptr<Request>> pending;
     std::unique_ptr<MeasurementRequest> measurement;
+    std::unique_ptr<AdminCacheRequest> admin;
     {
         std::lock_guard lock(queue_mutex_);
         failed_ = true;
         pending.swap(pending_);
         measurement = std::move(measurement_);
+        admin       = std::move(admin_);
     }
     finish_completion_exposure();
     scheduler_ = Scheduling{};
@@ -734,6 +736,7 @@ void EngineCore<Instance>::fail_all(std::exception_ptr error) noexcept {
     }
     pending_completions_.clear();
     if (measurement) measurement->completion.set_exception(error);
+    if (admin) admin->completion.set_exception(error);
     queue_cv_.notify_all();
 }
 

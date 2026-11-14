@@ -44,6 +44,14 @@ void test_resources_and_units() {
                 defaults.launch.logging.stats_interval_ms == 5000,
             "server defaults changed");
     require(!defaults.model_id_override, "public model alias is unexpectedly set by default");
+    require(!defaults.enable_admin_cache,
+            "admin cache routes are not disabled by default");
+    const auto admin_enabled =
+        parse({"ninfer-serve", "model.ninfer", "--enable-admin-cache"});
+    require(admin_enabled.enable_admin_cache, "--enable-admin-cache did not parse");
+    require(ninfer::product::startup_usage_text("ninfer-serve", ninfer::product::EntryPoint::Serve)
+                .find("--enable-admin-cache") != std::string::npos,
+            "serve help omits --enable-admin-cache");
     for (auto [quantity, bytes] : std::vector<std::pair<std::string, std::uint64_t>>{
              {"0B", 0},
              {"1.5 MiB", 1572864},

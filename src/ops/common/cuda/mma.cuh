@@ -4,6 +4,37 @@
 
 namespace ninfer::ops::common {
 
+struct MmaRowQuad {
+    float4 values;
+    int row, column;
+};
+
+// Transpose an m16n8 FP32 fragment into four adjacent rows per lane. All lanes
+// participate; row and column address the original 16x8 accumulator atom.
+__device__ __forceinline__ MmaRowQuad mma_row_quad(float4 fragment) {
+    const int lane = threadIdx.x & 31;
+    float values[]{fragment.x, fragment.y, fragment.z, fragment.w};
+#pragma unroll
+    for (int half = 0; half < 2; ++half) {
+        const float lo = values[half * 2], hi = values[half * 2 + 1];
+        const float other_lo = __shfl_xor_sync(0xffffffff, lo, 4);
+        const float other_hi = __shfl_xor_sync(0xffffffff, hi, 4);
+        values[half * 2]     = lane & 4 ? other_hi : lo;
+        values[half * 2 + 1] = lane & 4 ? hi : other_lo;
+    }
+#pragma unroll
+    for (int parity = 0; parity < 2; ++parity) {
+        const float lo = values[parity], hi = values[parity + 2];
+        const float other_lo = __shfl_xor_sync(0xffffffff, lo, 8);
+        const float other_hi = __shfl_xor_sync(0xffffffff, hi, 8);
+        values[parity]       = lane & 8 ? other_hi : lo;
+        values[parity + 2]   = lane & 8 ? hi : other_lo;
+    }
+    return {make_float4(values[0], values[1], values[2], values[3]),
+            ((lane >> 4) & 1) * 4 + ((lane >> 3) & 1) * 8,
+            (lane & 1) * 2 + ((lane >> 1) & 1) * 4 + ((lane >> 2) & 1)};
+}
+
 __device__ __forceinline__ void ldmatrix_x2(unsigned& r0, unsigned& r1, unsigned addr) {
     asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];\n"
                  : "=r"(r0), "=r"(r1)

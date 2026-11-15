@@ -18,7 +18,7 @@ Plan select_plan(const SwiGLUProfile&, int tokens, int shared_intermediate) {
                            .column_major_down      = tokens >= 1024,
                            .preserve_balanced_down = true,
                            .shared_algorithm =
-                             tokens < 8 ? SharedAlgorithm::Vector : SharedAlgorithm::Mma,
+                             tokens < 3 ? SharedAlgorithm::Vector : SharedAlgorithm::Mma,
                            .shared_split_activation = shared_intermediate != 320 || tokens < 128,
                            .shared_columns = shared_intermediate == 320 && tokens >= 512 ? 64 : 32,
                            .queued_ctas_per_sm = 6};
@@ -75,12 +75,47 @@ Plan select_plan(const SwiGLUProfile&, int tokens, int shared_intermediate) {
         p.dense.down_columns = p.dense.gate_columns;
         p.group_columns = tokens > 4096 ? 256 : std::max(p.job_columns(), p.dense.gate_columns);
     }
+    if (tokens > 16 && tokens <= 32) {
+        p.dense.tuning      = {Nvfp4Pipeline::K512, Nvfp4CachePolicy::RetainInputs, 0};
+        p.dense.down_tuning = {Nvfp4Pipeline::K512, Nvfp4CachePolicy::Cached, 0};
+    }
+    if (tokens >= 256) {
+        p.pool_expert_limit       = tokens < 1024 ? 10 : 20;
+        p.pool_columns            = 128;
+        p.pool_row_window         = 1;
+        p.pool_queued_ctas_per_sm = 3;
+        p.pool_token_threshold    = tokens < 1024 ? 0 : (tokens + 1) / 2;
+    }
+    if (tokens > 1024) {
+        p.down_columns = 128;
+        p.nvfp4_down   = {Nvfp4Pipeline::K256SingleStage, Nvfp4CachePolicy::StreamingAll, 1, 2};
+        for (auto* schedule : {&p.medium, &p.dense}) {
+            schedule->down_columns = 128;
+            schedule->down_tuning  = p.nvfp4_down;
+        }
+    }
+    if (tokens >= 128) {
+        p.shared_algorithm = SharedAlgorithm::Tma;
+        p.shared_columns   = tokens < 256 ? 64 : 128;
+    }
+    if (tokens >= 4 && tokens <= 32) {
+        p.shared_algorithm = SharedAlgorithm::SplitK;
+        p.shared_columns   = tokens <= 16 ? 16 : 32;
+    }
+    if (tokens >= 1024) {
+        p.dense.down_tuning  = p.dense.down_tuning.value_or(p.dense.tuning);
+        p.medium.down_tuning = p.medium.down_tuning.value_or(p.medium.tuning);
+        p.dense.tuning       = {Nvfp4Pipeline::K256SingleStage, Nvfp4CachePolicy::Cached, 0, 2};
+        if (tokens <= 2048) p.medium.tuning = p.dense.tuning;
+        if (tokens > 1024)
+            p.nvfp4 = {Nvfp4Pipeline::K256SingleStage, Nvfp4CachePolicy::StreamingAll, 0, 2};
+    }
     return plan;
 }
 } // namespace
 
 const ShapePolicy& nvfp4_h2560_i640_e512_k10() {
-    static constexpr int boundaries[]{2, 17, 33, 65, 128, 129, 512, 769, 1025, 2049, 4097};
+    static constexpr int boundaries[]{2, 3, 17, 33, 65, 128, 129, 256, 512, 769, 1025, 2049, 4097};
     static const ShapePolicy policy{
         .select = select_plan, .allocation_boundaries = boundaries, .masked_slice_tokens = 8192};
     return policy;

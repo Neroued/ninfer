@@ -9,7 +9,7 @@ namespace ninfer::ops::detail::moe_cuda::block_scaled {
 inline constexpr int kHidden = 2560, kIntermediate = 640, kExperts = 512, kTopK = 10;
 inline constexpr int kScoreRows = (kExperts + 4) / 4 * 4;
 
-enum class SharedAlgorithm { Vector, Mma };
+enum class SharedAlgorithm { Vector, Mma, SplitK, Tma };
 
 struct Fp8LoadTuning {
     int maximum_small_load = 0;

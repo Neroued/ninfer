@@ -30,7 +30,7 @@ __global__ void quantize_input(const __nv_bfloat16* input, std::uint8_t* codes, 
 template <bool Gate, int Columns, bool Atomic = false>
 void launch_mma(const Tensor& x, const CudaSwiGLUExperts& experts, const ExpertRoutes& routes,
                 const Storage& s, const Plan& plan, CudaExecutionView execution) {
-    using S               = Schedule<Columns, Gate>;
+    using S               = Schedule<Columns, Gate, 2, Atomic>;
     constexpr int rows    = Gate ? kIntermediate : kHidden;
     const int job_columns = plan.job_columns();
     const int subtiles    = job_columns / Columns;

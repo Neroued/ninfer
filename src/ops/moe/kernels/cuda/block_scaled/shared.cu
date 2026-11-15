@@ -1,7 +1,12 @@
+#include "core/platform.h"
 #include "ops/moe/kernels/cuda/block_scaled/output.cuh"
 #include "ops/common/cuda/mma.cuh"
 #include "ops/common/cuda/pipeline.cuh"
 #include "ops/moe/kernels/cuda/routing/topk.cuh"
+
+#if NINFER_TARGET_SPARK
+#    include "ops/moe/kernels/cuda/block_scaled/dgx_spark/shared.cuh"
+#endif
 
 namespace ninfer::ops::detail::moe_cuda::block_scaled {
 namespace {
@@ -262,6 +267,29 @@ void launch_shared_impl(const Tensor& x, const ScaledSwiGLUTerm& shared, const E
     with_output(
         destination, mode,
         [&](auto output) {
+#if NINFER_TARGET_SPARK
+            if (plan.shared_algorithm == SharedAlgorithm::SplitK) {
+                if (!prepared)
+                    spark_shared::launch_split_k<Intermediate, SplitActivation>(
+                        input, gu, nullptr, storage, nullptr, nullptr, tokens, plan.shared_columns,
+                        execution);
+                shared_mma<false, 32, Intermediate, SplitActivation>
+                    <<<dim3(kHidden / 64, (tokens + 31) / 32), 128, 0, stream>>>(
+                        input, down, storage, coefficients, beta, output, tokens);
+                CUDA_CHECK(cudaGetLastError());
+                return;
+            }
+            if (plan.shared_algorithm == SharedAlgorithm::Tma) {
+                if (!prepared)
+                    spark_shared::launch_gate<Intermediate, SplitActivation>(
+                        input, gu, nullptr, storage, nullptr, nullptr, tokens, plan.shared_columns,
+                        execution);
+                spark_shared::launch_down<Intermediate, SplitActivation>(
+                    down, storage, coefficients, beta, output, tokens, plan.shared_columns,
+                    execution);
+                return;
+            }
+#endif
             // Complete already produced the shared activation alongside control.
             // The final shared down still combines routed and shared terms once.
             if (plan.shared_algorithm == SharedAlgorithm::Vector) {
@@ -308,25 +336,42 @@ void launch_control_shared_impl(const Tensor& x, const MoeWeights& weights,
     const auto* control = static_cast<const __nv_bfloat16*>(weights.control.qdata);
     const bool routed   = subset.kind != ExpertSubsetKind::None;
     auto* shared_gate   = static_cast<float*>(shared.data);
-    if (plan.shared_algorithm == SharedAlgorithm::Vector) {
-        shared_vector<true, Intermediate>
-            <<<dim3(Intermediate / 4 + (routed ? (kExperts + 4) / 4 : 1), x.ne[1]), 128, 0,
-               stream>>>(input, gu, storage, nullptr, nullptr, FloatContribution{}, control, scores,
-                         shared_gate);
-    } else {
-        const auto launch = [&]<int Columns>() {
-            shared_mma<true, Columns, Intermediate, SplitActivation>
-                <<<dim3(Intermediate / 32 + (routed ? (kExperts + 64) / 64 : 1),
-                        (x.ne[1] + Columns - 1) / Columns),
-                   128, 0, stream>>>(input, gu, storage, nullptr, nullptr, FloatContribution{},
-                                     x.ne[1], control, scores, shared_gate);
-        };
-        if (plan.shared_columns == 64) {
-            launch.template operator()<64>();
-        } else {
-            launch.template operator()<32>();
+    const auto project  = [&] {
+#if NINFER_TARGET_SPARK
+        if (plan.shared_algorithm == SharedAlgorithm::SplitK) {
+            spark_shared::launch_split_k<Intermediate, SplitActivation>(
+                input, gu, control, storage, scores, shared_gate, x.ne[1], plan.shared_columns,
+                execution);
+            return;
         }
-    }
+        if (plan.shared_algorithm == SharedAlgorithm::Tma) {
+            spark_shared::launch_gate<Intermediate, SplitActivation>(
+                input, gu, control, storage, scores, shared_gate, x.ne[1], plan.shared_columns,
+                execution);
+            return;
+        }
+#endif
+        if (plan.shared_algorithm == SharedAlgorithm::Vector) {
+            shared_vector<true, Intermediate>
+                <<<dim3(Intermediate / 4 + (routed ? (kExperts + 4) / 4 : 1), x.ne[1]), 128, 0,
+                   stream>>>(input, gu, storage, nullptr, nullptr, FloatContribution{}, control,
+                             scores, shared_gate);
+        } else {
+            const auto launch = [&]<int Columns>() {
+                shared_mma<true, Columns, Intermediate, SplitActivation>
+                    <<<dim3(Intermediate / 32 + (routed ? (kExperts + 64) / 64 : 1),
+                            (x.ne[1] + Columns - 1) / Columns),
+                       128, 0, stream>>>(input, gu, storage, nullptr, nullptr, FloatContribution{},
+                                         x.ne[1], control, scores, shared_gate);
+            };
+            if (plan.shared_columns == 64) {
+                launch.template operator()<64>();
+            } else {
+                launch.template operator()<32>();
+            }
+        }
+    };
+    project();
     CUDA_CHECK(cudaGetLastError());
     if (!routed) { return; }
     const auto* mask  = static_cast<const int*>(subset.mask.data);

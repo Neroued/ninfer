@@ -5,6 +5,13 @@
 
 namespace ninfer::ops::detail::moe_cuda::block_scaled {
 
+__device__ __forceinline__ bool pool_writes_output(const int* load_range, int minimum_experts,
+                                                   int expert_limit, int token_threshold) {
+    if (!load_range || expert_limit <= 0 || load_range[2] <= minimum_experts) return false;
+    return load_range[2] <= expert_limit ||
+           (token_threshold > 0 && load_range[1] >= token_threshold);
+}
+
 // Each CTA sums a small expert set into one output tile. The set is either all
 // active experts or the heavily reused subset; other experts accumulate afterward.
 template <int TopK, int Columns, class Contraction>
@@ -18,12 +25,11 @@ template <int Hidden, int Experts, int TopK, int Columns, class Contraction, cla
 __global__ __launch_bounds__(Contraction::threads) void pool_down(
     Contraction contraction, Group groups, const int* ids, const float* coefficients, float* output,
     int tokens, int minimum_experts, int expert_limit, int row_window, int token_threshold) {
-    const int active = groups.load_range[2];
-    if (active <= minimum_experts) return;
-    const bool whole_pool = active <= expert_limit;
-    if (!whole_pool && (!token_threshold || groups.load_range[1] < token_threshold)) return;
-    using Storage = PoolDownStorage<TopK, Columns, Contraction>;
-    auto& storage = *reinterpret_cast<Storage*>(common::shared_storage<sizeof(Storage)>());
+    if (!pool_writes_output(groups.load_range, minimum_experts, expert_limit, token_threshold))
+        return;
+    const bool whole_pool = groups.load_range[2] <= expert_limit;
+    using Storage         = PoolDownStorage<TopK, Columns, Contraction>;
+    auto& storage         = *reinterpret_cast<Storage*>(common::shared_storage<sizeof(Storage)>());
     if (threadIdx.x == 0) storage.count = 0;
     __syncthreads();
     for (int e = threadIdx.x; e < Experts; e += blockDim.x)

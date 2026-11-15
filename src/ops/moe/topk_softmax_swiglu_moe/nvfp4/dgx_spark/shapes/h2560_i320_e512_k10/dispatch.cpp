@@ -15,7 +15,7 @@ Plan select_plan(int t, int shared_intermediate, ExpertSubsetKind) {
                            .single_block_grouping   = t <= 64,
                            .column_major_down       = t >= 1024,
                            .preserve_balanced_down  = true,
-                           .shared_algorithm        = t < 8 ? kernel::block_scaled::SharedAlgorithm::Vector
+                           .shared_algorithm        = t < 4 ? kernel::block_scaled::SharedAlgorithm::Vector
                                                             : kernel::block_scaled::SharedAlgorithm::Mma,
                            .shared_split_activation = shared_intermediate != 320 || t < 128,
                            .network_topk            = true,
@@ -39,6 +39,11 @@ Plan select_plan(int t, int shared_intermediate, ExpertSubsetKind) {
                            .queued_ctas_per_sm = t <= 512 ? 6 : 2};
         p.group_columns = t <= 512 ? 64 : 128;
     }
+    if (t >= 4 && t <= 16) {
+        p.gate_columns = p.down_columns = p.group_columns = 16;
+        p.small_expert_limit                              = 0;
+        p.medium = p.large = p.dense = {};
+    }
     if (t > 512) {
         p.down_columns          = 32;
         p.small_expert_limit    = 32;
@@ -56,6 +61,8 @@ Plan select_plan(int t, int shared_intermediate, ExpertSubsetKind) {
             .gate_columns = 128, .down_columns = 128, .max_load = 128, .queued_ctas_per_sm = 2};
         p.large.tuning      = {Nvfp4Pipeline::K512, Nvfp4CachePolicy::StreamingAll, 1};
         p.large.down_tuning = p.medium.down_tuning;
+        p.dense.down_tuning =
+            Nvfp4Tuning{Nvfp4Pipeline::K256SingleStage, Nvfp4CachePolicy::StreamingAll, 1, 2};
     }
     if (t >= 4 && t <= 32) {
         p.nvfp4_down         = {Nvfp4Pipeline::K512, Nvfp4CachePolicy::Cached, 0};
@@ -68,12 +75,25 @@ Plan select_plan(int t, int shared_intermediate, ExpertSubsetKind) {
         p.pool_row_window         = 4;
         p.pool_queued_ctas_per_sm = 3;
     }
+    if (t >= 16) {
+        p.shared_algorithm = kernel::block_scaled::SharedAlgorithm::Tma;
+        p.shared_columns   = t < 160 ? 32 : t < 512 ? 64 : 128;
+    }
+    if (t >= 4 && t <= 32) {
+        p.shared_algorithm = kernel::block_scaled::SharedAlgorithm::SplitK;
+        p.shared_columns   = t <= 16 ? 16 : 32;
+    }
+    if (t >= 2048) {
+        p.dense.tuning = {Nvfp4Pipeline::K256SingleStage,
+                          t <= 2048 ? Nvfp4CachePolicy::Cached : Nvfp4CachePolicy::StreamingAll, 0,
+                          2};
+    }
     return plan;
 }
 } // namespace
 
 const ShapePolicy& nvfp4_h2560_i320_e512_k10() {
-    static constexpr int boundaries[]{4, 5, 8, 33, 65, 96, 128, 256, 512, 513, 1024};
+    static constexpr int boundaries[]{4, 16, 17, 33, 65, 96, 128, 256, 512, 513, 1024};
     static const ShapePolicy policy{.select = select_plan, .allocation_boundaries = boundaries};
     return policy;
 }

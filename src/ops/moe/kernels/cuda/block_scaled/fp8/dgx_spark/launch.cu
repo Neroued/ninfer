@@ -32,21 +32,25 @@ __global__ void quantize_input(const __nv_bfloat16* input, std::uint8_t* codes, 
 template <bool Gate, int Columns, bool Atomic = false>
 void launch_mma(const Tensor& x, const CudaSwiGLUExperts& experts, const ExpertRoutes& routes,
                 const Storage& s, const Plan& plan, CudaExecutionView execution) {
-    using S               = Schedule<Columns, Gate>;
-    constexpr int rows    = Gate ? kIntermediate : kHidden;
-    const int job_columns = plan.job_columns();
-    const int subtiles    = job_columns / Columns;
-    const int max_jobs    = (kTopK * x.ne[1] / job_columns + kExperts) * subtiles;
-    const int blocks      = std::min(max_jobs * (rows / 128),
-                                     execution.multiprocessor_count() * plan.queued_ctas_per_sm);
+    constexpr int stages     = !Gate && Columns == 128 ? 1 : 2;
+    constexpr int min_blocks = !Gate && Columns >= 64 ? 2 : 1;
+    using S                  = Schedule<Columns, Gate, stages, Atomic>;
+    constexpr int rows       = Gate ? kIntermediate : kHidden;
+    const int job_columns    = plan.job_columns();
+    const int subtiles       = (std::min(job_columns, int(x.ne[1])) + Columns - 1) / Columns;
+    const int max_jobs       = (kTopK * x.ne[1] / job_columns + kExperts) * subtiles;
+    const int blocks         = std::min(max_jobs * (rows / 128),
+                                        execution.multiprocessor_count() * plan.queued_ctas_per_sm);
     const int shared_bytes =
-        common::prepare_shared<sizeof(TileStorage<S>), grouped_mma<Columns, Gate, Atomic>, true>();
-    grouped_mma<Columns, Gate, Atomic><<<blocks, S::threads, shared_bytes, execution.stream()>>>(
-        Gate ? s.input_codes : s.product_codes,
-        static_cast<const float*>(Gate ? s.input_scales : s.product_scales),
-        Gate ? experts.bank.gate_up : experts.bank.down, s.groups, s.product_codes,
-        static_cast<float*>(s.product_scales), s.contributions,
-        static_cast<const float*>(routes.coefficients.data), s.routed_sum, subtiles);
+        common::prepare_shared<sizeof(TileStorage<S>),
+                               grouped_mma<Columns, Gate, Atomic, stages, min_blocks>, true>();
+    grouped_mma<Columns, Gate, Atomic, stages, min_blocks>
+        <<<blocks, S::threads, shared_bytes, execution.stream()>>>(
+            Gate ? s.input_codes : s.product_codes,
+            static_cast<const float*>(Gate ? s.input_scales : s.product_scales),
+            Gate ? experts.bank.gate_up : experts.bank.down, s.groups, s.product_codes,
+            static_cast<float*>(s.product_scales), s.contributions,
+            static_cast<const float*>(routes.coefficients.data), s.routed_sum, subtiles);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -66,11 +70,8 @@ void with_columns(int columns, Function&& function) {
         function.template operator()<64>();
         break;
     case 128:
-        if constexpr (Gate) {
-            function.template operator()<128>();
-            break;
-        }
-        [[fallthrough]];
+        function.template operator()<128>();
+        break;
     default:
         throw std::logic_error("invalid block FP8 MoE column tile");
     }

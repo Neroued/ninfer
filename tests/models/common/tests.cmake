@@ -40,6 +40,10 @@ ninfer_add_test(ninfer_recovery_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/context/test_recovery.cpp"
   LIBRARIES ninfer_model_control)
 
+ninfer_add_test(ninfer_prefix_store_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/context/test_prefix.cpp"
+  LIBRARIES ninfer_model_control)
+
 ninfer_add_test(ninfer_context_conversion_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/context/test_conversion.cpp"
   LIBRARIES ninfer_model_control)

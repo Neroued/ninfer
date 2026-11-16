@@ -257,7 +257,7 @@ glm::SessionPlan plan(const glm::ModelDefinition& definition, bool pressure = fa
         glm::detail::Checkpoints::metadata_bytes(records) +
         ctx::RecoveryIndex<>::metadata_bytes(records) +
         ctx::recovery_value_metadata_bytes(records, p.shape.max_concurrency, 2, 2) +
-        glm::InputIdentity::cache_bytes(p.shape.max_context, p.shape.max_concurrency);
+        ctx::PrefixStore::metadata_bytes(p.shape.max_context * p.shape.max_concurrency, 64);
     return p;
 }
 
@@ -520,8 +520,10 @@ void recovery_quotes_match_tail_copies(std::shared_ptr<const glm::ModelDefinitio
         require(restore.placement.value == 0 && restore.transfers.empty(),
                 "same-frontier recovery was charged for future KV writes");
         const auto target = f.session.recovery_target(longer, frontier + 4, {0});
-        require(points.front().description->identity->prefix_of(*target->identity) &&
-                    target->identity->rebuild(frontier).tokens == 4,
+        require(f.session.recovery_precedes(points.front().description->prefix,
+                                            points.front().description->frontier, target->prefix,
+                                            target->frontier) &&
+                    target->work->rebuild(frontier).tokens == 4,
                 "tail-copy test did not describe a later recovery target");
         const auto candidate =
             f.session.inspect_source(longer, finished.checkpoint, false, {}, {}, {0});
@@ -607,7 +609,7 @@ void pause_quotes_match_shared_draft(std::shared_ptr<const glm::ModelDefinition>
     }
 }
 
-void identity_budget_replacement(std::shared_ptr<const glm::ModelDefinition> definition) {
+void long_input_replacement(std::shared_ptr<const glm::ModelDefinition> definition) {
     auto layout                  = plan(*definition);
     layout.shape.max_concurrency = 1;
     layout.batches               = std::make_shared<const models::BatchExecutionPlan>(
@@ -644,67 +646,26 @@ void identity_budget_replacement(std::shared_ptr<const glm::ModelDefinition> def
     for (auto h : input) require(f.session.release_checkpoint(h), "long input did not retire");
 }
 
-void identity_budget_retirement(std::shared_ptr<const glm::ModelDefinition> definition) {
+void retired_quotes_do_not_block_new_inputs(
+    std::shared_ptr<const glm::ModelDefinition> definition) {
     Fixture f(definition);
-    std::vector<std::shared_ptr<const rt::RecoveryIdentity>> retained;
-    bool exhausted = false;
+    std::vector<std::shared_ptr<const rt::RecoveryDescription>> quotes;
     for (unsigned i = 0; i < 32; ++i) {
         const auto request  = f.request(128);
         const auto sequence = f.bind(request, 0, 0);
         f.commit(f.prefill(sequence), true);
         const auto finished = f.session.finish(sequence);
-        require(finished.status == rt::ConsumeStatus::Consumed,
-                "identity pressure prevented a legal request from finishing");
+        require(finished.status == rt::ConsumeStatus::Consumed && finished.checkpoint,
+                "retired policy quotes prevented checkpoint publication");
         f.idle();
-        if (!finished.checkpoint) {
-            exhausted = true;
-            break;
-        }
         const auto points = f.session.recovery_points({}, {&*finished.checkpoint, 1});
-        require(points.size() == 1, "finished checkpoint has no recovery identity");
-        retained.push_back(points.front().description->identity);
+        quotes.push_back(points.front().description);
         require(f.session.release_checkpoint(*finished.checkpoint),
-                "retained quote prevented physical checkpoint retirement");
+                "quote pinned physical context");
     }
-    require(exhausted && !retained.empty(), "retired identity bytes escaped their finite pool");
     const auto usage = f.session.physical_usage();
     require(!usage.state_objects && !usage.history_objects,
-            "refused optional continuation retained native storage");
-
-    const auto request  = f.request(256);
-    const auto sequence = f.bind(request, 0, 0);
-    for (unsigned chunk = 0; chunk < 4; ++chunk) {
-        const glm::ExecutionUnit unit{sequence, glm::ExecutionUnitKind::Prefill, 64};
-        require(bool(f.session.reserve_units({&unit, 1})),
-                "identity cache pressure prevented necessary prefill");
-        const auto capture = f.session.prepare_capture(sequence);
-        require(!capture, "full identity cache accepted a new long capture");
-        require(f.session.start_prefill(sequence).has_value(), "identity pressure stalled prefill");
-        auto progress = f.event<glm::PrefillProgress>();
-        if (progress.pending)
-            f.commit(std::move(*progress.pending));
-        else
-            f.idle();
-    }
-    require(!f.session.prepare_pause(sequence, {rt::PauseKind::KeepDevice, {0}}),
-            "full identity cache prepared another pause snapshot");
-    const rt::PauseAction replay{rt::PauseKind::ReleaseAndReplay, {0}};
-    require(f.session.prepare_pause(sequence, replay) && f.session.start_pause(sequence, replay),
-            "full identity cache blocked the no-snapshot pause path");
-    auto paused = f.event<glm::ContextProgress>();
-    f.idle();
-    require(paused.paused && !paused.paused->has_snapshot(),
-            "identity-pressure fallback did not release and replay");
-
-    retained.clear();
-    const auto fresh   = f.request(128);
-    const auto resumed = f.bind(fresh, 0, 0);
-    f.commit(f.prefill(resumed), true);
-    const auto finished = f.session.finish(resumed);
-    require(finished.status == rt::ConsumeStatus::Consumed && finished.checkpoint,
-            "retired decision identities did not return optional-save capacity");
-    require(f.session.release_checkpoint(*finished.checkpoint),
-            "replacement identity checkpoint failed to retire");
+            "retired quotes retained physical context");
 }
 
 void fragmented_capture(std::shared_ptr<const glm::ModelDefinition> definition) {
@@ -805,7 +766,7 @@ void relocation_preflight_includes_destination_victims(
     const auto done = f.session.finish(donor);
     require(done.checkpoint.has_value(), "relocation victim was not published");
     f.idle();
-    const auto active = f.bind(request, 1, 1);
+    const auto active = f.bind(request, 1, 1, done.checkpoint);
     f.commit(f.prefill(active));
     auto options      = f.session.pause_options(active);
     const auto option = std::find_if(options.begin(), options.end(), [](const auto& value) {
@@ -843,8 +804,11 @@ void relocation_preflight_includes_destination_victims(
                     0,
             "prepared relocation lost its target after victim retirement");
     require(f.session.revoke_snapshot(*paused.paused), "relocated snapshot did not retire");
+    const auto metadata = f.session.physical_usage().metadata.allocated_bytes;
     paused.paused.reset();
     f.idle();
+    require(f.session.physical_usage().metadata.allocated_bytes == metadata,
+            "revoked snapshot retained input metadata through its paused request");
     fillers.clear();
     require(!f.session.physical_usage().state_objects &&
                 !f.session.physical_usage().history_objects,
@@ -907,18 +871,16 @@ void transactions(std::shared_ptr<const glm::ModelDefinition> definition) {
                 "captured writer release failed");
         f.idle();
         const auto quotes = f.session.recovery_points();
-        require(!quotes.empty() && quotes.front().description->identity->rebuild(2).tokens == 2,
+        require(!quotes.empty() && quotes.front().description->work->rebuild(2).tokens == 2,
                 "native recovery quote lost the captured target");
         const auto repeated = f.session.recovery_points();
         require(repeated.size() == quotes.size() &&
                     repeated.front().handle == quotes.front().handle &&
-                    repeated.front().description->identity == quotes.front().description->identity,
+                    repeated.front().description->work == quotes.front().description->work,
                 "simultaneous recovery views duplicated immutable identity metadata");
         for (auto checkpoint : captured.captured_checkpoints)
             require(f.session.release_checkpoint(checkpoint), "quote retained a State/KV lease");
-        require(quotes.front().description->identity->rebuild(0).tokens == 4 &&
-                    quotes.front().description->identity->prefix_of(
-                        *quotes.front().description->identity),
+        require(quotes.front().description->work->rebuild(0).tokens == 4,
                 "retired checkpoint invalidated its decision identity");
         const auto usage = f.session.physical_usage();
         require(!usage.state_objects && !usage.history_objects,
@@ -1262,7 +1224,7 @@ public:
     using glm::Session::Session;
     std::atomic<bool> arm{false}, survived{false};
     enum class Stage { Idle, Need, Deferred, Finished } stage = Stage::Idle;
-    mutable std::weak_ptr<const rt::RecoveryIdentity> observed;
+    mutable std::weak_ptr<const rt::RecoveryWork> observed;
     mutable bool captured = false;
 
     glm::ResourceReservation reserve_units(std::span<const glm::ExecutionUnit> units) {
@@ -1285,7 +1247,7 @@ public:
                     std::span<const glm::CheckpointHandle> selected = {}) const {
         auto points = glm::Session::recovery_points(removed, selected);
         if (stage == Stage::Need && !captured && selected.empty() && !points.empty()) {
-            observed = points.front().description->identity;
+            observed = points.front().description->work;
             captured = true;
         }
         return points;
@@ -1499,8 +1461,8 @@ int main(int argc, char** argv) {
         batch_geometry();
         require(argc >= 2, "missing artifact directory");
         artifact::Reader reader(std::filesystem::path(argv[1]) / "model.ninfer");
-        identity_budget_replacement(glm::read_definition(reader, {}));
-        identity_budget_retirement(glm::read_definition(reader, {}));
+        long_input_replacement(glm::read_definition(reader, {}));
+        retired_quotes_do_not_block_new_inputs(glm::read_definition(reader, {}));
         recovery_quotes_match_tail_copies(glm::read_definition(reader, {}));
         recovery_quotes_match_tail_copies(
             glm::read_definition(reader, {.speculative = SpeculativeBackend::Mtp}));

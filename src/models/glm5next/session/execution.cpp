@@ -101,7 +101,7 @@ Session::start_decode(std::span<const SequenceHandle> members,
         auto& s      = p.sequence(members[b]);
         const auto f = s.continuation.metadata.main_frontier;
         if (s.phase != detail::Phase::Active || !s.permit ||
-            !budgets[b].generated_tokens_remaining || s.identity.tokens.size() != f + 1 ||
+            !budgets[b].generated_tokens_remaining || s.ledger.size() != f + 1 ||
             s.membership_mark == mark)
             throw std::logic_error("decode row is not executable");
         s.membership_mark = mark;
@@ -161,7 +161,7 @@ Session::start_control(std::span<const SequenceHandle> members, std::span<const 
         s.membership_mark = mark;
         if (s.phase != detail::Phase::Active || !s.permit ||
             s.permit->kind != ExecutionUnitKind::Control ||
-            s.identity.tokens.size() != s.continuation.metadata.main_frontier + 1 ||
+            s.ledger.size() != s.continuation.metadata.main_frontier + 1 ||
             s.continuation.metadata.main_frontier + stride > s.permitted_frontier)
             throw std::logic_error("forced control row is not executable");
     }

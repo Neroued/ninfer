@@ -136,7 +136,7 @@ ContextProgress detail::SessionImpl::complete_context() {
                         history.handle(), checkpoint.snapshot.prefix(pool).frontier()));
                 }
                 checkpoint.snapshot = detail::Snapshot(states, continuation, std::move(prefixes),
-                                                       checkpoint.snapshot.identity_owner());
+                                                       checkpoint.snapshot.input_prefix());
                 checkpoint.snapshot.set_use(context::ContextUse::Request);
                 (void)destination.release();
                 tx->paused->sequence->continuation.metadata.placement = tx->action.placement;

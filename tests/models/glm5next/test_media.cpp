@@ -141,11 +141,11 @@ void golden(const std::filesystem::path& path, const std::filesystem::path& dump
         }
         const auto cached = f.prepare(input);
         const auto& hit   = glm::PreparedPromptAccess::view(cached);
-        require(
-            glm::input_prefix_equal(data.prefix_view(), hit.prefix_view(), data.token_ids.size()) &&
-                hit.token_ids == data.token_ids &&
-                cached.preparation_stats().media_cache_hits == data.identity.media.size(),
-            name + ": cached input differs");
+        require(glm_fixture::prefix_equal(data.prefix_view(), hit.prefix_view(),
+                                          data.token_ids.size()) &&
+                    hit.token_ids == data.token_ids &&
+                    cached.preparation_stats().media_cache_hits == data.identity.media.size(),
+                name + ": cached input differs");
         for (std::size_t i = 0; i < data.media_payloads.size(); ++i)
             require(data.media_payloads[i] == hit.media_payloads[i],
                     name + ": cached payload not retained");
@@ -194,20 +194,17 @@ void behavior(const std::filesystem::path& path, const std::filesystem::path& to
     changed.messages[0].parts[1].media.bytes.assign(different.begin(), different.end());
     const auto other       = f.prepare(changed);
     const auto& other_data = glm::PreparedPromptAccess::view(other);
-    require(
-        glm::input_prefix_equal(data.prefix_view(), other_data.prefix_view(), span.begin) &&
-            !glm::input_prefix_equal(data.prefix_view(), other_data.prefix_view(), span.begin + 1),
-        "changed image identity is not bound at its first embedding token");
-    require(glm::PrefixDigests(data.prefix_view()).at(span.begin + 1) !=
-                glm::PrefixDigests(other_data.prefix_view()).at(span.begin + 1),
-            "index queries inside media omitted content identity");
+    require(glm_fixture::prefix_equal(data.prefix_view(), other_data.prefix_view(), span.begin) &&
+                !glm_fixture::prefix_equal(data.prefix_view(), other_data.prefix_view(),
+                                           span.begin + 1),
+            "changed image identity is not bound at its first embedding token");
     auto config_changed                                = config;
     config_changed["image_processor"]["image_mean"][0] = 0.5;
     const auto cf          = make(config_changed, 16384, 16ULL << 20, tokenizer);
     const auto reprocessed = cf.prepare(input);
-    require(!glm::input_prefix_equal(data.prefix_view(),
-                                     glm::PreparedPromptAccess::view(reprocessed).prefix_view(),
-                                     span.begin + 1),
+    require(!glm_fixture::prefix_equal(data.prefix_view(),
+                                       glm::PreparedPromptAccess::view(reprocessed).prefix_view(),
+                                       span.begin + 1),
             "processor configuration is absent from input identity");
 
     auto repeated = input;

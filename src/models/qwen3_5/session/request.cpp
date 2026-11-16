@@ -25,6 +25,18 @@ void validate_sampling(const ResolvedSamplingParameters& sampling) {
 
 } // namespace
 
+context::InputIdentityView RequestBasePlanImpl::identity_view(context::TokenView tokens) const {
+    context::InputIdentityView out{.tokens          = tokens,
+                                   .types           = prompt->token_types,
+                                   .generated_delta = prompt->rope_delta,
+                                   .media           = media};
+    const auto count = prompt->token_ids.size();
+    for (std::size_t axis = 0; axis < 3; ++axis)
+        out.positions[axis] =
+            std::span<const std::int32_t>(prompt->positions).subspan(axis * count, count);
+    return out;
+}
+
 bool RequestBasePlanImpl::accepts_capture(std::uint32_t frontier) const noexcept {
     if (frontier == 0 || frontier > summary.prompt_tokens) { return false; }
     if (vision && !vision->can_checkpoint(frontier)) return false;
@@ -32,12 +44,10 @@ bool RequestBasePlanImpl::accepts_capture(std::uint32_t frontier) const noexcept
 }
 
 CaptureGroup RequestBasePlanImpl::capture_group(std::uint32_t frontier) const {
-    if (!capture_backing || !accepts_capture(frontier)) {
+    if (!accepts_capture(frontier)) {
         throw std::logic_error("capture identity requires a legal prompt frontier");
     }
-    return {.identity = capture_backing,
-            .key      = {prefix_digests.at(frontier), frontier, prefix_identity_tag},
-            .frontier = frontier};
+    return {.frontier = frontier};
 }
 
 RequestBasePlan SessionImpl::plan_request(qwen::PreparedPromptData&& prompt,
@@ -104,24 +114,20 @@ RequestBasePlan SessionImpl::plan_request(qwen::PreparedPromptData&& prompt,
                                                   plan.vision_max_features);
     }
 
-    base->prefix_digests.assign(prompt);
     base->prefix_identity_tag = static_cast<std::uint32_t>(speculative_backend) |
                                 (static_cast<std::uint32_t>(plan.proposal_head) << 8U) |
                                 (static_cast<std::uint32_t>(plan.kv_storage) << 16U);
     base->prompt = std::make_shared<const qwen::PreparedPromptData>(std::move(prompt));
+    for (const auto& item : base->prompt->vision_items) base->media.push_back({&item});
+    base->query = context::PrefixQuery(prefixes, base->prefix_identity_tag, base->identity_view());
     if (base->summary.publish_continuation) {
         const auto& prepared = *base->prompt;
-        auto backing         = std::make_shared<PreparedCaptureBacking>();
-        backing->digests     = base->prefix_digests;
-        backing->ledger      = prepared.token_ids;
-        backing->prefix_identity.assign(prepared);
-        base->capture_backing = std::move(backing);
-        const auto add        = [&](std::uint32_t frontier, runtime::CheckpointRole role,
+        const auto add       = [&](std::uint32_t frontier, runtime::CheckpointRole role,
                              SharedCandidateEvidence evidence = SharedCandidateEvidence::None) {
             if (!base->accepts_capture(frontier)) { return; }
             auto it =
                 std::find_if(base->capture_groups.begin(), base->capture_groups.end(),
-                                    [frontier](const auto& group) { return group.frontier == frontier; });
+                                   [frontier](const auto& group) { return group.frontier == frontier; });
             if (it == base->capture_groups.end()) {
                 base->capture_groups.push_back(base->capture_group(frontier));
                 it = std::prev(base->capture_groups.end());

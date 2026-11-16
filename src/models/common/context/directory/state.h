@@ -292,7 +292,7 @@ private:
     static void refresh_usage(Object&) noexcept;
     void retain_request_reference(StateId image, ContextMemory memory);
     void release_request_reference(StateId image, ContextMemory memory) noexcept;
-    template <class Metadata, class Identity>
+    template <class Metadata>
     friend class ContextSnapshot;
     [[nodiscard]] bool can_release_checkpoint_owner(StateId image) const noexcept;
     [[nodiscard]] static bool has_pending_replica(const Object& object) noexcept;

@@ -132,13 +132,24 @@ SequencePlanner make_sequence_planner(std::shared_ptr<const execution::ModelProf
     const auto checkpoints =
         std::size_t(spec.state.logical_capacity) + 2ULL * options.max_concurrency;
     const auto recovery_concurrency = impl->minimum->causal_scoring ? 0U : options.max_concurrency;
+    const bool vision               = impl->minimum->profile->options.vision;
+    const context::PrefixMetadataLayout prefix_layout{
+        vision, vision ? qwen::kMinimumMediaSpanTokens : 0, qwen::kMinimumMediaSpanTokens};
     metadata.fixed_bytes +=
         TokenCountBuilder::capacity_bytes(
             impl->minimum->causal_scoring ? 0 : impl->minimum->profile->public_tokens) +
         detail::Checkpoints::metadata_bytes(checkpoints) +
         context::RecoveryIndex<>::metadata_bytes(checkpoints) +
         context::recovery_value_metadata_bytes(checkpoints, recovery_concurrency) +
-        detail::PreparedCaptureBacking::cache_bytes(options.max_context, recovery_concurrency);
+        context::PrefixStore::metadata_bytes(
+            std::size_t(impl->minimum->prefill_chunk + context::PrefixStore::block_tokens) *
+                recovery_concurrency,
+            checkpoints + 2 * recovery_concurrency, prefix_layout);
+    if (vision)
+        metadata.fixed_bytes +=
+            ((std::size_t(options.max_context) + prefix_layout.span_stride - 1) /
+             prefix_layout.span_stride) *
+            recovery_concurrency * (sizeof(models::frontend::TokenSpan) + sizeof(double));
     const auto geometry    = describe_context_pool(impl->capacity_plan.records);
     const auto state_class = geometry.spec_classes.front().index;
     metadata.bytes_per_record[state_class] +=
@@ -146,6 +157,16 @@ SequencePlanner make_sequence_planner(std::shared_ptr<const execution::ModelProf
         context::RecoveryIndex<>::metadata_bytes(1) - context::RecoveryIndex<>::metadata_bytes(0) +
         context::recovery_value_metadata_bytes(1, recovery_concurrency) -
         context::recovery_value_metadata_bytes(0, recovery_concurrency);
+    const auto main_class = geometry.spec_classes.at(spec.state.layouts.size()).index;
+    const auto prefix_page_cost =
+        context::PrefixStore::metadata_bytes(kPagedKVPageSize, 0, prefix_layout) -
+        context::PrefixStore::metadata_bytes(0, 0, prefix_layout);
+    metadata.bytes_per_record[main_class] += prefix_page_cost;
+    metadata.fixed_bytes += (spec.ranks.front().host_bytes / geometry.block_bytes) *
+                            geometry.classes[main_class].records_per_block * prefix_page_cost;
+    metadata.bytes_per_record[state_class] +=
+        context::PrefixStore::metadata_bytes(0, 1, prefix_layout) -
+        context::PrefixStore::metadata_bytes(0, 0, prefix_layout);
     for (const auto& pool : spec.pools)
         metadata.bytes_per_record[state_class] +=
             context::HistoryDirectory::metadata_bytes(1, 0, pool.page_capacity) -

@@ -28,18 +28,18 @@ bool detail::SessionImpl::source_matches(const RequestBasePlan& base, Checkpoint
                                          const ResumeState* resume) const {
     if (!checkpoints.valid(handle)) return false;
     const auto& checkpoint = checkpoints.at(handle);
-    const auto& identity   = checkpoint.snapshot.identity();
+    const auto& identity   = checkpoint.snapshot.input_prefix();
     if (resume) {
         if (!resume->state_ || resume->state_->owner != this || !resume->state_->sequence ||
             resume->state_->sequence->request != base.plan_)
             throw std::invalid_argument("resume state belongs to another Session");
-        const auto& previous = resume->state_->sequence->identity;
-        return checkpoint.frontier() <= resume->frontier() && identity.tag == previous.tag &&
-               input_prefix_equal(identity.view(), previous.view(), checkpoint.frontier());
+        const auto& previous = *resume->state_->sequence;
+        return checkpoint.frontier() <= resume->frontier() &&
+               prefixes.domain(identity.id()) == previous.request->domain &&
+               resume->state_->query.matches(identity.id());
     }
-    return base.plan_->reuse && identity.tag == base.plan_->identity->tag &&
-           input_prefix_equal(base.plan_->prompt.prefix_view(), identity.view(),
-                              checkpoint.frontier());
+    return base.plan_->reuse && prefixes.domain(identity.id()) == base.plan_->domain &&
+           base.plan_->query.matches(identity.id());
 }
 
 std::optional<SourceCandidate>
@@ -61,8 +61,9 @@ Session::inspect_source(const RequestBasePlan& base, std::optional<CheckpointHan
     const auto end    = resume ? resume->frontier() : base.summary().prompt_tokens;
     if (out.reused_tokens > end) return {};
     out.remaining_work = models::vision::recovery_work(
-        base.plan_->identity->media, [](const auto& media) -> const auto& { return media.item; },
-        out.reused_tokens, end, p.shape.prefill_chunk, p.plan.vision_max_features);
+        base.plan_->prompt.identity.media,
+        [](const auto& media) -> const auto& { return media.item; }, out.reused_tokens, end,
+        p.shape.prefill_chunk, p.plan.vision_max_features);
     if (h) {
         const auto& c           = p.checkpoints.at(*h);
         const auto image        = c.snapshot.continuation().image;
@@ -295,7 +296,7 @@ ResidencyBinding SessionImpl::context_binding(BindOperation& operation) {
         sequence.id                        = previous.id;
         sequence.epoch                     = previous.epoch;
         sequence.request                   = previous.request;
-        sequence.identity                  = previous.identity;
+        sequence.ledger                    = previous.ledger;
         sequence.reused                    = previous.reused;
         sequence.resume_phase              = previous.phase;
         sequence.next_capture              = previous.next_capture;
@@ -307,7 +308,7 @@ ResidencyBinding SessionImpl::context_binding(BindOperation& operation) {
         sequence.id           = next_sequence++;
         sequence.epoch        = identity_generation;
         sequence.request      = operation.request;
-        sequence.identity     = *operation.request->identity;
+        sequence.ledger       = context::RequestLedger(operation.request->prompt.token_ids);
         sequence.reused       = operation.frontier;
         sequence.captures     = operation.request->captures;
         sequence.last_saved   = operation.frontier;
@@ -320,10 +321,12 @@ ResidencyBinding SessionImpl::context_binding(BindOperation& operation) {
             sequence.speculative.accepted_per_position.resize(shape.draft_tokens);
         }
     }
-    sequence.lane                = operation.lane;
-    const auto identity_capacity = std::size_t(sequence.request->summary.prompt_tokens) +
-                                   sequence.request->summary.effective_output_tokens;
-    sequence.identity.reserve(identity_capacity);
+    sequence.lane = operation.lane;
+    sequence.ledger.reserve_output(sequence.request->summary.effective_output_tokens);
+    sequence.prefix = context::PrefixBuilder(
+        prefixes, sequence.request->domain,
+        operation.source ? checkpoints.at(*operation.source).snapshot.input_prefix()
+                         : context::PrefixRef{});
     sequence.binding_generation = ++epochs[operation.lane];
     sequence.phase = operation.target > operation.frontier ? Phase::Replay : sequence.resume_phase;
     sequence.replay_target      = operation.target;
@@ -339,8 +342,7 @@ ResidencyBinding SessionImpl::context_binding(BindOperation& operation) {
            sequence.captures[sequence.next_capture].frontier <= operation.frontier)
         ++sequence.next_capture;
 
-    const auto generated = std::span<const TokenId>(sequence.identity.tokens)
-                               .subspan(sequence.request->summary.prompt_tokens);
+    const auto generated = sequence.ledger.generated();
     ResidencyBinding result{member(sequence), {}};
     const auto& sampling = sequence.request->sampling;
     if (sampling.presence_penalty || sampling.frequency_penalty)

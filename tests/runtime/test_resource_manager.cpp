@@ -1,5 +1,6 @@
 #include "runtime/engine/context_cache/resource_manager.h"
 #include "models/common/context/recovery.h"
+#include "models/common/context/prefix.h"
 #include "models/common/context/release_inventory.h"
 
 #include <algorithm>
@@ -93,7 +94,7 @@ struct Base {
 
     [[nodiscard]] const Advice& context_cache() const { return advice; }
 
-    [[nodiscard]] std::optional<Key> prefix_shortlist_key(std::uint32_t frontier) const {
+    [[nodiscard]] std::optional<Key> prefix_key(std::uint32_t frontier) const {
         if (frontier > tokens.size()) { return std::nullopt; }
         return Key(tokens.begin(), tokens.begin() + frontier);
     }
@@ -121,6 +122,35 @@ struct Source {
 
 // Concrete immutable contents and their Host aliases, without cache policy or an allocator.
 // The production stores have separate tests for actual allocation and transfer lifetimes.
+struct PrefixFixture {
+    ninfer::models::context::MetadataBudget budget{64ULL << 20};
+    ninfer::models::context::PrefixStore store{budget};
+    std::map<Key, ninfer::models::context::PrefixRef> inputs;
+
+    ninfer::runtime::PrefixId endpoint(const Key& tokens) {
+        if (const auto it = inputs.find(tokens); it != inputs.end()) return it->second.id();
+        const std::vector<ninfer::TokenId> ids(tokens.begin(), tokens.end());
+        auto prefix =
+            store.prepare(0, {.tokens = ninfer::models::context::TokenView(ids)}, ids.size());
+        const auto id = prefix.id();
+        inputs.emplace(tokens, std::move(prefix));
+        return id;
+    }
+};
+
+auto prefix_relations(std::span<const ninfer::runtime::PrefixId> ids) {
+    if (ids.empty()) return std::vector<ninfer::runtime::PrefixRelation>{};
+    const auto* store = static_cast<const ninfer::models::context::PrefixStore*>(ids.front().owner);
+    return store->relations(ids);
+}
+
+bool prefix_precedes(ninfer::runtime::PrefixId a, std::uint32_t af, ninfer::runtime::PrefixId b,
+                     std::uint32_t bf) {
+    const auto* store = static_cast<const ninfer::models::context::PrefixStore*>(a.owner);
+    return af <= bf && store && a.owner == b.owner && store->valid(a) && store->valid(b) &&
+           store->is_prefix(a, b);
+}
+
 struct Program {
     using ContextDemand     = Demand;
     using ContextAssessment = Assessment;
@@ -195,6 +225,36 @@ struct Program {
     mutable std::uint64_t host_plan_builds = 0;
     mutable std::uint64_t rebuild_quotes   = 0;
     mutable std::uint64_t recovery_scans   = 0;
+    mutable PrefixFixture prefixes;
+
+    auto checkpoint_prefix(Handle h) const {
+        return prefixes.endpoint(contents.at(h.index).tokens);
+    }
+
+    auto matching_prefixes(const Base& base) const {
+        std::vector<std::pair<std::size_t, ninfer::runtime::PrefixId>> matches;
+        for (std::uint32_t i = 0; i < contents.size(); ++i) {
+            const auto& c = contents[i];
+            if (c.alive && c.tokens.size() <= base.tokens.size() &&
+                std::equal(c.tokens.begin(), c.tokens.end(), base.tokens.begin()))
+                matches.emplace_back(c.tokens.size(), checkpoint_prefix({i}));
+        }
+        std::stable_sort(matches.begin(), matches.end(),
+                         [](const auto& a, const auto& b) { return a.first > b.first; });
+        std::vector<ninfer::runtime::PrefixId> out;
+        for (const auto& [size, id] : matches)
+            if (std::find(out.begin(), out.end(), id) == out.end()) out.push_back(id);
+        return out;
+    }
+
+    auto recovery_relations(std::span<const ninfer::runtime::PrefixId> ids) const {
+        return prefix_relations(ids);
+    }
+
+    bool recovery_precedes(ninfer::runtime::PrefixId a, std::uint32_t af,
+                           ninfer::runtime::PrefixId b, std::uint32_t bf) const {
+        return prefix_precedes(a, af, b, bf);
+    }
 
     using RecoveryAccount = ninfer::models::context::MetadataAccount;
     using RecoveryTopology =
@@ -203,33 +263,17 @@ struct Program {
 
     auto& recovery_budget() const { return metadata; }
 
-    class ValueIdentity final : public ninfer::runtime::RecoveryIdentity {
+    class ValueWork final : public ninfer::runtime::RecoveryWork {
     public:
-        ValueIdentity(const Program& owner, Key tokens, std::uint32_t end)
-            : ninfer::runtime::RecoveryIdentity(&owner, end, 0), program_(owner),
-              tokens_(std::move(tokens)) {
-            hashes_.push_back({0, 0});
-            for (auto token : tokens_) hashes_.push_back({hashes_.back()[0] * 131 + token, 0});
-        }
-
-        std::array<std::uint64_t, 2> digest(std::uint32_t f) const override {
-            return hashes_.at(f);
-        }
+        ValueWork(const Program& owner, std::uint32_t end) : program_(owner), frontier(end) {}
 
         ninfer::runtime::PrefillWork rebuild(std::uint32_t begin) const override {
             ++program_.rebuild_quotes;
             return ninfer::runtime::make_prefill_work(begin, frontier - begin, 0, 0, 1024);
         }
     private:
-        bool exact_prefix(const ninfer::runtime::RecoveryIdentity& other) const override {
-            const auto* value = dynamic_cast<const ValueIdentity*>(&other);
-            return value &&
-                   std::equal(tokens_.begin(), tokens_.begin() + frontier, value->tokens_.begin());
-        }
-
         const Program& program_;
-        Key tokens_;
-        std::vector<std::array<std::uint64_t, 2>> hashes_;
+        std::uint32_t frontier;
     };
 
     std::vector<RecoveryPoint> recovery_points(const Usage& removed             = {},
@@ -243,8 +287,9 @@ struct Program {
                 std::find(selected.begin(), selected.end(), h) == selected.end())
                 continue;
             auto value       = std::make_shared<ninfer::runtime::RecoveryDescription>();
-            value->identity  = std::make_shared<ValueIdentity>(*this, contents[i].tokens,
-                                                               contents[i].tokens.size());
+            value->prefix    = checkpoint_prefix(h);
+            value->frontier  = contents[i].tokens.size();
+            value->work      = std::make_shared<ValueWork>(*this, value->frontier);
             value->placement = contents[i].placement;
             for (auto target : available_placements) {
                 const auto source =
@@ -268,8 +313,10 @@ struct Program {
     std::shared_ptr<const ninfer::runtime::RecoveryDescription> recovery_target(
         const Base& base, std::uint32_t frontier, PlacementId placement,
         ninfer::runtime::CaptureStorage = ninfer::runtime::CaptureStorage::Device) const {
-        auto value       = std::make_shared<ninfer::runtime::RecoveryDescription>();
-        value->identity  = std::make_shared<ValueIdentity>(*this, base.tokens, frontier);
+        auto value    = std::make_shared<ninfer::runtime::RecoveryDescription>();
+        value->prefix = prefixes.endpoint(Key(base.tokens.begin(), base.tokens.begin() + frontier));
+        value->frontier  = frontier;
+        value->work      = std::make_shared<ValueWork>(*this, frontier);
         value->placement = placement;
         value->restores.push_back({placement, {}});
         return value;
@@ -435,10 +482,10 @@ struct Program {
                 content.role};
     }
 
-    [[nodiscard]] Key checkpoint_key(Handle handle, std::uint32_t frontier) const {
+    [[nodiscard]] Key checkpoint_key(Handle handle) const {
         const auto& content = contents.at(handle.index);
-        require(content.alive && frontier <= content.tokens.size(), "invalid prefix identity read");
-        return {content.tokens.begin(), content.tokens.begin() + frontier};
+        require(content.alive, "invalid prefix identity read");
+        return content.tokens;
     }
 
     [[nodiscard]] PhysicalUsage physical_usage() const {
@@ -675,14 +722,12 @@ struct Program {
                 return program.contents[h.index].tokens.size();
             }
 
-            ninfer::models::context::RecoveryKey key(Handle h, std::uint32_t f) const {
-                std::uint64_t hash = 0;
-                for (std::uint32_t i = 0; i < f; ++i)
-                    hash = hash * 131 + program.contents[h.index].tokens[i];
-                return {{hash, 0}, 0};
+            auto relations() const {
+                std::vector<ninfer::runtime::PrefixId> ids(capacity());
+                for (std::uint32_t i = 0; i < capacity(); ++i)
+                    if (valid(handle(i))) ids[i] = program.checkpoint_prefix(handle(i));
+                return program.prefixes.store.relations(ids);
             }
-
-            bool prefix(Handle a, Handle b) const { return program.prefix(a, b); }
         };
 
         recovery_index.synchronize(View{*this});
@@ -692,7 +737,7 @@ struct Program {
     [[nodiscard]] std::uint32_t checkpoint_recovery_frontier(Handle retained, const Base& base,
                                                              std::uint32_t target) const {
         const auto& tokens = contents.at(retained.index).tokens;
-        return tokens.size() <= target && base.prefix_shortlist_key(tokens.size()) == tokens
+        return tokens.size() <= target && base.prefix_key(tokens.size()) == tokens
                    ? static_cast<std::uint32_t>(tokens.size())
                    : 0;
     }
@@ -2652,7 +2697,7 @@ void test_independent_host_candidates_reuse_scores() {
         for (unsigned i = 0; i < n; ++i)
             f.publish(f.program.add({i + 1}, {f.program.host_block(1)}));
         (void)f.program.evaluate_recovery({});
-        const auto comparisons = f.program.recovery_index.work().exact_comparisons;
+        const auto comparisons = f.program.recovery_index.work().relations;
         std::optional<std::uint64_t> first_work;
         for (const auto count : {1U, n / 2}) {
             f.program.score_queries = f.program.scored_handles = 0;
@@ -2662,7 +2707,7 @@ void test_independent_host_candidates_reuse_scores() {
             require(victims && victims->size() == count && f.program.rebuild_quotes >= n &&
                         f.program.rebuild_quotes <= 8 * n &&
                         f.program.rebuild_quotes == *first_work &&
-                        f.program.recovery_index.work().exact_comparisons == comparisons,
+                        f.program.recovery_index.work().relations == comparisons,
                     "Host trials rescored unrelated selected checkpoints or repeated exact "
                     "identity checks");
             require(f.program.last_inventory->work().owner_visits <= 2ULL * (n * count + count),
@@ -2945,7 +2990,7 @@ void test_same_position_promotion_is_not_deduplicated_early() {
             "publication disagreed with promotion's restore-cost ordering");
 }
 
-void test_weighted_recovery_and_new_fallback() {
+void test_recovery_quote_is_fixed_until_next_decision() {
     Fixture f(64);
     ninfer::runtime::ContextMachineCostModel costs;
     costs.prefill.token_ns_q32 = ninfer::runtime::kContextCostQ32One;
@@ -2963,8 +3008,87 @@ void test_weighted_recovery_and_new_fallback() {
     f.cache.adopt_release(f.program, std::array{shallow}, cursor, quote);
     const auto fallback = f.program.add(tokens(1));
     f.publish(fallback);
-    require(f.cache.quote_release(f.program, std::array{target}, cursor).loss_after == 9,
-            "new fallback failed to enter both sides of the decision counterfactual");
+    require(f.cache.quote_release(f.program, std::array{target}, cursor).loss_after == 10,
+            "new publication rewrote an in-flight decision's frozen capabilities");
+    auto next = f.cache.begin_reclaim(f.program);
+    require(f.cache.quote_release(f.program, std::array{target}, next).loss_after == 9,
+            "next decision failed to use the newly published fallback");
+}
+
+void test_unexecuted_capture_refreshes_its_price() {
+    namespace rt = ninfer::runtime;
+    Fixture f(64);
+    rt::ContextMachineCostModel costs;
+    costs.prefill.token_ns_q32 = rt::kContextCostQ32One;
+    f.cache                    = Fixture::Cache(true, costs);
+    const auto source          = f.program.add(tokens(92));
+    const auto other           = f.program.add(tokens(9, 500));
+    f.publish(source);
+    f.publish(other);
+    const Base input{tokens(100)};
+    auto cursor = f.cache.begin_reclaim(
+        f.program, f.cache.capture_admission(f.program, 0, input, 100, Role::SharedPrefix));
+    require(!f.cache.capture_victims(f.program, f.program.pressure(1), cursor),
+            "capture spent more than its initial benefit");
+    require(f.cache.erase(f.program, source), "source did not retire");
+    f.program.prefixes.inputs.erase(tokens(92));
+    const auto victims = f.cache.capture_victims(f.program, f.program.pressure(1), cursor);
+    require(victims && *victims == std::vector{other},
+            "unexecuted capture refreshed sources without refreshing its benefit");
+}
+
+void test_capture_restore_price_survives_identity_retirement() {
+    namespace rt = ninfer::runtime;
+    Fixture f(64);
+    rt::ContextMachineCostModel costs;
+    costs.prefill.token_ns_q32 = rt::kContextCostQ32One;
+    costs.transfer[0].batch_ns = 2;
+    costs.transfer[1].batch_ns = 7;
+    f.cache                    = Fixture::Cache(true, costs);
+    const auto old             = f.program.add(tokens(92));
+    f.publish(old);
+    const Base input{tokens(100)};
+    const rt::CaptureCostQuote device{f.program.recovery_target(input, 100, {}), {}};
+    auto admission =
+        f.cache.capture_admission(f.program, 0, input, 100, Role::SharedPrefix, {}, &device);
+    admission.demand.last_demand = admission.priority.last_demand = 1;
+    auto cursor        = f.cache.begin_reclaim(f.program, admission);
+    const auto receipt = f.cache.quote_release(f.program, std::array{old}, cursor);
+    require(f.program.release_checkpoint(old), "old source did not retire");
+    f.program.prefixes.inputs.erase(tokens(92));
+    f.cache.adopt_release(f.program, std::array{old}, cursor, receipt);
+    auto target                   = std::make_shared<rt::RecoveryDescription>(*device.retained);
+    target->restores[0].transfers = {
+        {.direction = rt::ContextTransferDirection::HostToDevice, .work = {8, 1}}};
+    const rt::CaptureCostQuote host{
+        target, {{.direction = rt::ContextTransferDirection::DeviceToHost, .work = {8, 1}}}};
+    require(!f.cache.quote_capture(f.program, host, cursor) &&
+                f.cache.quote_capture(f.program, device, cursor),
+            "retired identity inflated capture benefit or lost the target's restore charge");
+}
+
+void test_required_target_keeps_proved_retired_ancestors() {
+    namespace rt = ninfer::runtime;
+    for (unsigned frontier : {2U, 3U}) {
+        Fixture f(64);
+        rt::ContextMachineCostModel costs;
+        costs.prefill.token_ns_q32 = rt::kContextCostQ32One;
+        f.cache                    = Fixture::Cache(true, costs);
+        const auto parent = f.program.add(tokens(2)), child = f.program.add(tokens(4));
+        f.publish(parent);
+        f.publish(child);
+        auto cursor        = f.cache.begin_reclaim(f.program);
+        const auto receipt = f.cache.quote_release(f.program, std::array{parent}, cursor);
+        const auto id      = f.program.prefixes.endpoint(tokens(2));
+        require(f.program.release_checkpoint(parent), "ancestor did not retire");
+        f.program.prefixes.inputs.erase(tokens(2));
+        require(!f.program.prefixes.store.valid(id), "fixture retained the ancestor's identity");
+        f.cache.adopt_release(f.program, std::array{parent}, cursor, receipt);
+        const auto next  = f.program.add(tokens(frontier));
+        const auto quote = f.cache.quote_release(f.program, std::array{child, next}, cursor);
+        require(quote.loss_after == 4,
+                "a new required target severed proved ancestry or duplicated an alias loss");
+    }
 }
 
 void test_weighted_loss_against_independent_oracle() {
@@ -3069,6 +3193,15 @@ void test_recycled_slot_keeps_distinct_decision_identity() {
         auto& recovery_budget() { return budget; }
 
         auto recovery_points() { return current; }
+
+        auto recovery_relations(std::span<const rt::PrefixId> ids) const {
+            return prefix_relations(ids);
+        }
+
+        bool recovery_precedes(rt::PrefixId a, std::uint32_t af, rt::PrefixId b,
+                               std::uint32_t bf) const {
+            return prefix_precedes(a, af, b, bf);
+        }
     } session;
 
     Program native{.host_capacity = 0};
@@ -3084,8 +3217,7 @@ void test_recycled_slot_keeps_distinct_decision_identity() {
     const std::array live{fresh};
     {
         rt::RecoveryCostEvaluation<Session, GenerationHandle> values(session, live, &ledger, costs);
-        require(values.frontier(old) == 50 && values.frontier(fresh) == 25 &&
-                    values.total_loss() == 25 && values.total_loss(live) == 50,
+        require(values.frontier(old) == 50 && !values.contains(fresh) && values.total_loss() == 50,
                 "recycled native slot aliased a retired decision target or created a new target");
     }
     ledger.include_required(session, session.current, live, costs);
@@ -3274,29 +3406,27 @@ struct CountSession {
     using RecoveryTopology = Program::RecoveryTopology;
     ninfer::models::context::MetadataBudget budget{64ULL << 20};
 
-    struct Identity : ninfer::runtime::RecoveryIdentity {
-        std::uint32_t tag;
-
-        Identity(const void* scope, std::uint32_t t) : RecoveryIdentity(scope, 1, 0), tag(t) {}
-
-        std::array<std::uint64_t, 2> digest(std::uint32_t f) const override {
-            return {f ? tag + 1 : 0, f};
-        }
-
+    struct Work : ninfer::runtime::RecoveryWork {
         ninfer::runtime::PrefillWork rebuild(std::uint32_t f) const override {
             return {.tokens = 1 - f};
         }
-
-        bool exact_prefix(const RecoveryIdentity& b) const override {
-            return tag == static_cast<const Identity&>(b).tag;
-        }
     };
 
+    PrefixFixture prefixes;
     std::vector<ninfer::runtime::RecoveryPoint<CountHandle>> points;
 
     auto& recovery_budget() { return budget; }
 
     auto recovery_points() { return points; }
+
+    auto recovery_relations(std::span<const ninfer::runtime::PrefixId> ids) const {
+        return prefix_relations(ids);
+    }
+
+    bool recovery_precedes(ninfer::runtime::PrefixId a, std::uint32_t af,
+                           ninfer::runtime::PrefixId b, std::uint32_t bf) const {
+        return prefix_precedes(a, af, b, bf);
+    }
 };
 
 void test_live_evaluation_membership_work_is_linear() {
@@ -3307,7 +3437,9 @@ void test_live_evaluation_membership_work_is_linear() {
         std::vector<CountHandle> advertised;
         for (unsigned i = 0; i < n; ++i) {
             auto description      = std::make_shared<rt::RecoveryDescription>();
-            description->identity = std::make_shared<CountSession::Identity>(&session, i);
+            description->work     = std::make_shared<CountSession::Work>();
+            description->prefix   = session.prefixes.endpoint({i});
+            description->frontier = 1;
             description->restores.push_back({{}, {}});
             session.points.push_back({{i}, std::move(description)});
             advertised.push_back({i});
@@ -3353,20 +3485,16 @@ void test_replay_preparation_is_priced_only_for_later_targets() {
 void test_host_chain_uses_lazy_bounded_source_search() {
     namespace rt = ninfer::runtime;
 
-    struct Identity : rt::RecoveryIdentity {
+    struct Work : rt::RecoveryWork {
         std::uint64_t& calls;
+        std::uint32_t frontier;
 
-        Identity(const void* owner, unsigned frontier, std::uint64_t& count)
-            : RecoveryIdentity(owner, frontier, 0), calls(count) {}
-
-        std::array<std::uint64_t, 2> digest(std::uint32_t f) const override { return {f, 0}; }
+        Work(unsigned end, std::uint64_t& count) : calls(count), frontier(end) {}
 
         rt::PrefillWork rebuild(std::uint32_t begin) const override {
             ++calls;
             return {.tokens = frontier - begin};
         }
-
-        bool exact_prefix(const rt::RecoveryIdentity&) const override { return true; }
     };
 
     for (unsigned count : {128U, 512U, 2048U}) {
@@ -3375,7 +3503,9 @@ void test_host_chain_uses_lazy_bounded_source_search() {
         std::vector<CountHandle> visible;
         for (unsigned i = 0; i < count; ++i) {
             auto value      = std::make_shared<rt::RecoveryDescription>();
-            value->identity = std::make_shared<Identity>(&session, i + 1, calls);
+            value->work     = std::make_shared<Work>(i + 1, calls);
+            value->prefix   = session.prefixes.endpoint(Key(i + 1, 1));
+            value->frontier = i + 1;
             value->restores.push_back(
                 {{}, {{.direction = rt::ContextTransferDirection::HostToDevice, .work = {1, 1}}}});
             session.points.push_back({{i}, value});
@@ -3408,7 +3538,10 @@ int main() {
         test_capture_and_maintenance_action_accounting();
         test_pause_prices_save_restore_and_victim_loss();
         test_same_position_promotion_is_not_deduplicated_early();
-        test_weighted_recovery_and_new_fallback();
+        test_recovery_quote_is_fixed_until_next_decision();
+        test_unexecuted_capture_refreshes_its_price();
+        test_capture_restore_price_survives_identity_retirement();
+        test_required_target_keeps_proved_retired_ancestors();
         test_recycled_slot_keeps_distinct_decision_identity();
         test_weighted_loss_against_independent_oracle();
         test_semantic_loss_and_joint_decision_budget();

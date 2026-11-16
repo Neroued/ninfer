@@ -118,16 +118,14 @@ void reclaim(q4::detail::SessionImpl& p, Executor& executor) {
         for (std::uint16_t pool = 0; pool < 2; ++pool)
             prefixes.push_back(p.directory.pool(pool).histories().retain_prefix(
                 owners[pool].handle(), frontier - pool));
-        auto identity = std::make_shared<q4::detail::Identity>();
         models::qwen::PreparedPromptData prompt;
         prompt.token_ids.resize(frontier, 1);
         prompt.token_types.resize(frontier);
         prompt.positions.resize(frontier * 3);
         for (unsigned axis = 0; axis < 3; ++axis)
             for (unsigned i = 0; i < frontier; ++i) prompt.positions[axis * frontier + i] = i;
-        identity->tokens = prompt.token_ids;
-        identity->positions.assign(prompt);
-        identity->digests.assign(prompt);
+        auto identity =
+            p.prefixes.prepare(0, {.tokens = context::TokenView(prompt.token_ids)}, frontier);
         const auto handle = *p.checkpoints.reserve();
         p.checkpoints.publish(
             handle,

@@ -4,8 +4,7 @@
 #include "models/qwen4_exp/state/continuation.h"
 #include "models/qwen4_exp/definition.h"
 #include "models/common/context/snapshot.h"
-#include "models/common/context/identity.h"
-#include "models/common/qwen/prefix_identity.h"
+#include "models/common/context/prefix.h"
 #include "models/common/qwen/vision/control.h"
 
 #include <deque>
@@ -22,30 +21,18 @@ struct CapturePoint {
     SharedCandidateEvidence evidence = SharedCandidateEvidence::None;
 };
 
-struct Identity {
-    std::vector<TokenId> tokens;
-    qwen::ResidentPrefixIdentity positions;
-    qwen::PrefixShortlistDigests digests;
-    std::uint32_t tag = 0;
-    context::IdentityMetadata retention;
-
-    [[nodiscard]] std::size_t metadata_bytes() const noexcept {
-        return sizeof(*this) + tokens.capacity() * sizeof(TokenId) + positions.metadata_bytes() +
-               digests.metadata_bytes();
-    }
-
-    [[nodiscard]] static std::size_t cache_bytes(std::size_t tokens, std::size_t concurrency) {
-        return context::IdentityMetadata::cache_bytes<Identity>(
-            tokens, concurrency,
-            sizeof(TokenId) + 3 * sizeof(std::int32_t) + sizeof(std::uint8_t) +
-                sizeof(std::array<std::uint64_t, 2>));
-    }
-};
-
 struct RequestPlan {
     qwen::PreparedPromptData prompt;
     runtime::RequestPlanSummary summary;
-    std::shared_ptr<const Identity> identity;
+    context::PrefixQuery query;
+    std::uint32_t domain = 0;
+    std::vector<context::MediaIdentityView> media;
+    [[nodiscard]] context::InputIdentityView identity_view(context::TokenView tokens) const;
+
+    [[nodiscard]] context::InputIdentityView identity_view() const {
+        return identity_view(context::TokenView(prompt.token_ids));
+    }
+
     std::vector<CapturePoint> captures;
     std::shared_ptr<const qwen::VisionExecutionInput> vision;
     ResolvedSamplingParameters sampling;
@@ -54,7 +41,7 @@ struct RequestPlan {
     [[nodiscard]] bool can_checkpoint(std::uint32_t frontier) const;
 };
 
-using Snapshot = context::ContextSnapshot<ContinuationMetadata, Identity>;
+using Snapshot = context::ContextSnapshot<ContinuationMetadata>;
 
 struct Checkpoint {
     Snapshot snapshot;
@@ -62,16 +49,10 @@ struct Checkpoint {
     runtime::CheckpointOrigin origin = runtime::CheckpointOrigin::Semantic;
     SharedCandidateEvidence evidence = SharedCandidateEvidence::None;
 
-    mutable std::weak_ptr<const runtime::RecoveryIdentity> recovery_identity_cache;
+    mutable std::weak_ptr<const runtime::RecoveryWork> recovery_work_cache;
 
     [[nodiscard]] std::uint32_t frontier() const {
         return snapshot.continuation().metadata.main_frontier;
-    }
-
-    [[nodiscard]] qwen::RecoveryIdentityView recovery_identity() const {
-        const auto& identity = snapshot.identity();
-        return {frontier(),         identity.tag,     identity.tokens,
-                identity.positions, identity.digests, snapshot.identity_owner().get()};
     }
 };
 
@@ -79,7 +60,7 @@ using Checkpoints = context::CheckpointStore<Checkpoint>;
 
 struct PreparedCheckpoint {
     Checkpoints::Reservation record;
-    std::shared_ptr<const Identity> identity;
+    context::PrefixRef identity;
 };
 
 enum class Phase { Prefill, Replay, Active, Pending, Finished };
@@ -89,7 +70,7 @@ struct CaptureReservation {
     Checkpoints* checkpoints;
     Image destination;
     std::optional<context::RecordReservation> host;
-    std::shared_ptr<const Identity> identity;
+    context::PrefixRef identity;
     std::vector<std::pair<CheckpointHandle, runtime::CheckpointRole>> records;
     ~CaptureReservation();
 };
@@ -99,7 +80,8 @@ struct Sequence {
     std::uint32_t lane               = 0;
     std::uint64_t binding_generation = 0;
     std::shared_ptr<const RequestPlan> request;
-    Identity identity;
+    context::RequestLedger ledger;
+    context::PrefixBuilder prefix;
     Continuation continuation;
     Image write_destination;
     std::array<context::HistoryOwner, 2> histories;
@@ -123,6 +105,7 @@ struct Suspended {
     std::unique_ptr<Sequence> sequence;
     std::optional<CheckpointHandle> snapshot;
     std::uint32_t frontier;
+    context::PrefixQuery query;
     ~Suspended();
 };
 
@@ -352,6 +335,7 @@ public:
     const ExecutionShape& shape;
     runtime::Executor<ExecutionTypes>* executor = nullptr;
     context::ContextDirectory directory;
+    context::PrefixStore prefixes{directory.metadata_budget()};
     context::RecoveryMetadata recovery_metadata;
     mutable context::RecoveryIndex<> recovery_index{directory.metadata_budget(),
                                                     &recovery_metadata};
@@ -384,9 +368,5 @@ public:
     std::uint64_t next_sequence       = 1;
     std::uint64_t identity_generation = 0;
 };
-
-[[nodiscard]] std::shared_ptr<const Identity> capture_identity(const Sequence&,
-                                                               context::MetadataBudget&);
-[[nodiscard]] PrefixShortlistKey key(const Identity&, std::uint32_t);
 
 } // namespace ninfer::models::qwen4_exp::detail

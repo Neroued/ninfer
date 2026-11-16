@@ -185,7 +185,7 @@ runtime::ContextCapacityPlan describe_execution_capacity(const ExecutionPlan& p)
         description, geometry, rank,
         p.shape.purpose == EnginePurpose::Generation ? p.profile->public_tokens : 0,
         p.shape.purpose == EnginePurpose::Generation ? p.shape.max_concurrency : 0,
-        p.shape.max_context);
+        p.shape.max_context, p.shape.prefill_chunk, p.workspace.vision.has_value());
     return out;
 }
 

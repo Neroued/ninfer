@@ -1,5 +1,4 @@
 target_sources(ninfer_model_control PRIVATE
-  "${CMAKE_CURRENT_LIST_DIR}/prefix_identity.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/frontend/frontend.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/frontend/output.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/frontend/chat_template.cpp"

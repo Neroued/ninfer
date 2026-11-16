@@ -4,6 +4,7 @@
 #include "models/common/context/directory/state.h"
 #include "models/common/context/directory.h"
 #include "models/common/context/work.h"
+#include "models/common/context/prefix.h"
 
 #include <algorithm>
 #include <memory>
@@ -25,13 +26,12 @@ std::uint32_t retired_state_references(const Store& checkpoints, StateId image,
     return result;
 }
 
-// A complete immutable recovery point. Metadata and identity are native types; the common
-// owner only retains the exact StateImage and the supplied logical KV prefixes.
-template <class Metadata, class Identity>
+// One coherent native continuation, its physical history prefixes and exact input endpoint.
+template <class Metadata>
 class ContextSnapshot {
 public:
     ContextSnapshot(StateDirectory& states, Continuation<Metadata> continuation,
-                    std::vector<HistoryPrefix> prefixes, std::shared_ptr<const Identity> identity)
+                    std::vector<HistoryPrefix> prefixes, PrefixRef identity)
         : states_(&states), continuation_(std::move(continuation)), prefixes_(std::move(prefixes)),
           identity_(std::move(identity)) {
         if (!identity_) throw std::invalid_argument("snapshot has no input identity");
@@ -81,11 +81,7 @@ public:
         return continuation_;
     }
 
-    [[nodiscard]] const Identity& identity() const noexcept { return *identity_; }
-
-    [[nodiscard]] const std::shared_ptr<const Identity>& identity_owner() const noexcept {
-        return identity_;
-    }
+    [[nodiscard]] const PrefixRef& input_prefix() const noexcept { return identity_; }
 
     [[nodiscard]] const HistoryPrefix& prefix(std::size_t index) const {
         return prefixes_.at(index);
@@ -212,7 +208,7 @@ private:
     StateDirectory* states_;
     Continuation<Metadata> continuation_;
     std::vector<HistoryPrefix> prefixes_;
-    std::shared_ptr<const Identity> identity_;
+    PrefixRef identity_;
     ContextUse use_       = ContextUse::Cache;
     ContextMemory memory_ = ContextMemory::Device;
 };

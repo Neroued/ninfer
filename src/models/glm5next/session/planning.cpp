@@ -1,16 +1,18 @@
 #include "models/glm5next/session/internal.h"
 
 #include "models/glm5next/parallel/preparation.h"
+#include "models/glm5next/frontend/resources.h"
 
 namespace ninfer::models::glm5next {
 
-runtime::ContextMetadataPlan session_metadata_plan(const context::ContextDirectorySpec& schema,
-                                                   const ContextPoolGeometry& geometry,
-                                                   std::uint32_t rank,
-                                                   std::uint32_t count_vocabulary,
-                                                   std::uint32_t concurrency,
-                                                   std::uint32_t max_context) {
-    auto metadata      = context::ContextDirectory::metadata_plan(schema, rank, 1);
+runtime::ContextMetadataPlan
+session_metadata_plan(const context::ContextDirectorySpec& schema,
+                      const ContextPoolGeometry& geometry, std::uint32_t rank,
+                      std::uint32_t count_vocabulary, std::uint32_t concurrency,
+                      std::uint32_t max_context, std::uint32_t prefill_chunk, bool vision) {
+    auto metadata = context::ContextDirectory::metadata_plan(schema, rank, 1);
+    const context::PrefixMetadataLayout prefix_layout{false, vision ? kMinimumMediaSpanTokens : 0,
+                                                      kMinimumMediaSpanTokens};
     const auto records = std::size_t(schema.state.logical_capacity);
     if (rank == schema.ranks.front().rank)
         metadata.fixed_bytes +=
@@ -19,7 +21,9 @@ runtime::ContextMetadataPlan session_metadata_plan(const context::ContextDirecto
             context::RecoveryIndex<>::metadata_bytes(records) +
             context::recovery_value_metadata_bytes(records, concurrency, schema.ranks.size(),
                                                    schema.ranks.size()) +
-            detail::Identity::cache_bytes(max_context, concurrency);
+            context::PrefixStore::metadata_bytes(
+                std::size_t(prefill_chunk + context::PrefixStore::block_tokens) * concurrency,
+                records + 2 * concurrency, prefix_layout);
     const auto checkpoint_cost =
         detail::Checkpoints::metadata_bytes(1) - detail::Checkpoints::metadata_bytes(0);
     const auto recovery_cost =
@@ -44,8 +48,26 @@ runtime::ContextMetadataPlan session_metadata_plan(const context::ContextDirecto
             });
         if (state_class)
             metadata.bytes_per_record.at(i) +=
-                (checkpoint_cost + recovery_cost + history_cost + ranks - 1) / ranks;
+                (checkpoint_cost + recovery_cost + history_cost +
+                 context::PrefixStore::metadata_bytes(0, 1, prefix_layout) -
+                 context::PrefixStore::metadata_bytes(0, 0, prefix_layout) + ranks - 1) /
+                ranks;
     }
+    const auto main =
+        std::find_if(schema.pools.front().parts.begin(), schema.pools.front().parts.end(),
+                     [&](const auto& part) { return part.rank == rank; });
+    if (main != schema.pools.front().parts.end())
+        for (std::size_t i = 0; i < geometry.classes.size(); ++i)
+            if (geometry.classes[i].spec.bytes == main->record.bytes &&
+                geometry.classes[i].spec.alignment == main->record.alignment)
+                metadata.bytes_per_record.at(i) +=
+                    context::PrefixStore::metadata_bytes(kPagedKVPageSize, 0, prefix_layout) -
+                    context::PrefixStore::metadata_bytes(0, 0, prefix_layout);
+    if (rank == schema.ranks.front().rank && vision)
+        metadata.fixed_bytes += ((std::size_t(max_context) + prefix_layout.span_stride - 1) /
+                                 prefix_layout.span_stride) *
+                                concurrency *
+                                (sizeof(models::frontend::TokenSpan) + sizeof(double));
     return metadata;
 }
 

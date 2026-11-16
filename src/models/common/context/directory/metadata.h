@@ -150,6 +150,12 @@ public:
         bytes_ -= bytes;
     }
 
+    void transfer(std::size_t bytes, MetadataAccount& destination) noexcept {
+        if (budget_ != destination.budget_ || bytes > bytes_) std::terminate();
+        bytes_ -= bytes;
+        destination.bytes_ += bytes;
+    }
+
     template <class T>
     void reserve(std::vector<T>& values, std::size_t capacity) {
         if (capacity <= values.capacity()) return;

@@ -3,6 +3,8 @@
 #include "models/common/context/recovery.h"
 #include "models/common/context/directory.h"
 #include "runtime/contract/recovery.h"
+#include "models/common/context/prefix.h"
+#include "models/common/vision/window.h"
 
 namespace ninfer::models::context {
 
@@ -106,6 +108,65 @@ pause_restore_work(const ContextDirectory& directory, StateId image,
     return demotion_work(directory, contents, true);
 }
 
+class RecoveryWork final : public runtime::RecoveryWork {
+public:
+    // Request targets borrow the geometry of their still-owned RequestPlan.
+    RecoveryWork(MetadataBudget& budget, std::uint32_t frontier,
+                 std::span<const MediaIdentityView> media, std::uint32_t chunk,
+                 std::uint32_t features)
+        : memory_(budget), frontier_(frontier), chunk_(chunk), features_(features), input_(media) {
+        memory_.acquire(sizeof(*this));
+    }
+
+    // Catalog descriptions retain compact reconstruction data, independently of prefix tokens.
+    RecoveryWork(MetadataBudget& budget, std::uint32_t frontier,
+                 std::shared_ptr<const ReplayMedia> media, std::uint32_t chunk,
+                 std::uint32_t features)
+        : memory_(budget), frontier_(frontier), chunk_(chunk), features_(features),
+          media_(std::move(media)) {
+        memory_.acquire(sizeof(*this));
+    }
+
+    runtime::PrefillWork rebuild(std::uint32_t begin) const override {
+        if (!media_)
+            return vision::recovery_work(
+                input_, [](const auto& source) -> const auto& { return *source.item; }, begin,
+                frontier_, chunk_, features_);
+        std::vector<const frontend::VisionItem*> items;
+        for (auto* media = media_.get(); media; media = media->previous().get()) {
+            const auto& item = media->item();
+            const auto last  = item.token_spans.back();
+            if (last.begin + last.count <= begin) break;
+            items.push_back(&item);
+        }
+        std::reverse(items.begin(), items.end());
+        return vision::recovery_work(
+            items, [](auto item) -> const auto& { return *item; }, begin, frontier_, chunk_,
+            features_);
+    }
+private:
+    MetadataAccount memory_;
+    std::uint32_t frontier_, chunk_, features_;
+    std::span<const MediaIdentityView> input_;
+    std::shared_ptr<const ReplayMedia> media_;
+};
+
+static_assert(sizeof(RecoveryWork) <= runtime::kRecoveryWorkMetadataLimit);
+
+inline std::shared_ptr<const runtime::RecoveryWork>
+recovery_work(MetadataBudget& budget, std::uint32_t frontier,
+              std::span<const MediaIdentityView> media, std::uint32_t chunk,
+              std::uint32_t features) {
+    return std::make_shared<RecoveryWork>(budget, frontier, media, chunk, features);
+}
+
+inline std::shared_ptr<const runtime::RecoveryWork>
+recovery_work(MetadataBudget& budget, const PrefixStore& store, PrefixId prefix,
+              std::uint32_t chunk, std::uint32_t features) {
+    return std::make_shared<RecoveryWork>(budget, store.frontier(prefix),
+                                          store.replay_media(prefix), chunk, features);
+}
+
 // Charge owned quote metadata for exactly as long as a decision or evaluation retains it.
 struct RecoveryDescription final : runtime::RecoveryDescription {
     RecoveryDescription(MetadataBudget& budget, runtime::RecoveryDescription value)
@@ -134,14 +195,13 @@ inline std::size_t recovery_value_storage_bytes(std::size_t capacity, std::size_
     const auto records = std::max<std::size_t>(1, capacity) + concurrency;
     const auto native  = sizeof(RecoveryDescription) +
                         sizeof(runtime::RecoveryPoint<CheckpointHandle>) +
-                        runtime::kRecoveryIdentityMetadataLimit +
+                        runtime::kRecoveryWorkMetadataLimit +
                         placements * (sizeof(runtime::RecoveryRestore) +
                                       12 * ranks * sizeof(runtime::ContextTransferRequirement));
-    const auto priced = runtime::kRecoveryPricedDescriptorLimit +
-                        placements * sizeof(runtime::RecoveryRestoreCost) +
-                        runtime::kRecoveryIdentityMetadataLimit +
-                        2 * sizeof(runtime::RecoveryPoint<CheckpointHandle>) +
-                        2 * sizeof(CheckpointHandle);
+    const auto priced =
+        runtime::kRecoveryPricedDescriptorLimit +
+        placements * sizeof(runtime::RecoveryRestoreCost) + runtime::kRecoveryWorkMetadataLimit +
+        2 * sizeof(runtime::RecoveryPoint<CheckpointHandle>) + 2 * sizeof(CheckpointHandle);
     // Capture and execution may both wait per lane; admission/pause and synchronous price
     // views add a bounded overlap. Raw transfer inventories exist only during quotation.
     return records * (2 * concurrency + runtime::kRecoveryAuxiliaryViews) * priced +
@@ -161,10 +221,9 @@ inline std::size_t recovery_value_metadata_bytes(std::size_t records, std::size_
 class RecoveryMetadata final : public MetadataCapacity {
 public:
     RecoveryMetadata(MetadataBudget& owner, std::size_t concurrency, std::size_t ranks = 1,
-                     std::size_t placements = 1, std::size_t identity_bytes = 0)
+                     std::size_t placements = 1)
         : budget_(recovery_value_storage_bytes(0, concurrency, ranks, placements), &owner),
-          identities_(identity_bytes, &owner), concurrency_(concurrency), ranks_(ranks),
-          placements_(placements) {}
+          concurrency_(concurrency), ranks_(ranks), placements_(placements) {}
 
     std::size_t metadata_requirement(std::size_t capacity) const override {
         const auto bytes = required(capacity);
@@ -179,14 +238,12 @@ public:
 
     MetadataBudget& budget() const { return budget_; }
 
-    MetadataBudget& identity_budget() const { return identities_; }
 private:
     std::size_t required(std::size_t capacity) const {
         return recovery_value_storage_bytes(capacity, concurrency_, ranks_, placements_);
     }
 
     mutable MetadataBudget budget_;
-    mutable MetadataBudget identities_;
     std::size_t concurrency_, ranks_, placements_;
 };
 

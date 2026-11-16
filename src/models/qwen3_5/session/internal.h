@@ -3,10 +3,9 @@
 #include "models/qwen3_5/session/session.h"
 #include "models/qwen3_5/state/continuation.h"
 #include "models/common/context/snapshot.h"
-#include "models/common/context/identity.h"
+#include "models/common/context/prefix.h"
 #include "models/common/context/work.h"
-#include "models/common/qwen/prefix_identity.h"
-#include "models/common/qwen/recovery_store.h"
+#include "models/common/context/recovery_store.h"
 #include "models/common/qwen/vision/control.h"
 
 #include <array>
@@ -22,28 +21,7 @@ namespace ninfer::models::qwen3_5::detail {
 class SessionImpl;
 struct PendingContext;
 
-struct PreparedCaptureBacking {
-    qwen::PrefixShortlistDigests digests;
-    std::vector<TokenId> ledger;
-    qwen::ResidentPrefixIdentity prefix_identity;
-    context::IdentityMetadata retention;
-
-    [[nodiscard]] std::size_t metadata_bytes() const noexcept {
-        return sizeof(*this) + ledger.capacity() * sizeof(TokenId) +
-               prefix_identity.metadata_bytes() + digests.metadata_bytes();
-    }
-
-    [[nodiscard]] static std::size_t cache_bytes(std::size_t tokens, std::size_t concurrency) {
-        return context::IdentityMetadata::cache_bytes<PreparedCaptureBacking>(
-            tokens, concurrency,
-            sizeof(TokenId) + 3 * sizeof(std::int32_t) + sizeof(std::uint8_t) +
-                sizeof(std::array<std::uint64_t, 2>));
-    }
-};
-
 struct CaptureGroup {
-    std::shared_ptr<const PreparedCaptureBacking> identity;
-    PrefixShortlistKey key;
     std::uint32_t frontier = 0;
     std::vector<runtime::CheckpointRole> roles;
     runtime::CheckpointOrigin origin = runtime::CheckpointOrigin::Semantic;
@@ -57,8 +35,14 @@ struct RequestBasePlanImpl {
     ResolvedSamplingParameters sampling;
     std::shared_ptr<const qwen::VisionExecutionInput> vision;
     std::vector<CaptureGroup> capture_groups;
-    std::shared_ptr<const PreparedCaptureBacking> capture_backing;
-    qwen::PrefixShortlistDigests prefix_digests;
+    context::PrefixQuery query;
+    std::vector<context::MediaIdentityView> media;
+    [[nodiscard]] context::InputIdentityView identity_view(context::TokenView tokens) const;
+
+    [[nodiscard]] context::InputIdentityView identity_view() const {
+        return identity_view(context::TokenView(prompt->token_ids));
+    }
+
     std::uint32_t prefix_identity_tag = 0;
     bool allow_prefix_reuse           = false;
 
@@ -112,9 +96,8 @@ struct SequenceState {
     context::StateId pending_write;
     std::uint32_t lane = 0;
 
-    std::vector<TokenId> ledger;
-    qwen::ResidentPrefixIdentity prefix_identity;
-    qwen::PrefixShortlistDigests prefix_digests;
+    context::RequestLedger ledger;
+    context::PrefixBuilder prefix;
     SequenceHandle id;
     runtime::ResidencyId residency;
     bool computing = false;
@@ -129,7 +112,7 @@ struct CaptureReservation {
     std::vector<std::pair<CheckpointHandle, runtime::CheckpointRole>> points;
     context::StateId state;
     std::optional<context::RecordReservation> host;
-    std::shared_ptr<const PreparedCaptureBacking> identity;
+    context::PrefixRef identity;
     std::uint32_t frontier = 0;
     ~CaptureReservation();
 };
@@ -153,7 +136,6 @@ struct RequestControl {
     bool capture_pending = false;
 
     struct Prefill {
-        qwen::PreparedPromptData prompt;
         std::uint32_t base          = 0;
         std::uint32_t cursor        = 0;
         std::uint32_t prompt_tokens = 0;
@@ -163,16 +145,15 @@ struct RequestControl {
     std::optional<Prefill> prefill;
 };
 
-using Snapshot = context::ContextSnapshot<ContinuationMetadata, PreparedCaptureBacking>;
+using Snapshot = context::ContextSnapshot<ContinuationMetadata>;
 
 struct CheckpointState {
     Snapshot snapshot;
-    runtime::CheckpointRole role = runtime::CheckpointRole::Continuation;
-    PrefixShortlistKey key;
+    runtime::CheckpointRole role     = runtime::CheckpointRole::Continuation;
     runtime::CheckpointOrigin origin = runtime::CheckpointOrigin::Semantic;
     SharedCandidateEvidence evidence = SharedCandidateEvidence::None;
 
-    mutable std::weak_ptr<const runtime::RecoveryIdentity> recovery_identity_cache;
+    mutable std::weak_ptr<const runtime::RecoveryWork> recovery_work_cache;
 
     [[nodiscard]] const Continuation& continuation() const noexcept {
         return snapshot.continuation();
@@ -180,13 +161,6 @@ struct CheckpointState {
 
     [[nodiscard]] std::uint32_t frontier() const noexcept {
         return continuation().metadata.execution_frontier;
-    }
-
-    [[nodiscard]] qwen::RecoveryIdentityView recovery_identity() const {
-        const auto& identity = snapshot.identity();
-        return {frontier(),       key.identity_tag,
-                identity.ledger,  identity.prefix_identity,
-                identity.digests, snapshot.identity_owner().get()};
     }
 
     [[nodiscard]] std::uint32_t backend_frontier() const noexcept {
@@ -209,7 +183,7 @@ using Checkpoints = context::CheckpointStore<CheckpointState>;
 
 struct PreparedCheckpoint {
     Checkpoints::Reservation record;
-    std::shared_ptr<const PreparedCaptureBacking> identity;
+    context::PrefixRef identity;
 };
 
 struct ResumeStateImpl {
@@ -217,6 +191,7 @@ struct ResumeStateImpl {
     std::optional<CheckpointHandle> snapshot;
     SequenceState sequence;
     RequestControl control;
+    context::PrefixQuery query;
     std::uint32_t frontier = 0;
     ~ResumeStateImpl();
 };
@@ -257,7 +232,7 @@ struct CaptureOperation {
     std::uint32_t frontier         = 0;
     std::uint32_t backend_frontier = 0;
     std::vector<std::pair<CheckpointHandle, runtime::CheckpointRole>> points;
-    std::shared_ptr<const PreparedCaptureBacking> identity;
+    context::PrefixRef identity;
 };
 
 struct MaintenanceOperation {
@@ -328,7 +303,6 @@ public:
                    std::span<const CheckpointHandle> private_points = {},
                    std::span<const CheckpointHandle> retired_points = {},
                    runtime::PlacementId target = {}, const ResumeState* resume = nullptr) const;
-    [[nodiscard]] PrefixShortlistKey checkpoint_key(CheckpointHandle, std::uint32_t frontier) const;
     [[nodiscard]] CheckpointSummary checkpoint_summary(CheckpointHandle checkpoint) const;
     [[nodiscard]] CheckpointMetadata checkpoint_metadata(CheckpointHandle checkpoint) const;
     [[nodiscard]] bool checkpoint_matches(CheckpointHandle checkpoint,
@@ -430,6 +404,7 @@ public:
     [[nodiscard]] runtime::Executor<ExecutionTypes>& executor() const { return *executor_; }
 
     context::ContextDirectory directory;
+    context::PrefixStore prefixes{directory.metadata_budget()};
     context::StateDirectory* state_store;
     context::HistoryDirectory* text_kv_histories;
     context::HistoryDirectory* backend_kv_histories;

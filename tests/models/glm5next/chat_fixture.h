@@ -1,6 +1,8 @@
 #pragma once
 
 #include "ninfer/types.h"
+#include "models/common/context/prefix.h"
+#include "models/glm5next/prefix_identity.h"
 #include <nlohmann/json.hpp>
 #include <filesystem>
 #include <fstream>
@@ -31,6 +33,19 @@ void rejects(Action action, std::string_view reason) {
         return;
     }
     throw std::runtime_error("expected rejection: " + std::string(reason));
+}
+
+inline bool prefix_equal(models::glm5next::InputPrefixView a, models::glm5next::InputPrefixView b,
+                         std::size_t frontier) {
+    namespace ctx = models::context;
+    if (frontier > a.tokens.size() || frontier > b.tokens.size()) return false;
+    std::vector<ctx::MediaIdentityView> left, right;
+    for (const auto& m : a.media) left.push_back({&m.item, &m.preparation_digest});
+    for (const auto& m : b.media) right.push_back({&m.item, &m.preparation_digest});
+    ctx::MetadataBudget budget(64ULL << 20);
+    ctx::PrefixStore store(budget);
+    auto ref = store.prepare(0, {.tokens = ctx::TokenView(a.tokens), .media = left}, frontier);
+    return store.matches(ref.id(), {.tokens = ctx::TokenView(b.tokens), .media = right});
 }
 
 inline ChatRole role(std::string_view name) {

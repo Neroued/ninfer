@@ -10,20 +10,15 @@ bool RequestPlan::can_checkpoint(std::uint32_t frontier) const {
     return true;
 }
 
-PrefixShortlistKey key(const Identity& identity, std::uint32_t frontier) {
-    return {identity.digests.at(frontier), frontier, identity.tag};
-}
-
-std::shared_ptr<const Identity> capture_identity(const Sequence& s,
-                                                 context::MetadataBudget& budget) {
-    if (!context::IdentityMetadata::can_copy(budget, s.identity)) return {};
-    auto out       = std::make_shared<Identity>(s.identity);
-    const auto end = s.continuation.metadata.main_frontier;
-    out->tokens.resize(end);
-    out->positions.truncate(end);
-    out->digests.truncate(end);
-    const std::shared_ptr<const Identity> immutable = std::move(out);
-    return immutable->retention.retain(budget, immutable);
+context::InputIdentityView RequestPlan::identity_view(context::TokenView tokens) const {
+    context::InputIdentityView out{.tokens = tokens, .media = media};
+    out.types           = prompt.token_types;
+    out.generated_delta = prompt.rope_delta;
+    const auto count    = prompt.token_ids.size();
+    for (std::size_t axis = 0; axis < 3; ++axis)
+        out.positions[axis] =
+            std::span<const std::int32_t>(prompt.positions).subspan(axis * count, count);
+    return out;
 }
 
 std::shared_ptr<const qwen::VisionExecutionInput>
@@ -46,10 +41,10 @@ const models::frontend::PreparedContextCache& RequestBasePlan::context_cache() c
     return plan_->prompt.context_cache;
 }
 
-std::optional<PrefixShortlistKey> RequestBasePlan::prefix_shortlist_key(std::uint32_t f) const {
+std::optional<PrefixKey> RequestBasePlan::prefix_key(std::uint32_t f) const {
     // Prefix-index branches can fall inside media even though checkpoints cannot.
     if (!plan_->reuse || !f || f > plan_->summary.prompt_tokens) return {};
-    return detail::key(*plan_->identity, f);
+    return plan_->query.key(f);
 }
 
 RequestBasePlan Session::plan_request(qwen::PreparedPrompt&& prompt,
@@ -80,12 +75,9 @@ RequestBasePlan Session::plan_request(qwen::PreparedPrompt&& prompt,
                           : FinishReason::ContextCapacity,
                       plan->reuse};
     plan->sampling = options.sampling;
-    auto identity  = std::make_shared<detail::Identity>();
-    identity->tokens = input.token_ids;
-    identity->positions.assign(input);
-    identity->digests.assign(input);
-    identity->tag  = static_cast<std::uint32_t>(p.shape.kv_storage) << 16;
-    plan->identity = std::move(identity);
+    plan->domain   = static_cast<std::uint32_t>(p.shape.kv_storage) << 16;
+    for (const auto& item : input.vision_items) plan->media.push_back({&item});
+    plan->query = context::PrefixQuery(p.prefixes, plan->domain, plan->identity_view());
     if (plan->reuse) {
         const auto add = [&](std::uint32_t f, runtime::CheckpointRole role,
                              SharedCandidateEvidence evidence = SharedCandidateEvidence::None) {

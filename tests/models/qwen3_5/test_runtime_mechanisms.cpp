@@ -4,8 +4,6 @@
 #include "models/qwen3_5/state/decoder_state.h"
 #include "models/common/qwen/vision/control.h"
 
-#include "models/common/qwen/prefix_identity.h"
-
 #include <algorithm>
 #include <array>
 #include <cstdint>
@@ -332,187 +330,6 @@ void test_vision_control() {
            "window borrows only its temporal patch ranges");
 }
 
-ninfer::models::qwen::PreparedPromptData identity_prompt(std::uint8_t digest_byte = 1) {
-    ninfer::models::qwen::PreparedPromptData prompt;
-    prompt.token_ids   = {10, 248056, 248056, 11};
-    prompt.token_types = {0, static_cast<std::uint8_t>(ninfer::models::frontend::Modality::Image),
-                          static_cast<std::uint8_t>(ninfer::models::frontend::Modality::Image), 0};
-    prompt.positions   = {0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 2, 3};
-    prompt.rope_delta  = 0;
-    auto item =
-        ninfer::models::frontend::VisionItem{.modality = ninfer::models::frontend::Modality::Image,
-                                             .grid     = {.temporal = 1, .height = 2, .width = 4},
-                                             .patch_begin = 0,
-                                             .patch_count = 8,
-                                             .token_spans = {{.begin = 1, .count = 2}}};
-    item.content_digest.fill(digest_byte);
-    prompt.vision_items.push_back(std::move(item));
-    return prompt;
-}
-
-void append_text_token(ninfer::models::qwen::PreparedPromptData& prompt, ninfer::TokenId token,
-                       std::int32_t position) {
-    const std::size_t old_tokens = prompt.token_ids.size();
-    std::vector<std::int32_t> positions;
-    positions.reserve(3 * (old_tokens + 1));
-    for (std::size_t axis = 0; axis < 3; ++axis) {
-        const auto begin =
-            prompt.positions.begin() + static_cast<std::ptrdiff_t>(axis * old_tokens);
-        positions.insert(positions.end(), begin, begin + static_cast<std::ptrdiff_t>(old_tokens));
-        positions.push_back(position);
-    }
-    prompt.token_ids.push_back(token);
-    prompt.token_types.push_back(0);
-    prompt.positions = std::move(positions);
-}
-
-void test_prefix_identity() {
-    ninfer::models::qwen::PreparedPromptData original = identity_prompt();
-    std::vector<ninfer::TokenId> ledger               = original.token_ids;
-    ninfer::models::qwen::ResidentPrefixIdentity resident;
-    ninfer::models::qwen::PrefixShortlistDigests digests;
-    resident.reserve(16);
-    resident.assign(original);
-    digests.reserve(16);
-    digests.assign(original);
-
-    expect(
-        ninfer::models::qwen::prefix_matches(original, ledger, resident, original.token_ids.size()),
-        "identical multimodal prefix identity");
-
-    ninfer::models::qwen::PreparedPromptData changed_media = identity_prompt(2);
-    expect(!ninfer::models::qwen::prefix_matches(changed_media, ledger, resident,
-                                                 changed_media.token_ids.size()),
-           "different media content must not reuse placeholder tokens");
-    expect(ninfer::models::qwen::prefix_matches(changed_media, ledger, resident, 1),
-           "media wholly after the frontier does not affect prefix identity");
-    expect(!ninfer::models::qwen::prefix_matches(original, ledger, resident, 2),
-           "frontier must not divide one Vision item");
-
-    ninfer::models::qwen::PreparedPromptData changed_position = identity_prompt();
-    changed_position.positions[0] += 1;
-    expect(!ninfer::models::qwen::prefix_matches(changed_position, ledger, resident,
-                                                 changed_position.token_ids.size()),
-           "different MRoPE positions must not reuse resident state");
-
-    resident.append_generated(1, original.rope_delta);
-    ledger.push_back(12);
-    const std::array<ninfer::TokenId, 1> generated{12};
-    digests.append_generated(generated, original.rope_delta);
-    append_text_token(original, 12, 4);
-    ninfer::models::qwen::PrefixShortlistDigests rebuilt;
-    rebuilt.assign(original);
-    expect(digests.at(ledger.size()) == rebuilt.at(ledger.size()),
-           "incremental generated-token shortlist diverged from a full rebuild");
-    expect(ninfer::models::qwen::prefix_matches(original, ledger, resident, ledger.size()),
-           "generated multimodal continuation identity");
-
-    ninfer::models::qwen::PreparedPromptData accepted_rebuild = identity_prompt();
-    const std::array<ninfer::TokenId, 3> proposed{20, 21, 22};
-    const std::span<const ninfer::TokenId> accepted(proposed.data(), 2);
-    std::vector<ninfer::TokenId> accepted_ledger = accepted_rebuild.token_ids;
-    accepted_ledger.insert(accepted_ledger.end(), accepted.begin(), accepted.end());
-    ninfer::models::qwen::ResidentPrefixIdentity accepted_resident;
-    ninfer::models::qwen::PrefixShortlistDigests accepted_digests;
-    accepted_resident.assign(accepted_rebuild);
-    accepted_digests.assign(accepted_rebuild);
-    accepted_resident.append_generated(accepted.size(), accepted_rebuild.rope_delta);
-    accepted_digests.append_generated(accepted, accepted_rebuild.rope_delta);
-    append_text_token(accepted_rebuild, accepted[0], 4);
-    append_text_token(accepted_rebuild, accepted[1], 5);
-    ninfer::models::qwen::PrefixShortlistDigests rebuilt_accepted_digests;
-    rebuilt_accepted_digests.assign(accepted_rebuild);
-    expect(ninfer::models::qwen::prefix_matches(accepted_rebuild, accepted_ledger,
-                                                accepted_resident, accepted_ledger.size()) &&
-               accepted_digests.at(accepted_ledger.size()) ==
-                   rebuilt_accepted_digests.at(accepted_ledger.size()),
-           "accepted generated prefix and rebuilt history formed different cache identities");
-
-    const ninfer::models::qwen::PreparedPromptData prompt_only = identity_prompt();
-    resident.truncate(prompt_only.token_ids.size());
-    digests.truncate(prompt_only.token_ids.size());
-    ledger.resize(prompt_only.token_ids.size());
-    ninfer::models::qwen::PrefixShortlistDigests prompt_digest;
-    prompt_digest.assign(prompt_only);
-    expect(digests.at(ledger.size()) == prompt_digest.at(ledger.size()),
-           "truncated shortlist did not restore the original frontier digest");
-    expect(ninfer::models::qwen::prefix_matches(prompt_only, ledger, resident, ledger.size()),
-           "truncated multimodal continuation identity");
-}
-
-void test_regular_prefix_identity() {
-    const auto prompt = [](std::size_t count, std::int32_t origin = 0) {
-        ninfer::models::qwen::PreparedPromptData value;
-        value.token_ids.assign(count, 12);
-        value.token_types.assign(count, 0);
-        value.positions.resize(3 * count);
-        for (std::size_t axis = 0; axis < 3; ++axis) {
-            for (std::size_t i = 0; i < count; ++i) {
-                value.positions[axis * count + i] = origin + static_cast<std::int32_t>(i);
-            }
-        }
-        return value;
-    };
-    auto original = prompt(128, 7);
-    ninfer::models::qwen::ResidentPrefixIdentity left, right;
-    left.assign(original);
-    right.assign(original);
-    expect(left.equals(right), "independently prepared regular position identities differ");
-    const auto check_against_input = [&](const auto& value, const auto& identity) {
-        // matches reads the stored arrays against the public input, without the prefix shortcut.
-        for (std::size_t count = 0; count <= value.token_ids.size(); ++count) {
-            expect(left.prefix_equals(identity, count) == left.matches(value, count),
-                   "resident identity comparison disagrees with the prepared input");
-        }
-    };
-    for (std::size_t axis = 0; axis < 3; ++axis) {
-        auto changed = original;
-        changed.positions[axis * 128 + 64] += 1;
-        right.assign(changed);
-        check_against_input(changed, right);
-    }
-    auto changed            = original;
-    changed.token_types[64] = 1;
-    right.assign(changed);
-    check_against_input(changed, right);
-    changed = prompt(128, 8);
-    right.assign(changed);
-    check_against_input(changed, right);
-    left.append_generated(2, 7);
-    right.assign(prompt(130, 7));
-    expect(left.equals(right), "regular generated positions differ from a full rebuild");
-    left.append_generated(1, 8);
-    right.assign(prompt(131, 7));
-    expect(left.prefix_equals(right, 130) && !left.equals(right),
-           "a changed generated position was ignored");
-    left.truncate(128);
-    left.append_generated(3, 7);
-    expect(left.equals(right), "truncation retained discarded position differences");
-
-    left.truncate(0);
-    left.append_generated(3, -4);
-    right.assign(prompt(3, -4));
-    expect(left.equals(right), "empty truncated identity retained an old position origin");
-    ninfer::models::qwen::ResidentPrefixIdentity saved = left;
-    right.assign(prompt(3, 11));
-    left.swap(right);
-    expect(right.equals(saved) && !left.equals(saved), "swap lost the exact position identity");
-    left.clear();
-    left.append_generated(3, -4);
-    expect(left.equals(saved), "cleared identity retained its prior position metadata");
-    auto moved = std::move(left);
-    left.append_generated(1, 0);
-    left.append_generated(1, 1);
-    right.assign(prompt(2));
-    expect(moved.equals(saved) && left.prefix_equals(right, 1) && !left.equals(right),
-           "reusing a moved-from identity ignored a new position difference");
-
-    auto vision       = identity_prompt();
-    auto other_vision = identity_prompt(2);
-    left.assign(vision);
-    right.assign(other_vision);
-    check_against_input(other_vision, right);
-}
 
 } // namespace
 
@@ -521,8 +338,6 @@ int main() {
     test_frame_layout();
     test_visual_embedding_windows();
     test_vision_control();
-    test_prefix_identity();
-    test_regular_prefix_identity();
     if (failures != 0) {
         std::cerr << failures << " Qwen3.5 runtime mechanism checks failed\n";
         return 1;

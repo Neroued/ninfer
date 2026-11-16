@@ -54,8 +54,8 @@ SessionImpl::reserve_capture_destination(std::uint32_t lane, std::uint32_t front
     auto ticket      = std::make_unique<CaptureReservation>();
     ticket->owner    = this;
     ticket->frontier = frontier;
-    ticket->identity =
-        group.identity->retention.retain(recovery_metadata.identity_budget(), group.identity);
+    ticket->identity = sequences[lane].prefix.try_checkpoint(
+        requests[lane].base->identity_view(sequences[lane].ledger.view()), frontier);
     if (!ticket->identity) return Status::Unavailable;
     ticket->points.reserve(group.roles.size());
     for (const auto role : group.roles) {
@@ -105,7 +105,9 @@ SessionImpl::prepare_capture(SequenceHandle handle, std::span<const CheckpointHa
     if (!valid_sequence(handle)) { throw std::logic_error("capture has a stale lane"); }
     const auto lane = this->lane(handle);
     auto& request   = requests[lane];
-    if (!request.base->capture_backing || (!request.permit && !request.capture_pending)) return {};
+    if (!request.base->summary.publish_continuation ||
+        (!request.permit && !request.capture_pending))
+        return {};
     if (request.recovery) {
         // Recovery owns enough resources to regain old progress and execute new work.
         // Optional saves cannot add a State/COW requirement to that finite guarantee.
@@ -247,9 +249,8 @@ std::vector<CheckpointHandle> SessionImpl::share_capture(SequenceHandle handle,
         return {};
     const auto& group = request.capture_groups[request.next_capture];
     const auto& prior = checkpoint(source);
-    if (prior.frontier() != group.frontier || prior.key != group.key ||
-        !prefix_matches(*request.base->prompt, prior.snapshot.identity().ledger,
-                        prior.snapshot.identity().prefix_identity, group.frontier))
+    if (prior.frontier() != group.frontier ||
+        !request.base->query.matches(prior.snapshot.input_prefix().id()))
         return {};
     if (request.capture_reservation &&
         state_store->device_resident(request.capture_reservation->state) &&
@@ -276,7 +277,7 @@ std::vector<CheckpointHandle> SessionImpl::share_capture(SequenceHandle handle,
     for (const auto& [point, role] : ticket->points) {
         copies.push_back({.snapshot = prior.snapshot,
                           .role     = role,
-                          .key      = group.key,
+
                           .origin   = group.origin,
                           .evidence = group.evidence});
         result.push_back(point);
@@ -357,7 +358,7 @@ void SessionImpl::publish_capture(CaptureOperation& tx, context::ContextTransact
     for (const auto& [handle, role] : tx.points)
         checkpoints.publish(handle, CheckpointState{.snapshot = snapshot,
                                                     .role     = role,
-                                                    .key      = group.key,
+
                                                     .origin   = group.origin,
                                                     .evidence = group.evidence});
     const auto writer =

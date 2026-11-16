@@ -209,8 +209,12 @@ void SessionImpl::prepare_pause_resources(context::ContextReservation& targets) 
             throw std::logic_error("prepared pause lost its checkpoint reservation");
         checkpoints.at(*pause.paused->snapshot).snapshot.set_use(context::ContextUse::Request);
     }
+    sequence.prefix = {};
     resident_sequences.erase(sequence.id);
     pause.paused->sequence = std::move(sequences[pause.lane]);
+    pause.paused->query =
+        context::PrefixQuery(prefixes, sequence.request->domain,
+                             sequence.request->identity_view(sequence.ledger.view()));
     if (pause.action.kind == runtime::PauseKind::Relocate) {
         const auto& snapshot = checkpoints.at(*pause.paused->snapshot).snapshot;
         const auto from      = snapshot.continuation().metadata.placement.value;

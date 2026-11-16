@@ -7,13 +7,9 @@ namespace ninfer::models::qwen4_exp::detail {
 SessionImpl::SessionImpl(std::shared_ptr<const ModelDefinition> model, SessionPlan prepared)
     : definition(std::move(model)), plan(std::move(prepared)), shape(plan.shape),
       directory(plan.context),
-      recovery_metadata(
-          directory.metadata_budget(),
-          shape.purpose == EnginePurpose::Generation ? shape.max_concurrency : 0,
-          plan.context.ranks.size(), 1,
-          Identity::cache_bytes(shape.max_context, shape.purpose == EnginePurpose::Generation
-                                                       ? shape.max_concurrency
-                                                       : 0)),
+      recovery_metadata(directory.metadata_budget(),
+                        shape.purpose == EnginePurpose::Generation ? shape.max_concurrency : 0,
+                        plan.context.ranks.size(), 1),
       checkpoints(Checkpoints::capacity_for_metadata(directory.metadata_budget().limit()),
                   directory.metadata_budget(), &recovery_index),
       sequences(shape.max_concurrency), epochs(shape.max_concurrency) {
@@ -124,6 +120,7 @@ void SessionImpl::clear(Sequence& s) noexcept {
     try {
         release_residency(member(s).residency);
         s.capture.reset();
+        s.prefix = {};
         for (auto& history : s.histories) history.reset();
         auto& states = directory.states();
         if (s.write_destination.valid()) {
@@ -235,9 +232,9 @@ WorkRow SessionImpl::work_row(const Sequence& s, std::uint32_t tokens) const {
     row.sampling          = s.request->sampling;
     row.sampling_position = m.main_frontier;
     const auto start      = m.main_frontier;
-    if (start > s.identity.tokens.size() || tokens > s.identity.tokens.size() - start)
+    if (start > s.ledger.size() || tokens > s.ledger.size() - start)
         throw std::logic_error("execution input exceeds committed identity");
-    row.ids.assign(s.identity.tokens.begin() + start, s.identity.tokens.begin() + start + tokens);
+    s.ledger.copy(start, start + tokens, row.ids);
     row.rope_positions.resize(3ULL * tokens);
     const auto position = [&](std::uint32_t p, std::uint32_t axis) {
         return p < s.request->prompt.token_ids.size() ? s.request->prompt.position_axis(axis)[p]
@@ -498,6 +495,29 @@ std::optional<SequenceHandle> Session::prefill_continuation() const {
 void Session::yield_prefill(SequenceHandle sequence) {
     const auto owner = impl_->vision_window.owner();
     if (owner && owner->sequence == sequence) impl_->vision_window.revoke(*owner);
+}
+
+} // namespace ninfer::models::qwen4_exp
+
+namespace ninfer::models::qwen4_exp {
+runtime::PrefixId Session::checkpoint_prefix(CheckpointHandle h) const {
+    return impl_->checkpoints.at(h).snapshot.input_prefix().id();
+}
+
+std::vector<runtime::PrefixId> Session::matching_prefixes(const RequestBasePlan& base) const {
+    const auto& plan = *base.plan_;
+    return plan.query.ancestors();
+}
+
+std::vector<runtime::PrefixRelation>
+Session::recovery_relations(std::span<const runtime::PrefixId> ids) const {
+    return impl_->prefixes.relations(ids);
+}
+
+bool Session::recovery_precedes(runtime::PrefixId a, std::uint32_t af, runtime::PrefixId b,
+                                std::uint32_t bf) const {
+    return af <= bf && impl_->prefixes.valid(a) && impl_->prefixes.valid(b) &&
+           impl_->prefixes.is_prefix(a, b);
 }
 
 } // namespace ninfer::models::qwen4_exp

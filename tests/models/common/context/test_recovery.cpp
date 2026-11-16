@@ -1,5 +1,4 @@
 #include "models/common/context/recovery_value.h"
-#include "models/common/context/identity.h"
 #include "models/common/context/recovery.h"
 #include "models/common/context/release_inventory.h"
 #include "models/common/context/directory.h"
@@ -25,7 +24,6 @@ struct View {
     context::MetadataBudget metadata{context::CheckpointStore<Record>::metadata_bytes(128) +
                                      context::RecoveryIndex<>::metadata_bytes(128) * 4};
     context::CheckpointStore<Record> store{128, metadata};
-    bool collide = false;
 
     const std::uint64_t& revision() const { return store.revision(); }
 
@@ -37,18 +35,28 @@ struct View {
 
     std::uint32_t frontier(Handle h) const { return store.at(h).tokens.size(); }
 
-    context::RecoveryKey key(Handle h, std::uint32_t f) const {
-        const auto& value    = store.at(h);
-        std::uint64_t digest = 1;
-        for (std::size_t i = 0; i < f && !collide; ++i) digest = digest * 131 + value.tokens.at(i);
-        return {{digest, digest ^ 42}, value.domain};
-    }
-
     bool prefix(Handle a, Handle b) const {
         const auto& x = store.at(a);
         const auto& y = store.at(b);
         return x.domain == y.domain && x.tokens.size() <= y.tokens.size() &&
                std::equal(x.tokens.begin(), x.tokens.end(), y.tokens.begin());
+    }
+
+    std::vector<ninfer::runtime::PrefixRelation> relations() const {
+        std::vector<ninfer::runtime::PrefixRelation> out(capacity());
+        for (std::uint32_t i = 0; i < capacity(); ++i) {
+            if (!valid(handle(i))) continue;
+            out[i].representative = i;
+            for (std::uint32_t j = 0; j < capacity(); ++j) {
+                if (!valid(handle(j)) || !prefix(handle(j), handle(i))) continue;
+                if (frontier(handle(j)) == frontier(handle(i)))
+                    out[i].representative = std::min(out[i].representative, j);
+                else if (out[i].parent == UINT32_MAX ||
+                         frontier(handle(j)) > frontier(handle(out[i].parent)))
+                    out[i].parent = j;
+            }
+        }
+        return out;
     }
 
     Handle add(std::vector<std::uint32_t> tokens, std::uint32_t domain = 0) {
@@ -152,15 +160,14 @@ void known_losses() {
                 "branch loss depended on checkpoint order or dropped the common ancestor");
         const std::array chain{root, reverse ? b : a};
         require(first.loss(chain) == 100, "intermediate fallback hid a shallow recovery point");
-        const auto comparisons = index.work().exact_comparisons;
+        const auto comparisons = index.work().relations;
         for (int i = 0; i < 50; ++i) require(first.loss(removed) == 300, "query state leaked");
-        require(index.work().exact_comparisons == comparisons, "query rescanned token identities");
+        require(index.work().relations == comparisons, "query rescanned token identities");
     }
 }
 
 void lifecycle() {
     View view;
-    view.collide = true;
     context::RecoveryIndex index(view.metadata);
     const auto deep = view.add({1, 2, 3, 4});
     index.synchronize(view);
@@ -173,7 +180,7 @@ void lifecycle() {
     auto evaluation = index.evaluate(advertised);
     require(evaluation.prefix(shallow, deep) && !evaluation.prefix(unrelated, deep) &&
                 !evaluation.prefix(domain, deep),
-            "digest collision or domain invented a prefix");
+            "unrelated input or identity domain invented a prefix");
     const std::array removed{shallow, shallow, deep};
     require(evaluation.loss(removed) == 2, "surviving alias did not provide fallback");
     require(view.store.erase(shallow), "could not retire a checkpoint");
@@ -206,7 +213,6 @@ void exhaustive_and_random() {
     std::mt19937 random(20261019);
     for (unsigned fixture = 0; fixture < 80; ++fixture) {
         View view;
-        view.collide = fixture % 4 == 0;
         context::RecoveryIndex index(view.metadata);
         std::vector<Handle> handles;
         for (unsigned i = 0; i < 32; ++i) {
@@ -408,65 +414,10 @@ void reserved_decision_metadata() {
     require(store.erase(*handle), "decision metadata prevented checkpoint retirement");
 }
 
-void shared_identity_budget_survives_retirement() {
-    struct Identity {
-        std::vector<std::uint32_t> tokens;
-        context::IdentityMetadata retention;
-
-        std::size_t metadata_bytes() const {
-            return sizeof(*this) + tokens.capacity() * sizeof(std::uint32_t);
-        }
-    };
-
-    context::MetadataBudget directory(8ULL << 20);
-    context::RecoveryMetadata recovery(directory, 2, 1, 1, 2048);
-    auto& budget = recovery.identity_budget();
-    auto source  = std::make_shared<Identity>();
-    source->tokens.reserve(256);
-    source->tokens.assign(4, 7);
-    const std::shared_ptr<const Identity> immutable = source;
-    auto first                                      = source->retention.retain(budget, immutable);
-    require(first && budget.allocated() >= source->tokens.capacity() * sizeof(std::uint32_t),
-            "identity cache omitted unused vector capacity");
-    const auto charged = budget.allocated();
-    auto alias         = source->retention.retain(budget, immutable);
-    require(alias && budget.allocated() == charged,
-            "shared checkpoint identity was charged more than once");
-
-    auto other = std::make_shared<Identity>(*source);
-    other->tokens.reserve(256);
-    require(!other->retention.retain(budget, std::shared_ptr<const Identity>(other)) &&
-                budget.allocated() == charged,
-            "optional identity admission exceeded the bounded pool or inherited a copy's lease");
-
-    context::MetadataAccount remaining(budget);
-    remaining.acquire(budget.available());
-    auto decision = first->retention.retain(budget, first);
-    require(decision != nullptr, "required recovery could not borrow a paid identity at capacity");
-    remaining.release(remaining.bytes());
-    first.reset();
-    alias.reset();
-    require(budget.allocated() == charged,
-            "checkpoint retirement returned bytes still retained by a recovery decision");
-    decision.reset();
-    require(budget.allocated() == 0 && source->tokens.size() == 4,
-            "expired weak identity cache retained its quota while the request remained alive");
-
-    auto replacement = other->retention.retain(budget, std::shared_ptr<const Identity>(other));
-    require(replacement != nullptr, "retired decision quota was not reusable");
-    std::weak_ptr<const Identity> lifetime = replacement;
-    other.reset();
-    require(!lifetime.expired(), "cache lease did not own its complete identity backing");
-    replacement.reset();
-    require(lifetime.expired() && budget.allocated() == 0,
-            "last cache lease failed to release its backing and quota");
-}
-
 } // namespace
 
 int main() {
     try {
-        shared_identity_budget_survives_retirement();
         recovery_workspace_returns_idle_high_water();
         reserved_decision_metadata();
         catalog_reclamation();

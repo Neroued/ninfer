@@ -86,9 +86,9 @@ WorkRow SessionImpl::work_row(const Sequence& s, std::uint32_t tokens) const {
     row.sampling          = s.request->sampling;
     row.sampling_position = m.main_frontier;
     const auto start      = m.main_frontier;
-    if (start > s.identity.tokens.size() || tokens > s.identity.tokens.size() - start)
+    if (start > s.ledger.size() || tokens > s.ledger.size() - start)
         throw std::logic_error("execution input exceeds committed identity");
-    row.ids.assign(s.identity.tokens.begin() + start, s.identity.tokens.begin() + start + tokens);
+    s.ledger.copy(start, start + tokens, row.ids);
     return row;
 }
 

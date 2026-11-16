@@ -156,9 +156,9 @@ void behavior(const glm::Frontend& f, const std::filesystem::path& tokenizer) {
     auto same          = input;
     same.context_cache = {};
     auto q             = f.prepare(same);
-    require(glm::input_prefix_equal(data.prefix_view(),
-                                    glm::PreparedPromptAccess::view(q).prefix_view(),
-                                    data.token_ids.size()),
+    require(glm_fixture::prefix_equal(data.prefix_view(),
+                                      glm::PreparedPromptAccess::view(q).prefix_view(),
+                                      data.token_ids.size()),
             "cache policy changed input identity");
     const auto copy = f;
     require(copy.identity() == f.identity() && frontend(tokenizer).identity() != f.identity(),
@@ -210,27 +210,23 @@ void identities() {
     const glm::InputPrefixView a{tokens, media};
     changed[0].item.content_digest[0] = 3;
     glm::InputPrefixView b{tokens, changed};
-    const glm::PrefixDigests left(a), right(b);
-    require(left.at(2) == right.at(2) && left.at(3) != right.at(3) &&
-                glm::input_prefix_equal(a, b, 2) && !glm::input_prefix_equal(a, b, 3),
+    require(glm_fixture::prefix_equal(a, b, 2) && !glm_fixture::prefix_equal(a, b, 3),
             "media identity did not enter at its first consumed token");
     require(!glm::complete_input_frontier(a, 3) && glm::complete_input_frontier(a, 5) &&
-                glm::input_prefix_equal(a, a, 3) && left.at(3) == glm::PrefixDigests(a).at(3),
+                glm_fixture::prefix_equal(a, a, 3),
             "identity query was coupled to checkpoint boundaries");
     changed[0] = media[0];
     changed[0].preparation_digest[0] ^= 1;
-    require(!glm::input_prefix_equal(a, b, 5) && left.at(5) != glm::PrefixDigests(b).at(5),
-            "different preparation reused a media identity");
+    require(!glm_fixture::prefix_equal(a, b, 5), "different preparation reused a media identity");
     auto later   = tokens;
     later.back() = 99;
-    require(glm::input_prefix_equal(a, {later, media}, 6) &&
-                !glm::input_prefix_equal(a, {later, media}, 7),
+    require(glm_fixture::prefix_equal(a, {later, media}, 6) &&
+                !glm_fixture::prefix_equal(a, {later, media}, 7),
             "token comparison escaped its requested prefix");
     changed[0]                 = media[0];
     media[0].item.timestamps   = {0.0};
     changed[0].item.timestamps = {-0.0};
-    require(glm::input_prefix_equal(a, b, 5) &&
-                glm::PrefixDigests(a).at(5) == glm::PrefixDigests(b).at(5),
+    require(glm_fixture::prefix_equal(a, b, 5),
             "equal media timestamps produced different shortlist digests");
 }
 
@@ -250,18 +246,16 @@ void multi_turn(const glm::Frontend& f) {
         const auto recovery = a.identity.rewrite_checkpoint->recovery_frontier;
         require(
             std::equal(a.token_ids.begin(), a.token_ids.begin() + recovery, b.token_ids.begin()) &&
-                glm::input_prefix_equal(a.prefix_view(), b.prefix_view(), recovery) &&
-                glm::PrefixDigests(a.prefix_view()).at(recovery) ==
-                    glm::PrefixDigests(b.prefix_view()).at(recovery),
+                glm_fixture::prefix_equal(a.prefix_view(), b.prefix_view(), recovery),
             "next-user rewrite invalidated the selected recovery prefix");
-        require(!glm::input_prefix_equal(a.prefix_view(), b.prefix_view(),
-                                         std::min(a.token_ids.size(), b.token_ids.size())),
+        require(!glm_fixture::prefix_equal(a.prefix_view(), b.prefix_view(),
+                                           std::min(a.token_ids.size(), b.token_ids.size())),
                 "different turn suffixes were treated as the same input");
         input.options.reasoning_effort = ReasoningEffort::Low;
         const auto changed             = f.prepare(input);
-        require(!glm::input_prefix_equal(b.prefix_view(),
-                                         glm::PreparedPromptAccess::view(changed).prefix_view(),
-                                         b.identity.rewrite_checkpoint->recovery_frontier),
+        require(!glm_fixture::prefix_equal(b.prefix_view(),
+                                           glm::PreparedPromptAccess::view(changed).prefix_view(),
+                                           b.identity.rewrite_checkpoint->recovery_frontier),
                 "changed reasoning instructions reused incompatible input");
     }
     PromptInput literal;

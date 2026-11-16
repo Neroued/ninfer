@@ -69,14 +69,16 @@ inline std::uint64_t recovery_restore_cost(const ContextMachineCostModel& costs,
 template <class Session>
 struct RecoveryValue {
     typename Session::RecoveryAccount memory;
-    std::shared_ptr<const RecoveryIdentity> identity;
+    PrefixId prefix;
+    std::uint32_t frontier;
+    std::shared_ptr<const RecoveryWork> work;
     PlacementId placement;
     std::vector<RecoveryRestoreCost> restores;
 
     RecoveryValue(Session& session, const RecoveryDescription& native,
                   const ContextMachineCostModel& costs)
-        : memory(session.recovery_budget()), identity(native.identity),
-          placement(native.placement) {
+        : memory(session.recovery_budget()), prefix(native.prefix), frontier(native.frontier),
+          work(native.work), placement(native.placement) {
         static_assert(sizeof(RecoveryValue) <= kRecoveryPricedDescriptorLimit);
         memory.acquire(sizeof(*this));
         memory.reserve(restores, native.restores.size());
@@ -90,6 +92,8 @@ template <class Session, class Handle>
 struct PricedRecoveryPoint {
     Handle handle;
     std::shared_ptr<const RecoveryValue<Session>> description;
+    Handle equivalent;
+    std::optional<Handle> parent;
 };
 
 template <class Session, class Handle>
@@ -107,6 +111,7 @@ struct RecoveryLedger {
     std::vector<Effect> effects;
     std::uint64_t loss_after = 0, paid_actions = 0, revision = 0;
     bool bounded_actions = false;
+    std::optional<std::uint64_t> target_before, initial_gain;
 
     RecoveryLedger(Session& session, std::span<const Handle> visible,
                    const ContextMachineCostModel& costs)
@@ -115,14 +120,122 @@ struct RecoveryLedger {
         memory.acquire(native.capacity() * sizeof(RecoveryPoint<Handle>));
         memory.reserve(basis, native.size());
         for (const auto& point : native)
-            basis.push_back({point.handle, std::make_shared<RecoveryValue<Session>>(
-                                               session, *point.description, costs)});
+            basis.push_back(
+                {point.handle,
+                 std::make_shared<RecoveryValue<Session>>(session, *point.description, costs),
+                 point.handle,
+                 {}});
         std::sort(basis.begin(), basis.end(),
                   [](const auto& a, const auto& b) { return a.handle.index < b.handle.index; });
         memory.reserve(advertised, visible.size());
         advertised.assign(visible.begin(), visible.end());
+        project_relations(session);
         memory.reserve(effects, basis.size());
         memory.release(native.capacity() * sizeof(RecoveryPoint<Handle>));
+    }
+
+    void project_relations(Session& session) {
+        typename Session::RecoveryAccount scratch(session.recovery_budget());
+        std::vector<PrefixId> ids;
+        scratch.reserve(ids, basis.size());
+        for (const auto& point : basis) ids.push_back(point.description->prefix);
+        const auto links = session.recovery_relations(ids);
+        scratch.acquire(links.capacity() * sizeof(PrefixRelation));
+        constexpr auto none = UINT32_MAX;
+        const bool frozen   = std::any_of(basis.begin(), basis.end(), [](const auto& point) {
+            return point.parent || point.equivalent != point.handle;
+        });
+        if (!frozen) {
+            for (std::size_t i = 0; i < basis.size(); ++i) {
+                if (links[i].representative != none)
+                    basis[i].equivalent = basis[links[i].representative].handle;
+                if (links[i].parent != none) basis[i].parent = basis[links[i].parent].handle;
+            }
+            return;
+        }
+        std::vector<std::uint32_t> representatives, parents;
+        scratch.reserve(representatives, basis.size());
+        scratch.reserve(parents, basis.size());
+        parents.resize(basis.size(), none);
+        for (std::uint32_t i = 0; i < basis.size(); ++i) representatives.push_back(i);
+        const auto root = [&](std::uint32_t i) {
+            while (representatives[i] != i) {
+                representatives[i] = representatives[representatives[i]];
+                i                  = representatives[i];
+            }
+            return i;
+        };
+        const auto depth = [&](auto i) { return basis[i].description->frontier; };
+        const auto unite = [&](auto a, auto b) {
+            a = root(a);
+            b = root(b);
+            if (depth(a) != depth(b)) throw std::logic_error("unequal recovery alias frontiers");
+            representatives[std::max(a, b)] = std::min(a, b);
+        };
+        const auto index = [&](Handle h) -> std::uint32_t {
+            const auto* point = find(h);
+            if (!point) throw std::logic_error("missing frozen recovery relation");
+            return point - basis.data();
+        };
+        for (std::uint32_t i = 0; i < basis.size(); ++i) {
+            unite(i, index(basis[i].equivalent));
+            if (links[i].representative != none) unite(i, links[i].representative);
+        }
+
+        struct Edge {
+            std::uint32_t child, parent;
+        };
+
+        std::vector<Edge> edges;
+        scratch.reserve(edges, 2 * basis.size());
+        for (std::uint32_t i = 0; i < basis.size(); ++i) {
+            if (basis[i].parent) edges.push_back({i, index(*basis[i].parent)});
+            if (links[i].parent != none) edges.push_back({i, links[i].parent});
+        }
+        const auto order = [&](Edge a, Edge b) { return depth(a.child) < depth(b.child); };
+        std::make_heap(edges.begin(), edges.end(), order);
+        // Both sets are exact facts. Ancestors of one child form a chain even when an
+        // old endpoint has retired. Process deepest children first so an inserted point
+        // cannot sever its previously proved ancestry. Each pop enqueues at most one edge.
+        while (!edges.empty()) {
+            std::pop_heap(edges.begin(), edges.end(), order);
+            const auto edge = edges.back();
+            edges.pop_back();
+            const auto child = root(edge.child), ancestor = root(edge.parent);
+            if (depth(ancestor) >= depth(child))
+                throw std::logic_error("invalid recovery ancestor frontier");
+            if (parents[child] == none) {
+                parents[child] = ancestor;
+                continue;
+            }
+            const auto prior = root(parents[child]);
+            if (prior == ancestor) continue;
+            if (depth(prior) == depth(ancestor)) {
+                unite(prior, ancestor);
+                parents[child] = root(prior);
+                continue;
+            }
+            const auto deeper    = depth(prior) > depth(ancestor) ? prior : ancestor;
+            const auto shallower = deeper == prior ? ancestor : prior;
+            parents[child]       = deeper;
+            edges.push_back({deeper, shallower});
+            std::push_heap(edges.begin(), edges.end(), order);
+        }
+        for (std::uint32_t i = 0; i < basis.size(); ++i) {
+            const auto representative = root(i), parent = parents[representative];
+            basis[i].equivalent = basis[representative].handle;
+            basis[i].parent =
+                parent == none ? std::nullopt : std::optional{basis[root(parent)].handle};
+        }
+    }
+
+    const Point* find(Handle h) const {
+        auto it =
+            std::lower_bound(basis.begin(), basis.end(), h.index,
+                             [](const auto& p, auto index) { return p.handle.index < index; });
+        for (; it != basis.end() && it->handle.index == h.index; ++it)
+            if (it->handle == h) return &*it;
+        return nullptr;
     }
 
     bool contains(Handle h) const {
@@ -153,6 +266,8 @@ struct RecoveryLedger {
     // A required recovery may revoke a snapshot created by pausing another request after
     // the decision began. Its owner explicitly adds that recovery obligation before mutation.
     // Optional admission never invokes this; new cache publications remain ineligible victims.
+    // Retired contents have no new identity evidence. Keep their proved relationships;
+    // a new obligation with no surviving proof is priced independently.
     void include_required(Session& session, std::span<const RecoveryPoint<Handle>> points,
                           std::span<const Handle> visible, const ContextMachineCostModel& costs) {
         memory.reserve(basis, basis.size() + points.size());
@@ -160,8 +275,11 @@ struct RecoveryLedger {
         bool changed = false;
         for (const auto& point : points) {
             if (contains(point.handle)) continue;
-            basis.push_back({point.handle, std::make_shared<RecoveryValue<Session>>(
-                                               session, *point.description, costs)});
+            basis.push_back(
+                {point.handle,
+                 std::make_shared<RecoveryValue<Session>>(session, *point.description, costs),
+                 point.handle,
+                 {}});
             std::stable_sort(basis.begin(), basis.end(), [](const auto& a, const auto& b) {
                 return a.handle.index < b.handle.index;
             });
@@ -170,7 +288,10 @@ struct RecoveryLedger {
             changed = true;
         }
         memory.reserve(effects, basis.size());
-        if (changed) ++revision;
+        if (changed) {
+            project_relations(session);
+            ++revision;
+        }
     }
 
     void accept(std::span<const Handle> changed, std::span<const Handle> retired,
@@ -196,9 +317,9 @@ struct RecoveryLedger {
     }
 };
 
-// A synchronous counterfactual evaluation. The reference view undoes only this decision's
-// accepted effects; the actual view never advertises deleted records. New live fallbacks
-// enter both views, while newly published targets cannot enlarge an existing budget.
+// A decision prices one fixed set of capabilities. The ledger preserves only their semantic
+// relation projection and work geometry; deleted input payloads are immediately reclaimable.
+// New publications participate in the next decision, never enlarge an in-flight action budget.
 template <class Session, class Handle>
 class RecoveryCostEvaluation {
     using Point    = RecoveryPoint<Handle>;
@@ -240,16 +361,9 @@ class RecoveryCostEvaluation {
 
         bool valid(RecoveryHandle h) const { return h.index < capacity(); }
 
-        std::uint32_t frontier(RecoveryHandle h) const { return owner.identity(h).frontier; }
+        std::uint32_t frontier(RecoveryHandle h) const { return owner.description(h).frontier; }
 
-        typename Topology::Key key(RecoveryHandle h, std::uint32_t f) const {
-            const auto& value = owner.identity(h);
-            return {value.digest(f), value.domain};
-        }
-
-        bool prefix(RecoveryHandle a, RecoveryHandle b) const {
-            return owner.identity(a).prefix_of(owner.identity(b));
-        }
+        const auto& relations() const { return owner.relations_; }
     };
 public:
     RecoveryCostEvaluation(Session& session, std::span<const Handle> advertised, Ledger* ledger,
@@ -265,6 +379,7 @@ public:
         std::sort(current.begin(), current.end(), by_slot);
         memory_.reserve(entries_, current.size() + (ledger ? ledger->basis.size() : 0));
         for (auto& point : current) {
+            if (ledger && !ledger->contains(point.handle)) continue;
             auto value = std::make_shared<Value>(session, *point.description, costs);
             Entry entry{point.handle, value, value, value, false, false, !ledger};
             if (ledger) {
@@ -317,6 +432,22 @@ public:
                     std::make_shared<Value>(session, *point.description, costs);
                 has_projection_ = true;
             }
+        memory_.reserve(relations_, entries_.size());
+        if (ledger) {
+            relations_.resize(entries_.size());
+            for (std::uint32_t i = 0; i < entries_.size(); ++i) {
+                const auto* point = ledger->find(entries_[i].handle);
+                if (!point) throw std::logic_error("recovery point is outside decision topology");
+                relations_[i].representative = require(point->equivalent).index;
+                relations_[i].parent = point->parent ? require(*point->parent).index : UINT32_MAX;
+            }
+        } else {
+            std::vector<PrefixId> ids;
+            ids.reserve(entries_.size());
+            for (std::uint32_t i = 0; i < entries_.size(); ++i)
+                ids.push_back(description({i}).prefix);
+            relations_ = session.recovery_relations(ids);
+        }
         topology_.synchronize(view_);
         core_.emplace(topology_.evaluate({}));
         memory_.reserve(components_, core_->component_capacity());
@@ -360,7 +491,7 @@ public:
 
     bool contains(Handle h) const { return find(h).has_value(); }
 
-    std::uint32_t frontier(Handle h) const { return identity(require(h)).frontier; }
+    std::uint32_t frontier(Handle h) const { return description(require(h)).frontier; }
 
     std::uint32_t component(Handle h) const { return core_->component(require(h)); }
 
@@ -456,23 +587,30 @@ public:
         return recovery_cost_increase(before.value(), total_loss(removed, unavailable));
     }
 
-    std::uint64_t gain(const RecoveryDescription& target, std::span<const Handle> removed = {},
-                       bool reference = false) const {
-        auto before = costs_.prefill_ns(target.identity->rebuild(0));
+    std::uint64_t recovery_cost(const RecoveryDescription& target,
+                                std::span<const Handle> removed = {}) const {
+        auto before = costs_.prefill_ns(target.work->rebuild(0));
         for (const auto& entry : entries_) {
-            const auto& source = reference ? entry.reference : entry.current;
-            const bool visible = reference ? entry.reference_visible : entry.current_visible;
-            if (!source || !visible || contains(removed, entry.handle) ||
-                (reference && entry.externally_removed) ||
-                !source->identity->prefix_of(*target.identity))
+            const auto& source = entry.current;
+            if (!source || !entry.current_visible || contains(removed, entry.handle) ||
+                !session_.recovery_precedes(source->prefix, source->frontier, target.prefix,
+                                            target.frontier))
                 continue;
             before = std::min(before, source_cost(*source, target));
         }
+        return before;
+    }
+
+    std::uint64_t gain_from(std::uint64_t before, const RecoveryDescription& target) const {
         const auto after = restore_cost(target, target.placement);
         if (before == UINT64_MAX || after == UINT64_MAX) return 0;
         return before > after ? before - after : 0;
     }
 
+    std::uint64_t gain(const RecoveryDescription& target,
+                       std::span<const Handle> removed = {}) const {
+        return gain_from(recovery_cost(target, removed), target);
+    }
 
 private:
     enum class Mode { Reference, Current, Projected };
@@ -523,8 +661,6 @@ private:
         return *(entry.reference ? entry.reference : entry.current);
     }
 
-    const RecoveryIdentity& identity(RecoveryHandle h) const { return *description(h).identity; }
-
     std::uint64_t restore_cost(const Value& source, PlacementId target, bool replay = false) const {
         for (const auto& restore : source.restores)
             if (restore.placement == target)
@@ -541,9 +677,8 @@ private:
     template <class Target>
     std::uint64_t source_cost(const Value& source, const Target& target) const {
         return add_recovery_cost(
-            restore_cost(source, target.placement,
-                         source.identity->frontier < target.identity->frontier),
-            costs_.prefill_ns(target.identity->rebuild(source.identity->frontier)));
+            restore_cost(source, target.placement, source.frontier < target.frontier),
+            costs_.prefill_ns(target.work->rebuild(source.frontier)));
     }
 
     std::uint64_t cost_to(RecoveryHandle target, std::span<const Handle> removed,
@@ -558,16 +693,16 @@ private:
             !(!reference && contains(removed, own.handle)) &&
             restore_cost(*local, goal.placement) == 0)
             return 0;
-        auto result = costs_.prefill_ns(goal.identity->rebuild(0));
+        auto result = costs_.prefill_ns(goal.work->rebuild(0));
         if (local && !contains(unavailable, own.handle) && !(reference && own.externally_removed) &&
             !(!reference && contains(removed, own.handle)))
             result = std::min(result, restore_cost(*local, goal.placement));
         core_->visit_prefixes(target, [&](RecoveryHandle id) {
             const auto& entry = entries_[id.index];
-            const auto begin  = identity(id).frontier;
+            const auto begin  = description(id).frontier;
             // Prefixes are visited from deepest to shallowest. Text work is a monotone
             // lower bound even when media windows alter the exact chunk segmentation.
-            auto minimum = make_prefill_work(begin, goal.identity->frontier - begin, 0, 0, 0);
+            auto minimum = make_prefill_work(begin, goal.frontier - begin, 0, 0, 0);
             if (costs_.prefill_ns(minimum) >= result) return false;
             const auto& source = reference               ? entry.reference
                                  : mode == Mode::Current ? entry.current
@@ -618,6 +753,7 @@ private:
     Ledger* ledger_;
     const ContextMachineCostModel& costs_;
     std::vector<Entry> entries_;
+    std::vector<PrefixRelation> relations_;
     std::vector<NativeSlot> native_slots_;
     std::vector<Component> components_;
     std::vector<PlacementId> placements_;

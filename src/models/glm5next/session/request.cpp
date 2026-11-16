@@ -6,24 +6,15 @@ namespace ninfer::models::glm5next::detail {
 
 bool RequestPlan::can_checkpoint(std::uint32_t frontier) const {
     if (!frontier) return false;
-    if (!complete_input_frontier(identity->view(),
-                                 std::min<std::size_t>(frontier, identity->tokens.size())))
+    if (!complete_input_frontier(prompt.prefix_view(),
+                                 std::min<std::size_t>(frontier, prompt.token_ids.size())))
         return false;
     return true;
 }
 
-PrefixShortlistKey key(const Identity& identity, std::uint32_t frontier) {
-    return {identity.digests.at(frontier), frontier, identity.tag};
-}
-
-std::shared_ptr<const Identity> capture_identity(const Sequence& s,
-                                                 context::MetadataBudget& budget) {
-    if (!context::IdentityMetadata::can_copy(budget, s.identity)) return {};
-    auto out       = std::make_shared<Identity>(s.identity);
-    const auto end = s.continuation.metadata.main_frontier;
-    out->truncate(end);
-    const std::shared_ptr<const Identity> immutable = std::move(out);
-    return immutable->retention.retain(budget, immutable);
+context::InputIdentityView RequestPlan::identity_view(context::TokenView tokens) const {
+    context::InputIdentityView out{.tokens = tokens, .media = media};
+    return out;
 }
 
 } // namespace ninfer::models::glm5next::detail
@@ -38,9 +29,9 @@ const models::frontend::PreparedContextCache& RequestBasePlan::context_cache() c
     return plan_->prompt.context_cache;
 }
 
-std::optional<PrefixShortlistKey> RequestBasePlan::prefix_shortlist_key(std::uint32_t f) const {
+std::optional<PrefixKey> RequestBasePlan::prefix_key(std::uint32_t f) const {
     if (!plan_->reuse || !f || f > plan_->summary.prompt_tokens) return {};
-    return detail::key(*plan_->identity, f);
+    return plan_->query.key(f);
 }
 
 RequestBasePlan Session::plan_request(PreparedPrompt&& prompt,
@@ -75,8 +66,10 @@ RequestBasePlan Session::plan_request(PreparedPrompt&& prompt,
                           : FinishReason::ContextCapacity,
                       plan->reuse};
     plan->sampling = options.sampling;
-    plan->identity =
-        std::make_shared<detail::Identity>(input, static_cast<std::uint32_t>(p.shape.kv_storage));
+    plan->domain   = static_cast<std::uint32_t>(p.shape.kv_storage);
+    for (const auto& media : input.identity.media)
+        plan->media.push_back({&media.item, &media.preparation_digest});
+    plan->query = context::PrefixQuery(p.prefixes, plan->domain, plan->identity_view());
     if (plan->reuse) {
         const auto add = [&](std::uint32_t f, runtime::CheckpointRole role,
                              SharedCandidateEvidence evidence = SharedCandidateEvidence::None) {

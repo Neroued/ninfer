@@ -53,12 +53,7 @@ private:
 
 [[nodiscard]] PreparedSession prepare_session(std::shared_ptr<const ModelDefinition>, SessionPlan);
 
-struct PrefixShortlistKey {
-    std::array<std::uint64_t, 2> digests{};
-    std::uint32_t frontier                                                   = 0;
-    std::uint32_t identity_tag                                               = 0;
-    friend auto operator<=>(PrefixShortlistKey, PrefixShortlistKey) noexcept = default;
-};
+using PrefixKey = runtime::PrefixKey;
 
 class RequestBasePlan {
 public:
@@ -71,8 +66,7 @@ public:
 
     [[nodiscard]] const runtime::RequestPlanSummary& summary() const noexcept;
     [[nodiscard]] const models::frontend::PreparedContextCache& context_cache() const noexcept;
-    [[nodiscard]] std::optional<PrefixShortlistKey>
-    prefix_shortlist_key(std::uint32_t frontier) const noexcept;
+    [[nodiscard]] std::optional<PrefixKey> prefix_key(std::uint32_t frontier) const;
 
 private:
     explicit RequestBasePlan(std::shared_ptr<const detail::RequestBasePlanImpl> impl) noexcept;
@@ -94,7 +88,7 @@ struct CheckpointMetadata {
 };
 
 struct CheckpointSummary {
-    PrefixShortlistKey key;
+    PrefixKey key;
     std::uint32_t frontier       = 0;
     runtime::CheckpointRole role = runtime::CheckpointRole::Continuation;
     bool leased                  = false;
@@ -377,7 +371,13 @@ public:
                                                    const ResumeState*   = nullptr,
                                                    ExecutionUnitKind    = ExecutionUnitKind::Decode,
                                                    std::uint32_t tokens = 1) const;
-    [[nodiscard]] PrefixShortlistKey checkpoint_key(CheckpointHandle, std::uint32_t frontier) const;
+    [[nodiscard]] runtime::PrefixId checkpoint_prefix(CheckpointHandle) const;
+    [[nodiscard]] std::vector<runtime::PrefixId> matching_prefixes(const RequestBasePlan&) const;
+    [[nodiscard]] std::vector<runtime::PrefixRelation>
+        recovery_relations(std::span<const runtime::PrefixId>) const;
+    [[nodiscard]] bool recovery_precedes(runtime::PrefixId, std::uint32_t, runtime::PrefixId,
+                                         std::uint32_t) const;
+    [[nodiscard]] PrefixKey checkpoint_key(CheckpointHandle) const;
     [[nodiscard]] CheckpointSummary checkpoint_summary(CheckpointHandle checkpoint) const;
     [[nodiscard]] CheckpointMetadata checkpoint_metadata(CheckpointHandle checkpoint) const;
     [[nodiscard]] bool checkpoint_matches(CheckpointHandle checkpoint,

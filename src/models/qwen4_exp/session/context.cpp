@@ -1,4 +1,4 @@
-#include "models/common/qwen/recovery_value.h"
+#include "models/common/vision/window.h"
 #include "models/qwen4_exp/session/internal.h"
 #include "models/common/context/work.h"
 
@@ -35,19 +35,16 @@ CheckpointMetadata Session::checkpoint_metadata(CheckpointHandle h) const {
             .evidence = c.evidence};
 }
 
-PrefixShortlistKey Session::checkpoint_key(CheckpointHandle h, std::uint32_t f) const {
-    const auto& c = impl_->checkpoints.at(h);
-    if (f > c.frontier()) throw std::out_of_range("checkpoint key exceeds its frontier");
-    return detail::key(c.snapshot.identity(), f);
+PrefixKey Session::checkpoint_key(CheckpointHandle h) const {
+    return impl_->checkpoints.at(h).snapshot.input_prefix().key();
 }
 
 bool Session::checkpoint_matches(CheckpointHandle h, const RequestBasePlan& base) const {
     if (!valid_checkpoint(h) || !base.plan_->reuse) return false;
     const auto& c        = impl_->checkpoints.at(h);
-    const auto& identity = c.snapshot.identity();
-    return identity.tag == base.plan_->identity->tag &&
-           qwen::prefix_matches(base.plan_->prompt, identity.tokens, identity.positions,
-                                c.frontier());
+    const auto& identity = c.snapshot.input_prefix();
+    return impl_->prefixes.domain(identity.id()) == base.plan_->domain &&
+           base.plan_->query.matches(identity.id());
 }
 
 std::uint32_t Session::checkpoint_recovery_frontier(CheckpointHandle h, const RequestBasePlan& base,
@@ -84,19 +81,18 @@ bool detail::SessionImpl::source_matches(const RequestBasePlan& base, Checkpoint
                                          const ResumeState* resume) const {
     if (!checkpoints.valid(handle)) return false;
     const auto& checkpoint = checkpoints.at(handle);
-    const auto& identity   = checkpoint.snapshot.identity();
+    const auto& identity   = checkpoint.snapshot.input_prefix();
     if (resume) {
         if (!resume->state_ || resume->state_->owner != this || !resume->state_->sequence ||
             resume->state_->sequence->request != base.plan_)
             throw std::invalid_argument("resume state belongs to another Session");
-        const auto& previous = resume->state_->sequence->identity;
-        return qwen::recovery_prefix_matches(checkpoint.recovery_identity(),
-                                             {resume->frontier(), previous.tag, previous.tokens,
-                                              previous.positions, previous.digests, &previous});
+        const auto& previous = *resume->state_->sequence;
+        return checkpoint.frontier() <= resume->frontier() &&
+               prefixes.domain(identity.id()) == previous.request->domain &&
+               resume->state_->query.matches(identity.id());
     }
-    return base.plan_->reuse && identity.tag == base.plan_->identity->tag &&
-           qwen::prefix_matches(base.plan_->prompt, identity.tokens, identity.positions,
-                                checkpoint.frontier());
+    return base.plan_->reuse && prefixes.domain(identity.id()) == base.plan_->domain &&
+           base.plan_->query.matches(identity.id());
 }
 
 std::optional<SourceCandidate>
@@ -116,9 +112,9 @@ Session::inspect_source(const RequestBasePlan& base, std::optional<CheckpointHan
     out.reused_tokens = h ? p.checkpoints.at(*h).frontier() : 0;
     const auto end    = resume ? resume->frontier() : base.summary().prompt_tokens;
     if (out.reused_tokens > end) return {};
-    out.remaining_work =
-        qwen::recovery_work(base.plan_->prompt.vision_items, out.reused_tokens, end,
-                            p.shape.prefill_chunk, p.plan.vision_max_features);
+    out.remaining_work = models::vision::recovery_work(
+        base.plan_->prompt.vision_items, [](const auto& item) -> const auto& { return item; },
+        out.reused_tokens, end, p.shape.prefill_chunk, p.plan.vision_max_features);
     if (h) {
         const auto& c      = p.checkpoints.at(*h);
         const auto image   = c.snapshot.continuation().image;

@@ -10,6 +10,8 @@ namespace ninfer::models::qwen {
 
 inline constexpr std::size_t kPreparedVisionPatchFeatures = 3ULL * 2ULL * 16ULL * 16ULL;
 inline constexpr std::uint64_t kRawPatchesPerVisionToken  = 4;
+// Each frame span contains at least one embedding token and its two control wrappers.
+inline constexpr std::uint32_t kMinimumMediaSpanTokens = 3;
 // Aggregate prompt capacity and one-item execution capacity are intentionally distinct. Multiple
 // media items are retained by one prepared prompt but pass through the Vision tower sequentially.
 inline constexpr std::uint64_t kMaximumPromptVisionTokens = 32'768;

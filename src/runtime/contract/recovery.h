@@ -7,12 +7,27 @@
 
 namespace ninfer::runtime {
 
+// Session-scoped exact semantic endpoint. A handle is borrowed; Native owns its lifetime.
+struct PrefixId {
+    const void* owner                          = nullptr;
+    std::uint32_t index                        = 0;
+    std::uint64_t generation                   = 0;
+    friend bool operator==(PrefixId, PrefixId) = default;
+};
+
+// Non-owning demand evidence survives eviction without retaining token contents.
+struct PrefixKey {
+    std::array<std::uint64_t, 2> digests{};
+    std::uint32_t frontier = 0, domain = 0;
+    friend auto operator<=>(PrefixKey, PrefixKey) = default;
+};
+
 // Besides per-lane captures and execution: admission, service/relocation, and synchronous
 // current/projected views. Startup and Native use this same control-lifetime bound.
 inline constexpr std::size_t kRecoveryAuxiliaryViews        = 5;
-inline constexpr std::size_t kRecoveryIdentityMetadataLimit = 128;
+inline constexpr std::size_t kRecoveryWorkMetadataLimit     = 128;
 inline constexpr std::size_t kRecoveryEvaluationEntryLimit  = 256;
-inline constexpr std::size_t kRecoveryPricedDescriptorLimit = 64;
+inline constexpr std::size_t kRecoveryPricedDescriptorLimit = 112;
 
 struct RecoveryRestoreCost {
     PlacementId placement;
@@ -21,26 +36,20 @@ struct RecoveryRestoreCost {
     friend bool operator==(const RecoveryRestoreCost&, const RecoveryRestoreCost&) = default;
 };
 
-// Owning semantic metadata only: no State/KV lease, execution address, or media payload.
-// Native supplies exact identity proofs and its primary reconstruction work.
-class RecoveryIdentity {
+// A synchronous relation projection. Equal endpoints use the same representative;
+// parent identifies the nearest strict ancestor in the supplied set.
+struct PrefixRelation {
+    std::uint32_t representative = UINT32_MAX;
+    std::uint32_t parent         = UINT32_MAX;
+};
+
+// Reconstruction geometry only; no token/coordinate storage or physical leases.
+// Request-target quotes borrow RequestPlan geometry; the caller keeps that plan alive.
+// Catalog quotes own their compact geometry and may outlive checkpoint retirement.
+class RecoveryWork {
 public:
-    RecoveryIdentity(const void* owner, std::uint32_t frontier, std::uint32_t domain)
-        : owner(owner), frontier(frontier), domain(domain) {}
-
-    virtual ~RecoveryIdentity() = default;
-    const void* const owner;
-    const std::uint32_t frontier, domain;
-
-    [[nodiscard]] bool prefix_of(const RecoveryIdentity& other) const {
-        return owner == other.owner && domain == other.domain && frontier <= other.frontier &&
-               digest(frontier) == other.digest(frontier) && exact_prefix(other);
-    }
-
-    [[nodiscard]] virtual std::array<std::uint64_t, 2> digest(std::uint32_t) const = 0;
-    [[nodiscard]] virtual PrefillWork rebuild(std::uint32_t begin) const           = 0;
-private:
-    [[nodiscard]] virtual bool exact_prefix(const RecoveryIdentity&) const = 0;
+    virtual ~RecoveryWork()                                              = default;
+    [[nodiscard]] virtual PrefillWork rebuild(std::uint32_t begin) const = 0;
 };
 
 struct RecoveryRestore {
@@ -53,7 +62,9 @@ struct RecoveryRestore {
 };
 
 struct RecoveryDescription {
-    std::shared_ptr<const RecoveryIdentity> identity;
+    PrefixId prefix;
+    std::uint32_t frontier = 0;
+    std::shared_ptr<const RecoveryWork> work;
     PlacementId placement;
     std::vector<RecoveryRestore> restores;
 };

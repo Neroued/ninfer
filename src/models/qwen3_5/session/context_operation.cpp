@@ -193,6 +193,8 @@ void SessionImpl::abort_context() noexcept {
                     release_sequence_kv(state);
                     requests[action.lane] = {};
                     invalidate_lane(action.lane);
+                    state      = {};
+                    state.lane = action.lane;
                     action.source_lease.reset();
                     action.carried_pins.clear();
                     for (const auto& [from, to] : action.carried_clones) {

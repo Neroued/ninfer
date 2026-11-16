@@ -16,23 +16,10 @@ PreparedCheckpoint SessionImpl::prepare_checkpoint(SequenceState& state) {
     demand.add_growth(*text_kv_histories, state.kv->text.handle(), 0);
     if (state.kv->backend) demand.add_growth(*backend_kv_histories, state.kv->backend->handle(), 0);
     if (!directory.reserve(demand)) return {};
-    auto& identity_budget = recovery_metadata.identity_budget();
-    const auto identity_bytes =
-        sizeof(PreparedCaptureBacking) + std::size_t(frontier) * sizeof(TokenId) +
-        state.prefix_digests.metadata_bytes() + state.prefix_identity.metadata_bytes();
-    if (!context::IdentityMetadata::can_retain<PreparedCaptureBacking>(identity_budget,
-                                                                       identity_bytes))
-        return {};
-    auto backing     = std::make_shared<PreparedCaptureBacking>();
-    backing->digests = state.prefix_digests;
-    backing->digests.truncate(frontier);
-    backing->ledger.assign(state.ledger.begin(), state.ledger.begin() + frontier);
-    backing->prefix_identity = state.prefix_identity;
-    backing->prefix_identity.truncate(frontier);
-    const std::shared_ptr<const PreparedCaptureBacking> immutable = std::move(backing);
-    auto retained = immutable->retention.retain(identity_budget, immutable);
-    if (!retained) return {};
-    return {std::move(record), std::move(retained)};
+    auto prefix = state.prefix.try_checkpoint(
+        requests[state.lane].base->identity_view(state.ledger.view()), frontier);
+    if (!prefix) return {};
+    return {std::move(record), std::move(prefix)};
 }
 
 std::optional<CheckpointHandle> SessionImpl::detach_checkpoint(SequenceState& state,
@@ -51,9 +38,7 @@ std::optional<CheckpointHandle> SessionImpl::detach_checkpoint(SequenceState& st
         prefixes.push_back(backend_kv_histories->retain_prefix(state.kv->backend->handle(),
                                                                backend_kv_valid(state)));
     CheckpointState snapshot{.snapshot = Snapshot(*state_store, captured, std::move(prefixes),
-                                                  std::move(prepared.identity)),
-                             .key      = {state.prefix_digests.at(frontier), frontier,
-                                          requests[state.lane].base->prefix_identity_tag}};
+                                                  std::move(prepared.identity))};
     // The complete snapshot now owns the base before an outstanding writer is discarded.
     if (state.pending_write.valid()) {
         state_store->abort_write(state.continuation.image, state.write_state());
@@ -346,9 +331,13 @@ bool SessionImpl::begin_pause(SequenceHandle handle, runtime::PauseAction action
         release_sequence_kv(state);
         release_sequence_state(state);
     }
+    state.prefix = {};
     resident_sequences.erase(state.id.value);
-    saved->sequence    = std::move(state);
-    saved->control     = std::move(control);
+    saved->sequence = std::move(state);
+    saved->control  = std::move(control);
+    saved->query =
+        context::PrefixQuery(prefixes, saved->control.base->prefix_identity_tag,
+                             saved->control.base->identity_view(saved->sequence.ledger.view()));
     state              = {};
     state.lane         = lane;
     control            = {};

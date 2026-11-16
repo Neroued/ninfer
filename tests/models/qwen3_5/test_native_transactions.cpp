@@ -983,6 +983,8 @@ public:
         expect_usage(baseline, "cancelled H2D restore retained unpublished destinations");
         require(program_.release_checkpoint(source),
                 "cancelled H2D restore retained source leases");
+        require(program_.prefixes.usage().stored_tokens == 0,
+                "cancelled binding retained its source input after checkpoint release");
         expect_empty("cancelled H2D restore leaked Context resources");
         next_request();
     }
@@ -1607,7 +1609,8 @@ public:
                     program_.host_bytes_released(family) == shared_host_bytes &&
                     program_.host_bytes_released(repeated) == shared_host_bytes,
                 "Host accounting double-counted a shared or repeated checkpoint holder");
-        program_.recovery_index.synchronize(models::qwen::RecoveryStoreView{program_.checkpoints});
+        program_.recovery_index.synchronize(
+            models::context::RecoveryStoreView{program_.checkpoints, program_.prefixes});
         auto recovery = program_.recovery_index.evaluate(ancestor_set);
         require(recovery.loss(descendant_set) == 64 && recovery.loss(family) == 128 &&
                     recovery.loss(descendant_set) == 64,
@@ -1677,6 +1680,8 @@ public:
         require(before_revoke ==
                     live_bytes(program_.physical_usage(), ContextMemoryDomain::Host) + paused_bytes,
                 "paused snapshot release footprint disagrees with revocation");
+        require(program_.prefixes.usage().stored_tokens == 0,
+                "snapshot revocation retained input storage through the paused request");
         paused.paused.reset();
         expect_empty("snapshot revocation leaked resources");
     }
@@ -1937,10 +1942,11 @@ void replay_sampling_counts(std::shared_ptr<const q35::ModelDefinition> definiti
         require(counts == expected_counts,
                                      std::string(phase) + ": sampling counts differ from committed output occurrences");
         const auto& sequence = program.sequences[lane];
-        require(sequence.ledger == expected_ledger &&
+        require(sequence.ledger.size() == expected_ledger.size() &&
+                                         sequence.ledger.view().equal(0, expected_ledger) &&
                                          sequence.continuation.metadata.execution_frontier == state_frontier &&
                                          sequence.continuation.metadata.text_kv_valid == state_frontier &&
-                                         sequence.prefix_identity.size() == expected_ledger.size(),
+                                         sequence.prefix.frontier() == state_frontier,
                                      std::string(phase) + ": replay changed committed ledger or State/KV frontiers");
     };
     check(0, expected_frontier, "after forced control");

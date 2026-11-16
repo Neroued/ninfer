@@ -91,7 +91,7 @@ InputWindow SessionImpl::input_window(const SequenceState& state, std::uint32_t 
     if (begin > end || end > state.ledger.size())
         throw std::logic_error("input window exceeds its committed ledger");
     InputWindow out;
-    out.tokens.assign(state.ledger.begin() + begin, state.ledger.begin() + end);
+    state.ledger.copy(begin, end, out.tokens);
     out.rope_positions.resize(3ULL * (end - begin));
     const auto& request = requests[state.lane];
     const auto& prompt  = *request.base->prompt;

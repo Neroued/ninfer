@@ -40,15 +40,6 @@ bool SessionImpl::revoke_snapshot(ResumeState& paused) noexcept {
 
 PhysicalUsageSnapshot SessionImpl::physical_usage() const noexcept { return directory.usage(); }
 
-PrefixShortlistKey SessionImpl::checkpoint_key(CheckpointHandle handle,
-                                               std::uint32_t frontier) const {
-    const auto& record = checkpoint(handle);
-    if (!frontier || frontier > record.frontier()) {
-        throw std::logic_error("checkpoint key is outside coverage");
-    }
-    return {record.snapshot.identity().digests.at(frontier), frontier, record.key.identity_tag};
-}
-
 CheckpointMetadata SessionImpl::checkpoint_metadata(CheckpointHandle handle) const {
     const auto& record = checkpoint(handle);
     return {.frontier = record.frontier(),
@@ -61,7 +52,9 @@ CheckpointMetadata SessionImpl::checkpoint_metadata(CheckpointHandle handle) con
 
 CheckpointSummary SessionImpl::checkpoint_summary(CheckpointHandle handle) const {
     const auto& record = checkpoint(handle);
-    CheckpointSummary out{.key = record.key, .frontier = record.frontier(), .role = record.role};
+    CheckpointSummary out{.key      = record.snapshot.input_prefix().key(),
+                          .frontier = record.frontier(),
+                          .role     = record.role};
     out.leased = checkpoint_metadata(handle).leased;
     return out;
 }

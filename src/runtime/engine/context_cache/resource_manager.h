@@ -42,8 +42,7 @@ public:
     using OwnerToken        = ContinuationOwnerToken;
     using Ledger            = RecoveryLedger<Session, Handle>;
 
-    using DemandKey =
-        typename decltype(std::declval<const Base&>().prefix_shortlist_key(0))::value_type;
+    using DemandKey = typename decltype(std::declval<const Base&>().prefix_key(0))::value_type;
 
     // Optional writes carry only their own demand evidence. Necessary execution has no
     // admission restriction. The request owns base for the lifetime of the reclaim decision.
@@ -82,9 +81,9 @@ public:
         std::vector<Victim> victims;
         std::vector<OwnerProtection> owners;
         std::optional<Admission> admission;
-        std::optional<std::uint64_t> gain_limit;
         std::uint64_t id = 0;
         mutable std::unique_ptr<Ledger> ledger;
+        mutable std::uint64_t ledger_catalog_revision = 0;
         ReclaimRights rights;
         std::vector<Handle> protected_points;
     };
@@ -424,7 +423,7 @@ public:
         } else {
             if (!resuming && choice.source.reused_tokens) {
                 const auto used_at = request_epoch_;
-                if (const auto key = base.prefix_shortlist_key(choice.source.reused_tokens)) {
+                if (const auto key = base.prefix_key(choice.source.reused_tokens)) {
                     remember_demand(*key, choice.source.reused_tokens, 0,
                                     CacheRetentionPriority{.last_demand = used_at});
                 }
@@ -475,11 +474,8 @@ public:
                 if (entry.handle == handle) return;
                 const auto prior = session.checkpoint_metadata(entry.handle);
                 if (prior.placement != summary.placement || prior.frontier != summary.frontier ||
-                    session.checkpoint_key(entry.handle, prior.frontier) !=
-                        session.checkpoint_key(handle, summary.frontier))
+                    session.checkpoint_prefix(entry.handle) != session.checkpoint_prefix(handle))
                     continue;
-                auto identities = session.evaluate_recovery({});
-                if (!identities.prefix(entry.handle, handle)) continue;
                 entry.evidence |= summary.evidence;
                 const auto cost = [&](Handle h) {
                     return restore_cost(session, h, summary.placement);
@@ -492,25 +488,24 @@ public:
                 entry.handle   = handle;
                 remove_reference(old, &References::shared, entry.ordinal);
                 add_reference(handle, &References::shared, entry.ordinal);
-                index_.insert(session, handle, summary.frontier, summary.role);
+                index_.insert(session, handle, summary.role);
                 release_unreferenced(session, old);
                 return;
             }
-            shared_.push_back(
-                {.handle      = handle,
-                 .ordinal     = ++ordinal_,
-                 .priority    = demand_priority(session.checkpoint_key(handle, summary.frontier)),
-                 .retained_at = ++retention_clock_,
-                 .evidence    = summary.evidence});
+            shared_.push_back({.handle      = handle,
+                               .ordinal     = ++ordinal_,
+                               .priority    = demand_priority(session.checkpoint_key(handle)),
+                               .retained_at = ++retention_clock_,
+                               .evidence    = summary.evidence});
             shared_lookup_.emplace(shared_.back().ordinal, std::prev(shared_.end()));
             add_reference(handle, &References::shared, shared_.back().ordinal);
-            index_.insert(session, handle, summary.frontier, summary.role);
+            index_.insert(session, handle, summary.role);
         } else {
             auto* owner = find_owner(token);
             if (!owner) {
                 throw std::logic_error("checkpoint publication lost continuation owner");
             }
-            const auto observed = demand_priority(session.checkpoint_key(handle, summary.frontier));
+            const auto observed = demand_priority(session.checkpoint_key(handle));
             if (summary.role == CheckpointRole::InputReplay && observed.reused() &&
                 (!owner->priority.reused() || observed.last_demand > owner->priority.last_demand)) {
                 owner->priority        = observed;
@@ -541,7 +536,7 @@ public:
                 }
                 owner->points.push_back({handle, summary.role});
                 add_reference(handle, &References::owners, owner->token);
-                index_.insert(session, handle, summary.frontier, summary.role);
+                index_.insert(session, handle, summary.role);
             }
         }
     }
@@ -552,12 +547,9 @@ public:
                              SharedCandidateEvidence evidence  = SharedCandidateEvidence::None,
                              const CaptureCostQuote* candidate = nullptr) {
         prune(session);
-        const auto key = base.prefix_shortlist_key(frontier);
-        if (!key) return false;
         for (auto& entry : shared_) {
             if (session.checkpoint_metadata(entry.handle).placement == placement &&
                 session.checkpoint_metadata(entry.handle).frontier == frontier &&
-                session.checkpoint_key(entry.handle, frontier) == *key &&
                 session.checkpoint_recovery_frontier(entry.handle, base, frontier) == frontier) {
                 if (candidate && capture_improves(session, entry.handle, *candidate)) continue;
                 entry.evidence |= evidence;
@@ -661,7 +653,7 @@ public:
         crossed.erase(std::unique(crossed.begin(), crossed.end()), crossed.end());
         auto* owner = find_owner(owner_token);
         for (const auto frontier : crossed) {
-            const auto key = base.prefix_shortlist_key(frontier);
+            const auto key = base.prefix_key(frontier);
             if (!key) { continue; }
             // A depth belonging only to another identity is not a new candidate.
             if (!demand_lookup_.contains(*key) &&
@@ -682,7 +674,7 @@ public:
                                               std::uint32_t frontier, CheckpointRole purpose,
                                               PlacementId placement         = {},
                                               const CaptureCostQuote* quote = nullptr) const {
-        auto demand = demand_priority(base.prefix_shortlist_key(frontier));
+        auto demand = demand_priority(base.prefix_key(frontier));
         if (!demand.reused() && purpose == CheckpointRole::InputReplay) {
             if (const auto* entry = find_owner(owner);
                 entry && entry->recomputed_frontier && entry->recomputed_frontier <= frontier)
@@ -723,9 +715,9 @@ public:
                         if (point.role == CheckpointRole::InputReplay)
                             cursor.protected_points.push_back(point.handle);
         }
-        if (admission && !admission->demand.reused()) {
+        if (admission) {
             Evaluation evaluation{.cursor = &cursor};
-            cursor.gain_limit = recovery_gain(session, *admission, {}, evaluation);
+            (void)recovery(session, evaluation);
         }
         return cursor;
     }
@@ -973,7 +965,7 @@ public:
         auto& values       = recovery(session, evaluation);
         const auto loss    = values.total_loss(removed);
         const auto action  = action_cost(capture.work);
-        const auto gain    = values.gain(*capture.retained, {}, true);
+        const auto gain    = capture_gain(values, cursor, *capture.retained);
         const bool bounded = needs_budget(cursor, removed) || cursor.ledger->bounded_actions;
         if (!affords_action(cursor, loss, action, gain, bounded)) return {};
         return ReclaimActionQuote{
@@ -992,8 +984,8 @@ public:
                 a.target ? a.target
                          : (a.base ? session.recovery_target(*a.base, a.frontier, a.placement)
                                    : nullptr);
-            const auto gain =
-                target ? values.gain(*target, {}, true) : recovery_gain(session, a, {}, evaluation);
+            const auto gain = target ? capture_gain(values, cursor, *target)
+                                     : cursor.ledger->initial_gain.value_or(0);
             if (!affords_action(cursor, values.total_loss(),
                                 add_recovery_cost(cost, a.pending_action), gain,
                                 cursor.ledger->bounded_actions))
@@ -1492,7 +1484,7 @@ private:
             }
             owner.points.push_back({handle, summary.role});
             add_reference(handle, &References::owners, owner.token);
-            index_.insert(session, handle, summary.frontier, summary.role);
+            index_.insert(session, handle, summary.role);
         }
         for (const auto handle : old) { release_unreferenced(session, handle); }
     }
@@ -1577,10 +1569,9 @@ private:
     [[nodiscard]] ReclaimCursor reclaim_order(Session& session) const {
         ReclaimCursor cursor;
         for (const auto& entry : ranked_victims(session)) {
-            const auto frontier = session.checkpoint_metadata(entry.handle).frontier;
-            cursor.victims.push_back(
-                {entry.handle, entry.priority,
-                 demand_priority(session.checkpoint_key(entry.handle, frontier)), entry.evidence});
+            cursor.victims.push_back({entry.handle, entry.priority,
+                                      demand_priority(session.checkpoint_key(entry.handle)),
+                                      entry.evidence});
         }
         for (const auto& owner : owners_)
             cursor.owners.push_back({owner.token, owner.priority.at(request_epoch_),
@@ -1681,8 +1672,18 @@ private:
     }
 
     void prepare_ledger(Session& session, const ReclaimCursor& cursor) const {
-        if (!cursor.ledger)
-            cursor.ledger = std::make_unique<Ledger>(session, advertised(session), costs_);
+        const auto revision = session.checkpoint_catalog_revision();
+        if (cursor.ledger && cursor.ledger_catalog_revision == revision) return;
+        if (cursor.ledger && (!cursor.ledger->effects.empty() || cursor.ledger->paid_actions ||
+                              cursor.ledger->loss_after || cursor.ledger->bounded_actions))
+            return;
+        // Before any action is accepted, a new catalog invalidates the unexecuted quote.
+        // Once execution starts, its priced capabilities and paid fees remain fixed.
+        const auto next = cursor.ledger ? cursor.ledger->revision + 1 : 0;
+        cursor.ledger.reset();
+        cursor.ledger           = std::make_unique<Ledger>(session, advertised(session), costs_);
+        cursor.ledger->revision = next;
+        cursor.ledger_catalog_revision = revision;
     }
 
     void include_required_snapshots(Session& session, const ReclaimCursor& cursor,
@@ -1703,7 +1704,40 @@ private:
             evaluation.recovery.emplace(
                 session, retained(session, evaluation),
                 evaluation.cursor ? evaluation.cursor->ledger.get() : nullptr, costs_);
+        if (evaluation.cursor && evaluation.cursor->admission) {
+            auto& ledger = *evaluation.cursor->ledger;
+            if (!ledger.initial_gain) {
+                const auto& admission = *evaluation.cursor->admission;
+                const auto target =
+                    admission.target
+                        ? admission.target
+                        : (admission.base
+                               ? session.recovery_target(*admission.base, admission.frontier,
+                                                         admission.placement)
+                               : nullptr);
+                if (target) {
+                    ledger.target_before = evaluation.recovery->recovery_cost(*target);
+                    ledger.initial_gain =
+                        evaluation.recovery->gain_from(*ledger.target_before, *target);
+                } else {
+                    auto sources = admission.sources;
+                    if (sources.empty() && admission.checkpoint &&
+                        session.valid_checkpoint(*admission.checkpoint))
+                        sources.push_back(*admission.checkpoint);
+                    ledger.initial_gain = evaluation.recovery->loss(sources);
+                }
+            }
+        }
         return *evaluation.recovery;
+    }
+
+    static std::uint64_t capture_gain(const Recovery& values, const ReclaimCursor& cursor,
+                                      const RecoveryDescription& target) {
+        // The old sources may already have retired. Preserve their initial recovery cost;
+        // the chosen target still pays its actual future Device/Host restore cost.
+        return cursor.ledger->target_before
+                   ? values.gain_from(*cursor.ledger->target_before, target)
+                   : values.gain(target);
     }
 
     [[nodiscard]] std::uint64_t action_loss(Session& session, std::span<const Handle> sources,
@@ -1894,8 +1928,9 @@ private:
             a.target
                 ? a.target
                 : (a.base ? session.recovery_target(*a.base, a.frontier, a.placement) : nullptr);
-        const auto gain = target ? recovery(session, evaluation).gain(*target, {}, true)
-                                 : recovery_gain(session, a, {}, evaluation);
+        auto& values    = recovery(session, evaluation);
+        const auto gain = target ? capture_gain(values, cursor, *target)
+                                 : cursor.ledger->initial_gain.value_or(0);
         return affords_action(
             cursor, quote.loss_after,
             add_recovery_cost(quote.action_cost,
@@ -1911,7 +1946,6 @@ private:
         // Cold InputReplay replacement keeps its explicit bootstrap exception. Current
         // copies still need positive payback, including when storage happens to be free.
         if (!paid && !bounded) return true;
-        if (cursor.gain_limit) gain = std::min(gain, *cursor.gain_limit);
         const auto spent = add_recovery_cost(bounded ? loss : 0, paid);
         return spent < gain;
     }
@@ -1989,8 +2023,10 @@ private:
         const auto spent = add_recovery_cost(
             cursor.ledger->loss_after,
             add_recovery_cost(cursor.ledger->paid_actions, admission.pending_action));
-        return !cursor.gain_limit ||
-               (spent < *cursor.gain_limit && loss < *cursor.gain_limit - spent);
+        const auto limit = cursor.admission && !cursor.admission->demand.reused()
+                               ? cursor.ledger->initial_gain
+                               : std::nullopt;
+        return !limit || (spent < *limit && loss < *limit - spent);
     }
 
     [[nodiscard]] bool admits(Session& session, std::span<const Handle> removed, ActionFacts& facts,

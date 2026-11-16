@@ -1,8 +1,9 @@
 #include "models/qwen4_exp/session/internal.h"
-#include "models/common/qwen/recovery_value.h"
+#include "models/common/vision/window.h"
 
 #include "models/common/context/physical_reclaim.h"
-#include "models/common/qwen/recovery_store.h"
+#include "models/common/context/recovery_store.h"
+#include "models/common/context/recovery_store.h"
 
 #include <algorithm>
 #include <unordered_set>
@@ -544,14 +545,15 @@ std::size_t Session::host_bytes_released(std::span<const CheckpointHandle> recor
 
 context::RecoveryEvaluation<>
 Session::evaluate_recovery(std::span<const CheckpointHandle> advertised) const {
-    impl_->recovery_index.synchronize(qwen::RecoveryStoreView{impl_->checkpoints});
+    impl_->recovery_index.synchronize(
+        context::RecoveryStoreView{impl_->checkpoints, impl_->prefixes});
     return impl_->recovery_index.evaluate(advertised);
 }
 
 CheckpointSummary Session::checkpoint_summary(CheckpointHandle handle) const {
     CheckpointSummary result;
     static_cast<CheckpointMetadata&>(result) = checkpoint_metadata(handle);
-    result.key                               = checkpoint_key(handle, result.frontier);
+    result.key                               = checkpoint_key(handle);
     return result;
 }
 
@@ -661,12 +663,13 @@ Session::recovery_points(const ContextReleaseSet& removed_device,
         runtime::RecoveryDescription value;
         value.restores.reserve(1);
         value.placement = {};
-        value.identity  = record.recovery_identity_cache.lock();
-        if (!value.identity) {
-            value.identity = std::shared_ptr<qwen::RecoveryIdentity>(new qwen::RecoveryIdentity(
-                recovery_budget(), &p, record.snapshot.identity_owner(), record.recovery_identity(),
-                p.shape.prefill_chunk, p.plan.vision_max_features));
-            record.recovery_identity_cache = value.identity;
+        value.prefix    = record.snapshot.input_prefix().id();
+        value.frontier  = record.frontier();
+        value.work      = record.recovery_work_cache.lock();
+        if (!value.work) {
+            value.work = context::recovery_work(recovery_budget(), p.prefixes, value.prefix,
+                                                p.shape.prefill_chunk, p.plan.vision_max_features);
+            record.recovery_work_cache = value.work;
         }
         value.restores.push_back({value.placement,
                                   record.snapshot.restore_requirements(p.directory, removed_device),
@@ -682,14 +685,13 @@ Session::recovery_target(const RequestBasePlan& base, std::uint32_t f, runtime::
                          runtime::CaptureStorage storage) const {
     if (target.value || !base.plan_ || !f || f > base.summary().prompt_tokens)
         throw std::invalid_argument("invalid Qwen4Exp recovery target");
-    const auto& backing = base.plan_->identity;
     runtime::RecoveryDescription value;
     value.placement = target;
-    value.identity  = std::make_shared<qwen::RecoveryIdentity>(
-        recovery_budget(), impl_.get(), backing,
-        qwen::RecoveryIdentityView{f, backing->tag, backing->tokens, backing->positions,
-                                   backing->digests, backing.get()},
-        impl_->shape.prefill_chunk, impl_->plan.vision_max_features);
+    value.frontier  = f;
+    value.prefix    = base.plan_->query.endpoint(f);
+    value.work =
+        context::recovery_work(recovery_budget(), f, base.plan_->media, impl_->shape.prefill_chunk,
+                               impl_->plan.vision_max_features);
     value.restores.push_back({target, {}});
     if (storage == runtime::CaptureStorage::Host)
         for (const auto& part : impl_->plan.context.state.layouts.front().parts) {
@@ -723,21 +725,24 @@ runtime::PauseCostQuote Session::pause_cost(SequenceHandle h, const PauseOption&
     const auto end =
         s.phase == detail::Phase::Replay ? s.replay_target : s.continuation.metadata.main_frontier;
     const auto work = [&](std::uint32_t begin) {
-        return qwen::recovery_work(s.identity.positions.vision_items(), begin, end,
-                                   p.shape.prefill_chunk, p.plan.vision_max_features);
+        return models::vision::recovery_work(
+            s.request->prompt.vision_items, [](const auto& item) -> const auto& { return item; },
+            begin, end, p.shape.prefill_chunk, p.plan.vision_max_features);
     };
     runtime::PauseCostQuote quote;
     quote.work =
         context::maintenance_work(p.directory.assess(option.demand, p.footprint(victims, true)));
     if (option.action.kind == runtime::PauseKind::ReleaseAndReplay) {
+        context::PrefixQuery query(p.prefixes, s.request->domain,
+                                   s.request->identity_view(s.ledger.view()));
         quote.recovery.push_back({work(0), {}});
-        const qwen::RecoveryIdentityView target{
-            end,    s.identity.tag, s.identity.tokens, s.identity.positions, s.identity.digests,
-            nullptr};
         for (auto source : sources) {
             if (!p.checkpoints.valid(source)) continue;
             const auto& c = p.checkpoints.at(source);
-            if (!qwen::recovery_prefix_matches(c.recovery_identity(), target)) continue;
+            if (c.frontier() > end ||
+                p.prefixes.domain(c.snapshot.input_prefix().id()) != s.request->domain ||
+                !query.matches(c.snapshot.input_prefix().id()))
+                continue;
             auto transfers = c.snapshot.restore_requirements(p.directory);
             if (c.frontier() < end) {
                 const auto tail = c.snapshot.replay_requirements(p.directory);

@@ -46,21 +46,6 @@ ContinuationMetadata forward_metadata(ContinuationMetadata value, std::uint32_t 
                                                                 : 0;
     return value;
 }
-
-void prepare_identity(SequenceState& state, std::size_t count) {
-    if (state.prefix_identity.size() != state.ledger.size() ||
-        state.prefix_digests.size() != state.ledger.size())
-        throw std::logic_error("generated identity does not match its ledger");
-    state.ledger.reserve(state.ledger.size() + count);
-    state.prefix_identity.prepare_generated(count, state.continuation.metadata.rope_delta);
-    state.prefix_digests.prepare_generated(count, state.continuation.metadata.rope_delta);
-}
-
-void append_identity(SequenceState& state, std::span<const TokenId> tokens) noexcept {
-    state.ledger.insert(state.ledger.end(), tokens.begin(), tokens.end());
-    state.prefix_identity.append_generated(tokens.size(), state.continuation.metadata.rope_delta);
-    state.prefix_digests.append_generated(tokens, state.continuation.metadata.rope_delta);
-}
 } // namespace
 
 void SessionImpl::receive_result(runtime::ResultReady<ExecutionTypes>&& event) {
@@ -164,13 +149,20 @@ void SessionImpl::commit_completed_unit() {
     auto& current      = *execution;
     current.settlement = std::make_unique<context::ContextTransaction>(directory);
     std::vector<std::uint8_t> recovery(current.members.size());
+    std::vector<context::PrefixUpdate> prefixes(current.members.size());
     Commit physical;
     physical.rows.reserve(current.members.size());
     for (std::size_t b = 0; b < current.members.size(); ++b) {
         const auto l        = lane(current.members[b]);
         auto& state         = sequences[l];
         const auto appended = current.kind == OperationKind::Control ? current.inputs[b].size() : 0;
-        if (appended) prepare_identity(state, appended);
+        state.ledger.prepare_append(appended);
+        if (!causal_scoring)
+            prefixes[b] =
+                state.prefix.prepare(requests[l].base->identity_view(state.ledger.view(
+                                         appended ? std::span<const TokenId>(current.inputs[b])
+                                                  : std::span<const TokenId>{})),
+                                     current.completed[b].execution_frontier);
         recovery[b] = prepare_settlement(l, current.completed[b], requests[l].lifecycle,
                                          state.ledger.size() + appended, *current.settlement);
         physical.rows.push_back({current.columns[b], false, false});
@@ -193,7 +185,8 @@ void SessionImpl::commit_completed_unit() {
             request.capture_reservation && request.capture_reservation->frontier == end;
         if (current.kind == OperationKind::Prefill) request.prefill->cursor = end;
         if (current.kind == OperationKind::Replay) request.replay_cursor = end;
-        if (current.kind == OperationKind::Control) append_identity(state, current.inputs[b]);
+        if (current.kind == OperationKind::Control) state.ledger.append(current.inputs[b]);
+        if (!causal_scoring) state.prefix.commit(std::move(prefixes[b]));
     }
 }
 
@@ -219,6 +212,7 @@ CommitResult SessionImpl::commit(PendingBatch&& pending,
     CommitResult result;
     result.rows.resize(decisions.size());
     std::vector<std::uint8_t> recovery(current.members.size());
+    std::vector<context::PrefixUpdate> prefixes(current.members.size());
     try {
         current.decisions.assign(decisions.begin(), decisions.end());
         current.settlement = std::make_unique<context::ContextTransaction>(directory);
@@ -250,7 +244,12 @@ CommitResult SessionImpl::commit(PendingBatch&& pending,
                 requests[l].speculative_stats.accepted_per_position.size());
             physical.rows.push_back({d.accepted_tokens, d.terminal, d.cancelled || d.failed});
             if (d.cancelled || d.failed) continue;
-            prepare_identity(state, d.accepted_tokens);
+            state.ledger.prepare_append(d.accepted_tokens);
+            const auto accepted = std::span<const TokenId>(pending.tokens_)
+                                      .subspan(b * pending.stride_, d.accepted_tokens);
+            prefixes[b] =
+                state.prefix.prepare(requests[l].base->identity_view(state.ledger.view(accepted)),
+                                     current.completed[b].execution_frontier);
             recovery[b] = prepare_settlement(
                 l, current.completed[b], d.terminal ? Lifecycle::Finishable : Lifecycle::Active,
                 state.ledger.size() + d.accepted_tokens, *current.settlement);
@@ -278,7 +277,8 @@ CommitResult SessionImpl::commit(PendingBatch&& pending,
                 request.prefill->cursor = current.completed[b].execution_frontier;
             const auto accepted = std::span<const TokenId>(pending.tokens_)
                                       .subspan(b * pending.stride_, d.accepted_tokens);
-            append_identity(state, accepted);
+            state.ledger.append(accepted);
+            state.prefix.commit(std::move(prefixes[b]));
             request.lifecycle = d.terminal ? Lifecycle::Finishable : Lifecycle::Active;
             request.capture_pending =
                 request.capture_reservation &&

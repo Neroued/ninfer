@@ -22,11 +22,12 @@ std::optional<PlePrefetch> prefetch(const detail::SessionImpl& p, const detail::
     const auto end = p.window_end(s, begin, limit);
     if (end == begin) return {};
     const auto eos = p.definition->config().text.ple.eos;
+    std::vector<TokenId> tokens;
+    s.ledger.copy(begin, end, tokens);
     return PlePrefetch{p.member(s),
                        begin,
-                       {begin >= 2 ? s.identity.tokens[begin - 2] : eos,
-                        begin ? s.identity.tokens[begin - 1] : eos},
-                       {s.identity.tokens.begin() + begin, s.identity.tokens.begin() + end}};
+                       {begin >= 2 ? s.ledger[begin - 2] : eos, begin ? s.ledger[begin - 1] : eos},
+                       std::move(tokens)};
 }
 } // namespace
 
@@ -116,7 +117,7 @@ Session::start_decode(std::span<const SequenceHandle> members,
         auto& s      = p.sequence(members[b]);
         const auto f = s.continuation.metadata.main_frontier;
         if (s.phase != detail::Phase::Active || !s.permit ||
-            !budgets[b].generated_tokens_remaining || s.identity.tokens.size() != f + 1 ||
+            !budgets[b].generated_tokens_remaining || s.ledger.size() != f + 1 ||
             s.membership_mark == mark)
             throw std::logic_error("decode row is not executable");
         s.membership_mark = mark;
@@ -171,7 +172,7 @@ Session::start_control(std::span<const SequenceHandle> members, std::span<const 
         s.membership_mark = mark;
         if (s.phase != detail::Phase::Active || !s.permit ||
             s.permit->kind != ExecutionUnitKind::Control ||
-            s.identity.tokens.size() != s.continuation.metadata.main_frontier + 1 ||
+            s.ledger.size() != s.continuation.metadata.main_frontier + 1 ||
             s.continuation.metadata.main_frontier + stride > s.permitted_frontier)
             throw std::logic_error("forced control row is not executable");
     }

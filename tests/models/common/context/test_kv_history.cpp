@@ -5,7 +5,7 @@
 #include "models/common/context/physical_reclaim.h"
 #include "models/common/context/snapshot.h"
 #include "models/common/context/transfer.h"
-#include "models/common/qwen/recovery_store.h"
+#include "models/common/context/recovery_store.h"
 #include "models/qwen3_5/session/internal.h"
 #include "models/qwen4_exp/session/internal.h"
 
@@ -803,17 +803,19 @@ void mixed_snapshot(DeviceContext& device) {
         std::array<std::int32_t, 3> tail_ids;
     };
 
-    using Snapshot = context::ContextSnapshot<Metadata, std::vector<std::int32_t>>;
+    context::MetadataBudget identity_budget(1 << 20);
+    context::PrefixStore identities(identity_budget);
+    const std::vector<ninfer::TokenId> input{0, 1, 2, 3, 4, 5, 6};
+    using Snapshot = context::ContextSnapshot<Metadata>;
     context::MetadataBudget checkpoint_budget(
         context::CheckpointStore<Snapshot>::metadata_bytes(3));
     context::CheckpointStore<Snapshot> checkpoints(3, checkpoint_budget);
     const auto point = checkpoints.reserve().value();
     std::vector<context::HistoryPrefix> prefixes;
     prefixes.push_back(f.histories->retain_prefix(owner.handle(), 7));
-    checkpoints.publish(point,
-                        Snapshot(states, {image, {7, raw_ids}}, std::move(prefixes),
-                                 std::make_shared<const std::vector<std::int32_t>>(
-                                     std::initializer_list<std::int32_t>{0, 1, 2, 3, 4, 5, 6})));
+    checkpoints.publish(point, Snapshot(states, {image, {7, raw_ids}}, std::move(prefixes),
+                                        identities.prepare(0, {.tokens = context::TokenView(input)},
+                                                           input.size())));
     const auto alias = checkpoints.reserve().value();
     checkpoints.publish(alias, checkpoints.at(point));
     auto lease = checkpoints.lease(point);
@@ -851,7 +853,8 @@ void mixed_snapshot(DeviceContext& device) {
                           cudaMemcpyDeviceToHost));
     expect(observed_ids == raw_ids && observed_state == state_values &&
                checkpoints.at(point).continuation().metadata.frontier == 7 &&
-               checkpoints.at(point).identity() == std::vector<std::int32_t>({0, 1, 2, 3, 4, 5, 6}),
+               identities.matches(checkpoints.at(point).input_prefix().id(),
+                                  {.tokens = context::TokenView(input)}),
            "snapshot restoration mismatched fixed state, indexer tail or identity");
     lease.reset();
     const auto epoch   = states.content_epoch(image);
@@ -887,6 +890,8 @@ void qwen_reclaim_facts(DeviceContext& device) {
     auto main_owner = f.create(200, 0, 0), backend_owner = f.create(64, 0, 1);
     auto& states = f.directory->states();
     std::vector<context::StateId> images;
+    context::MetadataBudget identity_budget(4 << 20);
+    context::PrefixStore identities(identity_budget);
     context::MetadataBudget checkpoint_budget(Store::metadata_bytes(32));
     Store store(32, checkpoint_budget);
     const auto add = [&](std::vector<TokenId> tokens, std::uint32_t domain = 0,
@@ -908,31 +913,27 @@ void qwen_reclaim_facts(DeviceContext& device) {
         for (unsigned axis = 0; axis < 3; ++axis)
             for (unsigned i = 0; i < frontier; ++i)
                 prompt.positions[axis * frontier + i] = i + position_offset;
+        context::InputIdentityView input{.tokens = context::TokenView(tokens),
+                                         .types  = prompt.token_types};
+        for (std::uint32_t axis = 0; axis < 3; ++axis)
+            input.positions[axis] =
+                std::span<const std::int32_t>(prompt.positions).subspan(axis * frontier, frontier);
+        auto identity     = identities.prepare(domain, input, frontier);
         const auto handle = *store.reserve();
         if constexpr (four) {
-            auto identity    = std::make_shared<q4::detail::Identity>();
-            identity->tokens = std::move(tokens);
-            identity->tag    = domain;
-            identity->positions.assign(prompt);
-            identity->digests.assign(prompt);
             store.publish(handle,
                           {q4::detail::Snapshot(
                                states, {*image, {.main_frontier = frontier, .mtp_frontier = 64}},
                                std::move(prefixes), std::move(identity)),
                            runtime::CheckpointRole::SharedPrefix});
         } else {
-            auto identity    = std::make_shared<q35::detail::PreparedCaptureBacking>();
-            identity->ledger = std::move(tokens);
-            identity->prefix_identity.assign(prompt);
-            identity->digests.assign(prompt);
             store.publish(handle, {q35::detail::Snapshot(states,
                                                          {*image,
                                                           {.execution_frontier = frontier,
                                                            .text_kv_valid      = frontier,
                                                            .backend_kv_valid   = 64}},
                                                          std::move(prefixes), std::move(identity)),
-                                   runtime::CheckpointRole::SharedPrefix,
-                                   {.identity_tag = domain}});
+                                   runtime::CheckpointRole::SharedPrefix});
         }
         return handle;
     };
@@ -953,7 +954,7 @@ void qwen_reclaim_facts(DeviceContext& device) {
     const std::array removed{root, left, right};
     const std::array kept{kept_left, kept_right};
     context::RecoveryIndex index(f.directory->metadata_budget());
-    index.synchronize(qwen::RecoveryStoreView{store});
+    index.synchronize(context::RecoveryStoreView{store, identities});
     auto evaluation = index.evaluate(kept);
     expect(evaluation.loss(removed) == 200 && !evaluation.prefix(domain, left) &&
                !evaluation.prefix(position, left),
@@ -1080,9 +1081,13 @@ void request_and_cache_usage(DeviceContext& device) {
     const auto image = states.reserve_destination().value();
     states.complete_initialization(image);
     states.freeze(image);
-    using Snapshot = context::ContextSnapshot<int, int>;
+    context::MetadataBudget identity_budget(1 << 20);
+    context::PrefixStore identities(identity_budget);
+    const std::vector<ninfer::TokenId> input{1};
+    using Snapshot = context::ContextSnapshot<int>;
     {
-        Snapshot checkpoint(states, {image, 0}, {cache}, std::make_shared<const int>(1));
+        Snapshot checkpoint(states, {image, 0}, {cache},
+                            identities.prepare(0, {.tokens = context::TokenView(input)}, 1));
         auto paused = checkpoint;
         paused.set_use(context::ContextUse::Request);
         check(ContextMemoryDomain::Device, 4, 0);

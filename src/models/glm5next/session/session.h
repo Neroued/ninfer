@@ -41,17 +41,13 @@ struct ResourceReservation {
 
 using CheckpointHandle = context::CheckpointHandle;
 
-struct PrefixShortlistKey {
-    std::array<std::uint64_t, 2> digests{};
-    std::uint32_t frontier = 0, identity_tag = 0;
-    friend auto operator<=>(PrefixShortlistKey, PrefixShortlistKey) noexcept = default;
-};
+using PrefixKey = runtime::PrefixKey;
 
 class RequestBasePlan {
 public:
     [[nodiscard]] const runtime::RequestPlanSummary& summary() const noexcept;
     [[nodiscard]] const models::frontend::PreparedContextCache& context_cache() const noexcept;
-    [[nodiscard]] std::optional<PrefixShortlistKey> prefix_shortlist_key(std::uint32_t) const;
+    [[nodiscard]] std::optional<PrefixKey> prefix_key(std::uint32_t) const;
 private:
     std::shared_ptr<const detail::RequestPlan> plan_;
 
@@ -72,7 +68,7 @@ struct CheckpointMetadata {
 };
 
 struct CheckpointSummary : CheckpointMetadata {
-    PrefixShortlistKey key;
+    PrefixKey key;
 };
 
 struct SourceCandidate {
@@ -342,7 +338,13 @@ public:
                    std::span<const CheckpointHandle> carried = {},
                    std::span<const CheckpointHandle> retired = {}, runtime::PlacementId target = {},
                    const ResumeState* resume = nullptr) const;
-    [[nodiscard]] PrefixShortlistKey checkpoint_key(CheckpointHandle, std::uint32_t) const;
+    [[nodiscard]] runtime::PrefixId checkpoint_prefix(CheckpointHandle) const;
+    [[nodiscard]] std::vector<runtime::PrefixId> matching_prefixes(const RequestBasePlan&) const;
+    [[nodiscard]] std::vector<runtime::PrefixRelation>
+        recovery_relations(std::span<const runtime::PrefixId>) const;
+    [[nodiscard]] bool recovery_precedes(runtime::PrefixId, std::uint32_t, runtime::PrefixId,
+                                         std::uint32_t) const;
+    [[nodiscard]] PrefixKey checkpoint_key(CheckpointHandle) const;
     [[nodiscard]] CheckpointSummary checkpoint_summary(CheckpointHandle) const;
     [[nodiscard]] CheckpointMetadata checkpoint_metadata(CheckpointHandle) const;
     [[nodiscard]] bool checkpoint_matches(CheckpointHandle, const RequestBasePlan&) const;

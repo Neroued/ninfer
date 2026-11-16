@@ -15,7 +15,8 @@ PreparedCheckpoint SessionImpl::prepare_checkpoint(Sequence& s) {
     for (std::uint32_t pool = 0; pool < pool_count(); ++pool)
         demand.add_growth(directory.pool(pool).histories(), s.histories[pool].handle(), 0);
     if (!directory.reserve(demand)) return {};
-    auto identity = capture_identity(s, recovery_metadata.identity_budget());
+    auto identity = s.prefix.try_checkpoint(s.request->identity_view(s.ledger.view()),
+                                            s.continuation.metadata.main_frontier);
     if (!identity) return {};
     return {std::move(record), std::move(identity)};
 }
@@ -97,8 +98,8 @@ Session::prepare_capture(SequenceHandle h, std::span<const CheckpointHandle> vic
     auto ticket         = std::make_unique<detail::CaptureReservation>();
     ticket->states      = &p.directory.states();
     ticket->checkpoints = &p.checkpoints;
-    ticket->identity = s.request->identity->retention.retain(p.recovery_metadata.identity_budget(),
-                                                             s.request->identity);
+    ticket->identity =
+        s.prefix.try_checkpoint(s.request->identity_view(s.ledger.view()), point.frontier);
     if (!ticket->identity) return {};
     ticket->records.reserve(point.roles.size());
     for (const auto role : point.roles) {
@@ -208,9 +209,8 @@ std::vector<CheckpointHandle> Session::share_capture(SequenceHandle h, Checkpoin
     const auto& point = s.captures[s.next_capture];
     const auto& prior = p.checkpoints.at(source);
     if (prior.frontier() != point.frontier ||
-        prior.snapshot.identity().tag != s.request->identity->tag ||
-        !qwen::prefix_matches(s.request->prompt, prior.snapshot.identity().tokens,
-                              prior.snapshot.identity().positions, point.frontier))
+        p.prefixes.domain(prior.snapshot.input_prefix().id()) != s.request->domain ||
+        !s.request->query.matches(prior.snapshot.input_prefix().id()))
         return {};
     if (s.capture && p.directory.states().device_resident(s.capture->destination) &&
         !prior.snapshot.restore_requirements(p.directory).empty())

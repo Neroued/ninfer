@@ -11,10 +11,6 @@ bool reached_dead_end(const RowResult& row) {
     const auto reached = count >= 32 ? UINT32_MAX : (std::uint32_t{1} << count) - 1;
     return (row.dead_positions & reached) != 0;
 }
-
-void append_identity(Sequence& s, std::span<const TokenId> tokens) noexcept {
-    s.identity.append_generated(tokens);
-}
 } // namespace
 
 void SessionImpl::finish_result(ComputeResult result) {
@@ -72,6 +68,7 @@ void SessionImpl::finish_result(ComputeResult result) {
     tx.completion = std::make_unique<context::ContextTransaction>(directory);
     Commit commit;
     std::vector<ContinuationMetadata> completed(tx.members.size());
+    std::vector<context::PrefixUpdate> prefixes(tx.members.size());
     commit.rows.reserve(tx.members.size());
     const bool retain_recovery = tx.kind == Kind::Replay;
     for (std::size_t b = 0; b < tx.members.size(); ++b) {
@@ -80,10 +77,15 @@ void SessionImpl::finish_result(ComputeResult result) {
         commit.rows.push_back({member(s), tx.rows[b].states, row.processed});
         if (tx.kind == Kind::Control) {
             const auto count = tx.rows[b].ids.size();
-            s.identity.prepare_generated(count);
+            s.ledger.prepare_append(count);
         }
         completed[b] =
             prepare_commit(s, tx.rows[b], tx.rows[b].ids.size(), retain_recovery, *tx.completion);
+        const auto staged = tx.kind == Kind::Control
+                                ? std::span<const TokenId>(tx.rows[b].ids).subspan(1)
+                                : std::span<const TokenId>{};
+        prefixes[b]       = s.prefix.prepare(s.request->identity_view(s.ledger.view(staged)),
+                                             completed[b].main_frontier);
     }
     if (tx.kind == Kind::Prefill) {
         const auto& s = sequence(tx.members[0]);
@@ -122,9 +124,10 @@ void SessionImpl::finish_result(ComputeResult result) {
         if (tx.kind == Kind::Control) {
             const auto& row   = tx.rows[b];
             const auto prefix = std::span<const TokenId>(row.ids).subspan(1);
-            append_identity(s, prefix);
-            append_identity(s, {&*row.control_last_token, 1});
+            s.ledger.append(prefix);
+            s.ledger.append({&*row.control_last_token, 1});
         }
+        s.prefix.commit(std::move(prefixes[b]));
         if (tx.kind == Kind::Replay && s.continuation.metadata.main_frontier == s.replay_target)
             s.phase = s.resume_phase;
     }
@@ -193,6 +196,7 @@ CommitResult Session::commit(PendingBatch&& batch,
     CommitResult result;
     result.rows.resize(decisions.size());
     std::vector<ContinuationMetadata> completed(decisions.size());
+    std::vector<context::PrefixUpdate> prefixes(decisions.size());
     try {
         tx.decisions.assign(decisions.begin(), decisions.end());
         tx.completion = std::make_unique<context::ContextTransaction>(p.directory);
@@ -209,11 +213,19 @@ CommitResult Session::commit(PendingBatch&& batch,
                                      decision.terminal, decision.cancelled, decision.failed});
             if (!decision.accepted_tokens) continue;
             const auto count = decision.accepted_tokens;
-            s.identity.prepare_generated(count);
+            s.ledger.prepare_append(count);
             const auto inputs = tx.kind == detail::ComputeTransaction::Kind::Speculative
                                     ? count
                                     : tx.rows[b].ids.size();
             completed[b]      = p.prepare_commit(s, tx.rows[b], inputs, false, *tx.completion);
+        }
+        for (std::size_t b = 0; b < decisions.size(); ++b) {
+            if (!decisions[b].accepted_tokens) continue;
+            auto& s             = p.sequence(tx.members[b]);
+            const auto accepted = std::span<const TokenId>(tx.result->rows[b].tokens)
+                                      .first(decisions[b].accepted_tokens);
+            prefixes[b] = s.prefix.prepare(s.request->identity_view(s.ledger.view(accepted)),
+                                           completed[b].main_frontier);
         }
         tx.completion->prepare_actions();
         physical.actions = p.actions(*tx.completion);
@@ -255,7 +267,8 @@ CommitResult Session::commit(PendingBatch&& batch,
                     s.capture && s.captures[s.next_capture].frontier == completed[b].main_frontier;
             const auto tokens =
                 std::span<const TokenId>(tx.result->rows[b].tokens).first(decision.accepted_tokens);
-            detail::append_identity(s, tokens);
+            s.ledger.append(tokens);
+            s.prefix.commit(std::move(prefixes[b]));
             s.phase         = decision.terminal ? detail::Phase::Finished : detail::Phase::Active;
             row.disposition = decision.terminal ? runtime::CommitDisposition::Finishable
                                                 : runtime::CommitDisposition::Active;

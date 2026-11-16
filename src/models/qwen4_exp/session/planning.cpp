@@ -66,7 +66,10 @@ runtime::ContextMetadataPlan session_metadata_plan(const ExecutionPlan& executio
         schema.state.layouts.front().parts.push_back(
             {i, state_part.image_bytes, state_part.alignment});
     }
-    auto metadata = context::ContextDirectory::metadata_plan(schema, rank);
+    auto metadata     = context::ContextDirectory::metadata_plan(schema, rank);
+    const bool vision = execution.workspace.vision.has_value();
+    const context::PrefixMetadataLayout prefix_layout{
+        vision, vision ? qwen::kMinimumMediaSpanTokens : 0, qwen::kMinimumMediaSpanTokens};
     const auto concurrency =
         execution.shape.purpose == EnginePurpose::Generation ? execution.shape.max_concurrency : 0U;
     const auto checkpoint_cost =
@@ -88,9 +91,28 @@ runtime::ContextMetadataPlan session_metadata_plan(const ExecutionPlan& executio
             context::RecoveryIndex<>::metadata_bytes(std::size_t(schema.state.logical_capacity)) +
             context::recovery_value_metadata_bytes(schema.state.logical_capacity, concurrency,
                                                    ranks) +
-            detail::Identity::cache_bytes(execution.shape.max_context, concurrency);
+            context::PrefixStore::metadata_bytes(
+                std::size_t(execution.shape.prefill_chunk + context::PrefixStore::block_tokens) *
+                    concurrency,
+                schema.state.logical_capacity + 2 * concurrency, prefix_layout);
     metadata.bytes_per_record.at(geometry.spec_classes[0].index) +=
-        (checkpoint_cost + recovery_cost + history_cost + ranks - 1) / ranks;
+        (checkpoint_cost + recovery_cost + history_cost +
+         context::PrefixStore::metadata_bytes(0, 1, prefix_layout) -
+         context::PrefixStore::metadata_bytes(0, 0, prefix_layout) + ranks - 1) /
+        ranks;
+    const auto main_class = geometry.spec_classes.at(schema.state.layouts.size()).index;
+    const auto prefix_page_cost =
+        (context::PrefixStore::metadata_bytes(kPagedKVPageSize, 0, prefix_layout) -
+         context::PrefixStore::metadata_bytes(0, 0, prefix_layout) + ranks - 1) /
+        ranks;
+    metadata.bytes_per_record.at(main_class) += prefix_page_cost;
+    metadata.fixed_bytes += (local_rank.host_bytes / geometry.block_bytes) *
+                            geometry.classes[main_class].records_per_block * prefix_page_cost;
+    if (rank == 0 && execution.workspace.vision)
+        metadata.fixed_bytes +=
+            ((std::size_t(execution.shape.max_context) + prefix_layout.span_stride - 1) /
+             prefix_layout.span_stride) *
+            concurrency * (sizeof(models::frontend::TokenSpan) + sizeof(double));
     return metadata;
 }
 

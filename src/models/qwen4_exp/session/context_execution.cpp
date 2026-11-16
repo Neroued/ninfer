@@ -10,7 +10,7 @@ ResidencyBinding SessionImpl::context_binding(BindOperation& operation) {
         sequence.id                        = previous.id;
         sequence.epoch                     = previous.epoch;
         sequence.request                   = previous.request;
-        sequence.identity                  = previous.identity;
+        sequence.ledger                    = previous.ledger;
         sequence.reused                    = previous.reused;
         sequence.resume_phase              = previous.phase;
         sequence.next_capture              = previous.next_capture;
@@ -22,7 +22,7 @@ ResidencyBinding SessionImpl::context_binding(BindOperation& operation) {
         sequence.id           = next_sequence++;
         sequence.epoch        = identity_generation;
         sequence.request      = operation.request;
-        sequence.identity     = *operation.request->identity;
+        sequence.ledger       = context::RequestLedger(operation.request->prompt.token_ids);
         sequence.reused       = operation.frontier;
         sequence.captures     = operation.request->captures;
         sequence.last_saved   = operation.frontier;
@@ -35,12 +35,12 @@ ResidencyBinding SessionImpl::context_binding(BindOperation& operation) {
             sequence.speculative.accepted_per_position.resize(shape.draft_tokens);
         }
     }
-    sequence.lane                = operation.lane;
-    const auto identity_capacity = std::size_t(sequence.request->summary.prompt_tokens) +
-                                   sequence.request->summary.effective_output_tokens;
-    sequence.identity.tokens.reserve(identity_capacity);
-    sequence.identity.positions.reserve(identity_capacity);
-    sequence.identity.digests.reserve(identity_capacity);
+    sequence.lane = operation.lane;
+    sequence.ledger.reserve_output(sequence.request->summary.effective_output_tokens);
+    sequence.prefix = context::PrefixBuilder(
+        prefixes, sequence.request->domain,
+        operation.source ? checkpoints.at(*operation.source).snapshot.input_prefix()
+                         : context::PrefixRef{});
     sequence.binding_generation = ++epochs[operation.lane];
     sequence.phase = operation.target > operation.frontier ? Phase::Replay : sequence.resume_phase;
     sequence.replay_target      = operation.target;
@@ -62,8 +62,7 @@ ResidencyBinding SessionImpl::context_binding(BindOperation& operation) {
            sequence.captures[sequence.next_capture].frontier <= operation.frontier)
         ++sequence.next_capture;
 
-    const auto generated = std::span<const TokenId>(sequence.identity.tokens)
-                               .subspan(sequence.request->summary.prompt_tokens);
+    const auto generated = sequence.ledger.generated();
     ResidencyBinding result{member(sequence), sequence.request->sampling, {}};
     const auto& sampling = sequence.request->sampling;
     if (sampling.presence_penalty || sampling.frequency_penalty)
@@ -125,8 +124,12 @@ void SessionImpl::prepare_pause_resources(context::ContextReservation& targets) 
                                   ? context::ContextMemory::Host
                                   : context::ContextMemory::Device);
     }
+    sequence.prefix = {};
     resident_sequences.erase(sequence.id);
     pause.paused->sequence = std::move(sequences[pause.lane]);
+    pause.paused->query =
+        context::PrefixQuery(prefixes, sequence.request->domain,
+                             sequence.request->identity_view(sequence.ledger.view()));
     if (pause.paused->snapshot && pause.action.kind == runtime::PauseKind::HostSnapshot) {
         const auto plan = demotion({&*pause.paused->snapshot, 1});
         if (plan && !prepare_demotion(operation->migration, *plan, targets, pause.targets))

@@ -25,7 +25,6 @@ void SessionImpl::initialize_captures(RequestControl& request, std::uint32_t fro
 void SessionImpl::initialize_prefill(RequestControl& request, std::uint32_t base) {
     const auto& plan = *request.base;
     auto& staged     = request.prefill.emplace();
-    staged.prompt    = *plan.prompt;
     staged.base = staged.cursor = base;
     staged.prompt_tokens        = plan.summary.prompt_tokens;
     staged.reuse                = base ? PrefixReusePath::Checkpoint : PrefixReusePath::Root;
@@ -187,14 +186,8 @@ BindingReservation SessionImpl::start_binding(const RequestBasePlan& base, runti
     SequenceState prepared_state;
     if (!resume) {
         initialize_prefill(prepared, transaction.reuse_frontier);
-        prepared_state.ledger = base.impl_->prompt->token_ids;
-        prepared_state.prefix_identity.assign(*base.impl_->prompt);
-        prepared_state.prefix_digests = base.impl_->prefix_digests;
-        const auto tokens =
-            std::size_t(base.summary().prompt_tokens) + base.summary().effective_output_tokens;
-        prepared_state.ledger.reserve(tokens);
-        prepared_state.prefix_identity.reserve(tokens);
-        prepared_state.prefix_digests.reserve(tokens);
+        prepared_state.ledger = context::RequestLedger(base.impl_->prompt->token_ids);
+        prepared_state.ledger.reserve_output(base.summary().effective_output_tokens);
         prepared.publish_continuation = base.summary().publish_continuation;
         prepared.sampling_host        = base.impl_->sampling;
         prepared.speculative_stats    = {
@@ -205,6 +198,9 @@ BindingReservation SessionImpl::start_binding(const RequestBasePlan& base, runti
                .accepted_per_position  = std::vector<std::uint64_t>(draft_window, 0),
         };
     }
+    prepared_state.prefix = context::PrefixBuilder(
+        prefixes, base.impl_->prefix_identity_tag,
+        source ? checkpoint(*source).snapshot.input_prefix() : context::PrefixRef{});
     prepared.lifecycle = Lifecycle::Binding;
     for (auto point : candidate.retired_points) {
         if (!release_checkpoint(point))
@@ -297,9 +293,7 @@ BindingReservation SessionImpl::start_binding(const RequestBasePlan& base, runti
             const auto& ledger = resume->impl_->sequence.ledger;
             if (ledger.size() < base.summary().prompt_tokens)
                 throw std::logic_error("sampling restore has no complete generated ledger");
-            binding.counts = count_builder.build(
-                std::span<const TokenId>(ledger).subspan(base.summary().prompt_tokens),
-                plan.profile->public_tokens);
+            binding.counts = count_builder.build(ledger.generated(), plan.profile->public_tokens);
         }
         work.bindings.push_back(std::move(binding));
         (void)submit_context(*context_operation_, std::move(work));
@@ -317,7 +311,9 @@ void SessionImpl::install_binding(BindOperation& tx) {
         auto& saved           = *tx.resume->impl_;
         request               = std::move(saved.control);
         const auto residency  = state.residency;
+        auto prefix           = std::move(state.prefix);
         state                 = std::move(saved.sequence);
+        state.prefix          = std::move(prefix);
         state.lane            = tx.lane;
         state.residency       = residency;
         const auto rope_delta = state.continuation.metadata.rope_delta;

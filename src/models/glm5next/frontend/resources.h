@@ -11,6 +11,9 @@ class Binder;
 
 namespace ninfer::models::glm5next {
 
+// Each frame span contains at least one embedding token and its two control wrappers.
+inline constexpr std::uint32_t kMinimumMediaSpanTokens = 3;
+
 struct FrontendResources {
     models::frontend::TextResources text;
     std::string_view processor_config_json;

@@ -1,4 +1,4 @@
-#include "models/common/qwen/recovery_value.h"
+#include "models/common/vision/window.h"
 #include "models/qwen3_5/session/internal.h"
 #include "models/common/context/work.h"
 
@@ -12,13 +12,10 @@ bool SessionImpl::checkpoint_matches(CheckpointHandle handle, const RequestBaseP
         return false;
     }
     const auto& record = checkpoint(handle);
-    if (record.frontier() > base.summary().prompt_tokens ||
-        record.key.identity_tag != base.impl_->prefix_identity_tag ||
-        base.impl_->prefix_digests.at(record.frontier()) != record.key.digests) {
-        return false;
-    }
-    return prefix_matches(*base.impl_->prompt, record.snapshot.identity().ledger,
-                          record.snapshot.identity().prefix_identity, record.frontier());
+    return record.frontier() <= base.summary().prompt_tokens &&
+           prefixes.domain(record.snapshot.input_prefix().id()) ==
+               base.impl_->prefix_identity_tag &&
+           base.impl_->query.matches(record.snapshot.input_prefix().id());
 }
 
 std::optional<SourceCandidate>
@@ -34,11 +31,11 @@ SessionImpl::inspect_source(const RequestBasePlan& base, std::optional<Checkpoin
     const auto matches = [&](CheckpointHandle point) {
         if (!resume) return checkpoint_matches(point, base);
         if (!valid_checkpoint(point)) return false;
-        const auto& saved = *resume->impl_;
-        return qwen::recovery_prefix_matches(
-            checkpoint(point).recovery_identity(),
-            {saved.frontier, saved.control.base->prefix_identity_tag, saved.sequence.ledger,
-             saved.sequence.prefix_identity, saved.sequence.prefix_digests, nullptr});
+        const auto& saved  = *resume->impl_;
+        const auto& prefix = checkpoint(point).snapshot.input_prefix();
+        return prefix.frontier() <= saved.frontier &&
+               prefixes.domain(prefix.id()) == saved.control.base->prefix_identity_tag &&
+               saved.query.matches(prefix.id());
     };
     if (!base.impl_ || (handle && !matches(*handle))) return std::nullopt;
     SourceCandidate candidate{.placement     = target,
@@ -46,9 +43,9 @@ SessionImpl::inspect_source(const RequestBasePlan& base, std::optional<Checkpoin
                               .reused_tokens = handle ? checkpoint(*handle).frontier() : 0};
     const auto& prompt         = *base.impl_->prompt;
     const auto target_frontier = resume ? resume->frontier() : base.summary().prompt_tokens;
-    candidate.remaining_work =
-        qwen::recovery_work(prompt.vision_items, candidate.reused_tokens, target_frontier,
-                            prefill_chunk, plan.vision_max_features);
+    candidate.remaining_work   = models::vision::recovery_work(
+        prompt.vision_items, [](const auto& item) -> const auto& { return item; },
+        candidate.reused_tokens, target_frontier, prefill_chunk, plan.vision_max_features);
     if (!handle) { return candidate; }
     const auto& record       = checkpoint(*handle);
     candidate.consume_source = consume_source;

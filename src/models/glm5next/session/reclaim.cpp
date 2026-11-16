@@ -1,72 +1,13 @@
 #include "models/glm5next/session/internal.h"
 
 #include "models/common/context/physical_reclaim.h"
+#include "models/common/context/recovery_store.h"
 
 #include <algorithm>
 #include <unordered_set>
 
 namespace ninfer::models::glm5next::detail {
 namespace {
-class RecoveryIdentity final : public runtime::RecoveryIdentity {
-public:
-    RecoveryIdentity(context::MetadataBudget& budget, const void* owner,
-                     std::shared_ptr<const InputIdentity> identity, std::uint32_t frontier,
-                     std::uint32_t chunk, std::uint32_t capacity)
-        : runtime::RecoveryIdentity(owner, frontier, identity->tag), account_(budget),
-          identity_(std::move(identity)), chunk_(chunk), capacity_(capacity) {
-        account_.acquire(sizeof(*this));
-    }
-
-    std::array<std::uint64_t, 2> digest(std::uint32_t f) const override {
-        return identity_->digests.at(f);
-    }
-
-    runtime::PrefillWork rebuild(std::uint32_t begin) const override {
-        return models::vision::recovery_work(
-            identity_->media, [](const auto& media) -> const auto& { return media.item; }, begin,
-            frontier, chunk_, capacity_);
-    }
-private:
-    bool exact_prefix(const runtime::RecoveryIdentity& other) const override {
-        const auto* value = dynamic_cast<const RecoveryIdentity*>(&other);
-        return value && input_prefix_equal(identity_->view(), value->identity_->view(), frontier);
-    }
-
-    context::MetadataAccount account_;
-    std::shared_ptr<const InputIdentity> identity_;
-    std::uint32_t chunk_, capacity_;
-};
-
-static_assert(sizeof(RecoveryIdentity) <= runtime::kRecoveryIdentityMetadataLimit);
-
-struct RecoveryStoreView {
-    const Checkpoints& store;
-
-    const std::uint64_t& revision() const { return store.revision(); }
-
-    std::size_t capacity() const { return store.metadata_extent(); }
-
-    auto handle(std::uint32_t index) const { return store.handle(index); }
-
-    bool valid(CheckpointHandle handle) const { return store.valid(handle); }
-
-    std::uint32_t frontier(CheckpointHandle handle) const { return store.at(handle).frontier(); }
-
-    context::RecoveryKey key(CheckpointHandle h, std::uint32_t f) const {
-        const auto& identity = store.at(h).snapshot.identity();
-        return {identity.digests.at(f), identity.tag};
-    }
-
-    bool prefix(CheckpointHandle a, CheckpointHandle b) const {
-        const auto& left  = store.at(a);
-        const auto& right = store.at(b);
-        return left.frontier() <= right.frontier() &&
-               left.snapshot.identity().tag == right.snapshot.identity().tag &&
-               input_prefix_equal(left.snapshot.identity().view(), right.snapshot.identity().view(),
-                                  left.frontier());
-    }
-};
-
 context::PhysicalReclaim physical_facts(const SessionImpl& session,
                                         std::span<const CheckpointHandle> allowed,
                                         std::span<const CheckpointHandle> excluded = {}) {
@@ -237,14 +178,15 @@ std::size_t Session::host_bytes_released(std::span<const CheckpointHandle> recor
 
 context::RecoveryEvaluation<>
 Session::evaluate_recovery(std::span<const CheckpointHandle> advertised) const {
-    impl_->recovery_index.synchronize(detail::RecoveryStoreView{impl_->checkpoints});
+    impl_->recovery_index.synchronize(
+        context::RecoveryStoreView{impl_->checkpoints, impl_->prefixes});
     return impl_->recovery_index.evaluate(advertised);
 }
 
 CheckpointSummary Session::checkpoint_summary(CheckpointHandle handle) const {
     CheckpointSummary result;
     static_cast<CheckpointMetadata&>(result) = checkpoint_metadata(handle);
-    result.key                               = checkpoint_key(handle, result.frontier);
+    result.key                               = checkpoint_key(handle);
     return result;
 }
 
@@ -317,12 +259,13 @@ Session::recovery_points(const ContextReleaseSet& removed_device,
         runtime::RecoveryDescription value;
         value.restores.reserve(p.placements.size());
         value.placement = record.snapshot.continuation().metadata.placement;
-        value.identity  = record.recovery_identity_cache.lock();
-        if (!value.identity) {
-            value.identity = std::shared_ptr<detail::RecoveryIdentity>(new detail::RecoveryIdentity(
-                recovery_budget(), &p, record.snapshot.identity_owner(), record.frontier(),
-                p.shape.prefill_chunk, p.plan.vision_max_features));
-            record.recovery_identity_cache = value.identity;
+        value.prefix    = record.snapshot.input_prefix().id();
+        value.frontier  = record.frontier();
+        value.work      = record.recovery_work_cache.lock();
+        if (!value.work) {
+            value.work = context::recovery_work(recovery_budget(), p.prefixes, value.prefix,
+                                                p.shape.prefill_chunk, p.plan.vision_max_features);
+            record.recovery_work_cache = value.work;
         }
         for (auto target : p.placements) {
             auto transfers =
@@ -358,9 +301,11 @@ Session::recovery_target(const RequestBasePlan& base, std::uint32_t f, runtime::
         throw std::invalid_argument("invalid GLM recovery target");
     runtime::RecoveryDescription value;
     value.placement = target;
-    value.identity  = std::make_shared<detail::RecoveryIdentity>(
-        recovery_budget(), impl_.get(), base.plan_->identity, f, impl_->shape.prefill_chunk,
-        impl_->plan.vision_max_features);
+    value.frontier  = f;
+    value.prefix    = base.plan_->query.endpoint(f);
+    value.work =
+        context::recovery_work(recovery_budget(), f, base.plan_->media, impl_->shape.prefill_chunk,
+                               impl_->plan.vision_max_features);
     value.restores.push_back({target, {}});
     for (std::uint32_t rank = 0; rank < impl_->plan.states.size(); ++rank)
         if (const auto& field = impl_->plan.states[rank].draft_context) {
@@ -383,20 +328,23 @@ runtime::PauseCostQuote Session::pause_cost(SequenceHandle h, const PauseOption&
         s.phase == detail::Phase::Replay ? s.replay_target : s.continuation.metadata.main_frontier;
     const auto work = [&](std::uint32_t begin) {
         return models::vision::recovery_work(
-            s.identity.media, [](const auto& media) -> const auto& { return media.item; }, begin,
-            end, p.shape.prefill_chunk, p.plan.vision_max_features);
+            s.request->prompt.identity.media,
+            [](const auto& media) -> const auto& { return media.item; }, begin, end,
+            p.shape.prefill_chunk, p.plan.vision_max_features);
     };
     runtime::PauseCostQuote quote;
     quote.work =
         context::maintenance_work(p.directory.assess(option.demand, p.footprint(victims, true)));
     if (option.action.kind == runtime::PauseKind::ReleaseAndReplay) {
+        context::PrefixQuery query(p.prefixes, s.request->domain,
+                                   s.request->identity_view(s.ledger.view()));
         quote.recovery.push_back({work(0), {}});
         for (auto source : sources) {
             if (!p.checkpoints.valid(source)) continue;
-            const auto& c  = p.checkpoints.at(source);
-            const auto& id = c.snapshot.identity();
-            if (c.frontier() > end || id.tag != s.identity.tag ||
-                !input_prefix_equal(id.view(), s.identity.view(), c.frontier()))
+            const auto& c = p.checkpoints.at(source);
+            if (c.frontier() > end ||
+                p.prefixes.domain(c.snapshot.input_prefix().id()) != s.request->domain ||
+                !query.matches(c.snapshot.input_prefix().id()))
                 continue;
             const auto points = recovery_points({}, {&source, 1});
             for (const auto& restore : points.front().description->restores)

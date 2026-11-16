@@ -1,7 +1,8 @@
 #include "models/qwen3_5/session/internal.h"
-#include "models/common/qwen/recovery_value.h"
+#include "models/common/vision/window.h"
 
 #include "models/common/context/physical_reclaim.h"
+#include "models/common/context/recovery_store.h"
 
 #include <algorithm>
 #include <array>
@@ -460,12 +461,13 @@ Session::recovery_points(const ContextReleaseSet& removed_device,
         const auto& record = p.checkpoints.at(handle);
         runtime::RecoveryDescription value;
         value.restores.reserve(1);
-        value.identity = record.recovery_identity_cache.lock();
-        if (!value.identity) {
-            value.identity = std::shared_ptr<qwen::RecoveryIdentity>(new qwen::RecoveryIdentity(
-                recovery_budget(), &p, record.snapshot.identity_owner(), record.recovery_identity(),
-                p.prefill_chunk, p.plan.vision_max_features));
-            record.recovery_identity_cache = value.identity;
+        value.prefix   = record.snapshot.input_prefix().id();
+        value.frontier = record.frontier();
+        value.work     = record.recovery_work_cache.lock();
+        if (!value.work) {
+            value.work = context::recovery_work(recovery_budget(), p.prefixes, value.prefix,
+                                                p.prefill_chunk, p.plan.vision_max_features);
+            record.recovery_work_cache = value.work;
         }
         auto transfers = record.snapshot.restore_requirements(p.directory, removed_device);
         const auto state_records = p.state_store->allocations(record.continuation().image);
@@ -489,16 +491,13 @@ Session::recovery_points(const ContextReleaseSet& removed_device,
 std::shared_ptr<const runtime::RecoveryDescription>
 Session::recovery_target(const RequestBasePlan& base, std::uint32_t f, runtime::PlacementId target,
                          runtime::CaptureStorage storage) const {
-    if (target.value || !base.impl_ || !base.impl_->capture_backing || !f ||
-        f > base.summary().prompt_tokens)
+    if (target.value || !base.impl_ || !f || f > base.summary().prompt_tokens)
         throw std::invalid_argument("invalid Qwen recovery target");
-    const auto& backing = base.impl_->capture_backing;
     runtime::RecoveryDescription value;
-    value.identity = std::make_shared<qwen::RecoveryIdentity>(
-        recovery_budget(), impl_.get(), backing,
-        qwen::RecoveryIdentityView{f, base.impl_->prefix_identity_tag, backing->ledger,
-                                   backing->prefix_identity, backing->digests, backing.get()},
-        impl_->prefill_chunk, impl_->plan.vision_max_features);
+    value.frontier = f;
+    value.prefix   = base.impl_->query.endpoint(f);
+    value.work     = context::recovery_work(recovery_budget(), f, base.impl_->media,
+                                            impl_->prefill_chunk, impl_->plan.vision_max_features);
     value.restores.push_back({target, {}});
     if (storage == runtime::CaptureStorage::Host)
         value.restores.back().transfers.push_back(context::state_transfer_requirement(
@@ -522,25 +521,27 @@ runtime::PauseCostQuote Session::pause_cost(SequenceHandle h, const PauseOption&
                           ? control.replay_target
                           : s.continuation.metadata.execution_frontier;
     const auto work = [&](std::uint32_t begin) {
-        return qwen::recovery_work(s.prefix_identity.vision_items(), begin, end, p.prefill_chunk,
-                                   p.plan.vision_max_features);
+        return models::vision::recovery_work(
+            control.base->prompt->vision_items,
+            [](const auto& item) -> const auto& { return item; }, begin, end, p.prefill_chunk,
+            p.plan.vision_max_features);
     };
     runtime::PauseCostQuote quote;
     const auto released = p.checkpoint_release_set(victims);
     if (!released) throw std::invalid_argument("invalid pause victims");
     quote.work = context::maintenance_work(p.directory.assess(option.demand, *released));
     if (option.action.kind == runtime::PauseKind::ReleaseAndReplay) {
+        context::PrefixQuery query(p.prefixes, control.base->prefix_identity_tag,
+                                   control.base->identity_view(s.ledger.view()));
         quote.recovery.push_back({work(0), {}});
-        const qwen::RecoveryIdentityView target{end,
-                                                control.base->prefix_identity_tag,
-                                                s.ledger,
-                                                s.prefix_identity,
-                                                s.prefix_digests,
-                                                nullptr};
         for (auto source : sources) {
             if (!p.valid_checkpoint(source)) continue;
             const auto& c = p.checkpoint(source);
-            if (!qwen::recovery_prefix_matches(c.recovery_identity(), target)) continue;
+            if (c.frontier() > end ||
+                p.prefixes.domain(c.snapshot.input_prefix().id()) !=
+                    control.base->prefix_identity_tag ||
+                !query.matches(c.snapshot.input_prefix().id()))
+                continue;
             const auto points   = recovery_points({}, {&source, 1});
             const auto& restore = points.front().description->restores.front();
             auto transfers      = restore.transfers;

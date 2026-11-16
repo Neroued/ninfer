@@ -85,6 +85,7 @@ bool permits_local_media(const httplib::Request& request) {
         if (lower == "origin" || lower == "forwarded" || lower.starts_with("x-forwarded-"))
             return false;
     }
+    if (request.get_header_value_count("Host") != 1) return false;
     const auto host = request.get_header_value("Host");
     for (const std::string_view local : {"localhost", "127.0.0.1", "[::1]"})
         if (host == local || (host.starts_with(local) && host.size() > local.size() + 1 &&

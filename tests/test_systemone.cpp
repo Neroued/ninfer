@@ -134,11 +134,19 @@ int main() {
         }
         for (const auto& images :
              {Json(nullptr), Json("file.png"), Json::array({""}), Json::array({3}),
+              Json::array({"ftp://example.com/a.png"}), Json::array({std::string("a\0.png", 6)}),
               Json(std::vector<std::string>(9, "a.png")), Json::array()}) {
             auto bad      = picture_body;
             bad["images"] = images;
             rejects([&] { (void)parse_systemone_request(bad); },
                     "box requires a valid nonempty image list");
+        }
+        for (const auto* source :
+             {"https://example.com/a.png", "/tmp/a.png", "C:\\photos\\a.png"}) {
+            auto input      = picture_body;
+            input["images"] = {source};
+            expect(parse_systemone_request(input).images.front() == source,
+                   "valid remote and local image sources retain their spelling");
         }
         auto many_boxes         = picture_body;
         many_boxes["questions"] = Json::object();

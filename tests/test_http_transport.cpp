@@ -129,6 +129,11 @@ int test_local_media_policy() {
     failures +=
         check(!ninfer::serve::permits_local_media(request), "remote peer can read local files");
     request.remote_addr = "127.0.0.1";
+    request.headers.clear();
+    request.set_header("Host", "localhost");
+    request.set_header("Host", "evil.example");
+    failures += check(!ninfer::serve::permits_local_media(request),
+                      "duplicate Host headers can authorize local pictures");
     for (const auto* host : {"evil.example", "localhost.evil.example", "localhost:port", ""}) {
         request.headers.clear();
         request.set_header("Host", host);

@@ -74,7 +74,12 @@ SystemOneRequest parse_systemone_request(const Json& body) {
     for (const auto& image : images) {
         require(image.is_string() && !image.get_ref<const std::string&>().empty(),
                 "each image must be a nonempty source string");
-        request.images.push_back(image.get<std::string>());
+        const auto& source = image.get_ref<const std::string&>();
+        require(source.find('\0') == std::string::npos, "image sources must not contain NUL bytes");
+        require(source.starts_with("data:") || source.starts_with("http://") ||
+                    source.starts_with("https://") || source.find("://") == std::string::npos,
+                "image sources support data URLs, HTTP(S), or filesystem paths");
+        request.images.push_back(source);
     }
     std::size_t bytes = context.size();
     const auto append = [&](const std::string& name, Json spec, const Json& rubric) {

@@ -2,6 +2,7 @@
 #include "ninfer/ops/sampling.h"
 #include "models/common/vocabulary.h"
 #include "models/common/qwen/frontend/prepared_prompt.h"
+#include "models/qwen4_exp/execution/workspace.h"
 
 #include <algorithm>
 
@@ -31,6 +32,7 @@ BufferLayout plan_buffers(LayoutBuilder& b, const Config& c, const EngineOptions
     const auto hidden = dimension(c.text.hidden), channels = dimension(c.text.residual_width());
     const auto index_key = dimension(c.text.qsa.index_key_width());
     const auto batch     = dimension(o.max_concurrency);
+    const auto sequence  = execution::sequence_parallel_policy(ranks);
     const auto width     = dimension(c.mtp ? std::uint64_t(o.speculative.draft_tokens) + 1 : 1);
     const auto positions = dimension(std::max<std::uint64_t>(chunk, std::uint64_t(batch) * width));
     const auto tensor    = [&](DType dtype, std::initializer_list<std::int32_t> shape,
@@ -122,8 +124,8 @@ BufferLayout plan_buffers(LayoutBuilder& b, const Config& c, const EngineOptions
     out.host_region = {out.ingress.offset,
                        last_host.region.offset + last_host.region.bytes - out.ingress.offset, 256};
     if (out.mtp) out.mtp->verify_ids = tensor(DType::I32, {width * batch}, "verify IDs");
-    out.prefill_sample =
-        tensor(DType::BF16, {hidden, static_cast<std::int32_t>(chunk)}, "prefill sample");
+    out.prefill_sample = tensor(
+        DType::BF16, {hidden, sequence.partition(dimension(chunk), 0).padded}, "prefill sample");
     out.pending_sample = tensor(DType::BF16, {hidden, width, batch}, "pending sample");
     const auto records = [&](std::uint32_t layers, std::int32_t columns) {
         return QsaRecordLayout{
@@ -136,8 +138,9 @@ BufferLayout plan_buffers(LayoutBuilder& b, const Config& c, const EngineOptions
     out.main_qsa    = records(c.text.qsa_layers, width);
     out.ple_records = tensor(DType::BF16, {channels, width, batch}, "PLE pending records");
     if (c.mtp) {
-        out.prefill_conditioning = tensor(
-            DType::BF16, {channels, static_cast<std::int32_t>(chunk) + 1}, "prefill conditioning");
+        out.prefill_conditioning =
+            tensor(DType::BF16, {channels, sequence.local_capacity(dimension(chunk)) + 1},
+                   "prefill conditioning");
         out.pending_conditioning =
             tensor(DType::BF16, {channels, width, batch}, "pending conditioning");
         out.gdn_records = plan_gdn_replay_records(

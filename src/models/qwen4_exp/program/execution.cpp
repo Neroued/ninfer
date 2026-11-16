@@ -163,12 +163,16 @@ void RankProgramImpl::prepare_main() {
     const auto batch   = static_cast<std::int32_t>(f.sequence ? 1 : f.physical.rows);
     const auto t       = static_cast<std::int32_t>(f.tokens);
     const auto hidden  = dimension(parameters.profile->config.text.hidden);
+    const auto columns = f.sequence
+                             ? execution::sequence_parallel_policy(parameters.profile->local.size)
+                                   .partition(t, parameters.profile->local.rank)
+                             : TokenPartition(t * batch);
     if (f.verify) {
         const auto channels = dimension(parameters.profile->config.text.residual_width());
         f.sample            = packed_tensor(layout.pending_sample, {hidden, t, batch});
         f.conditioning      = packed_tensor(*layout.pending_conditioning, {channels, t, batch});
     } else {
-        f.sample = f.sequence ? device_tensor(layout.prefill_sample).slice(1, 0, t)
+        f.sample = f.sequence ? device_tensor(layout.prefill_sample).slice(1, 0, columns.padded)
                               : packed_tensor(layout.pending_sample, {hidden, t, batch});
         if (parameters.mtp) {
             const auto channels = dimension(parameters.profile->config.text.residual_width());
@@ -182,8 +186,8 @@ void RankProgramImpl::prepare_main() {
                 auto first  = window.slice(1, 0, 1);
                 copy_bytes_async({first.data, first.bytes(), cuda.device()},
                                  {base.data, base.bytes(), cuda.device()}, cuda);
-                f.conditioning          = window.slice(1, 1, t);
-                f.previous_conditioning = window.slice(1, 0, t);
+                f.conditioning          = window.slice(1, 1, columns.count);
+                f.previous_conditioning = window.slice(1, 0, columns.count);
             } else {
                 f.conditioning = packed_tensor(*layout.pending_conditioning, {channels, t, batch});
                 f.previous_conditioning = base.view({channels, t, batch});

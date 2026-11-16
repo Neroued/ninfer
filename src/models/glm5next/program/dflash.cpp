@@ -1,9 +1,14 @@
 #include "models/glm5next/program/internal.h"
 
 namespace ninfer::models::glm5next::detail {
-Tensor RankProgramImpl::draft_features(int tokens, int rows) {
+Tensor RankProgramImpl::draft_features(const execution::BatchView& call) {
     const auto& field = frame.dflash->features;
-    return resources.packed(field, {field.shape[0], tokens, rows});
+    const auto& p     = *parameters.profile;
+    const auto columns =
+        call.sequence_owner
+            ? execution::sequence_parallel_policy(p.local.size).partition(call.tokens, p.local.rank)
+            : TokenPartition(call.tokens * call.rows);
+    return resources.packed(field, {field.shape[0], columns.count / call.rows, call.rows});
 }
 
 execution::DFlashRun RankProgramImpl::dflash_run(int b, std::uint32_t bound) {
@@ -25,20 +30,44 @@ execution::DFlashRun RankProgramImpl::dflash_run(int b, std::uint32_t bound) {
 
 void RankProgramImpl::append_dflash_context(const execution::BatchView& call, const Tensor& counts,
                                             ops::ContextKVMaterializeExecutionEnvelope envelope) {
-    auto features       = draft_features(call.tokens, call.rows);
+    auto scope          = resources.workspace.scope();
+    auto features       = draft_features(call);
     auto positions      = call.positions;
     auto live           = counts;
-    const auto capacity = parameters.profile->draft->context.capacity;
+    const auto& p       = *parameters.profile;
+    const auto capacity = p.draft->context.capacity;
+    const auto columns =
+        call.sequence_owner
+            ? execution::sequence_parallel_policy(p.local.size).partition(call.tokens, p.local.rank)
+            : TokenPartition(call.tokens * call.rows);
+    const int retained = std::min(std::uint32_t(call.tokens), capacity);
+    const int begin    = call.tokens - retained;
+    if (columns.split()) {
+        auto gathered = resources.workspace.alloc(DType::BF16, {features.ne[0], retained});
+        for (std::uint32_t rank = 0; rank < columns.ranks; ++rank) {
+            const TokenPartition part(call.tokens, columns.ranks, rank);
+            const int first = std::max(begin, part.begin);
+            const int last  = std::min(call.tokens, part.begin + part.count);
+            if (first >= last) continue;
+            auto destination = gathered.slice(1, first - begin, last - first);
+            if (rank == p.local.rank) {
+                const auto source = features.slice(1, first - part.begin, last - first);
+                copy_bytes_async({destination.data, destination.bytes(), cuda.device()},
+                                 {source.data, source.bytes(), cuda.device()}, cuda);
+            }
+            parallel->broadcast(destination, rank, cuda);
+        }
+        features = gathered;
+    }
     if (std::uint32_t(call.tokens) > capacity) {
         if (call.rows != 1 || envelope.min_count != std::uint32_t(call.tokens) ||
             envelope.max_count != std::uint32_t(call.tokens))
             throw std::logic_error(
                 "DFlash window replacement requires one fully committed sequence");
-        const auto begin = call.tokens - capacity;
-        features         = features.slice(1, begin, capacity);
-        positions        = positions.slice(0, begin, capacity);
-        live             = resources.tensor(frame.dflash->window_count);
-        envelope         = {capacity, capacity};
+        if (!columns.split()) features = features.slice(1, begin, capacity);
+        positions = positions.slice(0, begin, capacity);
+        live      = resources.tensor(frame.dflash->window_count);
+        envelope  = {capacity, capacity};
     }
     execution::draft_append_context(parameters, {resources.workspace, resources.states, *parallel},
                                     features, positions, live, call.destination_offsets, envelope,

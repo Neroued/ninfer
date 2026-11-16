@@ -1,4 +1,5 @@
 #include "models/qwen4_exp/execution/workspace.h"
+#include "core/platform.h"
 #include "ninfer/ops/gdn_control.h"
 #include "ninfer/ops/gdn_input_proj.h"
 #include "ninfer/ops/gated_delta_net.h"
@@ -13,6 +14,11 @@
 #include <algorithm>
 
 namespace ninfer::models::qwen4_exp::execution {
+SequenceParallelPolicy sequence_parallel_policy(std::uint32_t ranks) {
+    return NINFER_TARGET_SPARK && ranks == 2 ? SequenceParallelPolicy{2, 129}
+                                             : SequenceParallelPolicy{};
+}
+
 namespace {
 std::size_t linear(const ops::LinearProfile& p, int first, int last) {
     return ops::linear_workspace_capacity_bytes(p.qtype, p.n, p.k, p.policy, first, last);
@@ -20,10 +26,21 @@ std::size_t linear(const ops::LinearProfile& p, int first, int last) {
 
 std::size_t body(const ModelProfile& p, const EngineOptions& options, int first, int last,
                  int batch, bool prefill, bool mtp, int sm_count, const moe::Plan* offload) {
+    const auto policy = sequence_parallel_policy(p.local.size);
+    if (prefill && !mtp && policy.minimum_columns && first < policy.minimum_columns &&
+        last >= policy.minimum_columns)
+        return std::max(
+            body(p, options, first, policy.minimum_columns - 1, batch, prefill, mtp, sm_count,
+                 offload),
+            body(p, options, policy.minimum_columns, last, batch, prefill, mtp, sm_count, offload));
     WorkspaceLayoutBuilder a;
     const auto columns = dimension(std::uint64_t(last) * batch),
                minimum = dimension(std::uint64_t(first) * batch);
-    (void)workspace::roots(a, p.config.text, columns);
+    const auto partition =
+        prefill && !mtp ? policy.partition(columns, p.local.rank) : TokenPartition(columns);
+    const auto local_minimum =
+        partition.split() ? policy.partition(minimum, p.local.rank).count : minimum;
+    (void)workspace::roots(a, p.config.text, columns, partition.padded);
     const auto scratch = [&](std::size_t bytes) {
         auto scope = a.scope();
         (void)a.alloc_bytes(bytes);
@@ -40,8 +57,10 @@ std::size_t body(const ModelProfile& p, const EngineOptions& options, int first,
         (void)workspace::ple(a, p.config.text, columns, prefill);
         scratch(linear(p.text.ple, minimum, columns));
     }
-    const auto layer = [&](const BlockProfile& layer) {
-        scratch(ops::hc_mix_workspace_capacity_bytes(layer.attention_hc, minimum, columns));
+    const auto layer = [&](const BlockProfile& layer, bool local) {
+        const int lo = local ? local_minimum : minimum;
+        const int hi = local ? partition.count : columns;
+        scratch(ops::hc_mix_workspace_capacity_bytes(layer.attention_hc, lo, hi));
         {
             auto scope = a.scope();
             if (const auto* g = std::get_if<GdnProfile>(&layer.mixer)) {
@@ -75,7 +94,7 @@ std::size_t body(const ModelProfile& p, const EngineOptions& options, int first,
                 scratch(linear(q.output, minimum, columns));
             }
         }
-        scratch(ops::hc_mix_workspace_capacity_bytes(layer.moe_hc, minimum, columns));
+        scratch(ops::hc_mix_workspace_capacity_bytes(layer.moe_hc, lo, hi));
         scratch(moe::workspace_bytes(layer.moe.math, ops::MoeEpilogue::Write, minimum, columns,
                                      layer.moe.subset));
         if (!mtp && offload) {
@@ -83,34 +102,40 @@ std::size_t body(const ModelProfile& p, const EngineOptions& options, int first,
         }
     };
     if (mtp)
-        layer(p.mtp->layer);
+        layer(p.mtp->layer, false);
     else
-        for (const auto& block : p.text.layers) layer(block);
-    scratch(ops::hc_mix_workspace_capacity_bytes(mtp ? p.mtp->final_hc : p.text.final_hc, minimum,
-                                                 columns));
+        for (std::size_t i = 0; i < p.text.layers.size(); ++i)
+            layer(p.text.layers[i], partition.split() && i >= p.config.text.ple.layer);
+    scratch(ops::hc_mix_workspace_capacity_bytes(mtp ? p.mtp->final_hc : p.text.final_hc,
+                                                 local_minimum, partition.count));
     if (!mtp && !prefill && options.purpose == EnginePurpose::Generation)
         scratch(linear(p.text.head, minimum, columns));
     return a.peak_bytes();
 }
 
-std::size_t history(const ModelProfile& p, int first, int last, int batch) {
+std::size_t history(const ModelProfile& p, int first, int last, int batch,
+                    bool partitioned = false) {
     WorkspaceLayoutBuilder a;
     const auto columns = dimension(std::uint64_t(last) * batch),
                minimum = dimension(std::uint64_t(first) * batch);
     const auto& mtp    = *p.mtp;
-    (void)workspace::history_roots(a, p.config.text, columns);
+    const TokenPartition partition(columns, partitioned ? p.local.size : 1,
+                                   partitioned ? p.local.rank : 0);
+    const int local_minimum = TokenPartition(minimum, partition.ranks, partition.rank).count;
+    (void)workspace::history_roots(a, p.config.text, partition.count, partition.padded);
     const auto scratch = [&](std::size_t bytes) {
         auto scope = a.scope();
         (void)a.alloc_bytes(bytes);
     };
     {
         auto scope = a.scope();
-        (void)workspace::mtp_stem(a, p.config.text, columns);
-        scratch(linear(mtp.fc_embedding, minimum, columns));
-        scratch(linear(mtp.fc_hidden, dimension(std::uint64_t(p.config.text.hc.streams) * minimum),
-                       dimension(std::uint64_t(p.config.text.hc.streams) * columns)));
+        (void)workspace::mtp_stem(a, p.config.text, partition.count, columns);
+        scratch(linear(mtp.fc_embedding, local_minimum, partition.count));
+        scratch(linear(mtp.fc_hidden,
+                       dimension(std::uint64_t(p.config.text.hc.streams) * local_minimum),
+                       dimension(std::uint64_t(p.config.text.hc.streams) * partition.count)));
     }
-    scratch(ops::hc_mix_workspace_capacity_bytes(mtp.history.mix, minimum, columns));
+    scratch(ops::hc_mix_workspace_capacity_bytes(mtp.history.mix, local_minimum, partition.count));
     {
         auto scope = a.scope();
         (void)workspace::qsa_history(a, p.local.qsa, columns);
@@ -134,7 +159,16 @@ WorkspacePlan plan_workspace(const ModelProfile& p, const EngineOptions& o, std:
             out.history = std::max(out.history, history(p, 1, o.speculative.draft_tokens, b));
         }
     }
-    if (p.mtp) out.history = std::max(out.history, history(p, 1, chunk, 1));
+    if (p.mtp) {
+        const auto policy    = sequence_parallel_policy(p.local.size);
+        const int replicated = policy.minimum_columns
+                                   ? std::min(dimension(chunk), policy.minimum_columns - 1)
+                                   : dimension(chunk);
+        out.history          = std::max(out.history, history(p, 1, replicated, 1));
+        if (policy.minimum_columns && chunk >= std::uint32_t(policy.minimum_columns))
+            out.history =
+                std::max(out.history, history(p, policy.minimum_columns - 1, chunk, 1, true));
+    }
     const auto head_columns =
         o.purpose == EnginePurpose::CausalScoring
             ? std::min(chunk, 1024U)

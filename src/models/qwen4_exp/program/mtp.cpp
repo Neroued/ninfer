@@ -168,13 +168,46 @@ void RankProgramImpl::align_mtp(std::span<const WorkRow> rows, std::uint32_t tok
     const auto first    = rows.front().main_frontier;
     const auto skip     = batch == 1 && first == 0 ? 1U : 0U;
     const auto width    = std::max(1U, tokens - skip);
-    auto& inputs        = mtp_rows;
+    const auto rank     = parameters.profile->local.rank;
+    const auto main_columns =
+        compute->sequence ? execution::sequence_parallel_policy(parameters.profile->local.size)
+                                .partition(dimension(tokens), rank)
+                          : TokenPartition(dimension(std::uint64_t(tokens) * batch));
+    const auto history_columns = main_columns.split()
+                                     ? TokenPartition(dimension(width), main_columns.ranks, rank)
+                                     : TokenPartition(dimension(std::uint64_t(width) * batch));
+    auto& inputs               = mtp_rows;
     for (std::size_t b = 0; b < rows.size(); ++b) {
         inputs[b] = {rows[b].mtp_frontier,
                      std::span<const TokenId>(rows[b].ids).subspan(skip, tokens - skip)};
     }
-    const auto aligned = previous.view({channels, static_cast<std::int32_t>(tokens), batch})
-                             .slice(1, skip < tokens ? skip : 0, width);
+    Tensor aligned;
+    if (main_columns.split()) {
+        // The shifted history can move the partition boundary by one column.
+        const TokenPartition peer_main(dimension(tokens), main_columns.ranks, 1);
+        const TokenPartition peer_history(dimension(width), main_columns.ranks, 1);
+        const int peer_first = peer_history.begin + static_cast<int>(skip) - 1;
+        auto window          = device_tensor(*resources.buffers().prefill_conditioning);
+        if (peer_first < peer_main.begin) {
+            auto halo = packed_tensor(frame.base_conditioning, {channels, 1});
+            if (rank == 0) {
+                const auto source = conditioning.slice(1, peer_first, 1);
+                copy_bytes_async({halo.data, halo.bytes(), cuda.device()},
+                                 {source.data, source.bytes(), cuda.device()}, cuda);
+            }
+            parallel->broadcast(halo, 0, cuda);
+            if (rank == 1) {
+                auto destination = window.slice(1, 0, 1);
+                copy_bytes_async({destination.data, destination.bytes(), cuda.device()},
+                                 {halo.data, halo.bytes(), cuda.device()}, cuda);
+            }
+        }
+        const int source_first = history_columns.begin + static_cast<int>(skip) - 1;
+        aligned = window.slice(1, source_first - main_columns.begin + 1, history_columns.count);
+    } else {
+        aligned = previous.view({channels, static_cast<std::int32_t>(tokens), batch})
+                      .slice(1, skip < tokens ? skip : 0, width);
+    }
     if (tokens == skip) visual.reset();
     const auto metadata = mtp_inputs(history_control_view(frame.history, width, batch), rows, width,
                                      {inputs.data(), rows.size()}, true);
@@ -187,14 +220,26 @@ void RankProgramImpl::align_mtp(std::span<const WorkRow> rows, std::uint32_t tok
         visual =
             visual_view(*forward.visual->window.plan, first + skip, tokens - skip, region, host);
     }
-    execution::mtp_history(parameters.profile->config.text, parameters.profile->local.qsa,
-                           *parameters.mtp, aligned, metadata,
-                           resources.states->mtp_tail(metadata.source_offsets),
-                           resources.states->mtp_tail(metadata.destination_offsets),
-                           resources.mtp->layer(0), visual, resources.workspace, cuda);
-    const auto next = conditioning.view({channels, static_cast<std::int32_t>(tokens), batch})
-                          .slice(1, tokens - 1, 1)
-                          .view({channels, batch});
+    execution::mtp_history(
+        parameters.profile->config.text, parameters.profile->local.qsa, *parameters.mtp,
+        {aligned, history_columns}, metadata, resources.states->mtp_tail(metadata.source_offsets),
+        resources.states->mtp_tail(metadata.destination_offsets), resources.mtp->layer(0), visual,
+        resources.workspace, cuda, parallel ? &*parallel : nullptr);
+    Tensor next;
+    if (main_columns.split()) {
+        next             = packed_tensor(frame.base_conditioning, {channels, 1});
+        const auto owner = (tokens - 1) / main_columns.segment;
+        if (rank == owner) {
+            const auto source = conditioning.slice(1, tokens - 1 - main_columns.begin, 1);
+            copy_bytes_async({next.data, next.bytes(), cuda.device()},
+                             {source.data, source.bytes(), cuda.device()}, cuda);
+        }
+        parallel->broadcast(next, owner, cuda);
+    } else {
+        next = conditioning.view({channels, static_cast<std::int32_t>(tokens), batch})
+                   .slice(1, tokens - 1, 1)
+                   .view({channels, batch});
+    }
     ops::scatter(next, resources.states->conditioning(compute->batch.destination_offsets),
                  compute->batch.live_rows, cuda);
 }

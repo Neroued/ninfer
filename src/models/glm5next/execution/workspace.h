@@ -1,10 +1,14 @@
 #pragma once
 
+#include "models/common/parallel_execution.h"
+
 #include "models/common/vision/resources.h"
 #include "models/glm5next/execution/profile.h"
 #include "models/glm5next/execution_shape.h"
 
 namespace ninfer::models::glm5next::execution {
+
+[[nodiscard]] SequenceParallelPolicy sequence_parallel_policy(std::uint32_t ranks);
 
 struct WorkspacePlan {
     std::size_t prefill = 0, ordinary = 0, verify = 0, draft = 0, history = 0, finish = 0;
@@ -19,6 +23,7 @@ namespace workspace {
 
 struct Roots {
     Tensor residual, input, output;
+    Tensor exchange_input, exchange_output;
     std::array<ops::MhcCoefficients, 2> coefficients;
 };
 
@@ -33,13 +38,20 @@ AttentionBuffers attention(Arena& a, int hidden, int columns, int ranks) {
 }
 
 template <class Arena>
-Roots roots(Arena& a, const TextConfig& c, int columns) {
+Roots roots(Arena& a, const TextConfig& c, const TokenPartition& columns) {
     const auto h = dimension(c.hidden), s = dimension(c.mhc.streams);
-    return {a.alloc(DType::BF16, {h, s, columns}),
-            a.alloc(DType::BF16, {h, columns}),
-            a.alloc(DType::BF16, {h, columns}),
-            {{{a.alloc(DType::FP32, {s, columns}), a.alloc(DType::FP32, {s, s, columns})},
-              {a.alloc(DType::FP32, {s, columns}), a.alloc(DType::FP32, {s, s, columns})}}}};
+    auto residual = a.alloc(DType::BF16, {h, s, columns.count});
+    auto input    = a.alloc(DType::BF16, {h, columns.padded});
+    auto output   = a.alloc(DType::BF16, {h, columns.padded});
+    return {
+        residual,
+        input.slice(1, 0, columns.columns),
+        output.slice(1, 0, columns.columns),
+        input,
+        output,
+        {{{a.alloc(DType::FP32, {s, columns.count}), a.alloc(DType::FP32, {s, s, columns.count})},
+          {a.alloc(DType::FP32, {s, columns.count}),
+           a.alloc(DType::FP32, {s, s, columns.count})}}}};
 }
 
 struct KdaBuffers {

@@ -41,9 +41,16 @@ void mtp_forward(const TextConfig&, const QsaConfig&, const MtpParameters&,
                  CudaExecutionView, ParallelExecution* = nullptr);
 
 // Builds target-aligned history without attention readout, MoE or final mixing.
-void mtp_history(const TextConfig&, const QsaConfig&, const MtpParameters&,
-                 const Tensor& conditioning, const BatchView&, const ops::QsaTailStateView& before,
-                 ops::QsaTailStateView after, ops::QsaCacheView,
-                 std::optional<models::vision::EmbeddingView>, MemoryArena&, CudaExecutionView);
+// Conditioning contains the preceding Main columns for this token partition. Batch/cache
+// metadata still describes the complete sequence consumed by the rank-local QSA heads.
+struct MtpHistoryInput {
+    Tensor conditioning;
+    TokenPartition columns;
+};
+
+void mtp_history(const TextConfig&, const QsaConfig&, const MtpParameters&, MtpHistoryInput,
+                 const BatchView&, const ops::QsaTailStateView& before, ops::QsaTailStateView after,
+                 ops::QsaCacheView, std::optional<models::vision::EmbeddingView>, MemoryArena&,
+                 CudaExecutionView, ParallelExecution* = nullptr);
 
 } // namespace ninfer::models::qwen4_exp::execution

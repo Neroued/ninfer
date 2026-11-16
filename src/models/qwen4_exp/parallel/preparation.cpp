@@ -75,6 +75,19 @@ std::vector<distributed::GroupRequirements> RankPreparation::communication_requi
     auto& work         = result.collectives;
     const auto columns = std::max({batch, decode, std::size_t(shape.prefill_chunk)});
     work.push_back({Collective::AllReduce, DType::BF16, hidden, hidden * columns, hidden});
+    const auto sequence = execution::sequence_parallel_policy(profile_->local.size);
+    if (sequence.minimum_columns &&
+        shape.prefill_chunk >= std::uint32_t(sequence.minimum_columns)) {
+        const auto local = sequence.partition(dimension(shape.prefill_chunk), 0).segment;
+        work.push_back({Collective::ReduceScatter, DType::BF16, hidden, hidden * local, hidden});
+        work.push_back({Collective::AllGather, DType::BF16, hidden, hidden * local, hidden});
+        if (profile_->mtp) {
+            const auto conditioning = std::size_t(profile_->config.text.residual_width());
+            for (std::uint32_t owner = 0; owner < profile_->local.size; ++owner)
+                work.push_back({Collective::Broadcast, DType::BF16, conditioning, conditioning, 1,
+                                Reduction::Sum, owner});
+        }
+    }
     if (plan.persistent.buffers.ple_embedding) {
         const auto words =
             profile_->config.text.ple.embedding * dtype_size(DType::BF16) / dtype_size(DType::U32);

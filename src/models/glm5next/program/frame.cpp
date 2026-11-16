@@ -1,7 +1,7 @@
 #include "models/glm5next/program/frame.h"
 
 #include "models/common/vocabulary.h"
-#include "models/glm5next/execution/profile.h"
+#include "models/glm5next/execution/workspace.h"
 #include "ninfer/ops/sampling.h"
 
 #include <algorithm>
@@ -132,9 +132,10 @@ void reshape_frame_controls(FrameLayout& out, PhysicalBatchShape shape, std::uin
 
 FrameLayout plan_frame(LayoutBuilder& b, const execution::ModelProfile& p,
                        const ExecutionShape& s) {
-    const auto& c   = p.config.text;
-    const int batch = dimension(s.max_concurrency),
-              width = dimension(std::uint64_t(s.draft_tokens) + 1);
+    const auto& c       = p.config.text;
+    const auto sequence = execution::sequence_parallel_policy(p.local.size);
+    const int batch     = dimension(s.max_concurrency),
+              width     = dimension(std::uint64_t(s.draft_tokens) + 1);
     const int columns =
         dimension(std::max<std::uint64_t>(s.prefill_chunk, std::uint64_t(batch) * width));
     const int hidden = dimension(c.hidden), index = dimension(c.mla.index_dim);
@@ -169,11 +170,12 @@ FrameLayout plan_frame(LayoutBuilder& b, const execution::ModelProfile& p,
     if (out.speculative)
         out.speculative->verify_ids = tensor(DType::I32, {width * batch}, "verify IDs");
     if (out.dflash) {
-        auto& d    = *out.dflash;
-        d.features = tensor(
-            DType::BF16,
-            {dimension(std::uint64_t(c.hidden) * p.config.draft->target_layer_ids.size()), columns},
-            "Main draft conditioning");
+        auto& d = *out.dflash;
+        d.features =
+            tensor(DType::BF16,
+                   {dimension(std::uint64_t(c.hidden) * p.config.draft->target_layer_ids.size()),
+                    std::max(sequence.local_capacity(dimension(s.prefill_chunk)), batch * width)},
+                   "Main draft conditioning");
         d.window_count       = tensor(DType::I32, {1}, "draft retained window");
         d.ids                = tensor(DType::I32, {width, batch}, "masked block IDs");
         d.positions          = tensor(DType::I32, {width, batch}, "masked block positions");
@@ -188,7 +190,8 @@ FrameLayout plan_frame(LayoutBuilder& b, const execution::ModelProfile& p,
     }
     local.selection_rows = tensor(DType::I32, {columns}, "local selection identity");
     out.prefill_hidden =
-        tensor(DType::BF16, {hidden, dimension(s.prefill_chunk)}, "prefill hidden");
+        tensor(DType::BF16, {hidden, sequence.partition(dimension(s.prefill_chunk), 0).padded},
+               "prefill hidden");
     out.pending_hidden = tensor(DType::BF16, {hidden, width, batch}, "pending Main hidden");
     out.main_records = ops::plan_kpool_raw_records(b, index, width, batch, dimension(c.mla_layers));
     if (out.speculative) {

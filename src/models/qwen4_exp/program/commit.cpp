@@ -98,8 +98,8 @@ void RankProgramImpl::execute_mtp_commit(std::int32_t batch, bool rebuild_histor
     const auto tail_width = dimension(parameters.profile->config.text.qsa.compression - 1);
     const auto repair     = [&] {
         execution::mtp_history(parameters.profile->config.text, parameters.profile->local.qsa,
-                                   *parameters.mtp, aligned, history, tail, tail,
-                                   resources.mtp->layer(0), {}, resources.workspace, cuda);
+                                   *parameters.mtp, {aligned, TokenPartition(k * batch)}, history, tail,
+                                   tail, resources.mtp->layer(0), {}, resources.workspace, cuda);
     };
     if (captured_repair)
         captured_repair->capture(cuda.stream(), repair);

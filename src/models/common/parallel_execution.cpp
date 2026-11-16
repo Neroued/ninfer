@@ -3,8 +3,48 @@
 #include "ninfer/ops/collective.h"
 
 #include <limits>
+#include <algorithm>
 
 namespace ninfer::models {
+
+TokenPartition::TokenPartition(std::int32_t n, std::uint32_t size, std::uint32_t index)
+    : columns(n), ranks(size), rank(index) {
+    if (n < 1 || !size || index >= size) throw std::invalid_argument("invalid token partition");
+    const auto width = (std::uint64_t(n) + size - 1) / size;
+    const auto total = width * size;
+    if (total > std::numeric_limits<std::int32_t>::max())
+        throw std::overflow_error("token partition exceeds tensor extent");
+    segment = static_cast<std::int32_t>(width);
+    padded  = static_cast<std::int32_t>(total);
+    begin   = static_cast<std::int32_t>(index * width);
+    count   = std::clamp(n - begin, 0, segment);
+}
+
+Tensor TokenPartition::local(const Tensor& value, int axis) const {
+    return count ? value.slice(axis, begin, count) : Tensor{};
+}
+
+Tensor TokenPartition::exchange(const Tensor& value, int axis) const {
+    return value.slice(axis, begin, segment);
+}
+
+void TokenPartition::clear_padding(const Tensor& value, int axis, CudaExecutionView cuda) const {
+    if (columns == padded) return;
+    auto tail = value.slice(axis, columns, padded - columns);
+    if (!tail.is_contiguous() || tail.device != cuda.device())
+        throw std::invalid_argument("token padding requires contiguous device columns");
+    CUDA_CHECK(cudaMemsetAsync(tail.data, 0, tail.bytes(), cuda.stream()));
+}
+
+TokenPartition SequenceParallelPolicy::partition(std::int32_t columns, std::uint32_t rank) const {
+    return minimum_columns && columns >= minimum_columns ? TokenPartition(columns, ranks, rank)
+                                                         : TokenPartition(columns);
+}
+
+std::int32_t SequenceParallelPolicy::local_capacity(std::int32_t maximum) const {
+    if (!minimum_columns || maximum < minimum_columns) return TokenPartition(maximum).columns;
+    return std::max(minimum_columns - 1, partition(maximum, 0).segment);
+}
 
 ParallelExecution::ParallelExecution(ParallelBinding binding) : binding_(binding) {
     if (!binding.group) throw std::invalid_argument("parallel execution has no group");
@@ -21,6 +61,15 @@ std::uint32_t ParallelExecution::size() const {
 void ParallelExecution::sum(Tensor& value, CudaExecutionView cuda) {
 #if NINFER_ENABLE_DISTRIBUTED
     ops::all_reduce(value, value, distributed::Reduction::Sum, *binding_.group, cuda);
+#else
+    throw std::logic_error("distributed execution was not built");
+#endif
+}
+
+void ParallelExecution::sum_scatter(const Tensor& source, Tensor& destination,
+                                    CudaExecutionView cuda) {
+#if NINFER_ENABLE_DISTRIBUTED
+    ops::reduce_scatter(source, destination, distributed::Reduction::Sum, *binding_.group, cuda);
 #else
     throw std::logic_error("distributed execution was not built");
 #endif

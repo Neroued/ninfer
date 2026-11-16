@@ -44,15 +44,19 @@ public:
     void set_visible_tokens(std::uint32_t maximum) { batch_.max_visible_tokens = maximum; }
 
 private:
+    void mix(const HcParameters&);
+    [[nodiscard]] Tensor reduce_output();
     const Parameters& parameters_;
     TextExecution execution_;
     BatchView batch_;
     StateUpdate update_;
     CudaExecutionView cuda_;
+    TokenPartition partition_;
     MemoryArena::Scope scope_;
     workspace::Roots roots_;
     std::optional<moe::Schedule::Activity> expert_activity_;
     bool waiting_moe_ = false;
+    bool partitioned_ = false;
 };
 
 void project_head(const Tensor& sample, const LinearParameters&, Tensor& logits, MemoryArena&,

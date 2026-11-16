@@ -91,7 +91,7 @@ public:
     void accept_dflash(std::int32_t rows);
     void accept_speculative(std::int32_t rows);
     [[nodiscard]] execution::DFlashRun dflash_run(int rows, std::uint32_t bound);
-    [[nodiscard]] Tensor draft_features(int tokens, int rows);
+    [[nodiscard]] Tensor draft_features(const execution::BatchView&);
     void append_dflash_context(const execution::BatchView&, const Tensor& counts,
                                ops::ContextKVMaterializeExecutionEnvelope);
     void execute_speculative_commit(const execution::BatchView&, bool repair_history,

@@ -28,12 +28,17 @@ public:
     void finish_layer(std::uint32_t layer);
     void finish(Tensor& hidden);
 private:
-    void next_pre(const ops::MhcPreWeights&, const Tensor& feature = {});
+    void next_pre(const ops::MhcPreWeights&, const Tensor& feature = {},
+                  std::optional<std::uint32_t> owner = {});
+    void gather_input(std::optional<std::uint32_t> owner);
+    void reduce_output();
+    [[nodiscard]] std::optional<std::uint32_t> attention_owner(std::uint32_t layer) const;
     const Parameters& parameters_;
     TextExecution execution_;
     BatchView batch_;
     StateUpdate update_;
     CudaExecutionView cuda_;
+    TokenPartition columns_;
     MemoryArena::Scope scope_;
     workspace::Roots roots_;
     std::uint32_t coefficients_ = 0;

@@ -1,4 +1,5 @@
 #include "models/glm5next/execution/workspace.h"
+#include "core/platform.h"
 #include "models/glm5next/execution/dflash.h"
 #include "ninfer/ops/linear_pair.h"
 
@@ -17,6 +18,11 @@
 #include <algorithm>
 
 namespace ninfer::models::glm5next::execution {
+SequenceParallelPolicy sequence_parallel_policy(std::uint32_t ranks) {
+    return NINFER_TARGET_SPARK && ranks == 2 ? SequenceParallelPolicy{2, 256}
+                                             : SequenceParallelPolicy{};
+}
+
 namespace {
 std::size_t linear(const ops::LinearProfile& p, int first, int last) {
     return ops::linear_workspace_capacity_bytes(p.qtype, p.n, p.k, p.policy, first, last);
@@ -59,8 +65,20 @@ void mla(WorkspaceLayoutBuilder& a, const ModelProfile& p, const MlaProfile& m,
     }
 }
 
+std::size_t attention_workspace(const ModelProfile&, const ExecutionShape&, int first, int last,
+                                int batch, int sm_count, bool record, bool mtp);
+
 std::size_t body(const ModelProfile& p, const ExecutionShape& s, int first, int last, int batch,
                  int sm_count, bool prefill, bool mtp, std::size_t attention_bytes) {
+    const auto policy = sequence_parallel_policy(p.local.size);
+    if (prefill && !mtp && policy.minimum_columns && first < policy.minimum_columns &&
+        last >= policy.minimum_columns)
+        return std::max(body(p, s, first, policy.minimum_columns - 1, batch, sm_count, prefill, mtp,
+                             attention_workspace(p, s, first, policy.minimum_columns - 1, batch,
+                                                 sm_count, false, false)),
+                        body(p, s, policy.minimum_columns, last, batch, sm_count, prefill, mtp,
+                             attention_workspace(p, s, policy.minimum_columns, last, batch,
+                                                 sm_count, false, false)));
     WorkspaceLayoutBuilder a;
     const int minimum = dimension(std::uint64_t(first) * batch);
     const int columns = dimension(std::uint64_t(last) * batch);
@@ -78,19 +96,19 @@ std::size_t body(const ModelProfile& p, const ExecutionShape& s, int first, int 
                        p.mtp->moe.math, p.mtp->moe.subset, minimum, columns));
         return a.peak_bytes();
     }
-    (void)workspace::roots(a, p.config.text, columns);
+    const auto partition =
+        prefill ? policy.partition(columns, p.local.rank) : TokenPartition(columns);
+    const int local_minimum =
+        partition.split() ? policy.partition(minimum, p.local.rank).count : minimum;
+    (void)workspace::roots(a, p.config.text, partition);
     if (!prefill && p.local.size > 1)
         (void)workspace::attention(a, dimension(p.config.text.hidden), columns, p.local.size);
-    {
-        auto scope = a.scope();
-        (void)a.alloc(DType::BF16, {dimension(p.config.text.hidden), columns});
-        scratch(a, ops::mhc_expand_pre_workspace_capacity_bytes(p.text.mhc, sm_count, minimum,
-                                                                columns));
-    }
-    scratch(a, ops::mhc_pre_workspace_capacity_bytes(p.text.mhc, sm_count, minimum, columns));
-    scratch(a, ops::mhc_post_pre_workspace_capacity_bytes(p.text.mhc, sm_count, minimum, columns));
-    scratch(a, ops::mhc_post_mean_norm_workspace_capacity_bytes(p.text.mhc, sm_count, minimum,
-                                                                columns));
+    scratch(a, ops::mhc_expand_pre_workspace_capacity_bytes(p.text.mhc, sm_count, local_minimum,
+                                                            partition.count));
+    scratch(a, ops::mhc_post_pre_workspace_capacity_bytes(p.text.mhc, sm_count, local_minimum,
+                                                          partition.count));
+    scratch(a, ops::mhc_post_mean_norm_workspace_capacity_bytes(p.text.mhc, sm_count, local_minimum,
+                                                                partition.count));
     for (const auto& layer : p.text.layers) {
         if (const auto* k = std::get_if<KdaProfile>(&layer.mixer)) {
             auto scope         = a.scope();

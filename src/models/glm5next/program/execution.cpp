@@ -192,8 +192,7 @@ execution::TextRun RankProgramImpl::text_run(const execution::BatchView& call,
         parameters,
         {resources.workspace, resources.states, resources.main,
          resources.tensor(io.main_records.raw_keys), resources.tensor(io.main_records.raw_gates),
-         parallel ? &*parallel : nullptr,
-         parameters.draft ? draft_features(call.tokens, call.rows) : Tensor{}},
+         parallel ? &*parallel : nullptr, parameters.draft ? draft_features(call) : Tensor{}},
         call, update, cuda);
 }
 
@@ -210,8 +209,14 @@ void RankProgramImpl::main_forward(const execution::BatchView& call, execution::
         run.ffn(i);
         run.finish_layer(i);
     }
-    auto output =
-        hidden.view({dimension(parameters.profile->config.text.hidden), call.tokens * call.rows});
+    const auto& p = *parameters.profile;
+    const auto columns =
+        std::holds_alternative<execution::SequenceUpdate>(update)
+            ? execution::sequence_parallel_policy(p.local.size).partition(call.tokens, p.local.rank)
+            : TokenPartition(call.tokens * call.rows);
+    auto output = columns.split()
+                      ? resources.tensor(frame.prefill_hidden).slice(1, 0, columns.padded)
+                      : hidden.view({dimension(p.config.text.hidden), columns.columns});
     run.finish(output);
 }
 

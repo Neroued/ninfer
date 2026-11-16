@@ -245,15 +245,26 @@ std::size_t draft_workspace_capacity(const ModelProfile& p, int width, int max_b
 
 std::size_t draft_context_workspace_capacity(const ModelProfile& p, const ExecutionShape& s) {
     WorkspaceLayoutBuilder a;
+    const auto append = [&](int last, int batch) {
+        (void)workspace::draft_context(a, p, last * batch);
+        scratch(a, linear(p.draft->feature_projection, 1, last * batch));
+        scratch(a, ops::context_kv_materialize_workspace_capacity_bytes(p.draft->context, batch, 1,
+                                                                        last));
+    };
     for (int b = 1; b <= dimension(s.max_concurrency); ++b) {
         const int last = b == 1 ? std::max(std::min(s.prefill_chunk, p.draft->context.capacity),
                                            s.draft_tokens + 1)
                                 : s.draft_tokens + 1;
         auto scope     = a.scope();
-        (void)workspace::draft_context(a, p, last * b);
-        scratch(a, linear(p.draft->feature_projection, 1, last * b));
-        scratch(a,
-                ops::context_kv_materialize_workspace_capacity_bytes(p.draft->context, b, 1, last));
+        append(last, b);
+    }
+    if (sequence_parallel_policy(p.local.size).partition(dimension(s.prefill_chunk), 0).split()) {
+        auto scope         = a.scope();
+        const int retained = dimension(std::min(s.prefill_chunk, p.draft->context.capacity));
+        (void)a.alloc(
+            DType::BF16,
+            {dimension(p.config.text.hidden * p.config.draft->target_layer_ids.size()), retained});
+        append(retained, 1);
     }
     return a.peak_bytes();
 }

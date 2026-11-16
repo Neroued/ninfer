@@ -1,11 +1,16 @@
 #pragma once
 
+#include "models/common/parallel_execution.h"
+
 #include "core/layout.h"
 #include "models/qwen4_exp/execution/profile.h"
 #include "models/common/moe/schedule.h"
 #include "models/common/qwen/vision/vision.h"
 
 namespace ninfer::models::qwen4_exp::execution {
+
+[[nodiscard]] SequenceParallelPolicy sequence_parallel_policy(std::uint32_t ranks);
+
 struct WorkspacePlan {
     std::size_t prefill = 0, ordinary = 0, verify = 0, mtp = 0, history = 0, finish = 0;
     std::size_t general_bytes = 0, bytes = 0;
@@ -20,14 +25,23 @@ struct WorkspacePlan {
 namespace ninfer::models::qwen4_exp::execution::workspace {
 struct Roots {
     Tensor residual, normalized, input, output, injection;
+    Tensor exchange_input, exchange_output;
 };
 
 template <class Arena>
-Roots roots(Arena& a, const TextConfig& c, std::int32_t m) {
+Roots roots(Arena& a, const TextConfig& c, std::int32_t m, std::int32_t padded = 0) {
     const auto h = dimension(c.hidden), streams = dimension(c.hc.streams);
-    return {a.alloc(DType::BF16, {h, streams, m}), a.alloc(DType::BF16, {h, streams, m}),
-            a.alloc(DType::BF16, {h, m}), a.alloc(DType::BF16, {h, m}),
-            a.alloc(DType::FP32, {streams, m})};
+    auto residual   = a.alloc(DType::BF16, {h, streams, m});
+    auto normalized = a.alloc(DType::BF16, {h, streams, m});
+    auto input      = a.alloc(DType::BF16, {h, padded ? padded : m});
+    auto output     = a.alloc(DType::BF16, {h, padded ? padded : m});
+    return {residual,
+            normalized,
+            input.slice(1, 0, m),
+            output.slice(1, 0, m),
+            a.alloc(DType::FP32, {streams, m}),
+            input,
+            output};
 }
 
 struct HistoryRoots {
@@ -35,10 +49,11 @@ struct HistoryRoots {
 };
 
 template <class Arena>
-HistoryRoots history_roots(Arena& a, const TextConfig& c, std::int32_t m) {
+HistoryRoots history_roots(Arena& a, const TextConfig& c, std::int32_t m,
+                           std::int32_t input_columns = 0) {
     const auto h = dimension(c.hidden), streams = dimension(c.hc.streams);
     return {a.alloc(DType::BF16, {h, streams, m}), a.alloc(DType::BF16, {h, streams, m}),
-            a.alloc(DType::BF16, {h, m})};
+            a.alloc(DType::BF16, {h, input_columns ? input_columns : m})};
 }
 
 struct GdnBuffers {
@@ -125,9 +140,11 @@ struct MtpStemBuffers {
 };
 
 template <class Arena>
-MtpStemBuffers mtp_stem(Arena& a, const TextConfig& c, std::int32_t m) {
+MtpStemBuffers mtp_stem(Arena& a, const TextConfig& c, std::int32_t m,
+                        std::int32_t embedding_columns = 0) {
     const auto h = dimension(c.hidden), channels = dimension(c.residual_width());
-    return {a.alloc(DType::BF16, {h, m}), a.alloc(DType::BF16, {h, m}),
-            a.alloc(DType::BF16, {channels, m}), a.alloc(DType::BF16, {h, m})};
+    return {a.alloc(DType::BF16, {h, embedding_columns ? embedding_columns : m}),
+            a.alloc(DType::BF16, {h, m}), a.alloc(DType::BF16, {channels, m}),
+            a.alloc(DType::BF16, {h, m})};
 }
 } // namespace ninfer::models::qwen4_exp::execution::workspace

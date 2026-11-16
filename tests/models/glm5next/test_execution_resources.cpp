@@ -249,6 +249,26 @@ void capacity_views() {
             "small local Kpool record view changed allocated layer stride");
 }
 
+void sequence_capacity() {
+    auto p = storage_plan(0, false, KvCacheStorage::BFloat16, KvCacheVectorFormat::BFloat16, true);
+    const auto policy = glm::execution::sequence_parallel_policy(p.profile->local.size);
+    for (unsigned chunk : {255U, 256U, 257U, 4097U}) {
+        p.shape.prefill_chunk = chunk;
+        LayoutBuilder layout;
+        const auto frame = glm::plan_frame(layout, *p.profile, p.shape);
+        for (unsigned tokens = 1; tokens <= chunk; ++tokens)
+            for (unsigned rank = 0; rank < p.profile->local.size; ++rank) {
+                const auto columns = policy.partition(tokens, rank);
+                require(frame.prefill_hidden.shape[1] >= columns.padded &&
+                            frame.dflash->features.shape[1] >= columns.count,
+                        "prefill frame omitted an odd tail or a replicated threshold shape");
+            }
+        require(frame.dflash->features.shape[1] >=
+                    int(p.shape.max_concurrency * (p.shape.draft_tokens + 1)),
+                "local prefill taps reduced the full decode feature capacity");
+    }
+}
+
 void gpu() {
     DeviceContext device;
     Fixture f(true);
@@ -298,6 +318,7 @@ int main(int argc, char** argv) {
             host();
             dflash_storage();
             capacity_views();
+            sequence_capacity();
         } else {
             require(std::string_view(argv[1]) == "--gpu", "invalid resource test mode");
             int count = 0;

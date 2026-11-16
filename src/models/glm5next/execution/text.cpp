@@ -9,13 +9,21 @@ namespace ninfer::models::glm5next::execution {
 TextRun::TextRun(const Parameters& p, TextExecution execution, BatchView batch, StateUpdate update,
                  CudaExecutionView cuda)
     : parameters_(p), execution_(execution), batch_(batch), update_(update), cuda_(cuda),
+      columns_(std::holds_alternative<SequenceUpdate>(update)
+                   ? sequence_parallel_policy(p.profile->local.size)
+                         .partition(batch.tokens, p.profile->local.rank)
+                   : TokenPartition(batch.tokens * batch.rows)),
       scope_(execution.workspace.scope()),
-      roots_(workspace::roots(execution.workspace, p.profile->config.text,
-                              batch.tokens * batch.rows)) {
+      roots_(workspace::roots(execution.workspace, p.profile->config.text, columns_)) {
     if (batch.tokens < 1 || batch.rows < 1 || batch.attention.rows < 1 ||
         (std::holds_alternative<SequenceUpdate>(update) && batch.rows != 1) ||
         (std::holds_alternative<StepUpdate>(update) && batch.tokens != 1))
         throw std::invalid_argument("GLM5Next forward has inconsistent state-write extents");
+    if (columns_.split() && (!execution.parallel || !batch.sequence_owner))
+        throw std::invalid_argument(
+            "GLM5Next sequence parallel execution requires a sequence owner");
+    columns_.clear_padding(roots_.exchange_input, 1, cuda_);
+    columns_.clear_padding(roots_.exchange_output, 1, cuda_);
     if (execution.parallel && !batch.sequence_owner)
         attention_ =
             workspace::attention(execution.workspace, dimension(p.profile->config.text.hidden),
@@ -28,10 +36,12 @@ void TextRun::stem(std::optional<models::vision::EmbeddingView> visual) {
     if (visual)
         for (const auto& slice : visual->slices)
             ops::scatter(slice.features, slice.columns, roots_.output, cuda_);
-    ops::mhc_expand_pre(roots_.output, parameters_.text.layers.front().attention_hc,
+    auto input = columns_.local(roots_.exchange_input, 1);
+    ops::mhc_expand_pre(columns_.local(roots_.exchange_output, 1),
+                        parameters_.text.layers.front().attention_hc,
                         parameters_.profile->text.mhc_parameters, roots_.residual,
-                        {roots_.input, roots_.coefficients[coefficients_]}, execution_.workspace,
-                        cuda_);
+                        {input, roots_.coefficients[coefficients_]}, execution_.workspace, cuda_);
+    gather_input(attention_owner(0));
 }
 
 void TextRun::local_mixer(std::uint32_t layer, const MlaSubmit& submit) {
@@ -76,23 +86,58 @@ MlaRun TextRun::local_mla(std::uint32_t layer) {
         attention_.output.data ? attention_.output : roots_.output, execution_.workspace, cuda_);
 }
 
-void TextRun::next_pre(const ops::MhcPreWeights& weights, const Tensor& feature) {
+std::optional<std::uint32_t> TextRun::attention_owner(std::uint32_t layer) const {
+    return parameters_.profile->config.text.layers.at(layer).mixer == MixerKind::Mla
+               ? batch_.sequence_owner
+               : std::nullopt;
+}
+
+void TextRun::gather_input(std::optional<std::uint32_t> owner) {
+    if (!columns_.split()) return;
+    if (owner) {
+        const TokenPartition peer(columns_.columns, columns_.ranks, 1 - *owner);
+        auto half = peer.exchange(roots_.exchange_input, 1);
+        execution_.parallel->broadcast(half, peer.rank, cuda_);
+    } else {
+        execution_.parallel->gather(columns_.exchange(roots_.exchange_input, 1),
+                                    roots_.exchange_input, cuda_);
+    }
+}
+
+void TextRun::reduce_output() {
+    if (!execution_.parallel) return;
+    if (columns_.split()) {
+        auto local = columns_.exchange(roots_.exchange_output, 1);
+        execution_.parallel->sum_scatter(roots_.exchange_output, local, cuda_);
+    } else {
+        execution_.parallel->sum(roots_.output, cuda_);
+    }
+}
+
+void TextRun::next_pre(const ops::MhcPreWeights& weights, const Tensor& feature,
+                       std::optional<std::uint32_t> owner) {
     const auto next = 1 - coefficients_;
-    ops::mhc_post_pre(roots_.residual, roots_.output, roots_.coefficients[coefficients_], weights,
+    auto input      = columns_.local(roots_.exchange_input, 1);
+    ops::mhc_post_pre(roots_.residual, columns_.local(roots_.exchange_output, 1),
+                      roots_.coefficients[coefficients_], weights,
                       parameters_.profile->text.mhc_parameters, roots_.residual,
-                      {roots_.input, roots_.coefficients[next]}, execution_.workspace, cuda_,
-                      feature);
+                      {input, roots_.coefficients[next]}, execution_.workspace, cuda_, feature);
     coefficients_ = next;
+    gather_input(owner);
 }
 
 void TextRun::finish_mixer(std::uint32_t layer) {
     const auto& profile = *parameters_.profile;
     if (execution_.parallel) {
         if (profile.config.text.layers.at(layer).mixer == MixerKind::Kda)
-            execution_.parallel->sum(roots_.output, cuda_);
-        else if (batch_.sequence_owner)
-            execution_.parallel->broadcast(roots_.output, *batch_.sequence_owner, cuda_);
-        else {
+            reduce_output();
+        else if (batch_.sequence_owner) {
+            auto output = columns_.split() ? TokenPartition(columns_.columns, columns_.ranks,
+                                                            1 - *batch_.sequence_owner)
+                                                 .exchange(roots_.exchange_output, 1)
+                                           : roots_.output;
+            execution_.parallel->broadcast(output, *batch_.sequence_owner, cuda_);
+        } else {
             execution_.parallel->gather(attention_.output, attention_.gathered, cuda_);
             const int h = dimension(profile.config.text.hidden), t = batch_.tokens;
             auto output = roots_.output.view({h, t, batch_.rows});
@@ -119,7 +164,7 @@ void TextRun::ffn(std::uint32_t layer) {
 }
 
 void TextRun::finish_layer(std::uint32_t layer) {
-    if (execution_.parallel) execution_.parallel->sum(roots_.output, cuda_);
+    reduce_output();
     if (layer + 1 < parameters_.text.layers.size()) {
         Tensor feature;
         if (execution_.features.data) {
@@ -129,14 +174,20 @@ void TextRun::finish_layer(std::uint32_t layer) {
                 feature     = execution_.features.slice(0, slot * h, h);
             }
         }
-        next_pre(parameters_.text.layers[layer + 1].attention_hc, feature);
+        next_pre(parameters_.text.layers[layer + 1].attention_hc, feature,
+                 attention_owner(layer + 1));
     }
 }
 
 void TextRun::finish(Tensor& hidden) {
-    ops::mhc_post_mean_norm(roots_.residual, roots_.output, roots_.coefficients[coefficients_],
-                            parameters_.text.final_norm,
-                            parameters_.profile->config.text.norm_epsilon, hidden,
+    auto local = columns_.local(hidden, 1);
+    ops::mhc_post_mean_norm(roots_.residual, columns_.local(roots_.exchange_output, 1),
+                            roots_.coefficients[coefficients_], parameters_.text.final_norm,
+                            parameters_.profile->config.text.norm_epsilon, local,
                             execution_.workspace, cuda_);
+    if (columns_.split()) {
+        columns_.clear_padding(hidden, 1, cuda_);
+        execution_.parallel->gather(columns_.exchange(hidden, 1), hidden, cuda_);
+    }
 }
 } // namespace ninfer::models::glm5next::execution

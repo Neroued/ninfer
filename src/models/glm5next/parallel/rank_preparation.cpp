@@ -76,12 +76,23 @@ std::vector<distributed::GroupRequirements> RankPreparation::communication_requi
     const auto batch  = std::size_t(shape.max_concurrency);
     const auto decode = batch * (shape.draft_tokens + 1);
     distributed::GroupRequirements tensor{binding_.group->id(), {}, {}};
-    auto& work         = tensor.collectives;
-    const auto columns = std::max({batch, decode, std::size_t(shape.prefill_chunk)});
+    auto& work            = tensor.collectives;
+    const auto policy     = execution::sequence_parallel_policy(plan_.profile->local.size);
+    const auto sequence   = policy.partition(dimension(shape.prefill_chunk), 0);
+    const auto replicated = sequence.split() ? std::size_t(policy.minimum_columns - 1)
+                                             : std::size_t(shape.prefill_chunk);
+    const auto columns    = std::max({batch, decode, replicated});
     work.push_back({Collective::AllReduce, DType::BF16, hidden, hidden * columns, hidden});
+    if (sequence.split()) {
+        const auto segment = hidden * std::size_t(sequence.segment);
+        work.push_back({Collective::ReduceScatter, DType::BF16, hidden, segment, hidden});
+        work.push_back({Collective::AllGather, DType::BF16, hidden, segment, hidden});
+    }
+    const auto broadcast_columns =
+        std::size_t(policy.local_capacity(dimension(shape.prefill_chunk)));
     for (std::uint32_t root = 0; root < binding_.group->size(); ++root) {
-        work.push_back({Collective::Broadcast, DType::BF16, hidden,
-                        hidden * std::size_t(shape.prefill_chunk), hidden, Reduction::Sum, root});
+        work.push_back({Collective::Broadcast, DType::BF16, hidden, hidden * broadcast_columns,
+                        hidden, Reduction::Sum, root});
         if (plan_.workspace.vision)
             work.push_back({Collective::Broadcast, DType::BF16, hidden,
                             plan_.workspace.vision->output_bytes / dtype_size(DType::BF16), hidden,
@@ -100,6 +111,14 @@ std::vector<distributed::GroupRequirements> RankPreparation::communication_requi
             work.push_back({Collective::AllGather, DType::BF16, std::size_t(p.feature_projection.n),
                             p.feature_projection.n * context_columns,
                             std::size_t(p.feature_projection.n)});
+            if (sequence.split()) {
+                const auto feature = hidden * plan_.profile->config.draft->target_layer_ids.size();
+                const auto retained =
+                    std::min(std::size_t(shape.prefill_chunk), std::size_t(p.context.capacity));
+                for (std::uint32_t root = 0; root < binding_.group->size(); ++root)
+                    work.push_back({Collective::Broadcast, DType::BF16, feature, feature * retained,
+                                    feature, Reduction::Sum, root});
+            }
             const auto k = std::size_t(plan_.profile->config.draft->dflash2->selector_top_k);
             work.push_back(
                 {Collective::AllGather, DType::I64, k, k * batch * shape.draft_tokens, k});

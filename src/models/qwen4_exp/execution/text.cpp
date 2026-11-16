@@ -12,9 +12,13 @@ namespace ninfer::models::qwen4_exp::execution {
 TextRun::TextRun(const Parameters& p, TextExecution execution, BatchView batch, StateUpdate update,
                  CudaExecutionView cuda)
     : parameters_(p), execution_(execution), batch_(batch), update_(update), cuda_(cuda),
+      partition_(std::holds_alternative<SequenceState>(update)
+                     ? sequence_parallel_policy(p.profile->local.size)
+                           .partition(batch.tokens, p.profile->local.rank)
+                     : TokenPartition(batch.tokens * batch.batch)),
       scope_(execution.workspace.scope()),
       roots_(workspace::roots(execution.workspace, p.profile->config.text,
-                              batch.tokens * batch.batch)),
+                              batch.tokens * batch.batch, partition_.padded)),
       expert_activity_(execution.experts ? execution.experts->begin(batch.tokens * batch.batch,
                                                                     batch.active_tokens)
                                          : std::nullopt) {
@@ -23,6 +27,29 @@ TextRun::TextRun(const Parameters& p, TextExecution execution, BatchView batch, 
         (std::holds_alternative<StepUpdate>(update) && batch.tokens != 1) ||
         (std::holds_alternative<VerifyRecords>(update) && batch.tokens < 2))
         throw std::invalid_argument("invalid Qwen4Exp sequence/step window");
+    if (partition_.split() && !execution_.parallel)
+        throw std::invalid_argument("Qwen4Exp sequence partition requires its parallel group");
+    partition_.clear_padding(roots_.exchange_input, 1, cuda_);
+    partition_.clear_padding(roots_.exchange_output, 1, cuda_);
+}
+
+void TextRun::mix(const HcParameters& p) {
+    auto input = partitioned_ ? partition_.local(roots_.exchange_input, 1) : roots_.input;
+    ops::hc_mix(roots_.normalized, p.mix, execution_.workspace, input, roots_.injection, cuda_);
+    if (partitioned_) {
+        const auto local = partition_.exchange(roots_.exchange_input, 1);
+        execution_.parallel->gather(local, roots_.exchange_input, cuda_);
+    }
+}
+
+Tensor TextRun::reduce_output() {
+    if (partitioned_) {
+        auto local = partition_.exchange(roots_.exchange_output, 1);
+        execution_.parallel->sum_scatter(roots_.exchange_output, local, cuda_);
+        return partition_.local(roots_.exchange_output, 1);
+    }
+    if (execution_.parallel) execution_.parallel->sum(roots_.output, cuda_);
+    return roots_.output;
 }
 
 void TextRun::stem(std::optional<models::vision::EmbeddingView> visual) {
@@ -70,11 +97,7 @@ void TextRun::local_mixer(std::uint32_t i) {
     const auto& p      = parameters_.text.layers[i];
     const auto& state  = config.layers[i];
     auto& arena        = execution_.workspace;
-    {
-        auto scratch = arena.scope();
-        ops::hc_mix(roots_.normalized, p.attention_hc.mix, arena, roots_.input, roots_.injection,
-                    cuda_);
-    }
+    mix(p.attention_hc);
     if (const auto* g = std::get_if<GdnParameters>(&p.mixer)) {
         gdn(roots_.input, parameters_.profile->local.gdn, *g, batch_, execution_.states.gdn(),
             state.state_index, update_, config.norm_epsilon, roots_.output, arena, cuda_);
@@ -100,16 +123,12 @@ void TextRun::local_mixer(std::uint32_t i) {
 void TextRun::finish_mixer(std::uint32_t i) {
     const auto& config = parameters_.profile->config.text;
     const auto& p      = parameters_.text.layers[i];
-    auto& arena        = execution_.workspace;
     if (i == 0 && execution_.first_collective_ready)
         execution_.first_collective_ready->wait(cuda_.stream());
-    if (execution_.parallel) execution_.parallel->sum(roots_.output, cuda_);
-    ops::hc_combine_norm(roots_.residual, roots_.output, roots_.injection, p.moe_hc.norm,
+    const auto output = reduce_output();
+    ops::hc_combine_norm(roots_.residual, output, roots_.injection, p.moe_hc.norm,
                          config.norm_epsilon, roots_.residual, roots_.normalized, cuda_);
-    {
-        auto scratch = arena.scope();
-        ops::hc_mix(roots_.normalized, p.moe_hc.mix, arena, roots_.input, roots_.injection, cuda_);
-    }
+    mix(p.moe_hc);
 }
 
 void TextRun::resident_moe(std::uint32_t i) {
@@ -125,16 +144,16 @@ void TextRun::gpu_moe(const moe::GpuCall& call) {
 }
 
 void TextRun::combine(std::uint32_t i) {
-    if (execution_.parallel) execution_.parallel->sum(roots_.output, cuda_);
+    const auto output  = reduce_output();
     const auto& config = parameters_.profile->config.text;
     if (i + 1 == config.ple.layer) {
-        ops::hc_combine(roots_.residual, roots_.output, roots_.injection, roots_.residual, cuda_);
+        ops::hc_combine(roots_.residual, output, roots_.injection, roots_.residual, cuda_);
     } else {
         const auto& norm = i + 1 < config.layers.size()
                                ? parameters_.text.layers[i + 1].attention_hc.norm
                                : parameters_.text.final_hc.norm;
-        ops::hc_combine_norm(roots_.residual, roots_.output, roots_.injection, norm,
-                             config.norm_epsilon, roots_.residual, roots_.normalized, cuda_);
+        ops::hc_combine_norm(roots_.residual, output, roots_.injection, norm, config.norm_epsilon,
+                             roots_.residual, roots_.normalized, cuda_);
     }
 }
 
@@ -150,6 +169,12 @@ void TextRun::consume_ple(const Tensor& embedding) {
     ple(embedding, parameters_.profile->config.text, p.ple, batch_,
         execution_.states.ple(batch_.source_offsets), after, records, p.layers[start].attention_hc,
         roots_.residual, roots_.normalized, execution_.workspace, cuda_);
+    if (partition_.split()) {
+        roots_.residual   = partition_.local(roots_.residual, 2);
+        roots_.normalized = partition_.local(roots_.normalized, 2);
+        roots_.injection  = partition_.local(roots_.injection, 1);
+        partitioned_      = true;
+    }
 }
 
 void TextRun::finish(TextOutputs output, Tensor logits) {
@@ -157,9 +182,15 @@ void TextRun::finish(TextOutputs output, Tensor logits) {
     if (output.conditioning.data)
         copy_bytes_async({output.conditioning.data, output.conditioning.bytes(), cuda_.device()},
                          {roots_.residual.data, roots_.residual.bytes(), cuda_.device()}, cuda_);
-    auto sample = output.sample.view(
-        {dimension(parameters_.profile->config.text.hidden), batch_.tokens * batch_.batch});
-    ops::hc_mix(roots_.normalized, p.final_hc.mix, execution_.workspace, sample, cuda_);
+    auto sample =
+        output.sample.view({dimension(parameters_.profile->config.text.hidden), partition_.padded});
+    auto local = partitioned_ ? partition_.local(sample, 1) : sample;
+    ops::hc_mix(roots_.normalized, p.final_hc.mix, execution_.workspace, local, cuda_);
+    if (partitioned_) {
+        partition_.clear_padding(sample, 1, cuda_);
+        execution_.parallel->gather(partition_.exchange(sample, 1), sample, cuda_);
+    }
+    sample = sample.slice(1, 0, partition_.columns);
     if (logits.data) {
         logits = logits.view({logits.ne[0], batch_.tokens * batch_.batch});
         project_head(sample, p.head, logits, execution_.workspace, cuda_);

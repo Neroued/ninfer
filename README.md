@@ -182,8 +182,8 @@ MTP3 single-request phase means, in tok/s:
 
 | Deployment | 7,680-token prefill | 260,096-token prefill | Structured decode |
 |---|---:|---:|---:|
-| Single Spark | 3,192.2 | 2,950.0 | 66.8 |
-| Dual Spark, TP2 | 4,251.6 | 3,873.6 | 107.2 |
+| Single Spark | 3,219.2 | 2,975.0 | 66.8 |
+| Dual Spark, TP2 | 4,783.1 | 4,303.8 | 107.2 |
 
 The [full report](docs/performance/qwen3.8-flash-next.md) includes decode step latency, MTP0/MTP3
 context profiles, scenario statistics, and the 75-request corpus at C=1/2/4/8.

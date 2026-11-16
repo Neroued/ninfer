@@ -186,7 +186,9 @@ NInfer returns tool calls to the client; it does not execute them.
 
 ## Performance
 
-Measured on November 15–16, 2026 with NInfer revision `a107b983`, NVIDIA GB10 and CUDA 13.4.
+Measured on November 15–16, 2026 on NVIDIA GB10 and CUDA 13.4. Decode measurements use
+NInfer revision `a107b983`; prefill was refreshed using `72d72df3`, with HC sequence parallelism
+on dual Spark.
 Both deployments use FP8 KV, MTP3 with the optimized head, CUDA Graphs, a 4,096-token prefill chunk,
 and a 262,144-token context limit, with Vision and prefix reuse disabled. Dual Spark uses TP2,
 including expert TP, and Native communication.
@@ -203,8 +205,8 @@ MTP3 single-request phase means, in tok/s:
 
 | Deployment | 7,680-token prefill | 260,096-token prefill | Structured decode |
 |---|---:|---:|---:|
-| Single Spark | 3,192.2 | 2,950.0 | 66.8 |
-| Dual Spark, TP2 | 4,251.6 | 3,873.6 | 107.2 |
+| Single Spark | 3,219.2 | 2,975.0 | 66.8 |
+| Dual Spark, TP2 | 4,783.1 | 4,303.8 | 107.2 |
 
 See the [complete serving results](https://github.com/Neroued/ninfer/blob/master/docs/performance/qwen3.8-flash-next.md)
 for step latency, MTP0/MTP3 context profiles, per-scenario results, the 75-request concurrent corpus,

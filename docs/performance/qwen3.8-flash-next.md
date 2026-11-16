@@ -8,10 +8,12 @@ and **109.5 tok/s at C=1 and 811.9 tok/s at C=32** on two Sparks.
 
 ## Configuration
 
-The runs use NInfer revision `a107b983`, NVIDIA GB10 (SM 12.1), and CUDA 13.4
-compile/runtime/driver API. Dual Spark uses TP2, including expert TP, and the Native communication
-backend over the 200 Gb/s RDMA interconnect. Single Spark uses GPU experts and disk-backed PLE;
-dual Spark shards PLE across Device memory.
+The decode-saturation and fixed-corpus runs use NInfer revision `a107b983`. Context profiles
+were remeasured on November 16 using revision `72d72df3`, with HC sequence parallelism on dual Spark.
+Hardware is NVIDIA GB10 (SM 12.1), with CUDA 13.4 compile/runtime/driver API.
+Dual Spark uses TP2, including expert TP, and the Native communication backend over the 200 Gb/s
+RDMA interconnect. Single Spark uses GPU experts and disk-backed PLE; dual Spark shards PLE across
+Device memory.
 
 The artifact is [Qwen3.8-Flash-Next-NInfer](https://huggingface.co/neroued/Qwen3.8-Flash-Next-NInfer),
 recipe `qwen3_8_flash_next`: NVIDIA NVFP4 Main experts, Q8 large projections, BF16 retained weights,
@@ -34,8 +36,8 @@ The measured entry file is
 | Startup and warmup | Excluded; fresh server per configuration |
 
 Automatic MTP3 Context pools ranged from 37.92–39.00 GiB on one Spark, and from
-58.94–60.56 GiB on rank 0 / 60.83–61.69 GiB on rank 1 for dual Spark. The reported
-KV token-capacity estimates were 2.71–2.79M and 7.95–8.17M, respectively; KV and State share
+58.94–60.34 GiB on rank 0 / 60.83–61.69 GiB on rank 1 for dual Spark. The reported
+KV token-capacity estimates were 2.71–2.79M and 7.95–8.14M, respectively; KV and State share
 this capacity. Per-rank startup allocations are retained in the reports.
 
 | Workload | Modes | Single C | Dual C | Requests per point |
@@ -73,19 +75,19 @@ TTFT follows the server's first-token boundary; step latency is the mean decode 
 
 | Prompt tokens | Single prefill (tok/s) | Single TTFT (s) | Single step (ms) | Dual prefill (tok/s) | Dual TTFT (s) | Dual step (ms) |
 | --- | --- | --- | --- | --- | --- | --- |
-| 7,680 | 3,192.2 ± 68.3 | 2.47 ± 0.18 | 55.9 ± 1.2 | 4,251.6 ± 64.1 | 1.88 ± 0.18 | 38.5 ± 2.5 |
-| 64,512 | 3,125.9 ± 2.0 | 20.68 ± 0.02 | 56.8 ± 0.7 | 4,163.1 ± 9.6 | 15.55 ± 0.03 | 39.9 ± 2.2 |
-| 130,048 | 3,065.0 ± 1.1 | 42.49 ± 0.02 | 58.2 ± 0.4 | 4,056.6 ± 2.7 | 32.12 ± 0.04 | 38.1 ± 0.2 |
-| 260,096 | 2,950.0 ± 7.0 | 88.27 ± 0.20 | 60.3 ± 0.4 | 3,873.6 ± 2.3 | 67.26 ± 0.05 | 39.2 ± 0.1 |
+| 7,680 | 3,219.2 ± 66.3 | 2.45 ± 0.18 | 57.1 ± 0.7 | 4,783.1 ± 86.2 | 1.69 ± 0.20 | 39.2 ± 2.0 |
+| 64,512 | 3,144.6 ± 2.9 | 20.55 ± 0.02 | 57.2 ± 0.6 | 4,673.4 ± 10.7 | 13.84 ± 0.03 | 37.6 ± 1.2 |
+| 130,048 | 3,085.1 ± 2.8 | 42.21 ± 0.05 | 58.3 ± 0.5 | 4,501.4 ± 28.9 | 28.96 ± 0.18 | 37.9 ± 0.6 |
+| 260,096 | 2,975.0 ± 0.7 | 87.54 ± 0.03 | 59.9 ± 0.4 | 4,303.8 ± 2.7 | 60.55 ± 0.05 | 39.3 ± 0.3 |
 
 ### MTP0
 
 | Prompt tokens | Single prefill (tok/s) | Single TTFT (s) | Single step (ms) | Dual prefill (tok/s) | Dual TTFT (s) | Dual step (ms) |
 | --- | --- | --- | --- | --- | --- | --- |
-| 7,680 | 3,275.6 ± 53.8 | 2.41 ± 0.17 | 34.7 ± 0.2 | 4,242.9 ± 50.4 | 1.91 ± 0.26 | 24.2 ± 1.0 |
-| 64,512 | 3,186.7 ± 8.5 | 20.28 ± 0.05 | 37.0 ± 0.2 | 4,169.7 ± 11.0 | 15.51 ± 0.04 | 25.0 ± 0.3 |
-| 130,048 | 3,114.2 ± 1.9 | 41.83 ± 0.02 | 38.6 ± 0.2 | 4,069.5 ± 5.5 | 32.01 ± 0.05 | 25.8 ± 0.2 |
-| 260,096 | 2,999.6 ± 0.6 | 86.81 ± 0.02 | 41.8 ± 0.3 | 3,887.7 ± 8.2 | 67.00 ± 0.14 | 27.5 ± 0.2 |
+| 7,680 | 3,221.1 ± 45.3 | 2.45 ± 0.16 | 35.2 ± 0.3 | 4,799.5 ± 57.9 | 1.71 ± 0.26 | 24.5 ± 0.5 |
+| 64,512 | 3,148.0 ± 1.8 | 20.52 ± 0.02 | 35.6 ± 0.1 | 4,691.6 ± 15.1 | 13.79 ± 0.05 | 25.6 ± 0.3 |
+| 130,048 | 3,092.1 ± 1.4 | 42.12 ± 0.03 | 35.8 ± 0.1 | 4,543.1 ± 5.9 | 28.67 ± 0.04 | 26.3 ± 0.2 |
+| 260,096 | 2,983.9 ± 1.4 | 87.27 ± 0.05 | 36.3 ± 0.3 | 4,318.9 ± 3.0 | 60.33 ± 0.05 | 28.3 ± 0.3 |
 
 ![Prefill throughput and server TTFT by context length](assets/qwen3.8-flash-next-context.svg)
 
@@ -147,8 +149,9 @@ executions at the requested batch C. Acceptance is summed accepted / summed draf
 
 ## Completion outcomes
 
-All 774 formal requests completed without request execution errors. All 80 context-profile
-requests stopped naturally. The 94 saturation requests reached their 8,192-token budget.
+All 774 published formal requests completed without request execution errors.
+All 80 refreshed context-profile requests stopped naturally. The 94 saturation requests reached
+their 8,192-token budget.
 The fixed-corpus stop-token / output-limit counts are:
 
 | C | Single: stop / limit | Dual: stop / limit |
@@ -230,15 +233,18 @@ for perf_deployment in dual single; do
 done
 ```
 
-The recorded campaign cleared filesystem caches on participating nodes before each server start.
-Its local report root is `.agent-tmp/qwen-fn-serving-perf-20261115/` on the coordinator:
+The recorded campaigns cleared filesystem caches on participating nodes before each server start.
+Decode-saturation and fixed-corpus reports are under `.agent-tmp/qwen-fn-serving-perf-20261115/`
+on the coordinator:
 
 | Evidence | Location relative to report root |
 |---|---|
-| Final deployment summaries | `single/summary.*`, `dual/summary.*` |
 | JSONL saturation | `saturation-jsonl/{single,dual}/decode-c{C}/` |
-| Context profiles | `{single,dual}/context-mtp{0,3}/` |
 | Fixed corpus | `{single,dual}/corpus-c{1,2,4,8}/` |
+
+Refreshed context profiles are under `.agent-tmp/qwen-fn-prefill-refresh-20261116/` on the
+coordinator: `{single,dual}/context-mtp{0,3}/`, with deployment summaries in
+`{single,dual}/summary.*`.
 
 Each point retains its command, startup resources, Engine measurements, server logs, request seeds,
 complete responses, and termination records. C=1 request summaries also supply the scenario tables.

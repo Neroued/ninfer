@@ -184,6 +184,32 @@ The context limit is per request. Actual shared KV/State capacity is reported at
 on the deployment and selected resources. DFlash and DFlash2 are not used by this architecture.
 NInfer returns tool calls to the client; it does not execute them.
 
+## Performance
+
+Measured on November 15–16, 2026 with NInfer revision `a107b983`, NVIDIA GB10 and CUDA 13.4.
+Both deployments use FP8 KV, MTP3 with the optimized head, CUDA Graphs, a 4,096-token prefill chunk,
+and a 262,144-token context limit, with Vision and prefix reuse disabled. Dual Spark uses TP2,
+including expert TP, and Native communication.
+
+Saturation uses the JSONL fixture with an 8,192-token output budget. Cells show steady decode
+tok/s and draft-token acceptance:
+
+| Deployment | C=1 tok/s / accept | C=2 tok/s / accept | C=4 tok/s / accept | C=8 tok/s / accept | C=16 tok/s / accept | C=32 tok/s / accept |
+|---|---:|---:|---:|---:|---:|---:|
+| Single Spark | 70.0 / 99.5% | 107.9 / 99.5% | 160.1 / 99.3% | 226.4 / 99.3% | 328.5 / 99.1% | — |
+| Dual Spark, TP2 | 109.5 / 99.6% | 177.1 / 99.3% | 281.0 / 99.6% | 399.6 / 99.4% | 581.6 / 99.5% | 811.9 / 99.1% |
+
+MTP3 single-request phase means, in tok/s:
+
+| Deployment | 7,680-token prefill | 260,096-token prefill | Structured decode |
+|---|---:|---:|---:|
+| Single Spark | 3,192.2 | 2,950.0 | 66.8 |
+| Dual Spark, TP2 | 4,251.6 | 3,873.6 | 107.2 |
+
+See the [complete serving results](https://github.com/Neroued/ninfer/blob/master/docs/performance/qwen3.8-flash-next.md)
+for step latency, MTP0/MTP3 context profiles, per-scenario results, the 75-request concurrent corpus,
+completion outcomes, and reproduction commands.
+
 ## Evaluation
 
 Recorded on **2026-10-21–22** through NInfer's public OpenAI-compatible service and EvalScope 1.10.0.

@@ -1,30 +1,24 @@
 # Serving performance methodology
 
-This document defines the recorded RTX 5090 campaigns linked from the [performance index](../performance.md).
-Their resource settings and commands belong to those campaigns. Current capacity controls and
-measurement commands are described in [startup configuration](../startup-configuration.md) and
-[benchmarks](../../bench/README.md).
+This document defines measurement and publication for the serving campaigns linked from the
+[performance index](../performance.md), including RTX 5090 and single-/dual-Spark deployments.
+Model pages own measured values and run-specific conditions. Current resource controls are
+described in [startup configuration](../startup-configuration.md).
 
 [Performance index](../performance.md) · [Runner usage](../../tools/bench/README.md#serving-corpus-benchmark)
 
-This is the measurement and publication reference for the serving results in this directory.
-Model pages own measured values and run-specific conditions. Engine and Op benchmarks have their
-own contracts in [bench/README.md](../../bench/README.md); their rates do not establish HTTP serving
-performance.
+Engine and Op benchmarks have their own contracts in [bench/README.md](../../bench/README.md).
+The results here measure the public HTTP serving route.
 
 ## Common serving profile
 
-The published runs use the following settings. Model-page run records specify context,
-concurrency, KV representation and capacity, toolchain, sampling exceptions, and artifact paths.
-These are recorded experimental settings, not promises about current executable defaults.
+The published runs share the settings below. Each model page records hardware, node count,
+parallel strategy, communication backend, toolchain, weights, KV representation, prefill chunk,
+context/concurrency settings, and any sampling exceptions.
 
 | Setting | Value |
 |---|---|
-| GPU | One NVIDIA GeForce RTX 5090, 32 GiB |
-| CUDA compile/runtime | Qwen3.8: 13.4 / 13.4; Qwen3.6: 13.1 / 13.1 |
 | Route | Persistent `ninfer-serve`, loopback OpenAI Chat Completions, `stream=false` |
-| Prefill chunk | 1,024 tokens |
-| KV cache | Qwen3.8: FP8 E4M3 row-256; Qwen3.6: INT8 group-64 |
 | CUDA Graph | Enabled |
 | Prefix reuse | Disabled |
 | Stochastic sampling | Temperature 0.6, top-p 0.95, top-k 20, min-p 0, presence penalty 1.0, frequency penalty 0 |
@@ -33,7 +27,7 @@ These are recorded experimental settings, not promises about current executable 
 
 | Report label | Runner mode | Server options |
 |---|---|---|
-| MTP0 (no speculation) | `mtp0` | No `--spec` |
+| MTP0 (no speculation) | `mtp0` | `--spec none` |
 | MTP3 | `mtp3` | `--spec mtp --draft-tokens 3 --proposal-head optimized` |
 | DFlash, block=8 | `dflash7` | `--spec dflash --draft-tokens 7 --proposal-head optimized` |
 | DFlash2, block=8 | `dflash2_7` | `--spec dflash2 --draft-tokens 7 --proposal-head optimized` |
@@ -41,13 +35,18 @@ These are recorded experimental settings, not promises about current executable 
 `K` denotes draft tokens; block size is `K+1`. Weight format, backend, draft count, and proposal
 head are separate experimental dimensions.
 
+The per-request context limit and physical capacity are recorded separately. Current engines use
+per-rank Context byte pools shared by KV and State; `auto` follows each rank's remaining budget.
+Older campaigns record dedicated KV capacity in tokens. Preserve the resource meaning of each run.
+
 ## Workloads and measurement boundaries
 
 ### Single-request phases
 
-The MTP0 context-length profile uses `long_niah_8k`, `long_niah_64k`, `long_niah_128k`, and
+The context-length profile uses `long_niah_8k`, `long_niah_64k`, `long_niah_128k`, and
 `long_niah_256k`: thinking disabled, 128 output tokens requested, five seeds per fixture.
-Tables retain actual prompt lengths. This suite measures prefill, server TTFT, and baseline decode.
+It measures prefill, server TTFT, and decode for each selected speculative mode. Tables retain
+actual prompt lengths; MTP0 and MTP3 results are reported separately.
 
 The speculative corpus uses three reasoning fixtures (`long_decode_aime26_01`,
 `long_decode_aime26_15`, `long_decode_aime26_30`) with thinking enabled and a 65,536-token output
@@ -67,18 +66,17 @@ Each concurrency point starts a fresh server. The runner shuffles the fixed requ
 seed `20260811` and preserves its ordered HTTP send sequence at every C. Exactly C persistent
 workers submit their next request after reading their current response. Makespan starts at worker
 release and ends when the last complete HTTP response has been read. It includes prefill, decode,
-workload transitions, admission waits, and drain. Average decode batch covers the entire run.
+workload transitions, admission waits, and drain. Decode step latency is grouped by actual batch;
+the full-batch column selects steps at the requested C.
 
 Prompts, seeds, and send order are fixed; stochastic continuations and token totals can vary with
 weights, backends, and concurrency. Report token totals alongside makespan and rate.
 
 ### Decode saturation
 
-The published MTP3 waves use `long_decode_aime26_15`, thinking enabled, and an 8,192-token output
-budget per request. Actual rendered prompt length is model-specific and recorded on the model
-page. At each C, a fresh server releases C requests with distinct fixed seeds and waits for every
-response. Each request has a 16,384-token context ceiling; the measured automatic KV capacity is
-`C * 16,384` tokens.
+At each C, a fresh server releases C requests with distinct fixed seeds and waits for every
+response. Model pages specify the fixture, thinking mode, actual prompt length, output budget,
+and resource settings. The runner's `jobs.json` retains every seed and request assignment.
 
 Steady throughput includes only complete one-second server intervals with zero computed prefill
 tokens, `running=C`, `prefilling=0`, `decode_ready=C`, at least one decode round, and exactly C rows
@@ -86,7 +84,8 @@ in every round. Intervals must have no preemptions, Snapshot/Replay restores or 
 and no paused or replaying requests at the end. Ramp-up, prefill, recovery, and drain are excluded.
 Wave makespan still spans client release through the last complete response. Acceptance is
 aggregated over the full wave, not just steady intervals. Each published point is one wave,
-not a repeated-sample mean.
+not a repeated-sample mean. Full-batch step latency uses all recorded executions at batch C,
+independently of the one-second interval selection used for steady throughput.
 
 ## Metrics and statistics
 
@@ -98,6 +97,8 @@ not a repeated-sample mean.
 | Corpus prefill (tok/s) | Total computed prefill tokens / full corpus makespan |
 | Corpus decode (tok/s) | Total decode tokens / full corpus makespan |
 | Steady decode (tok/s) | Sum of committed decode tokens / sum of selected interval seconds |
+| Full-batch step (ms) | Total Engine decode execution time at actual batch C / step count at C |
+| Per-request step (ms) | Mean Engine decode execution time during one serial request |
 | Requests/s | Number of requests / full corpus makespan |
 | Spec acceptance | Accepted draft tokens / drafted tokens |
 | Spec tokens/round | `1 + accepted_tokens / speculative_rounds` |
@@ -149,20 +150,21 @@ baseline/speculative speedups.
 
 ## Publishing and updating results
 
-Use one model page ordered by configuration and run records, measured workload sections,
-termination/anomalies, and reproduction. Group results by weight format and backend within a
-workload section. Omit unmeasured sections; add comparisons or content audits only when in scope.
-A short page-local run ID links each result to its configuration, command, and source reports.
+Use one model page ordered by configuration, measured workloads, completion outcomes, and
+reproduction. Group or compare deployments, weight formats, and backends within each workload.
+Identify each result's configuration, command, and source reports; a page-local run ID can connect
+larger matrices. Omit unmeasured sections.
 
 Record the date, model/weights identity, explicit artifact and relevant companion, known tested
 revision, hardware/toolchain, workload, sample count, and runtime settings. Link common settings
-rather than repeating them; put exceptions and actual automatic KV capacities in the run record.
+rather than repeating them; put exceptions and measured per-rank capacities in the run record.
 Identify missing historical metadata without inferring values.
 
 Commands run from the repository root with a selected Python 3.11 interpreter. Use a fresh output
 directory for reruns; recorded report paths identify the measured evidence. Reproducing a workload
-on another build or artifact does not promise identical historical outputs or timings. Raw reports
-remain local under `profiles/bench/`; reuse existing JSON/CSV/Markdown summaries to verify values.
+on another build or artifact does not promise identical historical outputs or timings. New raw
+reports stay under `.agent-tmp/<campaign>/`; historical report locations remain recorded on their
+model pages. Reuse existing JSON/CSV/Markdown summaries to verify values.
 
 Model pages own detailed serving results. README and model-card excerpts link to them and update
 with the relevant measurements. Capability scores belong in model-card Evaluation sections, with
